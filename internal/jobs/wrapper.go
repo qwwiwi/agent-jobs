@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // StreamResult is the final `result` event of claude's stream-json output.
@@ -87,11 +89,72 @@ func ReadWrapperInfo(jobDir string) (WrapperInfo, error) {
 	return w, nil
 }
 
+// admitLock takes <jobdir>/admit.lock exclusively. The wrapper holds it while it checks the job
+// row and registers in wrapper.json; Cancel and the launch-grace failure hold it while they read
+// wrapper.json and finish the row. So either the wrapper registers first (and is then found and
+// killed), or the row is terminal first (and the wrapper refuses to start claude).
+func admitLock(jobDir string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(jobDir, "admit.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open admit lock: %w", err)
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("admit flock: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// lockAdmitIfExists takes the admit lock when the job dir exists (no dir = no wrapper can exist).
+func lockAdmitIfExists(jobDir string) (func(), error) {
+	if _, err := os.Stat(jobDir); err != nil {
+		return func() {}, nil
+	}
+	return admitLock(jobDir)
+}
+
+// admitted checks, in <state>/jobs.db (jobDir = <state>/jobs/<id>), that the job is still running
+// under this launch token.
+func admitted(jobDir, token string) error {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return err
+	}
+	dbPath := filepath.Join(filepath.Dir(filepath.Dir(abs)), "jobs.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("job database: %w", err)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	j, err := st.Get(filepath.Base(abs))
+	if err != nil {
+		return err
+	}
+	if j.Status != store.StatusRunning || j.LaunchToken != token {
+		return fmt.Errorf("job is %s under another launch or no longer running", j.Status)
+	}
+	return nil
+}
+
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,
 // cwd=<jobdir>/work; then extracts the final result text into report.md and writes exit_code.
 // exit_code is written last, so its presence means the job's files are complete.
 // It holds an exclusive lock on <jobdir>/wrapper.lock for its whole life: a second wrapper
-// for the same job refuses to run, so a job is never executed twice.
+// for the same job refuses to run, so a job is never executed twice. Before registering it checks
+// (under admit.lock) that the row is still running under its token; a late wrapper whose job was
+// cancelled or failed meanwhile exits 4 without running claude and without writing exit_code.
 func RunWrapper(jobDir, token string, argv []string) int {
 	if len(argv) == 0 || token == "" {
 		fmt.Fprintln(os.Stderr, "run-wrapper: missing launch token or claude command")
@@ -111,12 +174,24 @@ func RunWrapper(jobDir, token string, argv []string) int {
 		fmt.Fprintln(os.Stderr, "run-wrapper: job already ran (exit_code exists)")
 		return 3
 	}
+	unlockAdmit, err := admitLock(jobDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "run-wrapper:", err)
+		return 2
+	}
+	if err := admitted(jobDir, token); err != nil {
+		unlockAdmit()
+		fmt.Fprintln(os.Stderr, "run-wrapper: refused:", err)
+		return 4
+	}
 	pgid, err := syscall.Getpgid(0)
 	if err != nil {
 		pgid = os.Getpid()
 	}
 	info, _ := json.Marshal(WrapperInfo{PID: os.Getpid(), PGID: pgid, Token: token})
-	if err := writeAtomic(filepath.Join(jobDir, "wrapper.json"), info); err != nil {
+	err = writeAtomic(filepath.Join(jobDir, "wrapper.json"), info)
+	unlockAdmit()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "run-wrapper: register:", err)
 		return 2
 	}

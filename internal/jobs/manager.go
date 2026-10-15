@@ -371,6 +371,13 @@ var parseStream = ParseStream
 // adopt fills in the pid of a claimed job from wrapper.json. It returns false when the job
 // must be skipped this tick (wrapper not registered yet) or was failed (never registered).
 func (m *Manager) adopt(j *store.Job, now time.Time) bool {
+	// Same lock as the wrapper's admission: it either registered already or will see the failed row.
+	unlock, err := lockAdmitIfExists(m.JobDir(j.ID))
+	if err != nil {
+		m.Log.Printf("job %s: %v", j.ID, err)
+		return false
+	}
+	defer unlock()
 	w, err := ReadWrapperInfo(m.JobDir(j.ID))
 	if err == nil && w.Token == j.LaunchToken {
 		if err := m.Store.SetPID(j.ID, j.LaunchToken, w.PID, w.PGID); err != nil {
@@ -466,6 +473,13 @@ func (m *Manager) Cancel(id string) error {
 	if err != nil {
 		return err
 	}
+	// Same lock as the wrapper's admission: a wrapper registered before this point is killed below,
+	// one that comes later sees the cancelled row and does not start claude.
+	unlockAdmit, err := lockAdmitIfExists(m.JobDir(id))
+	if err != nil {
+		return err
+	}
+	defer unlockAdmit()
 	switch j.Status {
 	case store.StatusQueued:
 	case store.StatusRunning:

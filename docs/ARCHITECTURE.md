@@ -10,7 +10,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 |---|---|---|
 | store | `internal/store` | SQLite table `jobs` (modernc.org/sqlite, WAL, busy_timeout). Only `queued`/`running` rows can change status. A tick claims a job (`queued → running` + random `launch_token`) before anything is spawned, and its terminal update is `WHERE status='running' AND launch_token=?` – a tick can never finish another tick's job. Only an explicit cancel finishes by id alone. |
 | manager | `internal/jobs` | enqueue (validation, defaults, ceilings), launch, collect, timeout, cancel, notify, cleanup. |
-| wrapper | `agent-jobs run-wrapper` | holds `wrapper.lock` (a second wrapper for the job refuses), registers itself in `wrapper.json` (pid, pgid, launch token), then runs claude with prompt.md on stdin, writes stream.jsonl / stderr.log, extracts report.md, writes exit_code last. |
+| wrapper | `agent-jobs run-wrapper` | holds `wrapper.lock` (a second wrapper for the job refuses); under `admit.lock` checks that the job row is still `running` with its launch token (otherwise exits 4: no claude, no exit_code) and registers itself in `wrapper.json` (pid, pgid, launch token); then runs claude with prompt.md on stdin, writes stream.jsonl / stderr.log, extracts report.md, writes exit_code last. |
 | guard | `internal/guard`, `agent-jobs guard` | PreToolUse hook (exit 2 = block, reason on stderr). |
 | daemon | `agent-jobs daemon` / `tick` | one tick per minute; launchd template in `launchd/`. |
 | templates | `prompts/*.md`, `rules/owner.md` | embedded in the binary (`assets.go`). |
@@ -34,6 +34,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 | stream.jsonl | claude stream-json events |
 | stderr.log | claude stderr (+ wrapper errors) – first place to look when a job fails without a report |
 | wrapper.json | the wrapper's pid/pgid/launch token, written before claude starts (adoption after a daemon crash) |
+| admit.lock | admission handshake: wrapper (check row + register), `cancel` and the launch-grace failure take it, so a late wrapper never runs claude for a terminal row |
 | worktree.json | path, admin gitdir and base of the worktree this job created (ownership check before cleanup) |
 | exit_code | written by the wrapper when claude exits (written last) |
 | report.md | the job's final message (`result` of the last stream `result` event) |
@@ -46,7 +47,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 **Start.** `agent-jobs start` validates kind, limits (defaults 80 turns / $10 / 45 min; above 200 / $50 / 180 → error, never clamped), resolves repo + base to a commit SHA, picks the model (explicit `--model`, else kind × complexity table), inserts a `queued` row and prints the id. Nothing runs yet.
 
 **Tick** (every minute, also `agent-jobs tick`) runs under an exclusive `flock` on `<state>/tick.lock` (also taken by `cancel`), so two daemons or a manual tick never interleave. In this order:
-1. *Collect* each `running` job. A claimed job without a recorded pid (daemon died between spawn and pid write) is adopted from `wrapper.json` if its token matches; with no `wrapper.json` after 1 minute it is `failed` ("the wrapper never registered", work dir kept). Then: `exit_code` present → stream.jsonl is read *after* it (so the result is complete) → verdict; else past `started_at + timeout` → SIGTERM to the process group, 10 s, SIGKILL → `timeout`; else wrapper PID dead → re-check exit_code, then `failed` ("wrapper died without writing exit_code").
+1. *Collect* each `running` job. A claimed job without a recorded pid (daemon died between spawn and pid write) is adopted from `wrapper.json` if its token matches; with no `wrapper.json` after 1 minute it is `failed` under `admit.lock` ("the wrapper never registered", work dir kept). Then: `exit_code` present → stream.jsonl is read *after* it (so the result is complete) → verdict; else past `started_at + timeout` → SIGTERM to the process group, 10 s, SIGKILL → `timeout`; else wrapper PID dead → re-check exit_code, then `failed` ("wrapper died without writing exit_code").
 2. *Launch* queued jobs while fewer than 2 are running. Launch = claim (`running` + token) → prepare job dir (owner rules must be readable and ≤ 8 KB, else the job is `failed` with "refused to start: …") → start `agent-jobs run-wrapper <jobdir> --token T -- claude <args>` with `Setsid` (own session → own process group, not a child of the daemon's group) → store PID = PGID.
 3. *Notify* finished, not yet notified jobs: `tmux send-keys -t <target> -l "<line>"`, then `tmux send-keys -t <target> Enter`. The line is printable-only (whitespace → space, control/format characters such as Ctrl-U, ESC, bidi overrides dropped; title capped at 120 runes), so a title cannot type keystrokes into the session. A job is marked notified only after tmux accepted the line: with no target configured or a failing tmux (missing session) it stays pending, is logged and retried next tick, and cleanup waits.
 4. *Cleanup* jobs notified ≥ 30 min ago (see below).
@@ -55,7 +56,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 
 **Daemon restart.** The wrapper lives in its own session and writes `exit_code` itself; the daemon keeps no in-memory state. Killing the daemon (even SIGKILL) leaves the job running; the next daemon/tick finds `exit_code` and collects it (tested with the real binary).
 
-**Cancel.** `queued` → `cancelled`; `running` → TERM group / 10 s / KILL → `cancelled`. Terminal jobs cannot be cancelled.
+**Cancel** (under the lifecycle lock and the job's `admit.lock`). `queued` → `cancelled`; `running` → TERM group / 10 s / KILL → `cancelled`. Terminal jobs cannot be cancelled.
 
 **Cleanup** (repo jobs only; empty work dirs are left for the future `prune`). First the ownership check: `worktree.json` path matches, the path is registered in `git worktree list --porcelain` of the source repo, its admin gitdir equals the one recorded at creation and carries this job's owner mark (`agent-jobs-owner`) – otherwise nothing is touched. Then, without modifying the index or files: `diffstat.txt` = `git diff --stat <base>` + untracked list, `commits.patch` = `git format-patch <base>..HEAD --stdout`, `staged.patch` = `git diff --cached --binary HEAD`, `uncommitted.patch` = `git diff --binary HEAD`, `untracked.tar` = untracked, not ignored files (`git ls-files --others --exclude-standard`). Restore: in a fresh worktree checked out at `<base>`, with `J=<jobdir>` (empty patches are skipped – git rejects an empty patch; tested for only commits / only staged / only unstaged / only untracked / all / nothing):
 

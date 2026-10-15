@@ -104,7 +104,9 @@ func newManager(t *testing.T) *Manager {
 		// Never leave fake jobs behind.
 		if running, err := m.Store.ListByStatus(store.StatusRunning); err == nil {
 			for _, j := range running {
-				_ = syscall.Kill(-j.PGID, syscall.SIGKILL)
+				if j.PGID > 0 { // -0 would be the test's own process group
+					_ = syscall.Kill(-j.PGID, syscall.SIGKILL)
+				}
 			}
 		}
 		_ = m.Close()
@@ -973,6 +975,53 @@ func TestRestoreFromDocsAllCombinations(t *testing.T) {
 			}
 			if got := snapshot(t, other, j.BaseCommit); got != want {
 				t.Fatalf("restored state differs\nwant:\n%s\ngot:\n%s", want, got)
+			}
+		})
+	}
+}
+
+// B4 rest: a wrapper that starts late (daemon crashed between spawn and pid) must not run claude
+// once the row is terminal or owned by another launch.
+func TestLateWrapperRefusesTerminalRow(t *testing.T) {
+	cases := []struct {
+		name  string
+		token string
+		kill  func(t *testing.T, m *Manager, id string)
+	}{
+		{"cancelled", "tok", func(t *testing.T, m *Manager, id string) {
+			if err := m.Cancel(id); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"failed after launch grace", "tok", func(t *testing.T, m *Manager, id string) {
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(2 * LaunchGrace) }
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"foreign token", "other", func(*testing.T, *Manager, string) {}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newManager(t)
+			j := enqueue(t, m, "x", nil)
+			if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			dir := m.JobDir(j.ID)
+			if err := m.prepare(j, dir); err != nil {
+				t.Fatal(err)
+			}
+			c.kill(t, m, j.ID)
+			out, err := exec.Command(selfBin, "run-wrapper", dir, "--token", c.token, "--", filepath.Join(fakeHelpr, "claude")).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "refused") {
+				t.Fatalf("late wrapper ran: err=%v out=%s", err, out)
+			}
+			for _, f := range []string{"launches.txt", "exit_code", "wrapper.json"} {
+				if _, err := os.Stat(filepath.Join(dir, f)); err == nil {
+					t.Fatalf("late wrapper wrote %s", f)
+				}
 			}
 		})
 	}
