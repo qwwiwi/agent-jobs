@@ -203,3 +203,92 @@ func TestDecideUsesCwd(t *testing.T) {
 		t.Fatalf("want block via cwd-relative -F, got %q %v", r, err)
 	}
 }
+
+// Fix-loop 2: fail closed on any form the guard cannot resolve statically (N1–N3, B7, B2/B8 rest).
+func TestCheckFixLoop2(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// N1: stdin / here-string / heredoc feeding git, identity inside substitutions.
+		{"here-string message", "git commit -F - <<< 'Dashi'", true},
+		{"here-string clean message", "git commit -F - <<< 'Исправил'", true},
+		{"heredoc clean message", "git commit -F - <<'EOF'\nИсправил\nEOF", true},
+		{"stdin file into git", "git commit -F - < msg.txt", true},
+		{"pipe into commit -F -", "echo x | git commit -F -", true},
+		{"commit -F /dev/stdin", "git commit -F /dev/stdin", true},
+		{"identity in heredoc substitution", "cat <<EOF\n$(git -c user.name=Foreign commit -m x)\nEOF", true},
+		{"quoted heredoc body is data", "cat <<'EOF'\n$(git push)\nEOF", false},
+		{"git in substitution", `echo "$(git rev-parse HEAD)"`, true},
+		{"gh in backticks", "echo `gh pr create`", true},
+		{"git in process substitution", "diff <(git show HEAD:a) a", true},
+		{"eval with git", `eval "git status"`, true},
+		{"eval dynamic", `eval "$X"`, true},
+		{"eval plain", `eval echo hi`, false},
+		{"bash -c git", `bash -c "git status"`, true},
+		{"bash -c plain", `bash -c "go test ./..."`, false},
+		{"bash -c dynamic", `bash -c "$CMD"`, true},
+		{"bash heredoc", "bash <<EOF\ngit push\nEOF", true},
+		{"pipe into sh", "echo 'git push' | sh", true},
+		{"bash script file", "bash scripts/check.sh", false},
+		{"env -S", "env -S 'git push'", true},
+		{"env --split-string", "env --split-string='git push'", true},
+		{"xargs git", "echo push | xargs git", true},
+		{"find -exec git", `find . -name x -exec git add {} \;`, true},
+		{"alias git", `alias p='git push'; p`, true},
+		{"attached -c identity", "git -cuser.name=Foreign commit -m x", true},
+		{"attached -C", "git -C. status", true},
+		{"config-env", "git --config-env=user.name=N commit -m x", true},
+		{"dynamic command name", `G=git; $G push`, true},
+		{"dynamic quoted command name", `"$G" status`, true},
+		{"dynamic git subcommand", `S=push; git $S`, true},
+		{"dynamic gh subcommand", `gh pr "$X"`, true},
+		{"upper-case git", "GIT push", true},
+		{"dynamic commit message", `git commit -m "$MSG"`, true},
+		{"owner via variable", `M=Dashi; git commit -m "$M"`, true},
+		{"ansi-c quoted message", `git commit -m $'Da\x73hi'`, true},
+		{"static heredoc message", "git commit -m \"$(cat <<'EOF'\nИсправил лимиты\nEOF\n)\"", false},
+		{"static heredoc message with owner", "git commit -m \"$(cat <<'EOF'\nfix for Dashi\nEOF\n)\"", true},
+		{"dynamic -C dir ok", `git -C "$dir" status`, false},
+		{"echo git ok", "echo git push", false},
+		{"grep git ok", `grep -rn git .`, false},
+		{"which git ok", "which git", false},
+		{"trap string", `trap 'git push' EXIT`, true},
+		{"python -c", `python3 -c "import os; os.system('git push')"`, true},
+		{"watch string", `watch -n1 "gh pr create"`, true},
+		{"github url ok", `curl -s https://github.com/qwwiwi/x`, false},
+		{"dot git path ok", `rm -f .git/index.lock`, false},
+
+		// N2: wait-loop nested in control structure.
+		{"loop after then", "if true; then while pgrep -f server; do sleep 1; done; fi", true},
+		{"loop in braces", "{ while pgrep -f server; do sleep 1; done; }", true},
+		{"loop in subshell", "(until ! pgrep -f server; do sleep 1; done)", true},
+		{"loop after do", "for i in 1 2; do while pgrep -f server; do sleep 1; done; done", true},
+
+		// N3: an escaped `$?` is a literal, not a status read.
+		{"escaped status in dquotes", `false | true; echo "\$?"`, false},
+		{"escaped status bare", `false | true; echo \$?`, false},
+		{"single-quoted status", `false | true; echo '$?'`, false},
+		{"double backslash is real read", `false | true; echo \\$?`, true},
+
+		// B7: pipefail counts only as a top-level unconditional simple command.
+		{"pipefail inside if", "if x; then set -o pipefail; fi; a | b; echo $?", true},
+		{"pipefail in subshell", "(set -o pipefail); a | b; echo $?", true},
+		{"pipefail conditional", "false && set -o pipefail; a | b; echo $?", true},
+		{"pipefail after or", "x || set -o pipefail; a | b; echo $?", true},
+		{"pipefail backgrounded", "set -o pipefail & a | b; echo $?", true},
+		{"pipefail -eo", "set -eo pipefail; a | b; echo $?", false},
+		{"pipefail newline", "set -o pipefail\na | b\necho $?", false},
+		{"pipefail disabled in function", "set -o pipefail; f() { set +o pipefail; }; a | b; echo $?", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

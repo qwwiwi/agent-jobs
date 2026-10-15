@@ -6,8 +6,11 @@
 //   - a foreign git identity (author/committer other than the configured one);
 //   - anything that goes outside: git push/tag, gh release/api, PR/issue create/comment/edit/merge/review.
 //
-// Commands are parsed (quotes, separators, env prefixes, wrappers, substitutions, `sh -c`, `eval`),
-// not matched as raw text, so spelling variants such as `git -C x 'push'` are still seen.
+// Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
+// spelling variants such as `git -C x 'push'` are still seen. The guard FAILS CLOSED: a form it
+// cannot resolve statically (git/gh inside a substitution, eval or `sh -c`; stdin, here-doc or
+// here-string into git/gh; a command name or git subcommand from a variable; `env -S`; `xargs git`;
+// attached `-cKEY=V` / `-C.`; a shell reading commands from stdin) is rejected, not guessed at.
 package guard
 
 import (
@@ -17,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -56,7 +60,7 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkNothingOut, checkStatusAfterPipe, checkSelfMatchingWait, checkOwnerInCommit, checkForeignIdentity,
+		checkUnverifiable, checkNothingOut, checkStatusAfterPipe, checkSelfMatchingWait, checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
 			return r
@@ -81,10 +85,16 @@ func eachCmd(scripts []*script, f func(c *simpleCmd, argv []string) string) stri
 
 // gitCall is a parsed `git [global options] <sub> <args>`.
 type gitCall struct {
-	configs []string // -c key=value
-	sub     string
-	args    []string
+	configs  []string // -c key=value
+	cfgIdx   []int    // argv indices of the -c values
+	sub      string
+	subIdx   int // argv index of sub (len(argv) when there is none)
+	args     []string
+	attached string // first global option the guard cannot resolve (`-cK=V`, `-C.`, --config-env, --exec-path)
 }
+
+// isProg reports whether argv0 runs the program name (case-insensitive: macOS file systems are).
+func isProg(argv0, name string) bool { return strings.EqualFold(base(argv0), name) }
 
 // gitValueOpts are git global options that take a separate value.
 var gitValueOpts = map[string]bool{
@@ -94,7 +104,7 @@ var gitValueOpts = map[string]bool{
 
 func parseGit(argv []string) (gitCall, bool) {
 	var g gitCall
-	if len(argv) == 0 || base(argv[0]) != "git" {
+	if len(argv) == 0 || !isProg(argv[0], "git") {
 		return g, false
 	}
 	i := 1
@@ -103,27 +113,34 @@ func parseGit(argv []string) (gitCall, bool) {
 		if !strings.HasPrefix(a, "-") {
 			break
 		}
+		if ((strings.HasPrefix(a, "-c") || strings.HasPrefix(a, "-C")) && len(a) > 2) ||
+			strings.HasPrefix(a, "--config-env") || strings.HasPrefix(a, "--exec-path") {
+			if g.attached == "" {
+				g.attached = a
+			}
+			i++
+			continue
+		}
 		if gitValueOpts[a] && i+1 < len(argv) {
 			if a == "-c" {
 				g.configs = append(g.configs, argv[i+1])
+				g.cfgIdx = append(g.cfgIdx, i+1)
 			}
 			i += 2
 			continue
 		}
 		i++
 	}
+	g.subIdx = i
 	if i < len(argv) {
 		g.sub, g.args = argv[i], argv[i+1:]
 	}
 	return g, true
 }
 
-// parseGh returns the first two positional words of a `gh` call (group, subcommand).
-func parseGh(argv []string) (string, string, bool) {
-	if len(argv) == 0 || base(argv[0]) != "gh" {
-		return "", "", false
-	}
-	var pos []string
+// ghPositional returns the argv indices of the first two positional words of a `gh` call.
+func ghPositional(argv []string) []int {
+	var pos []int
 	for i := 1; i < len(argv) && len(pos) < 2; i++ {
 		a := argv[i]
 		switch {
@@ -131,13 +148,148 @@ func parseGh(argv []string) (string, string, bool) {
 			i++
 		case strings.HasPrefix(a, "-"):
 		default:
-			pos = append(pos, a)
+			pos = append(pos, i)
 		}
 	}
-	for len(pos) < 2 {
-		pos = append(pos, "")
+	return pos
+}
+
+// parseGh returns the first two positional words of a `gh` call (group, subcommand).
+func parseGh(argv []string) (string, string, bool) {
+	if len(argv) == 0 || !isProg(argv[0], "gh") {
+		return "", "", false
+	}
+	pos := []string{"", ""}
+	for k, i := range ghPositional(argv) {
+		pos[k] = argv[i]
 	}
 	return pos[0], pos[1], true
+}
+
+func cannot(form string) string {
+	return "blocked by guard: guard cannot verify this form (" + form + "); write it as a plain command " +
+		"(no substitution, eval, sh -c, stdin/here-doc, variable or attached option around git/gh)."
+}
+
+// indirect are programs that, as an argument of another program (find -exec, flock, watch, …),
+// would run something the guard does not see as a command.
+var indirect = map[string]bool{
+	"git": true, "gh": true, "eval": true, "env": true, "xargs": true, "exec": true, "command": true,
+	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
+}
+
+// safeReaders only print or match their arguments; a word "git" there is data.
+var safeReaders = map[string]bool{
+	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "which": true,
+	"type": true, "whereis": true, "man": true, "cat": true, "ls": true, "cd": true, "test": true, "[": true,
+	"head": true, "tail": true, "wc": true, "file": true, "stat": true, "pgrep": true, "ps": true,
+}
+
+var reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh)($|[^a-z0-9_-])`)
+
+// checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
+func checkUnverifiable(scripts []*script, _ string, _ Config) string {
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				if r := unverifiable(sc, c); r != "" {
+					return r
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func unverifiable(sc *script, c *simpleCmd) string {
+	v := split(c.words)
+	if v.splitString {
+		return cannot("env -S")
+	}
+	if v.start >= len(c.words) {
+		return ""
+	}
+	argv, dyn := c.words[v.start:], c.dyn[v.start:]
+	name := strings.ToLower(base(argv[0]))
+	if dyn[0] {
+		return cannot("command name from a variable or substitution")
+	}
+	if name == "git" || name == "gh" {
+		switch {
+		case sc.depth > 0:
+			return cannot(name + " inside a substitution, eval or sh -c")
+		case c.stdin:
+			return cannot("stdin redirect, here-doc or here-string into " + name)
+		case slices.Contains(v.wrappers, "xargs"):
+			return cannot("xargs " + name)
+		}
+		if name == "git" {
+			g, _ := parseGit(argv)
+			if g.attached != "" {
+				return cannot("attached git option " + g.attached)
+			}
+			if g.subIdx < len(argv) && dyn[g.subIdx] {
+				return cannot("git subcommand from a variable")
+			}
+			for _, k := range g.cfgIdx {
+				if dyn[k] {
+					return cannot("git -c value from a variable")
+				}
+			}
+			return ""
+		}
+		for _, k := range ghPositional(argv) {
+			if dyn[k] {
+				return cannot("gh subcommand from a variable")
+			}
+		}
+		return ""
+	}
+	switch {
+	case name == "eval":
+		// The text is parsed as a nested script (git there is rejected); a variable is not visible.
+		if slices.Contains(dyn[1:], true) {
+			return cannot("eval of a variable or substitution")
+		}
+	case shells[name]:
+		cflag, file, stdin := false, false, false
+		for k := 1; k < len(argv); k++ {
+			a := argv[k]
+			if strings.HasPrefix(a, "--") {
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				cflag = cflag || strings.ContainsRune(a, 'c')
+				stdin = stdin || strings.ContainsRune(a, 's')
+				continue
+			}
+			file = true
+			break
+		}
+		switch {
+		case cflag:
+			if slices.Contains(dyn[1:], true) {
+				return cannot(name + " -c of a variable or substitution")
+			}
+		case !file || stdin:
+			return cannot(name + " reading commands from stdin")
+		}
+	case name == "alias":
+		for k, a := range argv[1:] {
+			if dyn[k+1] || reMention.MatchString(a) {
+				return cannot("alias")
+			}
+		}
+	case !safeReaders[name]:
+		// find -exec git, flock … git, trap 'git push' EXIT, python -c "…git…": the guard cannot see
+		// what such a program runs, so any git/gh (or shell/eval) among its arguments is rejected.
+		for _, a := range argv[1:] {
+			if b := strings.ToLower(base(a)); indirect[b] || shells[b] || reMention.MatchString(a) {
+				return cannot(name + " running git/gh or a shell indirectly")
+			}
+		}
+	}
+	return ""
 }
 
 var ghOut = map[string]map[string]bool{
@@ -178,34 +330,74 @@ func checkNothingOut(scripts []*script, _ string, _ Config) string {
 	})
 }
 
-func statusRead(raw string) bool { return strings.Contains(raw, "$?") || strings.Contains(raw, "${?}") }
-
-// applySet updates the pipefail state from a `set` command.
-func applySet(argv []string, pipefail bool) bool {
-	if len(argv) == 0 || argv[0] != "set" {
-		return pipefail
+// statusRead reports an unescaped `$?` / `${?}` (single-quoted text is already removed from raw).
+func statusRead(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' {
+			i++ // the next character is literal
+			continue
+		}
+		if raw[i] == '$' && (strings.HasPrefix(raw[i+1:], "?") || strings.HasPrefix(raw[i+1:], "{?}")) {
+			return true
+		}
 	}
+	return false
+}
+
+// pipefailSet returns +1 / -1 when argv turns pipefail on / off, 0 otherwise.
+func pipefailSet(argv []string) int {
+	if len(argv) == 0 || argv[0] != "set" {
+		return 0
+	}
+	r := 0
 	for i := 1; i < len(argv)-1; i++ {
 		a := argv[i]
 		if len(a) > 1 && (a[0] == '-' || a[0] == '+') && !strings.HasPrefix(a, "--") &&
 			strings.HasSuffix(a, "o") && argv[i+1] == "pipefail" {
-			pipefail = a[0] == '-'
+			r = 1
+			if a[0] == '+' {
+				r = -1
+			}
 		}
 	}
-	return pipefail
+	return r
 }
 
+var (
+	ctlOpen  = map[string]bool{"if": true, "while": true, "until": true, "for": true, "case": true, "select": true, "{": true}
+	ctlClose = map[string]bool{"fi": true, "done": true, "esac": true, "}": true}
+)
+
+// checkStatusAfterPipe: pipefail counts as on only after a top-level, unconditional, foreground
+// `set -o pipefail` (a simple command, not inside if/loop/braces/subshell, not after && / ||);
+// any `set +o pipefail` anywhere later turns it off.
 func checkStatusAfterPipe(scripts []*script, _ string, _ Config) string {
 	for _, sc := range scripts {
-		pipefail, afterPipe := false, false
+		pipefail, afterPipe, ctl := false, false, 0
 		for _, pl := range sc.pipelines {
 			if afterPipe && !pipefail && statusRead(pl.raw()) {
 				return "blocked by guard: `$?` right after a pipe is the status of the LAST stage only, " +
-					"so a failure of an earlier stage looks like success. Use `set -o pipefail`, `${PIPESTATUS[@]}`, " +
-					"or check the command without a pipe."
+					"so a failure of an earlier stage looks like success. Use `set -o pipefail` (top level, before the pipe), " +
+					"`${PIPESTATUS[@]}`, or check the command without a pipe."
 			}
 			for _, c := range pl.cmds {
-				pipefail = applySet(argvOf(c.words), pipefail)
+				for _, w := range c.words {
+					if ctlOpen[w] {
+						ctl++
+					} else if ctlClose[w] {
+						ctl--
+					} else if !keywords[w] {
+						break
+					}
+				}
+				switch pipefailSet(argvOf(c.words)) {
+				case -1:
+					pipefail = false
+				case 1:
+					top := len(pl.cmds) == 1 && len(c.words) > 0 && c.words[0] == "set" && ctl == 0 && pl.nest == 0 &&
+						(pl.before == "" || pl.before == ";" || pl.before == "\n") && pl.after != "&"
+					pipefail = pipefail || top
+				}
 			}
 			afterPipe = len(pl.cmds) > 1
 		}
@@ -218,7 +410,7 @@ const pgrepValueFlags = "dgGPstuUFcJ"
 
 // pgrepFull returns the pattern of a `pgrep -f` call and whether it is case-insensitive.
 func pgrepFull(argv []string) (pattern string, icase, ok bool) {
-	if len(argv) == 0 || base(argv[0]) != "pgrep" {
+	if len(argv) == 0 || !isProg(argv[0], "pgrep") {
 		return "", false, false
 	}
 	full := false
@@ -248,8 +440,14 @@ func checkSelfMatchingWait(scripts []*script, whole string, _ Config) string {
 		loop := false
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
-				if len(c.words) > 0 && (c.words[0] == "while" || c.words[0] == "until") {
-					loop = true
+				// Loop keywords anywhere in the leading keywords: `then while …`, `{ until …`, `do while …`.
+				for _, w := range c.words {
+					if w == "while" || w == "until" {
+						loop = true
+					}
+					if !keywords[w] {
+						break
+					}
 				}
 			}
 		}
@@ -280,13 +478,36 @@ func checkSelfMatchingWait(scripts []*script, whole string, _ Config) string {
 	return ""
 }
 
+// staticHeredoc matches `$(cat <<'EOF' … EOF)`: a message whose text is literally in the command.
+var staticHeredoc = regexp.MustCompile(`(?s)^\$\(cat <<-?[ \t]*['"]([A-Za-z_][A-Za-z0-9_]*)['"][ \t]*\n(.*)\n[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\n?[ \t]*\)$`)
+
+// literalText reports whether a commit text word is fully visible to the guard.
+func literalText(w string, dyn bool) bool {
+	if !dyn {
+		return true
+	}
+	m := staticHeredoc.FindStringSubmatch(w)
+	if m == nil || m[1] != m[3] {
+		return false
+	}
+	for _, line := range strings.Split(m[2], "\n") {
+		if strings.TrimSpace(line) == m[1] {
+			return false // the here-doc ends early; the rest would run
+		}
+	}
+	return true
+}
+
 // commitTexts returns everything that ends up in a commit's message, author or trailers.
-// ok=false means a message file could not be read (fail closed).
-func commitTexts(c *simpleCmd, args []string, cfg Config) (texts []string, ok bool) {
-	ok = true
-	readFile := func(f string) {
-		if f == "-" {
-			texts = append(texts, c.heredoc, c.raw)
+// A non-empty problem means the text cannot be known statically (fail closed).
+func commitTexts(args []string, dyn []bool, cfg Config) (texts []string, problem string) {
+	readFile := func(f string, d bool) {
+		switch {
+		case d:
+			problem = "commit message file from a variable"
+			return
+		case f == "-" || f == "/dev/stdin" || strings.HasPrefix(f, "/dev/fd/") || strings.HasPrefix(f, "/proc/"):
+			problem = "commit message from stdin; write it to a file first, then `git commit -F <file>`"
 			return
 		}
 		if !filepath.IsAbs(f) && cfg.Dir != "" {
@@ -294,31 +515,38 @@ func commitTexts(c *simpleCmd, args []string, cfg Config) (texts []string, ok bo
 		}
 		b, err := os.ReadFile(f)
 		if err != nil {
-			ok = false
+			problem = "the commit message file is unreadable; write the file in a separate call first"
 			return
 		}
 		texts = append(texts, string(b))
 	}
+	text := func(w string, d bool) {
+		if !literalText(w, d) {
+			problem = "commit message from a variable or substitution; write it literally or use -F <file>"
+			return
+		}
+		texts = append(texts, w)
+	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		next := func() string {
+		next := func() (string, bool) {
 			if i+1 < len(args) {
 				i++
-				return args[i]
+				return args[i], dyn[i]
 			}
-			return ""
+			return "", false
 		}
 		switch {
 		case a == "--":
-			return texts, ok
+			return texts, problem
 		case a == "--message" || a == "--trailer" || a == "--author":
-			texts = append(texts, next())
+			text(next())
 		case a == "--file":
 			readFile(next())
 		case strings.HasPrefix(a, "--message="), strings.HasPrefix(a, "--trailer="), strings.HasPrefix(a, "--author="):
-			texts = append(texts, a[strings.IndexByte(a, '=')+1:])
+			text(a[strings.IndexByte(a, '=')+1:], dyn[i])
 		case strings.HasPrefix(a, "--file="):
-			readFile(strings.TrimPrefix(a, "--file="))
+			readFile(strings.TrimPrefix(a, "--file="), dyn[i])
 		case strings.HasPrefix(a, "--"):
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			for k := 1; k < len(a); k++ {
@@ -326,21 +554,21 @@ func commitTexts(c *simpleCmd, args []string, cfg Config) (texts []string, ok bo
 				if strings.IndexByte("mFCct", l) < 0 {
 					continue
 				}
-				v := a[k+1:]
+				v, d := a[k+1:], dyn[i]
 				if v == "" {
-					v = next()
+					v, d = next()
 				}
 				switch l {
 				case 'm':
-					texts = append(texts, v)
+					text(v, d)
 				case 'F':
-					readFile(v)
+					readFile(v, d)
 				}
 				break
 			}
 		}
 	}
-	return texts, ok
+	return texts, problem
 }
 
 func checkOwnerInCommit(scripts []*script, _ string, cfg Config) string {
@@ -349,9 +577,10 @@ func checkOwnerInCommit(scripts []*script, _ string, cfg Config) string {
 		if !isGit || g.sub != "commit" {
 			return ""
 		}
-		texts, ok := commitTexts(c, g.args, cfg)
-		if !ok {
-			return "blocked by guard: the commit message file is unreadable. Write the file in a separate call first."
+		dyn := c.dyn[len(c.words)-len(argv):]
+		texts, problem := commitTexts(g.args, dyn[g.subIdx+1:], cfg)
+		if problem != "" {
+			return "blocked by guard: " + problem + "."
 		}
 		low := strings.ToLower(strings.Join(texts, "\n"))
 		for _, name := range cfg.OwnerNames {

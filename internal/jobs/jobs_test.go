@@ -236,7 +236,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		b, _ := json.Marshal(m.Settings(kind)["permissions"])
 		return string(b)
 	}
-	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "WebFetch", "WebSearch"} {
+	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "WebFetch", "WebSearch"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}

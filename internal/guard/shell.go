@@ -14,13 +14,18 @@ import (
 // simpleCmd is one simple command: its words with quotes removed.
 type simpleCmd struct {
 	words   []string
+	dyn     []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents attached to this command
+	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
 type pipeline struct {
-	cmds []*simpleCmd
+	cmds   []*simpleCmd
+	nest   int    // subshell `( … )` depth
+	before string // separator before it: "" (start), ";", "\n", "&&", "||", "&", "(", ")"
+	after  string // separator after it
 }
 
 func (p *pipeline) raw() string {
@@ -34,6 +39,7 @@ func (p *pipeline) raw() string {
 // script is a list of pipelines in execution order (separated by ; && || & newline).
 type script struct {
 	src       string
+	depth     int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
 	pipelines []*pipeline
 }
 
@@ -47,9 +53,10 @@ const (
 )
 
 type pendingHeredoc struct {
-	delim string
-	strip bool
-	cmd   *simpleCmd
+	delim  string
+	strip  bool
+	quoted bool // quoted delimiter: the body is literal; otherwise substitutions in it run
+	cmd    *simpleCmd
 }
 
 type parser struct {
@@ -62,8 +69,12 @@ type parser struct {
 	cmd      *simpleCmd
 	word     strings.Builder
 	started  bool
+	dyn      bool // current word contains an expansion
+	quoted   bool // current word contains quoting
 	redir    redirKind
 	heredocs []pendingHeredoc
+	paren    int    // current `( … )` depth
+	sep      string // separator that ended the previous pipeline
 }
 
 // parseScript reads src into a script plus the sources of its substitutions.
@@ -72,7 +83,7 @@ func parseScript(src string) (*script, []string) {
 	p.pipe = &pipeline{}
 	p.cmd = &simpleCmd{}
 	p.run()
-	p.endPipeline()
+	p.endPipeline("")
 	return p.out, p.subs
 }
 
@@ -82,13 +93,14 @@ func (p *parser) endWord() {
 	}
 	w := p.word.String()
 	p.word.Reset()
-	p.started = false
 	switch p.redir {
 	case redirNone:
 		p.cmd.words = append(p.cmd.words, w)
+		p.cmd.dyn = append(p.cmd.dyn, p.dyn)
 	case redirHeredoc, redirHeredocStrip:
-		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, cmd: p.cmd})
+		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
 	}
+	p.started, p.dyn, p.quoted = false, false, false
 	p.redir = redirNone
 }
 
@@ -100,10 +112,15 @@ func (p *parser) endCmd() {
 	p.cmd = &simpleCmd{}
 }
 
-func (p *parser) endPipeline() {
+func (p *parser) endPipeline(sep string) {
 	p.endCmd()
 	if len(p.pipe.cmds) > 0 {
+		p.pipe.before, p.pipe.after, p.pipe.nest = p.sep, sep, p.paren
 		p.out.pipelines = append(p.out.pipelines, p.pipe)
+		p.sep = sep
+	} else if sep != "\n" || p.sep == "" {
+		// `a &&\n b`: an empty line does not make b unconditional.
+		p.sep = sep
 	}
 	p.pipe = &pipeline{}
 }
@@ -188,8 +205,28 @@ func (p *parser) readHeredocs() {
 			body.WriteByte('\n')
 		}
 		h.cmd.heredoc += body.String()
+		h.cmd.stdin = true
+		if !h.quoted { // `$(…)` and backticks in an unquoted here-doc body are executed
+			p.subs = append(p.subs, bodySubstitutions(body.String())...)
+		}
 	}
 	p.heredocs = nil
+}
+
+// bodySubstitutions returns the command substitutions of an unquoted here-doc body.
+func bodySubstitutions(body string) []string {
+	q := &parser{src: body}
+	for q.i < len(body) {
+		switch {
+		case body[q.i] == '\\':
+			q.i += 2
+		case body[q.i] == '$' && q.peek(1) == '(', body[q.i] == '`':
+			q.substitution()
+		default:
+			q.i++
+		}
+	}
+	return q.subs
 }
 
 func isDigits(s string) bool {
@@ -221,7 +258,7 @@ func (p *parser) run() {
 				p.word.WriteByte(p.src[p.i+1])
 				p.cmd.raw += p.src[p.i : p.i+2]
 			}
-			p.started = true
+			p.started, p.quoted = true, true
 			p.i += 2
 		case c == '\'':
 			end := strings.IndexByte(p.src[p.i+1:], '\'')
@@ -230,20 +267,15 @@ func (p *parser) run() {
 			}
 			p.word.WriteString(p.src[p.i+1 : p.i+1+end])
 			p.cmd.raw += "''"
-			p.started = true
+			p.started, p.quoted = true, true
 			p.i += end + 2
 		case c == '"':
 			p.double()
-		case c == '$' && p.peek(1) == '(':
+		case c == '$' && p.peek(1) == '(', c == '`':
 			lit := p.substitution()
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
-			p.started = true
-		case c == '`':
-			lit := p.substitution()
-			p.word.WriteString(lit)
-			p.cmd.raw += lit
-			p.started = true
+			p.started, p.dyn = true, true
 		case c == '#' && !p.started:
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			if nl < 0 {
@@ -252,14 +284,14 @@ func (p *parser) run() {
 				p.i += nl
 			}
 		case c == '\n':
-			p.endPipeline()
+			p.endPipeline("\n")
 			p.i++
 			p.readHeredocs()
 		case c == ';':
-			p.endPipeline()
+			p.endPipeline(";")
 			p.i++
 		case c == '&' && p.peek(1) == '&':
-			p.endPipeline()
+			p.endPipeline("&&")
 			p.i += 2
 		case c == '&' && p.peek(1) == '>':
 			p.endWord()
@@ -269,10 +301,10 @@ func (p *parser) run() {
 			}
 			p.redir = redirFile
 		case c == '&':
-			p.endPipeline()
+			p.endPipeline("&")
 			p.i++
 		case c == '|' && p.peek(1) == '|':
-			p.endPipeline()
+			p.endPipeline("||")
 			p.i += 2
 		case c == '|':
 			p.endCmd()
@@ -280,12 +312,20 @@ func (p *parser) run() {
 			if p.peek(0) == '&' {
 				p.i++
 			}
-		case c == '(' || c == ')':
-			p.endPipeline()
+		case c == '(':
+			p.endPipeline("(")
+			p.paren++
+			p.i++
+		case c == ')':
+			p.endPipeline(")")
+			p.paren--
 			p.i++
 		case c == '<' || c == '>':
 			p.redirect()
 		default:
+			if c == '$' {
+				p.dyn = true
+			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
 			p.started = true
@@ -298,7 +338,7 @@ func (p *parser) redirect() {
 	if p.peek(1) == '(' { // process substitution <(...) / >(...)
 		lit := p.substitution()
 		p.word.WriteString(lit)
-		p.started = true
+		p.started, p.dyn = true, true
 		return
 	}
 	if p.started && isDigits(p.word.String()) { // fd number: 2>&1
@@ -308,6 +348,9 @@ func (p *parser) redirect() {
 	p.endWord()
 	op := p.src[p.i]
 	p.i++
+	if op == '<' {
+		p.cmd.stdin = true
+	}
 	kind := redirFile
 	if op == '<' && p.peek(0) == '<' {
 		p.i++
@@ -328,7 +371,7 @@ func (p *parser) redirect() {
 
 func (p *parser) double() {
 	p.i++ // opening quote
-	p.started = true
+	p.started, p.quoted = true, true
 	for p.i < len(p.src) {
 		c := p.src[p.i]
 		switch {
@@ -345,7 +388,11 @@ func (p *parser) double() {
 			lit := p.substitution()
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
+			p.dyn = true
 		default:
+			if c == '$' {
+				p.dyn = true
+			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
 			p.i++
@@ -366,6 +413,7 @@ func parseAll(src string) []*script {
 			return
 		}
 		sc, subs := parseScript(s)
+		sc.depth = depth
 		out = append(out, sc)
 		for _, sub := range subs {
 			walk(sub, depth+1)
@@ -410,8 +458,16 @@ var wrapperValueFlags = map[string]string{
 	"timeout": "sk", "xargs": "IinPLdEsa", "sudo": "ugCDhpRrTU", "doas": "uC", "stdbuf": "ioe",
 }
 
-// argvOf strips keywords, assignments and wrapper programs: what remains is the real program and its args.
-func argvOf(words []string) []string {
+// cmdView is a simple command with keywords, assignments and wrapper programs stripped.
+type cmdView struct {
+	start       int      // index of the real program in words
+	wrappers    []string // wrapper programs stripped (env, xargs, sudo, …)
+	splitString bool     // `env -S` / `--split-string`: the program comes from a string the guard cannot see
+}
+
+// split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
+func split(words []string) cmdView {
+	var v cmdView
 	i := 0
 	for i < len(words) && (keywords[words[i]] || reAssign.MatchString(words[i])) {
 		i++
@@ -422,6 +478,7 @@ func argvOf(words []string) []string {
 			break
 		}
 		name := base(words[i])
+		v.wrappers = append(v.wrappers, name)
 		i++
 		for i < len(words) {
 			w := words[i]
@@ -434,6 +491,10 @@ func argvOf(words []string) []string {
 				continue
 			}
 			if strings.HasPrefix(w, "-") && len(w) > 1 {
+				if name == "env" && (strings.HasPrefix(w, "--split-string") ||
+					(!strings.HasPrefix(w, "--") && strings.ContainsRune(w, 'S'))) {
+					v.splitString = true
+				}
 				i++
 				if !strings.HasPrefix(w, "--") && strings.ContainsRune(vf, rune(w[len(w)-1])) {
 					i++ // value of the last flag in the cluster
@@ -446,5 +507,9 @@ func argvOf(words []string) []string {
 			i++ // duration
 		}
 	}
-	return words[i:]
+	v.start = min(i, len(words))
+	return v
 }
+
+// argvOf returns the real program and its args.
+func argvOf(words []string) []string { return words[split(words).start:] }

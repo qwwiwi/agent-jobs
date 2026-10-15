@@ -27,8 +27,14 @@ var denyRules = []string{
 	"Bash(gh issue new:*)",
 	"Bash(gh issue comment:*)",
 	"Bash(gh issue edit:*)",
+	// Attached / string forms the guard rejects as unverifiable (`git -cuser.name=x`, `env -S '…'`).
+	"Bash(git -c*)",
+	"Bash(git --config-env*)",
+	"Bash(git --exec-path*)",
+	"Bash(env -S*)",
+	"Bash(env --split-string*)",
 	// Prefix rules miss spellings like `git -C x push` or `gh pr -R o/r create`;
-	// the guard hook parses every Bash command and blocks those too.
+	// the guard hook parses every Bash command and blocks those too (fail closed).
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",
