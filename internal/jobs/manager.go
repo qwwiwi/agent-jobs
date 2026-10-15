@@ -268,6 +268,8 @@ func (m *Manager) launchQueued() error {
 			m.Log.Printf("job %s refused to start: %v", j.ID, err)
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
+			} else {
+				running-- // the failed launch no longer occupies a slot
 			}
 		}
 	}

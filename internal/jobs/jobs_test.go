@@ -870,3 +870,28 @@ func TestModelTable(t *testing.T) {
 		}
 	}
 }
+
+// N4: a launch that fails frees its slot in the same tick.
+func TestFailedLaunchFreesSlot(t *testing.T) {
+	m := newManager(t)
+	var bad []string
+	for i := 0; i < 2; i++ {
+		repo := newRepo(t)
+		bad = append(bad, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+		if err := os.RemoveAll(repo); err != nil { // worktree creation will fail
+			t.Fatal(err)
+		}
+	}
+	good := enqueue(t, m, "FAKE_SLEEP=2", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range bad {
+		if g := get(t, m, id); g.Status != store.StatusFailed {
+			t.Fatalf("bad job %s: %s", id, g.Status)
+		}
+	}
+	if g := get(t, m, good.ID); g.Status != store.StatusRunning {
+		t.Fatalf("healthy job waits for the next tick: %s", g.Status)
+	}
+}
