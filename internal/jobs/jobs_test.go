@@ -48,6 +48,14 @@ if [[ $prompt == *FAKE_STAGED* ]]; then
   mkdir -p d
   echo u > d/new-untracked.txt
 fi
+if [[ $prompt == *FAKE_ONLY_COMMIT* ]]; then
+  echo c > only-commit.txt
+  git add only-commit.txt
+  git -c user.name=T -c user.email=t@example.com commit -qm "only commit"
+fi
+if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
+if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
+if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
@@ -893,5 +901,79 @@ func TestFailedLaunchFreesSlot(t *testing.T) {
 	}
 	if g := get(t, m, good.ID); g.Status != store.StatusRunning {
 		t.Fatalf("healthy job waits for the next tick: %s", g.Status)
+	}
+}
+
+// snapshot is what a job left in its worktree, independent of commit hashes.
+func snapshot(t *testing.T, dir, base string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("log:\n" + gitT(t, dir, "log", "--format=%s", base+"..HEAD"))
+	b.WriteString("\nstaged:\n" + gitT(t, dir, "diff", "--cached", "HEAD"))
+	b.WriteString("\nunstaged:\n" + gitT(t, dir, "diff"))
+	untracked := gitT(t, dir, "ls-files", "--others", "--exclude-standard")
+	b.WriteString("\nuntracked:\n" + untracked)
+	for _, f := range strings.Fields(untracked) {
+		c, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.WriteString("\n" + f + "=" + string(c))
+	}
+	return b.String()
+}
+
+// restoreScript is the restore block from docs/ARCHITECTURE.md (the one users copy).
+func restoreScript(t *testing.T) string {
+	t.Helper()
+	doc, err := os.ReadFile("../../docs/ARCHITECTURE.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, after, ok := strings.Cut(string(doc), "<!-- restore -->\n```sh\n")
+	if !ok {
+		t.Fatal("docs/ARCHITECTURE.md has no restore block")
+	}
+	block, _, ok := strings.Cut(after, "```")
+	if !ok {
+		t.Fatal("unterminated restore block")
+	}
+	return block
+}
+
+// N5: the documented restore works for every combination, empty patches included.
+func TestRestoreFromDocsAllCombinations(t *testing.T) {
+	script := restoreScript(t)
+	for _, mode := range []string{"FAKE_ONLY_COMMIT", "FAKE_ONLY_STAGED", "FAKE_ONLY_UNSTAGED", "FAKE_ONLY_UNTRACKED", "FAKE_STAGED", "nothing"} {
+		t.Run(mode, func(t *testing.T) {
+			m := newManager(t)
+			notifyTo(t, m)
+			repo := newRepo(t)
+			j := runToEnd(t, m, enqueue(t, m, mode, func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" }).ID)
+			if j.Status != store.StatusSucceeded {
+				t.Fatalf("status %s %q", j.Status, j.Error)
+			}
+			dir := m.JobDir(j.ID)
+			want := snapshot(t, filepath.Join(dir, "work"), j.BaseCommit)
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			if get(t, m, j.ID).CleanedAt == nil {
+				t.Fatal("not cleaned")
+			}
+			other := filepath.Join(t.TempDir(), "restore")
+			gitT(t, repo, "worktree", "add", "-q", "--detach", other, j.BaseCommit)
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Dir = other
+			cmd.Env = append(os.Environ(), "J="+dir)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("restore: %v\n%s", err, out)
+			}
+			if got := snapshot(t, other, j.BaseCommit); got != want {
+				t.Fatalf("restored state differs\nwant:\n%s\ngot:\n%s", want, got)
+			}
+		})
 	}
 }

@@ -57,7 +57,18 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 
 **Cancel.** `queued` → `cancelled`; `running` → TERM group / 10 s / KILL → `cancelled`. Terminal jobs cannot be cancelled.
 
-**Cleanup** (repo jobs only; empty work dirs are left for the future `prune`). First the ownership check: `worktree.json` path matches, the path is registered in `git worktree list --porcelain` of the source repo, its admin gitdir equals the one recorded at creation and carries this job's owner mark (`agent-jobs-owner`) – otherwise nothing is touched. Then, without modifying the index or files: `diffstat.txt` = `git diff --stat <base>` + untracked list, `commits.patch` = `git format-patch <base>..HEAD --stdout`, `staged.patch` = `git diff --cached --binary HEAD`, `uncommitted.patch` = `git diff --binary HEAD`, `untracked.tar` = untracked, not ignored files (`git ls-files --others --exclude-standard`). Restore on base: `git am commits.patch && git apply --cached staged.patch && git apply uncommitted.patch && tar -xf untracked.tar` (tested). Then `git update-ref refs/agent-jobs/jobs/<id> <job HEAD>` in the source repo, then `git worktree remove --force <jobdir>/work` – only that path. Any failure before the removal keeps the worktree and retries next tick.
+**Cleanup** (repo jobs only; empty work dirs are left for the future `prune`). First the ownership check: `worktree.json` path matches, the path is registered in `git worktree list --porcelain` of the source repo, its admin gitdir equals the one recorded at creation and carries this job's owner mark (`agent-jobs-owner`) – otherwise nothing is touched. Then, without modifying the index or files: `diffstat.txt` = `git diff --stat <base>` + untracked list, `commits.patch` = `git format-patch <base>..HEAD --stdout`, `staged.patch` = `git diff --cached --binary HEAD`, `uncommitted.patch` = `git diff --binary HEAD`, `untracked.tar` = untracked, not ignored files (`git ls-files --others --exclude-standard`). Restore: in a fresh worktree checked out at `<base>`, with `J=<jobdir>` (empty patches are skipped – git rejects an empty patch; tested for only commits / only staged / only unstaged / only untracked / all / nothing):
+
+<!-- restore -->
+```sh
+set -e
+[ ! -s "$J/commits.patch" ] || git am "$J/commits.patch"
+[ ! -s "$J/staged.patch" ] || git apply --cached "$J/staged.patch"
+[ ! -s "$J/uncommitted.patch" ] || git apply "$J/uncommitted.patch"
+tar -xf "$J/untracked.tar"
+```
+
+Then `git update-ref refs/agent-jobs/jobs/<id> <job HEAD>` in the source repo, then `git worktree remove --force <jobdir>/work` – only that path. Any failure before the removal keeps the worktree and retries next tick.
 
 ## Launch command (reference, 1:1)
 

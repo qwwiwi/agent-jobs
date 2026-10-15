@@ -160,7 +160,7 @@ func (m *Manager) verifyWorktree(j *store.Job, work string) error {
 // (index vs HEAD), uncommitted.patch (working tree vs HEAD), untracked.tar (untracked, not ignored
 // files); sets refs/agent-jobs/jobs/<id> to the job's last commit; and only then removes the worktree.
 // Any failure before removal keeps the worktree, so no work is lost silently.
-// Restore: git am commits.patch; git apply --cached staged.patch; git apply uncommitted.patch; tar -xf untracked.tar.
+// Restore: see the restore block in docs/ARCHITECTURE.md (empty patches are skipped).
 func (m *Manager) Cleanup(j *store.Job) error {
 	dir := m.JobDir(j.ID)
 	work := filepath.Join(dir, "work")
