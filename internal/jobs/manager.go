@@ -1,0 +1,393 @@
+package jobs
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/store"
+)
+
+// Manager runs the job lifecycle for one agent.
+type Manager struct {
+	Agent    string
+	StateDir string
+	Cfg      Config
+	Store    *store.Store
+	// SelfBin is the agent-jobs binary used for run-wrapper and the guard hook.
+	SelfBin string
+	// Now is the clock (overridable in tests).
+	Now func() time.Time
+	// KillGrace is the wait between SIGTERM and SIGKILL of a job's process group.
+	KillGrace time.Duration
+	Log       *log.Logger
+}
+
+// Open creates the state dir, loads config, opens the DB and resolves the own binary.
+func Open(agent string) (*Manager, error) {
+	dir, err := StateDir(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "jobs"), 0o700); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	st, err := store.Open(filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		return nil, err
+	}
+	self, err := os.Executable()
+	if err == nil {
+		self, err = filepath.EvalSymlinks(self)
+	}
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("resolve own binary: %w", err)
+	}
+	return &Manager{
+		Agent: agent, StateDir: dir, Cfg: cfg, Store: st, SelfBin: self,
+		Now: time.Now, KillGrace: 10 * time.Second,
+		Log: log.New(os.Stderr, "agent-jobs["+agent+"] ", log.LstdFlags),
+	}, nil
+}
+
+// Close releases the DB.
+func (m *Manager) Close() error { return m.Store.Close() }
+
+// JobDir returns <state>/jobs/<id>.
+func (m *Manager) JobDir(id string) string { return filepath.Join(m.StateDir, "jobs", id) }
+
+// StartRequest is the input of `start` (job_start).
+type StartRequest struct {
+	Title          string
+	Kind           string
+	Brief          string
+	RepoPath       string
+	Base           string // ref in RepoPath; default HEAD
+	Model          string // explicit model; default from kind × complexity
+	Complexity     string // light|normal|hard
+	MaxTurns       int    // 0 = default
+	MaxBudgetUSD   float64
+	TimeoutMinutes int
+}
+
+// ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
+func ValidateLimits(turns int, budget float64, timeout int) (int, float64, int, error) {
+	if turns == 0 {
+		turns = DefaultMaxTurns
+	}
+	if budget == 0 {
+		budget = DefaultMaxBudgetUSD
+	}
+	if timeout == 0 {
+		timeout = DefaultTimeoutMinutes
+	}
+	var errs []string
+	if turns < 0 || turns > CeilingMaxTurns {
+		errs = append(errs, fmt.Sprintf("max_turns %d is outside 1..%d", turns, CeilingMaxTurns))
+	}
+	if budget < 0 || budget > CeilingMaxBudgetUSD {
+		errs = append(errs, fmt.Sprintf("max_budget_usd %.2f is outside 0..%.0f", budget, CeilingMaxBudgetUSD))
+	}
+	if timeout < 0 || timeout > CeilingTimeoutMinutes {
+		errs = append(errs, fmt.Sprintf("timeout_minutes %d is outside 1..%d", timeout, CeilingTimeoutMinutes))
+	}
+	if len(errs) > 0 {
+		return 0, 0, 0, fmt.Errorf("limits rejected (not clamped): %s", strings.Join(errs, "; "))
+	}
+	return turns, budget, timeout, nil
+}
+
+func newID(now time.Time) string {
+	b := make([]byte, 2)
+	_, _ = rand.Read(b)
+	return now.Format("060102-150405") + "-" + hex.EncodeToString(b)
+}
+
+func git(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// Enqueue validates the request and inserts a queued job. It returns immediately.
+func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
+	if strings.TrimSpace(r.Title) == "" {
+		return nil, errors.New("title is required")
+	}
+	if strings.TrimSpace(r.Brief) == "" {
+		return nil, errors.New("brief is required")
+	}
+	if !slices.Contains(Kinds, r.Kind) {
+		return nil, fmt.Errorf("kind %q must be one of %s", r.Kind, strings.Join(Kinds, "|"))
+	}
+	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
+	if err != nil {
+		return nil, err
+	}
+	model := r.Model
+	if model == "" {
+		if model, err = ModelFor(r.Kind, r.Complexity); err != nil {
+			return nil, err
+		}
+	} else if r.Complexity != "" {
+		if _, err := ModelFor(r.Kind, r.Complexity); err != nil {
+			return nil, err
+		}
+	}
+	var repo, base string
+	if r.RepoPath != "" {
+		if repo, err = filepath.Abs(r.RepoPath); err != nil {
+			return nil, fmt.Errorf("repo path: %w", err)
+		}
+		if repo, err = git(repo, "rev-parse", "--show-toplevel"); err != nil {
+			return nil, fmt.Errorf("repo %s is not a git repository: %w", r.RepoPath, err)
+		}
+		ref := r.Base
+		if ref == "" {
+			ref = "HEAD"
+		}
+		if base, err = git(repo, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
+			return nil, fmt.Errorf("base %q: %w", ref, err)
+		}
+	} else if r.Base != "" {
+		return nil, errors.New("base given without repo")
+	}
+	now := m.Now()
+	j := &store.Job{
+		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
+		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
+		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
+	}
+	if err := m.Store.Insert(j); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// Tick is one daemon pass: collect finished/timed-out jobs, start queued ones (≤2 running),
+// send job-done lines, and clean up worktrees whose notify is older than the cleanup delay.
+func (m *Manager) Tick() error {
+	var errs []error
+	if err := m.collect(); err != nil {
+		errs = append(errs, fmt.Errorf("collect: %w", err))
+	}
+	if err := m.launchQueued(); err != nil {
+		errs = append(errs, fmt.Errorf("launch: %w", err))
+	}
+	if err := m.notifyPending(); err != nil {
+		errs = append(errs, fmt.Errorf("notify: %w", err))
+	}
+	if err := m.cleanupDue(); err != nil {
+		errs = append(errs, fmt.Errorf("cleanup: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) launchQueued() error {
+	running, err := m.Store.CountRunning()
+	if err != nil {
+		return err
+	}
+	queued, err := m.Store.ListByStatus(store.StatusQueued)
+	if err != nil {
+		return err
+	}
+	for _, j := range queued {
+		if running >= MaxRunningPerAgent {
+			return nil
+		}
+		if err := m.launch(j); err != nil {
+			m.Log.Printf("job %s refused to start: %v", j.ID, err)
+			if ferr := m.Store.Finish(j.ID, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
+				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
+			}
+			continue
+		}
+		running++
+	}
+	return nil
+}
+
+// ClaudeArgs is the exact reference command line (prompt.md arrives on stdin).
+func ClaudeArgs(j *store.Job, jobDir string) []string {
+	return []string{
+		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
+		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
+		"--permission-mode", "bypassPermissions",
+		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", "project",
+		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
+		"--no-session-persistence", "--add-dir", jobDir,
+	}
+}
+
+func (m *Manager) launch(j *store.Job) error {
+	dir := m.JobDir(j.ID)
+	if err := m.prepare(j, dir); err != nil {
+		return err
+	}
+	args := append([]string{"run-wrapper", dir, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
+	cmd := exec.Command(m.SelfBin, args...)
+	cmd.Dir = filepath.Join(dir, "work")
+	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start wrapper: %w", err)
+	}
+	pid := cmd.Process.Pid
+	// Reap the wrapper if it finishes while this process is alive; otherwise it is re-parented to launchd/init.
+	go func() { _ = cmd.Wait() }()
+	if err := m.Store.MarkRunning(j.ID, pid, pid, m.Now()); err != nil {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		return fmt.Errorf("mark running: %w", err)
+	}
+	m.Log.Printf("job %s started pid=%d model=%s", j.ID, pid, j.Model)
+	return nil
+}
+
+// alive reports whether a process exists (EPERM counts as alive).
+func alive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func groupAlive(pgid int) bool {
+	if pgid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-pgid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// killGroup sends SIGTERM to the process group, waits up to KillGrace, then SIGKILL.
+func (m *Manager) killGroup(pgid int) {
+	if pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(m.KillGrace)
+	for time.Now().Before(deadline) {
+		if !groupAlive(pgid) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+func readExitCode(dir string) (int, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, "exit_code"))
+	if err != nil {
+		return 0, false
+	}
+	var code int
+	if _, err := fmt.Sscan(strings.TrimSpace(string(b)), &code); err != nil {
+		return 0, false
+	}
+	return code, true
+}
+
+func (m *Manager) collect() error {
+	running, err := m.Store.ListByStatus(store.StatusRunning)
+	if err != nil {
+		return err
+	}
+	now := m.Now()
+	for _, j := range running {
+		dir := m.JobDir(j.ID)
+		dur := 0
+		if j.StartedAt != nil {
+			dur = int(now.Sub(*j.StartedAt).Seconds())
+		}
+		res := ParseStream(filepath.Join(dir, "stream.jsonl"))
+		if code, ok := readExitCode(dir); ok {
+			status, msg := Verdict(code, res, dir)
+			m.finish(j, status, res, dur, msg, now)
+			continue
+		}
+		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
+			m.killGroup(j.PGID)
+			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
+			continue
+		}
+		if !alive(j.PID) {
+			// Re-check: the wrapper may have written exit_code right before exiting.
+			if code, ok := readExitCode(dir); ok {
+				status, msg := Verdict(code, res, dir)
+				m.finish(j, status, res, dur, msg, now)
+				continue
+			}
+			m.finish(j, store.StatusFailed, res, dur, "wrapper died without writing exit_code (see stderr.log)", now)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
+	if err := m.Store.Finish(j.ID, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
+		return
+	}
+	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+}
+
+// Verdict maps the wrapper's exit code and stream result to a terminal status.
+// exit 0 without a report is a failure.
+func Verdict(code int, res StreamResult, dir string) (string, string) {
+	if code != 0 {
+		return store.StatusFailed, fmt.Sprintf("claude exited with code %d", code)
+	}
+	if res.IsError {
+		return store.StatusFailed, "claude result is an error: " + res.Subtype
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
+	if err != nil || strings.TrimSpace(string(b)) == "" {
+		return store.StatusFailed, "exit 0 without a report"
+	}
+	return store.StatusSucceeded, ""
+}
+
+// Cancel stops a queued or running job. Final statuses cannot be cancelled.
+func (m *Manager) Cancel(id string) error {
+	j, err := m.Store.Get(id)
+	if err != nil {
+		return err
+	}
+	switch j.Status {
+	case store.StatusQueued:
+	case store.StatusRunning:
+		m.killGroup(j.PGID)
+	default:
+		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
+	}
+	now := m.Now()
+	dur := 0
+	if j.StartedAt != nil {
+		dur = int(now.Sub(*j.StartedAt).Seconds())
+	}
+	res := ParseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
+	return m.Store.Finish(id, store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+}
