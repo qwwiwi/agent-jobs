@@ -41,7 +41,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
 }
 ```
 
-- `notify_tmux_target` empty (default) = notify disabled.
+- `notify_tmux_target` empty (default) = no delivery: job-done lines stay pending (logged each tick) and worktrees are not cleaned up until a target is set.
 - `owner_names` must never appear in a job's commit; `git_name`/`git_email` is the only identity a job may set explicitly (empty = no override allowed).
 - Env overrides: `AGENT_JOBS_HOME` (state root), `AGENT_JOBS_AGENT` (default `--agent`), `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`.
 

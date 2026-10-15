@@ -188,6 +188,11 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 // Tick is one daemon pass: collect finished/timed-out jobs, start queued ones (≤2 running),
 // send job-done lines, and clean up worktrees whose notify is older than the cleanup delay.
 func (m *Manager) Tick() error {
+	unlock, err := m.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	var errs []error
 	if err := m.collect(); err != nil {
 		errs = append(errs, fmt.Errorf("collect: %w", err))
@@ -204,6 +209,39 @@ func (m *Manager) Tick() error {
 	return errors.Join(errs...)
 }
 
+// LaunchGrace is how long a claimed job may wait for its wrapper to register (wrapper.json)
+// before it is failed: a daemon that died between claim and spawn must not leave a ghost row.
+const LaunchGrace = time.Minute
+
+// lock takes the per-agent lifecycle lock (flock on <state>/tick.lock), so two daemons,
+// a manual `tick` and `cancel` never interleave. Released by the returned func or on exit.
+func (m *Manager) lock() (func(), error) {
+	f, err := os.OpenFile(filepath.Join(m.StateDir, "tick.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock: %w", err)
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("flock: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func newToken() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func (m *Manager) launchQueued() error {
 	running, err := m.Store.CountRunning()
 	if err != nil {
@@ -217,14 +255,21 @@ func (m *Manager) launchQueued() error {
 		if running >= MaxRunningPerAgent {
 			return nil
 		}
-		if err := m.launch(j); err != nil {
-			m.Log.Printf("job %s refused to start: %v", j.ID, err)
-			if ferr := m.Store.Finish(j.ID, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
-				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
+		token := newToken()
+		// The row is ours (running + token) before anything is created or spawned.
+		if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+			if errors.Is(err, store.ErrImmutable) {
+				continue // cancelled or taken meanwhile
 			}
-			continue
+			return err
 		}
 		running++
+		if err := m.launch(j, token); err != nil {
+			m.Log.Printf("job %s refused to start: %v", j.ID, err)
+			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
+				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
+			}
+		}
 	}
 	return nil
 }
@@ -241,28 +286,36 @@ func ClaudeArgs(j *store.Job, jobDir string) []string {
 	}
 }
 
-func (m *Manager) launch(j *store.Job) error {
-	dir := m.JobDir(j.ID)
-	if err := m.prepare(j, dir); err != nil {
+func (m *Manager) launch(j *store.Job, token string) error {
+	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		return err
 	}
-	args := append([]string{"run-wrapper", dir, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
+	pid, err := m.spawn(j, token)
+	if err != nil {
+		return err
+	}
+	// If the daemon dies before this line, the next tick adopts the wrapper via wrapper.json.
+	if err := m.Store.SetPID(j.ID, token, pid, pid); err != nil {
+		m.Log.Printf("job %s: record pid %d: %v (adopted next tick via wrapper.json)", j.ID, pid, err)
+	}
+	m.Log.Printf("job %s started pid=%d model=%s", j.ID, pid, j.Model)
+	return nil
+}
+
+// spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
+func (m *Manager) spawn(j *store.Job, token string) (int, error) {
+	dir := m.JobDir(j.ID)
+	args := append([]string{"run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
 	cmd := exec.Command(m.SelfBin, args...)
 	cmd.Dir = filepath.Join(dir, "work")
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start wrapper: %w", err)
+		return 0, fmt.Errorf("start wrapper: %w", err)
 	}
-	pid := cmd.Process.Pid
 	// Reap the wrapper if it finishes while this process is alive; otherwise it is re-parented to launchd/init.
 	go func() { _ = cmd.Wait() }()
-	if err := m.Store.MarkRunning(j.ID, pid, pid, m.Now()); err != nil {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		return fmt.Errorf("mark running: %w", err)
-	}
-	m.Log.Printf("job %s started pid=%d model=%s", j.ID, pid, j.Model)
-	return nil
+	return cmd.Process.Pid, nil
 }
 
 // alive reports whether a process exists (EPERM counts as alive).
@@ -310,6 +363,29 @@ func readExitCode(dir string) (int, bool) {
 	return code, true
 }
 
+// parseStream is ParseStream; a variable so tests can interleave the wrapper's writes.
+var parseStream = ParseStream
+
+// adopt fills in the pid of a claimed job from wrapper.json. It returns false when the job
+// must be skipped this tick (wrapper not registered yet) or was failed (never registered).
+func (m *Manager) adopt(j *store.Job, now time.Time) bool {
+	w, err := ReadWrapperInfo(m.JobDir(j.ID))
+	if err == nil && w.Token == j.LaunchToken {
+		if err := m.Store.SetPID(j.ID, j.LaunchToken, w.PID, w.PGID); err != nil {
+			m.Log.Printf("job %s: adopt pid %d: %v", j.ID, w.PID, err)
+			return false
+		}
+		j.PID, j.PGID = w.PID, w.PGID
+		m.Log.Printf("job %s: adopted wrapper pid=%d", j.ID, w.PID)
+		return true
+	}
+	if j.StartedAt != nil && now.Sub(*j.StartedAt) > LaunchGrace {
+		m.finish(j, store.StatusFailed, StreamResult{}, 0,
+			"launch interrupted: the wrapper never registered (no wrapper.json); work dir kept", now)
+	}
+	return false
+}
+
 func (m *Manager) collect() error {
 	running, err := m.Store.ListByStatus(store.StatusRunning)
 	if err != nil {
@@ -317,25 +393,32 @@ func (m *Manager) collect() error {
 	}
 	now := m.Now()
 	for _, j := range running {
+		if j.PID == 0 && !m.adopt(j, now) {
+			continue
+		}
 		dir := m.JobDir(j.ID)
 		dur := 0
 		if j.StartedAt != nil {
 			dur = int(now.Sub(*j.StartedAt).Seconds())
 		}
-		res := ParseStream(filepath.Join(dir, "stream.jsonl"))
+		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
+			res := parseStream(filepath.Join(dir, "stream.jsonl"))
 			status, msg := Verdict(code, res, dir)
 			m.finish(j, status, res, dur, msg, now)
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
 			m.killGroup(j.PGID)
+			res := parseStream(filepath.Join(dir, "stream.jsonl"))
 			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
-			if code, ok := readExitCode(dir); ok {
+			code, ok := readExitCode(dir)
+			res := parseStream(filepath.Join(dir, "stream.jsonl"))
+			if ok {
 				status, msg := Verdict(code, res, dir)
 				m.finish(j, status, res, dur, msg, now)
 				continue
@@ -347,7 +430,7 @@ func (m *Manager) collect() error {
 }
 
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
-	if err := m.Store.Finish(j.ID, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
 	}
@@ -372,6 +455,11 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 
 // Cancel stops a queued or running job. Final statuses cannot be cancelled.
 func (m *Manager) Cancel(id string) error {
+	unlock, err := m.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	j, err := m.Store.Get(id)
 	if err != nil {
 		return err
@@ -379,7 +467,13 @@ func (m *Manager) Cancel(id string) error {
 	switch j.Status {
 	case store.StatusQueued:
 	case store.StatusRunning:
-		m.killGroup(j.PGID)
+		pgid := j.PGID
+		if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
+			if w, err := ReadWrapperInfo(m.JobDir(id)); err == nil && w.Token == j.LaunchToken {
+				pgid = w.PGID
+			}
+		}
+		m.killGroup(pgid)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}
@@ -388,6 +482,6 @@ func (m *Manager) Cancel(id string) error {
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
-	res := ParseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
-	return m.Store.Finish(id, store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
+	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
 }

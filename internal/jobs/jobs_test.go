@@ -27,6 +27,7 @@ const fakeClaude = `#!/bin/bash
 set -u
 prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
+echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
@@ -35,6 +36,17 @@ if [[ $prompt == *FAKE_COMMIT* ]]; then
   git -c user.name=T -c user.email=t@example.com commit -qm "job commit"
   echo dirty >> tracked.txt
   echo untracked > new-untracked.txt
+fi
+if [[ $prompt == *FAKE_STAGED* ]]; then
+  echo new > committed.txt
+  git add committed.txt
+  git -c user.name=T -c user.email=t@example.com commit -qm "job commit"
+  printf 'staged\n' > tracked.txt
+  git add tracked.txt
+  printf 'v1\n' > tracked.txt
+  echo more >> committed.txt
+  mkdir -p d
+  echo u > d/new-untracked.txt
 fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
@@ -205,11 +217,11 @@ func TestSucceededReportFlagsAndFiles(t *testing.T) {
 			t.Fatalf("missing %s: %v", f, err)
 		}
 	}
-	if j.NotifiedAt == nil {
-		t.Fatal("finished job must be marked notified (notify disabled)")
+	if j.NotifiedAt != nil {
+		t.Fatal("without a notify target the job must stay pending, not be marked delivered")
 	}
 	// Terminal status never changes.
-	if err := m.Store.Finish(j.ID, store.StatusFailed, 0, 0, 0, "", time.Now()); !errors.Is(err, store.ErrImmutable) {
+	if err := m.Store.Finish(j.ID, "", store.StatusFailed, 0, 0, 0, "", time.Now()); !errors.Is(err, store.ErrImmutable) {
 		t.Fatalf("want ErrImmutable, got %v", err)
 	}
 	if err := m.Cancel(j.ID); !errors.Is(err, store.ErrImmutable) {
@@ -416,6 +428,8 @@ func gitT(t *testing.T, dir string, args ...string) string {
 
 func TestCleanupPreservesPatchesAndRef(t *testing.T) {
 	m := newManager(t)
+	m.Cfg.NotifyTmuxTarget = "fake-session"
+	t.Setenv("FAKE_TMUX_LOG", filepath.Join(t.TempDir(), "tmux.log"))
 	repo := t.TempDir()
 	gitT(t, repo, "init", "-q", "-b", "main")
 	gitT(t, repo, "config", "user.name", "T")
@@ -467,8 +481,11 @@ func TestCleanupPreservesPatchesAndRef(t *testing.T) {
 	if s := read("commits.patch"); !strings.Contains(s, "job commit") || !strings.Contains(s, "committed.txt") {
 		t.Fatalf("commits.patch: %s", s)
 	}
-	if s := read("uncommitted.patch"); !strings.Contains(s, "+dirty") || !strings.Contains(s, "new-untracked.txt") {
+	if s := read("uncommitted.patch"); !strings.Contains(s, "+dirty") {
 		t.Fatalf("uncommitted.patch: %s", s)
+	}
+	if s := read("untracked.tar"); !strings.Contains(s, "new-untracked.txt") {
+		t.Fatal("untracked.tar lacks new-untracked.txt")
 	}
 	if s := read("diffstat.txt"); !strings.Contains(s, "committed.txt") || !strings.Contains(s, "tracked.txt") {
 		t.Fatalf("diffstat.txt: %s", s)
@@ -485,5 +502,371 @@ func TestCleanupPreservesPatchesAndRef(t *testing.T) {
 	}
 	if _, err := git(other, "apply", filepath.Join(dir, "uncommitted.patch")); err != nil {
 		t.Fatalf("uncommitted.patch does not apply: %v", err)
+	}
+}
+
+// ---- Fix-loop 1 regressions ----
+
+func newRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	gitT(t, repo, "init", "-q", "-b", "main")
+	gitT(t, repo, "config", "user.name", "T")
+	gitT(t, repo, "config", "user.email", "t@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", ".")
+	gitT(t, repo, "commit", "-qm", "init")
+	return repo
+}
+
+func notifyTo(t *testing.T, m *Manager) string {
+	t.Helper()
+	logf := filepath.Join(t.TempDir(), "tmux.log")
+	t.Setenv("FAKE_TMUX_LOG", logf)
+	m.Cfg.NotifyTmuxTarget = "fake-session"
+	return logf
+}
+
+func hasControl(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == 0x202e || r == 0x200b {
+			return true
+		}
+	}
+	return false
+}
+
+// B1: the title can't smuggle control characters (Ctrl-U, ESC, CR/LF, tabs) into tmux.
+func TestDoneLineSanitized(t *testing.T) {
+	j := &store.Job{ID: "id1", Title: "x\x15echo injected #\x1b[2J\r\nnext\tcol\x7f‮end​", Status: store.StatusSucceeded}
+	line := DoneLine(j)
+	if hasControl(line) {
+		t.Fatalf("control chars in line: %q", line)
+	}
+	if !strings.Contains(line, "xecho injected #[2J next col") {
+		t.Fatalf("printable text lost: %q", line)
+	}
+	j.Title = strings.Repeat("я", 1000)
+	if n := len([]rune(DoneLine(j))); n > 220 {
+		t.Fatalf("title not capped: line is %d runes", n)
+	}
+	m := newManager(t)
+	logf := notifyTo(t, m)
+	if err := m.sendTmux("fake-session", "a\x15b\x1bc\rd"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(logf)
+	if hasControl(strings.TrimSuffix(strings.ReplaceAll(string(b), "|\n", "|"), "\n")) {
+		t.Fatalf("sendTmux passed control chars: %q", b)
+	}
+}
+
+// #26: no notify target = not delivered: the job stays pending (and is not cleaned up).
+func TestNotifyKeepsPendingWithoutTarget(t *testing.T) {
+	m := newManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
+	if j.NotifiedAt != nil {
+		t.Fatal("marked notified without a target")
+	}
+	logf := notifyTo(t, m)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).NotifiedAt == nil {
+		t.Fatal("pending notify not retried once a target exists")
+	}
+	if b, _ := os.ReadFile(logf); !strings.Contains(string(b), j.ID) {
+		t.Fatalf("tmux log: %s", b)
+	}
+	// A failing tmux (missing session) keeps it pending too.
+	m2 := newManager(t)
+	t.Setenv("AGENT_JOBS_TMUX_BIN", "/usr/bin/false")
+	m2.Cfg.NotifyTmuxTarget = "missing-session"
+	j2 := runToEnd(t, m2, enqueue(t, m2, "x", nil).ID)
+	if j2.NotifiedAt != nil {
+		t.Fatal("failed tmux delivery marked as notified")
+	}
+}
+
+// B3: two daemons ticking at once never double-start or fail each other's jobs.
+func TestConcurrentTicksAreSerialized(t *testing.T) {
+	m := newManager(t)
+	m2, err := Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m2.Close() })
+	m2.SelfBin, m2.Log, m2.KillGrace = selfBin, m.Log, m.KillGrace
+	var ids []string
+	for i := 0; i < 3; i++ {
+		ids = append(ids, enqueue(t, m, "FAKE_SLEEP=5", nil).ID)
+	}
+	done := make(chan error, 6)
+	for i := 0; i < 3; i++ {
+		go func() { done <- m.Tick() }()
+		go func() { done <- m2.Tick() }()
+	}
+	for i := 0; i < 6; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, _ := m.Store.CountRunning()
+	failed, _ := m.Store.ListByStatus(store.StatusFailed)
+	if n != 2 || len(failed) != 0 {
+		for _, f := range failed {
+			t.Logf("failed %s: %s", f.ID, f.Error)
+		}
+		t.Fatalf("running=%d failed=%d, want 2/0", n, len(failed))
+	}
+	for _, id := range ids {
+		j := get(t, m, id)
+		if j.Status != store.StatusRunning {
+			continue
+		}
+		waitFor(t, "launch", 5*time.Second, func() bool {
+			_, err := os.Stat(filepath.Join(m.JobDir(id), "launches.txt"))
+			return err == nil
+		})
+		b, _ := os.ReadFile(filepath.Join(m.JobDir(id), "launches.txt"))
+		if c := strings.Count(string(b), "launch"); c != 1 {
+			t.Fatalf("job %s launched %d times", id, c)
+		}
+	}
+}
+
+// B3: a finish from a tick that does not own the launch cannot touch the running row.
+func TestFinishRequiresLaunchOwnership(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(j.ID, "tok-a", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok-b", time.Now()); !errors.Is(err, store.ErrImmutable) {
+		t.Fatalf("second claim: %v", err)
+	}
+	if err := m.Store.Finish(j.ID, "tok-b", store.StatusFailed, 0, 0, 0, "x", time.Now()); !errors.Is(err, store.ErrImmutable) {
+		t.Fatalf("foreign finish: %v", err)
+	}
+	if get(t, m, j.ID).Status != store.StatusRunning {
+		t.Fatal("foreign finish changed the row")
+	}
+	if err := m.Store.Finish(j.ID, "tok-a", store.StatusFailed, 0, 0, 0, "x", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// B4: a daemon dying between spawning the wrapper and recording its PID loses nothing:
+// the next tick adopts the wrapper from wrapper.json instead of failing or launching twice.
+func TestOrphanWrapperAdopted(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	j := enqueue(t, m, "FAKE_SLEEP=1", func(r *StartRequest) { r.RepoPath = repo })
+	const tok = "crash-token"
+	if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.spawn(j, tok); err != nil { // "crash": PID never written
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).PID != 0 {
+		t.Fatal("precondition: pid must be unset")
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool {
+		_, ok := readExitCode(m.JobDir(j.ID))
+		return ok
+	})
+	if out, err := exec.Command(selfBin, "tick", "--agent", "test").CombinedOutput(); err != nil {
+		t.Fatalf("tick: %v %s", err, out)
+	}
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusSucceeded || got.PID == 0 {
+		t.Fatalf("after restart: %s pid=%d %q", got.Status, got.PID, got.Error)
+	}
+	b, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "launches.txt"))
+	if c := strings.Count(string(b), "launch"); c != 1 {
+		t.Fatalf("launched %d times", c)
+	}
+}
+
+// B4: a claim whose wrapper never registered is failed loudly after a grace period (work kept).
+func TestClaimWithoutWrapperFailsAfterGrace(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).Status != store.StatusRunning {
+		t.Fatal("failed inside the grace period")
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(2 * LaunchGrace) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g := get(t, m, j.ID); g.Status != store.StatusFailed || !strings.Contains(g.Error, "never registered") {
+		t.Fatalf("got %s %q", g.Status, g.Error)
+	}
+}
+
+// B4: a second wrapper for the same job directory refuses to run.
+func TestSecondWrapperRefuses(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "FAKE_SLEEP=3", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	dir := m.JobDir(j.ID)
+	waitFor(t, "wrapper.json", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(dir, "wrapper.json"))
+		return err == nil
+	})
+	out, err := exec.Command(selfBin, "run-wrapper", dir, "--token", "other", "--", filepath.Join(fakeHelpr, "claude")).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "already") {
+		t.Fatalf("second wrapper: err=%v out=%s", err, out)
+	}
+}
+
+// B5: the stream is read after exit_code is seen, never before.
+func TestCollectReadsStreamAfterExitCode(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "x", nil)
+	dir := m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ok := `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"r"}` + "\n"
+	bad := `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9,"total_cost_usd":0.9,"result":"r"}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPID(j.ID, "tok", os.Getpid(), os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper finishes right after the daemon's first look at the stream.
+	finished := false
+	orig := parseStream
+	t.Cleanup(func() { parseStream = orig })
+	parseStream = func(p string) StreamResult {
+		r := orig(p)
+		if !finished {
+			finished = true
+			_ = os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok+bad), 0o600)
+			_ = os.WriteFile(filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)
+		}
+		return r
+	}
+	for i := 0; i < 2; i++ {
+		if !finished && i == 1 { // fixed order never peeked: let the wrapper finish now
+			finished = true
+			_ = os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok+bad), 0o600)
+			_ = os.WriteFile(filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)
+		}
+		if err := m.collect(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := get(t, m, j.ID)
+	if g.Status != store.StatusFailed || g.Turns != 9 || !strings.Contains(g.Error, "error_max_turns") {
+		t.Fatalf("got %s turns=%d %q (stale stream used)", g.Status, g.Turns, g.Error)
+	}
+}
+
+// B6: staged-only content, unstaged edits and untracked files all survive cleanup and restore.
+func TestCleanupKeepsStagedUnstagedUntracked(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_STAGED", func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" }).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s %q", j.Status, j.Error)
+	}
+	dir := m.JobDir(j.ID)
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).CleanedAt == nil {
+		t.Fatal("not cleaned")
+	}
+	other := filepath.Join(t.TempDir(), "restore")
+	gitT(t, repo, "worktree", "add", "-q", "--detach", other, j.BaseCommit)
+	gitT(t, other, "am", "-q", filepath.Join(dir, "commits.patch"))
+	gitT(t, other, "apply", "--cached", filepath.Join(dir, "staged.patch"))
+	gitT(t, other, "apply", filepath.Join(dir, "uncommitted.patch"))
+	if out, err := exec.Command("tar", "-xf", filepath.Join(dir, "untracked.tar"), "-C", other).CombinedOutput(); err != nil {
+		t.Fatalf("untar: %v %s", err, out)
+	}
+	if s := gitT(t, other, "show", ":tracked.txt"); s != "staged" {
+		t.Fatalf("index tracked.txt = %q, want staged", s)
+	}
+	read := func(f string) string {
+		b, err := os.ReadFile(filepath.Join(other, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if s := read("tracked.txt"); s != "v1\n" {
+		t.Fatalf("worktree tracked.txt = %q", s)
+	}
+	if s := read("committed.txt"); s != "new\nmore\n" {
+		t.Fatalf("committed.txt = %q", s)
+	}
+	if s := read("d/new-untracked.txt"); s != "u\n" {
+		t.Fatalf("untracked = %q", s)
+	}
+}
+
+// Suspected: cleanup never touches a worktree it did not create, even at the same path.
+func TestCleanupRefusesForeignWorktree(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	gitT(t, repo, "worktree", "remove", "--force", work)
+	gitT(t, repo, "worktree", "add", "-q", "--detach", work, "HEAD")
+	if err := os.WriteFile(filepath.Join(work, "precious.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).CleanedAt != nil {
+		t.Fatal("foreign worktree was cleaned")
+	}
+	if _, err := os.Stat(filepath.Join(work, "precious.txt")); err != nil {
+		t.Fatal("foreign worktree content removed")
+	}
+}
+
+// DEVIATIONS #6 model table.
+func TestModelTable(t *testing.T) {
+	for _, c := range []struct{ kind, cx, want string }{
+		{"review", "light", "sonnet"}, {"review", "normal", "opus"}, {"review", "hard", "fable"},
+		{"fix", "hard", "fable"}, {"general", "hard", "fable"}, {"general", "", "opus"},
+		{"research", "light", "sonnet"}, {"research", "normal", "sonnet"}, {"research", "hard", "opus"},
+	} {
+		if got, _ := ModelFor(c.kind, c.cx); got != c.want {
+			t.Fatalf("%s/%s = %s, want %s", c.kind, c.cx, got, c.want)
+		}
 	}
 }

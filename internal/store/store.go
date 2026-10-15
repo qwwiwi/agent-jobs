@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
@@ -51,6 +52,8 @@ type Job struct {
 	CostUSD        float64
 	DurationSec    int
 	Error          string
+	// LaunchToken identifies the tick that claimed the job; only that launch may finish it.
+	LaunchToken string
 }
 
 // Store wraps the SQLite handle.
@@ -82,7 +85,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 	turns           INTEGER NOT NULL DEFAULT 0,
 	cost_usd        REAL NOT NULL DEFAULT 0,
 	duration_sec    INTEGER NOT NULL DEFAULT 0,
-	error           TEXT NOT NULL DEFAULT ''
+	error           TEXT NOT NULL DEFAULT '',
+	launch_token    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
 `
@@ -99,6 +103,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
+	// Databases created before launch_token existed.
+	if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN launch_token TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -107,7 +117,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, model,
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
-	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error`
+	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -118,11 +128,11 @@ func ts(t *time.Time) any {
 
 // Insert adds a new job row.
 func (s *Store) Insert(j *Job) error {
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
-		j.Turns, j.CostUSD, j.DurationSec, j.Error)
+		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -137,7 +147,7 @@ func scanJob(r scanner) (*Job, error) {
 	var started, finished, notified, cleaned sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
-		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error)
+		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken)
 	if err != nil {
 		return nil, err
 	}
@@ -223,23 +233,41 @@ func affected(res sql.Result, err error) error {
 	return nil
 }
 
-// MarkRunning moves a queued job to running.
-func (s *Store) MarkRunning(id string, pid, pgid int, now time.Time) error {
-	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=?, pgid=?, started_at=? WHERE id=? AND status='queued'`,
-		pid, pgid, now.Unix(), id))
+// Claim atomically moves a queued job to running under a launch token, BEFORE anything is
+// spawned. Exactly one claimer wins; the others get ErrImmutable.
+func (s *Store) Claim(id, token string, now time.Time) error {
+	if token == "" {
+		return errors.New("claim: empty launch token")
+	}
+	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?
+		WHERE id=? AND status='queued'`, token, now.Unix(), id))
 }
 
-// Finish moves a queued or running job to a terminal status. Terminal rows never change status again.
-func (s *Store) Finish(id, status string, turns int, cost float64, durationSec int, errMsg string, now time.Time) error {
+// SetPID records the wrapper's pid/pgid for the launch that owns the job.
+func (s *Store) SetPID(id, token string, pid, pgid int) error {
+	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=? WHERE id=? AND status='running' AND launch_token=?`,
+		pid, pgid, id, token))
+}
+
+// Finish moves a job to a terminal status. With a launch token, only the running job owned by
+// that launch can be finished (a tick never finishes another tick's job); with an empty token
+// (explicit cancel) any queued or running job can. Terminal rows never change status again.
+func (s *Store) Finish(id, token, status string, turns int, cost float64, durationSec int, errMsg string, now time.Time) error {
 	if status == StatusQueued || status == StatusRunning {
 		return fmt.Errorf("finish: %q is not a terminal status", status)
 	}
-	return affected(s.db.Exec(`UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=?
-		WHERE id=? AND status IN ('queued','running')`,
-		status, turns, cost, durationSec, errMsg, now.Unix(), id))
+	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=? WHERE id=? AND `
+	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), id}
+	if token == "" {
+		q += `status IN ('queued','running')`
+	} else {
+		q += `status='running' AND launch_token=?`
+		args = append(args, token)
+	}
+	return affected(s.db.Exec(q, args...))
 }
 
-// MarkNotified records that the job-done line was delivered (or skipped because notify is disabled).
+// MarkNotified records that the job-done line was delivered.
 func (s *Store) MarkNotified(id string, now time.Time) error {
 	_, err := s.db.Exec(`UPDATE jobs SET notified_at=? WHERE id=?`, now.Unix(), id)
 	return err

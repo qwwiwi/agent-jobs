@@ -18,10 +18,17 @@ var denyRules = []string{
 	"Bash(gh release:*)",
 	"Bash(gh api:*)",
 	"Bash(gh pr create:*)",
+	"Bash(gh pr new:*)",
 	"Bash(gh pr comment:*)",
+	"Bash(gh pr edit:*)",
+	"Bash(gh pr merge:*)",
 	"Bash(gh pr review:*)",
 	"Bash(gh issue create:*)",
+	"Bash(gh issue new:*)",
 	"Bash(gh issue comment:*)",
+	"Bash(gh issue edit:*)",
+	// Prefix rules miss spellings like `git -C x push` or `gh pr -R o/r create`;
+	// the guard hook parses every Bash command and blocks those too.
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",
@@ -161,5 +168,30 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if _, err := git(j.RepoPath, "worktree", "add", "--detach", work, j.BaseCommit); err != nil {
 		return err
 	}
+	if err := m.markWorktree(j, work); err != nil {
+		return err
+	}
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
+}
+
+// worktreeOwnerFile lives in the worktree's admin dir (<repo>/.git/worktrees/<name>/): git leaves
+// it alone and deletes it together with the worktree, so it proves which job created the worktree.
+const worktreeOwnerFile = "agent-jobs-owner"
+
+// WorktreeInfo is worktree.json: what this job created, recorded at creation.
+type WorktreeInfo struct {
+	Path   string `json:"path"`
+	GitDir string `json:"gitdir"`
+	Head   string `json:"head"`
+}
+
+func (m *Manager) markWorktree(j *store.Job, work string) error {
+	gitDir, err := git(work, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, worktreeOwnerFile), []byte(j.ID+"\n"), 0o600); err != nil {
+		return fmt.Errorf("mark worktree: %w", err)
+	}
+	return writeJSON(filepath.Join(m.JobDir(j.ID), "worktree.json"), WorktreeInfo{Path: work, GitDir: gitDir, Head: j.BaseCommit})
 }

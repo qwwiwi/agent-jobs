@@ -118,10 +118,11 @@ func (c Config) tmuxBin() string {
 
 // defaultModels implements DEVIATIONS #6: model chosen by kind × complexity.
 var defaultModels = map[string]map[string]string{
-	"review":   {"light": "sonnet", "normal": "opus", "hard": "opus"},
-	"fix":      {"light": "sonnet", "normal": "opus", "hard": "opus"},
+	// "fable" is the claude CLI alias of the latest Fable model (claude-fable-5-1 on 2026-10-15).
+	"review":   {"light": "sonnet", "normal": "opus", "hard": "fable"},
+	"fix":      {"light": "sonnet", "normal": "opus", "hard": "fable"},
 	"research": {"light": "sonnet", "normal": "sonnet", "hard": "opus"},
-	"general":  {"light": "sonnet", "normal": "opus", "hard": "opus"},
+	"general":  {"light": "sonnet", "normal": "opus", "hard": "fable"},
 }
 
 // ModelFor returns the default model for kind × complexity.

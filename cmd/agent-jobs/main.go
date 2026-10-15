@@ -34,7 +34,7 @@ const usage = `usage: agent-jobs <command> [flags]
   cancel     --agent A <id>
   tick       --agent A                     one daemon pass
   daemon     --agent A [--interval 1m]     tick forever
-  run-wrapper <jobdir> -- <claude> <args...>   (internal, started by the daemon)
+  run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
   guard      [--owner-name N]... [--git-name N] [--git-email E]   (PreToolUse hook, JSON on stdin)
 `
 
@@ -80,11 +80,11 @@ func main() {
 }
 
 func runWrapper(args []string) int {
-	if len(args) < 3 || args[1] != "--" {
-		fmt.Fprintln(os.Stderr, "usage: agent-jobs run-wrapper <jobdir> -- <claude> <args...>")
+	if len(args) < 5 || args[1] != "--token" || args[3] != "--" {
+		fmt.Fprintln(os.Stderr, "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> -- <claude> <args...>")
 		return 2
 	}
-	return jobs.RunWrapper(args[0], args[2:])
+	return jobs.RunWrapper(args[0], args[2], args[4:])
 }
 
 type multi []string
