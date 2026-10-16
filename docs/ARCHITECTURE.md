@@ -108,4 +108,6 @@ cwd = `<jobdir>/work`. Checked against claude 2.1.301: all flags accepted; `--ma
 
 ## Not in stage 1
 
-MCP server (job_* tools incl. `job_start`/`job_result` – stage 2, CLI stands in; memory, tasks), `prune`, `doctor procs`, `resume`, memory notes in the brief, «владелец ждёт» Stop-hook, schedules, heartbeat, codex runner, HTTP API.
+MCP server (job_* tools incl. `job_start`/`job_result` – stage 2, CLI stands in; memory, tasks), `prune`, `doctor procs`, `resume`, memory notes in the brief, «владелец ждёт» Stop-hook, schedules, heartbeat, codex runner, HTTP API, the separate code-graph MCP server (reference «Код: индекс кода в виде графа (отдельный сервер)», jobs: read and index) – stage 2+.
+
+Main-session duties (reference: the orchestrator reads the report, «Not done / uncertain» first, checks the diff, publishes only after that; cleanup after reading) cannot be enforced from the job side. They ship as `prompts/orchestrator.md` (verbatim quotes), which `agent-jobs init` writes to `<state>/orchestrator.md` for the agent's instructions. Cleanup stays «через 30 минут после уведомления» (the detailed rule); «удалять worktree после прочтения, сохранив патчи» from the minimum list is met because the patches and the ref survive, so a report read after cleanup loses nothing. Tying cleanup to a read mark would contradict the 30-minute rule, so it is not done.

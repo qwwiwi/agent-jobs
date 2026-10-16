@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -21,7 +22,12 @@ const (
 	CeilingTimeoutMinutes = 180
 	MaxRunningPerAgent    = 2
 	MaxOwnerRulesBytes    = 8 * 1024
-	DefaultCleanupDelay   = 30 // minutes after notify
+)
+
+// Reference timings («раз в минуту», «через 30 минут после уведомления»): fixed, not configurable.
+const (
+	TickInterval = time.Minute
+	CleanupDelay = 30 * time.Minute
 )
 
 // Kinds of work.
@@ -43,8 +49,12 @@ type Config struct {
 	ClaudeBin string `json:"claude_bin"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
-	// CleanupDelayMinutes is the delay between notify and worktree removal. Default 30.
-	CleanupDelayMinutes *int `json:"cleanup_delay_minutes"`
+}
+
+// removedConfigKeys were configurable once and now are fixed by the reference; a config that still
+// sets one is rejected instead of being silently ignored.
+var removedConfigKeys = map[string]string{
+	"cleanup_delay_minutes": "cleanup runs 30 minutes after notify (reference), not configurable",
 }
 
 var reAgent = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
@@ -85,13 +95,18 @@ func LoadConfig(stateDir string) (Config, error) {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
 		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return c, fmt.Errorf("parse config.json: %w", err)
+		}
+		for k, why := range removedConfigKeys {
+			if _, ok := raw[k]; ok {
+				return c, fmt.Errorf("config.json: %q is no longer supported: %s", k, why)
+			}
+		}
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
-	}
-	if c.CleanupDelayMinutes == nil {
-		d := DefaultCleanupDelay
-		c.CleanupDelayMinutes = &d
 	}
 	return c, nil
 }

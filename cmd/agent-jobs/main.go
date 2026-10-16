@@ -24,7 +24,8 @@ import (
 
 const usage = `usage: agent-jobs <command> [flags]
 
-  init       --agent A                     create state dir, copy owner-rules template
+  init       --agent A                     create state dir, copy owner-rules template,
+                                           write orchestrator.md (main-session duties)
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
              [--repo PATH [--base REF]] [--model M | --complexity light|normal|hard]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
@@ -33,7 +34,7 @@ const usage = `usage: agent-jobs <command> [flags]
   result     --agent A <id>                print report.md
   cancel     --agent A <id>
   tick       --agent A                     one daemon pass
-  daemon     --agent A [--interval 1m]     tick forever
+  daemon     --agent A                     tick every minute, forever
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
   guard      [--owner-name N]... [--git-name N] [--git-email E]   (PreToolUse hook, JSON on stdin)
 `
@@ -152,6 +153,19 @@ func cmdInit(args []string) error {
 		return err
 	}
 	defer m.Close()
+	// The main session's duties ship with the tool and are rewritten on every init (not user-edited).
+	ob, err := agentjobs.Templates.ReadFile("prompts/orchestrator.md")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(m.StateDir, 0o700); err != nil {
+		return err
+	}
+	op := filepath.Join(m.StateDir, "orchestrator.md")
+	if err := os.WriteFile(op, ob, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("main-session duties: %s (add to the agent's instructions: read the report, «Not done / uncertain» first, check the diff)\n", op)
 	p := m.Cfg.OwnerRulesPath
 	if _, err := os.Stat(p); err == nil {
 		fmt.Printf("state: %s\nowner rules already exist: %s\n", m.StateDir, p)
@@ -356,7 +370,6 @@ func cmdTick(args []string) error {
 func cmdDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	agent := agentFlag(fs)
-	interval := fs.Duration("interval", time.Minute, "tick interval")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -367,8 +380,9 @@ func cmdDaemon(args []string) error {
 	defer m.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	m.Log.Printf("daemon started, interval %s, state %s", *interval, m.StateDir)
-	t := time.NewTicker(*interval)
+	// The reference interval is fixed («раз в минуту»); it is not configurable.
+	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
 	for {
 		if err := m.Tick(); err != nil {

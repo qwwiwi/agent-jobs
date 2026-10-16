@@ -350,7 +350,7 @@ func TestTimeoutKillsProcessGroup(t *testing.T) {
 func TestDaemonRestartDoesNotKillOrLoseJob(t *testing.T) {
 	m := newManager(t)
 	j := enqueue(t, m, "FAKE_SLEEP=3", nil)
-	d := exec.Command(selfBin, "daemon", "--agent", "test", "--interval", "200ms")
+	d := exec.Command(selfBin, "daemon", "--agent", "test") // the first tick runs at start
 	d.Stderr = io.Discard
 	if err := d.Start(); err != nil {
 		t.Fatal(err)
@@ -1024,5 +1024,38 @@ func TestLateWrapperRefusesTerminalRow(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// B4: reference timings are fixed; a config that still sets the old override is rejected loudly.
+func TestCleanupDelayNotConfigurable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"cleanup_delay_minutes": 0}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(dir); err == nil || !strings.Contains(err.Error(), "cleanup_delay_minutes") {
+		t.Fatalf("want rejection of cleanup_delay_minutes, got %v", err)
+	}
+	if CleanupDelay != 30*time.Minute || TickInterval != time.Minute {
+		t.Fatalf("reference timings changed: cleanup %s, tick %s", CleanupDelay, TickInterval)
+	}
+}
+
+// B6: init ships the main-session duties (read the report, «Not done / uncertain» first, check the diff).
+func TestInitWritesOrchestratorDuties(t *testing.T) {
+	home := t.TempDir()
+	cmd := exec.Command(selfBin, "init", "--agent", "test")
+	cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("init: %v %s", err, out)
+	}
+	b, err := os.ReadFile(filepath.Join(home, "test", "orchestrator.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"оркестратор читает его первым", "после того как прочитала отчёт и проверила дифф", "Удалять worktree после прочтения"} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("orchestrator.md lacks %q", want)
+		}
 	}
 }

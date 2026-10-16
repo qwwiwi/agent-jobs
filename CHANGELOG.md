@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased] – fix-loop 2 (Codex + Fable review, conformance walk)
+
+### Fixed
+- Guard regression from N6: back to fail closed. A program not positively classified as data-only (echo/printf/grep/rg/cat/ls/head/tail/wc/file/stat/which/type/man/test/[, mkdir/touch/cp/mv/rm, find without -exec; brew install|info|search|list, apt-get install, go get|install, pip/npm install; a python script file with no -c/-m and option values skipped) is rejected when a git/gh or shell word is among its arguments. Closes awk system(), vim/ex -c '!…', docker exec, Rscript -e, deno eval, bun -e, expect -c, pwsh -c, gdb -ex shell, sed …/e, `python3 -W ignore -c`, rg --pre, man -P.
+- Shell detection is case-insensitive (`BASH -c` on a case-insensitive FS) and covers csh/tcsh/ash/mksh/fish (`--command`) and others; `busybox` is a wrapper, `nix-shell --run|--command` is parsed like `sh -c`; `eval --` and `time -p` no longer hide the command.
+- B1: gh is checked against a read-only allowlist (view/list/diff/checks/status …); `gh pr|issue close|reopen --comment`, `merge --body`, gist, repo edit, auth token and any future subcommand are rejected; deny list extended with `gh pr|issue close|reopen`, `gh gist create|new|edit`.
+- B2: `git commit -C/-c`, `--reuse-message`, `--reedit-message`, `--fixup` (incl. amend:/reword:), `--squash` and abbreviated long options (`--mess=`) are rejected; `-t/--template` files are checked like `-F`.
+- B3: preamble wording 1:1 with the reference – no «unless the brief names a path» exception.
+- B4: reference timings fixed: daemon `--interval` removed (tick every minute), `cleanup_delay_minutes` removed (cleanup 30 min after notify); a config that still sets it is rejected.
+
+### Added
+- B6: `prompts/orchestrator.md` – main-session duties quoted verbatim from the reference (read the report, «Not done / uncertain» first, check the diff, publish only after; cleanup/patches); `agent-jobs init` writes it to `<state>/orchestrator.md`, README links it.
+
+### Docs
+- B5: the separate code-graph MCP server is listed in ARCHITECTURE «Not in stage 1» as stage 2+.
+
 ## [Unreleased] – fix-loop 1 (Codex review of stage 1)
 
 ### Fixed

@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -88,10 +87,9 @@ func (m *Manager) cleanupDue() error {
 	if err != nil {
 		return err
 	}
-	delay := time.Duration(*m.Cfg.CleanupDelayMinutes) * time.Minute
 	now := m.Now()
 	for _, j := range jobs {
-		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < delay {
+		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
 		}
 		if err := m.Cleanup(j); err != nil {
