@@ -422,3 +422,80 @@ func TestCheckFailClosedAllowlist(t *testing.T) {
 		})
 	}
 }
+
+// B1–B2 (conformance walk): no comments in any gh form; no commit message reused from another commit.
+func TestCheckCommentsAndReusedMessages(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"gh pr close --comment", `gh pr close 123 --comment 'x'`, true},
+		{"gh pr close -c", `gh pr close 123 -c x`, true},
+		{"gh pr close plain", `gh pr close 123`, true},
+		{"gh issue close --comment", `gh issue close 5 --comment x`, true},
+		{"gh issue reopen -c", `gh issue reopen 5 -c x`, true},
+		{"gh pr reopen --comment", `gh pr reopen 5 --comment x`, true},
+		{"gh pr merge --body", `gh pr merge 5 --body x`, true},
+		{"gh pr ready", `gh pr ready 5`, true},
+		{"gh issue develop", `gh issue develop 5`, true},
+		{"gh gist create", `gh gist create f.txt`, true},
+		{"gh repo edit", `gh repo edit --description x`, true},
+		{"gh label create", `gh label create bug`, true},
+		{"gh workflow run", `gh workflow run ci.yml`, true},
+		{"gh auth token", `gh auth token`, true},
+		{"gh secret set", `gh secret set X`, true},
+		{"gh unknown future", `gh newthing do`, true},
+		{"gh -R close", `gh -R o/r issue close 1 --comment x`, true},
+		{"gh pr view ok", `gh pr view 5 --comments`, false},
+		{"gh pr list ok", `gh pr list --state open`, false},
+		{"gh issue view ok", `gh issue view 5`, false},
+		{"gh pr checks ok", `gh pr checks 5`, false},
+		{"gh search ok", `gh search issues guard`, false},
+		{"gh auth status ok", `gh auth status`, false},
+		{"gh version ok", `gh --version`, false},
+
+		{"commit -C HEAD", `git commit -C HEAD`, true},
+		{"commit -c HEAD", `git commit -c HEAD`, true},
+		{"commit -aC", `git commit -aC HEAD`, true},
+		{"commit -CHEAD", `git commit -CHEAD`, true},
+		{"commit --reuse-message=", `git commit --reuse-message=HEAD`, true},
+		{"commit --reuse-message sep", `git commit --reuse-message HEAD`, true},
+		{"commit --reedit-message=", `git commit --reedit-message=HEAD~1`, true},
+		{"commit --fixup=amend:", `git commit --fixup=amend:HEAD`, true},
+		{"commit --fixup=reword:", `git commit --fixup=reword:HEAD`, true},
+		{"commit --fixup plain", `git commit --fixup HEAD`, true},
+		{"commit --squash", `git commit --squash=HEAD`, true},
+		{"commit --squash sep", `git commit --squash HEAD`, true},
+		{"commit abbreviated --reuse", `git commit --reuse=HEAD`, true},
+		{"commit abbreviated --mess owner", `git commit --mess="by Dashi"`, true},
+		{"commit abbreviated --mess clean", `git commit --mess="Исправил"`, true},
+		{"commit -m with C inside value", `git commit -mCleanup`, false},
+		{"commit -am ok", `git commit -am "Исправил"`, false},
+		{"commit --amend --no-edit ok", `git commit --amend --no-edit`, false},
+		{"commit --allow-empty ok", `git commit --allow-empty -m x`, false},
+		{"git -C dir commit ok", `git -C sub commit -m x`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
+func TestCommitTemplateFileIsChecked(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tpl"), []byte("fix for Dashi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{OwnerNames: []string{"Dashi"}, Dir: dir}
+	for _, cmd := range []string{"git commit -t tpl", "git commit --template=tpl", "git commit --template tpl"} {
+		if Check(cmd, cfg) == "" {
+			t.Fatalf("%s: owner name in the template must block", cmd)
+		}
+	}
+}

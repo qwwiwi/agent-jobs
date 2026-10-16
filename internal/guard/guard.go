@@ -4,7 +4,8 @@
 //   - a wait-loop that uses `pgrep -f` (the loop's own shell matches its pattern, so it never ends);
 //   - the owner's name inside a commit;
 //   - a foreign git identity (author/committer other than the configured one);
-//   - anything that goes outside: git push/tag, gh release/api, PR/issue create/comment/edit/merge/review.
+//   - anything that goes outside: git push/tag; any gh call except read-only subcommands (view, list,
+//     diff, checks, status …), so PR/issue create/comment/edit/merge/review/close --comment are rejected.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'` are still seen. The guard FAILS CLOSED: a form it
@@ -372,10 +373,34 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	return ""
 }
 
-var ghOut = map[string]map[string]bool{
-	"pr":    {"create": true, "new": true, "comment": true, "edit": true, "merge": true, "review": true},
-	"issue": {"create": true, "new": true, "comment": true, "edit": true},
-	"alias": {"set": true, "import": true}, // an alias can disguise any of the above
+// ghRead is the only gh surface a job may use: read-only subcommands. Everything else is rejected
+// (fail closed): writes that publish or reach a human (pr/issue create, comment, edit, merge, review,
+// close/reopen --comment, gist, repo, label, secret, workflow run, release, api, alias set …) and
+// any subcommand gh adds later. A group with no subcommand (`gh pr`) only prints help.
+var ghRead = map[string]map[string]bool{
+	"":         {"": true},
+	"help":     nil, // any
+	"version":  nil,
+	"status":   {"": true},
+	"search":   nil,
+	"browse":   nil,
+	"pr":       {"": true, "view": true, "list": true, "diff": true, "checks": true, "status": true, "checkout": true},
+	"issue":    {"": true, "view": true, "list": true, "status": true},
+	"repo":     {"": true, "view": true, "list": true, "clone": true},
+	"run":      {"": true, "view": true, "list": true, "watch": true, "download": true},
+	"workflow": {"": true, "view": true, "list": true},
+	"gist":     {"": true, "view": true, "list": true, "clone": true},
+	"label":    {"": true, "list": true},
+	"auth":     {"": true, "status": true},
+	"alias":    {"": true, "list": true},
+}
+
+func ghAllowed(group, sub string) bool {
+	subs, ok := ghRead[group]
+	if !ok {
+		return false
+	}
+	return subs == nil || subs[sub]
 }
 
 func outside(what string) string {
@@ -402,7 +427,7 @@ func checkNothingOut(scripts []*script, _ string, _ Config) string {
 			return ""
 		}
 		if group, sub, ok := parseGh(argv); ok {
-			if group == "release" || group == "api" || ghOut[group][sub] {
+			if !ghAllowed(group, sub) {
 				return outside(strings.TrimSpace("gh " + group + " " + sub))
 			}
 		}
@@ -607,8 +632,23 @@ func commitTexts(args []string, dyn []bool, cfg Config) (texts []string, problem
 		}
 		texts = append(texts, w)
 	}
-	for i := 0; i < len(args); i++ {
+	reuse := func(form string) {
+		problem = "commit message reused from another commit (" + form + "): its text and author are not visible to the guard; " +
+			"write the message with -m or -F <file>"
+	}
+	for i := 0; i < len(args) && problem == ""; i++ {
 		a := args[i]
+		if strings.HasPrefix(a, "--") && a != "--" {
+			name, _, _ := strings.Cut(a[2:], "=")
+			if reuseLong(name) {
+				reuse("--" + name)
+				return texts, problem
+			}
+			if abbrev(name) {
+				problem = "abbreviated long option --" + name + "; write commit options in full"
+				return texts, problem
+			}
+		}
 		next := func() (string, bool) {
 			if i+1 < len(args) {
 				i++
@@ -621,17 +661,21 @@ func commitTexts(args []string, dyn []bool, cfg Config) (texts []string, problem
 			return texts, problem
 		case a == "--message" || a == "--trailer" || a == "--author":
 			text(next())
-		case a == "--file":
+		case a == "--file" || a == "--template":
 			readFile(next())
 		case strings.HasPrefix(a, "--message="), strings.HasPrefix(a, "--trailer="), strings.HasPrefix(a, "--author="):
 			text(a[strings.IndexByte(a, '=')+1:], dyn[i])
-		case strings.HasPrefix(a, "--file="):
-			readFile(strings.TrimPrefix(a, "--file="), dyn[i])
+		case strings.HasPrefix(a, "--file="), strings.HasPrefix(a, "--template="):
+			readFile(a[strings.IndexByte(a, '=')+1:], dyn[i])
 		case strings.HasPrefix(a, "--"):
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			for k := 1; k < len(a); k++ {
 				l := a[k]
-				if strings.IndexByte("mFCct", l) < 0 {
+				if l == 'C' || l == 'c' {
+					reuse("-" + string(l))
+					return texts, problem
+				}
+				if strings.IndexByte("mFt", l) < 0 {
 					continue
 				}
 				v, d := a[k+1:], dyn[i]
@@ -641,7 +685,7 @@ func commitTexts(args []string, dyn []bool, cfg Config) (texts []string, problem
 				switch l {
 				case 'm':
 					text(v, d)
-				case 'F':
+				case 'F', 't':
 					readFile(v, d)
 				}
 				break
@@ -649,6 +693,25 @@ func commitTexts(args []string, dyn []bool, cfg Config) (texts []string, problem
 		}
 	}
 	return texts, problem
+}
+
+// commitReuse are the `git commit` long options that take the message (and with -C/-c the
+// authorship) from another commit: --reuse-message, --reedit-message, --fixup (incl. amend:/reword:),
+// --squash.
+var commitReuse = []string{"reuse-message", "reedit-message", "fixup", "squash"}
+
+func reuseLong(name string) bool { return slices.Contains(commitReuse, name) }
+
+// commitTextOpts are the long options whose value ends up in the commit (or reuses another one).
+var commitTextOpts = []string{"message", "file", "template", "trailer", "author", "reuse-message", "reedit-message", "fixup", "squash"}
+
+// abbrev reports a long option git would expand (git accepts unique prefixes) into one of
+// commitTextOpts: `--mess=…` is `--message=…`, `--reuse` is `--reuse-message`.
+func abbrev(name string) bool {
+	if name == "" || slices.Contains(commitTextOpts, name) {
+		return false
+	}
+	return slices.ContainsFunc(commitTextOpts, func(o string) bool { return strings.HasPrefix(o, name) })
 }
 
 func checkOwnerInCommit(scripts []*script, _ string, cfg Config) string {

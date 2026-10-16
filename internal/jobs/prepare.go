@@ -27,6 +27,14 @@ var denyRules = []string{
 	"Bash(gh issue new:*)",
 	"Bash(gh issue comment:*)",
 	"Bash(gh issue edit:*)",
+	// close/reopen take --comment / -c: a job may not publish comments in any form.
+	"Bash(gh pr close:*)",
+	"Bash(gh pr reopen:*)",
+	"Bash(gh issue close:*)",
+	"Bash(gh issue reopen:*)",
+	"Bash(gh gist create:*)",
+	"Bash(gh gist new:*)",
+	"Bash(gh gist edit:*)",
 	// Attached / string forms the guard rejects as unverifiable (`git -cuser.name=x`, `env -S '…'`).
 	"Bash(git -c*)",
 	"Bash(git --config-env*)",
