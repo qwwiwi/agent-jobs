@@ -292,3 +292,44 @@ func TestCheckFixLoop2(t *testing.T) {
 		})
 	}
 }
+
+// N6: arguments of an ordinary program are data; only indirect executors have their args scanned.
+func TestCheckArgsAreData(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"brew install gh", "brew install gh", false},
+		{"brew install git", "brew install git", false},
+		{"mkdir git", "mkdir git", false},
+		{"go get git path", "go get github.com/x/git", false},
+		{"ls git", "ls git", false},
+		{"apt-get install git", "apt-get install git", false},
+		{"python script with git arg", "python3 tool.py git", false},
+		{"xargs git push", "xargs git push", true},
+		{"timeout git push", "timeout 5 git push", true},
+		{"nohup gh pr create", "nohup gh pr create", true},
+		{"python -c git push", `python3 -c "import os; os.system('git push')"`, true},
+		{"find -exec git push", `find . -exec git push \;`, true},
+		{"find -execdir git", `find . -execdir git push \;`, true},
+		{"flock git", "flock /tmp/l git push", true},
+		{"parallel gh", "parallel gh pr create ::: a", true},
+		{"ssh git", "ssh host git push", true},
+		{"perl -e git", `perl -e 'system("git push")'`, true},
+		{"node -e gh", `node -e 'require("child_process").execSync("gh pr create")'`, true},
+		{"fish -c git", `fish -c 'git push'`, true},
+		{"script -c git", `script -q -c 'git push' /dev/null`, true},
+		{"watch bash", "watch bash x.sh", true},
+		{"stdbuf git", "stdbuf -oL git push", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

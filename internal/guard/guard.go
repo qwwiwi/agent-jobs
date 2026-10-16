@@ -178,11 +178,66 @@ var indirect = map[string]bool{
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
 }
 
-// safeReaders only print or match their arguments; a word "git" there is data.
-var safeReaders = map[string]bool{
-	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "which": true,
-	"type": true, "whereis": true, "man": true, "cat": true, "ls": true, "cd": true, "test": true, "[": true,
-	"head": true, "tail": true, "wc": true, "file": true, "stat": true, "pgrep": true, "ps": true,
+// executors run (part of) their arguments as a command; for them a git/gh/shell word among the
+// arguments is rejected. For any other program the arguments are data (`brew install git`, `mkdir gh`).
+var executors = map[string]bool{
+	"xargs": true, "env": true, "nice": true, "nohup": true, "timeout": true, "time": true, "sudo": true,
+	"doas": true, "command": true, "exec": true, "builtin": true, "watch": true, "trap": true, "parallel": true,
+	"flock": true, "stdbuf": true, "unbuffer": true, "script": true, "ssh": true, "chroot": true, "setsid": true,
+}
+
+// codeFlags maps interpreters to the short flags (letters) and long flags that make them run
+// their argument as code: `python3 -c "…"`, `perl -e '…'`, `node --eval '…'`, `fish -c '…'`.
+var codeFlags = map[string]struct {
+	short string
+	long  []string
+}{
+	"python": {"c", nil}, "perl": {"eE", nil}, "ruby": {"e", nil}, "node": {"ep", []string{"--eval", "--print"}},
+	"fish": {"c", []string{"--command"}}, "osascript": {"e", nil}, "php": {"r", nil}, "lua": {"e", nil},
+}
+
+// findExec are the find actions that run a command.
+var findExec = map[string]bool{"-exec": true, "-execdir": true, "-ok": true, "-okdir": true}
+
+// interpreter returns the codeFlags key for name (python3, python3.12 -> python).
+func interpreter(name string) string {
+	if strings.HasPrefix(name, "python") {
+		return "python"
+	}
+	if _, ok := codeFlags[name]; ok {
+		return name
+	}
+	return ""
+}
+
+// runsArgs reports whether a program runs (part of) its arguments as a command.
+func runsArgs(name string, args []string) bool {
+	if executors[name] {
+		return true
+	}
+	if name == "find" {
+		return slices.ContainsFunc(args, func(a string) bool { return findExec[a] })
+	}
+	in := interpreter(name)
+	if in == "" {
+		return false
+	}
+	cf := codeFlags[in]
+	for _, a := range args {
+		if strings.HasPrefix(a, "--") {
+			if slices.ContainsFunc(cf.long, func(l string) bool { return a == l || strings.HasPrefix(a, l+"=") }) {
+				return true
+			}
+			continue
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return false // a script file (or stdin): the rest are its arguments, i.e. data
+		}
+		if strings.ContainsAny(a[1:], cf.short) {
+			return true
+		}
+	}
+	return false
 }
 
 var reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh)($|[^a-z0-9_-])`)
@@ -280,7 +335,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 				return cannot("alias")
 			}
 		}
-	case !safeReaders[name]:
+	case runsArgs(name, argv[1:]):
 		// find -exec git, flock … git, trap 'git push' EXIT, python -c "…git…": the guard cannot see
 		// what such a program runs, so any git/gh (or shell/eval) among its arguments is rejected.
 		for _, a := range argv[1:] {
