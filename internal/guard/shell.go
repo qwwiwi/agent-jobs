@@ -402,7 +402,49 @@ func (p *parser) double() {
 
 const maxNesting = 8
 
-var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true}
+// shells are matched on the lower-cased base name (macOS file systems are case-insensitive:
+// `BASH -c` runs bash). `busybox sh` is seen through the busybox wrapper (see wrapperValueFlags).
+var shells = map[string]bool{
+	"sh": true, "bash": true, "rbash": true, "zsh": true, "dash": true, "ash": true, "ksh": true,
+	"mksh": true, "pdksh": true, "oksh": true, "yash": true, "posh": true, "csh": true, "tcsh": true, "fish": true,
+}
+
+// shellCode returns the command string a shell runs from -c / --command / --command=.
+func shellCode(argv []string) (string, bool) {
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case strings.HasPrefix(a, "--command="):
+			return strings.TrimPrefix(a, "--command="), true
+		case a == "--command" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.Contains(a, "c")):
+			if i+1 < len(argv) {
+				return argv[i+1], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// runnerCode returns the command strings of runners that take a shell command as an option value
+// (`nix-shell --run 'git push'`, `nix-shell --command …`), so they are parsed like `sh -c`.
+func runnerCode(name string, argv []string) []string {
+	if name != "nix-shell" && name != "nix" {
+		return nil
+	}
+	var out []string
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case (a == "--run" || a == "--command") && i+1 < len(argv):
+			out = append(out, argv[i+1])
+			i++
+		case strings.HasPrefix(a, "--run="), strings.HasPrefix(a, "--command="):
+			out = append(out, a[strings.IndexByte(a, '=')+1:])
+		}
+	}
+	return out
+}
 
 // parseAll returns src and every script nested in it (substitutions, `sh -c`, `eval`).
 func parseAll(src string) []*script {
@@ -424,15 +466,20 @@ func parseAll(src string) []*script {
 				if len(argv) == 0 {
 					continue
 				}
-				switch name := base(argv[0]); {
+				switch name := strings.ToLower(base(argv[0])); {
 				case name == "eval":
-					walk(strings.Join(argv[1:], " "), depth+1)
+					rest := argv[1:]
+					if len(rest) > 0 && rest[0] == "--" {
+						rest = rest[1:] // `eval -- 'git push'`
+					}
+					walk(strings.Join(rest, " "), depth+1)
 				case shells[name]:
-					for i := 1; i < len(argv)-1; i++ {
-						if strings.HasPrefix(argv[i], "-") && !strings.HasPrefix(argv[i], "--") && strings.Contains(argv[i], "c") {
-							walk(argv[i+1], depth+1)
-							break
-						}
+					if code, ok := shellCode(argv); ok {
+						walk(code, depth+1)
+					}
+				default:
+					for _, code := range runnerCode(name, argv) {
+						walk(code, depth+1)
 					}
 				}
 			}
@@ -456,6 +503,7 @@ var (
 var wrapperValueFlags = map[string]string{
 	"env": "uCS", "command": "", "builtin": "", "exec": "a", "nohup": "", "nice": "n",
 	"timeout": "sk", "xargs": "IinPLdEsa", "sudo": "ugCDhpRrTU", "doas": "uC", "stdbuf": "ioe",
+	"busybox": "", // `busybox sh -c …`, `busybox git …`: the applet is the real program
 }
 
 // cmdView is a simple command with keywords, assignments and wrapper programs stripped.
@@ -470,14 +518,22 @@ func split(words []string) cmdView {
 	var v cmdView
 	i := 0
 	for i < len(words) && (keywords[words[i]] || reAssign.MatchString(words[i])) {
+		if words[i] == "time" { // `time -p git push`: the options of time do not hide the command
+			for i+1 < len(words) && strings.HasPrefix(words[i+1], "-") {
+				i++
+				if words[i] == "--" {
+					break
+				}
+			}
+		}
 		i++
 	}
 	for i < len(words) {
-		vf, ok := wrapperValueFlags[base(words[i])]
+		name := strings.ToLower(base(words[i]))
+		vf, ok := wrapperValueFlags[name]
 		if !ok {
 			break
 		}
-		name := base(words[i])
 		v.wrappers = append(v.wrappers, name)
 		i++
 		for i < len(words) {

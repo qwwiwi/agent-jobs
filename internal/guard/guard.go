@@ -178,63 +178,84 @@ var indirect = map[string]bool{
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
 }
 
-// executors run (part of) their arguments as a command; for them a git/gh/shell word among the
-// arguments is rejected. For any other program the arguments are data (`brew install git`, `mkdir gh`).
-var executors = map[string]bool{
-	"xargs": true, "env": true, "nice": true, "nohup": true, "timeout": true, "time": true, "sudo": true,
-	"doas": true, "command": true, "exec": true, "builtin": true, "watch": true, "trap": true, "parallel": true,
-	"flock": true, "stdbuf": true, "unbuffer": true, "script": true, "ssh": true, "chroot": true, "setsid": true,
+// dataReaders only print, match, inspect or move files named by their arguments: a word "git"
+// there is data. Every program NOT positively classified as data-only (here, dataSubcommands or a
+// python script file) has its arguments scanned, and a git/gh/shell word among them is rejected
+// (fail closed: awk system(), vim -c '!…', docker exec, gdb -ex shell, sed …/e and any runner the
+// guard does not know).
+var dataReaders = map[string]bool{
+	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "cat": true,
+	"ls": true, "head": true, "tail": true, "wc": true, "file": true, "stat": true, "which": true,
+	"type": true, "whereis": true, "man": true, "test": true, "[": true, "cd": true, "pgrep": true,
+	"ps": true, "mkdir": true, "touch": true, "cp": true, "mv": true, "rm": true, "find": true,
 }
 
-// codeFlags maps interpreters to the short flags (letters) and long flags that make them run
-// their argument as code: `python3 -c "…"`, `perl -e '…'`, `node --eval '…'`, `fish -c '…'`.
-var codeFlags = map[string]struct {
-	short string
-	long  []string
-}{
-	"python": {"c", nil}, "perl": {"eE", nil}, "ruby": {"e", nil}, "node": {"ep", []string{"--eval", "--print"}},
-	"fish": {"c", []string{"--command"}}, "osascript": {"e", nil}, "php": {"r", nil}, "lua": {"e", nil},
+// dataSubcommands are package managers whose listed subcommands only take package names.
+var dataSubcommands = map[string]map[string]bool{
+	"brew":    {"install": true, "info": true, "search": true, "list": true},
+	"apt-get": {"install": true},
+	"go":      {"get": true, "install": true},
+	"pip":     {"install": true},
+	"pip3":    {"install": true},
+	"npm":     {"install": true},
 }
 
 // findExec are the find actions that run a command.
 var findExec = map[string]bool{"-exec": true, "-execdir": true, "-ok": true, "-okdir": true}
 
-// interpreter returns the codeFlags key for name (python3, python3.12 -> python).
-func interpreter(name string) string {
-	if strings.HasPrefix(name, "python") {
-		return "python"
+// dataOnly reports whether name (lower-cased base name) with args is positively known to treat
+// its arguments as data only.
+func dataOnly(name string, args []string, dyn []bool) bool {
+	switch {
+	case name == "find":
+		return !slices.ContainsFunc(args, func(a string) bool { return findExec[a] })
+	case name == "rg": // --pre runs a command on every file
+		return !slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--pre") && !strings.HasPrefix(a, "--pre-glob") })
+	case name == "man": // -P / --pager / -H run a program
+		return !slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "-") })
+	case dataReaders[name]:
+		return true
+	case dataSubcommands[name] != nil:
+		return len(args) > 0 && !dyn[0] && dataSubcommands[name][args[0]]
+	case strings.HasPrefix(name, "python"):
+		return pythonScriptFile(args, dyn)
 	}
-	if _, ok := codeFlags[name]; ok {
-		return name
-	}
-	return ""
+	return false
 }
 
-// runsArgs reports whether a program runs (part of) its arguments as a command.
-func runsArgs(name string, args []string) bool {
-	if executors[name] {
-		return true
-	}
-	if name == "find" {
-		return slices.ContainsFunc(args, func(a string) bool { return findExec[a] })
-	}
-	in := interpreter(name)
-	if in == "" {
-		return false
-	}
-	cf := codeFlags[in]
+// pythonValueOpts are the python short options that take a value (attached or as the next word).
+const pythonValueOpts = "WX"
+
+// pythonScriptFile reports a plain `python3 [opts] script.py args…` call: no -c / -m anywhere
+// (fail closed even after the script name), option values skipped, a literal script file.
+func pythonScriptFile(args []string, dyn []bool) bool {
 	for _, a := range args {
-		if strings.HasPrefix(a, "--") {
-			if slices.ContainsFunc(cf.long, func(l string) bool { return a == l || strings.HasPrefix(a, l+"=") }) {
-				return true
+		if a == "--command" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsAny(a[1:], "cm")) {
+			return false
+		}
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return i+1 < len(args) && !dyn[i+1] && args[i+1] != "-"
+		case a == "-":
+			return false // program from stdin
+		case strings.HasPrefix(a, "--"):
+			if a == "--check-hash-based-pycs" {
+				i++
 			}
-			continue
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			return false // a script file (or stdin): the rest are its arguments, i.e. data
-		}
-		if strings.ContainsAny(a[1:], cf.short) {
-			return true
+		case strings.HasPrefix(a, "-"):
+			for k := 1; k < len(a); k++ {
+				if strings.IndexByte(pythonValueOpts, a[k]) >= 0 {
+					if k == len(a)-1 {
+						i++ // value is the next word
+					}
+					break
+				}
+			}
+		default:
+			return !dyn[i] // the script file; the rest are its arguments, i.e. data
 		}
 	}
 	return false
@@ -311,6 +332,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 		for k := 1; k < len(argv); k++ {
 			a := argv[k]
 			if strings.HasPrefix(a, "--") {
+				cflag = cflag || a == "--command" || strings.HasPrefix(a, "--command=") // fish
 				continue
 			}
 			if strings.HasPrefix(a, "-") && len(a) > 1 {
@@ -335,13 +357,16 @@ func unverifiable(sc *script, c *simpleCmd) string {
 				return cannot("alias")
 			}
 		}
-	case runsArgs(name, argv[1:]):
-		// find -exec git, flock … git, trap 'git push' EXIT, python -c "…git…": the guard cannot see
-		// what such a program runs, so any git/gh (or shell/eval) among its arguments is rejected.
-		for _, a := range argv[1:] {
-			if b := strings.ToLower(base(a)); indirect[b] || shells[b] || reMention.MatchString(a) {
-				return cannot(name + " running git/gh or a shell indirectly")
-			}
+	}
+	if name == "eval" || dataOnly(name, argv[1:], dyn[1:]) {
+		return ""
+	}
+	// Any other program (find -exec, flock, trap 'git push' EXIT, python -c, awk system(), vim -c '!…',
+	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
+	// arguments is rejected.
+	for _, a := range argv[1:] {
+		if b := strings.ToLower(base(a)); indirect[b] || shells[b] || reMention.MatchString(a) {
+			return cannot(name + " running git/gh or a shell indirectly")
 		}
 	}
 	return ""

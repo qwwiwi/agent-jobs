@@ -333,3 +333,92 @@ func TestCheckArgsAreData(t *testing.T) {
 		})
 	}
 }
+
+// Fix-loop 2, round 2: fail closed again. A program not positively known as data-only that has a
+// git/gh word among its arguments is rejected; N6's false positives stay allowed via the allowlist.
+func TestCheckFailClosedAllowlist(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// Bypasses of the N6 denylist: all must block.
+		{"awk system", `awk 'BEGIN{system("git push")}'`, true},
+		{"csh -c", `csh -c 'git push'`, true},
+		{"tcsh -c", `tcsh -c 'git push'`, true},
+		{"abs csh -c", `/bin/csh -c 'git push'`, true},
+		{"ksh -c", `ksh -c 'git push'`, true},
+		{"dash -c", `dash -c 'git push'`, true},
+		{"ash -c", `ash -c 'git push'`, true},
+		{"mksh -c", `mksh -c 'git push'`, true},
+		{"fish --command", `fish --command 'git push'`, true},
+		{"fish --command=", `fish --command='git push'`, true},
+		{"vim -c bang", `vim -c ':!git push' -c ':q' f`, true},
+		{"vim -es bang gh", `vim -Nu NONE -es -c '!gh pr merge 1 --merge' -c 'qa!'`, true},
+		{"ex -c bang", `ex -c '!git push|q' f`, true},
+		{"busybox sh -c", `busybox sh -c 'git push'`, true},
+		{"busybox git", `busybox git push`, true},
+		{"nix-shell --run", `nix-shell --run 'git push'`, true},
+		{"nix-shell --run=", `nix-shell --run='git push'`, true},
+		{"python -W value then -c", `python3 -W ignore -c 'import os; os.system("git push")'`, true},
+		{"python -m runner", `python3 -m tool git push`, true},
+		{"python stdin", `python3 - git`, true},
+		{"eval --", `eval -- 'git push'`, true},
+		{"time -p", `time -p git push`, true},
+		{"time -p --", `time -p -- git push`, true},
+		{"docker exec", `docker exec c git push`, true},
+		{"Rscript -e", `Rscript -e 'system("git push")'`, true},
+		{"deno eval", `deno eval 'Deno.run({cmd:["git","push"]})'`, true},
+		{"bun -e", `bun -e 'Bun.spawn(["gh","pr","create"])'`, true},
+		{"expect -c", `expect -c 'spawn git push'`, true},
+		{"pwsh -c", `pwsh -c 'git push'`, true},
+		{"gdb -ex shell", `gdb -ex 'shell git push'`, true},
+		{"sed e flag", `sed 's/.*/git push/e' f`, true},
+		{"unknown runner", `somerunner git push`, true},
+		{"rg --pre", `rg --pre 'git push' x .`, true},
+		{"man -P", `man -P 'git push' ls`, true},
+		{"brew other subcommand", `brew bundle exec git push`, true},
+		{"go run is not data", `go run ./x git push`, true},
+		{"upper BASH -c", `BASH -c 'git push'`, true},
+		{"upper ZSH -c", `ZSH -c 'git push'`, true},
+		{"upper SH -c", `SH -c 'git push'`, true},
+		{"upper abs BASH -c", `/bin/BASH -c 'git push'`, true},
+		{"upper EVAL", `EVAL 'git push'`, true},
+		{"upper ENV wrapper", `ENV git push`, true},
+
+		// N6 false positives: data-only programs, must pass.
+		{"brew install git", "brew install git", false},
+		{"brew info gh", "brew info gh", false},
+		{"mkdir gh", "mkdir gh", false},
+		{"ls git", "ls git", false},
+		{"echo git", "echo git", false},
+		{"grep -r gh", "grep -r gh .", false},
+		{"rg git", "rg -n git .", false},
+		{"cat git file", "cat docs/git.md", false},
+		{"cp git", "cp git /tmp/x", false},
+		{"rm gh", "rm -rf gh", false},
+		{"touch git", "touch git", false},
+		{"apt-get install git", "apt-get install git", false},
+		{"go get git", "go get github.com/x/git", false},
+		{"go install gh", "go install github.com/cli/cli/v2/cmd/gh@latest", false},
+		{"pip install git", "pip install gitpython git", false},
+		{"npm install gh", "npm install gh", false},
+		{"python script file", "python3 tool.py git", false},
+		{"python -W script file", "python3 -W ignore tool.py git", false},
+		{"python -Wvalue script file", "python3 -Wignore -u tool.py gh", false},
+		{"find name git", "find . -name git", false},
+		{"man git", "man git", false},
+		{"time -p plain", "time -p go test ./...", false},
+		{"eval -- plain", "eval -- echo hi", false},
+		{"csh plain", `csh -c 'make'`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
