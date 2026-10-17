@@ -265,10 +265,16 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch"} {
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch",
+		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}
+	}
+	// The hook is registered for every tool (file tools included), not only Bash.
+	hooks, _ := json.Marshal(m.Settings("general")["hooks"])
+	if !strings.Contains(string(hooks), `"matcher":"*"`) {
+		t.Fatalf("guard hook must match every tool: %s", hooks)
 	}
 	if strings.Contains(deny("research"), "WebFetch") || strings.Contains(deny("research"), "WebSearch") {
 		t.Fatal("research must allow web tools")
@@ -293,6 +299,74 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 	}
 	if code := run(`go test ./...`); code != 0 {
 		t.Fatalf("plain command: exit %d, want 0", code)
+	}
+	// File tools go through the same hook command.
+	runFile := func(tool, path string) int {
+		in, _ := json.Marshal(map[string]any{"tool_name": tool, "cwd": t.TempDir(), "tool_input": map[string]string{"file_path": path}})
+		c := exec.Command("sh", "-c", m.GuardCommand())
+		c.Stdin = bytes.NewReader(in)
+		var ee *exec.ExitError
+		if err := c.Run(); errors.As(err, &ee) {
+			return ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+	if code := runFile("Write", "/repo/.git/hooks/pre-commit"); code != 2 {
+		t.Fatalf("Write into .git: exit %d, want 2", code)
+	}
+	if code := runFile("Edit", "/repo/main.go"); code != 0 {
+		t.Fatalf("Edit elsewhere: exit %d, want 0", code)
+	}
+}
+
+// Codex review of PR #3: the guard of a repo job knows the worktree's real git dirs (admin dir and
+// common dir), so a file tool cannot write there whatever they are called.
+func TestGuardKnowsJobGitDirs(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	admin := gitT(t, work, "rev-parse", "--absolute-git-dir")
+	common := gitT(t, work, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s struct {
+		Hooks struct {
+			PreToolUse []struct {
+				Hooks []struct{ Command string } `json:"hooks"`
+			} `json:"PreToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil || len(s.Hooks.PreToolUse) == 0 || len(s.Hooks.PreToolUse[0].Hooks) == 0 {
+		t.Fatalf("settings.json: %v %s", err, b)
+	}
+	cmd := s.Hooks.PreToolUse[0].Hooks[0].Command
+	for _, d := range []string{admin, common} {
+		if !strings.Contains(cmd, "--git-dir "+shellQuote(d)) {
+			t.Fatalf("guard command lacks --git-dir %s: %s", d, cmd)
+		}
+	}
+	run := func(path string) int {
+		in, _ := json.Marshal(map[string]any{"tool_name": "Write", "cwd": work, "tool_input": map[string]string{"file_path": path}})
+		c := exec.Command("sh", "-c", cmd)
+		c.Stdin = bytes.NewReader(in)
+		var ee *exec.ExitError
+		if err := c.Run(); errors.As(err, &ee) {
+			return ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+	if code := run(filepath.Join(admin, "config.worktree")); code != 2 {
+		t.Fatalf("Write into the admin dir: exit %d, want 2", code)
+	}
+	if code := run(filepath.Join(work, "main.go")); code != 0 {
+		t.Fatalf("Write into the work tree: exit %d, want 0", code)
 	}
 }
 

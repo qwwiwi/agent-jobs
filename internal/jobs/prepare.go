@@ -66,6 +66,11 @@ var denyRules = []string{
 	"Bash(bun x:*)",
 	"Bash(pipx run:*)",
 	"Bash(uv tool run:*)",
+	// File tools never write inside a .git directory (also checked by the guard, symlinks resolved).
+	"Edit(**/.git/**)",
+	"Write(**/.git/**)",
+	"MultiEdit(**/.git/**)",
+	"NotebookEdit(**/.git/**)",
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",
@@ -77,8 +82,8 @@ var webTools = []string{"WebFetch", "WebSearch"}
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// GuardCommand is the PreToolUse hook command line for this agent's config.
-func (m *Manager) GuardCommand() string {
+// GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs.
+func (m *Manager) GuardCommand(gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Cfg.OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -89,11 +94,14 @@ func (m *Manager) GuardCommand() string {
 	if m.Cfg.GitEmail != "" {
 		parts = append(parts, "--git-email", shellQuote(m.Cfg.GitEmail))
 	}
+	for _, d := range gitDirs {
+		parts = append(parts, "--git-dir", shellQuote(d))
+	}
 	return strings.Join(parts, " ")
 }
 
-// Settings builds the job's only settings.json: deny rules + the guard hook.
-func (m *Manager) Settings(kind string) map[string]any {
+// Settings builds the job's only settings.json: deny rules + the guard hook (told the job's git dirs).
+func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 	deny := append([]string{}, denyRules...)
 	if kind != "research" {
 		deny = append(deny, webTools...)
@@ -104,7 +112,7 @@ func (m *Manager) Settings(kind string) map[string]any {
 			"PreToolUse": []any{
 				map[string]any{
 					"matcher": "*",
-					"hooks":   []any{map[string]any{"type": "command", "command": m.GuardCommand()}},
+					"hooks":   []any{map[string]any{"type": "command", "command": m.GuardCommand(gitDirs...)}},
 				},
 			},
 		},
@@ -188,9 +196,6 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
 		return err
 	}
-	if err := writeJSON(filepath.Join(dir, "settings.json"), m.Settings(j.Kind)); err != nil {
-		return err
-	}
 	if err := m.writeGitFiles(dir); err != nil {
 		return err
 	}
@@ -199,7 +204,11 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 		return err
 	}
 	work := filepath.Join(dir, "work")
+	settings := filepath.Join(dir, "settings.json")
 	if j.RepoPath == "" {
+		if err := writeJSON(settings, m.Settings(j.Kind)); err != nil {
+			return err
+		}
 		return os.MkdirAll(work, 0o700)
 	}
 	if _, err := os.Stat(work); err == nil {
@@ -209,6 +218,19 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 		return err
 	}
 	if err := m.markWorktree(j, work); err != nil {
+		return err
+	}
+	// The guard learns the worktree's real git dirs (its admin dir and the common dir), which need
+	// not be named .git, so file tools cannot write there.
+	gitDir, err := git(work, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return err
+	}
+	common, err := git(work, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	if err := writeJSON(settings, m.Settings(j.Kind, gitDir, common)); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)

@@ -36,7 +36,7 @@ const usage = `usage: agent-jobs <command> [flags]
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
-  guard      [--owner-name N]... [--git-name N] [--git-email E]   (PreToolUse hook, JSON on stdin)
+  guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
 `
 
 func main() {
@@ -99,10 +99,12 @@ func runGuard(args []string, stdin io.Reader) int {
 	fs.Var(&owners, "owner-name", "owner name that must not appear in commits (repeatable)")
 	name := fs.String("git-name", "", "the job's git user.name (git config may set only this value)")
 	email := fs.String("git-email", "", "allowed git user.email")
+	var gitDirs multi
+	fs.Var(&gitDirs, "git-dir", "the job worktree's git dir; file tools never write inside it (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	reason, err := guard.Decide(stdin, guard.Config{OwnerNames: owners, GitName: *name, GitEmail: *email})
+	reason, err := guard.Decide(stdin, guard.Config{OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
 		fmt.Fprintln(os.Stderr, err)
