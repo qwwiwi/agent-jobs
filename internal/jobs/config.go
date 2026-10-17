@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
@@ -61,6 +62,10 @@ type Config struct {
 	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
 	// and the memory notes of a brief. Empty = not configured: those tools say so, briefs carry no notes.
 	Brain brain.Config `json:"brain"`
+	// CgroupScope is the containment of a job's processes (env AGENT_JOBS_CGROUP_SCOPE wins):
+	// "auto" (default) = its own transient systemd user scope when `systemd-run --user` works, else the
+	// weaker session containment; "required" = a job that cannot get a scope is refused; "off" = never.
+	CgroupScope string `json:"cgroup_scope"`
 	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
 	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
 	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
@@ -145,6 +150,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if err := c.Brain.Validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
+		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
 	}
 	if c.IdleAfterResultSeconds < IdleAfterResultOff {
 		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
@@ -260,4 +268,45 @@ func ResolveModel(kind, model, complexity string) (string, error) {
 		return "", err
 	}
 	return model, nil
+}
+
+// PinScopeRequired sets cgroup_scope to "required" in <state>/config.json when the file does not set it
+// yet and a transient user scope can be created right now (the installer runs it: on a host where scopes
+// work, a job never silently falls back to the weaker session containment). Other keys are kept. It
+// returns what it did, for the installer's output.
+func PinScopeRequired(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, "config.json")
+	raw := map[string]json.RawMessage{}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return "", fmt.Errorf("read config: %w", err)
+	default:
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return "", fmt.Errorf("parse config.json: %w", err)
+		}
+	}
+	if v, ok := raw["cgroup_scope"]; ok {
+		return "cgroup_scope already set (" + string(v) + "), left as is", nil
+	}
+	if err := probeScope(); err != nil {
+		return "cgroup_scope left at auto (no user scope on this host: " + err.Error() + ")", nil
+	}
+	raw["cgroup_scope"] = json.RawMessage(`"required"`)
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return "cgroup_scope set to required (user scopes work on this host): " + path, nil
 }

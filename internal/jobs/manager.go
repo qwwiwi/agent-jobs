@@ -167,6 +167,18 @@ func (m *Manager) jobSpawnEnv() []string {
 	return env
 }
 
+// spawnEnv is the wrapper's start environment: jobSpawnEnv, plus the user bus fallback (userBusEnv)
+// when it starts through `systemd-run --user --scope`. A scope unit runs no process of its own:
+// systemd-run execs the wrapper with this environment, so the user manager's environment never
+// reaches the job.
+func (m *Manager) spawnEnv(unit string) []string {
+	env := m.jobSpawnEnv()
+	if unit != "" {
+		env = userBusEnv(env)
+	}
+	return env
+}
+
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = daemonGitEnv()
@@ -231,8 +243,9 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	return j, nil
 }
 
-// Tick is one daemon pass: collect finished/timed-out jobs, start queued ones (≤2 running),
-// send job-done lines, and clean up worktrees whose notify is older than the cleanup delay.
+// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, start
+// queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
+// cleanup delay.
 func (m *Manager) Tick() error {
 	unlock, err := m.lock()
 	if err != nil {
@@ -242,6 +255,9 @@ func (m *Manager) Tick() error {
 	var errs []error
 	if err := m.collect(); err != nil {
 		errs = append(errs, fmt.Errorf("collect: %w", err))
+	}
+	if err := m.retryScopeStops(); err != nil {
+		errs = append(errs, fmt.Errorf("scope stop: %w", err))
 	}
 	if err := m.launchQueued(); err != nil {
 		errs = append(errs, fmt.Errorf("launch: %w", err))
@@ -310,7 +326,13 @@ func (m *Manager) launchQueued() error {
 			return err
 		}
 		running++
-		if err := m.launch(j, token); err != nil {
+		if err := m.launch(j, token); errors.Is(err, errScopeRetry) {
+			m.Log.Printf("job %s: %v", j.ID, err)
+			if uerr := m.Store.Unclaim(j.ID, token); uerr != nil {
+				m.Log.Printf("job %s: requeue: %v", j.ID, uerr)
+			}
+			return nil // the next queued jobs would meet the same user manager
+		} else if err != nil {
 			m.Log.Printf("job %s refused to start: %v", j.ID, err)
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
@@ -335,10 +357,22 @@ func ClaudeArgs(j *store.Job, jobDir string) []string {
 }
 
 func (m *Manager) launch(j *store.Job, token string) error {
+	// Containment first: a requeued job (errScopeRetry) has nothing prepared yet.
+	unit, err := m.scopeFor(j.ID)
+	if err != nil {
+		return err
+	}
 	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		return err
 	}
-	pid, err := m.spawn(j, token)
+	if unit != "" {
+		// Recorded before the spawn: a daemon that dies right after it still stops the scope later.
+		if err := m.Store.SetScope(j.ID, token, unit); err != nil {
+			return fmt.Errorf("record scope: %w", err)
+		}
+		j.ScopeUnit = unit
+	}
+	pid, err := m.spawn(j, token, unit)
 	if err != nil {
 		return err
 	}
@@ -346,17 +380,26 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	if err := m.Store.SetPID(j.ID, token, pid, pid); err != nil {
 		m.Log.Printf("job %s: record pid %d: %v (adopted next tick via wrapper.json)", j.ID, pid, err)
 	}
-	m.Log.Printf("job %s started pid=%d model=%s", j.ID, pid, j.Model)
+	containment := "session only"
+	if unit != "" {
+		containment = "scope " + unit
+	}
+	m.Log.Printf("job %s started pid=%d model=%s containment=%s", j.ID, pid, j.Model, containment)
 	return nil
 }
 
 // spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
-func (m *Manager) spawn(j *store.Job, token string) (int, error) {
+// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
+// the new scope (same pid).
+func (m *Manager) spawn(j *store.Job, token, unit string) (int, error) {
 	dir := m.JobDir(j.ID)
-	args := append([]string{"run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
-	cmd := exec.Command(m.SelfBin, args...)
+	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
+	if unit != "" {
+		argv = append(scopeArgv(unit, fmt.Sprintf("agent-jobs job %s (agent %s)", j.ID, m.Agent), m.KillGrace), argv...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(dir, "work")
-	cmd.Env = m.jobSpawnEnv()
+	cmd.Env = m.spawnEnv(unit)
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
@@ -410,6 +453,57 @@ func verifyGroup(pid, pgid int) error {
 	}
 	if got != pgid {
 		return fmt.Errorf("wrapper pid %d is in process group %d, not %d", pid, got, pgid)
+	}
+	return nil
+}
+
+// killJob ends a running job (timeout, cancel): its whole scope when it has one, else (or when the
+// stop fails) its wrapper's process group.
+func (m *Manager) killJob(j *store.Job, pid, pgid int) {
+	if j.ScopeUnit != "" {
+		err := m.stopScope(j.ID)
+		if err == nil {
+			return
+		}
+		m.Log.Printf("job %s: stop scope: %v; falling back to the process group", j.ID, err)
+	}
+	if pgid != 0 {
+		m.killGroup(j.ID, pid, pgid)
+	}
+}
+
+// endScope stops a scoped job's unit before its row turns terminal (a no-op for an already collected
+// scope and for jobs without one). An error means the unit could still hold live processes: the stop is
+// then recorded as pending (before the row turns terminal) and retried every tick (retryScopeStops).
+func (m *Manager) endScope(j *store.Job) error {
+	if j.ScopeUnit == "" {
+		return nil
+	}
+	err := m.stopScope(j.ID)
+	if err != nil {
+		if perr := m.Store.SetScopePending(j.ID, true); perr != nil {
+			m.Log.Printf("job %s: record pending scope stop: %v", j.ID, perr)
+		}
+	}
+	return err
+}
+
+// retryScopeStops retries every pending scope stop (a stop that failed when the job ended) until the
+// unit is gone; only then is the pending mark cleared.
+func (m *Manager) retryScopeStops() error {
+	pending, err := m.Store.ScopePending()
+	if err != nil {
+		return err
+	}
+	for _, j := range pending {
+		if err := m.stopScope(j.ID); err != nil {
+			m.Log.Printf("job %s: scope stop still failing (retry next tick): %v", j.ID, err)
+			continue
+		}
+		if err := m.Store.SetScopePending(j.ID, false); err != nil {
+			return err
+		}
+		m.Log.Printf("job %s: scope stopped on retry", j.ID)
 	}
 	return nil
 }
@@ -504,7 +598,7 @@ func (m *Manager) collect() error {
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
-			m.killGroup(j.ID, j.PID, j.PGID)
+			m.killJob(j, j.PID, j.PGID)
 			res := parseStream(filepath.Join(dir, "stream.jsonl"))
 			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
@@ -525,6 +619,17 @@ func (m *Manager) collect() error {
 }
 
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
+	// Whatever ended the job, nothing of it may outlive the row turning terminal.
+	if err := m.endScope(j); err != nil {
+		// Fail closed: the job is over for the daemon, but it must not count as a clean finish.
+		m.Log.Printf("job %s: %v", j.ID, err)
+		note := ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
+		if status == store.StatusTimeout {
+			msg = Printable(msg+"; "+note, 300)
+		} else {
+			status, msg = store.StatusFailed, Printable(note, 300)
+		}
+	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
@@ -591,9 +696,7 @@ func (m *Manager) Cancel(id string) error {
 				pid, pgid = w.PID, w.PGID
 			}
 		}
-		if pgid != 0 {
-			m.killGroup(id, pid, pgid)
-		}
+		m.killJob(j, pid, pgid)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}
@@ -603,5 +706,10 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
-	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+	msg := "cancelled"
+	if err := m.endScope(j); err != nil {
+		m.Log.Printf("job %s: %v", id, err)
+		msg = Printable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
+	}
+	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now)
 }

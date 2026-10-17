@@ -31,12 +31,22 @@ func TestMain(m *testing.M) {
 		}
 	}
 	_ = os.Unsetenv(jobs.JobEnvVar) // the tests set the job marker themselves where they need it
+	// Run inside a job, the binary under test (hooked build) does not count that job's wrapper.
+	var outer []string
+	for _, find := range []func() (int, bool){jobs.WrapperAncestor, jobs.WrapperSession} {
+		if pid, _ := find(); pid > 1 && !slices.Contains(outer, fmt.Sprint(pid)) {
+			outer = append(outer, fmt.Sprint(pid))
+		}
+	}
+	if len(outer) > 0 {
+		_ = os.Setenv("AGENT_JOBS_TEST_OUTER_WRAPPER", strings.Join(outer, ","))
+	}
 	dir, err := os.MkdirTemp("", "agent-jobs-mcp-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	if out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	code := m.Run()
@@ -314,6 +324,12 @@ func TestJobToolsLifecycle(t *testing.T) {
 	if !res.Finished || res.Report != report || res.ReportMissing || res.DoneLine != jobs.DoneLine(done) ||
 		!slices.Contains(res.Artifacts, filepath.Join(dir, "commits.patch")) || !slices.Contains(res.Artifacts, filepath.Join(dir, "report.md")) {
 		t.Fatalf("job_result: %+v", res)
+	}
+	// Containment is visible: the weaker session fallback, a scope, or nothing before launch.
+	var doneSt JobView
+	call(t, cs, "job_status", map[string]any{"id": done.ID}, &doneSt)
+	if doneSt.Containment != "session only" || st.Containment != "" || !strings.HasSuffix(res.DoneLine, " · session only") {
+		t.Fatalf("containment: done %q, queued %q, line %q", doneSt.Containment, st.Containment, res.DoneLine)
 	}
 
 	var list JobListOutput

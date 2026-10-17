@@ -3,6 +3,8 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -294,5 +296,34 @@ func TestJobSpawnEnvDropsTokenEnv(t *testing.T) {
 	}
 	if filepath.Base(BrainSocketPath(m.StateDir)) != "brain.sock" {
 		t.Fatal("socket name")
+	}
+}
+
+// A wrapper started in a systemd scope gets the scrubbed environment too, and still the user bus
+// fallback that systemd-run needs (the merge of PR #10 and the brain token scrub kept only one).
+func TestSpawnEnvScopeDropsTokenKeepsUserBus(t *testing.T) {
+	m := newManager(t)
+	t.Setenv("AJ_TEST_BRAIN_TOKEN", "not-a-secret")
+	m.Cfg.Brain.TokenEnv = "AJ_TEST_BRAIN_TOKEN"
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	_ = os.Unsetenv("XDG_RUNTIME_DIR")
+	_ = os.Unsetenv("DBUS_SESSION_BUS_ADDRESS")
+	for _, unit := range []string{"", ScopePrefix + "a-b.scope"} {
+		for _, kv := range m.spawnEnv(unit) {
+			if strings.HasPrefix(kv, "AJ_TEST_BRAIN_TOKEN=") {
+				t.Fatalf("unit %q: token variable passed to the job", unit)
+			}
+		}
+	}
+	if slices.ContainsFunc(m.spawnEnv(""), func(kv string) bool { return strings.HasPrefix(kv, "XDG_RUNTIME_DIR=") }) {
+		t.Fatal("user bus fallback without a scope")
+	}
+	dir := fmt.Sprintf("/run/user/%d", os.Getuid())
+	if fi, err := os.Stat(filepath.Join(dir, "bus")); err != nil || fi.Mode()&fs.ModeSocket == 0 {
+		t.Skip("no user bus socket on this host")
+	}
+	if !slices.Contains(m.spawnEnv(ScopePrefix+"a-b.scope"), "XDG_RUNTIME_DIR="+dir) {
+		t.Fatal("scope spawn lost the user bus fallback")
 	}
 }

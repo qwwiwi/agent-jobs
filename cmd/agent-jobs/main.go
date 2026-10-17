@@ -246,6 +246,7 @@ func open(agent string) (*jobs.Manager, error) {
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	agent := agentFlag(fs)
+	pin := fs.Bool("pin-scope", false, "set cgroup_scope=required in config.json when unset and user scopes work here (installer)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -254,6 +255,13 @@ func cmdInit(args []string) error {
 		return err
 	}
 	defer m.Close()
+	if *pin {
+		msg, err := jobs.PinScopeRequired(m.StateDir)
+		if err != nil {
+			return err
+		}
+		fmt.Println(msg)
+	}
 	// The main session's duties ship with the tool and are rewritten on every init (not user-edited).
 	ob, err := agentjobs.Templates.ReadFile("prompts/orchestrator.md")
 	if err != nil {
@@ -373,6 +381,9 @@ func cmdStatus(args []string) error {
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
+	if c := jobs.Containment(j); c != "" {
+		fmt.Printf("contain:   %s\n", c)
+	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
@@ -397,11 +408,25 @@ func cmdList(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tTITLE")
+	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD, fmtTime(&j.CreatedAt), j.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD,
+			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// containShort is the containment column of `list`: scope, scope! (stop pending), session, or - (never launched).
+func containShort(j *store.Job) string {
+	switch {
+	case j.ScopeUnit != "" && j.ScopePending:
+		return "scope!"
+	case j.ScopeUnit != "":
+		return "scope"
+	case jobs.Containment(j) == "":
+		return "-"
+	}
+	return "session"
 }
 
 func cmdResult(args []string) error {

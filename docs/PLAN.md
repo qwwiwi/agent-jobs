@@ -12,19 +12,20 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 | [#2](https://github.com/qwwiwi/agent-jobs/pull/2) | **Linux port.** systemd user service `agent-jobs@<agent>` with `KillMode=process` (a daemon restart never kills jobs), idempotent installer, owner decisions recorded. |
 | [#3](https://github.com/qwwiwi/agent-jobs/pull/3) | **Guard hardening.** gh flags before the subcommand, no `gh auth status`, file tools cannot write into `.git`. |
 | [#5](https://github.com/qwwiwi/agent-jobs/pull/5) | **Publication prep.** Reference design published without personal names. |
+| [#7](https://github.com/qwwiwi/agent-jobs/pull/7) | **MCP job tools** (supersedes [#4](https://github.com/qwwiwi/agent-jobs/pull/4)). One MCP server per agent in two roles (`orchestrator`, `job` as an allowlist), `job_start/status/result/list/cancel`, model or complexity required, tmux socket, nested-job prevention (marker, ancestry, session and store checks), session sweep before `exit_code`. |
 | [#8](https://github.com/qwwiwi/agent-jobs/pull/8) | **Skill, subagents, job context** (moved out of Wave A). `agent-jobs` skill installed per agent by `scripts/install-linux.sh` (routing rule, model-or-complexity, how to read a result); jobs may use at most three subagents inside their own limits, guard-counted, only the input keys `description`, `prompt`, `subagent_type`, `model`; job profile (≤ 8 KB, `agent-jobs profile --from`) and project cards (≤ 4 KB, `agent-jobs card new\|list`) attached to the brief. |
 
 ## In progress
 
-**[PR #7](https://github.com/qwwiwi/agent-jobs/pull/7): MCP job tools** (supersedes [#4](https://github.com/qwwiwi/agent-jobs/pull/4)).
+**[PR #10](https://github.com/qwwiwi/agent-jobs/pull/10): cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
 
-- One Go MCP server per agent with two roles: `orchestrator` (main session) and `job`. The job role is an allowlist; the server itself refuses hidden tools, and a test fails if a tool is in neither list.
-- `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` on top of the existing manager.
-- A job's `mcp.json` points at the job-role server.
-- The caller must give a model or a complexity: no classifier, no guessing.
-- tmux socket support for the job-done line.
-- Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
-- Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
+1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope` (config `cgroup_scope`: `auto` by default, `required`, `off`).
+2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.
+3. Before `exit_code` the wrapper ends every other process of its scope's cgroup (pidfd signals, sub-cgroups included); cancel, timeout and every collection stop the whole unit (`systemctl --user stop`) before the row turns terminal.
+4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): the session sweep plus the marker, ancestry, session and store checks, documented as weaker.
+5. Tests: a `setsid` + reparented orphan is refused and killed on the real launch path (and, as a control, missed by the fallback); cancel and timeout stop the scope; a `KillMode=process` daemon unit restart leaves the job scope running. They skip when no user scope can be created.
+
+Also: the job's environment loses the user bus variables, and the guard rejects `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus` and writes under `/sys/fs/cgroup` (the ways out of a scope).
 
 **[PR #9](https://github.com/qwwiwi/agent-jobs/pull/9): prune, doctor procs, system and file tools.**
 
@@ -34,12 +35,6 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 ## Wave A
 
-- **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
-  1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id> …` (or the same call over D-Bus).
-  2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.
-  3. On wrapper exit, cancel or timeout the whole scope is stopped (`systemctl --user stop` / kill the unit) before `exit_code` is written, so no descendant survives.
-  4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): today's sid sweep plus the marker, ancestry, session and store checks. That path is documented as weaker.
-  5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
 - **Memory, tasks and team tools via the shared brain.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
 - **Memory notes in the brief.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
