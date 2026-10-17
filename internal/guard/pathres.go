@@ -1,11 +1,11 @@
 package guard
 
 import (
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,12 +20,9 @@ import (
 // maxScopeDirs bounds the directories tracked through cd chains; beyond it the directory is unknown.
 const maxScopeDirs = 64
 
-// A whole word longer than maxWordBytes or with more than maxWordSegs segments that splits into
+// A whole word longer than maxWordBytes (PATH_MAX: the kernel opens no such path) that splits into
 // several path tokens (inline code, a message) is not resolved as one path: its tokens are.
-const (
-	maxWordBytes = 4096
-	maxWordSegs  = 256
-)
+const maxWordBytes = 4096
 
 // protectedBudget is the time the protected-path check may take for one call; past it the call is
 // refused as too complex to verify (fail closed, independent of the hook runner's timeout).
@@ -212,9 +209,9 @@ func (s *pathScope) hit(w string, tree bool) (string, bool) {
 	return "", false
 }
 
-// bigText reports a word too long to resolve as one path that holds several path tokens.
+// bigText reports a word longer than any path the kernel opens that holds several path tokens.
 func bigText(w string) bool {
-	return (len(w) > maxWordBytes || strings.Count(w, "/") > maxWordSegs) && len(pathTokens(w)) > 1
+	return len(w) > maxWordBytes && len(pathTokens(w)) > 1
 }
 
 func (s *pathScope) hitPath(w string, tree bool) (string, bool) {
@@ -277,6 +274,11 @@ func physical(abs string) string {
 		case "", ".":
 		case "..":
 			cur = filepath.Dir(cur)
+			if !exists {
+				// back at a directory that may exist: its symlinks count again
+				_, err := os.Lstat(cur)
+				exists = err == nil
+			}
 		default:
 			next := filepath.Join(cur, seg)
 			if exists {
@@ -393,6 +395,9 @@ func (h textHit) reason() string {
 // after it.
 var reFileAuthority = regexp.MustCompile(`(?i)file://(localhost)?/`)
 
+// rePercent is one valid percent-encoded byte.
+var rePercent = regexp.MustCompile(`%[0-9A-Fa-f]{2}`)
+
 // contains returns the protected path that a word of a non-reader names inside its text: an option
 // value (`dd of=…`, `--file=…`, `file:…`) or inline code (`python3 -c`, `perl -e`, `node -e`). It
 // matches the protected path as a substring, absolute (homes expanded) or relative to any known
@@ -408,7 +413,7 @@ func (s *pathScope) contains(w string, code bool) (textHit, bool) {
 	if strings.Contains(strings.ToLower(w), "file:") {
 		u := reFileAuthority.ReplaceAllString(w, "file:/")
 		texts = append(texts, u)
-		if d, err := url.PathUnescape(u); err == nil && d != u {
+		if d := percentDecode(u); d != u {
 			texts = append(texts, d)
 		}
 	}
@@ -418,6 +423,17 @@ func (s *pathScope) contains(w string, code bool) (textHit, bool) {
 		}
 	}
 	return textHit{}, false
+}
+
+// percentDecode decodes every valid %XX sequence and keeps the rest (`'%d' % 1`, `100%`) as written.
+func percentDecode(w string) string {
+	return rePercent.ReplaceAllStringFunc(w, func(m string) string {
+		b, err := strconv.ParseUint(m[1:], 16, 8)
+		if err != nil {
+			return m
+		}
+		return string([]byte{byte(b)})
+	})
 }
 
 func (s *pathScope) containsText(w string, code bool) (textHit, bool) {
@@ -574,7 +590,7 @@ func parseCopyArgs(name string, args []string) copyArgs {
 				}
 			case len(key) > 4 && strings.HasPrefix("--no-target-directory", key):
 				ca.whole = true
-			case len(key) > 4 && strings.HasPrefix("--parents", key):
+			case len(key) > 3 && strings.HasPrefix("--parents", key):
 				ca.parents = true
 			case name == "install" && len(key) > 2 && strings.HasPrefix("--directory", key):
 				dirs = true
@@ -655,7 +671,7 @@ func (s *pathScope) checkDest(d string, ca copyArgs) string {
 
 // plainIntoHome reports `cp|install|ln|mv [-t ~] SRC… [~]` that writes only $HOME/<name>: the
 // destination is $HOME as written (`~`, `~/`, `$HOME`, the absolute path, no `..`), no -T or
-// --parents, and every source has a plain name (not `.`, `..`, `X/.`, no expansion or glob).
+// --parents, and every source is a bare name (no `/`, not `.` or `..`, no expansion or glob).
 func (s *pathScope) plainIntoHome(d string, ca copyArgs) bool {
 	exp, ok := s.expandHome(d)
 	if !ok || s.home == "" || ca.whole || ca.parents || hasDotDot(exp) || filepath.Clean(exp) != s.home {
@@ -664,7 +680,7 @@ func (s *pathScope) plainIntoHome(d string, ca copyArgs) bool {
 	for _, src := range ca.srcs {
 		t := strings.TrimRight(src, "/")
 		name := filepath.Base(t)
-		if t == "" || name == "." || name == ".." || strings.Contains(t+"/", "/./") ||
+		if t == "" || name == "." || name == ".." || strings.Contains(t, "/") ||
 			strings.ContainsAny(src, "$`") || hasGlob(src) {
 			return false
 		}

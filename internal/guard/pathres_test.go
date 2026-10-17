@@ -310,6 +310,8 @@ func TestProtectedLargeInlineScriptFast(t *testing.T) {
 	for _, cmd := range []string{
 		"rm " + strings.Repeat("x/../", 16*1024/5) + "out.txt",
 		"rm -r " + strings.Repeat("a/", 8*1024) + "b",
+		"echo x > \"" + strings.Repeat("a/../", 4000/5) + "b c\"",
+		"python3 -c \"" + strings.Repeat("'a/../b' ", 4000/9) + "\"",
 	} {
 		start := time.Now()
 		r := Check(cmd, cfg)
@@ -359,5 +361,65 @@ func TestResolvePath(t *testing.T) {
 	}
 	if got := resolvePath("a/b", "rel"); got != "rel/a/b" {
 		t.Errorf("relative dir: %q", got)
+	}
+}
+
+// Fix loop 2 of PR #12: forms the control review found allowed are refused.
+func TestProtectedFixLoop2Refused(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	if err := os.Symlink(filepath.Join(state, "subagents"), filepath.Join(cfg.Dir, "S")); err != nil {
+		t.Fatal(err)
+	}
+	deep := strings.Repeat("a/", 260)
+	up := strings.Repeat("../", 264)
+	feed := "printf \"open('../../../subagents/j.log','w')\" | "
+	attach := "printf \"ATTACH '../../../jobs.db' AS j; UPDATE j.jobs SET subagents=6;\" | "
+	for _, c := range []string{
+		// 1: a word with more than 256 `/` and a space or `,` is still one path
+		"mkdir -p \"" + deep + "b c\" && echo x > \"" + deep + "b c/" + up + "subagents/j.log\"",
+		"rm -rf \"" + deep + "b c/" + strings.TrimSuffix(up, "/") + "\"",
+		"rm -rf \"" + deep + "q,r/" + strings.TrimSuffix(up, "/") + "\"",
+		// 2: --pa is a unique abbreviation of --parents
+		"cp --pa .agent-jobs/thrall/jobs.db ~",
+		"cp --pa -t ~ .agent-jobs/thrall/jobs.db",
+		// 3: a stray % does not stop percent-decoding
+		"python3 -c \"import sqlite3; print('%d' % 1); sqlite3.connect('file:../../../jobs%2edb', uri=True).execute('UPDATE jobs SET subagents=0')\"",
+		"python3 -c \"import sqlite3; print('100%'); sqlite3.connect('file:../../../jobs%2edb', uri=True).execute('UPDATE jobs SET subagents=0')\"",
+		// 4: options taking a value do not make it a script or database operand
+		feed + "python3 -W ignore",
+		feed + "python3 -X utf8",
+		feed + "python3 -W ignore -",
+		attach + "sqlite3 -separator , x.db",
+		attach + "sqlite3 -cmd .timer x.db",
+		"printf 'unlink q(../../../jobs.db)' | perl -I lib",
+		"printf \"require('fs').rmSync('../../../jobs.db')\" | node -r fs",
+		// 5: `..` after a missing prefix returns to existing directories whose symlinks count
+		"mkdir n && rm n/../S/../jobs.db",
+		"mkdir n && dd if=/dev/null of=n/../S/../jobs.db",
+		"mkdir n && echo x > n/../S/../jobs.db",
+		"mkdir n && python3 -c \"open('n/../S/../jobs.db','w')\"",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%.120q allowed", c)
+		}
+	}
+}
+
+// Fix loop 2 of PR #12: ordinary work near the fixed forms stays allowed.
+func TestProtectedFixLoop2Allowed(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	deep := strings.Repeat("a/", 260)
+	for _, c := range []string{
+		"cp f ~", "cp out.txt ~/", "cp -r dist/ ~/",
+		"python3 script.py", "cat data.csv | python3 script.py",
+		"sqlite3 x.db < file", "echo 'select 1;' | sqlite3 -separator , test.db",
+		"mkdir -p a && cd a/..", "mkdir n && rm n/../out.txt",
+		"mkdir -p \"" + deep + "b c\" && echo x > \"" + deep + "b c/f.txt\"",
+		"python3 -c \"print('%d' % 1); print('100%')\"",
+		"python3 -c \"import sqlite3; print('%d' % 1); sqlite3.connect('file:out%2edb', uri=True)\"",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%.120q refused: %s", c, r)
+		}
 	}
 }

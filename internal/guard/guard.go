@@ -258,8 +258,8 @@ func ancestorBlocked(w, p string) string {
 //     and with an empty or `localhost` authority dropped; `..` walked like the kernel (after the
 //     symlinks of its prefix) as well as lexically, and refused outright when the call may create a
 //     symlink (ln, cp -s, a word naming symlink) and the part before the first `..` does not exist;
-//   - `xargs <non-reader>`, and an interpreter reading its program from the pipe (python, perl, node,
-//     ruby, php without code or script, sqlite3 without SQL), fed by an earlier stage of its pipeline
+//   - `xargs <non-reader>`, and an interpreter that may read its program from the pipe (python,
+//     perl, node, ruby, php, sqlite3, whatever its arguments), fed by an earlier stage of its pipeline
 //     that names a protected path or an ancestor of one;
 //   - after a cd the guard cannot resolve (`cd $X`, `cd -`, CDPATH), a relative word that could lead
 //     to a protected path; likewise `~user/…`;
@@ -285,38 +285,14 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 	return r
 }
 
-// stdinInterpreters run a program they read from stdin when given no code or file argument; the
-// value is their short options that give the program inline instead.
-var stdinInterpreters = map[string]string{"python": "cm", "sqlite3": "", "perl": "eE", "node": "ep", "ruby": "e", "php": "rBRE"}
+// stdinInterpreters may run a program they read from stdin. Options taking a value (`python3 -W
+// ignore`, `sqlite3 -separator , x.db`, `node -r fs`) make their arguments ambiguous, so as a later
+// pipe stage one is treated as reading its program from the pipe whatever its arguments.
+var stdinInterpreters = map[string]bool{"python": true, "sqlite3": true, "perl": true, "node": true, "ruby": true, "php": true}
 
-// programFromStdin reports an interpreter that takes its program from stdin: python/perl/node/ruby/
-// php without inline code or a script file (or with `-`), sqlite3 without SQL after the database.
-func programFromStdin(name string, args []string) bool {
-	if strings.HasPrefix(name, "python") {
-		name = "python"
-	}
-	inline, ok := stdinInterpreters[name]
-	if !ok {
-		return false
-	}
-	var pos []string
-	for _, a := range args {
-		switch {
-		case a == "-":
-			pos = append(pos, a)
-		case strings.HasPrefix(a, "-"):
-			if a == "--eval" || a == "--print" || a == "--command" ||
-				inline != "" && !strings.HasPrefix(a, "--") && strings.ContainsAny(a[1:], inline) {
-				return false // inline code, a module or a print-expression
-			}
-		default:
-			pos = append(pos, a)
-		}
-	}
-	if name == "sqlite3" {
-		return len(pos) < 2
-	}
-	return len(pos) == 0 || pos[0] == "-"
+// stdinInterpreter reports a program that may read its program from stdin.
+func stdinInterpreter(name string) bool {
+	return strings.HasPrefix(name, "python") || stdinInterpreters[name]
 }
 
 func (s *pathScope) checkScripts(scripts []*script) string {
@@ -370,8 +346,8 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				switch {
 				case slices.Contains(v.wrappers, "xargs"):
 					feeder = "`xargs " + name + "`"
-				case i > 0 && programFromStdin(name, argv[1:]):
-					feeder = "`" + name + "` (its program from the pipe)"
+				case i > 0 && stdinInterpreter(name):
+					feeder = "`" + name + "` (its program may come from the pipe)"
 				}
 				if feeder == "" {
 					continue
