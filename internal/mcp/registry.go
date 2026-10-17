@@ -45,6 +45,12 @@ var OrchestratorOnly = []string{
 	"task_get",
 	"send_message",
 	"inbox",
+	// System and files (reference, «MCP-тулы»: not available to a job).
+	"system_doctor",
+	"system_logs",
+	"activity_report",
+	"trash_move",
+	"trash_restore",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

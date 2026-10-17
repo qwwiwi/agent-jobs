@@ -61,6 +61,10 @@ type Config struct {
 	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
 	// and the memory notes of a brief. Empty = not configured: those tools say so, briefs carry no notes.
 	Brain brain.Config `json:"brain"`
+	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
+	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
+	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
+	TrashRoots []string `json:"trash_roots"`
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -123,6 +127,11 @@ func LoadConfig(stateDir string) (Config, error) {
 	if err := c.Brain.Validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
+	for _, r := range c.TrashRoots {
+		if !filepath.IsAbs(r) {
+			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
+		}
+	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
 	}
@@ -130,6 +139,15 @@ func LoadConfig(stateDir string) (Config, error) {
 		c.CardsDir = filepath.Join(stateDir, "cards")
 	}
 	return c, nil
+}
+
+// TrashRootsOrDefault returns the configured trash roots; nil when none are configured (fail
+// closed: there is no default root).
+func (c Config) TrashRootsOrDefault() []string {
+	if len(c.TrashRoots) > 0 {
+		return c.TrashRoots
+	}
+	return nil
 }
 
 func (c Config) claudeBin() string {
