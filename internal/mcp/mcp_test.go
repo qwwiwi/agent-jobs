@@ -608,19 +608,19 @@ func TestJobRoleToolWithoutManagerFailsCleanly(t *testing.T) {
 				return nil, JobCancelOutput{ID: fmt.Sprint(n)}, err
 			})
 	}})
-	JobAllowed = []string{"dummy_count"}
+	JobAllowed = append(slices.Clone(savedAllowed), "dummy_count")
 	s, err := NewServer(RoleJob, Deps{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cs := connect(t, s)
-	if got := toolNames(t, cs); !slices.Equal(got, []string{"dummy_count"}) {
+	if got := toolNames(t, cs); !slices.Contains(got, "dummy_count") || len(got) != len(JobAllowed) {
 		t.Fatalf("job tools %v", got)
 	}
 	if msg := callErr(t, cs, "dummy_count", map[string]any{}); !strings.Contains(msg, "needs the job database") {
 		t.Fatalf("dummy tool without a manager: %q", msg)
 	}
-	if got := toolNames(t, cs); len(got) != 1 { // the server survived the call
+	if got := toolNames(t, cs); len(got) != len(JobAllowed) { // the server survived the call
 		t.Fatalf("after the call: %v", got)
 	}
 }

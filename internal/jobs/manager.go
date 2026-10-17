@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -30,6 +31,10 @@ type Manager struct {
 	// KillGrace is the wait between SIGTERM and SIGKILL of a job's process group.
 	KillGrace time.Duration
 	Log       *log.Logger
+	// Brain is the shared brain from config (brain.Disabled when not configured).
+	Brain brain.Brain
+	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
+	MemoryTimeout time.Duration
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -49,6 +54,11 @@ func Open(agent string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	br, err := brain.New(cfg.Brain, agent)
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
 	self, err := os.Executable()
 	if err == nil {
 		self, err = filepath.EvalSymlinks(self)
@@ -59,7 +69,7 @@ func Open(agent string) (*Manager, error) {
 	}
 	return &Manager{
 		Agent: agent, StateDir: dir, Cfg: cfg, Store: st, SelfBin: self,
-		Now: time.Now, KillGrace: 10 * time.Second,
+		Now: time.Now, KillGrace: 10 * time.Second, Brain: br, MemoryTimeout: MemoryNotesTimeout,
 		Log: log.New(os.Stderr, "agent-jobs["+agent+"] ", log.LstdFlags),
 	}, nil
 }

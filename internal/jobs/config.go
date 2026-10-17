@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -56,6 +58,9 @@ type Config struct {
 	ClaudeBin string `json:"claude_bin"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
+	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
+	// and the memory notes of a brief. Empty = not configured: those tools say so, briefs carry no notes.
+	Brain brain.Config `json:"brain"`
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -114,6 +119,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
+	}
+	if err := c.Brain.Validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")

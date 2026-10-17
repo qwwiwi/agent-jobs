@@ -82,7 +82,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 
 1. **Start.** The session starts a job with a title, kind, brief, repo, model and limits. The call validates everything, inserts a `queued` row and returns the id. Nothing runs yet.
 2. **Queued.** On the next tick, if fewer than two jobs are running for this agent, the daemon claims it.
-3. **Running.** The daemon prepares the folder (brief, settings, worktree) and launches the wrapper detached, in its own session. The wrapper runs `claude -p` and writes `exit_code` last.
+3. **Running.** The daemon prepares the folder (brief with memory notes, settings, worktree) and launches the wrapper detached, in its own session. The wrapper runs `claude -p` and writes `exit_code` last.
 4. **Report.** The job's final message is saved as `report.md`. Exit code 0 with a report is `succeeded`; a non-zero exit, a turn or budget stop, or no report is `failed`; past the timeout the process group gets SIGTERM, then SIGKILL after 10 s, and the job is `timeout`. `cancelled` comes only from an explicit cancel.
 5. **Job-done line.** The session receives one line via `tmux send-keys`:
    ```
@@ -215,23 +215,37 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
 
-**Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
+**Memory, task and team tools** keep the reference's names and are backed by the team's shared brain (gbrain) instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)). Without a `brain` block in `config.json` each of them answers «brain not configured» and nothing else changes.
+
+| tool | what it does | shared brain call |
+|---|---|---|
+| `memory_search` | the closest notes for a query (default 6, ceiling 20): path, scope, score, snippet | recall `recall` |
+| `memory_write` | write a note: `decision` (immutable), `runbook` or `error_pattern` (needs category, severity, trigger condition, prevention rule); a job's notes get the tag `agent-jobs-job:<id>` | memory `create_decision_note` / `create_runbook_note` / `create_error_pattern_note` |
+| `memory_already_exists` | is there a note close to this text? `exists` when one of the top three scores ≥ `min_score` (default `brain.already_exists_min_score`, 0.5); the candidates are returned either way | recall `recall` |
+| `task_create` | a task on the shared board: title, description, assignee, priority | tasks `task_create` |
+| `task_list` | tasks by assignee and status (default 50, ceiling 200) | tasks `task_list` |
+| `task_update` | set fields, then move to a status: `progress`, `review`, `done`, `blocked` (note = reason), `reopen`; returns the task afterwards | tasks `task_update`, then `task_start` / `task_review` / `task_done` / `task_block` / `task_reopen`, then `task_get` |
+| `task_get` | one task by id; unknown id is an error | tasks `task_get` |
+| `send_message` | a message to another agent (≤ 16 KB) | swarm `notify` |
+| `inbox` | messages addressed to this agent not yet acknowledged; `ack` takes the ids you handled | swarm `ack`, `list_my_pending` |
+
+A job gets `memory_search` and `memory_write` only; everything that reaches another agent stays with the orchestrator.
+
+**Full tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
 |---|---|---|---|
 | Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` | none | built |
 | Jobs | `job_resume` | none | planned, Wave B |
-| Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
-| Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
-| Team | `send_message`, `inbox` | none | planned, Wave A |
+| Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | built (shared brain) |
+| Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | built (shared brain) |
+| Team | `send_message`, `inbox` | none | built (shared brain) |
 | System | `system_doctor`, `system_logs`, `activity_report` | none | planned, Wave A |
 | Files | `trash_move`, `trash_restore` | none | planned, Wave A |
 | Schedules | `schedule_add`, `schedule_list`, `schedule_remove` | none | planned, Wave B |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | planned, Wave B |
 | Owner | `notify_owner` | none | planned, Wave B |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
-
-Memory, tasks and team tools will keep the reference's names but will be backed by a shared team memory service instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)); not built yet.
 
 ---
 
@@ -279,7 +293,34 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
+- `brain`: the shared brain behind the memory, task and team tools and the memory notes of a brief (see «Shared brain» below). Absent = not configured.
 - Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
+
+**Shared brain**
+
+The memory, task and team tools and the memory notes of a brief talk to the team's shared brain over MCP streamable HTTP. Its endpoints and where to find the token go into the `brain` block; the token itself never does:
+
+```json
+{
+  "brain": {
+    "recall_url": "https://brain.example/recall/mcp",
+    "memory_url": "https://brain.example/memory/mcp",
+    "tasks_url":  "https://brain.example/task/mcp",
+    "swarm_url":  "https://brain.example/swarm/mcp",
+    "token_file": "~/.secrets/brain/token",
+    "agent": "my-agent",
+    "timeout_seconds": 15,
+    "already_exists_min_score": 0.5
+  }
+}
+```
+
+- `recall_url`: `memory_search`, `memory_already_exists` and the memory notes of a brief. `memory_url`: `memory_write`. `tasks_url`: `task_*`. `swarm_url`: `send_message`, `inbox`. Each is optional; the tools of a missing one answer «brain not configured (no …_url)». `https://` only, plain `http://` only on a loopback host; no credentials, query or fragment in a URL.
+- `token_file` (absolute or `~/…`, a regular file of one line, mode 600: readable by group or others is refused) **or** `token_env` (the name of an environment variable): the bearer token, read at call time and sent as `Authorization: Bearer …`. One of the two is required; both is refused. The token is never written into a brief, a log or an error.
+- `agent`: author name on notes and messages (default: the agent-jobs agent name). `timeout_seconds`: bound of one call (default 15, max 300). `already_exists_min_score`: default threshold of `memory_already_exists` (default 0.5).
+- A malformed block stops the daemon and the MCP server from starting, like any bad `config.json`; an unreachable brain does not: the call fails, the job still starts.
+
+**Memory notes in the brief.** When a job is prepared, the daemon asks `recall` for up to six notes closest to the job's title and brief (the first 4000 bytes) and adds a «Memory notes» section after the project cards: path, scope, score and the snippet quoted line by line (a note cannot open a section of its own), marked as data written by others. The lookup has 5 seconds; on an error or a timeout the job starts anyway and the section says «Shared memory was unreachable when this job was prepared (reason)». No brain configured = no section.
 
 **Run the daemon on Linux (systemd user service)**
 

@@ -189,8 +189,8 @@ func (m *Manager) readOwnerRules() (string, error) {
 }
 
 // BuildPrompt assembles prompt.md: preamble, subagent rules, owner rules (the job profile), the
-// project cards that match the job's repository, task, kind checklist, report contract.
-func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card) (string, error) {
+// project cards that match the job's repository, the memory notes, task, kind checklist, report contract.
+func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes) (string, error) {
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
 		return "", err
@@ -215,6 +215,7 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card) (st
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n%s\n\n## Owner rules\n\n%s\n\n", pre, sub, ownerRules)
 	b.WriteString(RenderCards(cards))
+	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
 		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
 	return b.String(), nil
@@ -253,7 +254,12 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err != nil {
 		return err
 	}
-	prompt, err := m.BuildPrompt(j, rules, cards)
+	// Memory notes never block the job: an unreachable brain is written into the brief instead.
+	notes := m.LookupMemoryNotes(j)
+	if notes.Err != nil {
+		m.Log.Printf("job %s: memory notes unavailable: %v", j.ID, notes.Err)
+	}
+	prompt, err := m.BuildPrompt(j, rules, cards, notes)
 	if err != nil {
 		return err
 	}

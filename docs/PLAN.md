@@ -43,8 +43,8 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - **`doctor procs`.** Find processes that outlived their job or session: preview servers, browsers, wait loops, running rows with a dead pid. Reports by default, kills only on a flag.
 - **System tools:** `system_doctor` (disk, processes, hooks), `system_logs`, `activity_report`.
 - **Files:** `trash_move`, `trash_restore`: reversible deletion instead of `rm`.
-- **Memory, tasks and team tools via the shared brain.** `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
-- **Memory notes in the brief.** The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
+- **Memory, tasks and team tools via the shared brain.** *Status: built on branch (job 261017-202027-acd4), in review; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
+- **Memory notes in the brief.** *Status: built on branch (job 261017-202027-acd4), in review; `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
 ## Wave B
 
