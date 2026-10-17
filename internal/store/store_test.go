@@ -2,7 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -53,6 +55,48 @@ func TestOpenMigratesStage1Database(t *testing.T) {
 	}
 }
 
+// Databases created by either parallel branch (one with `subagents` but no scope columns, one with the
+// scope columns but no `subagents`) open, gain the missing columns, and reopen as a no-op.
+func TestOpenMigratesEitherBranchDatabase(t *testing.T) {
+	for name, skip := range map[string]string{"subagents only": "scope_", "scope only": "subagents"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "jobs.db")
+			raw, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(stage1Schema); err != nil {
+				t.Fatal(err)
+			}
+			for _, alter := range migrations {
+				if !strings.Contains(alter, "COLUMN "+skip) {
+					if _, err := raw.Exec(alter); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_ = raw.Close()
+			for range 2 {
+				st, err := Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, err := st.SubagentCount("old-1"); err != nil || n != 0 {
+					t.Fatalf("subagents = %d, %v", n, err)
+				}
+				j, err := st.Get("old-1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if j.ScopeUnit != "" || j.ScopePending {
+					t.Fatalf("scope columns: %+v", j)
+				}
+				_ = st.Close()
+			}
+		})
+	}
+}
+
 // Every new column round-trips through Insert/Get, and the status filter of ListRecentByStatus holds.
 func TestNewColumnsRoundTrip(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
@@ -85,5 +129,39 @@ func TestNewColumnsRoundTrip(t *testing.T) {
 	}
 	if len(queued) != 1 || queued[0].ID != "a" {
 		t.Fatalf("queued: %v", queued)
+	}
+}
+
+func TestReserveSubagentMonotonic(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	j := &Job{ID: "j1", Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: StatusQueued, Model: "m", CreatedAt: now}
+	if err := s.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ReserveSubagent("j1", 3); err == nil {
+		t.Fatal("a queued job got a subagent")
+	}
+	if _, err := s.db.Exec(`UPDATE jobs SET status = 'running' WHERE id = 'j1'`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		prev, ok, err := s.ReserveSubagent("j1", 3)
+		if err != nil || !ok || prev != i {
+			t.Fatalf("reserve %d: prev=%d ok=%v err=%v", i, prev, ok, err)
+		}
+	}
+	if prev, ok, err := s.ReserveSubagent("j1", 3); err != nil || ok || prev != 3 {
+		t.Fatalf("fourth: prev=%d ok=%v err=%v", prev, ok, err)
+	}
+	if n, _ := s.SubagentCount("j1"); n != 3 {
+		t.Fatalf("count %d", n)
+	}
+	if _, _, err := s.ReserveSubagent("nope", 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown job: %v", err)
 	}
 }

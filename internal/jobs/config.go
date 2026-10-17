@@ -39,6 +39,9 @@ type Config struct {
 	// OwnerRulesPath is the owner's permanent rules file (≤8 KB) glued into every brief.
 	// Default: <state>/owner-rules.md. A job refuses to start if it is unreadable or too big.
 	OwnerRulesPath string `json:"owner_rules_path"`
+	// CardsDir holds the project cards (<name>.md) attached to briefs of matching repositories.
+	// Default: <state>/cards.
+	CardsDir string `json:"cards_dir"`
 	// NotifyTmuxTarget is the tmux target (e.g. "channel-silvana") for the job-done line. Empty = notify disabled.
 	NotifyTmuxTarget string `json:"notify_tmux_target"`
 	// TmuxSocket is the tmux socket name (`tmux -L <name>`) of the server that holds NotifyTmuxTarget.
@@ -58,6 +61,29 @@ type Config struct {
 	// "auto" (default) = its own transient systemd user scope when `systemd-run --user` works, else the
 	// weaker session containment; "required" = a job that cannot get a scope is refused; "off" = never.
 	CgroupScope string `json:"cgroup_scope"`
+	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
+	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
+	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
+	TrashRoots []string `json:"trash_roots"`
+	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
+	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
+	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
+	// the rule off (claude's own exit or the timeout ends the job).
+	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
+}
+
+// IdleAfterResultOff is the idle_after_result_seconds value that turns the rule off.
+const IdleAfterResultOff = -1
+
+// IdleAfterResult returns the idle-after-result grace; 0 means the rule is off.
+func (c Config) IdleAfterResult() time.Duration {
+	if c.IdleAfterResultSeconds == IdleAfterResultOff {
+		return 0
+	}
+	if c.IdleAfterResultSeconds > 0 {
+		return time.Duration(c.IdleAfterResultSeconds) * time.Second
+	}
+	return DefaultIdleAfterResult
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -120,10 +146,30 @@ func LoadConfig(stateDir string) (Config, error) {
 	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
 		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
 	}
+	if c.IdleAfterResultSeconds < IdleAfterResultOff {
+		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
+	}
+	for _, r := range c.TrashRoots {
+		if !filepath.IsAbs(r) {
+			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
+		}
+	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
 	}
+	if c.CardsDir == "" {
+		c.CardsDir = filepath.Join(stateDir, "cards")
+	}
 	return c, nil
+}
+
+// TrashRootsOrDefault returns the configured trash roots; nil when none are configured (fail
+// closed: there is no default root).
+func (c Config) TrashRootsOrDefault() []string {
+	if len(c.TrashRoots) > 0 {
+		return c.TrashRoots
+	}
+	return nil
 }
 
 func (c Config) claudeBin() string {

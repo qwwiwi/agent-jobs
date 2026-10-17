@@ -147,8 +147,46 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN resumed_from TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN billing TEXT NOT NULL DEFAULT 'subscription'`,
+	`ALTER TABLE jobs ADD COLUMN subagents INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN scope_unit TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN scope_pending INTEGER NOT NULL DEFAULT 0`,
+}
+
+// ReserveSubagent counts one more subagent for running job id unless max are already used. It
+// returns the count before this call and whether the call is allowed. The count only ever grows
+// (one UPDATE, guarded by the WHERE clause), so it is the job's monotonic subagent counter: the
+// guard compares its own log with it and refuses when the log was shortened.
+func (s *Store) ReserveSubagent(id string, max int) (prev int, allowed bool, err error) {
+	var cur int
+	err = s.db.QueryRow(`UPDATE jobs SET subagents = subagents + 1 WHERE id = ? AND status = ? AND subagents < ?
+		RETURNING subagents`, id, StatusRunning, max).Scan(&cur)
+	if err == nil {
+		return cur - 1, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("reserve subagent: %w", err)
+	}
+	var status string
+	if err := s.db.QueryRow(`SELECT subagents, status FROM jobs WHERE id = ?`, id).Scan(&cur, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, ErrNotFound
+		}
+		return 0, false, fmt.Errorf("reserve subagent: %w", err)
+	}
+	if status != StatusRunning {
+		return cur, false, fmt.Errorf("job %s is %s, not running", id, status)
+	}
+	return cur, false, nil
+}
+
+// SubagentCount returns how many subagents job id has used.
+func (s *Store) SubagentCount(id string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT subagents FROM jobs WHERE id = ?`, id).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	return n, err
 }
 
 // Close closes the database.
@@ -253,6 +291,13 @@ func (s *Store) List(limit int) ([]*Job, error) {
 // ListRecentByStatus returns the most recent jobs with the given status, newest first.
 func (s *Store) ListRecentByStatus(status string, limit int) ([]*Job, error) {
 	return s.query(`WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, status, limit)
+}
+
+// ListActivity returns jobs created or finished at or after since, plus every queued and running
+// job, newest first, at most limit rows.
+func (s *Store) ListActivity(since time.Time, limit int) ([]*Job, error) {
+	return s.query(`WHERE created_at >= ? OR finished_at >= ? OR status IN ('queued','running')
+		ORDER BY created_at DESC, rowid DESC LIMIT ?`, since.Unix(), since.Unix(), limit)
 }
 
 // PendingCleanup returns finished, notified, not yet cleaned jobs.

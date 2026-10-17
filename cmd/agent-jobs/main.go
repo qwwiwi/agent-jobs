@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,13 +35,25 @@ const usage = `usage: agent-jobs <command> [flags]
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
   cancel     --agent A <id>
+  profile    --agent A --from FILE [--from FILE]... [--force] [--dry-run]
+                                           generate the job profile (owner rules, <= 8 KB) from the
+                                           sections of the agent's own rules marked
+                                           <!-- agent-jobs:profile --> ... <!-- /agent-jobs:profile -->
+  card new   --agent A --repo PATH [--name N]   write a project card template for a repository
+  card list  --agent A [--repo PATH]       list project cards (with --repo: the ones a job there gets)
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
+  prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
+                                           small top-level text files stay)
+  doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
+                                           rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
-  guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
+  guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
+             [--subagent-db DB --subagent-job ID] [--protect PATH]...
+                                           (PreToolUse hook, JSON on stdin)
 `
 
 // version is set at build time: go build -ldflags "-X main.version=$(git describe --tags --always --dirty)".
@@ -74,10 +87,18 @@ func main() {
 		err = cmdResult(args)
 	case "cancel":
 		err = cmdCancel(args)
+	case "profile":
+		err = cmdProfile(args)
+	case "card":
+		err = cmdCard(args)
 	case "tick":
 		err = cmdTick(args)
 	case "daemon":
 		err = cmdDaemon(args)
+	case "prune":
+		err = cmdPrune(args)
+	case "doctor":
+		err = cmdDoctor(args)
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -148,10 +169,33 @@ func runGuard(args []string, stdin io.Reader) int {
 	email := fs.String("git-email", "", "allowed git user.email")
 	var gitDirs multi
 	fs.Var(&gitDirs, "git-dir", "the job worktree's git dir; file tools never write inside it (repeatable)")
+	subagentLog := fs.String("subagent-log", "", "the job's subagent log (at most 3 subagents per job; empty = none)")
+	subagentDB := fs.String("subagent-db", "", "the agent's job database holding the job's monotonic subagent counter")
+	subagentJob := fs.String("subagent-job", "", "the job id whose subagent counter --subagent-db holds")
+	var protected multi
+	fs.Var(&protected, "protect", "a path (file or dir) a job never writes (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	reason, err := guard.Decide(stdin, guard.Config{OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs})
+	var reserve func(int) (int, bool, error)
+	if *subagentDB != "" || *subagentJob != "" {
+		if *subagentDB == "" || *subagentJob == "" {
+			fmt.Fprintln(os.Stderr, "guard: --subagent-db and --subagent-job go together")
+			return 2
+		}
+		reserve = func(max int) (int, bool, error) {
+			st, err := store.Open(*subagentDB)
+			if err != nil {
+				return 0, false, err
+			}
+			defer st.Close()
+			return st.ReserveSubagent(*subagentJob, max)
+		}
+	}
+	reason, err := guard.Decide(stdin, guard.Config{
+		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
+		SubagentReserve: reserve, Protected: protected,
+	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
 		fmt.Fprintln(os.Stderr, err)
@@ -435,6 +479,93 @@ func cmdCancel(args []string) error {
 	return nil
 }
 
+func cmdProfile(args []string) error {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	var from multi
+	fs.Var(&from, "from", "an instruction file of the agent with marked profile sections (repeatable)")
+	force := fs.Bool("force", false, "replace a hand-written owner-rules file")
+	dry := fs.Bool("dry-run", false, "print the profile instead of writing it")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if *dry {
+		out, err := jobs.GenerateProfile(from)
+		if err != nil {
+			return err
+		}
+		fmt.Print(out)
+		fmt.Fprintf(os.Stderr, "job profile: %d of %d bytes\n", len(out), jobs.MaxOwnerRulesBytes)
+		return nil
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	p, n, err := m.WriteProfile(from, *force)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("job profile written: %s (%d of %d bytes)\n", p, n, jobs.MaxOwnerRulesBytes)
+	return nil
+}
+
+func cmdCard(args []string) error {
+	if len(args) == 0 {
+		return errors.New("card: want `card new` or `card list`")
+	}
+	sub, args := args[0], args[1:]
+	fs := flag.NewFlagSet("card "+sub, flag.ContinueOnError)
+	agent := agentFlag(fs)
+	repo := fs.String("repo", "", "repository path")
+	var name *string
+	if sub == "new" {
+		name = fs.String("name", "", "card name (default: the repository directory name)")
+	}
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	switch sub {
+	case "new":
+		if *repo == "" {
+			return errors.New("card new: --repo is required")
+		}
+		p, err := m.NewCard(*repo, *name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("project card written: %s (fill in the four sections; at most %d bytes)\n", p, jobs.MaxCardBytes)
+		return nil
+	case "list":
+		var cards []jobs.Card
+		if *repo != "" {
+			top, err := jobs.RepoTopLevel(*repo)
+			if err != nil {
+				return err
+			}
+			if cards, err = m.CardsFor(top); err != nil {
+				return err
+			}
+		} else if cards, err = m.LoadCards(); err != nil {
+			return err
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(w, "CARD\tBYTES\tMATCHES\tPATH")
+		for _, c := range cards {
+			keys := append(append([]string{}, c.Repos...), c.Remotes...)
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", c.Name, len(c.Body), strings.Join(keys, ","), c.Path)
+		}
+		return w.Flush()
+	}
+	return fmt.Errorf("card: unknown subcommand %q (want new or list)", sub)
+}
+
 func cmdTick(args []string) error {
 	fs := flag.NewFlagSet("tick", flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -498,4 +629,102 @@ func cmdMCP(args []string) error {
 	defer stop()
 	// stdout carries the protocol: nothing else may print there.
 	return mcp.Serve(ctx, role, *agent)
+}
+
+func cmdPrune(args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "only list what would be removed")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, perr := m.Prune(*dry)
+	if *asJSON {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+		return perr
+	}
+	verb := "removed"
+	if *dry {
+		verb = "would remove"
+	}
+	for _, j := range rep.Jobs {
+		var n int64
+		for _, e := range j.Removed {
+			n += e.Bytes
+		}
+		fmt.Printf("%s  %s  %s %d entries (%d bytes)", j.ID, j.Status, verb, len(j.Removed), n)
+		if j.Skipped != "" {
+			fmt.Printf("  [%s]", j.Skipped)
+		}
+		if j.Error != "" {
+			fmt.Printf("  error: %s", j.Error)
+		}
+		fmt.Println()
+		for _, e := range j.Removed {
+			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
+		}
+	}
+	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	return perr
+}
+
+func cmdDoctor(args []string) error {
+	if len(args) == 0 || args[0] != "procs" {
+		return errors.New("usage: agent-jobs doctor procs --agent A [--kill] [--json]")
+	}
+	fs := flag.NewFlagSet("doctor procs", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	kill := fs.Bool("kill", false, "end the processes proven to belong to a finished job (leaders and suspects are never killed)")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, err := m.DoctorProcs(*kill)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(rep)
+	}
+	if rep.Note != "" {
+		fmt.Println("note:", rep.Note)
+	}
+	for _, r := range rep.DeadRows {
+		fmt.Printf("row   %s  pid %d  %s  (%s)\n", r.ID, r.PID, r.Reason, r.Title)
+	}
+	for _, g := range rep.Ghosts {
+		state := ""
+		switch {
+		case g.Killed:
+			state = "  KILLED"
+		case g.KillError != "":
+			state = "  kill failed: " + g.KillError
+		}
+		fmt.Printf("%-7s pid %d  sid %d  %s  %s%s\n", g.Kind, g.PID, g.SID, g.Reason, g.Cmdline, state)
+	}
+	fmt.Printf("doctor procs: %d processes, %d dead rows, %d killed", len(rep.Ghosts), len(rep.DeadRows), rep.Killed)
+	if !*kill && len(rep.Ghosts) > 0 {
+		fmt.Print(" (report only; --kill ends the job ghosts)")
+	}
+	fmt.Println()
+	return nil
+}
+
+func printJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }

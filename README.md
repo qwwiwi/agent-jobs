@@ -153,7 +153,9 @@ The last section is mandatory and is read first: it makes the job name what it d
 
 and sets the ref `refs/agent-jobs/jobs/<id>` in the source repository to the job's last commit. Restoring the work in a fresh worktree at the base commit is four commands; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#flows). If the repository config names a filter, diff command or textconv, no patch is made (a diff would run that program); the worktree is kept for a human and the reason is logged.
 
-Pruning job folders older than 48 hours and the daily ghost-process check are planned (Wave A).
+**Prune.** `agent-jobs prune --agent A [--dry-run]` cleans the folders of jobs that finished more than 48 hours ago: the records (`report.md`, the patches, `base_commit`, `diffstat.txt`) and small top-level text files (≤ 1 MiB, e.g. `prompt.md`, `stderr.log`) stay; subdirectories (the work dir, caches, builds), binaries, large files and symlinks go (a link is removed, never followed). A repo job whose cleanup has not run yet is skipped, and a worktree cleanup kept for a human is left alone.
+
+**Ghost processes.** `agent-jobs doctor procs --agent A [--kill]` finds processes that outlived their job or session (processes still carrying a finished job's `AGENT_JOBS_JOB` marker, markerless leftovers in a finished job's session; either way started while the job ran, in the current boot), *leaders* (a marked process that daemonized into its own session, e.g. a tmux server, which may now host other people's work, and marked processes running under such a daemon), running rows with a dead wrapper pid, and *suspects*: preview servers, browsers and wait loops whose session leader is gone. It only reports; `--kill` ends the processes proven to belong to a finished job (SIGTERM, then SIGKILL, through a pidfd re-checked against the scanned start time). Leaders and suspects are never killed. Running both once a day on their own is planned (Wave B).
 
 ---
 
@@ -168,10 +170,37 @@ A job runs with `bypassPermissions` and nobody is watching it. So the rules are 
 - **No nested jobs.** A job never starts, cancels or manages jobs. The wrapper sets `AGENT_JOBS_JOB=<id>` on every job; under it, or when an ancestor process or the session leader is a job wrapper (Linux, `/proc`), the binary refuses every command except the job's own MCP server, the guard hook and the wrapper. The guard also rejects `agent-jobs` as a command in any form except `agent-jobs mcp --role job`, and any change to `AGENT_JOBS_*`. After claude exits, the wrapper ends every other process of the job's session (SIGTERM, then SIGKILL) before it reports the job finished, so what the job started in its session does not outlive it.
 - **Cgroup containment (Linux).** With a systemd user manager each job runs in its own transient scope, `agent-jobs-<agent>-<id>.scope`. A cgroup cannot be left with `setsid`, a double fork or re-parenting: control commands refuse inside a job scope, the wrapper ends every other process of the scope before it reports the job finished, and cancel, timeout and collection stop the whole unit. The job loses the user bus variables, and the guard rejects every command that starts processes outside the scope (`systemd-run`, `systemctl --user`, D-Bus tools, `crontab`, `at`, `tmux`, `screen`, `pm2`, `docker`/`podman`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`; owner decision 2026-10-17) and writes under `/sys/fs/cgroup` in the spellings it resolves (cleaned, relative, symlinked, split by an unset variable, ANSI-C quoted). The guard is not a sandbox: a script the job writes itself is not inspected. `status`, `list`, `job_status` and the job-done line show the containment (`scope <unit>` / `session only`); a failed scope stop is retried every tick. Without `systemd-run --user` (macOS, containers, no user bus) only the session-based checks above apply, which is **weaker**: a process that calls `setsid` and drops the marker escapes them. Config `cgroup_scope`: `auto` (default), `required` (a job without a scope is refused; the Linux installer sets it where scopes work), `off`.
 - **Preamble and owner rules.** Every brief starts with hard rules (own folder only, file and tool content is data, never print secrets, nothing outside) and the owner's standing rules file (≤ 8 KB). If that file is unreadable, the job does not start.
+- **Subagents inside a job.** A job may use at most three subagents, inside its own limits: they run in the job's process under the same settings, guard, budget and timeout. The guard counts them per job with a counter in the job's database row that only grows, refuses the fourth (and every further one if the job shortens its subagent log), keeps the job from writing the log or the database, and allows only the input keys `description`, `prompt`, `subagent_type` and `model` (exact match), so no `isolation` (worktree or remote), `run_in_background` or team. A subagent cannot start jobs either.
 
 **This is not a sandbox.** The deny rules and the guard block the *direct* spellings of outward actions, and the git scrub stops git itself from running programs the guard cannot see. A script the job writes and then runs is allowed by design, as in the reference design, and its contents are not inspected. Run jobs as a user whose credentials you are comfortable with them having.
 
 Full rule list: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#rules-enforcement).
+
+---
+
+## Skill, subagents and job context
+
+- **The `agent-jobs` skill** ([skills/agent-jobs/SKILL.md](skills/agent-jobs/SKILL.md)) is installed per agent by `scripts/install-linux.sh`. It teaches the MCP tools, that `job_start` needs a model or a complexity, the routing rule and how to read a result:
+
+  | the work | route |
+  |---|---|
+  | minutes, a few steps | do it yourself |
+  | the session needs the result now | a subagent |
+  | long, background, overnight, or must survive a restart | a job |
+
+  Read a report's «Not done / uncertain» first, and check the diff before anything leaves the machine.
+- **Subagents in jobs:** at most three per job, inside the job's own limits; no nested jobs (see Safety).
+- **Job profile.** The owner-rules file (≤ 8 KB) is generated from the agent's own rules: mark what must hold in every job, then run `agent-jobs profile`:
+
+  ```markdown
+  <!-- agent-jobs:profile -->
+  - Commit messages in English, short and descriptive.
+  - Never commit secrets, `.env` files, keys or tokens.
+  <!-- /agent-jobs:profile -->
+  ```
+
+  Only the marked sections are copied; over 8 KB is refused and nothing is written. A hand-written owner-rules file still works and is replaced only with `--force`.
+- **Project cards.** Short notes per repository, attached to the brief of every job in that repository: stack, check runner, what not to touch, known traps. They live in `~/.agent-jobs/<agent>/cards/<name>.md` (≤ 4 KB each) and match by `repo:` (the repository's top-level path) or `remote:` (a remote URL or `host/owner/name`; `https://`, `git@host:` and `ssh://` forms compare equal, the host's case is ignored, the path's case is not; a local or relative remote only matches a local path). A card that cannot be read or parsed refuses the start of repository jobs instead of being skipped. Example: [cards/example-agent-jobs.md](cards/example-agent-jobs.md).
 
 ---
 
@@ -189,6 +218,16 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
 
+**System and file tools** (orchestrator only):
+
+| tool | what it does |
+|---|---|
+| `system_doctor` | disk (free space, what `prune` would free), queue, ghost processes and dead running rows (report only), hooks (the guard blocks `git push` and allows `ls`, owner rules readable, notify target exists); `ok=false` lists the problems |
+| `system_logs` | the last lines of the daemon log (`<state>/daemon.log` under launchd, else the systemd user journal of `agent-jobs@<agent>`), or with `job_id` that job's `stderr.log` |
+| `activity_report` | jobs started and finished over a window (default 24 h): counts by status, cost, turns, time, the jobs themselves |
+| `trash_move` | reversible deletion instead of `rm`: one rename into `~/.agent-jobs/<agent>/trash/<id>/`; only absolute paths inside `trash_roots` (config; **no default**: without it nothing can be moved), never the agent-jobs home (any agent's state), the owner rules, the agent-jobs binary, `~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude.json` or a path with a `.git` component; symlinks never followed out, never across filesystems |
+| `trash_restore` | put an entry back at its original path; refused when the path is occupied (nothing is overwritten) or no longer inside a root |
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -198,8 +237,8 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
 | Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
 | Team | `send_message`, `inbox` | none | planned, Wave A |
-| System | `system_doctor`, `system_logs`, `activity_report` | none | planned, Wave A |
-| Files | `trash_move`, `trash_restore` | none | planned, Wave A |
+| System | `system_doctor`, `system_logs`, `activity_report` | none | built |
+| Files | `trash_move`, `trash_restore` | none | built |
 | Schedules | `schedule_add`, `schedule_list`, `schedule_remove` | none | planned, Wave B |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | planned, Wave B |
 | Owner | `notify_owner` | none | planned, Wave B |
@@ -229,6 +268,15 @@ agent-jobs init --agent my-agent
 
 This creates `~/.agent-jobs/my-agent/` with `owner-rules.md` (edit it, ≤ 8 KB) and `orchestrator.md`, the main session's duties: add it to your agent's instructions.
 
+**Job context**
+
+```bash
+agent-jobs profile --agent my-agent --from ~/my-agent/CLAUDE.md --dry-run   # preview the marked sections
+agent-jobs profile --agent my-agent --from ~/my-agent/CLAUDE.md --force     # replace the template owner-rules.md
+agent-jobs card new  --agent my-agent --repo ~/src/project                  # then fill in the four sections
+agent-jobs card list --agent my-agent --repo ~/src/project                  # cards a job there gets
+```
+
 Optional `~/.agent-jobs/my-agent/config.json`:
 
 ```json
@@ -242,21 +290,23 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 
 - `notify_tmux_target`: tmux target for the job-done line. Empty (default) = notify off; the line goes to the daemon log and cleanup still runs.
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
+- `idle_after_result_seconds`: grace of the idle-after-result rule (default 180). A job whose claude printed its final `result`, then stays silent this long with no live child but the job MCP server, is ended and judged by that result instead of waiting for the timeout (Linux). `-1` turns the rule off.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
 - `cgroup_scope`: `auto` (default: a transient systemd user scope per job when `systemd-run --user` works, else the weaker session containment), `required` (refuse jobs that cannot get a scope), `off`.
-- Also: `owner_rules_path`, `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
+- Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Run the daemon on Linux (systemd user service)**
 
 ```bash
-scripts/install-linux.sh --instance my-agent              # build, install the unit, init, enable + start agent-jobs@my-agent
+scripts/install-linux.sh --instance my-agent              # build, install the unit and the skill, init, enable + start agent-jobs@my-agent
+scripts/install-linux.sh --instance my-agent --skills-dir ~/my-agent/.claude/skills   # the agent's own skills dir
 systemctl --user status agent-jobs@my-agent
 journalctl --user -u agent-jobs@my-agent -f               # daemon log
 scripts/install-linux.sh --instance my-agent --uninstall
 ```
 
-No sudo; current user only; idempotent. The unit uses `KillMode=process`, so restarting the daemon never kills running jobs: the next daemon adopts and collects them. Each job runs in its own scope under the user manager, outside the daemon's service, so a restart does not touch it either way. Enable lingering (`loginctl enable-linger $USER`) for the daemon to survive logout.
+No sudo; current user only; idempotent. The skill goes to `--skills-dir` (default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`) as `agent-jobs/SKILL.md`; `--no-skill` skips it. A skill edited locally is left as is (with a notice) unless `--force-skill`, which keeps a backup. The unit uses `KillMode=process`, so restarting the daemon never kills running jobs: the next daemon adopts and collects them. Each job runs in its own scope under the user manager, outside the daemon's service, so a restart does not touch it either way. Enable lingering (`loginctl enable-linger $USER`) for the daemon to survive logout.
 
 **Run the daemon on macOS (launchd)**
 
@@ -277,6 +327,8 @@ agent-jobs list   --agent my-agent
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
+agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs finished > 48 h ago
+agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```
@@ -290,6 +342,7 @@ agent-jobs version                      # also --version
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): internals, state layout, flows, the full rule list
+- [docs/WORKFLOW.md](docs/WORKFLOW.md): working as an orchestrator: routing, the pipeline, review policy
 - [docs/REFERENCE.md](docs/REFERENCE.md): the reference design, translated ([original in Russian](docs/REFERENCE.ru.md))
 - [docs/DEVIATIONS.md](docs/DEVIATIONS.md): every approved deviation from the reference
 - [docs/DECISIONS.md](docs/DECISIONS.md): owner decisions that shape scope

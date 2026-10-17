@@ -53,11 +53,7 @@ const sweepRounds = 5
 // errPidfdUnsupported means the kernel has no pidfd_open/pidfd_send_signal.
 var errPidfdUnsupported = errors.New("pidfd unsupported")
 
-// pidfdOpen and pidfdSend are the kernel calls; variables so tests can stand in for them.
-var (
-	pidfdOpen = func(pid int) (int, error) { return unix.PidfdOpen(pid, 0) }
-	pidfdSend = func(fd int, sig syscall.Signal) error { return unix.PidfdSendSignal(fd, sig, nil, 0) }
-)
+// pidfdOpen and pidfdSend live in pidfd_linux.go and pidfd_other.go.
 
 // signalIgnore is signal.Ignore; a variable so the non-Linux sweep stays testable.
 var signalIgnore = signal.Ignore
@@ -107,7 +103,7 @@ func inCgroup(path string) func(int) bool {
 // (isMember: of the session, or of the scope's cgroup). It reports whether the signal was sent.
 func signalMember(pid int, isMember func(int) bool, sig syscall.Signal) (bool, error) {
 	fd, err := pidfdOpen(pid)
-	if errors.Is(err, unix.ENOSYS) {
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, errPidfdUnsupported) {
 		return false, errPidfdUnsupported
 	}
 	if errors.Is(err, unix.ESRCH) {
@@ -126,7 +122,7 @@ func signalMember(pid int, isMember func(int) bool, sig syscall.Signal) (bool, e
 	if errors.Is(err, unix.ESRCH) {
 		return false, nil
 	}
-	if errors.Is(err, unix.ENOSYS) {
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, errPidfdUnsupported) {
 		return false, errPidfdUnsupported
 	}
 	if err != nil {
