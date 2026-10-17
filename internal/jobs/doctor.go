@@ -261,15 +261,17 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	if err != nil {
 		return rep, fmt.Errorf("boot time: %w", err)
 	}
-	// Sessions of jobs that are over: recorded pgid (= the wrapper's session id) -> job.
+	// Sessions of finished jobs: recorded pgid (= the wrapper's session id) -> job. Not running rows
+	// whose wrapper died: their run window has no end, so a later session reusing the id would be
+	// attributed; such a row goes by the marker only.
 	sessions := map[int][]*store.Job{}
-	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled, store.StatusRunning} {
+	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled} {
 		list, err := m.Store.ListByStatus(status)
 		if err != nil {
 			return rep, err
 		}
 		for _, j := range list {
-			if j.PGID > 1 && !liveJob(j) {
+			if j.PGID > 1 && j.FinishedAt != nil && !liveJob(j) {
 				sessions[j.PGID] = append(sessions[j.PGID], j)
 			}
 		}
@@ -345,9 +347,16 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 			} else {
 				g.Reason = fmt.Sprintf("carries the marker of job %s, which is %s", j.ID, j.Status)
 			}
-			if p.sid == pid {
+			switch {
+			case p.sid == pid:
 				g.Kind = GhostLeader
 				g.Reason += "; it leads its own session (daemonized) and may host other work: reported, never killed"
+			case p.sid > 1 && p.sid != j.PGID && procExists(p.sid):
+				g.Kind = GhostLeader
+				g.Reason += "; its session leader is alive and is not the job's wrapper (it may run under a daemon): reported, never killed"
+			case underMarkedLeader(p.ppid, j.PGID):
+				g.Kind = GhostLeader
+				g.Reason += "; a marked session leader (daemonized) is among its ancestors: reported, never killed"
 			}
 		case sessJob != nil:
 			j := sessJob
@@ -385,9 +394,26 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	return rep, nil
 }
 
+// underMarkedLeader reports whether a process whose parent is ppid descends from a marked process
+// that leads its own session (a daemon the job started), other than the job's wrapper (pgid).
+func underMarkedLeader(ppid, pgid int) bool {
+	for n := 0; n < maxAncestry && ppid > 1; n++ {
+		a, err := procStatFull(ppid)
+		if err != nil {
+			return false
+		}
+		if a.sid == ppid && ppid != pgid && procMarker(ppid) != "" {
+			return true
+		}
+		ppid = a.ppid
+	}
+	return false
+}
+
 // ranDuring reports whether a process that started at t can belong to job j: the job started in
 // the current boot (pids and session ids of an earlier boot mean nothing now) and t lies within
-// [StartedAt-attrSlack, FinishedAt+attrSlack] (no upper bound for a running row whose wrapper died).
+// [StartedAt-attrSlack, FinishedAt+attrSlack] (no upper bound for a running row whose wrapper died:
+// such a row is matched by the marker only).
 func ranDuring(j *store.Job, t, boot time.Time) bool {
 	if j.StartedAt == nil || j.StartedAt.Before(boot) || t.Before(j.StartedAt.Add(-attrSlack)) {
 		return false

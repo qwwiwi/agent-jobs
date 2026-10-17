@@ -216,9 +216,14 @@ func TestTrashToolsFailClosedAndProtected(t *testing.T) {
 	sibling := mk(filepath.Join(filepath.Dir(m.StateDir), "silvana", "jobs.db"))
 	settings := mk(filepath.Join(base, ".claude", "settings.json"))
 	gitCfg := mk(filepath.Join(base, "repo", ".git", "config"))
+	claudeJSON := mk(filepath.Join(base, ".claude.json"))
+	configDir := filepath.Join(base, ".claude-lab", "thrall", ".claude")
+	configSettings := mk(filepath.Join(configDir, "settings.json"))
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 	cs = connect(t, mustServer(t, m))
 	for _, p := range []string{filepath.Dir(m.StateDir), filepath.Dir(sibling), sibling, m.StateDir,
-		m.Cfg.OwnerRulesPath, m.SelfBin, filepath.Dir(settings), settings, filepath.Dir(gitCfg), gitCfg} {
+		m.Cfg.OwnerRulesPath, m.SelfBin, filepath.Dir(settings), settings, filepath.Dir(gitCfg), gitCfg,
+		claudeJSON, configDir, configSettings} {
 		if msg := callErr(t, cs, "trash_move", map[string]any{"path": p}); !strings.Contains(msg, "refused") {
 			t.Fatalf("move %s: %q", p, msg)
 		}
@@ -232,6 +237,11 @@ func TestTrashToolsFailClosedAndProtected(t *testing.T) {
 	}
 	if !slices.Contains(trashProtected(m), exe) {
 		t.Fatalf("the running binary is not protected: %v", trashProtected(m))
+	}
+	// A relative CLAUDE_CONFIG_DIR is ignored (it would resolve against whatever the cwd is).
+	t.Setenv("CLAUDE_CONFIG_DIR", "rel/.claude")
+	if slices.Contains(trashProtected(m), "rel/.claude") {
+		t.Fatalf("relative CLAUDE_CONFIG_DIR protected: %v", trashProtected(m))
 	}
 	var e trash.Entry
 	call(t, cs, "trash_move", map[string]any{"path": free}, &e)

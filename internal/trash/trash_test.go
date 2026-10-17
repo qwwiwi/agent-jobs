@@ -246,3 +246,19 @@ func TestRestoreRefusals(t *testing.T) {
 		t.Fatalf("unknown id: %v", err)
 	}
 }
+
+// On a case-insensitive default filesystem (macOS), `.GIT` and a protected path named in another
+// case are refused; on Linux they are different names and may be moved.
+func TestCaseFoldedDenyList(t *testing.T) {
+	f := newFixture(t)
+	prot := filepath.Join(f.root, ".claude")
+	write(t, filepath.Join(prot, "settings.json"), "x")
+	f.t.Protected = append(f.t.Protected, prot)
+	for _, p := range []string{filepath.Join(f.root, ".Claude"), filepath.Join(f.root, "repo", ".GIT", "config")} {
+		write(t, p, "y")
+		_, err := f.t.check(p)
+		if refused := err != nil && strings.Contains(err.Error(), "refused"); refused != foldCase {
+			t.Fatalf("%s: foldCase=%v, err=%v", p, foldCase, err)
+		}
+	}
+}

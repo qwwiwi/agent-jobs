@@ -15,10 +15,13 @@
 //   - symlinks are never followed out: the parent directory is resolved and must lie inside a root
 //     (also after resolution), and the last component is not followed – a symlink is moved as the
 //     link itself. The rename runs relative to a descriptor of the resolved parent that is opened
-//     without following a link and re-checked (/proc/self/fd) after it is open, so a directory swapped
-//     for a symlink between the check and the rename is caught;
-//   - nothing is overwritten: the move and the restore use renameat2(RENAME_NOREPLACE), and a restore
-//     whose original path is occupied is refused.
+//     without following a link and re-checked after it is open (Linux: /proc/self/fd; macOS: fstat
+//     device and inode against an lstat of the directory), so a directory swapped for a symlink
+//     between the check and the rename is caught;
+//   - nothing is overwritten: the move and the restore use renameat2(RENAME_NOREPLACE) on Linux and
+//     renameatx_np(RENAME_EXCL) on macOS, and a restore whose original path is occupied is refused;
+//   - on macOS (case-insensitive APFS by default) the `.git` and protected-path checks compare
+//     case-folded paths.
 package trash
 
 import (
@@ -33,7 +36,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -126,9 +128,20 @@ func protectedPaths(paths []string) []string {
 	return out
 }
 
-// hasGitComponent reports whether any component of p is `.git`.
+// hasGitComponent reports whether any component of p is `.git` (case-folded where the filesystem
+// is case-insensitive by default).
 func hasGitComponent(p string) bool {
-	return slices.Contains(strings.Split(p, string(filepath.Separator)), ".git")
+	return slices.Contains(strings.Split(fold(p), string(filepath.Separator)), ".git")
+}
+
+// fold case-folds a path for the deny-list comparisons (.git, protected paths) on systems whose
+// default filesystem is case-insensitive, so `.GIT` or `~/.Claude` name the protected entry.
+// Allowed roots are not folded: a case mismatch there only refuses.
+func fold(p string) string {
+	if foldCase {
+		return strings.ToLower(p)
+	}
+	return p
 }
 
 // target is a checked path: its resolved parent and its last component.
@@ -181,27 +194,12 @@ func (t *Trash) check(path string) (target, error) {
 	}
 	for _, p := range protectedPaths(append(slices.Clone(t.Protected), t.Dir)) {
 		for _, c := range []string{real, full} {
-			if c == p || within(c, p) || within(p, c) {
+			if c, p := fold(c), fold(p); c == p || within(c, p) || within(p, c) {
 				return target{}, fmt.Errorf("refused: %s is or touches the protected path %s", real, p)
 			}
 		}
 	}
 	return target{parent: parent, base: base, path: real}, nil
-}
-
-// openDir opens dir without following a link and proves (via /proc/self/fd) that the descriptor is
-// that directory, so a component swapped for a symlink after the check is caught.
-func openDir(dir string) (int, error) {
-	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return -1, fmt.Errorf("open %s: %w", dir, err)
-	}
-	got, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
-	if err != nil || filepath.Clean(got) != filepath.Clean(dir) {
-		_ = unix.Close(fd)
-		return -1, fmt.Errorf("refused: %s changed while it was being opened (now %q, %v)", dir, got, err)
-	}
-	return fd, nil
 }
 
 func kindOf(fi fs.FileInfo) string {
@@ -241,14 +239,6 @@ func (t *Trash) ensureDir() (string, error) {
 		return "", fmt.Errorf("trash dir %s is not a real directory", t.Dir)
 	}
 	return filepath.EvalSymlinks(t.Dir)
-}
-
-func renameNoReplace(fromFd int, from string, toFd int, to string) error {
-	err := unix.Renameat2(fromFd, from, toFd, to, unix.RENAME_NOREPLACE)
-	if errors.Is(err, unix.EXDEV) {
-		return errors.New("refused: the path is on another filesystem than the trash (a move would be a copy)")
-	}
-	return err
 }
 
 // Move puts path into the trash and returns its entry.

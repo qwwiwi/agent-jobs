@@ -64,8 +64,8 @@ func findGhost(rep ProcsReport, pid int) *Ghost {
 func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 	m := newManager(t)
 	deadID := "doctor-dead-" + strconv.Itoa(os.Getpid())
-	// Not a session leader: a job's leftover child sits in some session it did not start.
-	ghost := spawn(t, false, []string{JobEnvVar + "=" + deadID}, "sleep", "300")
+	// Not a session leader: a job's leftover child in a session whose leader (the wrapper) is gone.
+	_, ghostPid := orphanInSession(t, "export "+JobEnvVar+"="+deadID+"; ")
 	finished := time.Now()
 	dead := insertJob(t, m, deadID, store.StatusFailed, &finished, nil)
 
@@ -78,7 +78,7 @@ func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 	// A marker of a job this agent does not know (another agent's): never judged.
 	foreign := spawnOwn(t, []string{JobEnvVar + "=not-in-this-store"}, "sleep", "300")
 
-	waitFor(t, "spawned processes", 5*time.Second, func() bool { return procMarker(ghost.Process.Pid) == dead.ID })
+	waitFor(t, "spawned processes", 5*time.Second, func() bool { return procMarker(ghostPid) == dead.ID })
 	rep, err := m.DoctorProcs(false)
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 	if !rep.Supported {
 		t.Skip("no /proc")
 	}
-	g := findGhost(rep, ghost.Process.Pid)
+	g := findGhost(rep, ghostPid)
 	if g == nil || g.Kind != GhostJob || g.JobID != dead.ID || g.Killed {
 		t.Fatalf("ghost not reported as the dead job's: %+v (all: %+v)", g, rep.Ghosts)
 	}
@@ -96,16 +96,16 @@ func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 		}
 	}
 	time.Sleep(200 * time.Millisecond)
-	if !pidAlive(ghost.Process.Pid) {
+	if !pidAlive(ghostPid) {
 		t.Fatal("report-only run killed the ghost")
 	}
 
 	// The CLI without --kill reports and kills nothing either.
 	out, err := execSelf("doctor", "procs", "--agent", "test")
-	if err != nil || !strings.Contains(out, strconv.Itoa(ghost.Process.Pid)) || !strings.Contains(out, "report only") {
+	if err != nil || !strings.Contains(out, strconv.Itoa(ghostPid)) || !strings.Contains(out, "report only") {
 		t.Fatalf("doctor procs CLI: %v\n%s", err, out)
 	}
-	if !pidAlive(ghost.Process.Pid) {
+	if !pidAlive(ghostPid) {
 		t.Fatal("CLI report-only run killed the ghost")
 	}
 
@@ -113,10 +113,10 @@ func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g := findGhost(rep, ghost.Process.Pid); g == nil || !g.Killed {
+	if g := findGhost(rep, ghostPid); g == nil || !g.Killed {
 		t.Fatalf("ghost not killed with the flag: %+v", g)
 	}
-	waitFor(t, "ghost gone", 5*time.Second, func() bool { return !pidAlive(ghost.Process.Pid) })
+	waitFor(t, "ghost gone", 5*time.Second, func() bool { return !pidAlive(ghostPid) })
 	for _, p := range []int{liveProc.Process.Pid, foreign.Process.Pid, wrapper.Process.Pid} {
 		if !pidAlive(p) {
 			t.Fatalf("pid %d was killed but is not a ghost", p)
@@ -413,5 +413,72 @@ func TestSuspectKind(t *testing.T) {
 		if got := SuspectKind(c.argv); got != c.want {
 			t.Errorf("%q: got %q, want %q", c.argv, got, c.want)
 		}
+	}
+}
+
+// Review probe (PR #9 fix-loop 2): a job daemonized a session leader (setsid sh, like a tmux server)
+// whose environment carries the marker; a child the leader started during the job's window carries
+// it too. Its session leader is alive and is not the job's wrapper: the child may be other people's
+// work hosted by the daemon, so it is reported as a leader and never killed.
+func TestDoctorProcsLeaderChildNeverKilled(t *testing.T) {
+	m := newManager(t)
+	id := "doctor-leaderchild-" + strconv.Itoa(os.Getpid())
+	sh := spawnOwn(t, []string{JobEnvVar + "=" + id}, "sh", "-c", "sleep 300 & wait")
+	leader := sh.Process.Pid
+	child := 0
+	waitFor(t, "child", 5*time.Second, func() bool {
+		ents, _ := os.ReadDir(procRoot)
+		for _, e := range ents {
+			if p, err := strconv.Atoi(e.Name()); err == nil {
+				if info, err := procStatFull(p); err == nil && info.ppid == leader && procMarker(p) == id {
+					child = p
+					return true
+				}
+			}
+		}
+		return false
+	})
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	finished := time.Now()
+	insertJob(t, m, id, store.StatusSucceeded, &finished, func(j *store.Job) { j.PGID = 999999 })
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	if g := findGhost(rep, child); g == nil || g.Kind != GhostLeader || g.Killed {
+		t.Fatalf("child of a marked session leader: %+v (all: %+v)", g, rep.Ghosts)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !pidAlive(child) {
+		t.Fatal("child of a daemonized leader was killed")
+	}
+}
+
+// Review probe (PR #9 fix-loop 2): a running row whose wrapper died has no end to its window, so its
+// session id, reused later by an unrelated session, must not attribute anything: such a row goes by
+// the marker only.
+func TestDoctorProcsDeadRunningRowReusedSid(t *testing.T) {
+	m := newManager(t)
+	leader, pid := orphanInSession(t, "")
+	started := time.Now().Add(-10 * time.Minute)
+	insertJob(t, m, "doctor-deadrun-"+strconv.Itoa(os.Getpid()), store.StatusRunning, nil, func(j *store.Job) {
+		j.PID, j.PGID, j.StartedAt = leader, leader, &started
+	})
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	if g := findGhost(rep, pid); g != nil && g.Kind == GhostJob {
+		t.Fatalf("process in a reused session of a dead running row was attributed: %+v", g)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !pidAlive(pid) {
+		t.Fatal("unrelated process was killed")
 	}
 }

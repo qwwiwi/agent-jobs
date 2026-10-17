@@ -26,8 +26,8 @@ func trashFor(m *jobs.Manager) *trash.Trash {
 
 // trashProtected are the paths trash never moves, whatever the roots: the agent-jobs home (every
 // agent's state dir and job database, not only this agent's), the owner rules, the agent-jobs
-// binary that every job's guard hook runs (as configured and as this process runs it), and
-// ~/.claude (settings and hooks).
+// binary that every job's guard hook runs (as configured and as this process runs it), ~/.claude
+// and $CLAUDE_CONFIG_DIR when absolute (settings and hooks), and ~/.claude.json (MCP servers).
 func trashProtected(m *jobs.Manager) []string {
 	out := []string{m.StateDir, filepath.Dir(m.StateDir), m.Cfg.OwnerRulesPath, m.SelfBin}
 	if h, err := jobs.Home(); err == nil {
@@ -37,7 +37,10 @@ func trashProtected(m *jobs.Manager) []string {
 		out = append(out, exe)
 	}
 	if h, err := os.UserHomeDir(); err == nil {
-		out = append(out, filepath.Join(h, ".claude"))
+		out = append(out, filepath.Join(h, ".claude"), filepath.Join(h, ".claude.json"))
+	}
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); filepath.IsAbs(d) {
+		out = append(out, filepath.Clean(d))
 	}
 	return out
 }
