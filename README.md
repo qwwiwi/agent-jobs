@@ -35,7 +35,6 @@ That is what a job avoids:
 - **A job can start lean.** It runs with `--strict-mcp-config` and only the MCP servers it is given. A subagent cannot be started that lean.
 - **A job has hard caps.** `--max-turns`, `--max-budget-usd` and a wall-clock timeout, enforced by the daemon. Subagents have none.
 - **A job outlives the session.** Subagents die with their session; a job runs in its own process group and survives a session or daemon restart. Resuming an interrupted job from its saved patches is planned (Wave B).
-- **No per-process spawn cap.** Claude Code caps the number of subagents one process may spawn (200). Jobs are separate processes, queued per agent.
 - **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most two run per agent) and, with schedules (planned, Wave B), can run when the window is quiet.
 - **A job is a full session.** A subagent starts with only its prompt and is often routed to a cheaper model. A job is a full top-level Claude Code run with its own model choice and the full tool set, inside the limits above.
 
