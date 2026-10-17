@@ -10,7 +10,7 @@ import (
 )
 
 func TestCheck(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -30,10 +30,10 @@ func TestCheck(t *testing.T) {
 		{"until loop pgrep -af", "until ! pgrep -af server; do sleep 2; done", true},
 		{"pgrep without loop", "pgrep -f server", false},
 		{"loop without pgrep -f", "while kill -0 $pid; do sleep 1; done", false},
-		{"owner in commit", `git commit -m "fix by dashi"`, true},
-		{"owner in co-author", "git commit -m 'x' -m 'Co-Authored-By: Dashi <d@x>'", true},
+		{"owner in commit", `git commit -m "fix by alex"`, true},
+		{"owner in co-author", "git commit -m 'x' -m 'Co-Authored-By: Alex <d@x>'", true},
 		{"commit without owner", `git commit -m "Исправил лимиты"`, false},
-		{"owner outside commit", `echo dashi`, false},
+		{"owner outside commit", `echo alex`, false},
 		{"foreign -c identity", `git -c user.name="Someone" commit -m x`, true},
 		{"own -c identity", `git -c user.email=bot@example.com commit -m x`, true}, // identity comes from the wrapper's gitconfig
 		{"foreign config", `git config user.email evil@example.com`, true},
@@ -76,7 +76,7 @@ func TestDecide(t *testing.T) {
 
 // Fix-loop 1 regressions (Codex review B2, B7, B8, B9).
 func TestCheckFixLoop1(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -135,14 +135,14 @@ func TestCheckFixLoop1(t *testing.T) {
 		{"status in single quotes", "a | b; echo '$?'", false},
 
 		// B8: the real commit message and identity, any spelling.
-		{"owner split by quotes", `git commit -m 'Da''shi'`, true},
-		{"owner in later statement", `git commit -m fix; echo Dashi`, false},
-		{"owner in --message=", `git commit --message="thanks dashi"`, true},
-		{"owner in -am", `git commit -am "by Dashi"`, true},
-		{"owner in -mText", `git commit -m"by Dashi"`, true},
-		{"owner in trailer", `git commit -m x --trailer "Co-authored-by: Dashi <d@x>"`, true},
-		{"owner in heredoc message", "git commit -F - <<'EOF'\nfix for Dashi\nEOF", true},
-		{"owner in -C dir commit", `git -C sub commit -m "dashi"`, true},
+		{"owner split by quotes", `git commit -m 'Al''ex'`, true},
+		{"owner in later statement", `git commit -m fix; echo Alex`, false},
+		{"owner in --message=", `git commit --message="thanks alex"`, true},
+		{"owner in -am", `git commit -am "by Alex"`, true},
+		{"owner in -mText", `git commit -m"by Alex"`, true},
+		{"owner in trailer", `git commit -m x --trailer "Co-authored-by: Alex <d@x>"`, true},
+		{"owner in heredoc message", "git commit -F - <<'EOF'\nfix for Alex\nEOF", true},
+		{"owner in -C dir commit", `git -C sub commit -m "alex"`, true},
 		{"foreign -c mixed case", `git -c User.Name=Foreign commit -m x`, true},
 		{"foreign -c USER.EMAIL", `git -c USER.EMAIL=x@y commit -m x`, true},
 		{"own -c mixed case", `git -c User.Email=bot@example.com commit -m x`, true},
@@ -175,13 +175,13 @@ func TestCheckFixLoop1(t *testing.T) {
 
 func TestOwnerInCommitMessageFile(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "msg.txt"), []byte("fix for Dashi\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "msg.txt"), []byte("fix for Alex\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "ok.txt"), []byte("Исправил лимиты\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{OwnerNames: []string{"Dashi"}, Dir: dir}
+	cfg := Config{OwnerNames: []string{"Alex"}, Dir: dir}
 	if Check("git commit -F msg.txt", cfg) == "" {
 		t.Fatal("owner name in -F file must block")
 	}
@@ -195,11 +195,11 @@ func TestOwnerInCommitMessageFile(t *testing.T) {
 
 func TestDecideUsesCwd(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "m"), []byte("dashi"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "m"), []byte("alex"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	in := `{"tool_name":"Bash","cwd":` + strconv.Quote(dir) + `,"tool_input":{"command":"git commit -F m"}}`
-	r, err := Decide(strings.NewReader(in), Config{OwnerNames: []string{"Dashi"}})
+	r, err := Decide(strings.NewReader(in), Config{OwnerNames: []string{"Alex"}})
 	if err != nil || r == "" {
 		t.Fatalf("want block via cwd-relative -F, got %q %v", r, err)
 	}
@@ -207,14 +207,14 @@ func TestDecideUsesCwd(t *testing.T) {
 
 // Fix-loop 2: fail closed on any form the guard cannot resolve statically (N1–N3, B7, B2/B8 rest).
 func TestCheckFixLoop2(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
 		block bool
 	}{
 		// N1: stdin / here-string / heredoc feeding git, identity inside substitutions.
-		{"here-string message", "git commit -F - <<< 'Dashi'", true},
+		{"here-string message", "git commit -F - <<< 'Alex'", true},
 		{"here-string clean message", "git commit -F - <<< 'Исправил'", true},
 		{"heredoc clean message", "git commit -F - <<'EOF'\nИсправил\nEOF", true},
 		{"stdin file into git", "git commit -F - < msg.txt", true},
@@ -248,10 +248,10 @@ func TestCheckFixLoop2(t *testing.T) {
 		{"dynamic gh subcommand", `gh pr "$X"`, true},
 		{"upper-case git", "GIT push", true},
 		{"dynamic commit message", `git commit -m "$MSG"`, true},
-		{"owner via variable", `M=Dashi; git commit -m "$M"`, true},
-		{"ansi-c quoted message", `git commit -m $'Da\x73hi'`, true},
+		{"owner via variable", `M=Alex; git commit -m "$M"`, true},
+		{"ansi-c quoted message", `git commit -m $'Al\x65x'`, true},
 		{"static heredoc message", "git commit -m \"$(cat <<'EOF'\nИсправил лимиты\nEOF\n)\"", false},
-		{"static heredoc message with owner", "git commit -m \"$(cat <<'EOF'\nfix for Dashi\nEOF\n)\"", true},
+		{"static heredoc message with owner", "git commit -m \"$(cat <<'EOF'\nfix for Alex\nEOF\n)\"", true},
 		{"dynamic -C dir ok", `git -C "$dir" status`, false},
 		{"echo git ok", "echo git push", false},
 		{"grep git ok", `grep -rn git .`, false},
@@ -296,7 +296,7 @@ func TestCheckFixLoop2(t *testing.T) {
 
 // N6: arguments of an ordinary program are data; only indirect executors have their args scanned.
 func TestCheckArgsAreData(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -338,7 +338,7 @@ func TestCheckArgsAreData(t *testing.T) {
 // Fix-loop 2, round 2: fail closed again. A program not positively known as data-only that has a
 // git/gh word among its arguments is rejected; N6's false positives stay allowed via the allowlist.
 func TestCheckFailClosedAllowlist(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -426,7 +426,7 @@ func TestCheckFailClosedAllowlist(t *testing.T) {
 
 // B1–B2 (conformance walk): no comments in any gh form; no commit message reused from another commit.
 func TestCheckCommentsAndReusedMessages(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -470,7 +470,7 @@ func TestCheckCommentsAndReusedMessages(t *testing.T) {
 		{"commit --squash", `git commit --squash=HEAD`, true},
 		{"commit --squash sep", `git commit --squash HEAD`, true},
 		{"commit abbreviated --reuse", `git commit --reuse=HEAD`, true},
-		{"commit abbreviated --mess owner", `git commit --mess="by Dashi"`, true},
+		{"commit abbreviated --mess owner", `git commit --mess="by Alex"`, true},
 		{"commit abbreviated --mess clean", `git commit --mess="Исправил"`, true},
 		{"commit -m with C inside value", `git commit -mCleanup`, false},
 		{"commit -am ok", `git commit -am "Исправил"`, false},
@@ -490,10 +490,10 @@ func TestCheckCommentsAndReusedMessages(t *testing.T) {
 
 func TestCommitTemplateFileIsChecked(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "tpl"), []byte("fix for Dashi\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "tpl"), []byte("fix for Alex\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{OwnerNames: []string{"Dashi"}, Dir: dir}
+	cfg := Config{OwnerNames: []string{"Alex"}, Dir: dir}
 	for _, cmd := range []string{"git commit -t tpl", "git commit --template=tpl", "git commit --template tpl"} {
 		if Check(cmd, cfg) == "" {
 			t.Fatalf("%s: owner name in the template must block", cmd)
@@ -504,7 +504,7 @@ func TestCommitTemplateFileIsChecked(t *testing.T) {
 // Security review (Fable) H1–H3: direct spellings of outward actions, git running programs from
 // config/env, nested agents.
 func TestCheckSecurityReview(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -530,7 +530,7 @@ func TestCheckSecurityReview(t *testing.T) {
 		{"git-tag binary", "/usr/lib/git-core/git-tag v1", true},
 		{"git-send-pack", "/usr/lib/git-core/git-send-pack remote HEAD", true},
 		{"git-http-push", "git-http-push https://x/y HEAD", true},
-		{"git-commit owner", `/usr/lib/git-core/git-commit -m "for Dashi"`, true},
+		{"git-commit owner", `/usr/lib/git-core/git-commit -m "for Alex"`, true},
 		{"git-commit ok", `/usr/lib/git-core/git-commit -m "Исправил"`, false},
 		{"git-status ok", "/usr/lib/git-core/git-status", false},
 		{"find -exec git-push", `find . -exec /usr/lib/git-core/git-push \;`, true},
@@ -783,7 +783,7 @@ func TestGitDeniedByName(t *testing.T) {
 // paths, clone/init --template, grep -O, `.git` respelled or as a directory target, merge strategies,
 // fetch-pack/ls-remote --exec, clone -c values.
 func TestCheckSecurityReview3(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
@@ -931,7 +931,7 @@ func TestCheckSecurityReview3(t *testing.T) {
 }
 
 func TestCheckSecurityReview2(t *testing.T) {
-	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cfg := Config{OwnerNames: []string{"Alex"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
 		name  string
 		cmd   string
