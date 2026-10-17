@@ -81,6 +81,9 @@ func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 				continue
 			}
 			pj := m.pruneJob(j, dryRun)
+			if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
+				m.pruneSessions(j, dryRun, &pj)
+			}
 			if pj.Error != "" {
 				errs = append(errs, fmt.Errorf("job %s: %s", j.ID, pj.Error))
 			}
@@ -154,6 +157,39 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})
 	}
 	return pj
+}
+
+// pruneSessions removes the claude session files of a pruned job (DEVIATIONS #14): the transcript
+// <id>.jsonl and the <id>/ directory of every session the job ran in (each attempt's). The ids are
+// the job's own (assigned by the daemon), so nothing else in the claude config dir is touched.
+func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
+	ids := []string{j.SessionID}
+	if atts, err := m.Store.Attempts(j.ID); err == nil {
+		for _, a := range atts {
+			ids = append(ids, a.SessionID)
+		}
+	}
+	slices.Sort(ids)
+	for _, id := range slices.Compact(ids) {
+		if !ValidSessionID(id) {
+			continue
+		}
+		paths, err := SessionPaths(id)
+		if err != nil {
+			pj.Error = err.Error()
+			return
+		}
+		for _, p := range paths {
+			size := treeSize(p)
+			if !dryRun {
+				if err := removeTree(p); err != nil {
+					pj.Error = err.Error()
+					return
+				}
+			}
+			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "claude session of the job"})
+		}
+	}
 }
 
 // pruneDecide says whether a top-level entry of a job folder stays. A kept entry may carry a reason

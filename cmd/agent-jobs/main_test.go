@@ -38,3 +38,19 @@ func TestVersion(t *testing.T) {
 		}
 	}
 }
+
+// run-wrapper options before "--" are only --prompt / --fallback-prompt / --fallback-session, each
+// with a value; anything else is a usage error (exit 2) before the wrapper touches the job dir.
+func TestRunWrapperUsage(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	for _, args := range [][]string{
+		{dir, "--token", "t", "--bogus", "x", "--", "prog"},
+		{dir, "--token", "t", "--prompt", "p.md", "prog", "x"},
+		{dir, "--token", "t", "--prompt", "--", "prog"},
+		{dir, "--token"},
+	} {
+		if code := runWrapper(args); code != 2 {
+			t.Errorf("%q: exit %d, want 2", args, code)
+		}
+	}
+}

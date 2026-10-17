@@ -280,6 +280,7 @@ func (m *Manager) launchQueued() error {
 			return err
 		}
 		running++
+		j.Attempt++ // as Claim counted it
 		if err := m.launch(j, token); err != nil {
 			m.Log.Printf("job %s refused to start: %v", j.ID, err)
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
@@ -292,23 +293,56 @@ func (m *Manager) launchQueued() error {
 	return nil
 }
 
-// ClaudeArgs is the exact reference command line (prompt.md arrives on stdin).
+// ClaudeArgs is the reference command line (prompt.md arrives on stdin) with a pre-assigned session
+// id instead of --no-session-persistence (DEVIATIONS #14): the session stays on disk so the job can
+// be resumed in it.
 func ClaudeArgs(j *store.Job, jobDir string) []string {
+	return append(claudeBaseArgs(j, jobDir), "--session-id", j.SessionID)
+}
+
+// ResumeClaudeArgs continues the job's session: the same command line with --resume <session id>.
+func ResumeClaudeArgs(j *store.Job, jobDir string) []string {
+	return append(claudeBaseArgs(j, jobDir), "--resume", j.SessionID)
+}
+
+func claudeBaseArgs(j *store.Job, jobDir string) []string {
 	return []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
 		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
 		"--permission-mode", "bypassPermissions",
 		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", "project",
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
-		"--no-session-persistence", "--add-dir", jobDir,
+		"--add-dir", jobDir,
 	}
 }
 
+// launchPlan is what one launch runs: claude's arguments and the wrapper's options.
+type launchPlan struct {
+	args    []string
+	wrapper []string // run-wrapper options before "--" (--prompt, --fallback-prompt, --fallback-session)
+}
+
 func (m *Manager) launch(j *store.Job, token string) error {
-	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
-		return err
+	var plan launchPlan
+	if j.Attempt > 1 {
+		p, err := m.prepareResume(j, token)
+		if err != nil {
+			return err
+		}
+		plan = p
+	} else {
+		if j.SessionID == "" {
+			j.SessionID = NewSessionID()
+		}
+		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunNew); err != nil {
+			return fmt.Errorf("record session: %w", err)
+		}
+		if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+			return err
+		}
+		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
 	}
-	pid, err := m.spawn(j, token)
+	pid, err := m.spawn(j, token, plan)
 	if err != nil {
 		return err
 	}
@@ -321,9 +355,10 @@ func (m *Manager) launch(j *store.Job, token string) error {
 }
 
 // spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
-func (m *Manager) spawn(j *store.Job, token string) (int, error) {
+func (m *Manager) spawn(j *store.Job, token string, plan launchPlan) (int, error) {
 	dir := m.JobDir(j.ID)
-	args := append([]string{"run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
+	args := append([]string{"run-wrapper", dir, "--token", token}, plan.wrapper...)
+	args = append(append(args, "--", m.Cfg.claudeBin()), plan.args...)
 	cmd := exec.Command(m.SelfBin, args...)
 	cmd.Dir = filepath.Join(dir, "work")
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
@@ -494,11 +529,26 @@ func (m *Manager) collect() error {
 }
 
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
+	m.noteFallback(j)
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
 	}
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+}
+
+// killRunning ends a running job's process group (SIGTERM, KillGrace, SIGKILL). Callers hold the
+// lifecycle lock and the job's admit lock.
+func (m *Manager) killRunning(j *store.Job) {
+	pid, pgid := j.PID, j.PGID
+	if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
+		if w, err := ReadWrapperInfo(m.JobDir(j.ID)); err == nil && w.Token == j.LaunchToken {
+			pid, pgid = w.PID, w.PGID
+		}
+	}
+	if pgid != 0 {
+		m.killGroup(j.ID, pid, pgid)
+	}
 }
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
@@ -521,7 +571,8 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 	return store.StatusSucceeded, ""
 }
 
-// Cancel stops a queued or running job. Final statuses cannot be cancelled.
+// Cancel stops a queued or running job, or gives up a stopped one (its work dir is then cleaned up
+// like any finished job's). Final statuses cannot be cancelled.
 func (m *Manager) Cancel(id string) error {
 	unlock, err := m.lock()
 	if err != nil {
@@ -541,16 +592,11 @@ func (m *Manager) Cancel(id string) error {
 	defer unlockAdmit()
 	switch j.Status {
 	case store.StatusQueued:
+	case store.StatusStopped:
+		// Nothing runs; keep the turns, cost and duration recorded at the stop.
+		return m.Store.Finish(id, "", store.StatusCancelled, j.Turns, j.CostUSD, j.DurationSec, "cancelled after stop", m.Now())
 	case store.StatusRunning:
-		pid, pgid := j.PID, j.PGID
-		if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
-			if w, err := ReadWrapperInfo(m.JobDir(id)); err == nil && w.Token == j.LaunchToken {
-				pid, pgid = w.PID, w.PGID
-			}
-		}
-		if pgid != 0 {
-			m.killGroup(id, pid, pgid)
-		}
+		m.killRunning(j)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}

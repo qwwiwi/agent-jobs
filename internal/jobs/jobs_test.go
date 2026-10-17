@@ -32,6 +32,26 @@ printf '%s\n' "$@" > ../argv.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
+printf '%s' "$prompt" > ../stdin.txt
+{ printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt
+# Sessions (FAKE_SESSIONS = the test's CLAUDE_CONFIG_DIR): --session-id creates the transcript,
+# --resume needs it (and fails like claude when it is missing or the update says FAKE_RESUME_FAIL).
+sid=""; resume=""; args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in --session-id) sid="${args[i+1]}" ;; --resume) resume="${args[i+1]}" ;; esac
+done
+if [[ -n "${FAKE_SESSIONS-}" ]]; then
+  if [[ -n $resume && ( ! -f "$FAKE_SESSIONS/projects/fake/$resume.jsonl" || $prompt == *FAKE_RESUME_FAIL* ) ]]; then
+    echo "No conversation found with session ID: $resume" >&2
+    exit 1
+  fi
+  if [[ -n $sid ]]; then mkdir -p "$FAKE_SESSIONS/projects/fake" && echo '{}' > "$FAKE_SESSIONS/projects/fake/$sid.jsonl"; fi
+fi
+if [[ $prompt == *FAKE_WIP* ]]; then
+  echo wip > wip.txt
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"WIP_PROGRESS_NOTE"}]}}'
+fi
+if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -919,7 +939,7 @@ func TestOrphanWrapperAdopted(t *testing.T) {
 	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.spawn(j, tok); err != nil { // "crash": PID never written
+	if _, err := m.spawn(j, tok, launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}); err != nil { // "crash": PID never written
 		t.Fatal(err)
 	}
 	if get(t, m, j.ID).PID != 0 {

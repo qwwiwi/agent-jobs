@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -120,5 +121,107 @@ func TestReserveSubagentMonotonic(t *testing.T) {
 	}
 	if _, _, err := s.ReserveSubagent("nope", 3); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown job: %v", err)
+	}
+}
+
+// A database whose status CHECK predates «stopped» is rebuilt once: rows, columns and the index kept,
+// stopped accepted afterwards; a second Open leaves it alone.
+func TestOpenMigratesStatusCheckForStopped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(stage1Schema); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	for range 2 {
+		st, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var def string
+		if err := st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='jobs'`).Scan(&def); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(def, "'stopped'") != 1 || !strings.Contains(def, "session_id") {
+			t.Fatalf("definition: %s", def)
+		}
+		var idx int
+		if err := st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='jobs_status'`).Scan(&idx); err != nil || idx != 1 {
+			t.Fatalf("index: %d %v", idx, err)
+		}
+		if j, err := st.Get("old-1"); err != nil || j.Title != "old job" || j.Status != StatusSucceeded {
+			t.Fatalf("row kept: %+v %v", j, err)
+		}
+		_ = st.Close()
+	}
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Insert(&Job{ID: "q", Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: StatusQueued,
+		Model: "m", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Finish("q", "", StatusStopped, 0, 0, 0, "stopped", time.Now()); err != nil {
+		t.Fatalf("stop on a migrated database: %v", err)
+	}
+}
+
+// Requeue archives the attempt that ran and resets the run fields; it only takes stopped, timeout
+// and failed rows. Amend appends to a queued brief only.
+func TestRequeueArchivesAttemptAndAmend(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Unix(1760000000, 0)
+	if err := st.Insert(&Job{ID: "j", Agent: "a", Title: "t", Kind: "fix", Brief: "b", Status: StatusQueued, Model: "m",
+		MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Amend("j", " more"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim("j", "tok", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Amend("j", "late"); !errors.Is(err, ErrImmutable) {
+		t.Fatalf("amend of a running job: %v", err)
+	}
+	if err := st.SetSession("j", "tok", "sid-1", RunNew); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Requeue("j", ResumeLimits{MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1}, "x", ""); !errors.Is(err, ErrImmutable) {
+		t.Fatalf("requeue of a running job: %v", err)
+	}
+	if err := st.Finish("j", "tok", StatusTimeout, 30, 2.5, 2700, "timeout after 45 minutes", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkNotified("j", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Requeue("j", ResumeLimits{MaxTurns: 50, MaxBudgetUSD: 7.5, TimeoutMinutes: 30}, "update", ""); err != nil {
+		t.Fatal(err)
+	}
+	j, err := st.Get("j")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Status != StatusQueued || j.Brief != "b more" || j.Attempt != 1 || j.MaxTurns != 50 || j.Turns != 0 ||
+		j.NotifiedAt != nil || j.FinishedAt != nil || j.StartedAt != nil || j.Error != "" || j.PendingContext != "update" || j.SessionID != "sid-1" {
+		t.Fatalf("requeued: %+v", j)
+	}
+	atts, err := st.Attempts("j")
+	if err != nil || len(atts) != 1 {
+		t.Fatalf("attempts: %+v %v", atts, err)
+	}
+	if a := atts[0]; a.N != 1 || a.Mode != RunNew || a.Status != StatusTimeout || a.Turns != 30 || a.CostUSD != 2.5 ||
+		a.MaxTurns != 80 || a.SessionID != "sid-1" || a.Error != "timeout after 45 minutes" || a.FinishedAt == nil {
+		t.Fatalf("attempt 1: %+v", a)
 	}
 }

@@ -60,6 +60,9 @@ type JobView struct {
 	ScheduleID     string  `json:"schedule_id,omitempty"`
 	Error          string  `json:"error,omitempty"`
 	JobDir         string  `json:"job_dir"`
+	SessionID      string  `json:"session_id,omitempty"`
+	Attempt        int     `json:"attempt"`
+	RunMode        string  `json:"run_mode,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -78,6 +81,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		StartedAt: fmtTS(j.StartedAt), FinishedAt: fmtTS(j.FinishedAt), NotifiedAt: fmtTS(j.NotifiedAt),
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID),
+		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode,
 	}
 }
 
@@ -165,6 +169,8 @@ type JobResultOutput struct {
 	ReportTruncated bool     `json:"report_truncated,omitempty"`
 	Artifacts       []string `json:"artifacts"`
 	Note            string   `json:"note,omitempty"`
+	// Attempts lists every attempt of a resumed job, oldest first; the last one is the current row.
+	Attempts []AttemptView `json:"attempts,omitempty"`
 }
 
 // errNotRegular marks a job file that is not a regular file (FIFO, device, socket, directory, symlink).
@@ -213,6 +219,9 @@ func addJobResult(s *sdk.Server, d Deps) {
 			return nil, JobResultOutput{}, err
 		}
 		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: j.Error, Artifacts: []string{}}
+		if out.Attempts, err = attemptViews(m, j); err != nil {
+			return nil, JobResultOutput{}, err
+		}
 		if !out.Finished {
 			out.Note = "job is " + j.Status + "; the session gets a [jobs:job-done] line when it ends"
 			return nil, out, nil
@@ -240,6 +249,9 @@ func addJobResult(s *sdk.Server, d Deps) {
 				out.Note = fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md"))
 			}
 		}
+		if j.Status == store.StatusStopped {
+			out.Note = strings.TrimSpace("stopped: work dir and session kept; job_resume continues it, job_cancel gives it up. " + out.Note)
+		}
 		return nil, out, nil
 	})
 }
@@ -247,7 +259,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 // JobListInput is job_list's input.
 type JobListInput struct {
 	Limit  int    `json:"limit,omitempty" jsonschema:"max rows, 1..200; default 20"`
-	Status string `json:"status,omitempty" jsonschema:"only jobs with this status: queued | running | succeeded | failed | timeout | cancelled"`
+	Status string `json:"status,omitempty" jsonschema:"only jobs with this status: queued | running | succeeded | failed | timeout | cancelled | stopped"`
 }
 
 // JobListOutput is job_list's output, newest first.
@@ -256,7 +268,7 @@ type JobListOutput struct {
 }
 
 var statuses = []string{store.StatusQueued, store.StatusRunning, store.StatusSucceeded, store.StatusFailed,
-	store.StatusTimeout, store.StatusCancelled}
+	store.StatusTimeout, store.StatusCancelled, store.StatusStopped}
 
 func addJobList(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
@@ -300,8 +312,9 @@ type JobCancelOutput struct {
 func addJobCancel(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_cancel",
-		Description: "Cancel a queued or running job (a running job's process group gets SIGTERM, then SIGKILL after 10 s). " +
-			"A finished job cannot be cancelled.",
+		Description: "Cancel a queued or running job (a running job's process group gets SIGTERM, then SIGKILL after 10 s), " +
+			"or give up a stopped one (its work dir is then cleaned up). A finished job cannot be cancelled. " +
+			"To change course and keep the work, use job_stop + job_resume instead.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobIDInput) (*sdk.CallToolResult, JobCancelOutput, error) {
 		j, err := getJob(d.Manager, in.ID)
 		if err != nil {

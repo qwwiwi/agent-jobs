@@ -11,7 +11,8 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, no cgo
 )
 
-// Job statuses. Only queued and running are mutable.
+// Job statuses. Only queued and running are mutable; stopped, timeout and failed can be resumed
+// (Requeue), which starts a new attempt of the same job; stopped can also be cancelled.
 const (
 	StatusQueued    = "queued"
 	StatusRunning   = "running"
@@ -19,6 +20,17 @@ const (
 	StatusFailed    = "failed"
 	StatusTimeout   = "timeout"
 	StatusCancelled = "cancelled"
+	// StatusStopped is a job the orchestrator stopped on purpose (job_stop): its work dir and session
+	// are kept, it is neither notified nor cleaned up, and it waits for job_resume or job_cancel.
+	StatusStopped = "stopped"
+)
+
+// Run modes of an attempt: a new session, the same session resumed, or a fresh session that falls
+// back to the brief plus a summary of the previous attempt (the session could not be resumed).
+const (
+	RunNew      = "new"
+	RunResume   = "resume"
+	RunFallback = "fallback"
 )
 
 // ErrNotFound is returned when a job id does not exist.
@@ -66,6 +78,35 @@ type Job struct {
 	ScheduleID string
 	// Billing is how the run is paid: "subscription" (default) or "api" (S3-M6 fallback).
 	Billing string
+	// SessionID is the claude session id assigned before launch (--session-id), so the job can be
+	// resumed in the same session (--resume). Empty for rows from before session resume.
+	SessionID string
+	// Attempt counts launches of this job: 1 for the first run, +1 for each resume.
+	Attempt int
+	// RunMode is how the current attempt runs: RunNew, RunResume or RunFallback.
+	RunMode string
+	// PendingContext is the orchestrator update the current (or next) attempt was resumed with.
+	PendingContext string
+}
+
+// Attempt is one earlier attempt of a resumed job (the current attempt is the job row itself).
+type Attempt struct {
+	JobID          string
+	N              int
+	Mode           string
+	Status         string
+	Model          string
+	MaxTurns       int
+	MaxBudgetUSD   float64
+	TimeoutMinutes int
+	Turns          int
+	CostUSD        float64
+	DurationSec    int
+	Error          string
+	Context        string
+	SessionID      string
+	StartedAt      *time.Time
+	FinishedAt     *time.Time
 }
 
 // Runners and billing modes.
@@ -88,7 +129,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	brief           TEXT NOT NULL,
 	repo_path       TEXT NOT NULL DEFAULT '',
 	base_commit     TEXT NOT NULL DEFAULT '',
-	status          TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','timeout','cancelled')),
+	status          TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','timeout','cancelled','stopped')),
 	model           TEXT NOT NULL,
 	max_turns       INTEGER NOT NULL,
 	max_budget_usd  REAL NOT NULL,
@@ -107,6 +148,25 @@ CREATE TABLE IF NOT EXISTS jobs (
 	launch_token    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+CREATE TABLE IF NOT EXISTS attempts (
+	job_id          TEXT NOT NULL,
+	n               INTEGER NOT NULL,
+	mode            TEXT NOT NULL,
+	status          TEXT NOT NULL,
+	model           TEXT NOT NULL,
+	max_turns       INTEGER NOT NULL,
+	max_budget_usd  REAL NOT NULL,
+	timeout_minutes INTEGER NOT NULL,
+	turns           INTEGER NOT NULL,
+	cost_usd        REAL NOT NULL,
+	duration_sec    INTEGER NOT NULL,
+	error           TEXT NOT NULL,
+	context         TEXT NOT NULL,
+	session_id      TEXT NOT NULL,
+	started_at      INTEGER,
+	finished_at     INTEGER,
+	PRIMARY KEY (job_id, n)
+);
 `
 
 // Open opens (and migrates) the database at path.
@@ -129,7 +189,63 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate db: %w", err)
 		}
 	}
+	if err := migrateStatusCheck(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// statusCheckOld / statusCheckNew are the status CHECK of the jobs table before and after the
+// stopped status. SQLite cannot alter a CHECK, so migrateStatusCheck rebuilds the table once.
+const (
+	statusCheckOld = "'timeout','cancelled'))"
+	statusCheckNew = "'timeout','cancelled','stopped'))"
+)
+
+// migrateStatusCheck rebuilds a jobs table whose status CHECK predates the stopped status: same
+// definition (all columns, in order) with the new CHECK, rows copied, index recreated, all in one
+// IMMEDIATE transaction that re-checks the definition (several processes open the database).
+func migrateStatusCheck(db *sql.DB) error {
+	def := func() (string, error) {
+		var q string
+		err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'`).Scan(&q)
+		return q, err
+	}
+	q, err := def()
+	if err != nil || strings.Contains(q, statusCheckNew) {
+		return err
+	}
+	// One connection (SetMaxOpenConns(1)): the statements below run inside this transaction.
+	if _, err := db.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_, _ = db.Exec(`ROLLBACK`)
+		return err
+	}
+	if q, err = def(); err != nil {
+		return rollback(err)
+	}
+	if strings.Contains(q, statusCheckNew) {
+		return rollback(nil)
+	}
+	if strings.Count(q, statusCheckOld) != 1 {
+		return rollback(fmt.Errorf("jobs table: unexpected status check in %q", q))
+	}
+	head, rest, ok := strings.Cut(q, "(")
+	if !ok || !strings.Contains(head, "jobs") {
+		return rollback(fmt.Errorf("jobs table: unexpected definition %q", q))
+	}
+	newDef := "CREATE TABLE jobs_rebuild (" + strings.Replace(rest, statusCheckOld, statusCheckNew, 1)
+	for _, stmt := range []string{newDef, `INSERT INTO jobs_rebuild SELECT * FROM jobs`, `DROP TABLE jobs`,
+		`ALTER TABLE jobs_rebuild RENAME TO jobs`, `CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status)`} {
+		if _, err := db.Exec(stmt); err != nil {
+			return rollback(fmt.Errorf("rebuild jobs table: %w", err))
+		}
+	}
+	_, err = db.Exec(`COMMIT`)
+	return err
 }
 
 // migrations add columns introduced after the first schema, in order. Never edit or reorder a row.
@@ -142,6 +258,10 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN billing TEXT NOT NULL DEFAULT 'subscription'`,
 	`ALTER TABLE jobs ADD COLUMN subagents INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN run_mode TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN pending_context TEXT NOT NULL DEFAULT ''`,
 }
 
 // ReserveSubagent counts one more subagent for running job id unless max are already used. It
@@ -187,7 +307,8 @@ func (s *Store) Close() error { return s.db.Close() }
 const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, model,
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
-	complexity, runner, owner_waits, resumed_from, schedule_id, billing`
+	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
+	pending_context`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -204,12 +325,13 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
-		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing)
+		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
+		j.RunMode, j.PendingContext)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -225,20 +347,22 @@ func scanJob(r scanner) (*Job, error) {
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
-		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing)
+		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
+		&j.RunMode, &j.PendingContext)
 	if err != nil {
 		return nil, err
 	}
 	j.CreatedAt = time.Unix(created, 0)
-	conv := func(n sql.NullInt64) *time.Time {
-		if !n.Valid {
-			return nil
-		}
-		t := time.Unix(n.Int64, 0)
-		return &t
-	}
-	j.StartedAt, j.FinishedAt, j.NotifiedAt, j.CleanedAt = conv(started), conv(finished), conv(notified), conv(cleaned)
+	j.StartedAt, j.FinishedAt, j.NotifiedAt, j.CleanedAt = convTS(started), convTS(finished), convTS(notified), convTS(cleaned)
 	return &j, nil
+}
+
+func convTS(n sql.NullInt64) *time.Time {
+	if !n.Valid {
+		return nil
+	}
+	t := time.Unix(n.Int64, 0)
+	return &t
 }
 
 // Get returns one job by id.
@@ -288,18 +412,19 @@ func (s *Store) ListRecentByStatus(status string, limit int) ([]*Job, error) {
 // ListActivity returns jobs created or finished at or after since, plus every queued and running
 // job, newest first, at most limit rows.
 func (s *Store) ListActivity(since time.Time, limit int) ([]*Job, error) {
-	return s.query(`WHERE created_at >= ? OR finished_at >= ? OR status IN ('queued','running')
+	return s.query(`WHERE created_at >= ? OR finished_at >= ? OR status IN ('queued','running','stopped')
 		ORDER BY created_at DESC, rowid DESC LIMIT ?`, since.Unix(), since.Unix(), limit)
 }
 
-// PendingCleanup returns finished, notified, not yet cleaned jobs.
+// PendingCleanup returns finished, notified, not yet cleaned jobs (a stopped job keeps its work dir).
 func (s *Store) PendingCleanup() ([]*Job, error) {
-	return s.query(`WHERE status NOT IN ('queued','running') AND notified_at IS NOT NULL AND cleaned_at IS NULL ORDER BY finished_at`)
+	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NOT NULL AND cleaned_at IS NULL ORDER BY finished_at`)
 }
 
-// PendingNotify returns finished jobs whose notification was not sent yet.
+// PendingNotify returns finished jobs whose notification was not sent yet. A stopped job is not
+// notified: the orchestrator stopped it itself.
 func (s *Store) PendingNotify() ([]*Job, error) {
-	return s.query(`WHERE status NOT IN ('queued','running') AND notified_at IS NULL ORDER BY finished_at`)
+	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NULL ORDER BY finished_at`)
 }
 
 // CountRunning returns the number of running jobs.
@@ -324,13 +449,89 @@ func affected(res sql.Result, err error) error {
 }
 
 // Claim atomically moves a queued job to running under a launch token, BEFORE anything is
-// spawned. Exactly one claimer wins; the others get ErrImmutable.
+// spawned, and counts the attempt. Exactly one claimer wins; the others get ErrImmutable.
 func (s *Store) Claim(id, token string, now time.Time) error {
 	if token == "" {
 		return errors.New("claim: empty launch token")
 	}
-	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?
-		WHERE id=? AND status='queued'`, token, now.Unix(), id))
+	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?,
+		attempt=attempt+1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+}
+
+// SetSession records the claude session id and run mode of the running launch that owns the job.
+func (s *Store) SetSession(id, token, sessionID, mode string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET session_id=?, run_mode=? WHERE id=? AND status='running' AND launch_token=?`,
+		sessionID, mode, id, token))
+}
+
+// Amend appends text to the brief of a queued job. The queue position (created_at, rowid) is kept.
+func (s *Store) Amend(id, text string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET brief = brief || ? WHERE id=? AND status='queued'`, text, id))
+}
+
+// ResumeLimits are the limits of the next attempt.
+type ResumeLimits struct {
+	MaxTurns       int
+	MaxBudgetUSD   float64
+	TimeoutMinutes int
+}
+
+// Requeue queues the next attempt of a stopped, timed-out or failed job: the current attempt is
+// archived in the attempts table (when it ran), then the row goes back to queued with the new limits
+// and context, its run fields reset (notify and cleanup start over). brief, when not empty, replaces
+// the brief (a job stopped before it ever ran gets the update appended to its brief instead).
+// It keeps created_at, so the job keeps its original queue position.
+func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const resumable = `status IN ('stopped','timeout','failed')`
+	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
+		timeout_minutes, turns, cost_usd, duration_sec, error, context, session_id, started_at, finished_at)
+		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
+		max_budget_usd, timeout_minutes, turns, cost_usd, duration_sec, error, pending_context, session_id,
+		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND `+resumable, id); err != nil {
+		return fmt.Errorf("archive attempt: %w", err)
+	}
+	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
+		cleaned_at=NULL, turns=0, cost_usd=0, duration_sec=0, error='', max_turns=?, max_budget_usd=?,
+		timeout_minutes=?, pending_context=?`
+	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
+	if brief != "" {
+		q += `, brief=?`
+		args = append(args, brief)
+	}
+	args = append(args, id)
+	if err := affected(tx.Exec(q+` WHERE id=? AND `+resumable, args...)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Attempts returns the archived attempts of a job, oldest first (the current one is the job row).
+func (s *Store) Attempts(id string) ([]Attempt, error) {
+	rows, err := s.db.Query(`SELECT job_id, n, mode, status, model, max_turns, max_budget_usd, timeout_minutes,
+		turns, cost_usd, duration_sec, error, context, session_id, started_at, finished_at
+		FROM attempts WHERE job_id=? ORDER BY n`, id)
+	if err != nil {
+		return nil, fmt.Errorf("query attempts: %w", err)
+	}
+	defer rows.Close()
+	var out []Attempt
+	for rows.Next() {
+		var a Attempt
+		var started, finished sql.NullInt64
+		if err := rows.Scan(&a.JobID, &a.N, &a.Mode, &a.Status, &a.Model, &a.MaxTurns, &a.MaxBudgetUSD,
+			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
+			&started, &finished); err != nil {
+			return nil, fmt.Errorf("scan attempt: %w", err)
+		}
+		a.StartedAt, a.FinishedAt = convTS(started), convTS(finished)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // SetPID records the wrapper's pid/pgid for the launch that owns the job.
@@ -341,7 +542,8 @@ func (s *Store) SetPID(id, token string, pid, pgid int) error {
 
 // Finish moves a job to a terminal status. With a launch token, only the running job owned by
 // that launch can be finished (a tick never finishes another tick's job); with an empty token
-// (explicit cancel) any queued or running job can. Terminal rows never change status again.
+// (explicit cancel or stop) any queued, running or stopped job can. Other terminal rows never change
+// status again (only Requeue starts a new attempt).
 func (s *Store) Finish(id, token, status string, turns int, cost float64, durationSec int, errMsg string, now time.Time) error {
 	if status == StatusQueued || status == StatusRunning {
 		return fmt.Errorf("finish: %q is not a terminal status", status)
@@ -349,7 +551,7 @@ func (s *Store) Finish(id, token, status string, turns int, cost float64, durati
 	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=? WHERE id=? AND `
 	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), id}
 	if token == "" {
-		q += `status IN ('queued','running')`
+		q += `status IN ('queued','running','stopped')`
 	} else {
 		q += `status='running' AND launch_token=?`
 		args = append(args, token)

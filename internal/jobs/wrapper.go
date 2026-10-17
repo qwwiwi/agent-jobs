@@ -156,9 +156,19 @@ func admitted(jobDir, token string) error {
 // for the same job refuses to run, so a job is never executed twice. Before registering it checks
 // (under admit.lock) that the row is still running under its token; a late wrapper whose job was
 // cancelled or failed meanwhile exits 4 without running claude and without writing exit_code.
-func RunWrapper(jobDir, token string, argv []string) int {
+//
+// opts.Prompt names the stdin file in the job dir (default prompt.md). With opts.FallbackPrompt and
+// opts.FallbackSession (a resume launch: argv holds --resume <id>), a claude that fails before any
+// progress (no assistant or result event: the session could not be resumed) is run once more in a
+// fresh session: --resume <id> becomes --session-id <FallbackSession>, stdin is FallbackPrompt, the
+// failed stream is kept as stream-resume-failed.jsonl and FallbackMarker records the new session id.
+func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if len(argv) == 0 || token == "" {
 		fmt.Fprintln(os.Stderr, "run-wrapper: missing launch token or claude command")
+		return 2
+	}
+	if err := opts.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "run-wrapper:", err)
 		return 2
 	}
 	lock, err := os.OpenFile(filepath.Join(jobDir, "wrapper.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -202,7 +212,10 @@ func RunWrapper(jobDir, token string, argv []string) int {
 		return 2
 	}
 	defer stderrLog.Close()
-	code := runClaude(jobDir, argv, stderrLog)
+	code := runClaude(jobDir, opts.prompt(), argv, stderrLog)
+	if opts.FallbackPrompt != "" && code != 0 && code < 128 && !streamProgressed(filepath.Join(jobDir, "stream.jsonl")) {
+		code = runFallback(jobDir, argv, opts, stderrLog, code)
+	}
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
@@ -232,8 +245,90 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	return 0
 }
 
-func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
-	stdin, err := os.Open(filepath.Join(jobDir, "prompt.md"))
+// WrapperOptions are the run-wrapper options of a resume launch (see RunWrapper).
+type WrapperOptions struct {
+	Prompt          string // stdin file name in the job dir; empty = prompt.md
+	FallbackPrompt  string // stdin file name for the fresh-session fallback; empty = no fallback
+	FallbackSession string // the fallback's session id
+}
+
+func (o WrapperOptions) prompt() string {
+	if o.Prompt == "" {
+		return "prompt.md"
+	}
+	return o.Prompt
+}
+
+func (o WrapperOptions) validate() error {
+	for _, f := range []string{o.Prompt, o.FallbackPrompt} {
+		if f != "" && (f != filepath.Base(f) || f == "." || f == "..") {
+			return fmt.Errorf("prompt file %q must be a file name in the job dir", f)
+		}
+	}
+	if (o.FallbackPrompt == "") != (o.FallbackSession == "") {
+		return errors.New("--fallback-prompt and --fallback-session go together")
+	}
+	if o.FallbackSession != "" && !ValidSessionID(o.FallbackSession) {
+		return fmt.Errorf("fallback session %q is not a session id", o.FallbackSession)
+	}
+	return nil
+}
+
+// FallbackMarker is the job-dir file the wrapper writes when a resume fell back to a fresh session;
+// it holds the new session id.
+const FallbackMarker = "fallback_session"
+
+// runFallback reruns claude in a fresh session after a failed resume (see RunWrapper).
+func runFallback(jobDir string, argv []string, opts WrapperOptions, stderrLog *os.File, code int) int {
+	fresh := make([]string, 0, len(argv))
+	replaced := false
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--resume" && i+1 < len(argv) && !replaced {
+			fresh = append(fresh, "--session-id", opts.FallbackSession)
+			i++
+			replaced = true
+			continue
+		}
+		fresh = append(fresh, argv[i])
+	}
+	if !replaced {
+		return code
+	}
+	fmt.Fprintf(stderrLog, "run-wrapper: resume failed (exit %d, no progress); falling back to a fresh session %s\n",
+		code, opts.FallbackSession)
+	if err := os.Rename(filepath.Join(jobDir, "stream.jsonl"), filepath.Join(jobDir, "stream-resume-failed.jsonl")); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: keep failed resume stream:", err)
+	}
+	if err := writeAtomic(filepath.Join(jobDir, FallbackMarker), []byte(opts.FallbackSession+"\n")); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: write fallback marker:", err)
+		return code
+	}
+	return runClaude(jobDir, opts.FallbackPrompt, fresh, stderrLog)
+}
+
+// streamProgressed reports whether stream.jsonl holds an assistant or result event: claude got as
+// far as the model. A resume that fails before that never ran a turn.
+func streamProgressed(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	for sc.Scan() {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(sc.Bytes(), &ev) == nil && (ev.Type == "assistant" || ev.Type == "result") {
+			return true
+		}
+	}
+	return false
+}
+
+func runClaude(jobDir, promptFile string, argv []string, stderrLog *os.File) int {
+	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
 		return 127

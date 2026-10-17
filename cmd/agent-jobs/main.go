@@ -34,7 +34,14 @@ const usage = `usage: agent-jobs <command> [flags]
   status     --agent A <id>
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
-  cancel     --agent A <id>
+  cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
+  stop       --agent A <id> [--reason R]   stop a queued/running job, keep work dir and session (resumable)
+  resume     --agent A <id> (--context TEXT | --context-file F | stdin)
+             [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
+                                           continue a stopped/timeout/failed job in the same session
+                                           with an «Orchestrator update»; limits default to what is left
+  amend      --agent A <id> (--context TEXT | --context-file F | stdin)
+                                           append context to a queued job's brief (keeps its place)
   profile    --agent A --from FILE [--from FILE]... [--force] [--dry-run]
                                            generate the job profile (owner rules, <= 8 KB) from the
                                            sections of the agent's own rules marked
@@ -48,7 +55,8 @@ const usage = `usage: agent-jobs <command> [flags]
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] -- <claude> <args...>
+                                           (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
@@ -87,6 +95,12 @@ func main() {
 		err = cmdResult(args)
 	case "cancel":
 		err = cmdCancel(args)
+	case "stop":
+		err = cmdStop(args)
+	case "resume":
+		err = cmdResume(args)
+	case "amend":
+		err = cmdAmend(args)
 	case "profile":
 		err = cmdProfile(args)
 	case "card":
@@ -149,11 +163,33 @@ func mcpRole(args []string) string {
 }
 
 func runWrapper(args []string) int {
-	if len(args) < 5 || args[1] != "--token" || args[3] != "--" {
-		fmt.Fprintln(os.Stderr, "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> -- <claude> <args...>")
+	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
+		"[--fallback-prompt F --fallback-session ID] -- <claude> <args...>"
+	if len(args) < 5 || args[1] != "--token" {
+		fmt.Fprintln(os.Stderr, u)
 		return 2
 	}
-	return jobs.RunWrapper(args[0], args[2], args[4:])
+	var opts jobs.WrapperOptions
+	rest := args[3:]
+	for len(rest) >= 2 && rest[0] != "--" {
+		switch rest[0] {
+		case "--prompt":
+			opts.Prompt = rest[1]
+		case "--fallback-prompt":
+			opts.FallbackPrompt = rest[1]
+		case "--fallback-session":
+			opts.FallbackSession = rest[1]
+		default:
+			fmt.Fprintln(os.Stderr, u)
+			return 2
+		}
+		rest = rest[2:]
+	}
+	if len(rest) < 2 || rest[0] != "--" {
+		fmt.Fprintln(os.Stderr, u)
+		return 2
+	}
+	return jobs.RunWrapper(args[0], args[2], rest[1:], opts)
 }
 
 type multi []string
@@ -373,6 +409,7 @@ func cmdStatus(args []string) error {
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
+	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
@@ -424,6 +461,17 @@ func cmdResult(args []string) error {
 	if j.Error != "" {
 		fmt.Println("error:", j.Error)
 	}
+	atts, err := m.Store.Attempts(id)
+	if err != nil {
+		return err
+	}
+	for _, a := range atts {
+		fmt.Printf("attempt %d: %s %s · %d turns · $%.2f · %ds · %s\n", a.N, a.Mode, a.Status, a.Turns, a.CostUSD,
+			a.DurationSec, filepath.Join(m.JobDir(id), jobs.AttemptReportName(a.N)))
+	}
+	if len(atts) > 0 {
+		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
+	}
 	b, err := os.ReadFile(filepath.Join(m.JobDir(id), "report.md"))
 	if err != nil {
 		return fmt.Errorf("no report.md (status %s): see %s", j.Status, filepath.Join(m.JobDir(id), "stderr.log"))
@@ -451,6 +499,98 @@ func cmdCancel(args []string) error {
 		return err
 	}
 	fmt.Println("cancelled", id)
+	return nil
+}
+
+func cmdStop(args []string) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	reason := fs.String("reason", "", "why the job is stopped (recorded on the job)")
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	j, err := m.Stop(id, *reason)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("stopped %s (%d turns, $%.2f); resume with: agent-jobs resume --agent %s %s --context ...\n",
+		j.ID, j.Turns, j.CostUSD, *agent, j.ID)
+	return nil
+}
+
+// contextFlags adds --context / --context-file; readContext falls back to stdin.
+func contextFlags(fs *flag.FlagSet) (*string, *string) {
+	return fs.String("context", "", "the update text"), fs.String("context-file", "", "read the update from a file")
+}
+
+func readContext(text, file string) (string, error) {
+	switch {
+	case text != "":
+		return text, nil
+	case file != "":
+		b, err := os.ReadFile(file)
+		return string(b), err
+	}
+	b, err := io.ReadAll(os.Stdin)
+	return string(b), err
+}
+
+func cmdResume(args []string) error {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text, file := contextFlags(fs)
+	var l jobs.Limits
+	fs.IntVar(&l.MaxTurns, "max-turns", 0, fmt.Sprintf("default: what is left; ceiling %d", jobs.CeilingMaxTurns))
+	fs.Float64Var(&l.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default: what is left; ceiling %g", jobs.CeilingMaxBudgetUSD))
+	fs.IntVar(&l.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default: what is left; ceiling %d", jobs.CeilingTimeoutMinutes))
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := readContext(*text, *file)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	j, err := m.Resume(id, ctx, l)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("resume queued %s (limits %d turns · $%g · %dm)\n", j.ID, j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
+	return nil
+}
+
+func cmdAmend(args []string) error {
+	fs := flag.NewFlagSet("amend", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text, file := contextFlags(fs)
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := readContext(*text, *file)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if _, err := m.Amend(id, ctx); err != nil {
+		return err
+	}
+	fmt.Println("amended", id)
 	return nil
 }
 

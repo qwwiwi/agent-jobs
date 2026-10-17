@@ -37,6 +37,9 @@ var toolDefs = []toolDef{
 	{"job_result", addJobResult},
 	{"job_list", addJobList},
 	{"job_cancel", addJobCancel},
+	{"job_stop", addJobStop},
+	{"job_resume", addJobResume},
+	{"job_amend", addJobAmend},
 	{"system_doctor", addSystemDoctor},
 	{"system_logs", addSystemLogs},
 	{"activity_report", addActivityReport},
@@ -67,6 +70,7 @@ Read it with job_result when ready, section "Not done / uncertain" first, and ch
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.
 system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
+To change a job's course: job_amend adds context to a queued job; job_stop + job_resume stops a running one and continues it in the same session with your update; job_cancel gives it up.
 The agent-jobs skill has the details.`
 
 const jobInstructions = `agent-jobs job role: only the tools allow-listed for jobs are available here.`

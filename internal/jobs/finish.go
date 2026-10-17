@@ -40,12 +40,20 @@ func Printable(s string, max int) string {
 }
 
 // DoneLine is the one line delivered to the agent's live session.
-// A job failed because processes survived it says so at the end of the line.
+// A job failed because processes survived it says so at the end of the line; a resumed attempt
+// says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 func DoneLine(j *store.Job) string {
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
 		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
 	if strings.HasPrefix(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
+	}
+	if j.Attempt > 1 {
+		line += fmt.Sprintf(" · resumed (attempt %d", j.Attempt)
+		if j.RunMode == store.RunFallback {
+			line += ", fresh session"
+		}
+		line += ")"
 	}
 	return line
 }

@@ -265,7 +265,8 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	// whose wrapper died: their run window has no end, so a later session reusing the id would be
 	// attributed; such a row goes by the marker only.
 	sessions := map[int][]*store.Job{}
-	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled} {
+	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled,
+		store.StatusStopped} {
 		list, err := m.Store.ListByStatus(status)
 		if err != nil {
 			return rep, err
