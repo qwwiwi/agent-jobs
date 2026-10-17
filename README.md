@@ -4,7 +4,7 @@
 
 Статус: этап 1 (ядро) готов; `codex exec` runner (DEVIATIONS #5) – следующие этапы.
 
-Background `claude -p` jobs for an agent's main session: the session hands work to one-shot processes, a daemon starts and cleans them up, the session gets one line when a job is done and reads the report on demand. Design: [`docs/REFERENCE-danya.md`](docs/REFERENCE-danya.md) (implemented 1:1), allowed deviations: [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md), internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Background `claude -p` jobs for an agent's main session: the session hands work to one-shot processes, a daemon starts and cleans them up, the session gets one line when a job is done and reads the report on demand. Design: [`docs/REFERENCE-danya.md`](docs/REFERENCE-danya.md) (implemented 1:1), allowed deviations: [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md), internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), owner decisions: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 Stage 1 (this release): queue + daemon + launch + settings/guard + report contract + tmux notify + cleanup.
 
@@ -16,7 +16,7 @@ git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/ch
 scripts/check.sh                       # gofmt, go vet, go test
 ```
 
-Requires Go 1.27, git, `claude` (tested with 2.1.301), tmux for notify.
+Requires Go 1.27, git, `claude` (tested with 2.1.301 on macOS, 2.1.302 on Linux), tmux for notify. Runs on macOS and Linux (same code: POSIX sessions, `flock`, process groups; no build tags).
 
 **Dependency:** `modernc.org/sqlite` – pure-Go SQLite driver. Chosen over `mattn/go-sqlite3` because it needs no cgo/C toolchain, so the binary cross-builds and runs anywhere (Mac mini, Linux VPS) as a single static file. It is the only direct dependency.
 
@@ -71,7 +71,7 @@ When a job finishes the session gets one line:
 [jobs:job-done] job 261015-124136-70d3 smoke OK succeeded · 1 turns · $0.03 · 0m
 ```
 
-## launchd (daemon)
+## Daemon on macOS (launchd)
 
 Not installed automatically. Fill `launchd/com.agent-jobs.daemon.plist.template`:
 
@@ -83,6 +83,24 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-jobs.$AGENT.pl
 ```
 
 `KeepAlive` restarts the daemon; jobs run in their own sessions, so a daemon restart neither kills nor loses them.
+
+## Daemon on Linux (systemd user unit)
+
+Same binary, same state layout (`~/.agent-jobs/<agent>/`); the daemon runs as a systemd **user** service, one instance per agent: `agent-jobs@<agent>` from [`deploy/systemd/agent-jobs@.service`](deploy/systemd/agent-jobs@.service). Installed for the current user only, no sudo:
+
+```bash
+scripts/install-linux.sh --instance thrall              # build → ~/.local/bin/agent-jobs, unit → ~/.config/systemd/user/,
+                                                        # daemon-reload, agent-jobs init, enable + (re)start agent-jobs@thrall
+scripts/install-linux.sh --instance thrall --uninstall  # stop + disable; unit and binary removed when no other instance is enabled
+systemctl --user status agent-jobs@thrall
+journalctl --user -u agent-jobs@thrall -f               # daemon log (macOS: ~/.agent-jobs/<agent>/daemon.log)
+```
+
+- Idempotent: re-running with an unchanged binary and unit leaves the running daemon alone; a changed one is swapped atomically (rename, never written in place – a running job's guard hook points at this path) and the daemon restarted.
+- `KillMode=process`: stop/restart signals only the daemon. Jobs live in their own sessions but in the unit's cgroup, so the default `control-group` would kill every running job on restart; with `process` they keep running and the next daemon adopts and collects them (the launchd counterpart is `AbandonProcessGroup`). `Restart=on-failure`.
+- Env file `~/.config/agent-jobs/<agent>.env` (`$XDG_CONFIG_HOME`; created once with everything commented out, never overwritten, kept on uninstall): `AGENT_JOBS_HOME`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `PATH` in the unit is `~/.local/bin:/usr/local/bin:/usr/bin:/bin`.
+- The daemon survives logout only with lingering on (`loginctl enable-linger <user>`); the script warns when it is off.
+- Without a login session `systemctl --user` needs `XDG_RUNTIME_DIR=/run/user/$(id -u)`; the script sets it when missing.
 
 ## Where to look when a job fails
 

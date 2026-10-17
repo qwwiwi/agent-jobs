@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] – Wave A part 1: Linux port
+
+### Added
+- Linux support: systemd user unit template `deploy/systemd/agent-jobs@.service` (instance = agent, `KillMode=process`, `Restart=on-failure`, env file `$XDG_CONFIG_HOME/agent-jobs/<agent>.env`) and `scripts/install-linux.sh` (idempotent build/install/enable/restart, `--uninstall`, no sudo, current user only).
+- Tests for the unit template and the install script (fake systemctl, sandboxed HOME): idempotent re-install, restart only on change, env file never overwritten, uninstall keeps shared files while another instance is enabled.
+- `docs/DECISIONS.md`: owner decisions 2026-10-17 (wave A/B order, deferred items, MCP control, subagents ≤ 3 per job, Thrall-only install).
+
+### Docs
+- README: Linux section; DEVIATIONS #11 (systemd user service on Linux).
+
 ## [Unreleased] – fix-loop 2 (Codex + Fable review, conformance walk)
 
 ### Fixed

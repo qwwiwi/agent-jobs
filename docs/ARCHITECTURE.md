@@ -12,7 +12,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 | manager | `internal/jobs` | enqueue (validation, defaults, ceilings), launch, collect, timeout, cancel, notify, cleanup. |
 | wrapper | `agent-jobs run-wrapper` | holds `wrapper.lock` (a second wrapper for the job refuses); under `admit.lock` checks that the job row is still `running` with its launch token (otherwise exits 4: no claude, no exit_code) and registers itself in `wrapper.json` (pid, pgid, launch token); then runs claude with a scrubbed git environment (below) and prompt.md on stdin, writes stream.jsonl / stderr.log, extracts report.md, writes exit_code last. |
 | guard | `internal/guard`, `agent-jobs guard` | PreToolUse hook (exit 2 = block, reason on stderr). |
-| daemon | `agent-jobs daemon` / `tick` | one tick per minute; launchd template in `launchd/`. |
+| daemon | `agent-jobs daemon` / `tick` | one tick per minute; launchd template in `launchd/` (macOS), systemd user unit `deploy/systemd/agent-jobs@.service` + `scripts/install-linux.sh` (Linux, `KillMode=process`). |
 | templates | `prompts/*.md`, `rules/owner.md` | embedded in the binary (`assets.go`). |
 
 ## State layout
