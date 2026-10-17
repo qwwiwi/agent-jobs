@@ -28,7 +28,7 @@ A job is started with `job_start` (MCP) or `agent-jobs start` (CLI). Give it:
 - `brief`: written for a stranger. A job has none of your conversation; state the goal, the boundaries, what counts as done and what not to touch;
 - limits only when the defaults (80 turns / $10 / 45 min) do not fit; above the ceilings (200 / $50 / 180 min) the call is rejected, not clamped.
 
-**Cost note.** Even an empty subagent loads a full context: we measured about 100K tokens for a subagent that only answered «ok». Its result then lands in the parent and is re-read on every following call. A job runs outside the session; the parent gets one line.
+**Cost note.** Even an empty subagent loads a full context: a subagent that only answered «ok» took about 100K tokens (measured once on one host, 2026-10-17). Its result then lands in the parent and is re-read on every following call. A job runs outside the session; the parent gets one line.
 
 ## Concurrency
 
@@ -51,12 +51,13 @@ A typical change goes through these steps. Each step says who does it.
 | 9 | Deploy and live check | Orchestrator | Through the project's own deploy script, then check the live system |
 | 10 | Report | Orchestrator | To the owner: result, evidence, what is left |
 
-A job commits locally and never pushes, by design: the deny rules and the guard block `git push`, tags, releases and PR or issue writes in a job. Step 8 is always the orchestrator's. To take a job's work, use its worktree while it exists, or after cleanup the ref `refs/agent-jobs/jobs/<id>` and the saved patches (see the README, «Cleanup and patches»).
+A job commits locally and never pushes, by design: in a job's Bash calls the deny rules and the guard block `git push` and `git tag`, `gh release`, `gh api` and every `gh` write (PR or issue create, comment, edit, merge, review, close/reopen; only read-only `gh` subcommands pass). This covers the direct spellings, not scripts a job writes and runs (see «Known limits»). Step 8 is always the orchestrator's. To take a job's work, use its worktree while it exists, or after cleanup the ref `refs/agent-jobs/jobs/<id>` and the saved patches (see the README, «Cleanup and patches»).
 
 ## Review policy
 
 - Review is never skipped.
-- One reviewer for ordinary changes. Two reviewers, on different models, for money, auth, production databases and infrastructure.
+- One reviewer for ordinary changes. Two reviewers, on different models, for money, auth, production databases and infrastructure. This is a recommendation for projects that use agent-jobs; each project sets its own list.
+- This repository's own rule is narrower (see [DECISIONS.md](DECISIONS.md), 2026-10-17): two reviewers only for changes to the guard or permissions and to doctor kill/trash; one for everything else.
 - The reviewer runs on a different model than the coder.
 - If a reviewer is out of quota, switch to another model and say so in the report.
 - A review that did not run is never reported as passed.
