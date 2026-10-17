@@ -285,6 +285,7 @@ agent-jobs version                      # или --version
 ## Документация
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): устройство, раскладка состояния, потоки, полный список правил (на английском)
+- [docs/WORKFLOW.ru.md](docs/WORKFLOW.ru.md): работа в роли оркестратора: маршрутизация, конвейер, политика ревью
 - [docs/REFERENCE.ru.md](docs/REFERENCE.ru.md): эталонный дизайн, оригинал ([английский перевод](docs/REFERENCE.md))
 - [docs/DEVIATIONS.md](docs/DEVIATIONS.md): все одобренные отличия от эталона
 - [docs/DECISIONS.md](docs/DECISIONS.md): решения владельца, задающие объём работ
