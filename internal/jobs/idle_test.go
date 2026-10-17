@@ -147,6 +147,8 @@ func TestLastReportText(t *testing.T) {
 not json
 {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"},{"type":"text","text":"## Summary\nsecond"}]}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"no sections here"}]}}
+{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"text","text":"## Summary\nsubagent"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Quoting the contract: ## Summary"}]}}
 {"type":"result","subtype":"success","result":"done"}
 `
 	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
@@ -157,16 +159,82 @@ not json
 	}
 }
 
-func TestIdleConfigRejectsNegative(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"idle_after_result_seconds": -1}`), 0o600); err != nil {
-		t.Fatal(err)
+func TestIdleConfig(t *testing.T) {
+	load := func(v string) (Config, error) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"idle_after_result_seconds": `+v+`}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(dir)
 	}
-	if _, err := LoadConfig(dir); err == nil {
-		t.Fatal("a negative idle_after_result_seconds must be rejected")
+	if _, err := load("-2"); err == nil {
+		t.Fatal("idle_after_result_seconds below -1 must be rejected")
+	}
+	if c, err := load("-1"); err != nil || c.IdleAfterResult() != 0 {
+		t.Fatalf("-1 must turn the rule off: %v, %v", c.IdleAfterResult(), err)
+	}
+	if c, err := load("5"); err != nil || c.IdleAfterResult() != 5*time.Second {
+		t.Fatalf("idle grace %v, %v", c.IdleAfterResult(), err)
 	}
 	c, err := LoadConfig(t.TempDir())
 	if err != nil || c.IdleAfterResult() != DefaultIdleAfterResult {
 		t.Fatalf("default idle grace %v, %v", c.IdleAfterResult(), err)
+	}
+}
+
+// The off switch: a report result followed by silence longer than any grace is not closed; the job
+// ends on claude's own exit.
+func TestIdleAfterResultOff(t *testing.T) {
+	m := idleManager(t)
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{"idle_after_result_seconds": -1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_IDLE_SHORT", nil).ID)
+	if j.Status != store.StatusSucceeded || j.Error != "" {
+		t.Fatalf("job: %s %q", j.Status, j.Error)
+	}
+	if took := time.Since(start); took < 2500*time.Millisecond {
+		t.Fatalf("job ended after %s: closed although the rule is off", took)
+	}
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), IdleClosedMarker)); err == nil {
+		t.Fatal("idle marker written with the rule off")
+	}
+	// Off by the config, not by a rejected config falling back to the default grace.
+	if s := readFile(t, filepath.Join(m.JobDir(j.ID), "stderr.log")); strings.Contains(s, "falls back to the default") {
+		t.Fatalf("config rejected: %s", s)
+	}
+}
+
+// An idle close keeps a report.md the job wrote itself when the last result is not a report.
+func TestIdleAfterResultKeepsOwnReport(t *testing.T) {
+	m := idleManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_IDLE_OWNREPORT", nil).ID)
+	if j.Status != store.StatusSucceeded || !strings.Contains(j.Error, ReasonIdleClosed) {
+		t.Fatalf("job: %s %q", j.Status, j.Error)
+	}
+	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); r != "## Summary\nown report\n" {
+		t.Fatalf("report.md: %q", r)
+	}
+}
+
+// A normal exit with an empty result text: subagent output and a quoted heading are not the report.
+func TestReportFallbackIgnoresSubagentAndQuotes(t *testing.T) {
+	m := newManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_SUBAGENT_REPORT", nil).ID)
+	if j.Status != store.StatusFailed || j.Error != "exit 0 without a report" {
+		t.Fatalf("job: %s %q", j.Status, j.Error)
+	}
+}
+
+// A normal exit whose result is not a success: no report from the assistant text.
+func TestReportFallbackOnlyAfterSuccess(t *testing.T) {
+	m := newManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_NONSUCCESS_REPORT", nil).ID)
+	if j.Status != store.StatusFailed || j.Error != "exit 0 without a report" {
+		t.Fatalf("job: %s %q", j.Status, j.Error)
+	}
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "report.md")); err == nil {
+		t.Fatal("report.md written from assistant text after a non-success result")
 	}
 }

@@ -62,12 +62,19 @@ type Config struct {
 	TrashRoots []string `json:"trash_roots"`
 	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
 	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
-	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes).
+	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
+	// the rule off (claude's own exit or the timeout ends the job).
 	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
 }
 
-// IdleAfterResult returns the idle-after-result grace.
+// IdleAfterResultOff is the idle_after_result_seconds value that turns the rule off.
+const IdleAfterResultOff = -1
+
+// IdleAfterResult returns the idle-after-result grace; 0 means the rule is off.
 func (c Config) IdleAfterResult() time.Duration {
+	if c.IdleAfterResultSeconds == IdleAfterResultOff {
+		return 0
+	}
 	if c.IdleAfterResultSeconds > 0 {
 		return time.Duration(c.IdleAfterResultSeconds) * time.Second
 	}
@@ -131,8 +138,8 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
 	}
-	if c.IdleAfterResultSeconds < 0 {
-		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must not be negative", c.IdleAfterResultSeconds)
+	if c.IdleAfterResultSeconds < IdleAfterResultOff {
+		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
 	}
 	for _, r := range c.TrashRoots {
 		if !filepath.IsAbs(r) {

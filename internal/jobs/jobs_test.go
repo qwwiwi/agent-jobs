@@ -99,6 +99,17 @@ if [[ $prompt == *FAKE_IDLE* ]]; then
     echo '{"type":"result","subtype":"success","is_error":false,"num_turns":6,"total_cost_usd":0.75,"result":"All done."}'
     pause 60
   fi
+  if [[ $prompt == *FAKE_IDLE_OWNREPORT* ]]; then
+    # The job wrote report.md itself and ends with a short final message.
+    printf '## Summary\nown report\n' > ../report.md
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"Report written to report.md"}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_SHORT* ]]; then
+    # A report result, then 3 s of silence before claude exits by itself.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.1,"result":"'"$report"'"}'
+    pause 3
+  fi
   if [[ $prompt == *FAKE_IDLE_NOREPORT* ]]; then
     echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"done, no report"}'
     pause 60
@@ -129,6 +140,19 @@ if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_ASSISTANT_REPORT* ]]; then
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_SUBAGENT_REPORT* ]]; then
+  # Only a subagent's text and a quoted heading carry the report sections; the result text is empty.
+  echo '{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"text","text":"## Summary\nfrom subagent"}]}}'
+  echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Template: ## Summary"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_NONSUCCESS_REPORT* ]]; then
+  # A report text, then a non-success result that is not flagged as an error.
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+  echo '{"type":"result","subtype":"error_max_budget_usd","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
 fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then

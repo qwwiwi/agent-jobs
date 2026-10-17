@@ -25,14 +25,17 @@ import (
 // IdleKillGrace) and the job is judged by that last result instead of waiting for the timeout.
 // Linux only (/proc); elsewhere the rule is off and claude's own exit ends the job.
 
-// DefaultIdleAfterResult is the grace period of the rule (config idle_after_result_seconds).
+// DefaultIdleAfterResult is the grace period of the rule (config idle_after_result_seconds; -1 turns
+// the rule off).
 const DefaultIdleAfterResult = 3 * time.Minute
 
 // IdleKillGrace is the wait between SIGTERM and SIGKILL of an idle claude (same as cancel).
 const IdleKillGrace = 10 * time.Second
 
 // IdleClosedMarker is the job-dir file the wrapper writes when it closed claude by the rule; it holds
-// the one-line reason the daemon records in the job row.
+// the one-line reason the daemon records in the job row. It belongs to one attempt: anything that runs
+// claude again in the same job dir (a resume) must move it aside with the attempt's other files, or
+// the next attempt's verdict reports the idle close.
 const IdleClosedMarker = "closed_idle_after_result"
 
 // ReasonIdleClosed starts the job-row message of a job closed by the rule.
@@ -224,33 +227,40 @@ func runIdleWatched(cmd *exec.Cmd, streamPath string, grace time.Duration, log i
 	return <-closed, err
 }
 
-// finishIdleClosed settles a job the rule ended: report.md from the stream (the last result if it
-// carries the report sections, else the last assistant text that does, else a short note), the
-// marker with the reason, and the exit code the daemon judges: 0 for a successful last result with a
-// report, 1 otherwise.
+// finishIdleClosed settles a job the rule ended: report.md (the last result's text if it is a report;
+// else a report.md the job wrote itself, left untouched; else the last top-level assistant text that is
+// a report; else a short note), the marker with the reason, and the exit code the daemon judges: 0 for
+// a successful last result with a report, 1 otherwise.
 func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) int {
-	report := ""
-	if strings.Contains(res.Text, reportHeading) {
+	reportPath := filepath.Join(jobDir, "report.md")
+	report, keep := "", false
+	switch {
+	case isReport(res.Text):
 		report = res.Text
-	} else {
+	case hasReport(jobDir):
+		keep = true
+	default:
 		report = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
 	}
+	found := keep || report != ""
 	code, reason := 0, ReasonIdleClosed+" (result "+res.Subtype+")"
 	switch {
 	case !res.Found:
 		code, reason = 1, ReasonIdleClosed+" (no result event)"
 	case res.IsError || res.Subtype != "success":
 		code = 1
-	case report == "":
+	case !found:
 		code, reason = 1, ReasonIdleClosed+" (result "+res.Subtype+", no report in the stream)"
 	}
-	if report == "" {
+	if !found {
 		report = "## Summary\nThe job ended without a report: claude went idle after its last result and was " +
 			"closed by the idle-after-result rule; no final message with the report sections was found in " +
 			"stream.jsonl.\n"
 	}
-	if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(strings.TrimRight(report, "\n")+"\n")); err != nil {
-		fmt.Fprintln(log, "run-wrapper: write report.md:", err)
+	if !keep {
+		if err := writeAtomic(reportPath, []byte(strings.TrimRight(report, "\n")+"\n")); err != nil {
+			fmt.Fprintln(log, "run-wrapper: write report.md:", err)
+		}
 	}
 	if err := writeAtomic(filepath.Join(jobDir, IdleClosedMarker), []byte(reason+"\n")); err != nil {
 		fmt.Fprintln(log, "run-wrapper: write idle marker:", err)
@@ -258,8 +268,14 @@ func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) int {
 	return code
 }
 
-// lastReportText returns the last assistant text block in stream.jsonl that carries the report
-// sections ("" if none).
+// isReport reports whether text follows the report contract: it starts with the report heading.
+func isReport(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), reportHeading)
+}
+
+// lastReportText returns the last top-level assistant text block in stream.jsonl that is a report
+// ("" if none). Subagent output (a non-null parent_tool_use_id) and text that only quotes the heading
+// do not count.
 func lastReportText(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -267,7 +283,8 @@ func lastReportText(path string) string {
 	}
 	defer f.Close()
 	var ev struct {
-		Type    string `json:"type"`
+		Type    string          `json:"type"`
+		Parent  json.RawMessage `json:"parent_tool_use_id"`
 		Message struct {
 			Content []struct {
 				Type string `json:"type"`
@@ -279,12 +296,15 @@ func lastReportText(path string) string {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
 	for sc.Scan() {
-		ev.Type, ev.Message.Content = "", nil
+		ev.Type, ev.Parent, ev.Message.Content = "", nil, nil
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil || ev.Type != "assistant" {
 			continue
 		}
+		if p := strings.TrimSpace(string(ev.Parent)); p != "" && p != "null" {
+			continue
+		}
 		for _, c := range ev.Message.Content {
-			if c.Type == "text" && strings.Contains(c.Text, reportHeading) {
+			if c.Type == "text" && isReport(c.Text) {
 				out = c.Text
 			}
 		}

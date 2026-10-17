@@ -225,9 +225,9 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	if idleClosed {
 		code = finishIdleClosed(jobDir, res, stderrLog)
 	} else if text := res.Text; text != "" || !hasReport(jobDir) {
-		if text == "" {
-			// No final result text and no report.md of the job's own: the last assistant text that
-			// carries the report sections is the report.
+		if text == "" && res.Found && !res.IsError && res.Subtype == "success" {
+			// A successful result without text and no report.md of the job's own: the last top-level
+			// assistant text that is a report is the report.
 			text = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
 		}
 		if text != "" {
