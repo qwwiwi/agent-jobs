@@ -76,14 +76,15 @@ func (m *Manager) notifyPending() error {
 	return nil
 }
 
-// sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key.
+// sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
+// on the configured tmux socket (-L) when there is one.
 func (m *Manager) sendTmux(target, line string) error {
 	bin := m.Cfg.tmuxBin()
 	line = Printable(line, 0)
-	if out, err := exec.Command(bin, "send-keys", "-t", target, "-l", line).CombinedOutput(); err != nil {
+	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "-l", line)...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send-keys: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.Command(bin, "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
+	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "Enter")...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send-keys Enter: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
