@@ -60,14 +60,16 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 - **Code-graph index.** The reference's separate MCP server that indexes code as a graph; jobs can read and index. Research first: pick or build the indexer, then integrate.
 
-## Deferred
+## Wave D
 
-Planned, but each waits for a separate owner decision:
+Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.md](DECISIONS.md)); built after Wave C:
 
 - **Heartbeat.** The daemon decides whether to wake the agent for its own goals: a cheap Go check (time, daily limit, night), then a small model decides (DEVIATIONS #1).
 - **«Owner waits» Stop hook.** A job started at the owner's request is marked; until the orchestrator has written to the owner, a Stop hook does not let the session end its turn silently.
-- **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap.
+- **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. Built switched off; turning it on (real money) needs its own owner «да».
 - **Read-only HTTP API** for a jobs dashboard (DEVIATIONS #8).
+- **Acceptance from a clean clone.** The whole install and a test job are replayed from a fresh clone before a release.
+- **Autopilot items 23-27:** risky-first review, a Progress section in reports, a job size check, secret redaction in reports and logs, an `acceptance_cmd` a job must pass.
 
 ## Conformance check against the reference after every wave
 
