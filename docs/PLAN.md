@@ -25,7 +25,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
 - Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
-**[PR #PRNUM](https://github.com/qwwiwi/agent-jobs/pull/PRNUM): `agent-jobs` skill, subagents in jobs, job context** (moved out of Wave A).
+**[PR #8](https://github.com/qwwiwi/agent-jobs/pull/8): `agent-jobs` skill, subagents in jobs, job context** (moved out of Wave A).
 
 - **`agent-jobs` skill.** `skills/agent-jobs/SKILL.md`, installed per agent by `scripts/install-linux.sh` (`--skills-dir`, default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`; idempotent; removed on uninstall only while unchanged). Teaches the MCP tools, the mandatory model-or-complexity, the routing rule (yourself: minutes; subagent: the session needs the result now; job: long, background, overnight, must survive a restart) and how to read a result («Not done / uncertain» first, check the diff before anything leaves the machine).
 - **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs. The brief says so; the subagent tool is not denied; the guard counts Agent/Task calls per job (`<state>/subagents/<id>.log`, locked), refuses the fourth; only the input keys `description`, `prompt`, `subagent_type`, `model` pass (exact, case-sensitive; no `isolation`, `run_in_background`, team).
