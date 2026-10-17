@@ -45,8 +45,9 @@ func DoneLine(j *store.Job) string {
 }
 
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
-// line; with no target configured or a failing tmux it stays pending and is retried next tick
-// (cleanup waits for a delivered notify, so the worktree is kept meanwhile).
+// line; a failing tmux keeps it pending and it is retried next tick (cleanup waits for a delivered
+// notify, so the worktree is kept meanwhile). With no target configured, notify is off: the line is
+// written to the log and the job is marked notified right away, so the 30-minute cleanup still runs.
 func (m *Manager) notifyPending() error {
 	jobs, err := m.Store.PendingNotify()
 	if err != nil || len(jobs) == 0 {
@@ -54,7 +55,12 @@ func (m *Manager) notifyPending() error {
 	}
 	t := m.Cfg.NotifyTmuxTarget
 	if t == "" {
-		m.Log.Printf("notify: notify_tmux_target is not configured; %d job-done line(s) pending", len(jobs))
+		for _, j := range jobs {
+			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j))
+			if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	for _, j := range jobs {
@@ -112,8 +118,20 @@ func samePath(a, b string) bool {
 	return ra == rb
 }
 
+// under reports whether path (symlinks resolved) lies strictly inside dir (symlinks resolved).
+func under(path, dir string) bool {
+	rp, err1 := filepath.EvalSymlinks(path)
+	rd, err2 := filepath.EvalSymlinks(dir)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rd, rp)
+	return err == nil && rel != "." && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // verifyWorktree proves that <jobdir>/work is the worktree this job created: registered in the
-// source repo at that path, with the admin dir recorded at creation, carrying this job's owner mark.
+// source repo at that path, with its admin dir under <repo's common git dir>/worktrees/ and equal to
+// the one recorded at creation, carrying this job's owner mark.
 func (m *Manager) verifyWorktree(j *store.Job, work string) error {
 	var info WorktreeInfo
 	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "worktree.json"))
@@ -143,6 +161,13 @@ func (m *Manager) verifyWorktree(j *store.Job, work string) error {
 	if err != nil {
 		return err
 	}
+	common, err := git(j.RepoPath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	if !under(gitDir, filepath.Join(common, "worktrees")) {
+		return fmt.Errorf("worktree admin dir %s is not under %s", gitDir, filepath.Join(common, "worktrees"))
+	}
 	if !samePath(gitDir, info.GitDir) {
 		return fmt.Errorf("worktree admin dir %s differs from the one recorded at creation (%s)", gitDir, info.GitDir)
 	}
@@ -165,8 +190,15 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if j.RepoPath == "" {
 		return nil // empty work dir, nothing to preserve; prune comes later
 	}
-	if _, err := os.Lstat(work); os.IsNotExist(err) {
+	fi, err := os.Lstat(work)
+	if os.IsNotExist(err) {
 		return nil // already removed
+	}
+	if err != nil {
+		return fmt.Errorf("refusing to touch %s: %w", work, err)
+	}
+	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to touch %s: not a real directory (%s)", work, fi.Mode().Type())
 	}
 	if err := m.verifyWorktree(j, work); err != nil {
 		return fmt.Errorf("refusing to touch %s: %w", work, err)

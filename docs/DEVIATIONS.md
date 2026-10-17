@@ -12,6 +12,8 @@ Only these. Anything else must match the reference 1:1. New deviation = prince's
 | 6 | Model chosen by brief | Model chosen by kind × complexity (light/normal/hard) | prince asked 2026-10-15 |
 | 7 | Ref namespace `refs/praxis/jobs/<id>`, tag `[praxis:...]` | `refs/agent-jobs/jobs/<id>`, tag `[jobs:...]` | naming only |
 | 8 | — | Read-only HTTP API for a future «Джобы» tab in Dashi Stats | prince asked 2026-10-15 (Agent Native) |
+| 9 | Guard rejects `$?` after a pipe, self-matching wait-loop, owner name in a commit, foreign git identity; deny on push/tag/gh writes | + guard rules: nested agents (`claude`, `codex`, `gemini`, `aider`, `cursor-agent`; a job is a leaf), `git -c` / `git config` only for an allowlist of harmless keys, no changes to the git environment (`GIT_*`/`PAGER`/`EDITOR`/`VISUAL`, `env -i`/`-u`, `unset`); wrapper starts claude with a scrubbed git env (own `GIT_CONFIG_GLOBAL` with the job identity, no system config, empty `core.hooksPath`, cat/true as pager/editor) | security hardening (Fable security review of PR #1); prince OK pending |
+| 10 | Before removing the worktree save diffstat, `commits.patch` (format-patch), `uncommitted.patch` (`git diff --binary`) | + `staged.patch` (index vs HEAD) and `untracked.tar` (untracked, not ignored files) | additive: the reference's «ни одна не теряет работу джобы молча» is not met by the three files alone (staged and untracked work would be lost); prince OK pending |
 
 ## Conformance check (prince 2026-10-15: «все сверки делай»)
 After every stage, before merge: Codex `gpt-6.1-sol` high walks REFERENCE-danya.md line by line → for each claim: implemented? where (file:line)? 1:1 / deviation. Any deviation not in the table above = blocker, no merge. Result table goes to the prince.

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -228,8 +229,14 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		return 127
 	}
 	defer stdout.Close()
+	env, err := GitEnv(jobDir, os.Environ())
+	if err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
+		return 127
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
+	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderrLog
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
@@ -243,4 +250,66 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		return 127
 	}
 	return 0
+}
+
+// Job git environment: files in the job dir (written by prepare; created empty here if missing).
+const (
+	gitConfigFile = "gitconfig" // GIT_CONFIG_GLOBAL: only the job identity
+	noHooksDir    = "no-hooks"  // core.hooksPath: empty, so repository hooks never run
+)
+
+// GitEnv returns env without any GIT_*, PAGER, EDITOR, VISUAL variable, plus the job's git
+// environment: no system config, <jobdir>/gitconfig as the only global config, cat as pager, true as
+// editor, no terminal prompt, and core.hooksPath=<jobdir>/no-hooks at command-line level (via
+// GIT_CONFIG_COUNT), which wins over any repository config. So git run by the job does not execute
+// hooks, a pager, an editor or a credential prompt the guard does not see.
+func GitEnv(jobDir string, env []string) ([]string, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg, hooks := filepath.Join(abs, gitConfigFile), filepath.Join(abs, noHooksDir)
+	if err := ensureGitFiles(cfg, hooks); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(env)+12)
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, "GIT_") || k == "PAGER" || k == "EDITOR" || k == "VISUAL" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL="+cfg,
+		"GIT_PAGER=cat", "PAGER=cat",
+		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0="+hooks,
+	), nil
+}
+
+// ensureGitFiles creates an empty read-only gitconfig and an empty read-only hooks dir when missing.
+func ensureGitFiles(cfg, hooks string) error {
+	if _, err := os.Lstat(cfg); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(cfg, nil, 0o400); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := os.Mkdir(hooks, 0o500); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	fi, err := os.Lstat(hooks)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", hooks)
+	}
+	return nil
 }

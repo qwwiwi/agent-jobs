@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -43,6 +44,14 @@ var denyRules = []string{
 	"Bash(env --split-string*)",
 	// Prefix rules miss spellings like `git -C x push` or `gh pr -R o/r create`;
 	// the guard hook parses every Bash command and blocks those too (fail closed).
+	"Bash(git send-pack:*)",
+	"Bash(git http-push:*)",
+	// A job is a leaf: no nested agents (also rejected by the guard in any spelling).
+	"Bash(claude:*)",
+	"Bash(codex:*)",
+	"Bash(gemini:*)",
+	"Bash(aider:*)",
+	"Bash(cursor-agent:*)",
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",
@@ -168,6 +177,9 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.Settings(j.Kind)); err != nil {
 		return err
 	}
+	if err := m.writeGitFiles(dir); err != nil {
+		return err
+	}
 	// Stage 1: no MCP servers. --strict-mcp-config makes this the complete list.
 	if err := writeJSON(filepath.Join(dir, "mcp.json"), map[string]any{"mcpServers": map[string]any{}}); err != nil {
 		return err
@@ -208,4 +220,30 @@ func (m *Manager) markWorktree(j *store.Job, work string) error {
 		return fmt.Errorf("mark worktree: %w", err)
 	}
 	return writeJSON(filepath.Join(m.JobDir(j.ID), "worktree.json"), WorktreeInfo{Path: work, GitDir: gitDir, Head: j.BaseCommit})
+}
+
+// writeGitFiles writes <jobdir>/gitconfig (the job identity from config, nothing else) and the empty
+// <jobdir>/no-hooks dir; the wrapper points GIT_CONFIG_GLOBAL and core.hooksPath at them (GitEnv).
+func (m *Manager) writeGitFiles(dir string) error {
+	cfg := filepath.Join(dir, gitConfigFile)
+	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
+		return fmt.Errorf("write gitconfig: %w", err)
+	}
+	for _, kv := range [][2]string{{"user.name", m.Cfg.GitName}, {"user.email", m.Cfg.GitEmail}} {
+		if kv[1] == "" {
+			continue
+		}
+		cmd := exec.Command("git", "config", "--file", cfg, kv[0], kv[1])
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("write gitconfig %s: %w: %s", kv[0], err, strings.TrimSpace(string(out)))
+		}
+	}
+	if err := os.Chmod(cfg, 0o400); err != nil {
+		return err
+	}
+	if err := os.Mkdir(filepath.Join(dir, noHooksDir), 0o500); err != nil {
+		return fmt.Errorf("create no-hooks dir: %w", err)
+	}
+	return nil
 }

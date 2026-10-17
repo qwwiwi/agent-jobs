@@ -97,7 +97,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	fs := flag.NewFlagSet("guard", flag.ContinueOnError)
 	var owners multi
 	fs.Var(&owners, "owner-name", "owner name that must not appear in commits (repeatable)")
-	name := fs.String("git-name", "", "allowed git user.name")
+	name := fs.String("git-name", "", "the job's git user.name (git config may set only this value)")
 	email := fs.String("git-email", "", "allowed git user.email")
 	if err := fs.Parse(args); err != nil {
 		return 2

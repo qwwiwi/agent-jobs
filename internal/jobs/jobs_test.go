@@ -56,6 +56,13 @@ fi
 if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
+if [[ $prompt == *FAKE_GITENV* ]]; then
+  env | grep -E '^(GIT_|PAGER=|EDITOR=|VISUAL=)' | sort > ../gitenv.txt
+  echo h > hooked.txt
+  git add hooked.txt
+  git commit -qm "env commit" 2>> ../commit.err
+  git log -1 --format='%an <%ae>' > ../author.txt
+fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
@@ -227,8 +234,8 @@ func TestSucceededReportFlagsAndFiles(t *testing.T) {
 			t.Fatalf("missing %s: %v", f, err)
 		}
 	}
-	if j.NotifiedAt != nil {
-		t.Fatal("without a notify target the job must stay pending, not be marked delivered")
+	if j.NotifiedAt == nil {
+		t.Fatal("notify off (no target): the job must be marked notified so cleanup still runs")
 	}
 	// Terminal status never changes.
 	if err := m.Store.Finish(j.ID, "", store.StatusFailed, 0, 0, 0, "", time.Now()); !errors.Is(err, store.ErrImmutable) {
@@ -246,7 +253,8 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		b, _ := json.Marshal(m.Settings(kind)["permissions"])
 		return string(b)
 	}
-	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "WebFetch", "WebSearch"} {
+	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "WebFetch", "WebSearch"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}
@@ -573,24 +581,38 @@ func TestDoneLineSanitized(t *testing.T) {
 	}
 }
 
-// #26: no notify target = not delivered: the job stays pending (and is not cleaned up).
-func TestNotifyKeepsPendingWithoutTarget(t *testing.T) {
+// Security review: with notify off (no target) the job is marked notified when it finishes (the line
+// goes to the log), so the 30-minute cleanup still runs instead of keeping the worktree forever.
+func TestNotifyOffStillCleansUp(t *testing.T) {
 	m := newManager(t)
-	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
-	if j.NotifiedAt != nil {
-		t.Fatal("marked notified without a target")
+	var logBuf bytes.Buffer
+	m.Log = log.New(&logBuf, "", 0)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_COMMIT", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	if j.Status != store.StatusSucceeded || j.NotifiedAt == nil {
+		t.Fatalf("status %s notified=%v", j.Status, j.NotifiedAt)
 	}
-	logf := notifyTo(t, m)
+	if !strings.Contains(logBuf.String(), "notify off") || !strings.Contains(logBuf.String(), j.ID) {
+		t.Fatalf("no notify-off log line: %s", logBuf.String())
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(31 * time.Minute) }
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
 	}
-	if get(t, m, j.ID).NotifiedAt == nil {
-		t.Fatal("pending notify not retried once a target exists")
+	if get(t, m, j.ID).CleanedAt == nil {
+		t.Fatal("not cleaned up with notify off")
 	}
-	if b, _ := os.ReadFile(logf); !strings.Contains(string(b), j.ID) {
-		t.Fatalf("tmux log: %s", b)
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "work")); !os.IsNotExist(err) {
+		t.Fatal("worktree kept with notify off")
 	}
-	// A failing tmux (missing session) keeps it pending too.
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "commits.patch")); err != nil {
+		t.Fatal("patches not saved before removal")
+	}
+}
+
+// #26: a failing tmux delivery (missing session) is not a delivery: the job stays pending.
+func TestNotifyKeepsPendingOnFailedDelivery(t *testing.T) {
 	m2 := newManager(t)
 	t.Setenv("AGENT_JOBS_TMUX_BIN", "/usr/bin/false")
 	m2.Cfg.NotifyTmuxTarget = "missing-session"
@@ -1057,5 +1079,235 @@ func TestInitWritesOrchestratorDuties(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("orchestrator.md lacks %q", want)
 		}
+	}
+}
+
+// Security review: killGroup / Cancel / adopt never signal a process group taken on faith from
+// wrapper.json (which the job can write): pgid 1 would be kill(-1), every process of the user.
+func TestKillRefusesImplausibleGroup(t *testing.T) {
+	var kills []int
+	realKill := killFn
+	killFn = func(pid int, _ syscall.Signal) error { kills = append(kills, pid); return nil }
+	t.Cleanup(func() { killFn = realKill })
+
+	sleeper := exec.Command("sleep", "30")
+	sleeper.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := sleeper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sleeper.Process.Kill(); _ = sleeper.Wait() })
+	pid := sleeper.Process.Pid
+	own, _ := syscall.Getpgid(0)
+	for _, c := range []struct {
+		name      string
+		pid, pgid int
+	}{
+		{"pgid 1", pid, 1},
+		{"pgid 0", pid, 0},
+		{"negative", pid, -5},
+		{"own group", pid, own},
+		{"pid not in group", os.Getpid(), pid},
+		{"dead pid", 1 << 22, 1 << 22},
+	} {
+		if err := verifyGroup(c.pid, c.pgid); err == nil {
+			t.Fatalf("%s: verifyGroup(%d, %d) accepted", c.name, c.pid, c.pgid)
+		}
+	}
+	if err := verifyGroup(pid, pid); err != nil {
+		t.Fatalf("real group refused: %v", err)
+	}
+
+	m := newManager(t)
+	var logBuf bytes.Buffer
+	m.Log = log.New(&logBuf, "", 0)
+	tamper := func(j *store.Job, w WrapperInfo) {
+		t.Helper()
+		if err := os.MkdirAll(m.JobDir(j.ID), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(w)
+		if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "wrapper.json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// adopt: a tampered wrapper.json (pgid=1) is not adopted.
+	ja := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(ja.ID, "tok-a", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	tamper(ja, WrapperInfo{PID: pid, PGID: 1, Token: "tok-a"})
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g := get(t, m, ja.ID); g.PID != 0 || g.PGID != 0 {
+		t.Fatalf("tampered wrapper.json adopted: pid=%d pgid=%d", g.PID, g.PGID)
+	}
+	if !strings.Contains(logBuf.String(), "refusing to adopt") {
+		t.Fatalf("no refusal logged: %s", logBuf.String())
+	}
+	// Cancel: the job is cancelled, but the tampered group is not signalled.
+	jc := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(jc.ID, "tok-c", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	tamper(jc, WrapperInfo{PID: pid, PGID: 1, Token: "tok-c"})
+	if err := m.Cancel(jc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if g := get(t, m, jc.ID); g.Status != store.StatusCancelled {
+		t.Fatalf("status %s", g.Status)
+	}
+	if !strings.Contains(logBuf.String(), "refusing to kill process group 1") {
+		t.Fatalf("no kill refusal logged: %s", logBuf.String())
+	}
+	// Timeout with a recorded pgid that is not the wrapper's group: refused as well.
+	jt := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(jt.ID, "tok-t", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetPID(jt.ID, "tok-t", pid, own); err != nil {
+		t.Fatal(err)
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(time.Duration(DefaultTimeoutMinutes+1) * time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g := get(t, m, jt.ID); g.Status != store.StatusTimeout {
+		t.Fatalf("status %s, want timeout", g.Status)
+	}
+	if len(kills) != 0 {
+		t.Fatalf("signalled process groups %v", kills)
+	}
+	// The real group is signalled.
+	m.killGroup("real", pid, pid)
+	if len(kills) == 0 || kills[0] != -pid {
+		t.Fatalf("real group not signalled: %v", kills)
+	}
+}
+
+// Security review: cleanup removes only a real directory that is this job's worktree, never a
+// symlink in its place and never a worktree whose admin dir lies outside <repo>/.git/worktrees/.
+func TestCleanupRefusesSymlinkAndForeignAdminDir(t *testing.T) {
+	t.Run("symlink", func(t *testing.T) {
+		m := newManager(t)
+		repo := newRepo(t)
+		j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+		work := filepath.Join(m.JobDir(j.ID), "work")
+		moved := filepath.Join(t.TempDir(), "elsewhere")
+		gitT(t, repo, "worktree", "move", work, moved)
+		if err := os.Symlink(moved, work); err != nil {
+			t.Fatal(err)
+		}
+		var logBuf bytes.Buffer
+		m.Log = log.New(&logBuf, "", 0)
+		real := time.Now
+		m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		if get(t, m, j.ID).CleanedAt != nil {
+			t.Fatal("symlinked work dir was cleaned")
+		}
+		if _, err := os.Stat(filepath.Join(moved, "tracked.txt")); err != nil {
+			t.Fatal("symlink target removed")
+		}
+		if !strings.Contains(logBuf.String(), "not a real directory") {
+			t.Fatalf("no refusal logged: %s", logBuf.String())
+		}
+	})
+	t.Run("admin dir outside .git/worktrees", func(t *testing.T) {
+		m := newManager(t)
+		repo := newRepo(t)
+		j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+		dir := m.JobDir(j.ID)
+		work := filepath.Join(dir, "work")
+		admin := gitT(t, work, "rev-parse", "--absolute-git-dir")
+		fake := filepath.Join(t.TempDir(), "fake-admin")
+		if out, err := exec.Command("cp", "-a", admin, fake).CombinedOutput(); err != nil {
+			t.Fatalf("cp: %v %s", err, out)
+		}
+		common := gitT(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err := os.WriteFile(filepath.Join(fake, "commondir"), []byte(common+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(work, ".git"), []byte("gitdir: "+fake+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(WorktreeInfo{Path: work, GitDir: fake, Head: j.BaseCommit})
+		if err := os.WriteFile(filepath.Join(dir, "worktree.json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := gitT(t, work, "rev-parse", "--absolute-git-dir"); !samePath(got, fake) {
+			t.Fatalf("precondition: admin dir %s, want %s", got, fake)
+		}
+		var logBuf bytes.Buffer
+		m.Log = log.New(&logBuf, "", 0)
+		real := time.Now
+		m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		if get(t, m, j.ID).CleanedAt != nil {
+			t.Fatal("worktree with a foreign admin dir was cleaned")
+		}
+		if _, err := os.Stat(filepath.Join(work, "tracked.txt")); err != nil {
+			t.Fatal("work removed")
+		}
+		if !strings.Contains(logBuf.String(), "is not under") {
+			t.Fatalf("no refusal logged: %s", logBuf.String())
+		}
+	})
+}
+
+// Security review H2: claude runs with a scrubbed git environment: own global config (job identity
+// only), no system config, repository hooks never run, cat/true as pager/editor; inherited GIT_* gone.
+func TestWrapperScrubsGitEnv(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.GitName, m.Cfg.GitEmail = "Job Bot", "bot@example.com"
+	repo := newRepo(t)
+	gitT(t, repo, "config", "--unset", "user.name")
+	gitT(t, repo, "config", "--unset", "user.email")
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	hook := filepath.Join(repo, ".git", "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch "+marker+"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_PAGER", "evil-pager")
+	t.Setenv("EDITOR", "evil-editor")
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'core.pager'='evil'")
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_GITENV", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s %q", j.Status, j.Error)
+	}
+	dir := m.JobDir(j.ID)
+	read := func(f string) string {
+		b, _ := os.ReadFile(filepath.Join(dir, f))
+		return string(b)
+	}
+	abs, _ := filepath.Abs(dir)
+	want := []string{
+		"EDITOR=true", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_GLOBAL=" + filepath.Join(abs, "gitconfig"),
+		"GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_VALUE_0=" + filepath.Join(abs, "no-hooks"),
+		"GIT_EDITOR=true", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "PAGER=cat", "VISUAL=true",
+	}
+	if got := strings.Fields(read("gitenv.txt")); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("git env:\n got %v\nwant %v", got, want)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("repository pre-commit hook ran")
+	}
+	if a := strings.TrimSpace(read("author.txt")); a != "Job Bot <bot@example.com>" {
+		t.Fatalf("author %q (commit.err: %s)", a, read("commit.err"))
+	}
+	if b := read("gitconfig"); strings.Count(b, "=") != 2 || !strings.Contains(b, "Job Bot") {
+		t.Fatalf("gitconfig must hold only the identity: %q", b)
+	}
+	// Without the scrub the same hook does run (the test proves something).
+	if out, err := exec.Command("git", "-C", repo, "commit", "--allow-empty", "-qm", "x").CombinedOutput(); err == nil {
+		t.Fatalf("precondition: hook must block a plain commit: %s", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("precondition: hook did not run without the scrub")
 	}
 }

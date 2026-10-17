@@ -337,12 +337,44 @@ func groupAlive(pgid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// killGroup sends SIGTERM to the process group, waits up to KillGrace, then SIGKILL.
-func (m *Manager) killGroup(pgid int) {
-	if pgid <= 0 {
+// killFn sends a signal (syscall.Kill); a variable so tests can see every kill without risking one.
+var killFn = syscall.Kill
+
+// plausibleGroup rejects a pgid that must never be signalled whatever wrapper.json says: 0 and 1
+// (kill(-1) reaches every process of the user), negative values and the daemon's own group.
+func plausibleGroup(pgid int) error {
+	if pgid <= 1 {
+		return fmt.Errorf("pgid %d is not a job's process group", pgid)
+	}
+	if own, err := syscall.Getpgid(0); err != nil || own == pgid {
+		return fmt.Errorf("pgid %d is the daemon's own process group (or it is unknown: %v)", pgid, err)
+	}
+	return nil
+}
+
+// verifyGroup proves that pgid is the live wrapper's process group right before a kill.
+func verifyGroup(pid, pgid int) error {
+	if err := plausibleGroup(pgid); err != nil {
+		return err
+	}
+	got, err := syscall.Getpgid(pid)
+	if err != nil {
+		return fmt.Errorf("wrapper pid %d: %w", pid, err)
+	}
+	if got != pgid {
+		return fmt.Errorf("wrapper pid %d is in process group %d, not %d", pid, got, pgid)
+	}
+	return nil
+}
+
+// killGroup sends SIGTERM to the wrapper's process group, waits up to KillGrace, then SIGKILL.
+// It refuses (and logs) unless pgid is plausible and is the live wrapper pid's group.
+func (m *Manager) killGroup(id string, pid, pgid int) {
+	if err := verifyGroup(pid, pgid); err != nil {
+		m.Log.Printf("job %s: refusing to kill process group %d: %v", id, pgid, err)
 		return
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	_ = killFn(-pgid, syscall.SIGTERM)
 	deadline := time.Now().Add(m.KillGrace)
 	for time.Now().Before(deadline) {
 		if !groupAlive(pgid) {
@@ -350,7 +382,7 @@ func (m *Manager) killGroup(pgid int) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = killFn(-pgid, syscall.SIGKILL)
 }
 
 func readExitCode(dir string) (int, bool) {
@@ -380,6 +412,13 @@ func (m *Manager) adopt(j *store.Job, now time.Time) bool {
 	defer unlock()
 	w, err := ReadWrapperInfo(m.JobDir(j.ID))
 	if err == nil && w.Token == j.LaunchToken {
+		// wrapper.json lies in the job dir, which the job can write: never adopt an implausible group.
+		// A live wrapper must really lead it; a dead one is only collected, never signalled (killGroup re-checks).
+		if gerr := plausibleGroup(w.PGID); gerr != nil || (alive(w.PID) && verifyGroup(w.PID, w.PGID) != nil) {
+			m.Log.Printf("job %s: refusing to adopt wrapper.json pid=%d pgid=%d: %v", j.ID, w.PID, w.PGID,
+				errors.Join(gerr, verifyGroup(w.PID, w.PGID)))
+			return false
+		}
 		if err := m.Store.SetPID(j.ID, j.LaunchToken, w.PID, w.PGID); err != nil {
 			m.Log.Printf("job %s: adopt pid %d: %v", j.ID, w.PID, err)
 			return false
@@ -390,7 +429,7 @@ func (m *Manager) adopt(j *store.Job, now time.Time) bool {
 	}
 	if j.StartedAt != nil && now.Sub(*j.StartedAt) > LaunchGrace {
 		m.finish(j, store.StatusFailed, StreamResult{}, 0,
-			"launch interrupted: the wrapper never registered (no wrapper.json); work dir kept", now)
+			"launch interrupted: the wrapper never registered (no valid wrapper.json); work dir kept", now)
 	}
 	return false
 }
@@ -418,7 +457,7 @@ func (m *Manager) collect() error {
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
-			m.killGroup(j.PGID)
+			m.killGroup(j.ID, j.PID, j.PGID)
 			res := parseStream(filepath.Join(dir, "stream.jsonl"))
 			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
@@ -483,13 +522,15 @@ func (m *Manager) Cancel(id string) error {
 	switch j.Status {
 	case store.StatusQueued:
 	case store.StatusRunning:
-		pgid := j.PGID
+		pid, pgid := j.PID, j.PGID
 		if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
 			if w, err := ReadWrapperInfo(m.JobDir(id)); err == nil && w.Token == j.LaunchToken {
-				pgid = w.PGID
+				pid, pgid = w.PID, w.PGID
 			}
 		}
-		m.killGroup(pgid)
+		if pgid != 0 {
+			m.killGroup(id, pid, pgid)
+		}
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}
