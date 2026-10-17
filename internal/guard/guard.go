@@ -13,7 +13,7 @@
 //   - git subcommands outside git's own command list (aliases, external git-*) or that run commands
 //     (rebase -x, submodule foreach, bisect run, difftool, filter-branch, …), and writes into
 //     .git/config, .git/hooks or $GIT_DIR;
-//   - nested agents (claude, codex, gemini, aider, cursor-agent): a job is a leaf.
+//   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
@@ -215,7 +215,9 @@ var indirect = map[string]bool{
 
 // agents are coding agents a job must not start: a job is a leaf, nested agents would run outside
 // the job's settings, hook and limits.
-var agents = map[string]bool{"claude": true, "codex": true, "gemini": true, "aider": true, "cursor-agent": true}
+var agents = map[string]bool{
+	"claude": true, "claude-code": true, "codex": true, "gemini": true, "aider": true, "cursor-agent": true,
+}
 
 // execName reports a lower-cased base name that, as an argument, names something that runs commands
 // the guard would not see: git (any git-<sub>), gh, a shell, a wrapper/indirect program or an agent.
@@ -323,7 +325,11 @@ func pythonScriptFile(args []string, dyn []bool) bool {
 }
 
 var (
-	reMention    = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh)($|[^a-z0-9_-])`)
+	// reMention finds git/gh, an agent or a shell as a word inside an argument, e.g. in interpreter code
+	// (`python3 -c '…subprocess.run(["claude", …])'`, `node -e '…codex…'`) or a package path
+	// (`npx @anthropic-ai/claude-code`, `node …/claude-code/cli.js`).
+	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh|claude|claude-code|codex|gemini|aider|cursor-agent|` +
+		`sh|bash|zsh|dash|fish)($|[^a-z0-9_-])`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
 )
 
@@ -456,7 +462,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	return ""
 }
 
-// checkNestedAgents: a job is a leaf. claude/codex/gemini/aider/cursor-agent are rejected as a
+// checkNestedAgents: a job is a leaf. claude/claude-code/codex/gemini/aider/cursor-agent are rejected as a
 // command (also behind env/command/exec and as a path); as an argument they are caught by the
 // indirect scan in unverifiable.
 func checkNestedAgents(scripts []*script, _ string, _ Config) string {
@@ -542,9 +548,54 @@ var gitFileReaders = map[string]bool{
 	"less": true, "diff": true,
 }
 
+// gitDirTargets take a directory as a destination or a new working directory: with `.git` itself as
+// an argument they reach its config and hooks under another spelling (`cd .git; echo > config`,
+// `ln -s ../.git d`, `cp evil-config .git/`).
+var gitDirTargets = map[string]bool{
+	"cd": true, "pushd": true, "ln": true, "cp": true, "mv": true, "tee": true, "install": true, "rsync": true,
+}
+
+// pathOf returns the cleaned path of a word; for an option `--opt=value` that of its value.
+func pathOf(w string) string {
+	if strings.HasPrefix(w, "-") {
+		if _, v, ok := strings.Cut(w, "="); ok {
+			w = v
+		}
+	}
+	return filepath.Clean(w)
+}
+
+// gitFile reports a word naming git's config, hooks or $GIT_DIR, also respelled (`.git//config`,
+// `.git/./hooks`, `x/../.git/config`).
+func gitFile(w string) bool { return reGitFiles.MatchString(w) || reGitFiles.MatchString(pathOf(w)) }
+
+// gitDir reports a word naming a `.git` directory itself.
+func gitDir(w string) bool { return strings.EqualFold(filepath.Base(pathOf(w)), ".git") }
+
+// gitGlob reports a glob/brace word the shell could expand into a path through `.git`: it mentions
+// `.git`, or one of its segments matches `.git` (`.gi?/config`, `.[g]it/hooks`). A segment that starts
+// with `*` or `?` does not match a dot file in the shell.
+func gitGlob(w string) bool {
+	if !hasGlob(w) {
+		return false
+	}
+	if strings.Contains(strings.ToLower(w), ".git") {
+		return true
+	}
+	for _, s := range strings.Split(w, "/") {
+		if s != "" && s[0] != '*' && s[0] != '?' {
+			if ok, _ := filepath.Match(strings.ToLower(s), ".git"); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // checkGitFiles rejects writes into the repository config, hooks or $GIT_DIR: an output redirection
-// to such a path (any program), or such a path as an argument of a program that is not a plain reader
-// (tee, cp, mv, ln, sed -i, chmod, …). git itself is checked by the config allowlist instead.
+// to such a path or to `.git` (any program), such a path or a glob through `.git` as an argument of a
+// program that is not a plain reader (tee, cp, mv, ln, sed -i, chmod, …), and `.git` itself as the
+// target of cd/pushd/ln/cp/mv/tee/install/rsync. git itself is checked by the config allowlist instead.
 func checkGitFiles(scripts []*script, _ string, _ Config) string {
 	blocked := func(p string) string {
 		return "blocked by guard: `" + p + "` is git's config, hooks or $GIT_DIR; a job does not write there " +
@@ -554,7 +605,7 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				for _, t := range c.outRedirs {
-					if reGitFiles.MatchString(t) {
+					if gitFile(t) || gitDir(t) || gitGlob(t) {
 						return blocked(t)
 					}
 				}
@@ -562,11 +613,16 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				if len(argv) == 0 {
 					continue
 				}
-				if name := strings.ToLower(base(argv[0])); isGitName(name) || gitFileReaders[name] {
+				name := strings.ToLower(base(argv[0]))
+				if isGitName(name) || gitFileReaders[name] {
 					continue
 				}
+				// find without an action only matches names: `find . -not -path '*/.git/*'` is a filter.
+				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
+					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
+				})
 				for _, a := range argv[1:] {
-					if reGitFiles.MatchString(a) {
+					if gitFile(a) || (gitGlob(a) && !findFilter) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
 				}
@@ -705,8 +761,112 @@ func gitRunForm(g gitCall) string {
 				return "clone -u"
 			}
 		}
+	case "fetch", "fetch-pack", "ls-remote": // --exec is --upload-pack
+		for _, a := range g.args {
+			if longPrefixOf(a, "exec") {
+				return g.sub + " --exec"
+			}
+		}
+	case "grep": // -O / --open-files-in-pager runs a pager program
+		for _, a := range g.args {
+			if longPrefixOf(a, "open-files-in-pager") ||
+				(strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'O')) {
+				return "grep -O/--open-files-in-pager"
+			}
+		}
+	}
+	switch g.sub {
+	case "clone", "init", "init-db": // a template directory brings its own hooks and config
+		for _, a := range g.args {
+			if longPrefixOf(a, "template") {
+				return g.sub + " --template"
+			}
+		}
+	case "merge", "pull", "rebase", "cherry-pick", "revert":
+		if s, ok := mergeStrategies(g); !ok {
+			return g.sub + " -s/--strategy " + s
+		}
 	}
 	return ""
+}
+
+// gitStrategies are git's own merge strategies; any other name runs a `git-merge-<name>` program.
+var gitStrategies = map[string]bool{"resolve": true, "recursive": true, "ort": true, "octopus": true, "ours": true, "subtree": true}
+
+// mergeStrategies checks every -s/--strategy value (also abbreviated `--strat=…`, attached `-sX`, in a
+// short cluster) of merge/pull/rebase/cherry-pick/revert; it returns the first one that is not one of
+// git's own strategies. -X/--strategy-option is a strategy's option and is left alone. cherry-pick and
+// revert have -s as --signoff, so only their long form is a strategy.
+func mergeStrategies(g gitCall) (string, bool) {
+	short := g.sub == "merge" || g.sub == "pull" || g.sub == "rebase"
+	for i := 0; i < len(g.args); i++ {
+		a := g.args[i]
+		var v string
+		switch {
+		case a == "--":
+			return "", true
+		case longPrefixOf(a, "strategy"):
+			if _, val, ok := strings.Cut(a, "="); ok {
+				v = val
+			} else if i+1 < len(g.args) {
+				i++
+				v = g.args[i]
+			}
+		case short && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 's'):
+			v = a[strings.IndexByte(a, 's')+1:]
+			if v == "" && i+1 < len(g.args) {
+				i++
+				v = g.args[i]
+			}
+		default:
+			continue
+		}
+		if !gitStrategies[v] {
+			return v, false
+		}
+	}
+	return "", true
+}
+
+// cloneConfigs returns the `git clone -c/--config key=value` values (also `--conf=…`, attached `-ckv`,
+// in a short cluster): clone writes them into the new repository's config.
+func cloneConfigs(g gitCall) []string {
+	var out []string
+	for i := 0; i < len(g.args); i++ {
+		a := g.args[i]
+		next := func() string {
+			if i+1 < len(g.args) {
+				i++
+				return g.args[i]
+			}
+			return ""
+		}
+		switch {
+		case a == "--":
+			return out
+		case longPrefixOf(a, "config"):
+			if _, val, ok := strings.Cut(a, "="); ok {
+				out = append(out, val)
+			} else {
+				out = append(out, next())
+			}
+		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--"):
+			for k := 1; k < len(a); k++ {
+				if strings.IndexByte("objc", a[k]) < 0 {
+					continue
+				}
+				v := a[k+1:]
+				if v == "" {
+					v = next()
+				}
+				if a[k] == 'c' {
+					out = append(out, v)
+				}
+				break
+			}
+		}
+	}
+	return out
 }
 
 func gitRunsBlocked(what string) string {
@@ -733,7 +893,7 @@ func configKey(kv string) string {
 	return strings.ToLower(strings.TrimSpace(k))
 }
 
-func checkNothingOut(scripts []*script, _ string, _ Config) string {
+func checkNothingOut(scripts []*script, _ string, cfg Config) string {
 	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
 		if g, ok := parseGit(argv); ok {
 			for _, kv := range g.configs {
@@ -743,6 +903,18 @@ func checkNothingOut(scripts []*script, _ string, _ Config) string {
 				}
 				if !gitConfigSafe[k] {
 					return gitConfigBlocked("-c " + k)
+				}
+			}
+			if g.sub == "clone" {
+				for _, kv := range cloneConfigs(g) {
+					k := configKey(kv)
+					_, v, _ := strings.Cut(kv, "=")
+					if f := identityField(k); f != "" && !allowedValue(f, v, cfg) {
+						return foreign("clone -c " + k)
+					}
+					if !gitConfigSafe[k] {
+						return gitConfigBlocked("clone -c " + k)
+					}
 				}
 			}
 			if gitOutside[g.sub] {

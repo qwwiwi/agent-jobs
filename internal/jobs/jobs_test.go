@@ -265,7 +265,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "WebFetch", "WebSearch"} {
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "WebFetch", "WebSearch"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}
@@ -1271,6 +1271,90 @@ func TestCleanupRefusesSymlinkAndForeignAdminDir(t *testing.T) {
 	})
 }
 
+// Fable control round: filter drivers, diff driver commands and textconv in the repo-level config
+// (also via an include, also in the worktree's own config) would run in the daemon's cleanup diffs.
+// Cleanup makes no patch, keeps the worktree, logs why, saves the ref and counts as done.
+func TestCleanupSkipsRepoDrivers(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, repo, work, script string)
+		attr  string
+	}{
+		{"clean filter", func(t *testing.T, repo, _, script string) {
+			gitT(t, repo, "config", "filter.evil.clean", script)
+		}, "* filter=evil\n"},
+		{"textconv", func(t *testing.T, repo, _, script string) {
+			gitT(t, repo, "config", "diff.txt.textconv", script)
+		}, "*.txt diff=txt\n"},
+		{"diff driver command", func(t *testing.T, repo, _, script string) {
+			gitT(t, repo, "config", "diff.txt.command", script)
+		}, "*.txt diff=txt\n"},
+		{"filter via include", func(t *testing.T, repo, _, script string) {
+			inc := filepath.Join(t.TempDir(), "inc.cfg")
+			if err := os.WriteFile(inc, []byte("[filter \"evil\"]\n\tclean = "+script+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, repo, "config", "include.path", inc)
+		}, "* filter=evil\n"},
+		{"filter in worktree config", func(t *testing.T, repo, work, script string) {
+			gitT(t, repo, "config", "extensions.worktreeConfig", "true")
+			gitT(t, work, "config", "--worktree", "filter.evil.clean", script)
+		}, "* filter=evil\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newManager(t)
+			repo := newRepo(t)
+			j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+			dir := m.JobDir(j.ID)
+			work := filepath.Join(dir, "work")
+			marker := filepath.Join(t.TempDir(), "driver-ran")
+			script := filepath.Join(t.TempDir(), "driver.sh")
+			if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+marker+"\ncat\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			c.setup(t, repo, work, script)
+			if err := os.WriteFile(filepath.Join(work, ".gitattributes"), []byte(c.attr), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(work, "tracked.txt"), []byte("changed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var logBuf bytes.Buffer
+			m.Log = log.New(&logBuf, "", 0)
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("cleanup ran a driver from the repo config")
+			}
+			if get(t, m, j.ID).CleanedAt == nil {
+				t.Fatalf("cleanup bookkeeping not finished: %s", logBuf.String())
+			}
+			if _, err := os.Stat(filepath.Join(work, "tracked.txt")); err != nil {
+				t.Fatal("worktree removed")
+			}
+			if !strings.Contains(logBuf.String(), "cleanup skipped") {
+				t.Fatalf("no skip logged: %s", logBuf.String())
+			}
+			if _, err := os.Stat(filepath.Join(dir, "uncommitted.patch")); err == nil {
+				t.Fatal("a patch was made")
+			}
+			if got := gitT(t, repo, "rev-parse", "refs/agent-jobs/jobs/"+j.ID); got != gitT(t, work, "rev-parse", "HEAD") {
+				t.Fatalf("job ref %s", got)
+			}
+			// Without the skip the same diff does run the driver (the test proves something).
+			cmd := exec.Command("git", "-C", work, "diff", "HEAD")
+			cmd.Env = daemonGitEnv()
+			_, _ = cmd.CombinedOutput()
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatal("precondition: the driver did not run on a plain daemon diff")
+			}
+		})
+	}
+}
+
 // Security review H2: claude runs with a scrubbed git environment: own global config (job identity
 // only), no system config, repository hooks never run, cat/true as pager/editor; inherited GIT_* gone.
 func TestWrapperScrubsGitEnv(t *testing.T) {
@@ -1328,16 +1412,13 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	if !strings.Contains(read("diff.out"), "+changed") {
 		t.Fatalf("git diff inside the job broken: %q, err: %s", read("diff.out"), read("commit.err"))
 	}
-	// Daemon side: a diff.external / textconv the job put into the repo config does not run in cleanup.
+	// Daemon side: a diff.external the job put into the repo config does not run in cleanup (drivers
+	// such as textconv/filter make cleanup keep the worktree instead: TestCleanupSkipsRepoDrivers).
 	extDiff := filepath.Join(ranDir, "diff.external.sh")
 	if err := os.WriteFile(extDiff, []byte("#!/bin/sh\ntouch "+filepath.Join(ranDir, "diff.external.ran")+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	gitT(t, repo, "config", "diff.external", extDiff)
-	gitT(t, repo, "config", "diff.txt.textconv", extDiff)
-	if err := os.WriteFile(filepath.Join(dir, "work", ".gitattributes"), []byte("*.txt diff=txt\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	real := time.Now
 	m.Now = func() time.Time { return real().Add(31 * time.Minute) }
 	if err := m.Tick(); err != nil {

@@ -52,6 +52,7 @@ var denyRules = []string{
 	"Bash(gemini:*)",
 	"Bash(aider:*)",
 	"Bash(cursor-agent:*)",
+	"Bash(claude-code:*)",
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",

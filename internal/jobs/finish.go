@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -203,6 +204,13 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if err := m.verifyWorktree(j, work); err != nil {
 		return fmt.Errorf("refusing to touch %s: %w", work, err)
 	}
+	drivers, err := repoDrivers(work)
+	if err != nil {
+		return err
+	}
+	if len(drivers) > 0 {
+		return m.keepWithDrivers(j, dir, work, drivers)
+	}
 	untracked, err := gitRaw(work, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return err
@@ -254,6 +262,55 @@ func (m *Manager) Cleanup(j *store.Job) error {
 		return err
 	}
 	m.Log.Printf("job %s: worktree removed, patches saved, ref refs/agent-jobs/jobs/%s -> %s", j.ID, j.ID, head)
+	return nil
+}
+
+// driverKey reports a git config key that names a program git runs while diffing or reading the
+// working tree: a filter driver (filter.<name>.clean/smudge/process), a diff driver command or textconv.
+func driverKey(k string) bool {
+	k = strings.ToLower(k)
+	return strings.HasPrefix(k, "filter.") ||
+		(strings.HasPrefix(k, "diff.") && (strings.HasSuffix(k, ".command") || strings.HasSuffix(k, ".textconv")))
+}
+
+// repoDrivers returns the driver keys (driverKey) in the repository-level config the job can write:
+// the shared repo config (scope local) and the worktree's own config (scope worktree), includes
+// followed (an included file reports the scope of the file that includes it). The daemon owner's
+// global/system config (e.g. filter.lfs) is not the job's and does not count.
+func repoDrivers(work string) ([]string, error) {
+	out, err := gitRaw(work, "config", "--list", "--show-scope", "--name-only", "--includes", "-z")
+	if err != nil {
+		return nil, err
+	}
+	f := strings.Split(string(out), "\x00")
+	var keys []string
+	for i := 0; i+1 < len(f); i += 2 {
+		scope, k := f[i], strings.TrimSpace(f[i+1])
+		if (scope == "local" || scope == "worktree") && driverKey(k) && !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
+	}
+	return keys, nil
+}
+
+// keepWithDrivers is the cleanup of a job whose repository config names filter/diff drivers: any
+// diff, format-patch or status would run them in the daemon, so no patch is made and the worktree is
+// kept for a human to inspect. The job's last commit is still saved under refs/agent-jobs/jobs/<id>
+// and the cleanup counts as done (it is not retried).
+func (m *Manager) keepWithDrivers(j *store.Job, dir, work string, drivers []string) error {
+	note := "cleanup skipped: the repository config names filter/diff drivers (" + strings.Join(drivers, ", ") +
+		"); no patches were made, the worktree is kept: " + work
+	if err := writeAtomic(filepath.Join(dir, "diffstat.txt"), []byte(note+"\n")); err != nil {
+		return err
+	}
+	head, err := git(work, "rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	if _, err := git(j.RepoPath, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
+		return err
+	}
+	m.Log.Printf("job %s: %s; ref refs/agent-jobs/jobs/%s -> %s", j.ID, note, j.ID, head)
 	return nil
 }
 

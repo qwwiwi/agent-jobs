@@ -650,6 +650,112 @@ func TestCheckSecurityReview(t *testing.T) {
 
 // Automated security review of the fix-loop guard commit: env abbreviations, glob/brace in wrapper
 // words, incomplete git denylist (unknown subcommands, command-running forms), writes into git files.
+// Fable control round of PR #1 (fix loop 2): agents and shells inside interpreter code and package
+// paths, clone/init --template, grep -O, `.git` respelled or as a directory target, merge strategies,
+// fetch-pack/ls-remote --exec, clone -c values.
+func TestCheckSecurityReview3(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// 2: agents and shells as words inside code strings and paths.
+		{"python -c subprocess claude", `python3 -c 'import subprocess; subprocess.run(["claude", "-p", "x"])'`, true},
+		{"node -e codex", `node -e 'require("child_process").execSync("codex exec x")'`, true},
+		{"npx claude-code", "npx @anthropic-ai/claude-code -p x", true},
+		{"node claude-code cli", "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js -p x", true},
+		{"claude-code command", "claude-code -p x", true},
+		{"python -c bash", `python3 -c 'import os; os.system("bash x")'`, true},
+		{"perl -e sh", `perl -e 'system("sh", "-c", "x")'`, true},
+		{"ruby -e zsh", `ruby -e 'exec "zsh"'`, true},
+		{"node -e gemini", `node -e 'spawn("gemini")'`, true},
+		{"python -c aider", `python3 -c 'run("aider --yes")'`, true},
+		{"python -c cursor-agent", `python3 -c 'run("cursor-agent")'`, true},
+		{"python -c dash fish", `python3 -c 'run(["dash"]); run(["fish"])'`, true},
+		{"python -c ok", `python3 -c 'print(1+1)'`, false},
+		{"script.sh arg ok", "chmod +x scripts/check.sh", false},
+		{"node script ok", "node build.js --prod", false},
+		{"go test ok", "go test -run TestBash ./...", false},
+		// 3: template directories.
+		{"clone --template", "git clone --template=/tmp/t https://x/y", true},
+		{"clone --templ abbrev", "git clone --templ /tmp/t https://x/y", true},
+		{"init --template", "git init --template /tmp/t", true},
+		{"init --te abbrev", "git init --te=/tmp/t", true},
+		{"init ok", "git init", false},
+		{"clone ok", "git clone --depth 1 https://x/y", false},
+		// 4: grep -O.
+		{"grep -O", "git grep -O foo", true},
+		{"grep -Ovim", "git grep -Ovim foo", true},
+		{"grep -nO cluster", "git grep -nO foo", true},
+		{"grep --open-files-in-pager", "git grep --open-files-in-pager=vim foo", true},
+		{"grep --open abbrev", "git grep --open foo", true},
+		{"grep ok", "git grep -n foo", false},
+		// 5: `.git` respelled, as a directory target, through a glob.
+		{"redirect .git//config", "echo x > .git//config", true},
+		{"redirect .git/./config", "echo x >> .git/./config", true},
+		{"redirect via ..", "echo x > sub/../.git/hooks/pre-commit", true},
+		{"cd .git", "cd .git", true},
+		{"cd abs .git", "cd /repo/.git", true},
+		{"cd .git/", "cd .git/", true},
+		{"ln -s .git", "ln -s ../repo/.git d", true},
+		{"cp into .git", "cp hooks -r .git/", true},
+		{"cp -t .git", "cp --target-directory=.git config", true},
+		{"mv into .git", "mv evil .git", true},
+		{"tee .git//config", "echo x | tee .git//config", true},
+		{"redirect to .git", "echo x > .git", true},
+		{"cp glob .gi?", "cp evil .gi?/config", true},
+		{"cp glob .[g]it", "cp evil .[g]it/hooks/pre-commit", true},
+		{"cp glob mentions .git", "cp evil .git/hook*", true},
+		{"redirect glob", "echo x > .g*/config", true},
+		{"ls .git ok", "ls .git", false},
+		{"cp glob ok", "cp src/* dst/", false},
+		{"find filter ok", "find . -type f -not -path '*/.git/*'", false},
+		{"find exec glob", "find . -path '*/.git/*' -exec rm {} +", true},
+		{"cd elsewhere ok", "cd internal/guard", false},
+		// 6: merge strategies.
+		{"merge -s evil", "git merge -s evil main", true},
+		{"merge -sevil", "git merge -sevil main", true},
+		{"merge -ns cluster", "git merge -ns evil main", true},
+		{"merge --strategy=evil", "git merge --strategy=evil main", true},
+		{"merge --strat abbrev", "git merge --strat evil main", true},
+		{"pull -s evil", "git pull -s evil origin main", true},
+		{"rebase --strategy evil", "git rebase --strategy evil main", true},
+		{"cherry-pick --strategy evil", "git cherry-pick --strategy=evil abc", true},
+		{"revert --strategy evil", "git revert --strategy evil abc", true},
+		{"merge -s ort ok", "git merge -s ort main", false},
+		{"merge --strategy=ours ok", "git merge --strategy=ours main", false},
+		{"merge -X ok", "git merge -X theirs main", false},
+		{"merge --strategy-option ok", "git merge --strategy-option=theirs main", false},
+		{"cherry-pick -s signoff ok", "git cherry-pick -s abc", false},
+		{"revert -s signoff ok", "git revert -s abc", false},
+		// 7: --exec is --upload-pack.
+		{"fetch-pack --exec", "git fetch-pack --exec='sh x' origin", true},
+		{"ls-remote --exec", "git ls-remote --exec 'sh x' origin", true},
+		{"ls-remote --ex abbrev", "git ls-remote --ex='sh x' origin", true},
+		{"fetch --exec", "git fetch --exec='sh x' origin", true},
+		{"ls-remote ok", "git ls-remote origin", false},
+		// 8: clone -c values go through the config allowlist.
+		{"clone -c hooksPath", "git clone -c core.hooksPath=/tmp/h https://x/y", true},
+		{"clone --config fsmonitor", "git clone --config core.fsmonitor=/tmp/x https://x/y", true},
+		{"clone --conf= abbrev", "git clone --conf=core.sshCommand=x https://x/y", true},
+		{"clone -ckv attached", "git clone -ccore.pager=x https://x/y", true},
+		{"clone -qc cluster", "git clone -qc alias.st=!sh https://x/y", true},
+		{"clone -c foreign identity", "git clone -c user.name=Other https://x/y", true},
+		{"clone -c own identity ok", "git clone -c 'user.name=Job Bot' https://x/y", false},
+		{"clone -c safe ok", "git clone -c core.autocrlf=false https://x/y", false},
+		{"clone -b ok", "git clone -b cfg https://x/y", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
 func TestCheckSecurityReview2(t *testing.T) {
 	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
 	cases := []struct {
