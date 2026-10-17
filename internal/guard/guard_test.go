@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -453,7 +454,7 @@ func TestCheckCommentsAndReusedMessages(t *testing.T) {
 		{"gh issue view ok", `gh issue view 5`, false},
 		{"gh pr checks ok", `gh pr checks 5`, false},
 		{"gh search ok", `gh search issues guard`, false},
-		{"gh auth status ok", `gh auth status`, false},
+		{"gh auth status (token printing forms)", `gh auth status`, true},
 		{"gh version ok", `gh --version`, false},
 
 		{"commit -C HEAD", `git commit -C HEAD`, true},
@@ -650,6 +651,108 @@ func TestCheckSecurityReview(t *testing.T) {
 
 // Automated security review of the fix-loop guard commit: env abbreviations, glob/brace in wrapper
 // words, incomplete git denylist (unknown subcommands, command-running forms), writes into git files.
+// Push review: gh flags before the subcommand fail closed; gh auth status (token printing) is gone.
+func TestGhFlagsBeforeSubcommand(t *testing.T) {
+	cfg := Config{GitName: "Job Bot", GitEmail: "bot@example.com"}
+	for _, c := range []struct {
+		cmd     string
+		block   bool
+		reasons string // substring the block reason must contain ("" = any)
+	}{
+		{"gh --hostname github.com pr create", true, ""},
+		{"gh -X pr view create", true, "gh flag -X"},
+		{"gh --foo pr view", true, "gh flag --foo"},
+		{"gh pr --web view", true, "gh flag --web"},
+		{"gh pr --jq x create", true, "gh flag --jq"},
+		{"gh --help pr", true, "gh flag --help"},
+		{"gh auth status", true, ""},
+		{"gh auth status -t", true, ""},
+		{"gh auth status --show-token", true, ""},
+		{"gh -R o/r pr view 1", false, ""},
+		{"gh --repo o/r pr view 1", false, ""},
+		{"gh --repo=o/r pr list", false, ""},
+		{"gh -Ro/r pr list", false, ""},
+		{"gh pr -R o/r view 1", false, ""},
+		{"gh --hostname=h.example pr list", false, ""},
+		{"gh pr view 1 --web --json title", false, ""},
+		{"gh pr list --state open", false, ""},
+	} {
+		got := Check(c.cmd, cfg)
+		if (got != "") != c.block || !strings.Contains(got, c.reasons) {
+			t.Errorf("Check(%q) = %q, want block=%v containing %q", c.cmd, got, c.block, c.reasons)
+		}
+	}
+}
+
+// Push review: Write/Edit/MultiEdit/NotebookEdit never write inside a .git directory, also through a
+// relative path, `..`, or a symlink in the job dir that points into .git.
+func TestFileToolsGuarded(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".git", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	if err := os.Symlink(filepath.Join(repo, ".git"), filepath.Join(work, "g")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(repo, ".git", "config"), filepath.Join(work, "cfg")); err != nil {
+		t.Fatal(err)
+	}
+	// hl -> .git/hooks: `hl/../config` is opened by the kernel as .git/config, though Clean says work/config.
+	if err := os.Symlink(filepath.Join(repo, ".git", "hooks"), filepath.Join(work, "hl")); err != nil {
+		t.Fatal(err)
+	}
+	// A real git dir not named .git (a separate git dir / worktree admin dir), told to the guard.
+	sep := filepath.Join(t.TempDir(), "store")
+	if err := os.MkdirAll(filepath.Join(sep, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sep, filepath.Join(work, "s")); err != nil {
+		t.Fatal(err)
+	}
+	decide := func(tool, key, path string) string {
+		in, _ := json.Marshal(map[string]any{"tool_name": tool, "cwd": work, "tool_input": map[string]string{key: path}})
+		r, err := Decide(strings.NewReader(string(in)), Config{GitDirs: []string{sep}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	for _, c := range []struct {
+		tool, key, path string
+		block           bool
+	}{
+		{"Write", "file_path", filepath.Join(repo, ".git", "config"), true},
+		{"Edit", "file_path", filepath.Join(repo, ".git", "hooks", "pre-commit"), true},
+		{"MultiEdit", "file_path", filepath.Join(repo, ".git", "info", "attributes"), true},
+		{"NotebookEdit", "notebook_path", filepath.Join(repo, ".git", "x.ipynb"), true},
+		{"Write", "file_path", filepath.Join(repo, ".GIT", "config"), true},
+		{"Write", "file_path", repo + "/sub/../.git/config", true}, // literal: Join would drop sub/..
+		{"Write", "file_path", work + "/hl/../config", true},       // symlink then .. = .git/config
+		{"Write", "file_path", "hl/../config", true},               // same, relative
+		{"Write", "file_path", "notes/../x.md", true},              // any .. is rejected
+		{"Write", "file_path", filepath.Join(sep, "config"), true}, // job git dir not named .git
+		{"Edit", "file_path", filepath.Join(sep, "hooks", "pre-commit"), true},
+		{"Write", "file_path", filepath.Join(work, "s", "config"), true}, // symlink into that git dir
+		{"Write", "file_path", sep, true},
+		{"Write", "file_path", filepath.Join(filepath.Dir(sep), "other"), false}, // next to it is fine
+		{"Write", "file_path", ".git/config", true},
+		{"Write", "file_path", filepath.Join(repo, ".git"), true},
+		{"Write", "file_path", "g/hooks/pre-commit", true},                         // symlinked dir into .git
+		{"Write", "file_path", filepath.Join(work, "g", "new", "deep", "f"), true}, // non-existing tail
+		{"Edit", "file_path", filepath.Join(work, "cfg"), true},                    // symlinked file into .git
+		{"Write", "file_path", filepath.Join(repo, "main.go"), false},
+		{"Edit", "file_path", "notes/report.md", false},
+		{"Write", "file_path", filepath.Join(repo, ".github", "x.yml"), false},
+		{"NotebookEdit", "notebook_path", filepath.Join(repo, "a.ipynb"), false},
+		{"Read", "file_path", filepath.Join(repo, ".git", "config"), false}, // reading is fine
+	} {
+		if got := decide(c.tool, c.key, c.path); (got != "") != c.block {
+			t.Errorf("%s %s: %q, want block=%v", c.tool, c.path, got, c.block)
+		}
+	}
+}
+
 // Every subcommand denied by name is blocked by its own check (not only by the git-command allowlist),
 // so its message names the real reason and dropping it from its deny list fails here.
 func TestGitDeniedByName(t *testing.T) {
