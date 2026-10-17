@@ -19,6 +19,7 @@ import (
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/mcp"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -27,7 +28,7 @@ const usage = `usage: agent-jobs <command> [flags]
   init       --agent A                     create state dir, copy owner-rules template,
                                            write orchestrator.md (main-session duties)
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
-             [--repo PATH [--base REF]] [--model M | --complexity light|normal|hard]
+             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
   status     --agent A <id>
   list       --agent A [--limit N]
@@ -37,6 +38,8 @@ const usage = `usage: agent-jobs <command> [flags]
   daemon     --agent A                     tick every minute, forever
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
+  mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
+                                           job: only the tools allow-listed for jobs)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
 `
 
@@ -49,6 +52,10 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if reason := refuseInsideJob(cmd, args); reason != "" {
+		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
+		os.Exit(1)
+	}
 	var err error
 	switch cmd {
 	case "run-wrapper":
@@ -74,6 +81,8 @@ func main() {
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
+	case "mcp":
+		err = cmdMCP(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -85,6 +94,37 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agent-jobs:", err)
 		os.Exit(1)
 	}
+}
+
+// refuseInsideJob: no nested jobs. Inside a job – the env marker AGENT_JOBS_JOB is set (the wrapper
+// sets it on every job) or an ancestor process is the job wrapper (Linux /proc) – only the job's own
+// MCP server (`mcp --role job`), the guard hook, run-wrapper and help run; every command that reads or
+// changes the agent's jobs is refused. open() adds the session check once the agent is known.
+func refuseInsideJob(cmd string, args []string) string {
+	switch cmd {
+	case "run-wrapper", "guard", "-h", "--help", "help", "version", "--version":
+		return ""
+	case "mcp":
+		if mcpRole(args) == string(mcp.RoleJob) {
+			return ""
+		}
+	}
+	if err := jobs.CheckNotInJob(); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// mcpRole returns the --role value of `mcp` args ("" when absent or unparsable).
+func mcpRole(args []string) string {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = fs.String("agent", "", "")
+	role := fs.String("role", "", "")
+	if _, err := parse(fs, args); err != nil {
+		return ""
+	}
+	return *role
 }
 
 func runWrapper(args []string) int {
@@ -148,7 +188,15 @@ func open(agent string) (*jobs.Manager, error) {
 	if agent == "" {
 		return nil, errors.New("--agent is required")
 	}
-	return jobs.Open(agent)
+	m, err := jobs.Open(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.CheckNotInJobSession(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
+	return m, nil
 }
 
 func cmdInit(args []string) error {
@@ -204,8 +252,8 @@ func cmdStart(args []string) error {
 	briefFile := fs.String("brief-file", "", "read brief from file")
 	fs.StringVar(&r.RepoPath, "repo", "", "git repository for the worktree (optional)")
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
-	fs.StringVar(&r.Model, "model", "", "model (default by kind × complexity)")
-	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard")
+	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
+	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
@@ -405,4 +453,24 @@ func cmdDaemon(args []string) error {
 		case <-t.C:
 		}
 	}
+}
+
+func cmdMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	roleFlag := fs.String("role", "", "orchestrator|job")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if *agent == "" {
+		return errors.New("--agent is required")
+	}
+	role, err := mcp.ParseRole(*roleFlag)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	// stdout carries the protocol: nothing else may print there.
+	return mcp.Serve(ctx, role, *agent)
 }
