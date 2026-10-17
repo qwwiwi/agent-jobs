@@ -38,6 +38,12 @@ var OrchestratorOnly = []string{
 	"job_result",
 	"job_list",
 	"job_cancel",
+	// System and files (reference, «MCP-тулы»: not available to a job).
+	"system_doctor",
+	"system_logs",
+	"activity_report",
+	"trash_move",
+	"trash_restore",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too). Empty until S2-M2 opens

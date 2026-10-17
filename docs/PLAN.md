@@ -12,6 +12,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 | [#2](https://github.com/qwwiwi/agent-jobs/pull/2) | **Linux port.** systemd user service `agent-jobs@<agent>` with `KillMode=process` (a daemon restart never kills jobs), idempotent installer, owner decisions recorded. |
 | [#3](https://github.com/qwwiwi/agent-jobs/pull/3) | **Guard hardening.** gh flags before the subcommand, no `gh auth status`, file tools cannot write into `.git`. |
 | [#5](https://github.com/qwwiwi/agent-jobs/pull/5) | **Publication prep.** Reference design published without personal names. |
+| [#8](https://github.com/qwwiwi/agent-jobs/pull/8) | **Skill, subagents, job context** (moved out of Wave A). `agent-jobs` skill installed per agent by `scripts/install-linux.sh` (routing rule, model-or-complexity, how to read a result); jobs may use at most three subagents inside their own limits, guard-counted, only the input keys `description`, `prompt`, `subagent_type`, `model`; job profile (≤ 8 KB, `agent-jobs profile --from`) and project cards (≤ 4 KB, `agent-jobs card new\|list`) attached to the brief. |
 
 ## In progress
 
@@ -25,11 +26,11 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
 - Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
-**[PR #8](https://github.com/qwwiwi/agent-jobs/pull/8): `agent-jobs` skill, subagents in jobs, job context** (moved out of Wave A).
+**[PR #9](https://github.com/qwwiwi/agent-jobs/pull/9): prune, doctor procs, system and file tools.**
 
-- **`agent-jobs` skill.** `skills/agent-jobs/SKILL.md`, installed per agent by `scripts/install-linux.sh` (`--skills-dir`, default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`; idempotent; removed on uninstall only while unchanged). Teaches the MCP tools, the mandatory model-or-complexity, the routing rule (yourself: minutes; subagent: the session needs the result now; job: long, background, overnight, must survive a restart) and how to read a result («Not done / uncertain» first, check the diff before anything leaves the machine).
-- **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs. The brief says so; the subagent tool is not denied; the guard counts Agent/Task calls per job (`<state>/subagents/<id>.log`, locked), refuses the fourth; only the input keys `description`, `prompt`, `subagent_type`, `model` pass (exact, case-sensitive; no `isolation`, `run_in_background`, team).
-- **Job context.** The job profile is the reference's ≤ 8 KB owner-rules file, generated with `agent-jobs profile --from <file>...` from the sections of the agent's own rules marked `<!-- agent-jobs:profile -->`; larger than 8 KB is refused. Project cards (`<state>/cards/<name>.md`, ≤ 4 KB, `agent-jobs card new|list`) are matched by repository path or remote and attached to the brief; a broken card refuses the start. Example: `cards/example-agent-jobs.md`.
+- `agent-jobs prune [--dry-run]`: folders of jobs finished more than 48 hours ago keep their records and small top-level text files; work dirs, caches, builds, binaries, large files and symlinks go.
+- `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #13).
+- Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
 
 ## Wave A
 
@@ -39,10 +40,6 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
   3. On wrapper exit, cancel or timeout the whole scope is stopped (`systemctl --user stop` / kill the unit) before `exit_code` is written, so no descendant survives.
   4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): today's sid sweep plus the marker, ancestry, session and store checks. That path is documented as weaker.
   5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
-- **`prune`.** Clean folders of jobs finished more than 48 hours ago; keep the records (report, patches, `base_commit`) and small top-level text files, drop binaries, caches and builds.
-- **`doctor procs`.** Find processes that outlived their job or session: preview servers, browsers, wait loops, running rows with a dead pid. Reports by default, kills only on a flag.
-- **System tools:** `system_doctor` (disk, processes, hooks), `system_logs`, `activity_report`.
-- **Files:** `trash_move`, `trash_restore`: reversible deletion instead of `rm`.
 - **Memory, tasks and team tools via the shared brain.** `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
 - **Memory notes in the brief.** The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
@@ -87,8 +84,8 @@ Each item waits for a separate owner go; it is not part of the current mandate (
 - **E7. Skills for jobs: a catalog and an explicit per-job selection.** Owner request, refined.
   - Today: `--setting-sources project` means user-level skills (`~/.claude/skills`, plugins) are not loaded; a job sees only the target repo's `.claude/skills` plus the profile and project cards. Skills are scattered across hosts (Mac mini: about 59 agent, 25 user-level, 12 shared, about 295 from plugins; Thrall has its own set).
   - Catalog: one registry built by `agent-jobs skills index` from front matter in each `SKILL.md` (name, scope `common | project:<repo> | agent:<name> | kind:<code|review|research>`, path, size, has scripts, network/secrets risk, owner, version/sha, origin); duplicate names resolved by an explicit priority order; a lint step in `scripts/check.sh`.
-  - Storage: a single git repo of skills is the source of truth (proposed `qwwiwi/orgrimmar-skills`: `common/`, `agents/<name>/`, `projects/<repo>/`), pulled by each host; the index reads only from it plus repo-local `.claude/skills`; ad-hoc copies are not indexed. Same format on Thrall and Mac mini.
-  - Sources rule (owner, 2026-10-17, msg 63424): skills from public registries or marketplaces are never imported without the owner's permission for that skill; without asking, only from our own workspaces and fleet hosts. The index refuses entries with no recorded origin.
+  - Storage: a single git repo of skills is the source of truth (private repo `qwwiwi/dashis-skills`, created 2026-10-17: `common/`, `agents/<name>/`, `projects/<repo>/`), pulled by each host; the index reads only from it plus repo-local `.claude/skills`; ad-hoc copies are not indexed. Same format on Thrall and Mac mini.
+  - Sources rule (owner, 2026-10-17, msgs 63424, 63434): NEW skills from public registries or marketplaces are never downloaded without the owner's permission. Everything already installed on our hosts may be used: our own workspaces and repos, and installed plugins (referenced in the catalog by plugin name and version, not copied). The index refuses entries with no recorded origin.
   - Discovery and selection: MCP tool `skill_list(scope?, kind?, repo?)`. Defaults (the `core` skills for the job kind plus the project card's skills) are attached automatically; `job_start(skills=[...])` only adds or excludes (`+name`, `-name`); an unknown name refuses the start. Deterministic matching by kind and project first, hard budget of 5-8 skills per job; semantic retrieval only if matching proves insufficient.
   - Pre-launch skill hook: a PreToolUse hook in the orchestrator session on `job_start`, installed by the agent-jobs skill installer. Without `skills_decision` it denies once with up to about 8 candidates (status and a one-line description each); the orchestrator re-calls with `skills=[...]` or `skills_decision='defaults'`. No model call in the hook (the classifier was rejected, see DECISIONS). One extra round trip per job; deprecated/draft names refused unless explicit; the decision is stored in job metadata.
   - Lifecycle: `status: core | active | draft | deprecated`, `owner`, `last_verified`. deprecated is never loaded; draft only on explicit request. Staleness: not used for 60 days or not verified for 90 days goes to a review list; a weekly digest to the orchestrator.

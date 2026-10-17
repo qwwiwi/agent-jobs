@@ -56,6 +56,10 @@ type Config struct {
 	ClaudeBin string `json:"claude_bin"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
+	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
+	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
+	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
+	TrashRoots []string `json:"trash_roots"`
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -115,6 +119,11 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
 	}
+	for _, r := range c.TrashRoots {
+		if !filepath.IsAbs(r) {
+			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
+		}
+	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
 	}
@@ -122,6 +131,15 @@ func LoadConfig(stateDir string) (Config, error) {
 		c.CardsDir = filepath.Join(stateDir, "cards")
 	}
 	return c, nil
+}
+
+// TrashRootsOrDefault returns the configured trash roots; nil when none are configured (fail
+// closed: there is no default root).
+func (c Config) TrashRootsOrDefault() []string {
+	if len(c.TrashRoots) > 0 {
+		return c.TrashRoots
+	}
+	return nil
 }
 
 func (c Config) claudeBin() string {

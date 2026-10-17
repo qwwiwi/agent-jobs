@@ -37,6 +37,11 @@ var toolDefs = []toolDef{
 	{"job_result", addJobResult},
 	{"job_list", addJobList},
 	{"job_cancel", addJobCancel},
+	{"system_doctor", addSystemDoctor},
+	{"system_logs", addSystemLogs},
+	{"activity_report", addActivityReport},
+	{"trash_move", addTrashMove},
+	{"trash_restore", addTrashRestore},
 }
 
 func definitions() []toolDef { return toolDefs }
@@ -60,7 +65,9 @@ State an explicit model or a complexity (light|normal|hard, mapped to a model by
 When a job ends this session receives one line "[jobs:job-done] job <id> ..."; the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
-A job may use at most 3 subagents inside its own limits and can never start jobs itself. The agent-jobs skill has the details.`
+A job may use at most 3 subagents inside its own limits and can never start jobs itself.
+system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
+The agent-jobs skill has the details.`
 
 const jobInstructions = `agent-jobs job role: only the tools allow-listed for jobs are available here.`
 
