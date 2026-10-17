@@ -120,6 +120,9 @@ func (c Config) timeout() time.Duration {
 	return DefaultTimeout
 }
 
+// CallTimeout is the effective bound of one brain call.
+func (c Config) CallTimeout() time.Duration { return c.timeout() }
+
 // MinScore is the effective memory_already_exists threshold.
 func (c Config) MinScore() float64 {
 	if c.AlreadyExistsMinScore > 0 {

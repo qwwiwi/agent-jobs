@@ -107,6 +107,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 	launch_token    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+CREATE TABLE IF NOT EXISTS job_notes (
+	path       TEXT PRIMARY KEY,
+	job_id     TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 `
 
 // Open opens (and migrates) the database at path.
@@ -179,6 +184,33 @@ func (s *Store) SubagentCount(id string) (int, error) {
 		return 0, ErrNotFound
 	}
 	return n, err
+}
+
+// AddJobNote records that job jobID wrote the shared-memory note at path (written through the
+// daemon's brain proxy), so the note is never taken for the agent's own.
+func (s *Store) AddJobNote(path, jobID string, now time.Time) error {
+	if _, err := s.db.Exec(`INSERT INTO job_notes(path, job_id, created_at) VALUES(?, ?, ?)
+		ON CONFLICT(path) DO NOTHING`, path, jobID, now.Unix()); err != nil {
+		return fmt.Errorf("record job note: %w", err)
+	}
+	return nil
+}
+
+// JobNotes returns, for those of paths a job wrote, the job's id by path.
+func (s *Store) JobNotes(paths []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, p := range paths {
+		var id string
+		err := s.db.QueryRow(`SELECT job_id FROM job_notes WHERE path = ?`, p).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("job notes: %w", err)
+		}
+		out[p] = id
+	}
+	return out, nil
 }
 
 // Close closes the database.

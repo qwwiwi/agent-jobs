@@ -28,7 +28,13 @@ type MemoryNotes struct {
 	Disabled bool // no brain configured: the brief gets no memory section
 	Notes    []brain.Note
 	Err      error // memory unreachable: the brief says so and the job starts anyway
+	// FromJobs counts close notes left out because a job wrote them (unreviewed, never quoted).
+	FromJobs int
 }
+
+// MemoryBreaker is how long lookups are skipped after one went unanswered, so a hanging brain
+// delays one launch, not every launch of a tick.
+const MemoryBreaker = time.Minute
 
 // memoryQuery is the search text for a job: its title and brief, cut on a rune boundary.
 func memoryQuery(j *store.Job) string {
@@ -43,11 +49,39 @@ func memoryQuery(j *store.Job) string {
 	return q
 }
 
+// MarkJobNotes sets FromJob on the notes a job wrote: by the paths the daemon recorded when it wrote
+// them for a job, or by the marker line in the snippet.
+func (m *Manager) MarkJobNotes(notes []brain.Note) error {
+	paths := make([]string, 0, len(notes))
+	for _, n := range notes {
+		paths = append(paths, n.Path)
+	}
+	byPath, err := m.Store.JobNotes(paths)
+	if err != nil {
+		return err
+	}
+	for i := range notes {
+		notes[i].FromJob = byPath[notes[i].Path]
+		if notes[i].FromJob == "" {
+			notes[i].FromJob = brain.NoteJob(notes[i])
+		}
+	}
+	return nil
+}
+
 // LookupMemoryNotes asks the shared brain for the notes closest to j's brief. It never fails: an
 // error or a timeout (MemoryTimeout) is returned inside MemoryNotes, and the job starts anyway.
+// Notes written by jobs are left out (counted in FromJobs): a job's note never reaches a later
+// brief before someone reviewed it and wrote it again as the agent's own.
 func (m *Manager) LookupMemoryNotes(j *store.Job) MemoryNotes {
 	if brain.IsDisabled(m.Brain) {
 		return MemoryNotes{Disabled: true}
+	}
+	m.memMu.Lock()
+	until := m.memDownUntil
+	m.memMu.Unlock()
+	if m.Now().Before(until) {
+		return MemoryNotes{Err: fmt.Errorf("skipped: a lookup went unanswered recently; next try after %s", until.Format(time.TimeOnly))}
 	}
 	d := m.MemoryTimeout
 	if d <= 0 {
@@ -59,26 +93,43 @@ func (m *Manager) LookupMemoryNotes(j *store.Job) MemoryNotes {
 		notes []brain.Note
 		err   error
 	}
+	timedOut := func() MemoryNotes {
+		m.memMu.Lock()
+		m.memDownUntil = m.Now().Add(MemoryBreaker)
+		m.memMu.Unlock()
+		return MemoryNotes{Err: fmt.Errorf("no answer within %s", d)}
+	}
 	// The call runs in its own goroutine so a brain that ignores the context still cannot hold the job.
+	// Twice as many notes as quoted are asked for, so leaving out jobs' notes still leaves some.
 	ch := make(chan result, 1)
+	b, q := m.Brain, memoryQuery(j)
 	go func() {
-		n, err := m.Brain.Search(ctx, memoryQuery(j), MaxMemoryNotes)
+		n, err := b.Search(ctx, q, 2*MaxMemoryNotes)
 		ch <- result{n, err}
 	}()
 	select {
 	case r := <-ch:
 		if r.err != nil {
 			if errors.Is(r.err, context.DeadlineExceeded) {
-				r.err = fmt.Errorf("no answer within %s", d)
+				return timedOut()
 			}
 			return MemoryNotes{Err: r.err}
 		}
-		if len(r.notes) > MaxMemoryNotes {
-			r.notes = r.notes[:MaxMemoryNotes]
+		if err := m.MarkJobNotes(r.notes); err != nil {
+			return MemoryNotes{Err: err}
 		}
-		return MemoryNotes{Notes: r.notes}
+		out := MemoryNotes{Notes: []brain.Note{}}
+		for _, n := range r.notes {
+			switch {
+			case n.FromJob != "":
+				out.FromJobs++
+			case len(out.Notes) < MaxMemoryNotes:
+				out.Notes = append(out.Notes, n)
+			}
+		}
+		return out
 	case <-ctx.Done():
-		return MemoryNotes{Err: fmt.Errorf("no answer within %s", d)}
+		return timedOut()
 	}
 }
 
@@ -122,6 +173,7 @@ func RenderMemoryNotes(mn MemoryNotes) string {
 		return b.String()
 	case len(mn.Notes) == 0:
 		b.WriteString("Shared memory has no notes close to this brief.\n\n")
+		b.WriteString(fromJobsLine(mn.FromJobs))
 		return b.String()
 	}
 	fmt.Fprintf(&b, "The %d notes from the team's shared memory closest to this brief, found when the job was prepared. "+
@@ -138,5 +190,13 @@ func RenderMemoryNotes(mn MemoryNotes) string {
 		}
 	}
 	b.WriteString("\n")
+	b.WriteString(fromJobsLine(mn.FromJobs))
 	return b.String()
+}
+
+func fromJobsLine(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d close notes written by jobs were left out: they are unreviewed.\n\n", n)
 }

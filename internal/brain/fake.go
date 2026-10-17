@@ -134,20 +134,19 @@ func (f *Fake) UpdateTask(ctx context.Context, u TaskUpdate) (Object, error) {
 	if t == nil {
 		return nil, fmt.Errorf("task %d: %w", u.ID, ErrNotFound)
 	}
-	to := t["status"]
-	if u.Status != "" {
-		next, ok := fakeTransitions[u.Status][fmt.Sprint(t["status"])]
-		if !ok {
-			return nil, fmt.Errorf("brain %s: invalid transition from %v", statusTools[u.Status], t["status"])
-		}
-		to = next
-	}
+	// Fields first, then the transition, as the real client does (two calls, not atomic).
 	for k, v := range map[string]string{"title": u.Title, "description": u.Description, "assignee": u.Assignee, "priority": u.Priority} {
 		if v != "" {
 			t[k] = v
 		}
 	}
-	t["status"] = to
+	if u.Status != "" {
+		next, ok := fakeTransitions[u.Status][fmt.Sprint(t["status"])]
+		if !ok {
+			return nil, partialUpdate(u, fmt.Errorf("brain %s: invalid transition from %v", statusTools[u.Status], t["status"]))
+		}
+		t["status"] = next
+	}
 	return cloneObj(t), nil
 }
 

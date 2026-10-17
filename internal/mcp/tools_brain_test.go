@@ -3,11 +3,14 @@ package mcp
 import (
 	"context"
 	"errors"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -20,7 +23,7 @@ var brainTools = []string{"memory_search", "memory_write", "memory_already_exist
 
 func brainServer(t *testing.T, role Role, b brain.Brain, jobID string) *sdk.ClientSession {
 	t.Helper()
-	d := Deps{Brain: b, JobID: jobID}
+	d := Deps{Brain: b, JobID: jobID, Author: "sa-test"}
 	if role == RoleOrchestrator {
 		d.Manager = newManager(t)
 	}
@@ -109,8 +112,10 @@ func TestMemoryToolsWithFake(t *testing.T) {
 	callErr(t, cs, "memory_already_exists", map[string]any{"text": ""})
 
 	var w ObjectOutput
-	call(t, cs, "memory_write", map[string]any{"kind": "decision", "title": "T", "body": "B", "tags": []string{"x"}}, &w)
-	if w.Result["path"] == nil || len(f.Written) != 1 || slices.ContainsFunc(f.Written[0].Tags, func(s string) bool { return strings.HasPrefix(s, jobTagPrefix) }) {
+	// The orchestrator cannot forge a job tag either: caller tags with the prefix are dropped.
+	call(t, cs, "memory_write", map[string]any{"kind": "decision", "title": "T", "body": "B",
+		"tags": []string{"x", brain.JobTagPrefix + "261017-000000-dead"}}, &w)
+	if w.Result["path"] == nil || len(f.Written) != 1 || !slices.Equal(f.Written[0].Tags, []string{"x"}) || f.Written[0].Author != "" {
 		t.Fatalf("memory_write: %+v %+v", w, f.Written)
 	}
 	for _, a := range []map[string]any{
@@ -130,7 +135,8 @@ func TestMemoryToolsWithFake(t *testing.T) {
 	}
 }
 
-// A job's notes carry the job id as a tag; a job can read memory as well.
+// A job's notes carry its provenance (job tag that cannot be forged or dropped, author
+// <agent>/job:<id>, marker line); a job cannot write a decision; a job can read memory as well.
 func TestJobRoleMemoryTools(t *testing.T) {
 	f := &brain.Fake{Notes: []brain.Note{{Path: "p.md", Score: 1}}}
 	cs := brainServer(t, RoleJob, f, "261017-120000-beef")
@@ -140,9 +146,15 @@ func TestJobRoleMemoryTools(t *testing.T) {
 		t.Fatalf("job memory_search: %+v", found)
 	}
 	var w ObjectOutput
-	call(t, cs, "memory_write", map[string]any{"kind": "runbook", "title": "T", "body": "B", "tags": []string{"x"}}, &w)
-	if tags := f.Written[0].Tags; !slices.Equal(tags, []string{"x", jobTagPrefix + "261017-120000-beef"}) {
-		t.Fatalf("job note tags: %v", tags)
+	call(t, cs, "memory_write", map[string]any{"kind": "runbook", "title": "T", "body": "B",
+		"tags": []string{"x", brain.JobTagPrefix + "261017-000000-dead"}}, &w)
+	n := f.Written[0]
+	if !slices.Equal(n.Tags, []string{"x", brain.JobTagPrefix + "261017-120000-beef"}) || n.Author != "sa-test/job:261017-120000-beef" ||
+		brain.NoteJob(brain.Note{Snippet: n.Body}) != "261017-120000-beef" {
+		t.Fatalf("job note: %+v", n)
+	}
+	if msg := callErr(t, cs, "memory_write", map[string]any{"kind": "decision", "title": "T", "body": "B", "tags": []string{"x"}}); !strings.Contains(msg, "cannot write a decision") {
+		t.Fatalf("job decision: %q", msg)
 	}
 }
 
@@ -243,8 +255,74 @@ func TestStdioJobRoleWithoutBrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	bad := exec.Command(selfBin, "mcp", "--role", "job", "--agent", "test")
-	bad.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home)
+	bad.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home, jobs.JobEnvVar+"=261017-120000-beef")
 	if out, err := bad.CombinedOutput(); err == nil || !strings.Contains(string(out), "loopback") {
 		t.Fatalf("bad brain config: %v %s", err, out)
+	}
+	// Without the job marker the job role refuses to start: its notes would carry no job.
+	noJob := exec.Command(selfBin, "mcp", "--role", "job", "--agent", "test")
+	noJob.Env = append(os.Environ(), "AGENT_JOBS_HOME="+t.TempDir())
+	if out, err := noJob.CombinedOutput(); err == nil || !strings.Contains(string(out), jobs.JobEnvVar+" is not set") {
+		t.Fatalf("job role without job id: %v %s", err, out)
+	}
+}
+
+// M1: the real binary in the job role never reads the brain token (the variable is unset and the
+// call still works): memory_search and memory_write go through the daemon's proxy, which gives the
+// note the job's provenance.
+func TestStdioJobRoleThroughDaemonProxy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AGENT_JOBS_HOME", home)
+	if err := os.MkdirAll(home+"/test", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"brain":{"recall_url":"http://127.0.0.1:9/mcp","memory_url":"http://127.0.0.1:9/mcp","token_env":"AJ_TEST_UNSET_BRAIN_TOKEN"}}`
+	if err := os.WriteFile(home+"/test/config.json", []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	m.Log = log.New(io.Discard, "", 0)
+	f := &brain.Fake{Notes: []brain.Note{{Path: "70-runbooks/a.md", Score: 0.7, Snippet: "A"}}}
+	m.Brain = f
+	j, err := m.Enqueue(jobs.StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "sonnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- m.ServeBrain(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	deadline := time.Now().Add(5 * time.Second)
+	for _, err := os.Stat(jobs.BrainSocketPath(m.StateDir)); err != nil; _, err = os.Stat(jobs.BrainSocketPath(m.StateDir)) {
+		if time.Now().After(deadline) {
+			t.Fatal("no brain socket")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cmd := exec.Command(selfBin, "mcp", "--role", "job", "--agent", "test")
+	cmd.Env = append(os.Environ(), jobs.JobEnvVar+"="+j.ID)
+	cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "0"}, nil).
+		Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cs.Close() })
+	var found NotesOutput
+	call(t, cs, "memory_search", map[string]any{"query": "q"}, &found)
+	if len(found.Notes) != 1 || found.Notes[0].Path != "70-runbooks/a.md" {
+		t.Fatalf("job memory_search via proxy: %+v", found)
+	}
+	var w ObjectOutput
+	call(t, cs, "memory_write", map[string]any{"kind": "runbook", "title": "T", "body": "B", "tags": []string{"x"}}, &w)
+	if len(f.Written) != 1 || f.Written[0].Author != "test/job:"+j.ID || !slices.Contains(f.Written[0].Tags, brain.JobTagPrefix+j.ID) {
+		t.Fatalf("job note via proxy: %+v", f.Written)
 	}
 }

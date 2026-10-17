@@ -361,6 +361,9 @@ func TestStdioSubcommand(t *testing.T) {
 	run := func(role string) *sdk.ClientSession {
 		cmd := exec.Command(selfBin, "mcp", "--role", role, "--agent", "test")
 		cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home)
+		if role == "job" {
+			cmd.Env = append(cmd.Env, jobs.JobEnvVar+"=261017-120000-beef") // the job role runs only inside a job
+		}
 		cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "0"}, nil).
 			Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
 		if err != nil {

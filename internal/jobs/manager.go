@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -35,6 +36,9 @@ type Manager struct {
 	Brain brain.Brain
 	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
 	MemoryTimeout time.Duration
+
+	memMu        sync.Mutex
+	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -145,6 +149,19 @@ func daemonGitEnv() []string {
 		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
 	}
 	return out
+}
+
+// jobSpawnEnv is the daemon's environment without the brain token variable (brain.token_env): a job
+// reaches the brain only through the daemon's proxy and never holds the credential.
+func (m *Manager) jobSpawnEnv() []string {
+	env := os.Environ()
+	if name := m.Cfg.Brain.TokenEnv; name != "" {
+		env = slices.DeleteFunc(env, func(kv string) bool {
+			k, _, _ := strings.Cut(kv, "=")
+			return k == name
+		})
+	}
+	return env
 }
 
 func git(dir string, args ...string) (string, error) {
@@ -336,6 +353,7 @@ func (m *Manager) spawn(j *store.Job, token string) (int, error) {
 	args := append([]string{"run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
 	cmd := exec.Command(m.SelfBin, args...)
 	cmd.Dir = filepath.Join(dir, "work")
+	cmd.Env = m.jobSpawnEnv()
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -37,15 +38,28 @@ func New(cfg Config, agent string) (Brain, error) {
 	return &Client{cfg: cfg, agent: agent, HTTP: &http.Client{}}, nil
 }
 
-// authTransport adds the bearer token to every request of one call.
+// authTransport adds the bearer token to the requests of one call that go to the configured
+// endpoint (same scheme, host and port), and to nothing else.
 type authTransport struct {
-	header string
-	base   http.RoundTripper
+	header       string
+	scheme, host string
+	base         http.RoundTripper
+}
+
+func newAuthTransport(endpoint, header string, base http.RoundTripper) (authTransport, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return authTransport{}, err
+	}
+	return authTransport{header: header, scheme: strings.ToLower(u.Scheme), host: strings.ToLower(u.Host), base: base}, nil
 }
 
 func (t authTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
-	r.Header.Set("Authorization", t.header)
+	r.Header.Del("Authorization")
+	if strings.ToLower(r.URL.Scheme) == t.scheme && strings.ToLower(r.URL.Host) == t.host {
+		r.Header.Set("Authorization", t.header)
+	}
 	return t.base.RoundTrip(r)
 }
 
@@ -67,8 +81,15 @@ func (c *Client) call(ctx context.Context, endpoint, key, tool string, args map[
 	if base == nil {
 		base = http.DefaultTransport
 	}
+	at, err := newAuthTransport(endpoint, auth, base)
+	if err != nil {
+		return nil, fmt.Errorf("brain %s: %w", key, err)
+	}
 	hc := *c.HTTP
-	hc.Transport = authTransport{header: auth, base: base}
+	hc.Transport = at
+	// The brain's MCP endpoints need no redirect, and a redirect could lead the call (and, through a
+	// transport that adds the header, the token) anywhere: the redirect response is the answer.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	// Bounds the HTTP requests themselves, so a session closed in the background (below) ends too.
 	hc.Timeout = c.cfg.timeout()
 	tr := &sdk.StreamableClientTransport{Endpoint: endpoint, HTTPClient: &hc, DisableStandaloneSSE: true, MaxRetries: -1}
@@ -193,6 +214,9 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]Note, e
 	if len(notes) > limit {
 		notes = notes[:limit]
 	}
+	for i := range notes {
+		notes[i].FromJob = "" // provenance is agent-jobs' own, never the brain's word
+	}
 	return notes, nil
 }
 
@@ -208,7 +232,11 @@ func (c *Client) Write(ctx context.Context, n NoteInput) (Object, error) {
 	if err := n.Validate(); err != nil {
 		return nil, err
 	}
-	args := map[string]any{"title": n.Title, "body": n.Body, "tags": n.Tags, "agent": c.agent}
+	author := c.agent
+	if n.Author != "" {
+		author = n.Author
+	}
+	args := map[string]any{"title": n.Title, "body": n.Body, "tags": n.Tags, "agent": author}
 	switch n.Kind {
 	case KindDecision:
 		if len(n.Related) > 0 {
@@ -264,7 +292,8 @@ func (c *Client) ListTasks(ctx context.Context, f TaskFilter) ([]Object, error) 
 	return asList("task_list", v)
 }
 
-// UpdateTask calls task_update for the fields, then the status tool, then task_get.
+// UpdateTask calls task_update for the fields, then the status tool, then task_get. The two calls are
+// not atomic: when the status change fails after the fields were set, the error says so.
 func (c *Client) UpdateTask(ctx context.Context, u TaskUpdate) (Object, error) {
 	if err := u.Validate(); err != nil {
 		return nil, err
@@ -287,7 +316,7 @@ func (c *Client) UpdateTask(ctx context.Context, u TaskUpdate) (Object, error) {
 		}
 		setIf(args, key, u.Note)
 		if _, err := c.call(ctx, c.cfg.TasksURL, "tasks_url", statusTools[u.Status], args); err != nil {
-			return nil, err
+			return nil, partialUpdate(u, err)
 		}
 	}
 	return c.GetTask(ctx, u.ID)
@@ -306,15 +335,16 @@ func (c *Client) GetTask(ctx context.Context, id int64) (Object, error) {
 	return o, err
 }
 
-// Send calls notify; the payload gets the author as "from" unless it has one.
+// Send calls notify; the payload's "from" is always the author (a payload cannot set it).
 func (c *Client) Send(ctx context.Context, to string, payload Object) (Object, error) {
 	if err := ValidateAgentName(to); err != nil {
 		return nil, err
 	}
-	p := Object{"from": c.agent}
+	p := Object{}
 	for k, v := range payload {
 		p[k] = v
 	}
+	p["from"] = c.agent
 	v, err := c.call(ctx, c.cfg.SwarmURL, "swarm_url", "notify", map[string]any{"to_agent": to, "payload": p})
 	if err != nil {
 		return nil, err

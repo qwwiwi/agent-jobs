@@ -38,6 +38,9 @@ type Note struct {
 	SourceType string  `json:"source_type,omitempty"`
 	Score      float64 `json:"score"`
 	Snippet    string  `json:"snippet"`
+	// FromJob is the job that wrote the note (set by agent-jobs from its own records and the note's
+	// marker line, never trusted from the brain): such a note is unreviewed.
+	FromJob string `json:"from_job,omitempty"`
 }
 
 // Note kinds memory_write can create.
@@ -62,6 +65,8 @@ type NoteInput struct {
 	Severity         string
 	TriggerCondition string
 	PreventionRule   string
+	// Author overrides the client's author name ("" = the agent). Set by ForJob for a job's note.
+	Author string
 }
 
 // Validate checks a note before it is sent.
@@ -85,6 +90,9 @@ func (n NoteInput) Validate() error {
 	}
 	if len(n.Related) > 0 && n.Kind != KindDecision {
 		return errors.New("related applies to decision only")
+	}
+	if n.Author != "" && !reAuthor.MatchString(n.Author) {
+		return fmt.Errorf("author %q is not an agent name or <agent>/job:<id>", n.Author)
 	}
 	return nil
 }
@@ -131,6 +139,14 @@ type TaskUpdate struct {
 
 func (u TaskUpdate) hasFields() bool { return u.Title+u.Description+u.Assignee+u.Priority != "" }
 
+// partialUpdate wraps a failed status change: when fields were set first, they stay set.
+func partialUpdate(u TaskUpdate, err error) error {
+	if !u.hasFields() {
+		return err
+	}
+	return fmt.Errorf("task %d: fields updated, but the status change to %s failed: %w", u.ID, u.Status, err)
+}
+
 // Validate checks an update before it is sent.
 func (u TaskUpdate) Validate() error {
 	if u.ID <= 0 {
@@ -148,7 +164,10 @@ func (u TaskUpdate) Validate() error {
 	return nil
 }
 
-var reAgentName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+var (
+	reAgentName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+	reAuthor    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}(/job:[A-Za-z0-9][A-Za-z0-9-]{0,63})?$`)
+)
 
 // ValidateAgentName checks a recipient of send_message.
 func ValidateAgentName(s string) error {

@@ -570,6 +570,12 @@ func cmdDaemon(args []string) error {
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
 	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
+	go func() {
+		if err := m.ServeBrain(ctx); err != nil {
+			m.Log.Printf("%v (jobs get no memory tools until the daemon restarts)", err)
+		}
+	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
 	for {

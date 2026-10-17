@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,8 +29,10 @@ type Deps struct {
 	Brain brain.Brain
 	// MinScore is memory_already_exists' default threshold (config brain.already_exists_min_score).
 	MinScore float64
-	// JobID is set in the job role: notes the job writes are tagged with it.
+	// JobID is set in the job role: notes the job writes get its provenance (brain.ForJob).
 	JobID string
+	// Author is the agent's author name in the brain (brain.agent, else the agent name).
+	Author string
 }
 
 // toolDef binds a tool name to the function that registers it on a server.
@@ -173,6 +176,10 @@ func Serve(ctx context.Context, role Role, agent string) error {
 		d.Manager = m
 		d.Brain, d.MinScore = m.Brain, m.Cfg.Brain.MinScore()
 	} else {
+		// The job role runs only inside a job: its notes carry the job's id.
+		if d.JobID = os.Getenv(jobs.JobEnvVar); d.JobID == "" {
+			return fmt.Errorf("%s role: %s is not set; this role runs only inside a job", role, jobs.JobEnvVar)
+		}
 		dir, err := jobs.StateDir(agent) // validates the agent name
 		if err != nil {
 			return err
@@ -181,10 +188,14 @@ func Serve(ctx context.Context, role Role, agent string) error {
 		if err != nil {
 			return err
 		}
-		if d.Brain, err = brain.New(cfg.Brain, agent); err != nil {
-			return err
+		// The job role never reads the brain token: it goes through the daemon's proxy.
+		d.Brain, d.MinScore, d.Author = brain.Disabled{}, cfg.Brain.MinScore(), agent
+		if cfg.Brain.Agent != "" {
+			d.Author = cfg.Brain.Agent
 		}
-		d.MinScore, d.JobID = cfg.Brain.MinScore(), os.Getenv(jobs.JobEnvVar)
+		if cfg.Brain.Configured() {
+			d.Brain = brain.SocketClient{Path: jobs.BrainSocketPath(dir), JobID: d.JobID, Timeout: cfg.Brain.CallTimeout() + 5*time.Second}
+		}
 	}
 	s, err := NewServer(role, d)
 	if err != nil {
