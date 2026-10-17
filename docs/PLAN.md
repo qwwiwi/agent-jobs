@@ -25,7 +25,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
 - Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
-**This PR: prune, doctor procs, system and file tools.**
+**[PR #9](https://github.com/qwwiwi/agent-jobs/pull/9): prune, doctor procs, system and file tools.**
 
 - `agent-jobs prune [--dry-run]`: folders of jobs finished more than 48 hours ago keep their records and small top-level text files; work dirs, caches, builds, binaries, large files and symlinks go.
 - `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #12).
