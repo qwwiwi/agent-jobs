@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -202,7 +204,7 @@ func RunWrapper(jobDir, token string, argv []string) int {
 		return 2
 	}
 	defer stderrLog.Close()
-	code := runClaude(jobDir, argv, stderrLog)
+	code, idleClosed := runClaude(jobDir, argv, idleGrace(jobDir, stderrLog), stderrLog)
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
@@ -220,9 +222,18 @@ func RunWrapper(jobDir, token string, argv []string) int {
 		}
 	}
 	res := ParseStream(filepath.Join(jobDir, "stream.jsonl"))
-	if res.Text != "" {
-		if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(res.Text+"\n")); err != nil {
-			fmt.Fprintln(stderrLog, "run-wrapper: write report.md:", err)
+	if idleClosed {
+		code = finishIdleClosed(jobDir, res, stderrLog)
+	} else if text := res.Text; text != "" || !hasReport(jobDir) {
+		if text == "" {
+			// No final result text and no report.md of the job's own: the last assistant text that
+			// carries the report sections is the report.
+			text = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
+		}
+		if text != "" {
+			if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(text+"\n")); err != nil {
+				fmt.Fprintln(stderrLog, "run-wrapper: write report.md:", err)
+			}
 		}
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
@@ -232,45 +243,61 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	return 0
 }
 
-func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
+// idleGrace is the idle-after-result grace from the agent's config.json (<state>/jobs/<id> = jobDir);
+// an unreadable config falls back to the default.
+func idleGrace(jobDir string, log io.Writer) time.Duration {
+	abs, err := filepath.Abs(jobDir)
+	if err == nil {
+		var c Config
+		if c, err = LoadConfig(filepath.Dir(filepath.Dir(abs))); err == nil {
+			return c.IdleAfterResult()
+		}
+	}
+	fmt.Fprintln(log, "run-wrapper: config (idle-after-result grace falls back to the default):", err)
+	return DefaultIdleAfterResult
+}
+
+// runClaude runs claude and returns its exit code, and whether the idle-after-result rule ended it.
+func runClaude(jobDir string, argv []string, idle time.Duration, stderrLog *os.File) (int, bool) {
 	stdin, err := os.Open(filepath.Join(jobDir, "prompt.md"))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127
+		return 127, false
 	}
 	defer stdin.Close()
 	stdout, err := os.Create(filepath.Join(jobDir, "stream.jsonl"))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127
+		return 127, false
 	}
 	defer stdout.Close()
 	env, err := GitEnv(jobDir, os.Environ())
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
-		return 127
+		return 127, false
 	}
 	env, err = JobEnv(jobDir, env)
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
-		return 127
+		return 127, false
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderrLog
-	if err := cmd.Run(); err != nil {
+	closed, err := runIdleWatched(cmd, filepath.Join(jobDir, "stream.jsonl"), idle, stderrLog)
+	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				return 128 + int(ws.Signal())
+				return 128 + int(ws.Signal()), closed
 			}
-			return ee.ExitCode()
+			return ee.ExitCode(), closed
 		}
 		fmt.Fprintln(stderrLog, "run-wrapper: start claude:", err)
-		return 127
+		return 127, false
 	}
-	return 0
+	return 0, closed
 }
 
 // JobEnvVar marks every process of a job: the wrapper sets AGENT_JOBS_JOB=<job id> on claude, and

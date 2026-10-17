@@ -289,6 +289,7 @@ agent-jobs card list --agent my-agent --repo ~/src/project                  # к
 ```
 
 - `notify_tmux_target`: цель tmux для строки job-done. Пусто (по умолчанию) — уведомления выключены; строка уходит в журнал демона, чистка всё равно идёт.
+- `idle_after_result_seconds`: пауза правила idle-after-result (по умолчанию 180). Если claude выдал финальный `result` и затем молчит столько секунд, а живых дочерних процессов, кроме MCP-сервера джобы, нет, джоба завершается и оценивается по этому результату, а не ждёт таймаута (Linux).
 - `owner_names`: имена, которые никогда не должны попасть в коммит джобы.
 - `git_name` / `git_email`: git-идентичность джобы; джоба не может её подменить.
 - Ещё: `owner_rules_path`, `cards_dir` (по умолчанию `<state>/cards`), `claude_bin`, `tmux_bin`; переменные окружения `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`.

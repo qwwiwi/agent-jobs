@@ -60,6 +60,18 @@ type Config struct {
 	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
 	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
 	TrashRoots []string `json:"trash_roots"`
+	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
+	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
+	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes).
+	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
+}
+
+// IdleAfterResult returns the idle-after-result grace.
+func (c Config) IdleAfterResult() time.Duration {
+	if c.IdleAfterResultSeconds > 0 {
+		return time.Duration(c.IdleAfterResultSeconds) * time.Second
+	}
+	return DefaultIdleAfterResult
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -118,6 +130,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
+	}
+	if c.IdleAfterResultSeconds < 0 {
+		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must not be negative", c.IdleAfterResultSeconds)
 	}
 	for _, r := range c.TrashRoots {
 		if !filepath.IsAbs(r) {
