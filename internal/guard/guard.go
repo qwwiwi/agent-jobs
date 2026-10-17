@@ -211,46 +211,71 @@ func protectedBlocked(p string) string {
 	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database); a job does not write there."
 }
 
-// checkProtected rejects Bash writes into cfg.Protected: an output redirection to such a path, or
-// such a path (made absolute against the call's directory, cleaned, symlinks resolved on the longest
-// existing prefix) as an argument of any program that is not a plain reader (rm, mv, cp, ln, tee,
-// truncate, sed -i, cd, …). A path built at run time (a variable, a substitution) is not resolved:
-// that and a script the job writes are the documented residual gap.
+// checkProtected rejects Bash writes into cfg.Protected. Paths are resolved by pathScope (pathres.go):
+// `~/` and $HOME expanded, relative words against the call's directory and every literal cd/pushd
+// target in the call, symlinks resolved on the longest existing prefix. Refused:
+//   - an output redirection to a protected path;
+//   - a protected path (or one inside it) as an argument of any program that is not a plain reader
+//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value or
+//     inline code (`dd of=…`, `python3 -c "open('…')"`), and the directory holding one (`cp f <dir>`);
+//   - for rm/mv/cp/ln/rsync/chmod/chown/tar/… and find with an action, an ancestor of a protected
+//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`);
+//   - `xargs <non-reader>` fed by an earlier stage of its pipeline that names a protected path or an
+//     ancestor of one;
+//   - after a cd the guard cannot resolve (`cd $X`, `cd -`, CDPATH), a relative word that could lead
+//     to a protected path; likewise `~user/…`.
+//
+// A path built at run time otherwise (a variable other than $HOME, a substitution, a file read by
+// xargs) is not resolved: that and a script the job writes are the documented residual gap.
 func checkProtected(scripts []*script, _ string, cfg Config) string {
 	if len(cfg.Protected) == 0 {
 		return ""
 	}
-	hit := func(w string) (string, bool) {
-		w = pathOf(w)
-		if w == "" || w == "." {
-			return "", false
-		}
-		given := w
-		if !filepath.IsAbs(given) {
-			given = filepath.Join(cfg.Dir, given)
-		}
-		for _, p := range []string{filepath.Clean(given), resolvePath(w, cfg.Dir)} {
-			if inJobGitDir(p, cfg.Protected) {
-				return p, true
-			}
-		}
-		return "", false
-	}
+	s := newPathScope(scripts, cfg)
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
-			for _, c := range pl.cmds {
+			for i, c := range pl.cmds {
 				for _, t := range c.outRedirs {
-					if p, ok := hit(t); ok {
+					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
 					}
 				}
-				argv := argvOf(c.words)
-				if len(argv) == 0 || gitFileReaders[strings.ToLower(base(argv[0]))] {
+				v := split(c.words)
+				argv := c.words[v.start:]
+				if len(argv) == 0 {
 					continue
 				}
+				name := strings.ToLower(base(argv[0]))
+				if gitFileReaders[name] {
+					continue
+				}
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
 				for _, a := range argv[1:] {
-					if p, ok := hit(a); ok {
+					if p, ok := s.hit(a, tree); ok {
 						return protectedBlocked(p)
+					}
+					if p, ok := s.contains(a); ok {
+						return protectedBlocked(p)
+					}
+					if name != "cd" && name != "pushd" {
+						if p, ok := s.parentHit(a); ok {
+							return protectedBlocked(p)
+						}
+					}
+				}
+				if p, ok := s.contains(c.heredoc); ok && c.heredoc != "" {
+					return protectedBlocked(p)
+				}
+				if slices.Contains(v.wrappers, "xargs") {
+					for _, prev := range pl.cmds[:i] {
+						for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
+							_, h := s.hit(w, true)
+							_, m := s.contains(w)
+							if w != "" && (h || m) {
+								return "blocked by guard: `xargs " + name + "` reads `" + w + "`, which names agent-jobs " +
+									"state (the subagent log or the job database); the guard cannot verify what xargs passes on."
+							}
+						}
 					}
 				}
 			}

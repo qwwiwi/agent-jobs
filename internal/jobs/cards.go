@@ -178,9 +178,18 @@ func CardRemoteIdentity(v string) (string, error) {
 	return netIdentity(host, path)
 }
 
-// cardRemoteValue renders an identity back as a card `remote:` value.
+// cardRemoteValue renders an identity back as a card `remote:` value that CardRemoteIdentity reads
+// back to the same identity: the shorthand host/path for a dotted host, ssh://host/path for a dotless
+// one (`myserver`, `localhost`) and ssh://[host]/path for an IPv6 address.
 func cardRemoteValue(id string) string {
 	if v, ok := strings.CutPrefix(id, "net:"); ok {
+		host, path, _ := strings.Cut(v, "/")
+		switch {
+		case strings.Contains(host, ":"):
+			return "ssh://[" + host + "]/" + path
+		case !strings.Contains(host, "."):
+			return "ssh://" + v
+		}
 		return v
 	}
 	return strings.TrimPrefix(id, "local:")

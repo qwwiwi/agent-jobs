@@ -24,9 +24,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
 - A job with a repository refuses to start («refused to start: project card …») when a card in the cards directory is unreadable, unparsable or over 4 KB, or when its matching cards exceed 8 KB, like unreadable owner rules.
 
+### Fixed
+- `agent-jobs card new` works for an origin whose host has no dot (`git@myserver:org/repo.git`, `ssh://localhost/…`) or is an IPv6 address: such remotes are written as `ssh://host/path`.
+- Subagent log and counter: the log line is appended (under the flock) before the counter is reserved, and taken back when the counter refuses; a failed write is reported as a write error and no longer leaves the counter ahead of the log (which refused every later subagent as «shortened»).
+
 ### Security
 - Guard: a job's subagent must stay inside the job. Its input may carry only the string keys `description`, `prompt`, `subagent_type` and `model`, matched exactly and case-sensitively by a token walk (encoding/json would match `Isolation` to `isolation` and let a later duplicate win); duplicate keys and every other key (`isolation`, `run_in_background`, `team_name`, …) are refused. Without a subagent log every subagent is refused. The hook input must be a single JSON object.
 - Guard: protected paths (`--protect`: the subagent logs and `jobs.db*`) cannot be written by file tools or literal Bash targets (redirections; arguments of any program that is not a plain reader), symlinks resolved.
+- Guard: protected-path resolution (`internal/guard/pathres.go`) expands `~/` and `$HOME`, follows literal `cd`/`pushd` through the call, and refuses protected paths inside option values and inline code (`dd of=`, `python3 -c`, `perl -e`, `node -e`), ancestors as targets of `rm`/`mv`/`cp`/`ln`/`rsync`/`chmod`/`chown`/`tar`/`find -delete`, the directory holding one as a destination, `xargs <non-reader>` fed a protected path, and relative words that could reach one after an unresolvable `cd` (`$X`, `-`, `CDPATH`) or under `~user/`.
 - Project cards are opened with `openat(O_NOFOLLOW)` relative to the cards directory and read bounded from the same descriptor (no symlink escape, no growth after the size check); front matter selectors and a new card's origin with control characters (CR/LF, …) are refused.
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release

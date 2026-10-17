@@ -95,7 +95,8 @@ func CheckSubagent(raw json.RawMessage, cfg Config) string {
 // store row (cfg.SubagentReserve, an UPDATE that only ever increments) when it is configured, else by
 // the log's line count. The log must never be shorter than the counter: a log the job truncated or
 // rewrote refuses every further subagent (tampering), and the log is also one of the guard's
-// protected paths (file tools and literal Bash targets cannot write it).
+// protected paths (file tools and literal Bash targets cannot write it). With the counter, the log
+// line is appended before the reservation (see below), so a failed write never moves the counter.
 func reserveSubagent(cfg Config, typ, desc string) string {
 	f, err := os.OpenFile(cfg.SubagentLog, os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
@@ -119,20 +120,46 @@ func reserveSubagent(cfg Config, typ, desc string) string {
 	if err := sc.Err(); err != nil {
 		return "agent-jobs guard: subagent log: " + err.Error()
 	}
-	prev, allowed := lines, lines < MaxSubagentsPerJob
-	if cfg.SubagentReserve != nil {
-		if prev, allowed, err = cfg.SubagentReserve(MaxSubagentsPerJob); err != nil {
-			return "agent-jobs guard: subagent counter: " + err.Error()
+	if cfg.SubagentReserve == nil {
+		if lines >= MaxSubagentsPerJob {
+			return capReached()
 		}
-		if lines < prev {
-			return fmt.Sprintf("agent-jobs guard: the subagent log has %d entries but %d subagents were started: "+
-				"it was shortened, so no more subagents start in this job", lines, prev)
-		}
+		return appendSubagent(f, typ, desc)
 	}
-	if !allowed {
-		return fmt.Sprintf("agent-jobs guard: at most %d subagents per job, all %d are used; do the rest yourself",
-			MaxSubagentsPerJob, MaxSubagentsPerJob)
+	// The log line is written first and the counter reserved after it, so a failed write (disk full,
+	// EIO) leaves the counter untouched and is reported as what it is. A refusal after the write takes
+	// the line back; if that fails, the log is one line ahead of the counter, which is harmless.
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return "agent-jobs guard: subagent log: " + err.Error()
 	}
+	if r := appendSubagent(f, typ, desc); r != "" {
+		_ = f.Truncate(size)
+		return r
+	}
+	prev, allowed, err := cfg.SubagentReserve(MaxSubagentsPerJob)
+	switch {
+	case err != nil:
+		_ = f.Truncate(size)
+		return "agent-jobs guard: subagent counter: " + err.Error()
+	case lines < prev:
+		_ = f.Truncate(size)
+		return fmt.Sprintf("agent-jobs guard: the subagent log has %d entries but %d subagents were started: "+
+			"it was shortened, so no more subagents start in this job", lines, prev)
+	case !allowed:
+		_ = f.Truncate(size)
+		return capReached()
+	}
+	return ""
+}
+
+func capReached() string {
+	return fmt.Sprintf("agent-jobs guard: at most %d subagents per job, all %d are used; do the rest yourself",
+		MaxSubagentsPerJob, MaxSubagentsPerJob)
+}
+
+// appendSubagent writes one log line for an allowed subagent.
+func appendSubagent(f *os.File, typ, desc string) string {
 	line := fmt.Sprintf("%s\t%s\t%s\n", time.Now().UTC().Format(time.RFC3339), oneLine(typ), oneLine(desc))
 	if _, err := f.WriteString(line); err != nil {
 		return "agent-jobs guard: subagent log: " + err.Error()

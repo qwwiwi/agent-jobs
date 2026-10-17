@@ -2,6 +2,7 @@ package guard
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,5 +234,50 @@ func TestProtectedPaths(t *testing.T) {
 		if r := Check(c, cfg); r != "" {
 			t.Errorf("%q refused: %s", c, r)
 		}
+	}
+}
+
+// N6: the log line is written before the counter is reserved (a failed write leaves the counter
+// untouched), and a refusal by the counter takes the line back.
+func TestSubagentLogWrittenBeforeReserve(t *testing.T) {
+	logf := filepath.Join(t.TempDir(), "job.log")
+	count, seen := 0, -1
+	reserve := func(max int) (int, bool, error) {
+		b, err := os.ReadFile(logf)
+		if err != nil {
+			return 0, false, err
+		}
+		seen = strings.Count(string(b), "\n")
+		if count >= max {
+			return count, false, nil
+		}
+		count++
+		return count - 1, true, nil
+	}
+	cfg := Config{SubagentLog: logf, SubagentReserve: reserve}
+	call := subagentCall(t, "Agent", map[string]any{"prompt": "p"})
+	if r := decide(t, call, cfg); r != "" {
+		t.Fatalf("first subagent refused: %s", r)
+	}
+	if seen != 1 {
+		t.Fatalf("log had %d lines when the counter was reserved, want 1 (written first)", seen)
+	}
+	for i := 1; i < MaxSubagentsPerJob; i++ {
+		if r := decide(t, call, cfg); r != "" {
+			t.Fatalf("subagent %d refused: %s", i+1, r)
+		}
+	}
+	if r := decide(t, call, cfg); !strings.Contains(r, "at most") {
+		t.Fatalf("at the cap: %q", r)
+	}
+	if b, _ := os.ReadFile(logf); strings.Count(string(b), "\n") != MaxSubagentsPerJob {
+		t.Fatalf("refused subagent left its line in the log:\n%s", b)
+	}
+	failing := func(int) (int, bool, error) { return 0, false, errors.New("db locked") }
+	if r := decide(t, call, Config{SubagentLog: logf, SubagentReserve: failing}); !strings.Contains(r, "db locked") {
+		t.Fatalf("counter error: %q", r)
+	}
+	if b, _ := os.ReadFile(logf); strings.Count(string(b), "\n") != MaxSubagentsPerJob {
+		t.Fatalf("counter error left a line in the log:\n%s", b)
 	}
 }

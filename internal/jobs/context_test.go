@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -495,6 +497,33 @@ func TestNewCardRejectsControlCharsInOrigin(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if !strings.Contains(string(b), "remote: github.com/Org/Proj\n") {
 		t.Fatalf("card:\n%s", b)
+	}
+}
+
+// N5: `card new` works for an origin whose host has no dot (or is an IPv6 address), and the written
+// value reads back to the origin's identity.
+func TestNewCardDotlessHost(t *testing.T) {
+	m := newManager(t)
+	for i, u := range []string{"git@myserver:org/repo.git", "ssh://localhost/srv/repo", "ssh://git@[::1]:22/o/r.git", "https://github.com/O/R"} {
+		repo := newRepo(t)
+		gitT(t, repo, "config", "remote.origin.url", u)
+		name := fmt.Sprintf("c%d", i)
+		p, err := m.NewCard(repo, name)
+		if err != nil {
+			t.Fatalf("%s: %v", u, err)
+		}
+		b, _ := os.ReadFile(p)
+		c, err := ParseCard(name, b)
+		if err != nil {
+			t.Fatalf("%s: %v", u, err)
+		}
+		want, err := RemoteIdentity(u, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(c.Remotes, want) {
+			t.Fatalf("%s: card remotes %v, want %s:\n%s", u, c.Remotes, want, b)
+		}
 	}
 }
 
