@@ -15,7 +15,9 @@
 //     .git/config, .git/hooks or $GIT_DIR;
 //   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf;
 //   - agent-jobs itself in any form except `agent-jobs mcp --role job` (no nested jobs), and any change
-//     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets).
+//     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets);
+//   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
+//     (isolation worktree/remote, background run, agent team).
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
@@ -49,6 +51,15 @@ type Config struct {
 	GitEmail   string   // allowed git user.email ("" = no identity override allowed)
 	GitDirs    []string // the job worktree's real git dirs (admin dir, common dir): file tools never write there
 	Dir        string   // working directory of the call (resolves `git commit -F <file>`)
+	// SubagentLog is the job's subagent log (one line per allowed subagent, at most MaxSubagentsPerJob).
+	// Empty = subagents are refused.
+	SubagentLog string
+	// SubagentReserve is the job's monotonic subagent counter (the store row): it counts one more
+	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
+	SubagentReserve func(max int) (prev int, allowed bool, err error)
+	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
+	// database that holds the counter. File tools and literal Bash targets into them are refused.
+	Protected []string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -60,6 +71,8 @@ type HookInput struct {
 		FilePath     string `json:"file_path"`
 		NotebookPath string `json:"notebook_path"`
 	} `json:"tool_input"`
+	// RawInput is tool_input as sent (subagent calls are checked on fields of their own).
+	RawInput json.RawMessage `json:"-"`
 }
 
 // fileTools write the file named in their input (file_path, or notebook_path for NotebookEdit).
@@ -67,10 +80,21 @@ var fileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, 
 
 // Decide parses the hook JSON and returns a non-empty reason when the call must be blocked.
 func Decide(r io.Reader, cfg Config) (string, error) {
+	var raw struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return "", fmt.Errorf("guard: read hook input: %w", err)
+	}
 	var in HookInput
-	if err := json.NewDecoder(r).Decode(&in); err != nil {
+	if err := json.Unmarshal(b, &in); err != nil {
 		return "", fmt.Errorf("guard: parse hook input: %w", err)
 	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return "", fmt.Errorf("guard: parse hook input: %w", err)
+	}
+	in.RawInput = raw.ToolInput
 	if cfg.Dir == "" {
 		cfg.Dir = in.Cwd
 	}
@@ -80,6 +104,9 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 			p = in.ToolInput.NotebookPath
 		}
 		return CheckFileWrite(in.ToolName, p, cfg), nil
+	}
+	if IsSubagentTool(in.ToolName) {
+		return CheckSubagent(in.RawInput, cfg), nil
 	}
 	if in.ToolName != "Bash" {
 		return "", nil
@@ -173,6 +200,86 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
 				"(git would run programs from its config and hooks)."
 		}
+		if inJobGitDir(p, cfg.Protected) {
+			return protectedBlocked(p)
+		}
+	}
+	return ""
+}
+
+func protectedBlocked(p string) string {
+	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database); a job does not write there."
+}
+
+// checkProtected rejects Bash writes into cfg.Protected. Paths are resolved by pathScope (pathres.go):
+// `~/` and $HOME expanded, relative words against the call's directory and every literal cd/pushd
+// target in the call, symlinks resolved on the longest existing prefix. Refused:
+//   - an output redirection to a protected path;
+//   - a protected path (or one inside it) as an argument of any program that is not a plain reader
+//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value or
+//     inline code (`dd of=…`, `python3 -c "open('…')"`), and the directory holding one (`cp f <dir>`);
+//   - for rm/mv/cp/ln/rsync/chmod/chown/tar/… and find with an action, an ancestor of a protected
+//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`);
+//   - `xargs <non-reader>` fed by an earlier stage of its pipeline that names a protected path or an
+//     ancestor of one;
+//   - after a cd the guard cannot resolve (`cd $X`, `cd -`, CDPATH), a relative word that could lead
+//     to a protected path; likewise `~user/…`.
+//
+// A path built at run time otherwise (a variable other than $HOME, a substitution, a file read by
+// xargs) is not resolved: that and a script the job writes are the documented residual gap.
+func checkProtected(scripts []*script, _ string, cfg Config) string {
+	if len(cfg.Protected) == 0 {
+		return ""
+	}
+	s := newPathScope(scripts, cfg)
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for i, c := range pl.cmds {
+				for _, t := range c.outRedirs {
+					if p, ok := s.hit(t, false); ok {
+						return protectedBlocked(p)
+					}
+				}
+				v := split(c.words)
+				argv := c.words[v.start:]
+				if len(argv) == 0 {
+					continue
+				}
+				name := strings.ToLower(base(argv[0]))
+				if gitFileReaders[name] {
+					continue
+				}
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
+				for _, a := range argv[1:] {
+					if p, ok := s.hit(a, tree); ok {
+						return protectedBlocked(p)
+					}
+					if p, ok := s.contains(a); ok {
+						return protectedBlocked(p)
+					}
+					if name != "cd" && name != "pushd" {
+						if p, ok := s.parentHit(a); ok {
+							return protectedBlocked(p)
+						}
+					}
+				}
+				if p, ok := s.contains(c.heredoc); ok && c.heredoc != "" {
+					return protectedBlocked(p)
+				}
+				if slices.Contains(v.wrappers, "xargs") {
+					for _, prev := range pl.cmds[:i] {
+						for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
+							_, h := s.hit(w, true)
+							_, m := s.contains(w)
+							if w != "" && (h || m) {
+								return "blocked by guard: `xargs " + name + "` reads `" + w + "`, which names agent-jobs " +
+									"state (the subagent log or the job database); the guard cannot verify what xargs passes on."
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -181,7 +288,7 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {

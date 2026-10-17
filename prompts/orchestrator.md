@@ -39,3 +39,12 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 > Через 30 минут после уведомления демон удаляет worktree, самую тяжёлую часть. Перед этим сохраняет diffstat, коммиты джобы через `git format-patch` и незакоммиченные правки через `git diff --binary`, а в исходном репозитории ставит ref `refs/reference/jobs/<id>` на последний коммит. Так работу можно взять и после удаления папки.
 
 The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: apply the saved patches or check out the ref.
+
+## Beyond the reference (owner decisions 2026-10-17, `docs/DECISIONS.md`)
+
+Not in the reference; recorded as owner decisions and in `docs/DEVIATIONS.md` #12.
+
+- **Route the work.** Do it yourself when it takes minutes; use a subagent when this session needs the result now; start a job when the work is long, runs in the background or overnight, or must survive a restart. The `agent-jobs` skill (installed per agent by `scripts/install-linux.sh`) teaches the tools.
+- **State a model or a complexity** on every `job_start`; with neither the call is rejected.
+- **Jobs may use subagents:** at most three per job, inside the job's own limits; no nested jobs. Write briefs so that three are enough, and split larger work into several jobs from this session.
+- **Job context.** The owner rules are the job profile, generated from your own rules with `agent-jobs profile --from <file>...` (marked sections only, ≤ 8 KB). Project cards (`agent-jobs card new --repo <path>`) add stack, check runner, what not to touch and known traps to every job in that repository.

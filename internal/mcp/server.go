@@ -64,7 +64,10 @@ job_start queues a job and returns its id at once; the daemon starts it within a
 State an explicit model or a complexity (light|normal|hard, mapped to a model by kind); with neither job_start is rejected: there is no default and no classifier.
 When a job ends this session receives one line "[jobs:job-done] job <id> ..."; the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
-system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.`
+Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
+A job may use at most 3 subagents inside its own limits and can never start jobs itself.
+system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
+The agent-jobs skill has the details.`
 
 const jobInstructions = `agent-jobs job role: only the tools allow-listed for jobs are available here.`
 

@@ -38,6 +38,9 @@ type Config struct {
 	// OwnerRulesPath is the owner's permanent rules file (≤8 KB) glued into every brief.
 	// Default: <state>/owner-rules.md. A job refuses to start if it is unreadable or too big.
 	OwnerRulesPath string `json:"owner_rules_path"`
+	// CardsDir holds the project cards (<name>.md) attached to briefs of matching repositories.
+	// Default: <state>/cards.
+	CardsDir string `json:"cards_dir"`
 	// NotifyTmuxTarget is the tmux target (e.g. "channel-silvana") for the job-done line. Empty = notify disabled.
 	NotifyTmuxTarget string `json:"notify_tmux_target"`
 	// TmuxSocket is the tmux socket name (`tmux -L <name>`) of the server that holds NotifyTmuxTarget.
@@ -123,6 +126,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
+	}
+	if c.CardsDir == "" {
+		c.CardsDir = filepath.Join(stateDir, "cards")
 	}
 	return c, nil
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -85,5 +86,39 @@ func TestNewColumnsRoundTrip(t *testing.T) {
 	}
 	if len(queued) != 1 || queued[0].ID != "a" {
 		t.Fatalf("queued: %v", queued)
+	}
+}
+
+func TestReserveSubagentMonotonic(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	j := &Job{ID: "j1", Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: StatusQueued, Model: "m", CreatedAt: now}
+	if err := s.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ReserveSubagent("j1", 3); err == nil {
+		t.Fatal("a queued job got a subagent")
+	}
+	if _, err := s.db.Exec(`UPDATE jobs SET status = 'running' WHERE id = 'j1'`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		prev, ok, err := s.ReserveSubagent("j1", 3)
+		if err != nil || !ok || prev != i {
+			t.Fatalf("reserve %d: prev=%d ok=%v err=%v", i, prev, ok, err)
+		}
+	}
+	if prev, ok, err := s.ReserveSubagent("j1", 3); err != nil || ok || prev != 3 {
+		t.Fatalf("fourth: prev=%d ok=%v err=%v", prev, ok, err)
+	}
+	if n, _ := s.SubagentCount("j1"); n != 3 {
+		t.Fatalf("count %d", n)
+	}
+	if _, _, err := s.ReserveSubagent("nope", 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown job: %v", err)
 	}
 }

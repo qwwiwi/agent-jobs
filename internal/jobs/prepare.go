@@ -82,8 +82,30 @@ var webTools = []string{"WebFetch", "WebSearch"}
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs.
-func (m *Manager) GuardCommand(gitDirs ...string) string {
+// GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
+// without a subagent log (every subagent refused). Jobs get JobGuardCommand.
+func (m *Manager) GuardCommand(gitDirs ...string) string { return m.guardCommand("", gitDirs...) }
+
+// JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
+// guard.MaxSubagentsPerJob subagents per job.
+func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
+	return m.guardCommand(id, gitDirs...)
+}
+
+// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
+// database (with its WAL files) that holds the monotonic subagent counter.
+func (m *Manager) ProtectedPaths() []string {
+	db := filepath.Join(m.StateDir, "jobs.db")
+	return []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal"}
+}
+
+// SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
+// outside the job directory (the job's --add-dir), so the job is not told to write there.
+func (m *Manager) SubagentLogPath(id string) string {
+	return filepath.Join(m.StateDir, "subagents", id+".log")
+}
+
+func (m *Manager) guardCommand(jobID string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Cfg.OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -97,11 +119,30 @@ func (m *Manager) GuardCommand(gitDirs ...string) string {
 	for _, d := range gitDirs {
 		parts = append(parts, "--git-dir", shellQuote(d))
 	}
+	if jobID != "" {
+		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
+			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
+		for _, p := range m.ProtectedPaths() {
+			parts = append(parts, "--protect", shellQuote(p))
+		}
+	}
 	return strings.Join(parts, " ")
 }
 
-// Settings builds the job's only settings.json: deny rules + the guard hook (told the job's git dirs).
+// Settings builds the job's only settings.json: deny rules + the guard hook (told the job's git dirs),
+// with no subagent log (subagents refused). Jobs get JobSettings.
 func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
+	return m.settings(kind, m.GuardCommand(gitDirs...))
+}
+
+// JobSettings is the settings.json of job j: Settings plus the job's subagent log in the guard hook.
+// The subagent tool (Agent, formerly Task) is not denied: a job may use up to three subagents, which
+// run inside the job's process, under these settings and this hook, within the job's limits.
+func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
+	return m.settings(j.Kind, m.JobGuardCommand(j.ID, gitDirs...))
+}
+
+func (m *Manager) settings(kind, guardCmd string) map[string]any {
 	deny := append([]string{}, denyRules...)
 	if kind != "research" {
 		deny = append(deny, webTools...)
@@ -112,7 +153,7 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 			"PreToolUse": []any{
 				map[string]any{
 					"matcher": "*",
-					"hooks":   []any{map[string]any{"type": "command", "command": m.GuardCommand(gitDirs...)}},
+					"hooks":   []any{map[string]any{"type": "command", "command": guardCmd}},
 				},
 			},
 		},
@@ -147,9 +188,14 @@ func (m *Manager) readOwnerRules() (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-// BuildPrompt assembles prompt.md: preamble, owner rules, task, kind checklist, report contract.
-func (m *Manager) BuildPrompt(j *store.Job, ownerRules string) (string, error) {
+// BuildPrompt assembles prompt.md: preamble, subagent rules, owner rules (the job profile), the
+// project cards that match the job's repository, task, kind checklist, report contract.
+func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card) (string, error) {
 	pre, err := template("prompts/preamble.md")
+	if err != nil {
+		return "", err
+	}
+	sub, err := template("prompts/subagents.md")
 	if err != nil {
 		return "", err
 	}
@@ -167,8 +213,10 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string) (string, error) {
 			"Commit locally; never push. The diff is measured from that base.", j.BaseCommit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n## Owner rules\n\n%s\n\n## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
-		pre, ownerRules, j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
+	fmt.Fprintf(&b, "%s\n\n%s\n\n## Owner rules\n\n%s\n\n", pre, sub, ownerRules)
+	b.WriteString(RenderCards(cards))
+	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
 	return b.String(), nil
 }
 
@@ -201,12 +249,19 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err != nil {
 		return err
 	}
-	prompt, err := m.BuildPrompt(j, rules)
+	cards, err := m.CardsFor(j.RepoPath)
+	if err != nil {
+		return err
+	}
+	prompt, err := m.BuildPrompt(j, rules, cards)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create job dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(m.SubagentLogPath(j.ID)), 0o700); err != nil {
+		return fmt.Errorf("create subagent log dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
 		return err
@@ -222,7 +277,7 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	work := filepath.Join(dir, "work")
 	settings := filepath.Join(dir, "settings.json")
 	if j.RepoPath == "" {
-		if err := writeJSON(settings, m.Settings(j.Kind)); err != nil {
+		if err := writeJSON(settings, m.JobSettings(j)); err != nil {
 			return err
 		}
 		return os.MkdirAll(work, 0o700)
@@ -246,7 +301,7 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := writeJSON(settings, m.Settings(j.Kind, gitDir, common)); err != nil {
+	if err := writeJSON(settings, m.JobSettings(j, gitDir, common)); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
