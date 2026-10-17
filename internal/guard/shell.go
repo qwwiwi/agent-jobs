@@ -511,6 +511,8 @@ type cmdView struct {
 	start       int      // index of the real program in words
 	wrappers    []string // wrapper programs stripped (env, xargs, sudo, …)
 	splitString bool     // `env -S` / `--split-string`: the program comes from a string the guard cannot see
+	envClear    bool     // `env -i` / `env -` / `--ignore-environment` / `exec -c`: the program runs with an emptied environment
+	envUnset    []string // variables removed by `env -u NAME` / `-uNAME` / `--unset[=]NAME`
 }
 
 // split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
@@ -546,13 +548,43 @@ func split(words []string) cmdView {
 				i++
 				continue
 			}
+			if w == "-" && name == "env" { // `env -` is `env -i`
+				v.envClear = true
+				i++
+				continue
+			}
 			if strings.HasPrefix(w, "-") && len(w) > 1 {
-				if name == "env" && (strings.HasPrefix(w, "--split-string") ||
-					(!strings.HasPrefix(w, "--") && strings.ContainsRune(w, 'S'))) {
-					v.splitString = true
+				long, attached := strings.HasPrefix(w, "--"), false
+				switch {
+				case name == "env" && long:
+					v.splitString = v.splitString || strings.HasPrefix(w, "--split-string")
+					v.envClear = v.envClear || w == "--ignore-environment"
+					if u, ok := strings.CutPrefix(w, "--unset="); ok {
+						v.envUnset = append(v.envUnset, u)
+					} else if (w == "--unset" || w == "--chdir") && i+1 < len(words) {
+						if w == "--unset" {
+							v.envUnset = append(v.envUnset, words[i+1])
+						}
+						i++ // value of the long option
+					}
+				case name == "env":
+					v.splitString = v.splitString || strings.ContainsRune(w, 'S')
+					if k := strings.IndexByte(w, 'u'); k > 0 {
+						if k+1 < len(w) {
+							v.envUnset = append(v.envUnset, w[k+1:]) // -uNAME
+							attached = true
+						} else if i+1 < len(words) {
+							v.envUnset = append(v.envUnset, words[i+1])
+						}
+						v.envClear = v.envClear || strings.ContainsRune(w[:k], 'i')
+					} else {
+						v.envClear = v.envClear || strings.ContainsRune(w, 'i')
+					}
+				case name == "exec" && !long:
+					v.envClear = v.envClear || strings.ContainsRune(w, 'c') // bash `exec -c`: empty environment
 				}
 				i++
-				if !strings.HasPrefix(w, "--") && strings.ContainsRune(vf, rune(w[len(w)-1])) {
+				if !long && !attached && strings.ContainsRune(vf, rune(w[len(w)-1])) {
 					i++ // value of the last flag in the cluster
 				}
 				continue

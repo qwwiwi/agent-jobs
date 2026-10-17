@@ -34,13 +34,13 @@ func TestCheck(t *testing.T) {
 		{"commit without owner", `git commit -m "Исправил лимиты"`, false},
 		{"owner outside commit", `echo dashi`, false},
 		{"foreign -c identity", `git -c user.name="Someone" commit -m x`, true},
-		{"own -c identity", `git -c user.email=bot@example.com commit -m x`, false},
+		{"own -c identity", `git -c user.email=bot@example.com commit -m x`, true}, // identity comes from the wrapper's gitconfig
 		{"foreign config", `git config user.email evil@example.com`, true},
 		{"read config ok", `git config user.email`, false},
 		{"foreign author", `git commit --author="X <x@y>" -m x`, true},
 		{"own author", `git commit --author="Job Bot <bot@example.com>" -m x`, false},
 		{"foreign env", `GIT_AUTHOR_EMAIL=x@y git commit -m x`, true},
-		{"own env", `GIT_COMMITTER_NAME="Job Bot" git commit -m x`, false},
+		{"own env", `GIT_COMMITTER_NAME="Job Bot" git commit -m x`, true}, // no GIT_* assignment next to git
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -144,7 +144,7 @@ func TestCheckFixLoop1(t *testing.T) {
 		{"owner in -C dir commit", `git -C sub commit -m "dashi"`, true},
 		{"foreign -c mixed case", `git -c User.Name=Foreign commit -m x`, true},
 		{"foreign -c USER.EMAIL", `git -c USER.EMAIL=x@y commit -m x`, true},
-		{"own -c mixed case", `git -c User.Email=bot@example.com commit -m x`, false},
+		{"own -c mixed case", `git -c User.Email=bot@example.com commit -m x`, true},
 		{"foreign config mixed case", `git config User.Name Foreign`, true},
 		{"foreign config --global", `git config --global user.email x@y`, true},
 		{"foreign config set", `git config set user.name Foreign`, true},
@@ -396,7 +396,7 @@ func TestCheckFailClosedAllowlist(t *testing.T) {
 		{"grep -r gh", "grep -r gh .", false},
 		{"rg git", "rg -n git .", false},
 		{"cat git file", "cat docs/git.md", false},
-		{"cp git", "cp git /tmp/x", false},
+		{"cp git", "cp git /tmp/x", true}, // a file named git copied elsewhere is a renamed git
 		{"rm gh", "rm -rf gh", false},
 		{"touch git", "touch git", false},
 		{"apt-get install git", "apt-get install git", false},
@@ -497,5 +497,153 @@ func TestCommitTemplateFileIsChecked(t *testing.T) {
 		if Check(cmd, cfg) == "" {
 			t.Fatalf("%s: owner name in the template must block", cmd)
 		}
+	}
+}
+
+// Security review (Fable) H1–H3: direct spellings of outward actions, git running programs from
+// config/env, nested agents.
+func TestCheckSecurityReview(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// H1: glob/brace in the command name or git words.
+		{"brace git push", "{git,push} origin HEAD", true},
+		{"glob git path", "/usr/bin/g[i]t push", true},
+		{"glob ? git", "/usr/bin/gi? push", true},
+		{"glob * git", "/usr/bin/gi* push", true},
+		{"brace in env", "env {git,push} origin", true},
+		{"brace subcommand", "git {push,} origin", true},
+		{"glob subcommand", "git pu?h origin", true},
+		{"brace in -C value", "git -C {x,push}", true},
+		{"glob gh subcommand", "gh pr cr*ate", true},
+		{"test bracket ok", "[ -f go.mod ] && echo ok", false},
+		{"double bracket ok", "[[ -f go.mod ]] && echo ok", false},
+		{"glob after subcommand ok", "git add '*.go'", false},
+		{"glob in ls ok", "ls internal/*.go", false},
+		// H1: git-<sub> binaries.
+		{"git-push binary", "/usr/lib/git-core/git-push origin HEAD", true},
+		{"git-push bare", "git-push origin", true},
+		{"git-tag binary", "/usr/lib/git-core/git-tag v1", true},
+		{"git-send-pack", "/usr/lib/git-core/git-send-pack remote HEAD", true},
+		{"git-http-push", "git-http-push https://x/y HEAD", true},
+		{"git-commit owner", `/usr/lib/git-core/git-commit -m "for Dashi"`, true},
+		{"git-commit ok", `/usr/lib/git-core/git-commit -m "Исправил"`, false},
+		{"git-status ok", "/usr/lib/git-core/git-status", false},
+		{"find -exec git-push", `find . -exec /usr/lib/git-core/git-push \;`, true},
+		{"git-push in substitution", "echo $(git-push)", true},
+		// H1: send-pack / http-push subcommands.
+		{"git send-pack", "git send-pack origin HEAD", true},
+		{"git http-push", "git http-push https://x/y HEAD", true},
+		{"git -C send-pack", "git -C . send-pack x HEAD", true},
+		// H1: copying git/gh/a shell makes a renamed executable.
+		{"cp git binary", "cp /usr/bin/git ./x", true},
+		{"cp git-push", "cp /usr/lib/git-core/git-push ./x", true},
+		{"mv gh", "mv /usr/bin/gh ./x", true},
+		{"install git", "install -m 755 /usr/bin/git ./x", true},
+		{"ln -s git", "ln -s /usr/bin/git ./x", true},
+		{"ln git hard", "ln /usr/bin/git ./x", true},
+		{"cp bash", "cp /bin/bash ./x", true},
+		{"cp claude", "cp $(which claude) ./x", true},
+		{"cp which git", "cp `which git` ./x", true},
+		{"cp claude path", "cp /usr/local/bin/claude ./x", true},
+		{"cp dynamic ok", `cp "$f" /tmp/x`, false},
+		{"cp source file ok", "cp internal/git.go /tmp/x", false},
+		{"cp gitignore ok", "cp .gitignore /tmp/x", false},
+		{"mv ok", "mv a.txt b.txt", false},
+		{"ln -s ok", "ln -s ../data data", false},
+
+		// H2: git env assignments next to git.
+		{"GIT_DIR prefix", "GIT_DIR=/tmp/x git status", true},
+		{"GIT_EXEC_PATH prefix", "GIT_EXEC_PATH=/tmp/x git status", true},
+		{"GIT_SSH_COMMAND", "GIT_SSH_COMMAND='sh -c x' git fetch", true},
+		{"GIT_PAGER", "GIT_PAGER='sh x' git log", true},
+		{"PAGER", "PAGER=less git log", true},
+		{"EDITOR", "EDITOR=vim git commit", true},
+		{"VISUAL", "VISUAL=vim git commit", true},
+		{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_GLOBAL=$HOME/.gitconfig git log", true},
+		{"export GIT_CONFIG_GLOBAL", "export GIT_CONFIG_GLOBAL=~/.gitconfig; git log", true},
+		{"export -n", "export -n GIT_CONFIG_NOSYSTEM; git log", true},
+		{"declare", "declare -x PAGER=less; git log", true},
+		{"printf -v", "printf -v GIT_PAGER %s less; git log", true},
+		{"default expansion", ": ${GIT_PAGER:=less}; git log", true},
+		{"env assign", "env GIT_CONFIG_COUNT=0 git status", true},
+		{"append assign", "GIT_CONFIG_COUNT+=1 git status", true},
+		{"git-commit with EDITOR", "EDITOR=vi /usr/lib/git-core/git-commit", true},
+		{"git env in bash -c", `bash -c 'GIT_DIR=x git status'`, true},
+		{"sudo git", "sudo git status", true},
+		{"PAGER without git ok", "PAGER=cat man ls", false},
+		{"GIT var without git ok", "GIT_TRACE=1 go test ./...", false},
+		// H2: emptied or unset environment, with or without git.
+		{"env -i", "env -i git status", true},
+		{"env -i no git", "env -i ./run.sh", true},
+		{"env - ", "env - ./run.sh", true},
+		{"env --ignore-environment", "env --ignore-environment ./run.sh", true},
+		{"env -iv", "env -iv ./run.sh", true},
+		{"env -u GIT", "env -u GIT_CONFIG_GLOBAL ./run.sh", true},
+		{"env -uGIT", "env -uGIT_CONFIG_NOSYSTEM ./run.sh", true},
+		{"env --unset=", "env --unset=GIT_CONFIG_COUNT ./run.sh", true},
+		{"env --unset sep", "env --unset PAGER ./run.sh", true},
+		{"env -u other ok", "env -u LANG ./run.sh", false},
+		{"unset GIT", "unset GIT_CONFIG_GLOBAL; ./run.sh", true},
+		{"unset -v EDITOR", "unset -v EDITOR", true},
+		{"unset other ok", "unset FOO", false},
+		{"exec -c", "exec -c ./run.sh", true},
+		// H2: git config / -c allowlist.
+		{"-c core.hooksPath", "git -c core.hooksPath=/tmp/h commit -m x", true},
+		{"-c core.pager", "git -c core.pager='sh x' log", true},
+		{"-c core.sshCommand", "git -c core.sshCommand='sh x' fetch", true},
+		{"-c credential.helper", "git -c credential.helper='!sh x' fetch", true},
+		{"-c diff.external", "git -c diff.external=/tmp/x diff", true},
+		{"-c core.fsmonitor", "git -c core.fsmonitor=/tmp/x status", true},
+		{"-c alias", "git -c alias.x='!sh y' x", true},
+		{"-c include.path", "git -c include.path=/tmp/c log", true},
+		{"-c bare key", "git -c core.hooksPath log", true},
+		{"-c gpgsign ok", "git -c commit.gpgsign=false commit -m x", false},
+		{"-c color ok", "git -c color.ui=never log", false},
+		{"config core.hooksPath", "git config core.hooksPath /tmp/h", true},
+		{"config --local hooksPath", "git config --local core.hooksPath /tmp/h", true},
+		{"config --file hooksPath", "git config --file .git/config core.hooksPath /tmp/h", true},
+		{"config set pager", "git config set core.pager 'sh x'", true},
+		{"config --add credential", "git config --add credential.helper '!sh x'", true},
+		{"config diff.x.textconv", "git config diff.x.textconv /tmp/x", true},
+		{"config filter", "git config filter.x.clean /tmp/x", true},
+		{"config url insteadOf", "git config url.https://evil/.insteadOf https://github.com/", true},
+		{"config rename-section", "git config --rename-section x core", true},
+		{"config gpgsign ok", "git config commit.gpgsign false", false},
+		{"config own identity ok", `git config user.email bot@example.com`, false},
+		{"config foreign identity", `git config user.email evil@example.com`, true},
+		{"config read hooksPath ok", "git config --get core.hooksPath", false},
+		{"config list ok", "git config --list", false},
+
+		// H3: nested agents.
+		{"claude", `claude -p "do it"`, true},
+		{"claude path", `/usr/local/bin/claude -p x`, true},
+		{"claude upper", `CLAUDE -p x`, true},
+		{"env claude", `env FOO=1 claude -p x`, true},
+		{"command claude", `command claude -p x`, true},
+		{"exec claude", `exec claude -p x`, true},
+		{"nohup claude", `nohup claude -p x &`, true},
+		{"codex", `codex exec "fix"`, true},
+		{"gemini", `gemini -p x`, true},
+		{"aider", `aider --yes`, true},
+		{"cursor-agent", `cursor-agent -p x`, true},
+		{"claude in bash -c", `bash -c 'claude -p x'`, true},
+		{"claude in substitution", `echo $(claude -p x)`, true},
+		{"npx claude", `npx claude -p x`, true},
+		{"timeout codex", `timeout 60 codex exec x`, true},
+		{"find -exec claude", `find . -exec claude -p {} \;`, true},
+		{"which claude ok", `which claude`, false},
+		{"grep claude ok", `grep -rn claude docs`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
 	}
 }

@@ -1,17 +1,29 @@
 // Package guard implements the PreToolUse hook that rejects tool calls whose
-// failure would look like success, or that misattribute authorship:
+// failure would look like success, or that misattribute authorship or reach outside the job:
 //   - `$?` read right after a pipeline (it is the status of the last stage only);
 //   - a wait-loop that uses `pgrep -f` (the loop's own shell matches its pattern, so it never ends);
 //   - the owner's name inside a commit;
 //   - a foreign git identity (author/committer other than the configured one);
-//   - anything that goes outside: git push/tag; any gh call except read-only subcommands (view, list,
-//     diff, checks, status …), so PR/issue create/comment/edit/merge/review/close --comment are rejected.
+//   - anything that goes outside: git push/tag/send-pack/http-push; any gh call except read-only
+//     subcommands (view, list, diff, checks, status …), so PR/issue create/comment/edit/merge/review/
+//     close --comment are rejected;
+//   - git configuration that runs programs (hooks, pager, editor, ssh command, credential helper,
+//     external diff, aliases …): `git -c` / `git config` only for an allowlist of harmless keys, and no
+//     change to the git environment the wrapper sets up (GIT_*, PAGER, EDITOR, VISUAL; env -i / -u, unset);
+//   - nested agents (claude, codex, gemini, aider, cursor-agent): a job is a leaf.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
-// spelling variants such as `git -C x 'push'` are still seen. The guard FAILS CLOSED: a form it
-// cannot resolve statically (git/gh inside a substitution, eval or `sh -c`; stdin, here-doc or
-// here-string into git/gh; a command name or git subcommand from a variable; `env -S`; `xargs git`;
-// attached `-cKEY=V` / `-C.`; a shell reading commands from stdin) is rejected, not guessed at.
+// spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
+// seen, and a form the guard cannot resolve statically around git/gh (git/gh inside a substitution,
+// eval or `sh -c`; stdin, here-doc or here-string into git/gh; a command name or git subcommand from a
+// variable or a glob/brace; `env -S`; `xargs git`; attached `-cKEY=V` / `-C.`; a shell reading
+// commands from stdin) is rejected, not guessed at.
+//
+// The guard is NOT a sandbox. It blocks the direct spellings of outward actions in a Bash call, and
+// together with the git environment scrub in the wrapper (own GIT_CONFIG_GLOBAL, no system config,
+// empty hooks dir, cat/true as pager and editor) it keeps git from running programs the guard does
+// not see. A script the job writes and then runs is allowed by design (as in the reference): what
+// such a script does is not inspected.
 package guard
 
 import (
@@ -61,7 +73,8 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNothingOut, checkStatusAfterPipe, checkSelfMatchingWait, checkOwnerInCommit, checkForeignIdentity,
+		checkUnverifiable, checkNestedAgents, checkNothingOut, checkGitEnv, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
 			return r
@@ -97,6 +110,16 @@ type gitCall struct {
 // isProg reports whether argv0 runs the program name (case-insensitive: macOS file systems are).
 func isProg(argv0, name string) bool { return strings.EqualFold(base(argv0), name) }
 
+// isGitName reports a lower-cased base name that runs git: `git` itself or a dashed form such as
+// `git-push` (/usr/lib/git-core/git-push is `git push`).
+func isGitName(name string) bool {
+	return name == "git" || (strings.HasPrefix(name, "git-") && len(name) > 4)
+}
+
+// hasGlob reports a glob or brace character: the shell expands such a word into names the guard
+// does not see (`{git,push}`, `/usr/bin/g[i]t`, `git pu?h` with a file named push).
+func hasGlob(w string) bool { return strings.ContainsAny(w, "{[?*") }
+
 // gitValueOpts are git global options that take a separate value.
 var gitValueOpts = map[string]bool{
 	"-C": true, "-c": true, "--git-dir": true, "--work-tree": true, "--namespace": true,
@@ -105,8 +128,16 @@ var gitValueOpts = map[string]bool{
 
 func parseGit(argv []string) (gitCall, bool) {
 	var g gitCall
-	if len(argv) == 0 || !isProg(argv[0], "git") {
+	if len(argv) == 0 {
 		return g, false
+	}
+	name := strings.ToLower(base(argv[0]))
+	if !isGitName(name) {
+		return g, false
+	}
+	if name != "git" { // git-<sub>: the subcommand is in the program name
+		g.sub, g.subIdx, g.args = name[len("git-"):], 0, argv[1:]
+		return g, true
 	}
 	i := 1
 	for i < len(argv) {
@@ -179,6 +210,25 @@ var indirect = map[string]bool{
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
 }
 
+// agents are coding agents a job must not start: a job is a leaf, nested agents would run outside
+// the job's settings, hook and limits.
+var agents = map[string]bool{"claude": true, "codex": true, "gemini": true, "aider": true, "cursor-agent": true}
+
+// execName reports a lower-cased base name that, as an argument, names something that runs commands
+// the guard would not see: git (any git-<sub>), gh, a shell, a wrapper/indirect program or an agent.
+func execName(b string) bool { return indirect[b] || shells[b] || agents[b] || isGitName(b) }
+
+// mentionsExec reports a word (e.g. a substitution `$(which git)`) that names an execName program.
+func mentionsExec(w string) bool {
+	return slices.ContainsFunc(strings.FieldsFunc(strings.ToLower(w), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_')
+	}), execName)
+}
+
+// copiers place a file at another name; with git/gh/a shell/an agent as an argument they make a
+// renamed executable (`cp /usr/bin/git ./x; ./x push`), so such a call is not data.
+var copiers = map[string]bool{"cp": true, "mv": true, "install": true, "ln": true}
+
 // dataReaders only print, match, inspect or move files named by their arguments: a word "git"
 // there is data. Every program NOT positively classified as data-only (here, dataSubcommands or a
 // python script file) has its arguments scanned, and a git/gh/shell word among them is rejected
@@ -188,7 +238,7 @@ var dataReaders = map[string]bool{
 	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "cat": true,
 	"ls": true, "head": true, "tail": true, "wc": true, "file": true, "stat": true, "which": true,
 	"type": true, "whereis": true, "man": true, "test": true, "[": true, "cd": true, "pgrep": true,
-	"ps": true, "mkdir": true, "touch": true, "cp": true, "mv": true, "rm": true, "find": true,
+	"ps": true, "mkdir": true, "touch": true, "rm": true, "find": true,
 }
 
 // dataSubcommands are package managers whose listed subcommands only take package names.
@@ -208,6 +258,13 @@ var findExec = map[string]bool{"-exec": true, "-execdir": true, "-ok": true, "-o
 // its arguments as data only.
 func dataOnly(name string, args []string, dyn []bool) bool {
 	switch {
+	case copiers[name]:
+		for k, a := range args {
+			if !strings.HasPrefix(a, "-") && (execName(strings.ToLower(base(a))) || (dyn[k] && mentionsExec(a))) {
+				return false
+			}
+		}
+		return true
 	case name == "find":
 		return !slices.ContainsFunc(args, func(a string) bool { return findExec[a] })
 	case name == "rg": // --pre runs a command on every file
@@ -262,7 +319,10 @@ func pythonScriptFile(args []string, dyn []bool) bool {
 	return false
 }
 
-var reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh)($|[^a-z0-9_-])`)
+var (
+	reMention    = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh)($|[^a-z0-9_-])`)
+	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
+)
 
 // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
 func checkUnverifiable(scripts []*script, _ string, _ Config) string {
@@ -291,7 +351,10 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if dyn[0] {
 		return cannot("command name from a variable or substitution")
 	}
-	if name == "git" || name == "gh" {
+	if hasGlob(argv[0]) && argv[0] != "[" && argv[0] != "[[" {
+		return cannot("glob/brace in command name " + argv[0])
+	}
+	if isGitName(name) || name == "gh" {
 		switch {
 		case sc.depth > 0:
 			return cannot(name + " inside a substitution, eval or sh -c")
@@ -300,8 +363,13 @@ func unverifiable(sc *script, c *simpleCmd) string {
 		case slices.Contains(v.wrappers, "xargs"):
 			return cannot("xargs " + name)
 		}
-		if name == "git" {
+		if name != "gh" {
 			g, _ := parseGit(argv)
+			for k := 1; k <= g.subIdx && k < len(argv); k++ {
+				if hasGlob(argv[k]) {
+					return cannot("glob/brace in a git option or subcommand: " + argv[k])
+				}
+			}
 			if g.attached != "" {
 				return cannot("attached git option " + g.attached)
 			}
@@ -318,6 +386,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 		for _, k := range ghPositional(argv) {
 			if dyn[k] {
 				return cannot("gh subcommand from a variable")
+			}
+			if hasGlob(argv[k]) {
+				return cannot("glob/brace in a gh subcommand: " + argv[k])
 			}
 		}
 		return ""
@@ -365,9 +436,85 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	// Any other program (find -exec, flock, trap 'git push' EXIT, python -c, awk system(), vim -c '!…',
 	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
 	// arguments is rejected.
-	for _, a := range argv[1:] {
-		if b := strings.ToLower(base(a)); indirect[b] || shells[b] || reMention.MatchString(a) {
-			return cannot(name + " running git/gh or a shell indirectly")
+	for k, a := range argv[1:] {
+		if b := strings.ToLower(base(a)); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
+			(dyn[k+1] && mentionsExec(a)) {
+			return cannot(name + " running git/gh, a shell or an agent indirectly")
+		}
+	}
+	return ""
+}
+
+// checkNestedAgents: a job is a leaf. claude/codex/gemini/aider/cursor-agent are rejected as a
+// command (also behind env/command/exec and as a path); as an argument they are caught by the
+// indirect scan in unverifiable.
+func checkNestedAgents(scripts []*script, _ string, _ Config) string {
+	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		if len(argv) > 0 && agents[strings.ToLower(base(argv[0]))] {
+			return "blocked by guard: `" + base(argv[0]) + "` starts a nested agent. A job is a leaf: it does the work itself " +
+				"and reports; only the orchestrator starts jobs."
+		}
+		return ""
+	})
+}
+
+var (
+	// scrubbed are the variables the wrapper sets for git (GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM,
+	// GIT_CONFIG_COUNT/KEY/VALUE for core.hooksPath, GIT_PAGER, GIT_EDITOR, GIT_TERMINAL_PROMPT, PAGER,
+	// EDITOR, VISUAL) or that redirect git (GIT_DIR, GIT_EXEC_PATH, GIT_SSH_COMMAND, …).
+	reScrubVar    = regexp.MustCompile(`^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL)$`)
+	reScrubAssign = regexp.MustCompile(`^(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL)\+?=`)
+	reScrubExpand = regexp.MustCompile(`\$\{(GIT_[A-Za-z0-9_]*|PAGER|EDITOR|VISUAL):?=`)
+)
+
+func envBlocked(what string) string {
+	return "blocked by guard: `" + what + "` changes the git environment the job runs with (own config, no hooks, " +
+		"cat/true as pager and editor). Run git with the environment unchanged."
+}
+
+// checkGitEnv keeps the wrapper's git environment intact: an emptied environment (`env -i`, `env -`,
+// `exec -c`) or an unset scrubbed variable (`env -u`, `unset`) is always rejected; in a call that runs
+// git, any assignment to or mention of a scrubbed variable (prefix, env, export, declare, read,
+// printf -v, ${VAR:=…}) and sudo/doas (environment reset) are rejected too.
+func checkGitEnv(scripts []*script, _ string, _ Config) string {
+	runsGit := false
+	_ = eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		runsGit = runsGit || (len(argv) > 0 && isGitName(strings.ToLower(base(argv[0]))))
+		return ""
+	})
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				v := split(c.words)
+				if v.envClear {
+					return envBlocked("env -i / env - / exec -c")
+				}
+				for _, u := range v.envUnset {
+					if reScrubVar.MatchString(u) {
+						return envBlocked("env -u " + u)
+					}
+				}
+				argv := c.words[v.start:]
+				if len(argv) > 0 && strings.ToLower(base(argv[0])) == "unset" {
+					for _, a := range argv[1:] {
+						if reScrubVar.MatchString(a) {
+							return envBlocked("unset " + a)
+						}
+					}
+				}
+				if !runsGit {
+					continue
+				}
+				if slices.Contains(v.wrappers, "sudo") || slices.Contains(v.wrappers, "doas") {
+					return envBlocked("sudo/doas (resets the environment)")
+				}
+				for _, w := range c.words {
+					if reScrubAssign.MatchString(w) || reScrubVar.MatchString(w) || reScrubExpand.MatchString(w) {
+						name, _, _ := strings.Cut(w, "=")
+						return envBlocked(name)
+					}
+				}
+			}
 		}
 	}
 	return ""
@@ -403,25 +550,59 @@ func ghAllowed(group, sub string) bool {
 	return subs == nil || subs[sub]
 }
 
+func gitConfigBlocked(what string) string {
+	return "blocked by guard: `git " + what + "` is not on the allowlist of harmless git config keys " +
+		"(git may run programs from config: hooks, pager, editor, ssh, credential helper, external diff, aliases)."
+}
+
 func outside(what string) string {
 	return "blocked by guard: `" + what + "` reaches outside the job. A job commits locally only; " +
 		"the orchestrator publishes after reading the report and the diff."
+}
+
+// gitOutside are git subcommands that publish or reach another repository.
+var gitOutside = map[string]bool{"push": true, "tag": true, "send-pack": true, "http-push": true}
+
+// gitConfigSafe are the git config keys a job may set (`git -c`, `git config`): none of them makes
+// git run a program. Everything else is rejected (fail closed): core.hooksPath, core.pager,
+// core.editor, core.sshCommand, core.fsmonitor, credential.*, diff.external, *.textconv, filter.*,
+// alias.*, include.*, url.* … Identity keys are allowed for `git config` only with the configured
+// value (checkForeignIdentity); via `-c` they are rejected: the job's identity comes from the
+// wrapper's GIT_CONFIG_GLOBAL.
+var gitConfigSafe = map[string]bool{
+	"user.name": true, "user.email": true, "commit.gpgsign": true, "commit.verbose": true, "commit.cleanup": true,
+	"core.autocrlf": true, "core.safecrlf": true, "core.filemode": true, "core.quotepath": true,
+	"color.ui": true, "diff.renames": true, "diff.algorithm": true, "diff.context": true, "diff.noprefix": true,
+	"merge.conflictstyle": true, "rerere.enabled": true, "init.defaultbranch": true, "log.date": true,
+	"status.short": true, "status.showuntrackedfiles": true, "advice.detachedhead": true,
+}
+
+func configKey(kv string) string {
+	k, _, _ := strings.Cut(kv, "=")
+	return strings.ToLower(strings.TrimSpace(k))
 }
 
 func checkNothingOut(scripts []*script, _ string, _ Config) string {
 	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
 		if g, ok := parseGit(argv); ok {
 			for _, kv := range g.configs {
-				if strings.HasPrefix(strings.ToLower(kv), "alias.") {
-					return outside("git -c alias.*")
+				k := configKey(kv)
+				if identityField(k) != "" {
+					return foreign("-c " + k + "; the job identity is set by the wrapper")
+				}
+				if !gitConfigSafe[k] {
+					return gitConfigBlocked("-c " + k)
 				}
 			}
-			switch g.sub {
-			case "push", "tag":
+			if gitOutside[g.sub] {
 				return outside("git " + g.sub)
-			case "config":
-				if k, _, set := gitConfigWrite(g.args); set && strings.HasPrefix(k, "alias.") {
-					return outside("git config alias.*")
+			}
+			if g.sub == "config" {
+				if slices.Contains(g.args, "--rename-section") || slices.Contains(g.args, "rename-section") {
+					return gitConfigBlocked("config rename-section")
+				}
+				if k, _, set := gitConfigWrite(g.args); set && !gitConfigSafe[k] {
+					return gitConfigBlocked("config " + k)
 				}
 			}
 			return ""
@@ -823,12 +1004,6 @@ func checkForeignIdentity(scripts []*script, _ string, cfg Config) string {
 		g, ok := parseGit(argv)
 		if !ok {
 			return ""
-		}
-		for _, kv := range g.configs {
-			k, v, _ := strings.Cut(kv, "=")
-			if f := identityField(k); f != "" && !allowedValue(f, v, cfg) {
-				return foreign("-c " + k)
-			}
 		}
 		switch g.sub {
 		case "config":
