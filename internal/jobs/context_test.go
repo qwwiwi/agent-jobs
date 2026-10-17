@@ -58,9 +58,17 @@ func runHook(t *testing.T, command string, payload map[string]any) int {
 // into settings.json holds the cap and keeps refusing job control.
 func TestJobBriefAndLaunchCarrySubagentRules(t *testing.T) {
 	m := newManager(t)
-	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
-	if j.Status != store.StatusSucceeded {
-		t.Fatalf("job %s: %q", j.Status, j.Error)
+	// Two running jobs: the counter lives in the running row.
+	j := enqueue(t, m, "x FAKE_SLEEP=30", nil)
+	j2 := enqueue(t, m, "y FAKE_SLEEP=30", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Cancel(j.ID); _ = m.Cancel(j2.ID) })
+	for _, id := range []string{j.ID, j2.ID} {
+		if got := get(t, m, id); got.Status != store.StatusRunning {
+			t.Fatalf("job %s: %s %q", id, got.Status, got.Error)
+		}
 	}
 	dir := m.JobDir(j.ID)
 	prompt, _ := os.ReadFile(filepath.Join(dir, "prompt.md"))
@@ -94,8 +102,40 @@ func TestJobBriefAndLaunchCarrySubagentRules(t *testing.T) {
 	if code := runHook(t, cmd, agent); code != 2 {
 		t.Fatalf("fourth subagent: exit %d, want 2", code)
 	}
+	if n, err := m.Store.SubagentCount(j.ID); err != nil || n != 3 {
+		t.Fatalf("store counter = %d, %v; want 3", n, err)
+	}
+	// H1: shortening the log (as a script the job runs could) does not reset the cap: the store's
+	// monotonic counter still says 3, and the shortened log is reported as tampering.
+	if err := os.WriteFile(m.SubagentLogPath(j.ID), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := runHook(t, cmd, agent); code != 2 {
+		t.Fatalf("subagent after truncating the log: exit %d, want 2", code)
+	}
+	// H1: the job cannot write its subagent log or the job database with file tools or Bash.
+	logPath := m.SubagentLogPath(j.ID)
+	db := filepath.Join(m.StateDir, "jobs.db")
+	for _, tool := range []string{"Write", "Edit", "MultiEdit", "NotebookEdit"} {
+		key := "file_path"
+		if tool == "NotebookEdit" {
+			key = "notebook_path"
+		}
+		for _, p := range []string{logPath, db} {
+			if code := runHook(t, cmd, map[string]any{"tool_name": tool, "cwd": dir, "tool_input": map[string]any{key: p}}); code != 2 {
+				t.Errorf("%s %s: exit %d, want 2", tool, p, code)
+			}
+		}
+	}
+	for _, c := range []string{
+		": > " + shellQuote(logPath), "rm -f " + shellQuote(logPath), "truncate -s 0 " + shellQuote(logPath),
+		"sqlite3 " + shellQuote(db) + " 'update jobs set subagents=0'", "cp /dev/null " + shellQuote(db),
+	} {
+		if code := runHook(t, cmd, map[string]any{"tool_name": "Bash", "cwd": dir, "tool_input": map[string]any{"command": c}}); code != 2 {
+			t.Errorf("%q: exit %d, want 2", c, code)
+		}
+	}
 	// A second job has its own count.
-	j2 := runToEnd(t, m, enqueue(t, m, "y", nil).ID)
 	cmd2, _ := hookCommand(t, m.JobDir(j2.ID))
 	if code := runHook(t, cmd2, agent); code != 0 {
 		t.Fatalf("other job's first subagent: exit %d, want 0", code)
@@ -216,25 +256,61 @@ func TestWriteProfileIntoBrief(t *testing.T) {
 	}
 }
 
-func TestNormalizeRemote(t *testing.T) {
+// Network and local remotes are different identities; local paths keep their case and resolve
+// against the repository; host case and URL spelling do not matter for network remotes.
+func TestRemoteIdentity(t *testing.T) {
+	base := "/work/repo"
 	for in, want := range map[string]string{
-		"https://github.com/Owner/Repo.git":      "github.com/owner/repo",
-		"https://user@github.com:443/O/R/":       "github.com/o/r",
-		"git@github.com:O/R.git":                 "github.com/o/r",
-		"ssh://git@github.com/O/R":               "github.com/o/r",
-		"github.com/O/R":                         "github.com/o/r",
-		"/srv/git/project.git":                   "/srv/git/project",
-		"  https://gitlab.example.com/g/s/p  \n": "gitlab.example.com/g/s/p",
+		"https://github.com/Owner/Repo.git":    "net:github.com/Owner/Repo",
+		"https://user@GitHub.com:443/O/R/":     "net:github.com/O/R",
+		"git@github.com:O/R.git":               "net:github.com/O/R",
+		"ssh://git@github.com:22/O/R":          "net:github.com/O/R",
+		"/srv/git/Repo.git":                    "local:/srv/git/Repo.git",
+		"/srv/git/repo.git":                    "local:/srv/git/repo.git",
+		"file:///srv/git/Repo.git":             "local:/srv/git/Repo.git",
+		"github.com/o/r.git":                   "local:/work/repo/github.com/o/r.git",
+		"../up":                                "local:/work/up",
+		"  https://gitlab.example.com/g/s/p  ": "net:gitlab.example.com/g/s/p",
 	} {
-		if got := NormalizeRemote(in); got != want {
-			t.Errorf("NormalizeRemote(%q) = %q, want %q", in, got, want)
+		if got, err := RemoteIdentity(in, base); err != nil || got != want {
+			t.Errorf("RemoteIdentity(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	net, _ := RemoteIdentity("https://github.com/o/r.git", base)
+	loc, _ := RemoteIdentity("github.com/o/r.git", base)
+	if net == loc {
+		t.Fatal("a relative local remote collides with the network repository")
+	}
+	a, _ := RemoteIdentity("/srv/Repo.git", base)
+	b, _ := RemoteIdentity("/srv/repo.git", base)
+	if a == b {
+		t.Fatal("local paths that differ in case collide")
+	}
+	for _, bad := range []string{"", "https://x.com/o/r\nrepo: /etc", "git@h:o/r\r"} {
+		if _, err := RemoteIdentity(bad, base); err == nil {
+			t.Errorf("RemoteIdentity(%q) accepted", bad)
+		}
+	}
+	// Card side: the host/owner/name shorthand is a network repository.
+	for in, want := range map[string]string{
+		"github.com/qwwiwi/agent-jobs":         "net:github.com/qwwiwi/agent-jobs",
+		"https://github.com/qwwiwi/agent-jobs": "net:github.com/qwwiwi/agent-jobs",
+		"/srv/git/Repo.git":                    "local:/srv/git/Repo.git",
+	} {
+		if got, err := CardRemoteIdentity(in); err != nil || got != want {
+			t.Errorf("CardRemoteIdentity(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"relative/path", "noslash", "github.com/o/r\u2028x"} {
+		if _, err := CardRemoteIdentity(bad); err == nil {
+			t.Errorf("CardRemoteIdentity(%q) accepted", bad)
 		}
 	}
 }
 
 func TestParseCard(t *testing.T) {
 	c, err := ParseCard("p", []byte("---\nrepo: /src/p\nremote: git@github.com:O/P.git\n---\n# P\n\n## Stack\n- Go\n"))
-	if err != nil || len(c.Repos) != 1 || c.Remotes[0] != "github.com/o/p" || !strings.HasPrefix(c.Body, "# P") {
+	if err != nil || len(c.Repos) != 1 || c.Remotes[0] != "net:github.com/O/P" || !strings.HasPrefix(c.Body, "# P") {
 		t.Fatalf("ParseCard = %+v, %v", c, err)
 	}
 	for name, s := range map[string]string{
@@ -244,6 +320,9 @@ func TestParseCard(t *testing.T) {
 		"relative repo":   "---\nrepo: src/p\n---\n# P\n",
 		"unknown key":     "---\nrepo: /x\nowner: me\n---\n# P\n",
 		"empty body":      "---\nrepo: /x\n---\n\n",
+		"CR in selector":  "---\nrepo: /x\rremote: github.com/e/vil\n---\n# P\n",
+		"tab in selector": "---\nrepo:\t/x\n---\n# P\n",
+		"bidi in remote":  "---\nremote: github.com/o/\u202er\n---\n# P\n",
 	} {
 		if _, err := ParseCard("p", []byte(s)); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -264,7 +343,7 @@ func TestShippedCards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Matches("/nowhere", []string{NormalizeRemote("https://github.com/qwwiwi/agent-jobs.git")}) {
+	if !c.Matches("/nowhere", []string{mustIdentity(t, "https://github.com/qwwiwi/agent-jobs.git")}) {
 		t.Fatal("example card does not match its own repository")
 	}
 	for _, sec := range []string{"## Stack", "## Check runner", "## Do not touch", "## Known traps"} {
@@ -286,7 +365,7 @@ func TestProjectCardsAttachedToMatchingRepo(t *testing.T) {
 		t.Fatal("NewCard overwrote an existing card")
 	}
 	card, _ := os.ReadFile(p)
-	if !strings.Contains(string(card), "remote: github.com/org/project") || !strings.Contains(string(card), "## Known traps") {
+	if !strings.Contains(string(card), "remote: github.com/Org/Project\n") || !strings.Contains(string(card), "## Known traps") {
 		t.Fatalf("new card:\n%s", card)
 	}
 	if err := os.WriteFile(p, bytes.Replace(card, []byte("## Known traps"), []byte("## Known traps\n- CARD_MARKER_BY_REPO"), 1), 0o600); err != nil {
@@ -294,7 +373,7 @@ func TestProjectCardsAttachedToMatchingRepo(t *testing.T) {
 	}
 	// A card that matches by remote only, and one for another project.
 	other := filepath.Join(m.CardsDir(), "remote-only.md")
-	if err := os.WriteFile(other, []byte("---\nremote: https://github.com/org/project\n---\n- CARD_MARKER_BY_REMOTE\n"), 0o600); err != nil {
+	if err := os.WriteFile(other, []byte("---\nremote: https://github.com/Org/Project\n---\n- CARD_MARKER_BY_REMOTE\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(m.CardsDir(), "unrelated.md"), []byte("---\nremote: github.com/org/else\nrepo: /elsewhere\n---\n- CARD_MARKER_UNRELATED\n"), 0o600); err != nil {
@@ -383,5 +462,115 @@ func TestContextCLI(t *testing.T) {
 		if out, err := run([]string{JobEnvVar + "=some-job"}, args...); err == nil || !strings.Contains(out, "refused") {
 			t.Errorf("%v inside a job: err=%v\n%s", args, err, out)
 		}
+	}
+}
+
+func mustIdentity(t *testing.T, u string) string {
+	t.Helper()
+	id, err := RemoteIdentity(u, "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// M3: an origin with CR/LF cannot inject a second front matter selector into a new card.
+func TestNewCardRejectsControlCharsInOrigin(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	gitT(t, repo, "config", "remote.origin.url", "https://github.com/o/r\nrepo: /")
+	if p, err := m.NewCard(repo, "evil"); err == nil {
+		b, _ := os.ReadFile(p)
+		t.Fatalf("card written from a CR/LF origin:\n%s", b)
+	}
+	if _, err := os.Stat(filepath.Join(m.CardsDir(), "evil.md")); !os.IsNotExist(err) {
+		t.Fatal("card file exists after the refusal")
+	}
+	// A plain origin is written as the shorthand and parses back to the same identity.
+	gitT(t, repo, "config", "remote.origin.url", "git@github.com:Org/Proj.git")
+	p, err := m.NewCard(repo, "ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if !strings.Contains(string(b), "remote: github.com/Org/Proj\n") {
+		t.Fatalf("card:\n%s", b)
+	}
+}
+
+// M4: a card that is a symlink (also one pointing outside the cards dir) or not a regular file is
+// refused, never followed.
+func TestCardSymlinkAndNonRegularRefused(t *testing.T) {
+	m := newManager(t)
+	if err := os.MkdirAll(m.CardsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.md")
+	if err := os.WriteFile(outside, []byte("---\nrepo: /x\n---\n- SECRET\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(m.CardsDir(), "link.md")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.LoadCards(); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked card: %v", err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(m.CardsDir(), "dir.md"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.LoadCards(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory card: %v", err)
+	}
+}
+
+// M5: one card may be exactly MaxCardBytes, not one byte more; the brief section of all matching
+// cards (headings and separators included) may be exactly MaxCardsPerJobBytes, not one byte more.
+func TestCardSizeLimitsExact(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	if err := os.MkdirAll(m.CardsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	front := "---\nrepo: " + repo + "\n---\n"
+	writeCard := func(name string, size int) {
+		t.Helper()
+		body := strings.Repeat("b", size-len(front))
+		if err := os.WriteFile(filepath.Join(m.CardsDir(), name+".md"), []byte(front+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCard("one", MaxCardBytes)
+	if _, err := m.LoadCards(); err != nil {
+		t.Fatalf("card of exactly %d bytes: %v", MaxCardBytes, err)
+	}
+	writeCard("one", MaxCardBytes+1)
+	if _, err := m.LoadCards(); err == nil || !strings.Contains(err.Error(), "limit is 4096") {
+		t.Fatalf("card of %d bytes: %v", MaxCardBytes+1, err)
+	}
+	// Three cards whose rendered section is exactly the aggregate limit.
+	rendered := func(name string, body int) int { return len("## Project card: "+name+"\n\n") + body + 2 }
+	b1 := MaxCardBytes - len(front)
+	b2 := b1
+	b3 := MaxCardsPerJobBytes - rendered("c1", b1) - rendered("c2", b2) - rendered("c3", 0)
+	if b3 <= 0 {
+		t.Fatalf("test setup: b3=%d", b3)
+	}
+	if err := os.Remove(filepath.Join(m.CardsDir(), "one.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeCard("c1", len(front)+b1)
+	writeCard("c2", len(front)+b2)
+	writeCard("c3", len(front)+b3)
+	cards, err := m.CardsFor(repo)
+	if err != nil || len(RenderCards(cards)) != MaxCardsPerJobBytes {
+		t.Fatalf("aggregate of exactly %d: %d bytes, %v", MaxCardsPerJobBytes, len(RenderCards(cards)), err)
+	}
+	writeCard("c3", len(front)+b3+1)
+	if _, err := m.CardsFor(repo); err == nil || !strings.Contains(err.Error(), "limit is 8192") {
+		t.Fatalf("aggregate of %d: %v", MaxCardsPerJobBytes+1, err)
 	}
 }

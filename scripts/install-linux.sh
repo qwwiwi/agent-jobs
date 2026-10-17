@@ -15,12 +15,14 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: install-linux.sh --instance AGENT [--binary PATH] [--skills-dir DIR | --no-skill] [--uninstall]
+usage: install-linux.sh --instance AGENT [--binary PATH] [--skills-dir DIR | --no-skill] [--force-skill] [--uninstall]
   --instance AGENT  agent name = systemd instance (agent-jobs@AGENT); default $AGENT_JOBS_AGENT
   --binary PATH     install this prebuilt binary instead of building from the repo
   --skills-dir DIR  the agent's Claude Code skills dir; the agent-jobs skill goes to DIR/agent-jobs/SKILL.md
                     (default ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills)
   --no-skill        do not install (or remove) the agent-jobs skill
+  --force-skill     replace a SKILL.md that differs from what this installer last wrote (edited
+                    locally); the old file is kept as SKILL.md.bak.<time>
   --uninstall       stop + disable agent-jobs@AGENT; remove the unit template and the binary
                     when no other agent-jobs@ instance is enabled (state and env file are kept)
 USAGE
@@ -31,6 +33,7 @@ BINARY=""
 UNINSTALL=0
 SKILLS_DIR=""
 NO_SKILL=0
+FORCE_SKILL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --instance) [ $# -ge 2 ] || { usage >&2; exit 2; }; INSTANCE="$2"; shift 2 ;;
@@ -40,6 +43,7 @@ while [ $# -gt 0 ]; do
     --skills-dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; SKILLS_DIR="$2"; shift 2 ;;
     --skills-dir=*) SKILLS_DIR="${1#*=}"; shift ;;
     --no-skill) NO_SKILL=1; shift ;;
+    --force-skill) FORCE_SKILL=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install-linux: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -71,10 +75,45 @@ ENV_DIR="$CONFIG_HOME/agent-jobs"
 ENV_FILE="$ENV_DIR/$INSTANCE.env"
 UNIT="agent-jobs@$INSTANCE.service"
 SYSTEMCTL="${AGENT_JOBS_SYSTEMCTL:-systemctl}"
-SKILLS_EXPLICIT=0
-if [ -n "$SKILLS_DIR" ]; then SKILLS_EXPLICIT=1; else SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"; fi
+[ -n "$SKILLS_DIR" ] || SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 SKILL_SRC="$REPO_ROOT/skills/agent-jobs/SKILL.md"
-SKILL_DST="$SKILLS_DIR/agent-jobs/SKILL.md"
+# Ownership of the installed skill is tracked by its canonical directory, one record per instance
+# ($ENV_DIR/<instance>.skill); the destination's .installed-sha256 is the hash this installer wrote.
+SKILL_RECORD="$ENV_DIR/$INSTANCE.skill"
+set_skill_paths() {
+  SKILL_DIR="$(realpath -m -- "$1")"
+  SKILL_DST="$SKILL_DIR/SKILL.md"
+  SKILL_HASH="$SKILL_DIR/.installed-sha256"
+}
+set_skill_paths "$SKILLS_DIR/agent-jobs"
+
+sha256() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# refuse_skill_alias: the destination must never be the repository's own skill (a --skills-dir of
+# "$REPO_ROOT/skills" would make uninstall delete the tracked source).
+refuse_skill_alias() {
+  local src_dir
+  src_dir="$(realpath -m -- "$(dirname "$SKILL_SRC")")"
+  if [ "$SKILL_DIR" = "$src_dir" ] || [ "$(realpath -m -- "$SKILL_DST")" = "$(realpath -m -- "$SKILL_SRC")" ]; then
+    echo "install-linux: skill destination $SKILL_DIR is the repository's own skill; choose another --skills-dir" >&2
+    exit 2
+  fi
+}
+
+# skill_ours: the destination is what this installer wrote (recorded hash) or the shipped file.
+skill_ours() {
+  { [ -f "$SKILL_HASH" ] && [ "$(sha256 "$SKILL_DST")" = "$(cat "$SKILL_HASH")" ]; } ||
+    { [ -f "$SKILL_SRC" ] && cmp -s "$SKILL_SRC" "$SKILL_DST"; }
+}
+
+# skill_users prints the other instances whose record names the same canonical skill directory.
+skill_users() {
+  local f
+  for f in "$ENV_DIR"/*.skill; do
+    [ -f "$f" ] && [ "$f" != "$SKILL_RECORD" ] || continue
+    if [ "$(cat "$f")" = "$SKILL_DIR" ]; then basename "$f" .skill; fi
+  done | tr '\n' ' '
+}
 
 # systemctl --user needs the user manager's bus; non-login shells (tmux, ssh -c) often lack it.
 if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
@@ -129,20 +168,26 @@ if [ "$UNINSTALL" = 1 ]; then
   sc disable --now "$UNIT" || echo "  (unit was not enabled/active)"
   others="$(other_instances)"
   rc=0
-  # The skill is per agent: removed with an explicit --skills-dir, or from the shared default dir when
-  # no other instance is left; only when it is still the shipped file (a local edit is kept).
+  # The skill this instance installed (its record; else the given/default dir) is removed when no
+  # other instance records the same directory and it is still what this installer wrote.
   if [ "$NO_SKILL" = 1 ]; then
     echo "  skill: left as is (--no-skill)"
-  elif [ ! -f "$SKILL_DST" ]; then
-    :
-  elif [ "$SKILLS_EXPLICIT" = 0 ] && [ -n "$others" ]; then
-    echo "  skill: other instances still enabled or active: keeping $SKILL_DST"
-  elif [ -f "$SKILL_SRC" ] && cmp -s "$SKILL_SRC" "$SKILL_DST"; then
-    rm -f "$SKILL_DST"
-    rmdir "$(dirname "$SKILL_DST")" 2>/dev/null || true
-    echo "  removed $SKILL_DST"
   else
-    echo "  skill: $SKILL_DST differs from the shipped one: kept"
+    if [ -f "$SKILL_RECORD" ]; then set_skill_paths "$(cat "$SKILL_RECORD")"; fi
+    refuse_skill_alias
+    users="$(skill_users)"
+    if [ ! -f "$SKILL_DST" ]; then
+      :
+    elif [ -n "$users" ]; then
+      echo "  skill: also installed for $users: keeping $SKILL_DST"
+    elif skill_ours; then
+      rm -f "$SKILL_DST" "$SKILL_HASH"
+      rmdir "$SKILL_DIR" 2>/dev/null || true
+      echo "  removed $SKILL_DST"
+    else
+      echo "  skill: $SKILL_DST differs from what this installer wrote (edited locally?): kept"
+    fi
+    rm -f "$SKILL_RECORD"
   fi
   if [ -n "$others" ]; then
     echo "  other instances still enabled or active ($others): keeping $UNIT_DST and $BIN"
@@ -220,20 +265,43 @@ fi
 
 echo "== skill $SKILL_DST"
 # Installed per agent: teaches the MCP tools and when to do work yourself, use a subagent or start a job.
-# Shipped file, rewritten when it changes (like orchestrator.md); never needs a daemon restart.
+# Updated automatically only while the destination is still what this installer wrote (its recorded
+# hash); a locally edited SKILL.md is left alone unless --force-skill (then backed up). Never needs a
+# daemon restart.
 if [ "$NO_SKILL" = 1 ]; then
   echo "  skipped (--no-skill)"
 elif [ ! -f "$SKILL_SRC" ]; then
   echo "install-linux: skill not found: $SKILL_SRC" >&2
   exit 1
-elif [ -f "$SKILL_DST" ] && cmp -s "$SKILL_SRC" "$SKILL_DST"; then
-  echo "  unchanged"
 else
-  mkdir -p "$(dirname "$SKILL_DST")"
-  stmp="$SKILL_DST.new.$$"
-  install -m 0644 "$SKILL_SRC" "$stmp"
-  mv -f "$stmp" "$SKILL_DST"
-  echo "  installed"
+  refuse_skill_alias
+  write_skill() {
+    mkdir -p "$SKILL_DIR"
+    stmp="$SKILL_DST.new.$$"
+    install -m 0644 "$SKILL_SRC" "$stmp"
+    mv -f "$stmp" "$SKILL_DST"
+  }
+  if [ ! -e "$SKILL_DST" ]; then
+    write_skill
+    echo "  installed"
+  elif cmp -s "$SKILL_SRC" "$SKILL_DST"; then
+    echo "  unchanged"
+  elif skill_ours; then
+    write_skill
+    echo "  updated"
+  elif [ "$FORCE_SKILL" = 1 ]; then
+    bak="$SKILL_DST.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -p -- "$SKILL_DST" "$bak"
+    write_skill
+    echo "  replaced (--force-skill); the previous file is $bak"
+  else
+    echo "  NOTICE: $SKILL_DST differs from what this installer last wrote (edited locally?): left as is;" >&2
+    echo "          rerun with --force-skill to replace it (the old file is backed up)" >&2
+  fi
+  if cmp -s "$SKILL_SRC" "$SKILL_DST"; then
+    sha256 "$SKILL_DST" >"$SKILL_HASH"
+  fi
+  printf '%s\n' "$SKILL_DIR" >"$SKILL_RECORD"
 fi
 
 echo "== env file $ENV_FILE"

@@ -87,51 +87,57 @@ func CheckSubagent(raw json.RawMessage, cfg Config) string {
 	if cfg.SubagentLog == "" {
 		return "agent-jobs guard: subagents are not counted for this call (no job subagent log), so none may start"
 	}
-	n, err := reserveSubagent(cfg.SubagentLog, in["subagent_type"], in["description"])
+	return reserveSubagent(cfg, in["subagent_type"], in["description"])
+}
+
+// reserveSubagent decides one subagent under an exclusive lock on the job's subagent log, so the
+// parallel calls of one message are serialized. The cap is held by the monotonic counter in the job's
+// store row (cfg.SubagentReserve, an UPDATE that only ever increments) when it is configured, else by
+// the log's line count. The log must never be shorter than the counter: a log the job truncated or
+// rewrote refuses every further subagent (tampering), and the log is also one of the guard's
+// protected paths (file tools and literal Bash targets cannot write it).
+func reserveSubagent(cfg Config, typ, desc string) string {
+	f, err := os.OpenFile(cfg.SubagentLog, os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return "agent-jobs guard: subagent log: " + err.Error()
 	}
-	if n > MaxSubagentsPerJob {
-		return fmt.Sprintf("agent-jobs guard: at most %d subagents per job, all %d are used; do the rest yourself",
-			MaxSubagentsPerJob, MaxSubagentsPerJob)
-	}
-	return ""
-}
-
-// reserveSubagent counts the subagents already recorded in path and, below the cap, records one more.
-// It returns the number this call would be (cap+1 = refused, nothing recorded). The file is locked,
-// so parallel calls of one message cannot pass the cap together.
-func reserveSubagent(path, typ, desc string) (int, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return 0, err
-	}
 	defer f.Close()
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return 0, fmt.Errorf("%s is not a regular file", path)
+		return "agent-jobs guard: subagent log " + cfg.SubagentLog + " is not a regular file"
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return 0, err
+		return "agent-jobs guard: subagent log: " + err.Error()
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // released on close anyway
-	n := 0
+	lines := 0
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		if strings.TrimSpace(sc.Text()) != "" {
-			n++
+			lines++
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return 0, err
+		return "agent-jobs guard: subagent log: " + err.Error()
 	}
-	if n >= MaxSubagentsPerJob {
-		return n + 1, nil
+	prev, allowed := lines, lines < MaxSubagentsPerJob
+	if cfg.SubagentReserve != nil {
+		if prev, allowed, err = cfg.SubagentReserve(MaxSubagentsPerJob); err != nil {
+			return "agent-jobs guard: subagent counter: " + err.Error()
+		}
+		if lines < prev {
+			return fmt.Sprintf("agent-jobs guard: the subagent log has %d entries but %d subagents were started: "+
+				"it was shortened, so no more subagents start in this job", lines, prev)
+		}
+	}
+	if !allowed {
+		return fmt.Sprintf("agent-jobs guard: at most %d subagents per job, all %d are used; do the rest yourself",
+			MaxSubagentsPerJob, MaxSubagentsPerJob)
 	}
 	line := fmt.Sprintf("%s\t%s\t%s\n", time.Now().UTC().Format(time.RFC3339), oneLine(typ), oneLine(desc))
 	if _, err := f.WriteString(line); err != nil {
-		return 0, err
+		return "agent-jobs guard: subagent log: " + err.Error()
 	}
-	return n + 1, nil
+	return ""
 }
 
 // oneLine keeps a log field on one line and short.

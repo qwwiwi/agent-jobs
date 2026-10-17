@@ -163,3 +163,75 @@ func TestSubagentCannotStartJobs(t *testing.T) {
 		}
 	}
 }
+
+// H1: with the store counter configured, a shortened log refuses further subagents, and the cap
+// comes from the counter even when the log is empty.
+func TestSubagentCounterAndTamper(t *testing.T) {
+	count := 0
+	reserve := func(max int) (int, bool, error) {
+		if count >= max {
+			return count, false, nil
+		}
+		count++
+		return count - 1, true, nil
+	}
+	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log"), SubagentReserve: reserve}
+	call := subagentCall(t, "Agent", map[string]any{"prompt": "p"})
+	for i := 0; i < 2; i++ {
+		if r := decide(t, call, cfg); r != "" {
+			t.Fatalf("subagent %d refused: %s", i+1, r)
+		}
+	}
+	if err := os.WriteFile(cfg.SubagentLog, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r := decide(t, call, cfg); !strings.Contains(r, "shortened") {
+		t.Fatalf("after truncation: %q, want tampering", r)
+	}
+	count = 3
+	cfg.SubagentLog = filepath.Join(t.TempDir(), "fresh.log")
+	if r := decide(t, call, cfg); r == "" {
+		t.Fatal("counter at the cap with an empty log: allowed")
+	}
+}
+
+// H1: protected paths cannot be written by file tools (also through a symlink in the job dir) or
+// by literal Bash targets; plain readers may read them.
+func TestProtectedPaths(t *testing.T) {
+	state := t.TempDir()
+	logs := filepath.Join(state, "subagents")
+	if err := os.MkdirAll(logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logf := filepath.Join(logs, "j.log")
+	if err := os.WriteFile(logf, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	jobdir := t.TempDir()
+	if err := os.Symlink(logs, filepath.Join(jobdir, "l")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Protected: []string{logs, filepath.Join(state, "jobs.db")}, Dir: jobdir}
+	for _, p := range []string{logf, filepath.Join(jobdir, "l", "j.log"), filepath.Join(state, "jobs.db"), "l/new.log"} {
+		if CheckFileWrite("Write", p, cfg) == "" {
+			t.Errorf("Write %s allowed", p)
+		}
+	}
+	if CheckFileWrite("Write", filepath.Join(jobdir, "ok.txt"), cfg) != "" {
+		t.Error("Write in the job dir refused")
+	}
+	for _, c := range []string{
+		"echo > " + logf, ": >> " + logf, "rm " + logf, "mv " + logf + " /tmp/x", "truncate -s0 " + logf,
+		"cp /dev/null " + logf, "tee " + logf, "sed -i d " + logf, "ln -sf /dev/null " + logf,
+		"cd " + logs + " && rm j.log", "rm l/j.log", "printf x > l/j.log",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+	for _, c := range []string{"cat " + logf, "wc -l " + logf, "echo hi > out.txt", "go test ./..."} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}

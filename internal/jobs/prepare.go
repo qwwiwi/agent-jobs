@@ -89,7 +89,14 @@ func (m *Manager) GuardCommand(gitDirs ...string) string { return m.guardCommand
 // JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
 // guard.MaxSubagentsPerJob subagents per job.
 func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
-	return m.guardCommand(m.SubagentLogPath(id), gitDirs...)
+	return m.guardCommand(id, gitDirs...)
+}
+
+// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
+// database (with its WAL files) that holds the monotonic subagent counter.
+func (m *Manager) ProtectedPaths() []string {
+	db := filepath.Join(m.StateDir, "jobs.db")
+	return []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal"}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -98,7 +105,7 @@ func (m *Manager) SubagentLogPath(id string) string {
 	return filepath.Join(m.StateDir, "subagents", id+".log")
 }
 
-func (m *Manager) guardCommand(subagentLog string, gitDirs ...string) string {
+func (m *Manager) guardCommand(jobID string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Cfg.OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -112,8 +119,12 @@ func (m *Manager) guardCommand(subagentLog string, gitDirs ...string) string {
 	for _, d := range gitDirs {
 		parts = append(parts, "--git-dir", shellQuote(d))
 	}
-	if subagentLog != "" {
-		parts = append(parts, "--subagent-log", shellQuote(subagentLog))
+	if jobID != "" {
+		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
+			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
+		for _, p := range m.ProtectedPaths() {
+			parts = append(parts, "--protect", shellQuote(p))
+		}
 	}
 	return strings.Join(parts, " ")
 }
@@ -203,9 +214,7 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card) (st
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n%s\n\n## Owner rules\n\n%s\n\n", pre, sub, ownerRules)
-	for _, c := range cards {
-		fmt.Fprintf(&b, "## Project card: %s\n\n%s\n\n", c.Name, c.Body)
-	}
+	b.WriteString(RenderCards(cards))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
 		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
 	return b.String(), nil

@@ -54,6 +54,12 @@ type Config struct {
 	// SubagentLog is the job's subagent log (one line per allowed subagent, at most MaxSubagentsPerJob).
 	// Empty = subagents are refused.
 	SubagentLog string
+	// SubagentReserve is the job's monotonic subagent counter (the store row): it counts one more
+	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
+	SubagentReserve func(max int) (prev int, allowed bool, err error)
+	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
+	// database that holds the counter. File tools and literal Bash targets into them are refused.
+	Protected []string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -194,6 +200,61 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
 				"(git would run programs from its config and hooks)."
 		}
+		if inJobGitDir(p, cfg.Protected) {
+			return protectedBlocked(p)
+		}
+	}
+	return ""
+}
+
+func protectedBlocked(p string) string {
+	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database); a job does not write there."
+}
+
+// checkProtected rejects Bash writes into cfg.Protected: an output redirection to such a path, or
+// such a path (made absolute against the call's directory, cleaned, symlinks resolved on the longest
+// existing prefix) as an argument of any program that is not a plain reader (rm, mv, cp, ln, tee,
+// truncate, sed -i, cd, …). A path built at run time (a variable, a substitution) is not resolved:
+// that and a script the job writes are the documented residual gap.
+func checkProtected(scripts []*script, _ string, cfg Config) string {
+	if len(cfg.Protected) == 0 {
+		return ""
+	}
+	hit := func(w string) (string, bool) {
+		w = pathOf(w)
+		if w == "" || w == "." {
+			return "", false
+		}
+		given := w
+		if !filepath.IsAbs(given) {
+			given = filepath.Join(cfg.Dir, given)
+		}
+		for _, p := range []string{filepath.Clean(given), resolvePath(w, cfg.Dir)} {
+			if inJobGitDir(p, cfg.Protected) {
+				return p, true
+			}
+		}
+		return "", false
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				for _, t := range c.outRedirs {
+					if p, ok := hit(t); ok {
+						return protectedBlocked(p)
+					}
+				}
+				argv := argvOf(c.words)
+				if len(argv) == 0 || gitFileReaders[strings.ToLower(base(argv[0]))] {
+					continue
+				}
+				for _, a := range argv[1:] {
+					if p, ok := hit(a); ok {
+						return protectedBlocked(p)
+					}
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -202,7 +263,7 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {

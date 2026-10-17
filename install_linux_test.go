@@ -3,6 +3,8 @@
 package agentjobs
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -212,14 +214,15 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if !strings.Contains(out, "== skill "+skillDst+"\n  unchanged") {
 		t.Errorf("unchanged re-install rewrote the skill:\n%s", out)
 	}
-	// A stale skill is replaced, without a daemon restart.
-	e.write(skillDst, "old skill\n", 0o644)
+	// A skill this installer wrote earlier (its recorded hash matches) is updated, without a restart.
+	e.write(skillDst, "old shipped skill\n", 0o644)
+	e.write(filepath.Join(filepath.Dir(skillDst), ".installed-sha256"), sha256Hex("old shipped skill\n")+"\n", 0o644)
 	e.resetCalls()
 	if out, err = e.run("--instance", "t1", "--binary", e.bin); err != nil {
 		t.Fatalf("re-install: %v\n%s", err, out)
 	}
 	if e.read(skillDst) != e.read("skills/agent-jobs/SKILL.md") || strings.Contains(e.calls(), "restart") {
-		t.Errorf("stale skill not replaced, or the daemon restarted for it:\n%s", e.calls())
+		t.Errorf("stale skill not updated, or the daemon restarted for it:\n%s\n%s", out, e.calls())
 	}
 	if e.read(envFile) != "AGENT_JOBS_TMUX_BIN=/x/tmux\n" {
 		t.Error("re-install overwrote the env file")
@@ -251,10 +254,14 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if !strings.Contains(e.calls(), "--user disable --now agent-jobs@t1.service") {
 		t.Errorf("uninstall did not disable --now:\n%s", e.calls())
 	}
-	for _, p := range []string{unitDst, binDst, envFile, skillDst} {
+	for _, p := range []string{unitDst, binDst, envFile} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("%s removed while another instance is enabled: %v", p, err)
 		}
+	}
+	// t2 never installed a skill, so t1's skill went with t1's uninstall.
+	if _, err := os.Stat(skillDst); !os.IsNotExist(err) {
+		t.Errorf("t1's skill kept although no other instance recorded it: %v", err)
 	}
 	e.assertOtherUntouched("agent-jobs@t2")
 
@@ -359,8 +366,15 @@ func TestInstallLinuxEnvFileParsedNotSourced(t *testing.T) {
 	}
 }
 
-// --skills-dir puts the skill into the agent's own Claude config; --no-skill leaves skills alone; an
-// edited skill survives uninstall.
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// --skills-dir puts the skill into the agent's own Claude config; --no-skill leaves skills alone.
+// H2: a locally edited skill is never replaced silently: a notice, --force-skill replaces it and
+// keeps a backup; uninstall keeps an edited skill. M1: uninstall goes by the recorded destination,
+// not by a different --skills-dir.
 func TestInstallLinuxSkillDirOptions(t *testing.T) {
 	e := newInstallEnv(t)
 	dir := filepath.Join(e.home, "agent-config/skills")
@@ -371,16 +385,45 @@ func TestInstallLinuxSkillDirOptions(t *testing.T) {
 	if e.read(skill) != e.read("skills/agent-jobs/SKILL.md") {
 		t.Fatal("skill not installed into --skills-dir")
 	}
+	if got := strings.TrimSpace(e.read(filepath.Join(dir, "agent-jobs/.installed-sha256"))); got != sha256Hex(e.read(skill)) {
+		t.Fatalf("recorded hash %q", got)
+	}
 	if _, err := os.Stat(filepath.Join(e.home, ".claude")); !os.IsNotExist(err) {
 		t.Error("default skills dir touched although --skills-dir was given")
 	}
+	// A local edit survives a re-install, with a notice.
 	e.write(skill, "edited by the agent's owner\n", 0o644)
-	out, err := e.run("--instance", "t1", "--uninstall", "--skills-dir", dir)
+	out, err := e.run("--instance", "t1", "--binary", e.bin, "--skills-dir", dir)
+	if err != nil {
+		t.Fatalf("re-install: %v\n%s", err, out)
+	}
+	if e.read(skill) != "edited by the agent's owner\n" || !strings.Contains(out, "--force-skill") {
+		t.Fatalf("edited skill replaced without --force-skill:\n%s", out)
+	}
+	// Uninstall keeps an edited skill, and goes by the recorded destination: a wrong --skills-dir
+	// cannot make it delete something else.
+	other := filepath.Join(e.home, "elsewhere/skills/agent-jobs/SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(other), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.write(other, e.read("skills/agent-jobs/SKILL.md"), 0o644)
+	out, err = e.run("--instance", "t1", "--uninstall", "--skills-dir", filepath.Join(e.home, "elsewhere/skills"))
 	if err != nil {
 		t.Fatalf("uninstall: %v\n%s", err, out)
 	}
-	if e.read(skill) != "edited by the agent's owner\n" || !strings.Contains(out, "differs from the shipped one: kept") {
+	if e.read(skill) != "edited by the agent's owner\n" || !strings.Contains(out, "edited locally?): kept") {
 		t.Errorf("edited skill not kept on uninstall:\n%s", out)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("uninstall touched a skill it never recorded: %v", err)
+	}
+	// --force-skill replaces an edited skill and keeps a backup.
+	if out, err := e.run("--instance", "t1", "--binary", e.bin, "--skills-dir", dir, "--force-skill"); err != nil {
+		t.Fatalf("install --force-skill: %v\n%s", err, out)
+	}
+	baks, _ := filepath.Glob(skill + ".bak.*")
+	if e.read(skill) != e.read("skills/agent-jobs/SKILL.md") || len(baks) != 1 || e.read(baks[0]) != "edited by the agent's owner\n" {
+		t.Errorf("--force-skill: skill replaced=%v backups=%v", e.read(skill) == e.read("skills/agent-jobs/SKILL.md"), baks)
 	}
 
 	e2 := newInstallEnv(t)
@@ -389,6 +432,66 @@ func TestInstallLinuxSkillDirOptions(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e2.home, ".claude")); !os.IsNotExist(err) {
 		t.Error("--no-skill installed a skill")
+	}
+}
+
+// M1: two instances installing into the same skills dir share it; it goes with the last of them.
+func TestInstallLinuxSharedSkillKeptForOtherInstance(t *testing.T) {
+	e := newInstallEnv(t)
+	for _, inst := range []string{"t1", "t2"} {
+		if out, err := e.run("--instance", inst, "--binary", e.bin); err != nil {
+			t.Fatalf("install %s: %v\n%s", inst, err, out)
+		}
+	}
+	skill := filepath.Join(e.home, ".claude/skills/agent-jobs/SKILL.md")
+	out, err := e.run("--instance", "t1", "--uninstall")
+	if err != nil {
+		t.Fatalf("uninstall t1: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(skill); err != nil || !strings.Contains(out, "also installed for t2") {
+		t.Fatalf("shared skill removed with t1: %v\n%s", err, out)
+	}
+	if out, err := e.run("--instance", "t2", "--uninstall"); err != nil {
+		t.Fatalf("uninstall t2: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(skill); !os.IsNotExist(err) {
+		t.Fatal("skill kept after the last instance")
+	}
+}
+
+// M1: a skills dir that is the repository's own skills/ is refused at install and at uninstall, so
+// the tracked source is never overwritten or deleted. Runs on a copy of the repository files.
+func TestInstallLinuxRefusesSkillSourceAlias(t *testing.T) {
+	e := newInstallEnv(t)
+	repo := t.TempDir()
+	for _, f := range []string{"scripts/install-linux.sh", "skills/agent-jobs/SKILL.md", "deploy/systemd/agent-jobs@.service"} {
+		if err := os.MkdirAll(filepath.Join(repo, filepath.Dir(f)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.write(filepath.Join(repo, f), e.read(f), 0o755)
+	}
+	src := filepath.Join(repo, "skills/agent-jobs/SKILL.md")
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command("bash", append([]string{filepath.Join(repo, "scripts/install-linux.sh")}, args...)...)
+		cmd.Env = []string{"HOME=" + e.home, "PATH=/usr/local/bin:/usr/bin:/bin", "FAKE_DIR=" + e.fake,
+			"AGENT_JOBS_SYSTEMCTL=" + filepath.Join(e.fake, "systemctl"), "XDG_RUNTIME_DIR=" + e.fake}
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	for _, alias := range []string{filepath.Join(repo, "skills"), filepath.Join(repo, "scripts/../skills")} {
+		out, err := run("--instance", "t1", "--binary", e.bin, "--skills-dir", alias)
+		if err == nil || !strings.Contains(out, "repository's own skill") {
+			t.Errorf("install into %s: err=%v\n%s", alias, err, out)
+		}
+	}
+	// A record pointing at the source (written by hand) is refused at uninstall too.
+	e.write(filepath.Join(e.home, ".config/agent-jobs/t1.skill"), filepath.Join(repo, "skills/agent-jobs")+"\n", 0o600)
+	out, err := run("--instance", "t1", "--uninstall")
+	if err == nil || !strings.Contains(out, "repository's own skill") {
+		t.Errorf("uninstall with an aliased record: err=%v\n%s", err, out)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("the repository's skill was deleted: %v", err)
 	}
 }
 

@@ -47,6 +47,7 @@ const usage = `usage: agent-jobs <command> [flags]
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
+             [--subagent-db DB --subagent-job ID] [--protect PATH]...
                                            (PreToolUse hook, JSON on stdin)
 `
 
@@ -160,11 +161,31 @@ func runGuard(args []string, stdin io.Reader) int {
 	var gitDirs multi
 	fs.Var(&gitDirs, "git-dir", "the job worktree's git dir; file tools never write inside it (repeatable)")
 	subagentLog := fs.String("subagent-log", "", "the job's subagent log (at most 3 subagents per job; empty = none)")
+	subagentDB := fs.String("subagent-db", "", "the agent's job database holding the job's monotonic subagent counter")
+	subagentJob := fs.String("subagent-job", "", "the job id whose subagent counter --subagent-db holds")
+	var protected multi
+	fs.Var(&protected, "protect", "a path (file or dir) a job never writes (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	var reserve func(int) (int, bool, error)
+	if *subagentDB != "" || *subagentJob != "" {
+		if *subagentDB == "" || *subagentJob == "" {
+			fmt.Fprintln(os.Stderr, "guard: --subagent-db and --subagent-job go together")
+			return 2
+		}
+		reserve = func(max int) (int, bool, error) {
+			st, err := store.Open(*subagentDB)
+			if err != nil {
+				return 0, false, err
+			}
+			defer st.Close()
+			return st.ReserveSubagent(*subagentJob, max)
+		}
+	}
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
+		SubagentReserve: reserve, Protected: protected,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
