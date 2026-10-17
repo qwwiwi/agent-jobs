@@ -263,7 +263,7 @@ func TestSucceededReportFlagsAndFiles(t *testing.T) {
 
 func TestSettingsDenyAndGuardHook(t *testing.T) {
 	m := newManager(t)
-	m.Cfg.OwnerNames = []string{"Dashi"}
+	m.Cfg.OwnerNames = []string{"Alex"}
 	deny := func(kind string) string {
 		b, _ := json.Marshal(m.Settings(kind)["permissions"])
 		return string(b)
@@ -298,7 +298,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		}
 		return 0
 	}
-	if code := run(`git commit -m "for dashi"`); code != 2 {
+	if code := run(`git commit -m "for alex"`); code != 2 {
 		t.Fatalf("owner in commit: exit %d, want 2", code)
 	}
 	if code := run(`go test ./...`); code != 0 {

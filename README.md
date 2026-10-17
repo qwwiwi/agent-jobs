@@ -1,10 +1,10 @@
 # agent-jobs
 
-Фоновые джобы `claude -p` / `codex exec` для агентов Orgrimmar. Реализация 1:1 по `docs/REFERENCE-danya.md`, допустимые отличия – только `docs/DEVIATIONS.md`.
+Фоновые джобы `claude -p` / `codex exec` для агентов Orgrimmar. Реализация 1:1 по `docs/REFERENCE.md`, допустимые отличия – только `docs/DEVIATIONS.md`.
 
 Статус: этап 1 (ядро) готов; `codex exec` runner (DEVIATIONS #5) – следующие этапы.
 
-Background `claude -p` jobs for an agent's main session: the session hands work to one-shot processes, a daemon starts and cleans them up, the session gets one line when a job is done and reads the report on demand. Design: [`docs/REFERENCE-danya.md`](docs/REFERENCE-danya.md) (implemented 1:1), allowed deviations: [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md), internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), owner decisions: [`docs/DECISIONS.md`](docs/DECISIONS.md).
+Background `claude -p` jobs for an agent's main session: the session hands work to one-shot processes, a daemon starts and cleans them up, the session gets one line when a job is done and reads the report on demand. Design: [`docs/REFERENCE.md`](docs/REFERENCE.md) (implemented 1:1), allowed deviations: [`docs/DEVIATIONS.md`](docs/DEVIATIONS.md), internals: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), owner decisions: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 Stage 1 (this release): queue + daemon + launch + settings/guard + report contract + tmux notify + cleanup.
 
@@ -35,7 +35,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
   "owner_rules_path": "/Users/me/.agent-jobs/silvana/owner-rules.md",
   "notify_tmux_target": "channel-silvana",
   "tmux_socket": "",
-  "owner_names": ["Dashi"],
+  "owner_names": ["Alex"],
   "git_name": "",
   "git_email": "",
   "claude_bin": "/Users/me/.local/bin/claude",

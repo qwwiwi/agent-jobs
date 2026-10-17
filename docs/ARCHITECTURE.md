@@ -1,6 +1,6 @@
 # Architecture (stage 1 core + stage 2 MCP job tools)
 
-Implements `docs/REFERENCE-danya.md`, section «Как сделать у себя (минимум)», items 1–6. Deviations are only those in `docs/DEVIATIONS.md` (#6 model by kind × complexity, #7 naming are used here).
+Implements `docs/REFERENCE.md`, section «Как сделать у себя (минимум)», items 1–6. Deviations are only those in `docs/DEVIATIONS.md` (#6 model by kind × complexity, #7 naming are used here).
 
 **MCP tools.** The reference starts jobs with the MCP tool `job_start` and reads reports with `job_result`. `agent-jobs mcp --role orchestrator|job --agent A` is that server (stdio, `github.com/modelcontextprotocol/go-sdk`), built on the same Manager as the CLI (`agent-jobs start/status/result/list/cancel`, kept for manual use).
 
