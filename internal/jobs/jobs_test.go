@@ -140,7 +140,7 @@ func newManager(t *testing.T) *Manager {
 
 func enqueue(t *testing.T, m *Manager, brief string, mod func(*StartRequest)) *store.Job {
 	t.Helper()
-	r := StartRequest{Title: "test job", Kind: "general", Brief: brief}
+	r := StartRequest{Title: "test job", Kind: "general", Brief: brief, Model: "sonnet"}
 	if mod != nil {
 		mod(&r)
 	}
@@ -201,14 +201,14 @@ func TestLimitsDefaultsAndCeilingsRejected(t *testing.T) {
 		func(r *StartRequest) { r.TimeoutMinutes = 181 },
 		func(r *StartRequest) { r.MaxTurns = -1 },
 	} {
-		r := StartRequest{Title: "t", Kind: "general", Brief: "b"}
+		r := StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "sonnet"}
 		mod(&r)
 		got, err := m.Enqueue(r)
 		if err == nil || !strings.Contains(err.Error(), "rejected") {
 			t.Fatalf("want rejection for %+v, got job=%v err=%v", r, got, err)
 		}
 	}
-	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "deploy", Brief: "b"}); err == nil {
+	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "deploy", Brief: "b", Model: "sonnet"}); err == nil {
 		t.Fatal("unknown kind must be rejected")
 	}
 	list, _ := m.Store.List(100)
@@ -521,6 +521,61 @@ func TestNotifyOneLineViaTmux(t *testing.T) {
 	}
 	if b2, _ := os.ReadFile(logf); !bytes.Equal(b, b2) {
 		t.Fatal("job notified twice")
+	}
+}
+
+// The plan's tmux gap: an agent whose session lives on a named tmux socket gets `-L <socket>` on
+// both send-keys calls; a socket that looks like a path or a flag is rejected at config load.
+func TestNotifyUsesTmuxSocket(t *testing.T) {
+	m := newManager(t)
+	logf := filepath.Join(t.TempDir(), "tmux.log")
+	t.Setenv("FAKE_TMUX_LOG", logf)
+	m.Cfg.NotifyTmuxTarget = "fake-session"
+	m.Cfg.TmuxSocket = "arthas"
+	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
+	b, err := os.ReadFile(logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "-L|arthas|send-keys|-t|fake-session|-l|[jobs:job-done] job "+j.ID) ||
+		lines[1] != "-L|arthas|send-keys|-t|fake-session|Enter|" {
+		t.Fatalf("tmux calls:\n%s", b)
+	}
+	for _, bad := range []string{"/tmp/sock", "-S", "../x", "a b"} {
+		dir := t.TempDir()
+		cfg, _ := json.Marshal(map[string]string{"tmux_socket": bad})
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), cfg, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(dir); err == nil {
+			t.Fatalf("tmux_socket %q accepted", bad)
+		}
+	}
+}
+
+// The job's mcp.json names exactly one server: this binary in the job role, for this agent.
+func TestJobMCPConfigPointsAtJobRole(t *testing.T) {
+	m := newManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "mcp.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		MCPServers map[string]struct {
+			Type    string   `json:"type"`
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	srv, ok := cfg.MCPServers[JobMCPServerName]
+	if len(cfg.MCPServers) != 1 || !ok || srv.Type != "stdio" || srv.Command != selfBin ||
+		!slices.Equal(srv.Args, []string{"mcp", "--role", "job", "--agent", "test"}) {
+		t.Fatalf("mcp.json: %s", b)
 	}
 }
 
@@ -979,16 +1034,43 @@ func TestCleanupRefusesForeignWorktree(t *testing.T) {
 	}
 }
 
-// DEVIATIONS #6 model table.
+// DEVIATIONS #6 model table; owner 2026-10-17: the complexity is stated, never defaulted.
 func TestModelTable(t *testing.T) {
 	for _, c := range []struct{ kind, cx, want string }{
 		{"review", "light", "sonnet"}, {"review", "normal", "opus"}, {"review", "hard", "fable"},
-		{"fix", "hard", "fable"}, {"general", "hard", "fable"}, {"general", "", "opus"},
+		{"fix", "hard", "fable"}, {"general", "hard", "fable"}, {"general", "normal", "opus"},
 		{"research", "light", "sonnet"}, {"research", "normal", "sonnet"}, {"research", "hard", "opus"},
 	} {
 		if got, _ := ModelFor(c.kind, c.cx); got != c.want {
 			t.Fatalf("%s/%s = %s, want %s", c.kind, c.cx, got, c.want)
 		}
+	}
+	if _, err := ModelFor("general", ""); err == nil {
+		t.Fatal("empty complexity defaulted")
+	}
+}
+
+// Owner 2026-10-17: no classifier. Enqueue takes an explicit model or a complexity; with neither
+// (or a malformed model) it is rejected. New columns get their defaults.
+func TestEnqueueModelOrComplexity(t *testing.T) {
+	m := newManager(t)
+	for _, c := range []struct{ model, cx string }{
+		{"", ""}, {"  ", ""}, {"--dangerously-skip-permissions", ""}, {"opus; rm", ""}, {"a b", ""},
+		{"", "huge"}, {"opus", "huge"},
+	} {
+		if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "general", Brief: "b", Model: c.model, Complexity: c.cx}); err == nil {
+			t.Fatalf("model %q complexity %q accepted", c.model, c.cx)
+		}
+	}
+	byCx := enqueue(t, m, "x", func(r *StartRequest) { r.Model, r.Kind, r.Complexity = "", "review", "hard" })
+	if byCx.Model != "fable" || byCx.Complexity != "hard" {
+		t.Fatalf("complexity → model: %+v", byCx)
+	}
+	j := enqueue(t, m, "x", func(r *StartRequest) { r.Model, r.Complexity = "claude-sonnet-4-6[1m]", "light" })
+	got := get(t, m, j.ID)
+	if got.Model != "claude-sonnet-4-6[1m]" || got.Complexity != "light" || got.Runner != "claude" ||
+		got.Billing != "subscription" || got.OwnerWaits || got.ResumedFrom != "" || got.ScheduleID != "" {
+		t.Fatalf("row: %+v", got)
 	}
 }
 

@@ -54,7 +54,25 @@ type Job struct {
 	Error          string
 	// LaunchToken identifies the tick that claimed the job; only that launch may finish it.
 	LaunchToken string
+	// Complexity is the stated light|normal|hard (picks the model when none was given), empty when only a model was given.
+	Complexity string
+	// Runner is the program that runs the job ("claude"; "codex" arrives with S3-M1).
+	Runner string
+	// OwnerWaits marks a job the owner asked for (the Stop-hook that enforces it is S3-M5).
+	OwnerWaits bool
+	// ResumedFrom is the id of the job this one continues (S2-M5), empty otherwise.
+	ResumedFrom string
+	// ScheduleID is the schedule that created the job (S2-M4), empty otherwise.
+	ScheduleID string
+	// Billing is how the run is paid: "subscription" (default) or "api" (S3-M6 fallback).
+	Billing string
 }
+
+// Runners and billing modes.
+const (
+	RunnerClaude        = "claude"
+	BillingSubscription = "subscription"
+)
 
 // Store wraps the SQLite handle.
 type Store struct {
@@ -103,13 +121,26 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
-	// Databases created before launch_token existed.
-	if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN launch_token TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column") {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate db: %w", err)
+	// Tolerant migrations: databases created before a column existed get it with its default;
+	// "duplicate column" means the column is already there.
+	for _, alter := range migrations {
+		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: %w", err)
+		}
 	}
 	return &Store{db: db}, nil
+}
+
+// migrations add columns introduced after the first schema, in order. Never edit or reorder a row.
+var migrations = []string{
+	`ALTER TABLE jobs ADD COLUMN launch_token TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN complexity TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN runner TEXT NOT NULL DEFAULT 'claude'`,
+	`ALTER TABLE jobs ADD COLUMN owner_waits INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN resumed_from TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN billing TEXT NOT NULL DEFAULT 'subscription'`,
 }
 
 // Close closes the database.
@@ -117,7 +148,8 @@ func (s *Store) Close() error { return s.db.Close() }
 
 const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, model,
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
-	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token`
+	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
+	complexity, runner, owner_waits, resumed_from, schedule_id, billing`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -126,13 +158,20 @@ func ts(t *time.Time) any {
 	return t.Unix()
 }
 
-// Insert adds a new job row.
+// Insert adds a new job row. Empty Runner / Billing get their defaults.
 func (s *Store) Insert(j *Job) error {
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	if j.Runner == "" {
+		j.Runner = RunnerClaude
+	}
+	if j.Billing == "" {
+		j.Billing = BillingSubscription
+	}
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
-		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken)
+		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
+		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -147,7 +186,8 @@ func scanJob(r scanner) (*Job, error) {
 	var started, finished, notified, cleaned sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
-		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken)
+		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
+		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +240,11 @@ func (s *Store) ListByStatus(status string) ([]*Job, error) {
 // List returns the most recent jobs, newest first.
 func (s *Store) List(limit int) ([]*Job, error) {
 	return s.query(`ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
+}
+
+// ListRecentByStatus returns the most recent jobs with the given status, newest first.
+func (s *Store) ListRecentByStatus(status string, limit int) ([]*Job, error) {
+	return s.query(`WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, status, limit)
 }
 
 // PendingCleanup returns finished, notified, not yet cleaned jobs.

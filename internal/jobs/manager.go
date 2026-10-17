@@ -77,8 +77,8 @@ type StartRequest struct {
 	Brief          string
 	RepoPath       string
 	Base           string // ref in RepoPath; default HEAD
-	Model          string // explicit model; default from kind × complexity
-	Complexity     string // light|normal|hard
+	Model          string // explicit model; else picked by kind × complexity
+	Complexity     string // light|normal|hard; model or complexity is required (no default, no classifier)
 	MaxTurns       int    // 0 = default
 	MaxBudgetUSD   float64
 	TimeoutMinutes int
@@ -166,15 +166,9 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	model := r.Model
-	if model == "" {
-		if model, err = ModelFor(r.Kind, r.Complexity); err != nil {
-			return nil, err
-		}
-	} else if r.Complexity != "" {
-		if _, err := ModelFor(r.Kind, r.Complexity); err != nil {
-			return nil, err
-		}
+	model, err := ResolveModel(r.Kind, strings.TrimSpace(r.Model), r.Complexity)
+	if err != nil {
+		return nil, err
 	}
 	var repo, base string
 	if r.RepoPath != "" {
@@ -199,6 +193,7 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
+		Complexity: r.Complexity, Runner: store.RunnerClaude, Billing: store.BillingSubscription,
 	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err

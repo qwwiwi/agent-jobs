@@ -1,8 +1,18 @@
-# Architecture (stage 1 – core)
+# Architecture (stage 1 core + stage 2 MCP job tools)
 
 Implements `docs/REFERENCE-danya.md`, section «Как сделать у себя (минимум)», items 1–6. Deviations are only those in `docs/DEVIATIONS.md` (#6 model by kind × complexity, #7 naming are used here).
 
-**MCP tools are Stage 2.** The reference starts jobs with the MCP tool `job_start` and reads reports with `job_result`. In stage 1 the CLI is the stand-in (`agent-jobs start` = job_start, `agent-jobs result` = job_result, plus status/list/cancel); the Go MCP server exposing `job_*` lands in stage 2 on top of the same Manager.
+**MCP tools.** The reference starts jobs with the MCP tool `job_start` and reads reports with `job_result`. `agent-jobs mcp --role orchestrator|job --agent A` is that server (stdio, `github.com/modelcontextprotocol/go-sdk`), built on the same Manager as the CLI (`agent-jobs start/status/result/list/cancel`, kept for manual use).
+
+| tool | role | wraps |
+|---|---|---|
+| job_start | orchestrator | `Manager.Enqueue` – an explicit `model` or a `complexity` required (neither = rejected); limits default/ceiling as the CLI; returns the queued row |
+| job_status | orchestrator | `Store.Get` |
+| job_result | orchestrator | `Store.Get` + `DoneLine` + `report.md` (capped at 256 KB) + paths of the patches/logs that exist |
+| job_list | orchestrator | `Store.List` / `Store.ListRecentByStatus`, newest first, limit 1..200 |
+| job_cancel | orchestrator | `Manager.Cancel` |
+
+Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed` (an allow-list; empty until memory tools arrive). A test fails when a tool is in neither list or in both. The job-role server registers only `JobAllowed` tools **and** a receiving middleware refuses any other `tools/call` and filters `tools/list`, so the boundary holds even if a hidden tool were registered. The job role does not open the job database.
 
 ## Components
 
@@ -28,7 +38,7 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 |---|---|
 | prompt.md | assembled brief given to claude on stdin |
 | settings.json | the job's only settings: deny rules and the guard hook |
-| mcp.json | the job's MCP servers, and only those (stage 1: empty) |
+| mcp.json | the job's MCP servers, and only those: `agent-jobs mcp --role job --agent <agent>` |
 | gitconfig | the job's only global git config (`GIT_CONFIG_GLOBAL`): the identity from `git_name`/`git_email`, nothing else (read-only) |
 | no-hooks/ | empty read-only dir; `core.hooksPath` points here, so repository hooks never run |
 | work/ | working dir: git worktree (detached at base) or empty dir |
@@ -46,12 +56,12 @@ Implements `docs/REFERENCE-danya.md`, section «Как сделать у себ�
 
 ## Flows
 
-**Start.** `agent-jobs start` validates kind, limits (defaults 80 turns / $10 / 45 min; above 200 / $50 / 180 → error, never clamped), resolves repo + base to a commit SHA, picks the model (explicit `--model`, else kind × complexity table), inserts a `queued` row and prints the id. Nothing runs yet.
+**Start.** `agent-jobs start` validates kind, limits (defaults 80 turns / $10 / 45 min; above 200 / $50 / 180 → error, never clamped), resolves repo + base to a commit SHA, picks the model (explicit `--model`, validated as a model name so it can never become a flag; else the kind × complexity table; neither given = rejected, complexity is never defaulted), inserts a `queued` row and prints the id. Nothing runs yet.
 
 **Tick** (every minute, also `agent-jobs tick`) runs under an exclusive `flock` on `<state>/tick.lock` (also taken by `cancel`), so two daemons or a manual tick never interleave. In this order:
 1. *Collect* each `running` job. A claimed job without a recorded pid (daemon died between spawn and pid write) is adopted from `wrapper.json` if its token matches; with no `wrapper.json` after 1 minute it is `failed` under `admit.lock` ("the wrapper never registered", work dir kept). Then: `exit_code` present → stream.jsonl is read *after* it (so the result is complete) → verdict; else past `started_at + timeout` → SIGTERM to the process group, 10 s, SIGKILL → `timeout`; else wrapper PID dead → re-check exit_code, then `failed` ("wrapper died without writing exit_code").
 2. *Launch* queued jobs while fewer than 2 are running. Launch = claim (`running` + token) → prepare job dir (owner rules must be readable and ≤ 8 KB, else the job is `failed` with "refused to start: …") → start `agent-jobs run-wrapper <jobdir> --token T -- claude <args>` with `Setsid` (own session → own process group, not a child of the daemon's group) → store PID = PGID.
-3. *Notify* finished, not yet notified jobs: `tmux send-keys -t <target> -l "<line>"`, then `tmux send-keys -t <target> Enter`. The line is printable-only (whitespace → space, control/format characters such as Ctrl-U, ESC, bidi overrides dropped; title capped at 120 runes), so a title cannot type keystrokes into the session. With a target configured, a job is marked notified only after tmux accepted the line: a failing tmux (missing session) keeps it pending, logged and retried next tick, and cleanup waits. With no target configured notify is off: the line goes to the daemon log and the job is marked notified at once, so the 30-minute cleanup still runs.
+3. *Notify* finished, not yet notified jobs: `tmux send-keys -t <target> -l "<line>"`, then `tmux send-keys -t <target> Enter` (both with `-L <tmux_socket>` when configured). The line is printable-only (whitespace → space, control/format characters such as Ctrl-U, ESC, bidi overrides dropped; title capped at 120 runes), so a title cannot type keystrokes into the session. With a target configured, a job is marked notified only after tmux accepted the line: a failing tmux (missing session) keeps it pending, logged and retried next tick, and cleanup waits. With no target configured notify is off: the line goes to the daemon log and the job is marked notified at once, so the 30-minute cleanup still runs.
 4. *Cleanup* jobs notified ≥ 30 min ago (see below).
 
 **Verdict.** exit_code ≠ 0 → failed; stream `result.is_error` (e.g. max turns / budget) → failed; exit 0 but empty/missing report.md → failed ("exit 0 without a report"); otherwise succeeded. Turns and cost come from the stream `result` event; duration is wall time from start to collection.

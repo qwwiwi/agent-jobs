@@ -19,6 +19,7 @@ import (
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/mcp"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -27,7 +28,7 @@ const usage = `usage: agent-jobs <command> [flags]
   init       --agent A                     create state dir, copy owner-rules template,
                                            write orchestrator.md (main-session duties)
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
-             [--repo PATH [--base REF]] [--model M | --complexity light|normal|hard]
+             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
   status     --agent A <id>
   list       --agent A [--limit N]
@@ -36,6 +37,8 @@ const usage = `usage: agent-jobs <command> [flags]
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
+  mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
+                                           job: only the tools allow-listed for jobs)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
 `
 
@@ -67,6 +70,8 @@ func main() {
 		err = cmdTick(args)
 	case "daemon":
 		err = cmdDaemon(args)
+	case "mcp":
+		err = cmdMCP(args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -197,8 +202,8 @@ func cmdStart(args []string) error {
 	briefFile := fs.String("brief-file", "", "read brief from file")
 	fs.StringVar(&r.RepoPath, "repo", "", "git repository for the worktree (optional)")
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
-	fs.StringVar(&r.Model, "model", "", "model (default by kind × complexity)")
-	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard")
+	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
+	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
@@ -398,4 +403,24 @@ func cmdDaemon(args []string) error {
 		case <-t.C:
 		}
 	}
+}
+
+func cmdMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	roleFlag := fs.String("role", "", "orchestrator|job")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if *agent == "" {
+		return errors.New("--agent is required")
+	}
+	role, err := mcp.ParseRole(*roleFlag)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	// stdout carries the protocol: nothing else may print there.
+	return mcp.Serve(ctx, role, *agent)
 }

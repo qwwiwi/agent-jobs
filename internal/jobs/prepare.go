@@ -180,6 +180,21 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, append(b, '\n'), 0o600)
 }
 
+// JobMCPServerName is the job-role server's key in the job's mcp.json.
+const JobMCPServerName = "agent-jobs"
+
+// JobMCPConfig is the job's mcp.json: one stdio server, `agent-jobs mcp --role job --agent <agent>`.
+// The job-role server exposes only the tools allow-listed for jobs and refuses every other call.
+func (m *Manager) JobMCPConfig() map[string]any {
+	return map[string]any{"mcpServers": map[string]any{
+		JobMCPServerName: map[string]any{
+			"type":    "stdio",
+			"command": m.SelfBin,
+			"args":    []string{"mcp", "--role", "job", "--agent", m.Agent},
+		},
+	}}
+}
+
 // prepare creates the job directory: prompt.md, settings.json, mcp.json, work/, base_commit.
 func (m *Manager) prepare(j *store.Job, dir string) error {
 	rules, err := m.readOwnerRules()
@@ -199,8 +214,9 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	if err := m.writeGitFiles(dir); err != nil {
 		return err
 	}
-	// Stage 1: no MCP servers. --strict-mcp-config makes this the complete list.
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), map[string]any{"mcpServers": map[string]any{}}); err != nil {
+	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only);
+	// --strict-mcp-config makes this the complete list.
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig()); err != nil {
 		return err
 	}
 	work := filepath.Join(dir, "work")

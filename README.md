@@ -34,6 +34,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
 {
   "owner_rules_path": "/Users/me/.agent-jobs/silvana/owner-rules.md",
   "notify_tmux_target": "channel-silvana",
+  "tmux_socket": "",
   "owner_names": ["Dashi"],
   "git_name": "",
   "git_email": "",
@@ -43,6 +44,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
 ```
 
 - `notify_tmux_target` empty (default) = notify off: the job-done line goes to the daemon log and the job counts as notified, so its worktree is still cleaned up 30 minutes later. With a target set, a failed tmux delivery keeps the line pending (retried each tick) and cleanup waits.
+- `tmux_socket` (optional) is the tmux socket name of the session in `notify_tmux_target` (`tmux -L <name>`); empty = tmux's default socket. A name only, not a path.
 - `owner_names` must never appear in a job's commit.
 - `git_name`/`git_email` is the job's git identity: the wrapper writes it into `<jobdir>/gitconfig` and points `GIT_CONFIG_GLOBAL` at it (repo-local `user.*` still wins, as in git). A job cannot override it (`-c user.*`, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, `--author` are rejected; `git config user.*` only with the same value). Empty = no identity from agent-jobs.
 - Timings are fixed by the reference and not configurable: the daemon ticks every minute, a worktree is removed 30 minutes after the job-done line was delivered.
@@ -52,7 +54,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
 
 ```bash
 agent-jobs start --agent silvana --title "review auth" --kind review \
-  --repo ~/projects/x [--base main] [--complexity light|normal|hard | --model opus] \
+  --repo ~/projects/x [--base main] (--complexity light|normal|hard | --model opus) \
   [--max-turns 80] [--max-budget-usd 10] [--timeout-minutes 45] \
   --brief-file brief.md            # or --brief "..." or stdin; prints the job id immediately
 agent-jobs list   --agent silvana
@@ -61,7 +63,10 @@ agent-jobs result --agent silvana <id>   # job-done line + report.md
 agent-jobs cancel --agent silvana <id>
 agent-jobs tick   --agent silvana        # one daemon pass
 agent-jobs daemon --agent silvana        # tick every minute
+agent-jobs mcp --agent silvana --role orchestrator   # MCP server (stdio): job_start/status/result/list/cancel
 ```
+
+Give `--model` or `--complexity` (kind × complexity picks the model); with neither the job is rejected – no default, no classifier (owner 2026-10-17). `job_start` over MCP takes the same fields.
 
 Kinds: `review`, `fix`, `research`, `general`. Limits: defaults 80 turns / $10 / 45 min, ceilings 200 / $50 / 180 – a request above a ceiling is rejected, never clamped. At most 2 running jobs per agent.
 
