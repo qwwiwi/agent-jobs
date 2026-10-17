@@ -206,7 +206,7 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
-	sw := sweepSession(stderrLog)
+	sw := sweepJob(jobDir, stderrLog)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
 	}
@@ -281,7 +281,14 @@ const JobEnvVar = "AGENT_JOBS_JOB"
 // InsideJob returns the job id when this process runs inside a job (the marker is set, even empty).
 func InsideJob() (string, bool) { return os.LookupEnv(JobEnvVar) }
 
-// JobEnv returns env without any inherited marker, plus AGENT_JOBS_JOB=<id of jobDir>.
+// userBusVars point at the user's D-Bus session (systemd user manager). They are removed from the job's
+// environment: with them, `systemd-run --user` or a D-Bus call would start a process in a new unit,
+// outside the job's scope (not a sandbox: a script can rebuild the address; the guard rejects the
+// direct spellings).
+var userBusVars = map[string]bool{"DBUS_SESSION_BUS_ADDRESS": true, "XDG_RUNTIME_DIR": true}
+
+// JobEnv returns env without any inherited marker and without the user bus variables, plus
+// AGENT_JOBS_JOB=<id of jobDir>.
 func JobEnv(jobDir string, env []string) ([]string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
@@ -289,7 +296,7 @@ func JobEnv(jobDir string, env []string) ([]string, error) {
 	}
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {
-		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar {
+		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar && !userBusVars[k] {
 			out = append(out, kv)
 		}
 	}

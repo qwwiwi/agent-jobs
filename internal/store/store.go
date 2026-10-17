@@ -66,6 +66,9 @@ type Job struct {
 	ScheduleID string
 	// Billing is how the run is paid: "subscription" (default) or "api" (S3-M6 fallback).
 	Billing string
+	// ScopeUnit is the transient systemd user scope the wrapper was launched in
+	// (agent-jobs-<agent>-<id>.scope), empty when the job runs without one (session containment only).
+	ScopeUnit string
 }
 
 // Runners and billing modes.
@@ -141,6 +144,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN resumed_from TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN billing TEXT NOT NULL DEFAULT 'subscription'`,
+	`ALTER TABLE jobs ADD COLUMN scope_unit TEXT NOT NULL DEFAULT ''`,
 }
 
 // Close closes the database.
@@ -149,7 +153,7 @@ func (s *Store) Close() error { return s.db.Close() }
 const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, model,
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
-	complexity, runner, owner_waits, resumed_from, schedule_id, billing`
+	complexity, runner, owner_waits, resumed_from, schedule_id, billing, scope_unit`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -166,12 +170,12 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
-		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing)
+		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.ScopeUnit)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -187,7 +191,7 @@ func scanJob(r scanner) (*Job, error) {
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
-		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing)
+		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.ScopeUnit)
 	if err != nil {
 		return nil, err
 	}
@@ -292,6 +296,12 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 func (s *Store) SetPID(id, token string, pid, pgid int) error {
 	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=? WHERE id=? AND status='running' AND launch_token=?`,
 		pid, pgid, id, token))
+}
+
+// SetScope records the systemd scope unit of the launch that owns the job, before the wrapper is spawned.
+func (s *Store) SetScope(id, token, unit string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET scope_unit=? WHERE id=? AND status='running' AND launch_token=?`,
+		unit, id, token))
 }
 
 // Finish moves a job to a terminal status. With a launch token, only the running job owned by

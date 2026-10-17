@@ -1164,3 +1164,43 @@ func TestJobMarkerSurvivesAllowedCommands(t *testing.T) {
 		}
 	}
 }
+
+// A job stays in its cgroup scope: no new units through the user's service manager or bus, no writes
+// into the cgroup file system (docs/ARCHITECTURE.md, «Cgroup containment»).
+func TestCheckUserManagerAndCgroupFS(t *testing.T) {
+	cfg := Config{}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"systemd-run scope", `systemd-run --user --scope sleep 600`, true},
+		{"systemd-run path", `/usr/bin/systemd-run --user -t bash`, true},
+		{"systemd-run behind nohup", `nohup systemd-run --user sleep 9 &`, true},
+		{"systemd-run in sh -c", `sh -c 'systemd-run --user --scope sleep 9'`, true},
+		{"systemd-run find -exec", `find . -exec systemd-run --user {} \;`, true},
+		{"busctl", `busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 x y`, true},
+		{"dbus-send", `dbus-send --session --dest=org.freedesktop.systemd1 /x y`, true},
+		{"gdbus", `gdbus call --session -d org.freedesktop.systemd1 -o / -m x`, true},
+		{"dbus-run-session", `dbus-run-session -- ./run.sh`, true},
+		{"systemctl --user start", `systemctl --user start x.service`, true},
+		{"systemctl --user after verb", `systemctl start x.service --user`, true},
+		{"systemctl abbreviated", `systemctl --us start x.service`, true},
+		{"systemctl --user=", `systemctl --user=yes stop x`, true},
+		{"echo into cgroup.procs", `echo $$ > /sys/fs/cgroup/user.slice/cgroup.procs`, true},
+		{"tee into cgroup", `echo 1 | tee /sys/fs/cgroup/x/cgroup.procs`, true},
+		{"cd into cgroupfs", `cd /sys/fs/cgroup/user.slice`, true},
+		{"systemctl status ok", `systemctl status nginx`, false},
+		{"systemctl --runtime ok", `systemctl --runtime status nginx`, false},
+		{"cat cgroup ok", `cat /sys/fs/cgroup/cgroup.controllers`, false},
+		{"grep systemd-run ok", `grep -rn systemd-run docs`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

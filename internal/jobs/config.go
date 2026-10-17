@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 )
 
@@ -53,6 +54,10 @@ type Config struct {
 	ClaudeBin string `json:"claude_bin"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
+	// CgroupScope is the containment of a job's processes (env AGENT_JOBS_CGROUP_SCOPE wins):
+	// "auto" (default) = its own transient systemd user scope when `systemd-run --user` works, else the
+	// weaker session containment; "required" = a job that cannot get a scope is refused; "off" = never.
+	CgroupScope string `json:"cgroup_scope"`
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -111,6 +116,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
+	}
+	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
+		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")

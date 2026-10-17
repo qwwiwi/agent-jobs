@@ -92,11 +92,17 @@ func WrapperAncestor() (pid int, ok bool) {
 	return 0, true
 }
 
-// CheckNotInJob is the agent-independent part: the env marker, then the wrapper ancestry.
+// CheckNotInJob is the agent-independent part: the env marker, the job scope cgroup (setsid, double
+// forks and re-parenting stay inside it), then the wrapper ancestry and session (the fallback where
+// there is no scope).
 func CheckNotInJob() error {
 	if id, inside := InsideJob(); inside {
 		return fmt.Errorf("refused: running inside job %q (%s is set); a job never starts, cancels or manages jobs, "+
 			"only the orchestrator does", id, JobEnvVar)
+	}
+	if unit, _ := JobScope(); unit != "" {
+		return fmt.Errorf("refused: running in the cgroup of job scope %s; a job never starts, cancels or manages jobs, "+
+			"only the orchestrator does", unit)
 	}
 	if pid, _ := WrapperAncestor(); pid != 0 {
 		return fmt.Errorf("refused: running under the job wrapper (pid %d); a job never starts, cancels or manages jobs, "+

@@ -32,6 +32,18 @@ printf '%s\n' "$@" > ../argv.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
+if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
+  # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a
+  # subreaper), marker dropped. Then it tries a control command for another agent and stays alive.
+  JOBDIR=$(cd .. && pwd) setsid bash -c '( sleep 0.5
+      read -r _ _ _ ppid _ sid _ < /proc/$BASHPID/stat
+      echo "$BASHPID $ppid $sid" > "$JOBDIR/orphan.info"
+      env -u AGENT_JOBS_JOB "$AGENT_JOBS_SELF" list --agent agentb > "$JOBDIR/orphan.out" 2>&1
+      echo "exit=$?" >> "$JOBDIR/orphan.out"
+      : > "$JOBDIR/orphan.ready"
+      exec sleep 300 ) & exit 0' < /dev/null > /dev/null 2>&1
+  for _ in $(seq 200); do [[ -e ../orphan.ready ]] && break; sleep 0.05; done
+fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -131,6 +143,8 @@ func newManager(t *testing.T) *Manager {
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("AGENT_JOBS_CLAUDE_BIN", filepath.Join(fakeHelpr, "claude"))
 	t.Setenv("AGENT_JOBS_TMUX_BIN", filepath.Join(fakeHelpr, "tmux"))
+	// Session containment unless a test asks for a scope (scope_test.go): the same on every host.
+	t.Setenv("AGENT_JOBS_CGROUP_SCOPE", ScopeOff)
 	m, err := Open("test")
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +296,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch",
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "Bash(systemd-run:*)", "Bash(systemctl --user:*)", "Bash(busctl:*)", "Bash(dbus-send:*)", "Bash(gdbus:*)", "WebFetch", "WebSearch",
 		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
@@ -919,7 +933,7 @@ func TestOrphanWrapperAdopted(t *testing.T) {
 	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.spawn(j, tok); err != nil { // "crash": PID never written
+	if _, err := m.spawn(j, tok, ""); err != nil { // "crash": PID never written
 		t.Fatal(err)
 	}
 	if get(t, m, j.ID).PID != 0 {

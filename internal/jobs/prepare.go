@@ -55,6 +55,13 @@ var denyRules = []string{
 	"Bash(claude-code:*)",
 	"Bash(gemini-cli:*)",
 	"Bash(aider-chat:*)",
+	// The user's service manager and session bus would start processes outside the job's cgroup scope
+	// (also rejected by the guard in any spelling).
+	"Bash(systemd-run:*)",
+	"Bash(systemctl --user:*)",
+	"Bash(busctl:*)",
+	"Bash(dbus-send:*)",
+	"Bash(gdbus:*)",
 	// Package runners fetch and run a package by name (also rejected by the guard).
 	"Bash(npx:*)",
 	"Bash(pnpx:*)",

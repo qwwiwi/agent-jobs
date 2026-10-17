@@ -44,7 +44,7 @@ func Printable(s string, max int) string {
 func DoneLine(j *store.Job) string {
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
 		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
-	if strings.HasPrefix(j.Error, ReasonSurvivors) {
+	if strings.Contains(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
 	}
 	return line

@@ -181,7 +181,7 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -328,6 +328,7 @@ var indirect = map[string]bool{
 	"git": true, "gh": true, "eval": true, "env": true, "xargs": true, "exec": true, "command": true,
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
 	"npx": true, "pnpx": true, "bunx": true, "uvx": true,
+	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "dbus-run-session": true,
 }
 
 // agents are coding agents a job must not start: a job is a leaf, nested agents would run outside
@@ -683,6 +684,56 @@ func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 		if len(argv) > 0 && isAgent(strings.ToLower(base(argv[0]))) {
 			return "blocked by guard: `" + base(argv[0]) + "` starts a nested agent. A job is a leaf: it does the work itself " +
 				"and reports; only the orchestrator starts jobs."
+		}
+		return ""
+	})
+}
+
+// userManagerTools reach the user's systemd manager or session bus, where a new transient unit would
+// run a process outside the job's cgroup scope.
+var userManagerTools = map[string]bool{
+	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "dbus-run-session": true,
+}
+
+// cgroupFS is the cgroup file system: writing a pid into a cgroup.procs there moves it out of the scope.
+const cgroupFS = "/sys/fs/cgroup"
+
+// checkUserManager: a job stays in its cgroup scope. systemd-run, busctl, dbus-send, gdbus, qdbus,
+// dbus-run-session are rejected as commands; `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
+// `--user=…`) too (the system manager, without --user, cannot start units for the job); and any write
+// under /sys/fs/cgroup: an output redirection there, or such a path as an argument of a program that
+// is not a plain reader. As an argument of another program these tools are caught by the indirect scan.
+// Not a sandbox: a script the job writes is not inspected.
+func checkUserManager(scripts []*script, _ string, _ Config) string {
+	return eachCmd(scripts, func(c *simpleCmd, argv []string) string {
+		for _, t := range c.outRedirs {
+			if strings.Contains(t, cgroupFS) {
+				return "blocked by guard: `" + t + "` is the cgroup file system; a job does not move processes out of its scope."
+			}
+		}
+		if len(argv) == 0 {
+			return ""
+		}
+		name := strings.ToLower(base(argv[0]))
+		if userManagerTools[name] {
+			return "blocked by guard: `" + name + "` talks to the user's service manager or session bus; a job does not " +
+				"start units or processes outside its scope."
+		}
+		if name == "systemctl" {
+			for _, a := range argv[1:] {
+				opt, _, _ := strings.Cut(a, "=")
+				if len(opt) >= 3 && strings.HasPrefix("--user", opt) {
+					return "blocked by guard: `systemctl --user` controls the user's service manager; a job does not start " +
+						"or stop units."
+				}
+			}
+		}
+		if !gitFileReaders[name] {
+			for _, a := range argv[1:] {
+				if strings.Contains(a, cgroupFS) {
+					return "blocked by guard: `" + a + "` is the cgroup file system; a job does not move processes out of its scope."
+				}
+			}
 		}
 		return ""
 	})

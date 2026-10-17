@@ -14,9 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `tmux_socket` config: notify on a named tmux socket (`tmux -L`).
 - Nested-job prevention: job marker `AGENT_JOBS_JOB`; the binary refuses control commands under the marker, under a wrapper ancestor, in a wrapper's session or in a running job's session; guard rules against `agent-jobs` as a command and against changing `AGENT_JOBS_*` (incl. `mapfile`/`readarray`, `printf -v`).
 - Session sweep: after claude exits the wrapper ends every other process of the job's session before writing `exit_code`. Signals go through a pidfd opened before the membership check, so a reused pid is never signalled; without pidfd support nothing is signalled. If processes survive or the sweep fails, the wrapper writes a `sweep_incomplete` marker and the daemon fails the job with «processes survived the job», which the job-done line repeats.
+- Cgroup containment on Linux: the daemon launches each wrapper in its own transient systemd user scope (`systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope`); control commands refuse when `/proc/self/cgroup` names a job scope; the wrapper sweeps the scope's cgroup (pidfd, sub-cgroups included) before `exit_code`; cancel, timeout and every collection stop the whole unit (`systemctl --user stop`), and a failed stop fails the job with «processes survived the job». Config `cgroup_scope` (`auto` default, `required`, `off`; env `AGENT_JOBS_CGROUP_SCOPE`); store column `scope_unit`. Without `systemd-run --user` the session containment stays, documented as weaker.
 
 ### Changed
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
+
+### Security
+- A job's environment no longer carries `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`; the guard and the deny rules reject `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus` (guard also `qdbus`, `dbus-run-session`, and writes under `/sys/fs/cgroup`), the direct ways out of a job's scope.
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 
