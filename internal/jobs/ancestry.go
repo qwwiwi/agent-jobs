@@ -102,13 +102,43 @@ func CheckNotInJob() error {
 		return fmt.Errorf("refused: running under the job wrapper (pid %d); a job never starts, cancels or manages jobs, "+
 			"only the orchestrator does", pid)
 	}
+	if sid, _ := WrapperSession(); sid != 0 {
+		return fmt.Errorf("refused: running in the session of a job wrapper (session %d); a job never starts, cancels "+
+			"or manages jobs, only the orchestrator does", sid)
+	}
 	return nil
+}
+
+// WrapperSession returns this process's session id when the session leader is a job wrapper (0 =
+// not). The wrapper is started with setsid, so it leads the session of every job process that did not
+// call setsid itself – also of an orphan re-parented away from the wrapper, whose ppid chain no longer
+// reaches it. Independent of the agent and the state dir (a job could target another agent's store).
+// ok is false when the check could not run (not Linux, /proc unreadable): the caller fails open.
+func WrapperSession() (sid int, ok bool) {
+	if runtime.GOOS != "linux" {
+		return 0, false
+	}
+	if _, err := os.Stat(filepath.Join(procRoot, "self", "stat")); err != nil {
+		return 0, false
+	}
+	sid, err := unix.Getsid(0)
+	if err != nil || sid <= 1 || sid == os.Getpid() {
+		return 0, true
+	}
+	argv, err := procCmdline(sid)
+	if err != nil {
+		return 0, true // the leader exited: the store check (CheckNotInJobSession) still applies
+	}
+	if IsWrapperCmdline(argv) {
+		return sid, true
+	}
+	return 0, true
 }
 
 // ErrInJobSession is returned when this process is in the session of a running job.
 var ErrInJobSession = errors.New("refused: running inside a job's session; a job never starts, cancels or manages jobs")
 
-// CheckNotInJobSession refuses when this process's session id is the recorded pgid of one of the
+// CheckNotInJobSession is the fallback when the session leader is gone: it refuses when this process's session id is the recorded pgid of one of the
 // agent's running jobs (the wrapper starts with setsid, so its pgid is also the session id).
 func (m *Manager) CheckNotInJobSession() error {
 	sid, err := unix.Getsid(0)

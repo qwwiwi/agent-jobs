@@ -624,3 +624,42 @@ func TestJobRoleToolWithoutManagerFailsCleanly(t *testing.T) {
 		t.Fatalf("after the call: %v", got)
 	}
 }
+
+// No nested jobs, session leader: a job script clears the marker and orphans a child (no setsid), so
+// the ppid walk no longer reaches the wrapper, and the child targets ANOTHER agent's store (no matching
+// pgid there). The session leader is still the wrapper, and the child is refused.
+func TestOrphanInWrapperSessionRefusedForOtherAgent(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("session-leader check is Linux-only (/proc)")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "agent-jobs")
+	out := filepath.Join(dir, "child.out")
+	// The fake wrapper (agent A's job) leads its own session; the subshell exits at once, so the
+	// child is re-parented; the wrapper waits for the child's output file to be complete.
+	// `( bash -c … & )`: the outer subshell exits at once, so the inner bash (its own cmdline, not the
+	// wrapper's) is re-parented and the child's ppid chain never meets the wrapper.
+	body := "#!/bin/bash\n" +
+		"( bash -c 'env -u AGENT_JOBS_JOB \"$REAL_BIN\" start --agent agentb --title t --model opus --brief b > \"$OUT.tmp\" 2>&1; " +
+		"echo \"ppid-chain-parent=$PPID exit=$?\" >> \"$OUT.tmp\"; mv \"$OUT.tmp\" \"$OUT\"' & )\n" +
+		"for _ in $(seq 200); do [ -e \"$OUT\" ] && exit 0; sleep 0.05; done\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(script, "run-wrapper", filepath.Join(dir, "agenta", "jobs", "x"), "--token", "t", "--", "claude")
+	cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+dir, "REAL_BIN="+selfBin, "OUT="+out, "AGENT_JOBS_JOB=x")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fake wrapper: %v %s", err, b)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "refused: running in the session of a job wrapper") || strings.Contains(string(b), "exit=0") {
+		t.Fatalf("orphan in a wrapper session, other agent: %s", b)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "agentb")); err == nil {
+		t.Fatal("the refused command created agent B's state dir")
+	}
+}
