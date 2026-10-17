@@ -1,10 +1,12 @@
 package guard
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // protectedSetup is the realistic layout of the control review's probe: state under
@@ -205,5 +207,157 @@ func TestKeyValueGitFile(t *testing.T) {
 		if Check(c, Config{Dir: t.TempDir()}) == "" {
 			t.Errorf("%q allowed", c)
 		}
+	}
+}
+
+// Fix loop 1 of PR #12: forms the two reviews found allowed are refused.
+func TestProtectedFixLoop1Refused(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	home := filepath.Dir(filepath.Dir(state))
+	for _, c := range []string{
+		// 1: a source spelled `.` / `X/.` / `X/./` copies its contents; --parents keeps the source path
+		"mkdir -p m/thrall && cp x m/thrall/jobs.db && cp -r m/. ~/.agent-jobs",
+		"cp -r m/. " + home + "/.agent-jobs/",
+		"cp -r x/./ ~/.agent-jobs",
+		"cp -r . ~/.agent-jobs",
+		"cp -r x/. ~",
+		"cp --parents thrall/jobs.db ~/.agent-jobs",
+		"cp --par x/y ~",
+		"cp out.txt ~/.agent-jobs",
+		"mv x/. ~/.agent-jobs",
+		// 3: SQLite URIs: authority and percent-encoding
+		"sqlite3 'file://localhost" + home + "/.agent-jobs//thrall/jobs.db' 'UPDATE jobs SET subagents=0'",
+		"sqlite3 'file://" + home + "/x/../.agent-jobs/thrall/jobs.db' .dump",
+		"sqlite3 'file:../../../jobs%2edb' 'UPDATE jobs SET subagents=0'",
+		"sqlite3 'file:..%2F..%2F..%2Fjobs.db' .dump",
+		"sqlite3 'file:" + state + "/jobs%2Edb' .dump",
+		// 4: here-strings
+		"python3 <<< \"open('../../../jobs.db','w')\"",
+		"sqlite3 <<< '.open ../.././../jobs.db'",
+		// 5: a plain ancestor of state below $HOME inside inline code
+		"python3 -c \"import shutil; shutil.rmtree('" + state + "')\"",
+		"python3 -c \"import shutil; shutil.rmtree('" + home + "/.agent-jobs')\"",
+		"python3 -c \"import os; os.chdir('" + state + "'); os.remove('jobs.db')\"",
+		// 6: interpreters reading their program from a pipe
+		"echo '.open ../../../jobs.db' | sqlite3",
+		"printf \"open('../../../jobs.db','w')\" | python3",
+		"echo 'unlink q(../../../jobs.db)' | perl",
+		"echo \"require('fs').rmSync('../../../jobs.db')\" | node -",
+		// 7: symlinks made in the same call
+		"ln -s ../.. A && ln -s A/.. B && rm B/jobs.db",
+		"ln -s ../.. A; rm A/../jobs.db",
+		"python3 -c \"import os; os.symlink('../..','A')\" && rm A/../jobs.db",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+}
+
+// Fix loop 1 of PR #12: ordinary work the token pass refused, and the home destination, stay allowed.
+func TestProtectedFixLoop1Allowed(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{
+		"python3 -c \"print(7 // 2)\"",
+		"node -e \"// run\nconsole.log(1)\"",
+		"sed -i 's,//,/,g' out.txt",
+		"git commit -m 'fix // path'",
+		"git commit -m 'go up ../../..'",
+		"git commit -m 'a=b ../../..'",
+		"cd ../../.. && ls",
+		"mv out.txt ~", "mv out.txt ~/", "cp out.txt ~", "cp -r dist/ ~/", "cp -t ~ out.txt",
+		"python3 -c \"import os; os.makedirs('out/a/../b')\"",
+		"mkdir -p out/a && touch out/a/../b",
+		"ln -s ../shared lib",
+		"echo 'select 1;' | sqlite3 test.db",
+		"cat data.csv | python3 script.py",
+		"python3 -c \"import shutil; shutil.rmtree('/tmp/x')\"",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
+
+// Ancestor hits inside text say «ancestor»; an expired budget refuses as too complex to verify.
+func TestProtectedFixLoop1Messages(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{
+		"python3 -c \"import shutil; shutil.rmtree('" + state + "')\"",
+		"python3 -c \"import shutil; shutil.rmtree('" + state + "/./')\"",
+		"cp -r m/. ~/.agent-jobs",
+	} {
+		if r := Check(c, cfg); !strings.Contains(r, "an ancestor of agent-jobs state") {
+			t.Errorf("%q: %q", c, r)
+		}
+	}
+	old := protectedBudget
+	protectedBudget = 0
+	defer func() { protectedBudget = old }()
+	if r := Check("rm out.txt", cfg); !strings.Contains(r, "too complex to verify") {
+		t.Errorf("expired budget: %q", r)
+	}
+}
+
+// The protected-path check stays linear: a 16 KB inline script with `..` checks well under a second,
+// also when every token is different.
+func TestProtectedLargeInlineScriptFast(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	var uniq strings.Builder
+	for i := 0; uniq.Len() < 16*1024; i++ {
+		fmt.Fprintf(&uniq, "os.makedirs('out/a%d/../b%d')\n", i, i)
+	}
+	for _, cmd := range []string{
+		"rm " + strings.Repeat("x/../", 16*1024/5) + "out.txt",
+		"rm -r " + strings.Repeat("a/", 8*1024) + "b",
+	} {
+		start := time.Now()
+		r := Check(cmd, cfg)
+		if d := time.Since(start); d > time.Second || r != "" {
+			t.Errorf("%.30q…: %v %s", cmd, d, r)
+		}
+	}
+	for _, code := range []string{
+		strings.Repeat("os.makedirs('out/a/../b')\n", 16*1024/26),
+		strings.Repeat("'./a/../b' ", 16*1024/11),
+		uniq.String(),
+	} {
+		start := time.Now()
+		r := Check("python3 -c \""+code+"\"", cfg)
+		d := time.Since(start)
+		t.Logf("%d bytes: %v", len(code), d)
+		if d > time.Second {
+			t.Errorf("%.30q…: %v", code, d)
+		}
+		if r != "" {
+			t.Errorf("%.30q… refused: %s", code, r)
+		}
+	}
+}
+
+// resolvePath resolves symlinks on the longest existing prefix and follows a dangling link's text.
+func TestResolvePath(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "real", "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range [][2]string{{"real", "L"}, {"real/sub", "real/S"}, {"gone/x", "D"}, {"L2", "L1"}, {"L1", "L2"}} {
+		if err := os.Symlink(filepath.Join(root, l[0]), filepath.Join(root, l[1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range [][2]string{
+		{"real/sub/f", "real/sub/f"}, {"L/sub/f", "real/sub/f"}, {"L/S/new/a/b", "real/sub/new/a/b"},
+		{"D/y", "gone/x/y"}, {"missing/a/b", "missing/a/b"}, {"L//./sub", "real/sub"}, {"L1/x", "L1/x"},
+	} {
+		if got, want := resolvePath(c[0], root), filepath.Join(root, c[1]); got != want {
+			t.Errorf("resolvePath(%q) = %q, want %q", c[0], got, want)
+		}
+	}
+	if got := resolvePath("a/b", "rel"); got != "rel/a/b" {
+		t.Errorf("relative dir: %q", got)
 	}
 }

@@ -124,8 +124,30 @@ func resolveDepth(path, dir string, depth int) string {
 		path = filepath.Join(dir, path)
 	}
 	path = filepath.Clean(path)
-	rest := ""
-	for p := path; ; p = filepath.Dir(p) {
+	// Past a component that does not exist no longer prefix exists either: start from the longest
+	// existing one, so a deep path costs one pass, not one per level.
+	end := len(path)
+	for i := 1; i <= len(path); i++ {
+		if i < len(path) && path[i] != filepath.Separator {
+			continue
+		}
+		if _, err := os.Lstat(path[:i]); err != nil {
+			end = strings.LastIndexByte(path[:i], filepath.Separator)
+			break
+		}
+	}
+	for {
+		if end <= 0 {
+			if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
+				return path
+			}
+			end = 0
+		}
+		p := path[:end]
+		if end == 0 {
+			p = string(filepath.Separator)
+		}
+		rest := strings.TrimLeft(path[end:], string(filepath.Separator))
 		if r, err := filepath.EvalSymlinks(p); err == nil {
 			return filepath.Join(r, rest)
 		}
@@ -134,10 +156,10 @@ func resolveDepth(path, dir string, depth int) string {
 				return resolveDepth(filepath.Join(target, rest), filepath.Dir(p), depth+1)
 			}
 		}
-		if p == filepath.Dir(p) {
+		if end == 0 {
 			return path
 		}
-		rest = filepath.Join(filepath.Base(p), rest)
+		end = strings.LastIndexByte(path[:end], filepath.Separator)
 	}
 }
 
@@ -221,29 +243,83 @@ func ancestorBlocked(w, p string) string {
 // target in the call, symlinks resolved on the longest existing prefix. Refused:
 //   - an output redirection to a protected path;
 //   - a protected path (or one inside it) as an argument of any program that is not a plain reader
-//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value or
-//     inline code (`dd of=…`, `python3 -c "open('…')"`), and the directory holding one (`cp f <dir>`);
+//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value, inline
+//     code, a here-doc or a here-string (`dd of=…`, `python3 -c "open('…')"`, `python3 <<< "…"`),
+//     and the directory holding one (`cp f <dir>`);
 //   - for rm/mv/cp/ln/rsync/chmod/chown/tar/… and find with an action, an ancestor of a protected
-//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`); for cp/install/ln only as a
-//     source: a destination D is refused when it is or holds a protected path, when D/<source name>
-//     reaches one, or with -T when D is an ancestor (`cp f ~` stays allowed);
+//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`); for cp/install/ln/mv a
+//     destination D is refused when it is or holds a protected path, when D/<source name> reaches
+//     one, or when it is an ancestor of one, except D written as $HOME itself without -T or --parents
+//     and with every source a plain name (`cp f ~` stays allowed, `cp -r m/. ~` does not);
 //   - inside option values and inline code, every path-like token (split on `=`, `:`, quotes,
-//     brackets, …) resolved like an argument, and with `//`, `/./` or `..` also as an ancestor;
-//     `..` is walked like the kernel does (after the symlinks of its prefix) as well as lexically;
-//   - `xargs <non-reader>` fed by an earlier stage of its pipeline that names a protected path or an
-//     ancestor of one;
+//     brackets, …; tokens that clean to `/` or `.` skipped) resolved like an argument; in inline code
+//     (-c/-e values, here-docs, here-strings) and `--opt=`/`key=` values also as an ancestor when
+//     spelled with `//`, `/./`, `..` or lying strictly below $HOME; a `file:` URI also percent-decoded
+//     and with an empty or `localhost` authority dropped; `..` walked like the kernel (after the
+//     symlinks of its prefix) as well as lexically, and refused outright when the call may create a
+//     symlink (ln, cp -s, a word naming symlink) and the part before the first `..` does not exist;
+//   - `xargs <non-reader>`, and an interpreter reading its program from the pipe (python, perl, node,
+//     ruby, php without code or script, sqlite3 without SQL), fed by an earlier stage of its pipeline
+//     that names a protected path or an ancestor of one;
 //   - after a cd the guard cannot resolve (`cd $X`, `cd -`, CDPATH), a relative word that could lead
-//     to a protected path; likewise `~user/…`.
+//     to a protected path; likewise `~user/…`;
+//   - a call whose check takes longer than protectedBudget (fail closed: «too complex to verify»).
 //
 // Residual gap (DEVIATIONS #12), not resolved: a path built at run time (a variable other than
-// $HOME, a substitution, a file list read by xargs, a path assembled or escaped in inline code), a
-// relative path inside inline code after an unresolved cd, a cd made in an earlier Bash call (only
-// the hook's cwd and the cds of this call are known), and a script the job writes and runs.
+// $HOME, a substitution, a file list read by xargs or a program read by an interpreter from a file
+// or from a pipe stage the guard does not see the text of, a path assembled or escaped in inline
+// code), a plain ancestor of a protected path in free text or outside $HOME (`os.chdir('/home')`,
+// then a relative path), a relative path inside inline code after an unresolved cd, a symlink made
+// in an earlier Bash call that is not on disk yet when the hook runs, a cd made in an earlier Bash
+// call (only the hook's cwd and the cds of this call are known), and a script the job writes and runs.
 func checkProtected(scripts []*script, _ string, cfg Config) string {
 	if len(cfg.Protected) == 0 {
 		return ""
 	}
 	s := newPathScope(scripts, cfg)
+	r := s.checkScripts(scripts)
+	if s.expired {
+		return "blocked by guard: the command is too complex to verify against agent-jobs state (the subagent log " +
+			"or the job database) within the guard's time budget; split it or write the code to a file and run that."
+	}
+	return r
+}
+
+// stdinInterpreters run a program they read from stdin when given no code or file argument; the
+// value is their short options that give the program inline instead.
+var stdinInterpreters = map[string]string{"python": "cm", "sqlite3": "", "perl": "eE", "node": "ep", "ruby": "e", "php": "rBRE"}
+
+// programFromStdin reports an interpreter that takes its program from stdin: python/perl/node/ruby/
+// php without inline code or a script file (or with `-`), sqlite3 without SQL after the database.
+func programFromStdin(name string, args []string) bool {
+	if strings.HasPrefix(name, "python") {
+		name = "python"
+	}
+	inline, ok := stdinInterpreters[name]
+	if !ok {
+		return false
+	}
+	var pos []string
+	for _, a := range args {
+		switch {
+		case a == "-":
+			pos = append(pos, a)
+		case strings.HasPrefix(a, "-"):
+			if a == "--eval" || a == "--print" || a == "--command" ||
+				inline != "" && !strings.HasPrefix(a, "--") && strings.ContainsAny(a[1:], inline) {
+				return false // inline code, a module or a print-expression
+			}
+		default:
+			pos = append(pos, a)
+		}
+	}
+	if name == "sqlite3" {
+		return len(pos) < 2
+	}
+	return len(pos) == 0 || pos[0] == "-"
+}
+
+func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
@@ -278,8 +354,8 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 						}
 						return protectedBlocked(p)
 					}
-					if p, ok := s.contains(a); ok {
-						return protectedBlocked(p)
+					if h, ok := s.contains(a, codeArg(argv, k+1)); ok {
+						return h.reason()
 					}
 					if name != "cd" && name != "pushd" {
 						if p, ok := s.parentHit(a); ok {
@@ -287,18 +363,26 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 						}
 					}
 				}
-				if p, ok := s.contains(c.heredoc); ok && c.heredoc != "" {
-					return protectedBlocked(p)
+				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
+					return h.reason()
 				}
-				if slices.Contains(v.wrappers, "xargs") {
-					for _, prev := range pl.cmds[:i] {
-						for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
-							_, h := s.hit(w, true)
-							_, m := s.contains(w)
-							if w != "" && (h || m) {
-								return "blocked by guard: `xargs " + name + "` reads `" + w + "`, which names agent-jobs " +
-									"state (the subagent log or the job database); the guard cannot verify what xargs passes on."
-							}
+				feeder := ""
+				switch {
+				case slices.Contains(v.wrappers, "xargs"):
+					feeder = "`xargs " + name + "`"
+				case i > 0 && programFromStdin(name, argv[1:]):
+					feeder = "`" + name + "` (its program from the pipe)"
+				}
+				if feeder == "" {
+					continue
+				}
+				for _, prev := range pl.cmds[:i] {
+					for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
+						_, h := s.hit(w, true)
+						_, m := s.contains(w, true)
+						if w != "" && (h || m) {
+							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
+								"state (the subagent log or the job database); the guard cannot verify what it is fed."
 						}
 					}
 				}
