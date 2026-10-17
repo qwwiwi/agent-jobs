@@ -54,7 +54,8 @@ type Config struct {
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
 	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
-	// them back into). Empty = the user's home directory. The state dir is always refused.
+	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
+	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
 	TrashRoots []string `json:"trash_roots"`
 }
 
@@ -126,13 +127,11 @@ func LoadConfig(stateDir string) (Config, error) {
 	return c, nil
 }
 
-// TrashRootsOrDefault returns the configured trash roots, or the user's home directory.
+// TrashRootsOrDefault returns the configured trash roots; nil when none are configured (fail
+// closed: there is no default root).
 func (c Config) TrashRootsOrDefault() []string {
 	if len(c.TrashRoots) > 0 {
 		return c.TrashRoots
-	}
-	if h, err := os.UserHomeDir(); err == nil {
-		return []string{h}
 	}
 	return nil
 }

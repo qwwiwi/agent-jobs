@@ -28,8 +28,10 @@ type DiskStatus struct {
 	FreeBytes  uint64  `json:"free_bytes"` // available to this user
 	UsedPct    float64 `json:"used_pct"`
 	// PrunableBytes is what `prune` would remove now (job folders finished > 48 h ago).
-	PrunableBytes int64  `json:"prunable_bytes"`
-	Error         string `json:"error,omitempty"`
+	PrunableBytes int64 `json:"prunable_bytes"`
+	// PruneError is a failure of the prune dry run behind PrunableBytes (then the number may be low).
+	PruneError string `json:"prune_error,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // Disk reports the state dir's filesystem.
@@ -45,8 +47,17 @@ func (m *Manager) Disk() DiskStatus {
 	if st.Blocks > 0 {
 		d.UsedPct = float64(st.Blocks-st.Bfree) * 100 / float64(st.Blocks)
 	}
-	if rep, err := m.Prune(true); err == nil {
-		d.PrunableBytes = rep.Bytes
+	rep, err := m.Prune(true)
+	d.PrunableBytes = rep.Bytes
+	if err != nil {
+		d.PruneError = err.Error()
+		return d
+	}
+	for _, j := range rep.Jobs {
+		if j.Error != "" {
+			d.PruneError = fmt.Sprintf("job %s: %s", j.ID, j.Error)
+			break
+		}
 	}
 	return d
 }

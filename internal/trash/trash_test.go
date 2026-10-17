@@ -152,6 +152,46 @@ func TestMoveRefusals(t *testing.T) {
 	}
 }
 
+// Protected files (owner rules, the binary) are refused as named, through a link that names them,
+// and when only their resolved target is listed; so is any path with a .git component.
+func TestMoveRefusesProtectedFilesAndGit(t *testing.T) {
+	f := newFixture(t)
+	rules := filepath.Join(f.root, "rules", "owner-rules.md")
+	write(t, rules, "r")
+	realBin := filepath.Join(f.root, "opt", "agent-jobs-1.0")
+	write(t, realBin, "bin")
+	binLink := filepath.Join(f.root, "bin", "agent-jobs")
+	if err := os.MkdirAll(filepath.Dir(binLink), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realBin, binLink); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(f.root, "other-link")
+	if err := os.Symlink(realBin, other); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(f.root, "repo", ".git", "config"), "c")
+	write(t, filepath.Join(f.root, "wt", ".git"), "gitdir: x")
+	f.t.Protected = append(f.t.Protected, rules, binLink)
+	for _, p := range []string{rules, filepath.Dir(rules), binLink, realBin, other, filepath.Dir(binLink),
+		filepath.Join(f.root, "repo", ".git"), filepath.Join(f.root, "repo", ".git", "config"), filepath.Join(f.root, "wt", ".git")} {
+		_, err := f.t.Move(p)
+		if err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Fatalf("move %s: got %v, want a refusal", p, err)
+		}
+	}
+	for _, p := range []string{rules, binLink, realBin, filepath.Join(f.root, "repo", ".git", "config")} {
+		if gone(p) {
+			t.Fatalf("%s moved", p)
+		}
+	}
+	// The repository around .git is the user's to trash.
+	if _, err := f.t.Move(filepath.Join(f.root, "repo")); err != nil {
+		t.Fatalf("move the repo: %v", err)
+	}
+}
+
 func TestRestoreRefusals(t *testing.T) {
 	f := newFixture(t)
 	p := filepath.Join(f.root, "dir", "f.txt")

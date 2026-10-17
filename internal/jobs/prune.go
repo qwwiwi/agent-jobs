@@ -13,6 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -238,11 +240,34 @@ func removeTree(p string) error {
 	if err := os.RemoveAll(p); err == nil {
 		return nil
 	}
-	_ = filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() && d.Type()&fs.ModeSymlink == 0 {
-			_ = os.Chmod(path, 0o700)
-		}
-		return nil
-	})
+	chmodTree(unix.AT_FDCWD, p, 0)
 	return os.RemoveAll(p)
+}
+
+// maxChmodDepth bounds chmodTree's recursion.
+const maxChmodDepth = 256
+
+// chmodTree makes the directory name (relative to dirfd) and every directory under it 0700. Each
+// directory is opened relative to its parent's descriptor with O_NOFOLLOW and changed through its
+// own descriptor, so a directory swapped for a symlink mid-walk (a ghost still writing in the job
+// dir) is never followed: the chmod cannot reach outside the tree. A directory that cannot be
+// opened for reading is left as it is (the removal then reports the error).
+func chmodTree(dirfd int, name string, depth int) {
+	if depth > maxChmodDepth {
+		return
+	}
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	_ = unix.Fchmod(fd, 0o700)
+	names, _ := f.Readdirnames(-1)
+	for _, n := range names {
+		var st unix.Stat_t
+		if unix.Fstatat(fd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			chmodTree(fd, n, depth+1)
+		}
+	}
 }

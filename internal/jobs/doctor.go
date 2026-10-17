@@ -26,8 +26,15 @@ import (
 //
 //   - job ghosts: a process that carries the job marker (AGENT_JOBS_JOB=<id>) of a job in this agent's
 //     store that is finished (or whose wrapper is dead), or a process in the session of such a job
-//     (session id = the job's recorded pgid) whose session leader is gone and that started after the
-//     job. These are proven to be the job's and are the only ones --kill ends.
+//     (session id = the job's recorded pgid) whose session leader is gone. Either way the process
+//     must have started while the job ran ([StartedAt-1s, FinishedAt+1s], the job started in the
+//     current boot), and for a session the earliest-started live member of the session too: the
+//     kernel keeps a session id allocated while any member lives, so a session whose first member
+//     predates or postdates the job is a reused id, not the job's. These are the only ones --kill
+//     ends.
+//   - leaders: a marked process in that window that leads its own session (sid == pid: it
+//     daemonized, like a tmux server whose environment, and so every later pane, carries the
+//     marker). It may now host other people's work, so it is reported, never killed.
 //   - suspects: a process whose session leader is gone and whose command line looks like a preview
 //     server, a browser or a wait loop. It cannot be tied to a job (it may be the agent's own or
 //     another agent's), so it is reported, never killed.
@@ -36,8 +43,12 @@ import (
 // Ghost kinds.
 const (
 	GhostJob     = "job"
+	GhostLeader  = "leader"
 	GhostSuspect = "suspect"
 )
+
+// attrSlack widens a job's run window: stored times have whole seconds, and so has btime.
+const attrSlack = time.Second
 
 // DoctorKillGrace is the wait between SIGTERM and SIGKILL of a ghost.
 var DoctorKillGrace = 3 * time.Second
@@ -49,7 +60,7 @@ type Ghost struct {
 	SID       int    `json:"sid"`
 	Cmdline   string `json:"cmdline"`
 	StartedAt string `json:"started_at,omitempty"`
-	Kind      string `json:"kind"` // job | suspect
+	Kind      string `json:"kind"` // job | leader | suspect
 	JobID     string `json:"job_id,omitempty"`
 	Reason    string `json:"reason"`
 	Killed    bool   `json:"killed,omitempty"`
@@ -221,9 +232,9 @@ func liveJob(j *store.Job) bool {
 }
 
 // DoctorProcs scans for processes that outlived their job or session and for running rows whose
-// wrapper is dead. It only reports, unless kill is set: then every job ghost (never a suspect) gets
-// SIGTERM, DoctorKillGrace, SIGKILL – through a pidfd opened first and only after its start time
-// and session were re-read and found unchanged, so a reused pid is never signalled.
+// wrapper is dead. It only reports, unless kill is set: then every job ghost (never a leader or a
+// suspect) gets SIGTERM, DoctorKillGrace, SIGKILL – through a pidfd opened first and only after its
+// start time and session were re-read and found unchanged, so a reused pid is never signalled.
 func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	rep := ProcsReport{Kill: kill, Ghosts: []Ghost{}, DeadRows: []DeadRow{}}
 	running, err := m.Store.ListByStatus(store.StatusRunning)
@@ -251,7 +262,7 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 		return rep, fmt.Errorf("boot time: %w", err)
 	}
 	// Sessions of jobs that are over: recorded pgid (= the wrapper's session id) -> job.
-	sessions := map[int]*store.Job{}
+	sessions := map[int][]*store.Job{}
 	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled, store.StatusRunning} {
 		list, err := m.Store.ListByStatus(status)
 		if err != nil {
@@ -259,7 +270,7 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 		}
 		for _, j := range list {
 			if j.PGID > 1 && !liveJob(j) {
-				sessions[j.PGID] = j
+				sessions[j.PGID] = append(sessions[j.PGID], j)
 			}
 		}
 	}
@@ -268,6 +279,31 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	if err != nil {
 		return rep, err
 	}
+	// The earliest start of every live session member (all users: a session id stays allocated while
+	// any member lives, whoever owns it).
+	type scanned struct {
+		pid int
+		p   procInfo
+	}
+	var mine []scanned
+	earliest := map[int]uint64{}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		p, err := procStatFull(pid)
+		if err != nil || p.state == "Z" {
+			continue
+		}
+		if s, ok := earliest[p.sid]; !ok || p.start < s {
+			earliest[p.sid] = p.start
+		}
+		if !skip[pid] && procOwnedByMe(pid) {
+			mine = append(mine, scanned{pid, p})
+		}
+	}
+	at := func(start uint64) time.Time { return boot.Add(time.Duration(start) * time.Second / userHZ) }
 	jobCache := map[string]*store.Job{}
 	lookup := func(id string) *store.Job {
 		if j, ok := jobCache[id]; ok {
@@ -280,25 +316,27 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 		jobCache[id] = j
 		return j
 	}
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 1 || skip[pid] || !procOwnedByMe(pid) {
-			continue
-		}
-		p, err := procStatFull(pid)
-		if err != nil || p.state == "Z" {
-			continue
-		}
+	for _, sc := range mine {
+		pid, p := sc.pid, sc.p
 		p.cmdline, _ = procCmdline(pid)
 		p.marker = procMarker(pid)
-		started := boot.Add(time.Duration(p.start) * time.Second / userHZ)
+		started := at(p.start)
 		g := Ghost{PID: pid, PPID: p.ppid, SID: p.sid, Cmdline: Printable(strings.Join(p.cmdline, " "), 300),
 			StartedAt: started.UTC().Format(time.RFC3339), start: p.start}
 		leaderGone := p.sid > 1 && p.sid != pid && !procExists(p.sid)
+		var sessJob *store.Job // the finished job whose run window holds this process and its session
+		if leaderGone {
+			for _, j := range sessions[p.sid] {
+				if ranDuring(j, started, boot) && ranDuring(j, at(earliest[p.sid]), boot) {
+					sessJob = j
+					break
+				}
+			}
+		}
 		switch {
 		case p.marker != "":
 			j := lookup(p.marker)
-			if j == nil || liveJob(j) {
+			if j == nil || liveJob(j) || !ranDuring(j, started, boot) {
 				continue
 			}
 			g.Kind, g.JobID = GhostJob, j.ID
@@ -307,8 +345,12 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 			} else {
 				g.Reason = fmt.Sprintf("carries the marker of job %s, which is %s", j.ID, j.Status)
 			}
-		case sessions[p.sid] != nil && leaderGone && jobStartedBy(sessions[p.sid], started):
-			j := sessions[p.sid]
+			if p.sid == pid {
+				g.Kind = GhostLeader
+				g.Reason += "; it leads its own session (daemonized) and may host other work: reported, never killed"
+			}
+		case sessJob != nil:
+			j := sessJob
 			g.Kind, g.JobID = GhostJob, j.ID
 			g.Reason = fmt.Sprintf("in the session of job %s (%s), its wrapper is gone", j.ID, j.Status)
 		case leaderGone:
@@ -343,10 +385,14 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 	return rep, nil
 }
 
-// jobStartedBy reports whether a process that started at t can belong to job j (it started no
-// earlier than the job was claimed; the stored time has whole seconds).
-func jobStartedBy(j *store.Job, t time.Time) bool {
-	return j.StartedAt != nil && !t.Before(j.StartedAt.Add(-time.Second))
+// ranDuring reports whether a process that started at t can belong to job j: the job started in
+// the current boot (pids and session ids of an earlier boot mean nothing now) and t lies within
+// [StartedAt-attrSlack, FinishedAt+attrSlack] (no upper bound for a running row whose wrapper died).
+func ranDuring(j *store.Job, t, boot time.Time) bool {
+	if j.StartedAt == nil || j.StartedAt.Before(boot) || t.Before(j.StartedAt.Add(-attrSlack)) {
+		return false
+	}
+	return j.FinishedAt == nil || !t.After(j.FinishedAt.Add(attrSlack))
 }
 
 // samePinned reports whether pid is still the process that was scanned (start time and session).

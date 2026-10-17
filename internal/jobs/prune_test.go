@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -177,6 +179,55 @@ func TestPruneReadOnlyJobDir(t *testing.T) {
 	}
 	if got := names(dir); !slices.Equal(got, []string{"report.md"}) {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// The retry chmod never follows a symlink: not one named as the tree, not one inside it. Real
+// read-only directories inside the tree are opened up.
+func TestChmodTreeNoFollow(t *testing.T) {
+	base := t.TempDir()
+	outside := filepath.Join(base, "outside")
+	tree := filepath.Join(base, "tree")
+	for _, d := range []string{outside, filepath.Join(tree, "a", "b")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(tree, "a", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(base, "tree-link")); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{outside, filepath.Join(tree, "a", "b"), filepath.Join(tree, "a"), tree} {
+		if err := os.Chmod(d, 0o500); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, d := range []string{outside, tree, filepath.Join(tree, "a"), filepath.Join(tree, "a", "b")} {
+			_ = os.Chmod(d, 0o700)
+		}
+	})
+	mode := func(p string) os.FileMode {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	chmodTree(unix.AT_FDCWD, filepath.Join(base, "tree-link"), 0)
+	if got := mode(outside); got != 0o500 {
+		t.Fatalf("symlink named as the tree was followed: outside is %o", got)
+	}
+	chmodTree(unix.AT_FDCWD, tree, 0)
+	for _, d := range []string{tree, filepath.Join(tree, "a"), filepath.Join(tree, "a", "b")} {
+		if got := mode(d); got != 0o700 {
+			t.Fatalf("%s is %o, want 700", d, got)
+		}
+	}
+	if got := mode(outside); got != 0o500 {
+		t.Fatalf("symlink inside the tree was followed: outside is %o", got)
 	}
 }
 

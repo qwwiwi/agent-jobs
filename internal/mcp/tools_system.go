@@ -54,19 +54,29 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			out.Problems = append(out.Problems, fmt.Sprintf("disk: %.1f%% used, %d bytes free (prune would free %d)",
 				out.Disk.UsedPct, out.Disk.FreeBytes, out.Disk.PrunableBytes))
 		}
+		if out.Disk.PruneError != "" {
+			out.Problems = append(out.Problems, "prune dry run failed (prunable bytes may be low): "+out.Disk.PruneError)
+		}
 		for _, c := range out.Hooks {
 			if !c.OK {
 				out.Problems = append(out.Problems, c.Name+": "+c.Detail)
 			}
 		}
-		jobGhosts := 0
+		jobGhosts, leaders := 0, 0
 		for _, g := range out.Procs.Ghosts {
-			if g.Kind == jobs.GhostJob {
+			switch g.Kind {
+			case jobs.GhostJob:
 				jobGhosts++
+			case jobs.GhostLeader:
+				leaders++
 			}
 		}
 		if jobGhosts > 0 {
 			out.Problems = append(out.Problems, fmt.Sprintf("%d processes outlived their job (agent-jobs doctor procs --kill ends them)", jobGhosts))
+		}
+		if leaders > 0 {
+			out.Problems = append(out.Problems, fmt.Sprintf("%d daemonized processes carry a finished job's marker "+
+				"(session leaders: never killed automatically, check them by hand with agent-jobs doctor procs)", leaders))
 		}
 		if n := len(out.Procs.DeadRows); n > 0 {
 			out.Problems = append(out.Problems, fmt.Sprintf("%d running rows with a dead wrapper", n))

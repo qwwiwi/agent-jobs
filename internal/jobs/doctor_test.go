@@ -22,9 +22,15 @@ func execSelf(args ...string) (string, error) {
 // signals processes it spawned itself.
 func spawnOwn(t *testing.T, env []string, name string, args ...string) *exec.Cmd {
 	t.Helper()
+	return spawn(t, true, env, name, args...)
+}
+
+// spawn starts a process (in a new session when setsid) and registers a kill for it.
+func spawn(t *testing.T, setsid bool, env []string, name string, args ...string) *exec.Cmd {
+	t.Helper()
 	c := exec.Command(name, args...)
 	c.Env = append(os.Environ(), env...)
-	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: setsid}
 	if err := c.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -57,9 +63,11 @@ func findGhost(rep ProcsReport, pid int) *Ghost {
 // is ended only with kill; a live job's process is never reported.
 func TestDoctorProcsMarkerGhostKilledOnlyWithFlag(t *testing.T) {
 	m := newManager(t)
-	finished := time.Now().Add(-time.Minute)
-	dead := insertJob(t, m, "doctor-dead-"+strconv.Itoa(os.Getpid()), store.StatusFailed, &finished, nil)
-	ghost := spawnOwn(t, []string{JobEnvVar + "=" + dead.ID}, "sleep", "300")
+	deadID := "doctor-dead-" + strconv.Itoa(os.Getpid())
+	// Not a session leader: a job's leftover child sits in some session it did not start.
+	ghost := spawn(t, false, []string{JobEnvVar + "=" + deadID}, "sleep", "300")
+	finished := time.Now()
+	dead := insertJob(t, m, deadID, store.StatusFailed, &finished, nil)
 
 	// A running job with a live wrapper: its process is the job's business, not a ghost.
 	wrapper := spawnOwn(t, nil, "sleep", "300")
@@ -187,6 +195,165 @@ func TestDoctorProcsIgnoresOlderProcessInSession(t *testing.T) {
 	}
 	if !pidAlive(pid) {
 		t.Fatal("older process was killed")
+	}
+}
+
+// orphanInSession starts a detached sleep in a new session whose leader (sh) exits at once, like the
+// leftover of a dead wrapper, and returns the leader's pid (the session id) and the sleep's pid.
+// pre is shell code run before the sleep that is returned.
+func orphanInSession(t *testing.T, pre string) (leader, pid int) {
+	t.Helper()
+	c := exec.Command("sh", "-c", pre+`sleep 300 >/dev/null 2>&1 & echo $!`)
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	out, err := c.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader = c.Process.Pid
+	if pid, err = strconv.Atoi(strings.TrimSpace(string(out))); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Every member of the session the test made (pre may start more than the returned one).
+		ents, _ := os.ReadDir(procRoot)
+		for _, e := range ents {
+			if p, err := strconv.Atoi(e.Name()); err == nil {
+				if _, sid, err := procStat(p); err == nil && sid == leader {
+					_ = syscall.Kill(p, syscall.SIGKILL)
+				}
+			}
+		}
+	})
+	return leader, pid
+}
+
+// Review probe (PR #9): a job finished minutes ago; its session id is later reused by an unrelated
+// process of this user (setsid, fork, the leader exits). The leftover started after the job
+// finished: it is not the job's and must be neither attributed nor killed.
+func TestDoctorProcsReusedSessionAfterFinish(t *testing.T) {
+	m := newManager(t)
+	leader, pid := orphanInSession(t, "")
+	started, finished := time.Now().Add(-10*time.Minute), time.Now().Add(-5*time.Minute)
+	insertJob(t, m, "doctor-reused-"+strconv.Itoa(os.Getpid()), store.StatusSucceeded, &finished, func(j *store.Job) {
+		j.PID, j.PGID, j.StartedAt = leader, leader, &started
+	})
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	if g := findGhost(rep, pid); g != nil && g.Kind == GhostJob {
+		t.Fatalf("process started after the job finished was attributed: %+v", g)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !pidAlive(pid) {
+		t.Fatal("unrelated process was killed")
+	}
+}
+
+// A session whose earliest live member started before the job is a reused session id: even a member
+// that started inside the job's window is not attributed.
+func TestDoctorProcsSessionWithOlderMember(t *testing.T) {
+	m := newManager(t)
+	t0 := time.Now()
+	// The first sleep starts at ~t0, the returned one at ~t0+4s.
+	leader, pid := orphanInSession(t, `sleep 300 >/dev/null 2>&1 & sleep 4; `)
+	started, finished := t0.Add(3*time.Second), time.Now()
+	insertJob(t, m, "doctor-oldmember-"+strconv.Itoa(os.Getpid()), store.StatusFailed, &finished, func(j *store.Job) {
+		j.PID, j.PGID, j.StartedAt = leader, leader, &started
+	})
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	for _, g := range rep.Ghosts {
+		if g.SID == leader && g.Kind == GhostJob {
+			t.Fatalf("member of a session older than the job attributed: %+v", g)
+		}
+	}
+	if !pidAlive(pid) {
+		t.Fatal("session member was killed")
+	}
+}
+
+// A job that started before the current boot owns no pid or session id of this boot, even when its
+// stored window would cover the process.
+func TestDoctorProcsJobBeforeBoot(t *testing.T) {
+	m := newManager(t)
+	boot, err := bootTime()
+	if err != nil {
+		t.Skip("no /proc")
+	}
+	leader, pid := orphanInSession(t, "")
+	started, finished := boot.Add(-time.Hour), time.Now().Add(time.Hour)
+	id := "doctor-preboot-" + strconv.Itoa(os.Getpid())
+	insertJob(t, m, id, store.StatusFailed, &finished, func(j *store.Job) {
+		j.PID, j.PGID, j.StartedAt = leader, leader, &started
+	})
+	marked := spawn(t, false, []string{JobEnvVar + "=" + id}, "sleep", "300")
+	waitFor(t, "marker", 5*time.Second, func() bool { return procMarker(marked.Process.Pid) == id })
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []int{pid, marked.Process.Pid} {
+		if g := findGhost(rep, p); g != nil {
+			t.Fatalf("process attributed to a job of an earlier boot: %+v", g)
+		}
+		if !pidAlive(p) {
+			t.Fatalf("pid %d was killed", p)
+		}
+	}
+}
+
+// A marked process that started after its job finished (it inherited the marker from something the
+// job left behind, e.g. a tmux server's environment) is not the job's.
+func TestDoctorProcsMarkerAfterFinishIgnored(t *testing.T) {
+	m := newManager(t)
+	finished := time.Now().Add(-5 * time.Minute)
+	dead := insertJob(t, m, "doctor-late-"+strconv.Itoa(os.Getpid()), store.StatusSucceeded, &finished, nil)
+	late := spawn(t, false, []string{JobEnvVar + "=" + dead.ID}, "sleep", "300")
+	waitFor(t, "marker", 5*time.Second, func() bool { return procMarker(late.Process.Pid) == dead.ID })
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := findGhost(rep, late.Process.Pid); g != nil {
+		t.Fatalf("late marked process attributed: %+v", g)
+	}
+	if !pidAlive(late.Process.Pid) {
+		t.Fatal("late marked process was killed")
+	}
+}
+
+// A marked process that leads its own session (it daemonized, like a tmux server started by the
+// job) is reported as a leader and never killed, even with the flag.
+func TestDoctorProcsMarkedLeaderNeverKilled(t *testing.T) {
+	m := newManager(t)
+	id := "doctor-leader-" + strconv.Itoa(os.Getpid())
+	daemon := spawnOwn(t, []string{JobEnvVar + "=" + id}, "sleep", "300")
+	waitFor(t, "marker", 5*time.Second, func() bool { return procMarker(daemon.Process.Pid) == id })
+	finished := time.Now()
+	insertJob(t, m, id, store.StatusSucceeded, &finished, nil)
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	g := findGhost(rep, daemon.Process.Pid)
+	if g == nil || g.Kind != GhostLeader || g.JobID != id || g.Killed {
+		t.Fatalf("marked session leader: %+v (all: %+v)", g, rep.Ghosts)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !pidAlive(daemon.Process.Pid) {
+		t.Fatal("session leader was killed")
 	}
 }
 

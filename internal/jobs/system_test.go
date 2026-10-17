@@ -24,9 +24,9 @@ func TestTrashRootsConfig(t *testing.T) {
 	if err != nil || strings.Join(c.TrashRootsOrDefault(), ",") != "/srv/a,/srv/b" {
 		t.Fatalf("roots: %v %v", c.TrashRoots, err)
 	}
-	home, _ := os.UserHomeDir()
-	if got := (Config{}).TrashRootsOrDefault(); len(got) != 1 || got[0] != home {
-		t.Fatalf("default roots %v, want the home dir", got)
+	// Fail closed: no default root.
+	if got := (Config{}).TrashRootsOrDefault(); got != nil {
+		t.Fatalf("default roots %v, want none", got)
 	}
 }
 

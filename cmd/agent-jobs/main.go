@@ -535,7 +535,7 @@ func cmdDoctor(args []string) error {
 	}
 	fs := flag.NewFlagSet("doctor procs", flag.ContinueOnError)
 	agent := agentFlag(fs)
-	kill := fs.Bool("kill", false, "end the processes proven to belong to a finished job (suspects are never killed)")
+	kill := fs.Bool("kill", false, "end the processes proven to belong to a finished job (leaders and suspects are never killed)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	if _, err := parse(fs, args[1:]); err != nil {
 		return err

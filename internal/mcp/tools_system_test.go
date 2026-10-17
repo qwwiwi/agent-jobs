@@ -178,3 +178,61 @@ func TestTrashTools(t *testing.T) {
 		t.Fatal("jobs.db moved")
 	}
 }
+
+// The trash is closed without configured roots, and inside a root it never moves the agent-jobs
+// home (another agent's state too), the owner rules, the agent-jobs binary, ~/.claude or a .git.
+func TestTrashToolsFailClosedAndProtected(t *testing.T) {
+	m := newManager(t)
+	base, err := filepath.EvalSymlinks(filepath.Dir(filepath.Dir(m.StateDir)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", base)
+	mk := func(p string) string {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	free := mk(filepath.Join(base, "free.txt"))
+	cs := connect(t, mustServer(t, m))
+	if msg := callErr(t, cs, "trash_move", map[string]any{"path": free}); !strings.Contains(msg, "trash_roots") {
+		t.Fatalf("no roots must refuse and explain: %q", msg)
+	}
+	if msg := callErr(t, cs, "trash_restore", map[string]any{"id": "261017-000000-00000000"}); !strings.Contains(msg, "trash_roots") {
+		t.Fatalf("no roots must refuse restore and explain: %q", msg)
+	}
+	if _, err := os.Stat(free); err != nil {
+		t.Fatal("moved without roots")
+	}
+
+	m.Cfg.TrashRoots = []string{base}
+	m.Cfg.OwnerRulesPath = mk(filepath.Join(base, "elsewhere", "owner-rules.md"))
+	m.SelfBin = mk(filepath.Join(base, ".local", "bin", "agent-jobs"))
+	sibling := mk(filepath.Join(filepath.Dir(m.StateDir), "silvana", "jobs.db"))
+	settings := mk(filepath.Join(base, ".claude", "settings.json"))
+	gitCfg := mk(filepath.Join(base, "repo", ".git", "config"))
+	cs = connect(t, mustServer(t, m))
+	for _, p := range []string{filepath.Dir(m.StateDir), filepath.Dir(sibling), sibling, m.StateDir,
+		m.Cfg.OwnerRulesPath, m.SelfBin, filepath.Dir(settings), settings, filepath.Dir(gitCfg), gitCfg} {
+		if msg := callErr(t, cs, "trash_move", map[string]any{"path": p}); !strings.Contains(msg, "refused") {
+			t.Fatalf("move %s: %q", p, msg)
+		}
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("%s moved", p)
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(trashProtected(m), exe) {
+		t.Fatalf("the running binary is not protected: %v", trashProtected(m))
+	}
+	var e trash.Entry
+	call(t, cs, "trash_move", map[string]any{"path": free}, &e)
+}

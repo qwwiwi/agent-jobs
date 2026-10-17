@@ -6,9 +6,12 @@
 // rename(2) on the same filesystem (a path on another filesystem is refused, not copied).
 //
 // Boundaries:
+//   - fail closed: with no allowed roots nothing can be moved;
 //   - only absolute paths without a `..` segment, strictly inside one of the allowed roots; the root
-//     itself, an ancestor of a root and anything inside, or containing, a protected dir (the agent's
-//     state dir, which holds the trash and the job database) is refused;
+//     itself, an ancestor of a root, anything that is, lies inside or contains a protected path (the
+//     agent-jobs home with every agent's state, the owner rules, the agent-jobs binary, ~/.claude; a
+//     protected path counts both as named and with every symlink resolved), and any path with a
+//     `.git` component are refused;
 //   - symlinks are never followed out: the parent directory is resolved and must lie inside a root
 //     (also after resolution), and the last component is not followed – a symlink is moved as the
 //     link itself. The rename runs relative to a descriptor of the resolved parent that is opened
@@ -44,8 +47,9 @@ type Trash struct {
 	Dir string
 	// Roots are the directories trash_move may take paths from (and trash_restore put them back into).
 	Roots []string
-	// Protected are directories nothing may be taken from and that may not be moved themselves (the
-	// agent's state dir).
+	// Protected are files and directories that may not be moved, nor anything inside them, nor
+	// anything containing them (the agent-jobs home, the owner rules, the binary, ~/.claude). Dir is
+	// always protected.
 	Protected []string
 	// Now is the clock (tests).
 	Now func() time.Time
@@ -100,6 +104,33 @@ func resolvedDirs(dirs []string) []string {
 	return out
 }
 
+// protectedPaths returns every protected path twice where they differ: with only the parent
+// resolved (a symlink named as protected is protected as the link) and fully resolved (its target).
+// A path that does not exist yet is kept as given (cleaned).
+func protectedPaths(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if !filepath.IsAbs(p) {
+			continue
+		}
+		p = filepath.Clean(p)
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			out = append(out, filepath.Clean(r))
+		}
+		if d, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+			out = append(out, filepath.Join(d, filepath.Base(p)))
+		} else {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// hasGitComponent reports whether any component of p is `.git`.
+func hasGitComponent(p string) bool {
+	return slices.Contains(strings.Split(p, string(filepath.Separator)), ".git")
+}
+
 // target is a checked path: its resolved parent and its last component.
 type target struct {
 	parent, base, path string
@@ -123,6 +154,9 @@ func (t *Trash) check(path string) (target, error) {
 		return target{}, fmt.Errorf("parent of %s: %w", clean, err)
 	}
 	real := filepath.Join(parent, base)
+	if hasGitComponent(clean) || hasGitComponent(real) {
+		return target{}, fmt.Errorf("refused: %s is or lies inside a .git directory", real)
+	}
 	roots := resolvedDirs(t.Roots)
 	if len(roots) == 0 {
 		return target{}, errors.New("refused: no allowed roots are configured (trash_roots)")
@@ -139,9 +173,17 @@ func (t *Trash) check(path string) (target, error) {
 	if !inRoot {
 		return target{}, fmt.Errorf("refused: %s (resolved from %s) is outside the allowed roots %v", real, clean, roots)
 	}
-	for _, p := range resolvedDirs(append(slices.Clone(t.Protected), t.Dir)) {
-		if real == p || within(real, p) || within(p, real) {
-			return target{}, fmt.Errorf("refused: %s is or touches the protected dir %s", real, p)
+	// A symlink is moved as the link, but one that resolves to a protected path may be the very name
+	// something runs it by: it is refused too.
+	full, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		full = real
+	}
+	for _, p := range protectedPaths(append(slices.Clone(t.Protected), t.Dir)) {
+		for _, c := range []string{real, full} {
+			if c == p || within(c, p) || within(p, c) {
+				return target{}, fmt.Errorf("refused: %s is or touches the protected path %s", real, p)
+			}
 		}
 	}
 	return target{parent: parent, base: base, path: real}, nil
