@@ -76,7 +76,7 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -211,17 +211,34 @@ func cannot(form string) string {
 var indirect = map[string]bool{
 	"git": true, "gh": true, "eval": true, "env": true, "xargs": true, "exec": true, "command": true,
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
+	"npx": true, "pnpx": true, "bunx": true, "uvx": true,
 }
 
 // agents are coding agents a job must not start: a job is a leaf, nested agents would run outside
-// the job's settings, hook and limits.
+// the job's settings, hook and limits. Package names (`claude-code`, `gemini-cli`, `aider-chat`) and
+// any other `<agent>-<suffix>` count too (isAgent).
 var agents = map[string]bool{
-	"claude": true, "claude-code": true, "codex": true, "gemini": true, "aider": true, "cursor-agent": true,
+	"claude": true, "claude-code": true, "codex": true, "gemini": true, "gemini-cli": true, "aider": true,
+	"aider-chat": true, "cursor-agent": true,
+}
+
+// isAgent reports a lower-cased base name that is an agent or an agent with a `-suffix`.
+func isAgent(b string) bool {
+	if agents[b] {
+		return true
+	}
+	for a := range agents {
+		if strings.HasPrefix(b, a+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // execName reports a lower-cased base name that, as an argument, names something that runs commands
-// the guard would not see: git (any git-<sub>), gh, a shell, a wrapper/indirect program or an agent.
-func execName(b string) bool { return indirect[b] || shells[b] || agents[b] || isGitName(b) }
+// the guard would not see: git (any git-<sub>), gh, a shell, a wrapper/indirect program, a package
+// runner or an agent.
+func execName(b string) bool { return indirect[b] || shells[b] || isAgent(b) || isGitName(b) }
 
 // mentionsExec reports a word (e.g. a substitution `$(which git)`) that names an execName program.
 func mentionsExec(w string) bool {
@@ -328,8 +345,9 @@ var (
 	// reMention finds git/gh, an agent or a shell as a word inside an argument, e.g. in interpreter code
 	// (`python3 -c '…subprocess.run(["claude", …])'`, `node -e '…codex…'`) or a package path
 	// (`npx @anthropic-ai/claude-code`, `node …/claude-code/cli.js`).
-	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])(git|gh|claude|claude-code|codex|gemini|aider|cursor-agent|` +
-		`sh|bash|zsh|dash|fish)($|[^a-z0-9_-])`)
+	// Agent names may carry a `-suffix` (`gemini-cli`, `aider-chat`, `@google/gemini-cli`, `codex-cli`).
+	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((git|gh|sh|bash|zsh|dash|fish)($|[^a-z0-9_-])|` +
+		`(claude|codex|gemini|aider|cursor-agent)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
 )
 
@@ -462,12 +480,50 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	return ""
 }
 
+// packageRunners fetch and run a package by name (npx, pnpm dlx, …): what runs is decided by a
+// registry, not by the command line, and a job has no need for them. Value: the subcommand words
+// that make the program a runner ("" = the program itself).
+var packageRunners = map[string][]string{
+	"npx": {""}, "pnpx": {""}, "bunx": {""}, "uvx": {""},
+	"npm": {"exec", "x"}, "pnpm": {"dlx"}, "yarn": {"dlx"}, "bun": {"x"}, "pipx": {"run"}, "uv": {"tool run"},
+}
+
+// checkPackageRunners rejects package runners: npx/pnpx/bunx/uvx, npm exec|x, pnpm dlx, yarn dlx,
+// bun x, pipx run, uv tool run. The subcommand is looked for among the first three positional words
+// (an option value before it would otherwise hide it).
+func checkPackageRunners(scripts []*script, _ string, _ Config) string {
+	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		if len(argv) == 0 {
+			return ""
+		}
+		name := strings.ToLower(base(argv[0]))
+		subs, ok := packageRunners[name]
+		if !ok {
+			return ""
+		}
+		var pos []string
+		for _, a := range argv[1:] {
+			if !strings.HasPrefix(a, "-") && len(pos) < 3 {
+				pos = append(pos, strings.ToLower(a))
+			}
+		}
+		joined := " " + strings.Join(pos, " ") + " "
+		for _, s := range subs {
+			if s == "" || strings.Contains(joined, " "+s+" ") {
+				return "blocked by guard: `" + strings.TrimSpace(name+" "+s) + "` fetches and runs a package by name " +
+					"(npx, pnpm dlx, yarn dlx, bunx, uvx, pipx run …); a job does not use package runners."
+			}
+		}
+		return ""
+	})
+}
+
 // checkNestedAgents: a job is a leaf. claude/claude-code/codex/gemini/aider/cursor-agent are rejected as a
 // command (also behind env/command/exec and as a path); as an argument they are caught by the
 // indirect scan in unverifiable.
 func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
-		if len(argv) > 0 && agents[strings.ToLower(base(argv[0]))] {
+		if len(argv) > 0 && isAgent(strings.ToLower(base(argv[0]))) {
 			return "blocked by guard: `" + base(argv[0]) + "` starts a nested agent. A job is a leaf: it does the work itself " +
 				"and reports; only the orchestrator starts jobs."
 		}
@@ -545,7 +601,7 @@ var reGitFiles = regexp.MustCompile(`(?i)((^|/)\.git/(config|hooks|worktrees/[^/
 var gitFileReaders = map[string]bool{
 	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "cat": true,
 	"ls": true, "head": true, "tail": true, "wc": true, "file": true, "stat": true, "test": true, "[": true,
-	"less": true, "diff": true,
+	"less": true, "diff": true, "pgrep": true, "ps": true, "which": true, "type": true, "whereis": true,
 }
 
 // gitDirTargets take a directory as a destination or a new working directory: with `.git` itself as
@@ -572,19 +628,30 @@ func gitFile(w string) bool { return reGitFiles.MatchString(w) || reGitFiles.Mat
 // gitDir reports a word naming a `.git` directory itself.
 func gitDir(w string) bool { return strings.EqualFold(filepath.Base(pathOf(w)), ".git") }
 
-// gitGlob reports a glob/brace word the shell could expand into a path through `.git`: it mentions
-// `.git`, or one of its segments matches `.git` (`.gi?/config`, `.[g]it/hooks`). A segment that starts
-// with `*` or `?` does not match a dot file in the shell.
-func gitGlob(w string) bool {
-	if !hasGlob(w) {
+// globBlocked is the reason for a glob/brace word where a write could land: the guard does not
+// evaluate globs (dotglob, braces and `*` can all resolve to `.git`), it rejects them.
+func globBlocked(w string) string {
+	return "blocked by guard: `" + w + "` is a glob/brace word in a redirection or an argument of a program " +
+		"that may write; the guard does not expand globs (one could resolve to .git). Write the paths out."
+}
+
+// dotGlobOn reports a command that makes globs match dot files (`.git`): bash `shopt -s dotglob`,
+// a GLOBIGNORE assignment (bash then matches dot files), zsh `setopt globdots` / `set -o globdots`
+// (zsh option names ignore case and underscores).
+func dotGlobOn(c *simpleCmd, argv []string) bool {
+	for _, w := range c.words {
+		if strings.HasPrefix(w, "GLOBIGNORE=") {
+			return true
+		}
+	}
+	if len(argv) == 0 {
 		return false
 	}
-	if strings.Contains(strings.ToLower(w), ".git") {
-		return true
-	}
-	for _, s := range strings.Split(w, "/") {
-		if s != "" && s[0] != '*' && s[0] != '?' {
-			if ok, _ := filepath.Match(strings.ToLower(s), ".git"); ok {
+	switch strings.ToLower(base(argv[0])) {
+	case "shopt", "setopt", "unsetopt", "set":
+		for _, a := range argv[1:] {
+			n := strings.ReplaceAll(strings.ToLower(a), "_", "")
+			if strings.Contains(n, "dotglob") || strings.Contains(n, "globdots") {
 				return true
 			}
 		}
@@ -593,9 +660,11 @@ func gitGlob(w string) bool {
 }
 
 // checkGitFiles rejects writes into the repository config, hooks or $GIT_DIR: an output redirection
-// to such a path or to `.git` (any program), such a path or a glob through `.git` as an argument of a
-// program that is not a plain reader (tee, cp, mv, ln, sed -i, chmod, …), and `.git` itself as the
-// target of cd/pushd/ln/cp/mv/tee/install/rsync. git itself is checked by the config allowlist instead.
+// to such a path or to `.git` (any program), such a path as an argument of a program that is not a
+// plain reader (tee, cp, mv, ln, sed -i, chmod, …), and `.git` itself as the target of
+// cd/pushd/ln/cp/mv/tee/install/rsync. Globs are not evaluated: any glob/brace word in a redirection
+// target or in an argument of a non-reader is rejected (fail closed), as is turning on dotglob/globdots.
+// git itself is checked by the config allowlist instead.
 func checkGitFiles(scripts []*script, _ string, _ Config) string {
 	blocked := func(p string) string {
 		return "blocked by guard: `" + p + "` is git's config, hooks or $GIT_DIR; a job does not write there " +
@@ -605,11 +674,17 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				for _, t := range c.outRedirs {
-					if gitFile(t) || gitDir(t) || gitGlob(t) {
+					if gitFile(t) || gitDir(t) {
 						return blocked(t)
+					}
+					if hasGlob(t) {
+						return globBlocked(t)
 					}
 				}
 				argv := argvOf(c.words)
+				if dotGlobOn(c, argv) {
+					return "blocked by guard: dotglob/globdots (or GLOBIGNORE) makes globs match .git; a job does not change glob options."
+				}
 				if len(argv) == 0 {
 					continue
 				}
@@ -617,13 +692,16 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				if isGitName(name) || gitFileReaders[name] {
 					continue
 				}
-				// find without an action only matches names: `find . -not -path '*/.git/*'` is a filter.
+				// find without an action only matches names: `find . -name '*.go'` is a filter.
 				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 				})
 				for _, a := range argv[1:] {
-					if gitFile(a) || (gitGlob(a) && !findFilter) || (gitDirTargets[name] && gitDir(a)) {
+					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
+					}
+					if hasGlob(a) && !findFilter {
+						return globBlocked(a)
 					}
 				}
 			}

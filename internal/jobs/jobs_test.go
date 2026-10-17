@@ -265,7 +265,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "WebFetch", "WebSearch"} {
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}
@@ -374,7 +374,11 @@ func TestDaemonRestartDoesNotKillOrLoseJob(t *testing.T) {
 	if err := d.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "job running", 10*time.Second, func() bool { return get(t, m, j.ID).Status == store.StatusRunning })
+	// The job is marked running when claimed, before the wrapper starts: wait for its pid as well.
+	waitFor(t, "job running", 10*time.Second, func() bool {
+		g := get(t, m, j.ID)
+		return g.Status == store.StatusRunning && g.PID > 0
+	})
 	// Hard-kill the daemon mid-job.
 	_ = d.Process.Kill()
 	_ = d.Wait()
