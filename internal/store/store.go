@@ -247,6 +247,13 @@ func (s *Store) ListRecentByStatus(status string, limit int) ([]*Job, error) {
 	return s.query(`WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, status, limit)
 }
 
+// ListActivity returns jobs created or finished at or after since, plus every queued and running
+// job, newest first, at most limit rows.
+func (s *Store) ListActivity(since time.Time, limit int) ([]*Job, error) {
+	return s.query(`WHERE created_at >= ? OR finished_at >= ? OR status IN ('queued','running')
+		ORDER BY created_at DESC, rowid DESC LIMIT ?`, since.Unix(), since.Unix(), limit)
+}
+
 // PendingCleanup returns finished, notified, not yet cleaned jobs.
 func (s *Store) PendingCleanup() ([]*Job, error) {
 	return s.query(`WHERE status NOT IN ('queued','running') AND notified_at IS NOT NULL AND cleaned_at IS NULL ORDER BY finished_at`)

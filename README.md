@@ -153,7 +153,9 @@ The last section is mandatory and is read first: it makes the job name what it d
 
 and sets the ref `refs/agent-jobs/jobs/<id>` in the source repository to the job's last commit. Restoring the work in a fresh worktree at the base commit is four commands; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#flows). If the repository config names a filter, diff command or textconv, no patch is made (a diff would run that program); the worktree is kept for a human and the reason is logged.
 
-Pruning job folders older than 48 hours and the daily ghost-process check are planned (Wave A).
+**Prune.** `agent-jobs prune --agent A [--dry-run]` cleans the folders of jobs that finished more than 48 hours ago: the records (`report.md`, the patches, `base_commit`, `diffstat.txt`) and small top-level text files (≤ 1 MiB, e.g. `prompt.md`, `stderr.log`) stay; subdirectories (the work dir, caches, builds), binaries, large files and symlinks go (a link is removed, never followed). A repo job whose cleanup has not run yet is skipped, and a worktree cleanup kept for a human is left alone.
+
+**Ghost processes.** `agent-jobs doctor procs --agent A [--kill]` finds processes that outlived their job or session (processes still carrying a finished job's `AGENT_JOBS_JOB` marker, markerless leftovers in a finished job's session), running rows with a dead wrapper pid, and *suspects*: preview servers, browsers and wait loops whose session leader is gone. It only reports; `--kill` ends the processes proven to belong to a finished job (SIGTERM, then SIGKILL, through a pidfd re-checked against the scanned start time). Suspects are never killed. Running both once a day on their own is planned (Wave B).
 
 ---
 
@@ -188,6 +190,16 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
 
+**System and file tools** (orchestrator only):
+
+| tool | what it does |
+|---|---|
+| `system_doctor` | disk (free space, what `prune` would free), queue, ghost processes and dead running rows (report only), hooks (the guard blocks `git push` and allows `ls`, owner rules readable, notify target exists); `ok=false` lists the problems |
+| `system_logs` | the last lines of the daemon log (`<state>/daemon.log` under launchd, else the systemd user journal of `agent-jobs@<agent>`), or with `job_id` that job's `stderr.log` |
+| `activity_report` | jobs started and finished over a window (default 24 h): counts by status, cost, turns, time, the jobs themselves |
+| `trash_move` | reversible deletion instead of `rm`: one rename into `~/.agent-jobs/<agent>/trash/<id>/`; only absolute paths inside `trash_roots` (config; default the home directory), never the state dir, symlinks never followed out, never across filesystems |
+| `trash_restore` | put an entry back at its original path; refused when the path is occupied (nothing is overwritten) or no longer inside a root |
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -197,8 +209,8 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
 | Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
 | Team | `send_message`, `inbox` | none | planned, Wave A |
-| System | `system_doctor`, `system_logs`, `activity_report` | none | planned, Wave A |
-| Files | `trash_move`, `trash_restore` | none | planned, Wave A |
+| System | `system_doctor`, `system_logs`, `activity_report` | none | built |
+| Files | `trash_move`, `trash_restore` | none | built |
 | Schedules | `schedule_add`, `schedule_list`, `schedule_remove` | none | planned, Wave B |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | planned, Wave B |
 | Owner | `notify_owner` | none | planned, Wave B |
@@ -275,6 +287,8 @@ agent-jobs list   --agent my-agent
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
+agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs finished > 48 h ago
+agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```

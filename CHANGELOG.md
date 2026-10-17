@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Nested-job prevention: job marker `AGENT_JOBS_JOB`; the binary refuses control commands under the marker, under a wrapper ancestor, in a wrapper's session or in a running job's session; guard rules against `agent-jobs` as a command and against changing `AGENT_JOBS_*` (incl. `mapfile`/`readarray`, `printf -v`).
 - Session sweep: after claude exits the wrapper ends every other process of the job's session before writing `exit_code`. Signals go through a pidfd opened before the membership check, so a reused pid is never signalled; without pidfd support nothing is signalled. If processes survive or the sweep fails, the wrapper writes a `sweep_incomplete` marker and the daemon fails the job with «processes survived the job», which the job-done line repeats.
 
+- `agent-jobs prune [--dry-run] [--json]`: folders of jobs finished more than 48 hours ago keep the records (`report.md`, patches, `base_commit`, `diffstat.txt`) and small top-level text files (≤ 1 MiB); subdirectories, binaries, large files and symlinks (removed as links, never followed) go. Repo jobs whose cleanup has not run are skipped; a worktree kept for a human is left alone. Runs under the lifecycle lock.
+- `agent-jobs doctor procs [--kill] [--json]`: finds processes carrying a finished job's marker, markerless leftovers in a finished job's session (leader gone, started after the job), running rows with a dead wrapper pid, and suspects (preview servers, browsers, wait loops whose session leader is gone). Report only by default; `--kill` ends the job ghosts (never suspects) through a pidfd after re-checking start time and session.
+- Orchestrator MCP tools `system_doctor` (disk, queue, processes, hooks), `system_logs` (daemon log or a job's `stderr.log`), `activity_report` (jobs over a window), `trash_move` / `trash_restore` (reversible deletion by rename into `<state>/trash/<id>/`, `renameat2(RENAME_NOREPLACE)` on a re-checked parent descriptor). None of them is open to jobs.
+- Config `trash_roots` (default: the home directory).
+
 ### Changed
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
 

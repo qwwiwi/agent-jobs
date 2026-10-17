@@ -25,6 +25,12 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
 - Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
+**This PR: prune, doctor procs, system and file tools.**
+
+- `agent-jobs prune [--dry-run]`: folders of jobs finished more than 48 hours ago keep their records and small top-level text files; work dirs, caches, builds, binaries, large files and symlinks go.
+- `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #12).
+- Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
+
 ## Wave A
 
 - **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
@@ -35,10 +41,6 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
   5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
 - **`agent-jobs` skill.** A SKILL.md, installed per agent, that teaches the MCP tools and the routing rule: do it yourself (minutes), a subagent (the session needs the result now), or a job (long, background, overnight, must survive a restart).
 - **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs.
-- **`prune`.** Clean folders of jobs finished more than 48 hours ago; keep the records (report, patches, `base_commit`) and small top-level text files, drop binaries, caches and builds.
-- **`doctor procs`.** Find processes that outlived their job or session: preview servers, browsers, wait loops, running rows with a dead pid. Reports by default, kills only on a flag.
-- **System tools:** `system_doctor` (disk, processes, hooks), `system_logs`, `activity_report`.
-- **Files:** `trash_move`, `trash_restore`: reversible deletion instead of `rm`.
 - **Memory, tasks and team tools via the shared brain.** `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
 - **Memory notes in the brief.** The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 - **Job context.** A general job profile (≤ 8 KB) generated from the agent's own rules, plus short per-project cards (stack, check runner, what not to touch, known traps).
