@@ -206,7 +206,7 @@ ENVFILE
   echo "  created (all settings commented out)"
 fi
 
-echo "== state (agent-jobs init --agent $INSTANCE)"
+echo "== state (agent-jobs init --agent $INSTANCE --pin-scope)"
 # Same environment as the service: the env file may move the state root.
 # Parsed, never sourced: only KEY=VALUE lines (systemd EnvironmentFile syntax, optional quotes).
 (
@@ -217,7 +217,8 @@ echo "== state (agent-jobs init --agent $INSTANCE)"
     if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
     export "$key=$val"
   done <"$ENV_FILE"
-  "$BIN" init --agent "$INSTANCE"
+  # --pin-scope: where user scopes work, cgroup_scope=required (no silent fallback to session containment).
+  "$BIN" init --agent "$INSTANCE" --pin-scope
 ) | sed 's/^/  /'
 
 echo "== systemd"

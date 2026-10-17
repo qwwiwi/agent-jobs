@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -213,7 +214,7 @@ func TestScopeRefusesAndKillsSetsidOrphan(t *testing.T) {
 	if done := get(t, m, j.ID); done.Status != store.StatusSucceeded {
 		t.Fatalf("job: %s %q", done.Status, done.Error)
 	}
-	if st, err := scopeState(running.ScopeUnit); err != nil || st != "inactive" {
+	if st, _, err := scopeState(running.ScopeUnit); err != nil || st != "inactive" {
 		t.Fatalf("scope after the job: %q %v", st, err)
 	}
 }
@@ -286,7 +287,7 @@ func TestScopeStoppedOnCancelAndTimeout(t *testing.T) {
 			if !gone(o.pid) {
 				t.Fatalf("setsid orphan %d survived the %s", o.pid, how)
 			}
-			if st, err := scopeState(unit); err != nil || st != "inactive" {
+			if st, _, err := scopeState(unit); err != nil || st != "inactive" {
 				t.Fatalf("scope after %s: %q %v", how, st, err)
 			}
 		})
@@ -344,7 +345,7 @@ func TestDaemonUnitRestartLeavesJobScope(t *testing.T) {
 	if out, err := systemdCmd(t.Context(), "systemctl", "--user", "restart", svc).CombinedOutput(); err != nil {
 		t.Fatalf("restart daemon unit: %v %s", err, out)
 	}
-	if st, err := scopeState(running.ScopeUnit); err != nil || st != "active" || !alive(running.PID) {
+	if st, _, err := scopeState(running.ScopeUnit); err != nil || st != "active" || !alive(running.PID) {
 		t.Fatalf("daemon restart touched the job: scope %q %v, wrapper alive %v", st, err, alive(running.PID))
 	}
 	waitFor(t, "exit_code", 30*time.Second, func() bool {
@@ -356,5 +357,258 @@ func TestDaemonUnitRestartLeavesJobScope(t *testing.T) {
 	}
 	if got := get(t, m, j.ID); got.Status != store.StatusSucceeded || got.Turns != 3 {
 		t.Fatalf("after the restart: %s %q", got.Status, got.Error)
+	}
+}
+
+// fakeSystemctl points systemctlBin at a script that fails every call until ok() is called; after that
+// `show` reports the unit gone (not loaded). The sweep fallback finds no cgroup (cgroupRoot is empty).
+func fakeSystemctl(t *testing.T) (ok func()) {
+	t.Helper()
+	dir := t.TempDir()
+	okFile := filepath.Join(dir, "ok")
+	body := "#!/bin/bash\n[ -e " + okFile + " ] || { echo 'Failed to connect to bus' >&2; exit 1; }\n" +
+		"case \" $* \" in *' show '*) printf 'ActiveState=inactive\\nControlGroup=\\n' ;; esac\n"
+	bin := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldBin, oldRoot := systemctlBin, cgroupRoot
+	systemctlBin, cgroupRoot = bin, t.TempDir()
+	t.Cleanup(func() { systemctlBin, cgroupRoot = oldBin, oldRoot })
+	return func() {
+		if err := os.WriteFile(okFile, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// scopedRow is a claimed running job that records a scope unit (no process behind it).
+func scopedRow(t *testing.T, m *Manager) *store.Job {
+	t.Helper()
+	j := enqueue(t, m, "x", nil)
+	if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetScope(j.ID, "tok", ScopeUnit(m.Agent, j.ID)); err != nil {
+		t.Fatal(err)
+	}
+	return get(t, m, j.ID)
+}
+
+// A scope stop that fails does not leave a terminal row with nothing retrying: the stop is recorded as
+// pending before the row turns terminal, shown on the job-done line, retried every tick, and cleared only
+// once the unit is gone. Covers finish (collect), timeout and cancel.
+func TestFailedScopeStopIsRetried(t *testing.T) {
+	m := newManager(t)
+	ok := fakeSystemctl(t)
+
+	done := scopedRow(t, m)
+	m.finish(done, store.StatusSucceeded, StreamResult{}, 0, "", m.Now())
+	timedOut := scopedRow(t, m)
+	m.finish(timedOut, store.StatusTimeout, StreamResult{}, 0, "timeout after 1 minutes", m.Now())
+	cancelled := scopedRow(t, m)
+	if err := m.Cancel(cancelled.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		j      *store.Job
+		status string
+	}{{done, store.StatusFailed}, {timedOut, store.StatusTimeout}, {cancelled, store.StatusCancelled}} {
+		got := get(t, m, c.j.ID)
+		if got.Status != c.status || !got.ScopePending || !strings.Contains(got.Error, ReasonSurvivors) {
+			t.Fatalf("after a failed stop: %s pending=%v %q, want %s pending", got.Status, got.ScopePending, got.Error, c.status)
+		}
+		if line := DoneLine(got); !strings.Contains(line, "stop pending") || !strings.Contains(line, ReasonSurvivors) {
+			t.Fatalf("job-done line hides the pending stop: %q", line)
+		}
+	}
+	// Still failing: the next tick keeps it pending.
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !get(t, m, done.ID).ScopePending {
+		t.Fatal("a tick whose stop failed cleared the pending mark")
+	}
+	ok()
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range []*store.Job{done, timedOut, cancelled} {
+		if got := get(t, m, j.ID); got.ScopePending {
+			t.Fatalf("job %s: pending after a successful retry", j.ID)
+		}
+	}
+}
+
+// A unit that is failed but still has processes in its cgroup is not stopped (L3 of the PR #10 review).
+func TestFailedUnitWithMembersIsNotStopped(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cgroups are Linux")
+	}
+	m := newManager(t)
+	dir := t.TempDir()
+	body := "#!/bin/bash\ncase \" $* \" in *' show '*) printf 'ActiveState=failed\\nControlGroup=/x.scope\\n' ;; esac\n"
+	bin := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(bin, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "x.scope"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A member the sweep cannot verify (its /proc/<pid>/cgroup is not /x.scope): it is left, so the
+	// cgroup is not provably empty.
+	if err := os.WriteFile(filepath.Join(root, "x.scope", "cgroup.procs"), []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldBin, oldRoot := systemctlBin, cgroupRoot
+	systemctlBin, cgroupRoot = bin, root
+	t.Cleanup(func() { systemctlBin, cgroupRoot = oldBin, oldRoot })
+	if err := m.stopScope("261017-000000-0000"); err == nil {
+		t.Fatal("a failed unit with processes in its cgroup counted as stopped")
+	}
+}
+
+// Cancel with a broken user bus does not rely on the wrapper's process group: the daemon sweeps the
+// scope's cgroup itself, so a setsid orphan (outside that group) dies too.
+func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
+	requireSetsid(t)
+	m := scopedManager(t)
+	t.Setenv("AGENT_JOBS_SELF", selfBin)
+	j := enqueue(t, m, "FAKE_SETSID_ORPHAN FAKE_SLEEP=60", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	o := readOrphan(t, m.JobDir(j.ID))
+	t.Cleanup(func() { _ = syscall.Kill(o.pid, syscall.SIGKILL) })
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := systemctlBin
+	systemctlBin = bin
+	t.Cleanup(func() { systemctlBin = old })
+	if err := m.Cancel(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !gone(o.pid) {
+		t.Fatalf("setsid orphan %d survived a cancel without the user bus", o.pid)
+	}
+	if got := get(t, m, j.ID); got.Status != store.StatusCancelled || got.ScopePending {
+		t.Fatalf("cancel: %s pending=%v %q", got.Status, got.ScopePending, got.Error)
+	}
+}
+
+// fakeProbe makes probeScope fail (or succeed) for one test.
+func fakeProbe(t *testing.T, err error) {
+	t.Helper()
+	old := probeScope
+	probeScope = func() error { return err }
+	t.Cleanup(func() { probeScope = old })
+}
+
+// In auto (and required), a failing probe on a host where a scope worked before requeues the job for
+// up to ScopeRetryWindow instead of downgrading it; after the window auto falls back (visibly) and
+// required refuses. On a host that never had a scope, auto falls back at once.
+func TestScopeProbeFailureRequeuesOnceScopesWorked(t *testing.T) {
+	for _, mode := range []string{ScopeAuto, ScopeRequired} {
+		t.Run(mode, func(t *testing.T) {
+			m := newManager(t)
+			t.Setenv("AGENT_JOBS_CGROUP_SCOPE", mode)
+			fakeProbe(t, errors.New("bus timeout"))
+			if err := os.WriteFile(filepath.Join(m.StateDir, scopeOKFile), []byte("x\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			j := enqueue(t, m, "x", nil)
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			if got := get(t, m, j.ID); got.Status != store.StatusQueued || got.StartedAt != nil || got.LaunchToken != "" {
+				t.Fatalf("within the window: %s started=%v token=%q, want requeued", got.Status, got.StartedAt, got.LaunchToken)
+			}
+			if _, err := os.Stat(m.JobDir(j.ID)); err == nil {
+				t.Fatal("a requeued job was prepared")
+			}
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(ScopeRetryWindow + time.Minute) }
+			if mode == ScopeRequired {
+				if err := m.Tick(); err != nil {
+					t.Fatal(err)
+				}
+				if got := get(t, m, j.ID); got.Status != store.StatusFailed || !strings.Contains(got.Error, "required") {
+					t.Fatalf("required after the window: %s %q", got.Status, got.Error)
+				}
+				return
+			}
+			got := runToEnd(t, m, j.ID)
+			if got.Status != store.StatusSucceeded || Containment(got) != "session only" ||
+				!strings.Contains(DoneLine(got), "session only") {
+				t.Fatalf("auto after the window: %s %q %q", got.Status, Containment(got), DoneLine(got))
+			}
+		})
+	}
+	t.Run("never worked", func(t *testing.T) {
+		m := newManager(t)
+		t.Setenv("AGENT_JOBS_CGROUP_SCOPE", ScopeAuto)
+		fakeProbe(t, errors.New("no systemd"))
+		got := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
+		if got.Status != store.StatusSucceeded || Containment(got) != "session only" {
+			t.Fatalf("auto on a host without scopes: %s %q", got.Status, Containment(got))
+		}
+	})
+}
+
+// The installer's pin: cgroup_scope=required only when unset and a scope works; other keys stay.
+func TestPinScopeRequired(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfg, []byte(`{"notify_tmux_target":"s:0"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeProbe(t, errors.New("no bus"))
+	if msg, err := PinScopeRequired(dir); err != nil || !strings.Contains(msg, "left at auto") {
+		t.Fatalf("probe failing: %q %v", msg, err)
+	}
+	fakeProbe(t, nil)
+	if msg, err := PinScopeRequired(dir); err != nil || !strings.Contains(msg, "set to required") {
+		t.Fatalf("probe ok: %q %v", msg, err)
+	}
+	c, err := LoadConfig(dir)
+	if err != nil || c.CgroupScope != ScopeRequired || c.NotifyTmuxTarget != "s:0" {
+		t.Fatalf("config after pin: %+v %v", c, err)
+	}
+	if err := os.WriteFile(cfg, []byte(`{"cgroup_scope":"off"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := PinScopeRequired(dir); err != nil || !strings.Contains(msg, "left as is") {
+		t.Fatalf("explicit setting: %q %v", msg, err)
+	}
+	if c, _ := LoadConfig(dir); c.CgroupScope != ScopeOff {
+		t.Fatalf("pin overwrote an explicit cgroup_scope: %q", c.CgroupScope)
+	}
+}
+
+// A wrapper moved into a sub-cgroup of its scope still sweeps from the scope itself (L1 of the PR #10
+// review).
+func TestOwnJobScopeFromSubCgroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cgroups are Linux")
+	}
+	f := filepath.Join(t.TempDir(), "cgroup")
+	old := cgroupFile
+	cgroupFile = f
+	t.Cleanup(func() { cgroupFile = old })
+	for _, c := range []struct{ content, want string }{
+		{"0::/u/app.slice/agent-jobs-a-1.scope\n", "/u/app.slice/agent-jobs-a-1.scope"},
+		{"0::/u/app.slice/agent-jobs-a-1.scope/sub/deeper\n", "/u/app.slice/agent-jobs-a-1.scope"},
+		{"0::/u/app.slice/agent-jobs-a-2.scope/sub\n", ""},
+	} {
+		if err := os.WriteFile(f, []byte(c.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := ownJobScope("agent-jobs-a-1.scope"); got != c.want {
+			t.Errorf("ownJobScope for %q = %q, want %q", c.content, got, c.want)
+		}
 	}
 }

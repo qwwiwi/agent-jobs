@@ -44,10 +44,28 @@ func Printable(s string, max int) string {
 func DoneLine(j *store.Job) string {
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
 		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
+	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
+		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
+	}
 	if strings.Contains(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
 	}
 	return line
+}
+
+// Containment says how a launched job's processes were contained: "scope <unit>" (its own systemd user
+// scope; "…, stop pending" while a failed stop is retried) or "session only" (the weaker fallback:
+// cgroup_scope off, or auto without a working user manager). "" for a job that never launched.
+func Containment(j *store.Job) string {
+	switch {
+	case j.ScopeUnit != "" && j.ScopePending:
+		return "scope " + j.ScopeUnit + ", stop pending"
+	case j.ScopeUnit != "":
+		return "scope " + j.ScopeUnit
+	case j.StartedAt == nil:
+		return ""
+	}
+	return "session only"
 }
 
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
@@ -104,6 +122,9 @@ func (m *Manager) cleanupDue() error {
 	for _, j := range jobs {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
+		}
+		if j.ScopePending {
+			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
 		if err := m.Cleanup(j); err != nil {
 			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %v", j.ID, err)

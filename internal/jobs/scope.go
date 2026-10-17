@@ -34,10 +34,12 @@ import (
 // leaves the session (docs/ARCHITECTURE.md, «Cgroup containment»).
 //
 // What a scope does not close: a process of the same user can write its pid into another cgroup's
-// cgroup.procs under the user manager, or ask the user manager for a new unit over D-Bus. The wrapper
-// removes the bus address from the job's environment and the guard rejects the direct spellings
-// (systemd-run, systemctl --user, busctl, dbus-send, gdbus, writes under /sys/fs/cgroup), but a
-// script the job writes is not inspected (not a sandbox).
+// cgroup.procs under the user manager, ask the user manager for a new unit over D-Bus, or have a daemon
+// outside the scope (cron, tmux, pm2, docker, ssh, …) start a process for it. The wrapper removes the
+// bus address from the job's environment and the guard rejects the direct spellings (systemd-run,
+// systemctl --user, D-Bus tools, crontab/at, tmux/screen, pm2, docker/podman, ssh, machinectl,
+// loginctl, unshare/nsenter, writes under /sys/fs/cgroup), but a script the job writes is not
+// inspected (not a sandbox).
 
 // Containment modes (config cgroup_scope, env AGENT_JOBS_CGROUP_SCOPE).
 const (
@@ -123,8 +125,9 @@ func procCgroup(pid int) (string, error) {
 // inSubtree reports whether cgroup path p is scope or a cgroup below it.
 func inSubtree(p, scope string) bool { return p == scope || strings.HasPrefix(p, scope+"/") }
 
-// ownJobScope returns this process's cgroup v2 path when its last component is want (the wrapper's
-// expected scope), else "". Only then does the wrapper sweep by cgroup.
+// ownJobScope returns the cgroup v2 path of want (the wrapper's expected scope) when this process runs
+// in it or in a sub-cgroup below it (a job can create one and move the wrapper there), else "". Only
+// then does the wrapper sweep by cgroup, from the scope itself.
 func ownJobScope(want string) string {
 	if runtime.GOOS != "linux" || want == "" {
 		return ""
@@ -134,10 +137,16 @@ func ownJobScope(want string) string {
 		return ""
 	}
 	p, ok := unifiedPath(string(b))
-	if !ok || filepath.Base(p) != want {
+	if !ok {
 		return ""
 	}
-	return p
+	parts := strings.Split(p, "/")
+	for i, c := range parts {
+		if c == want {
+			return strings.Join(parts[:i+1], "/")
+		}
+	}
+	return ""
 }
 
 // cgroupMembers lists the pids in the cgroup subtree at path (cgroup v2), except this process. A
@@ -220,6 +229,9 @@ func (c Config) scopeMode() string {
 	return m
 }
 
+// probeScope is ProbeScope; a variable so tests can make the user manager fail.
+var probeScope = ProbeScope
+
 // ProbeScope checks that a transient user scope can be created right now: it runs `true` in a
 // throwaway scope. Linux only.
 func ProbeScope() error {
@@ -256,61 +268,178 @@ func scopeArgv(unit, description string, grace time.Duration) []string {
 		fmt.Sprintf("--property=TimeoutStopSec=%ds", secs), "--"}
 }
 
+// ScopeRetryWindow is how long a launch waits (requeued every tick) for the user manager on a host where
+// a scope was created before, before auto falls back to session containment and required refuses.
+const ScopeRetryWindow = 10 * time.Minute
+
+// errScopeRetry asks launchQueued to put the job back into the queue: no scope right now, but this host
+// had working scopes, so the failure is taken as transient (bus hiccup, user manager restarting).
+var errScopeRetry = errors.New("no cgroup scope right now; job requeued")
+
+// Host state of the probe, in the state dir: scope-ok once a scope was created on this host (never
+// removed), scope-failing-since while probes fail after that (removed on the next success).
+const (
+	scopeOKFile      = "scope-ok"
+	scopeFailingFile = "scope-failing-since"
+)
+
 // scopeFor decides the containment of a launch: the scope unit to launch in, or "" for session
-// containment only. In required mode a missing scope refuses the launch.
+// containment only. In required mode a missing scope refuses the launch. Once a scope worked on this
+// host, a failing probe requeues the job (errScopeRetry) for up to ScopeRetryWindow instead of
+// downgrading it (auto) or refusing it (required) on a transient failure.
 func (m *Manager) scopeFor(id string) (string, error) {
 	switch mode := m.Cfg.scopeMode(); mode {
 	case ScopeOff:
 		return "", nil
 	case ScopeAuto, ScopeRequired:
-		if err := ProbeScope(); err != nil {
-			if mode == ScopeRequired {
-				return "", fmt.Errorf("cgroup_scope is required but no scope can be created: %w", err)
+		err := probeScope()
+		if err == nil {
+			_ = os.Remove(filepath.Join(m.StateDir, scopeFailingFile))
+			if _, serr := os.Stat(filepath.Join(m.StateDir, scopeOKFile)); serr != nil {
+				_ = os.WriteFile(filepath.Join(m.StateDir, scopeOKFile), []byte(m.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
 			}
-			m.Log.Printf("job %s: no cgroup scope (%v); session containment only (weaker, see docs/ARCHITECTURE.md)", id, err)
-			return "", nil
+			return ScopeUnit(m.Agent, id), nil
 		}
-		return ScopeUnit(m.Agent, id), nil
+		if since, ok := m.scopeFailingSince(); ok && m.Now().Sub(since) < ScopeRetryWindow {
+			return "", fmt.Errorf("%w (failing since %s): %v", errScopeRetry, since.UTC().Format(time.RFC3339), err)
+		}
+		if mode == ScopeRequired {
+			return "", fmt.Errorf("cgroup_scope is required but no scope can be created: %w", err)
+		}
+		m.Log.Printf("job %s: no cgroup scope (%v); session containment only (weaker, see docs/ARCHITECTURE.md)", id, err)
+		return "", nil
 	default:
 		return "", fmt.Errorf("cgroup_scope %q must be one of auto|required|off", mode)
 	}
 }
 
-// errScopeActive means the unit is still active after a stop.
+// scopeFailingSince returns when probes started failing on a host where a scope worked before (the
+// first failure records it); ok is false on a host that never had a working scope.
+func (m *Manager) scopeFailingSince() (time.Time, bool) {
+	if _, err := os.Stat(filepath.Join(m.StateDir, scopeOKFile)); err != nil {
+		return time.Time{}, false
+	}
+	f := filepath.Join(m.StateDir, scopeFailingFile)
+	if b, err := os.ReadFile(f); err == nil {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b))); err == nil {
+			return t, true
+		}
+	}
+	now := m.Now()
+	_ = os.WriteFile(f, []byte(now.UTC().Format(time.RFC3339)+"\n"), 0o600)
+	return now, true
+}
+
+// errScopeActive means the unit is still active (or its cgroup still has processes) after a stop.
 var errScopeActive = errors.New("scope still active after stop")
+
+// systemctlBin is the systemctl the daemon calls; a variable so tests can make a stop fail.
+var systemctlBin = "systemctl"
+
+// scopeCgroupPath is the cgroup v2 path a job scope gets from `systemd-run --user --scope` (the user
+// manager's app.slice): the daemon can reach it without the bus.
+func scopeCgroupPath(unit string) string {
+	uid := os.Getuid()
+	return fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/app.slice/%s", uid, uid, unit)
+}
 
 // stopScope stops a job's scope: systemd sends SIGTERM to every process in the unit's cgroup, waits
 // TimeoutStopSec, sends SIGKILL, and returns once the cgroup is empty. A unit that no longer exists
-// (the wrapper exited and the scope was collected) is fine. The unit is always recomputed from the
-// agent and the job id, never read from a file the job could write.
+// (the wrapper exited and the scope was collected) is fine; a failed unit only when its cgroup is empty
+// (a stop that timed out on unkillable processes leaves it failed with members). When systemctl cannot
+// stop it (no user bus, the manager busy), the daemon sweeps the scope's cgroup itself (pidfd, membership
+// re-checked) and accepts the stop only when the cgroup is then provably empty. The unit is always
+// recomputed from the agent and the job id, never read from a file the job could write.
 func (m *Manager) stopScope(id string) error {
 	unit := ScopeUnit(m.Agent, id)
 	ctx, cancel := context.WithTimeout(context.Background(), m.KillGrace+30*time.Second)
 	defer cancel()
 	var stderr bytes.Buffer
-	cmd := systemdCmd(ctx, "systemctl", "--user", "stop", unit)
+	cmd := systemdCmd(ctx, systemctlBin, "--user", "stop", unit)
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	state, serr := scopeState(unit)
-	if serr == nil && (state == "inactive" || state == "failed" || state == "") {
+	state, cg, serr := scopeState(unit)
+	if serr == nil && (state == "inactive" || state == "") {
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("systemctl --user stop %s: %w: %s", unit, err, strings.TrimSpace(stderr.String()))
+	if serr == nil && state == "failed" && cg == "" {
+		return nil // a failed unit whose cgroup is gone
 	}
-	if serr != nil {
-		return serr
+	if cg == "" {
+		cg = scopeCgroupPath(unit)
+	}
+	if ferr := m.sweepScopeCgroup(id, cg); ferr == nil {
+		return nil
+	} else if serr == nil && state == "failed" {
+		return fmt.Errorf("%s: failed with processes left: %w", unit, ferr)
+	} else if err != nil {
+		return fmt.Errorf("systemctl --user stop %s: %w: %s; %w", unit, err, strings.TrimSpace(stderr.String()), ferr)
+	} else if serr != nil {
+		return errors.Join(serr, ferr)
 	}
 	return fmt.Errorf("%s: %w (%s)", unit, errScopeActive, state)
 }
 
-// scopeState returns the ActiveState of a unit ("inactive" for a unit that is not loaded).
-func scopeState(unit string) (string, error) {
+// sweepScopeCgroup ends every process of a job's scope cgroup (path relative to cgroupRoot) without the
+// user manager. nil only when the cgroup is gone or empty afterwards. A missing cgroup counts as gone only
+// when its parent slice exists (the layout is the expected one); otherwise it proves nothing.
+func (m *Manager) sweepScopeCgroup(id, path string) error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("no cgroup sweep on %s", runtime.GOOS)
+	}
+	full := filepath.Join(cgroupRoot, path)
+	if _, err := os.Stat(full); errors.Is(err, fs.ErrNotExist) {
+		if fi, perr := os.Stat(filepath.Dir(full)); perr == nil && fi.IsDir() {
+			return nil
+		}
+		return fmt.Errorf("scope cgroup %s not found (and no parent slice): %w", path, err)
+	} else if err != nil {
+		return fmt.Errorf("scope cgroup %s: %w", path, err)
+	}
+	r := sweepCgroup(path, m.Log.Writer())
+	if r.Signalled > 0 {
+		m.Log.Printf("job %s: ended %d process(es) of the scope cgroup directly", id, r.Signalled)
+	}
+	if r.Incomplete() {
+		return fmt.Errorf("scope cgroup %s: %d process(es) left: %v", path, len(r.Survivors), r.Err)
+	}
+	// The sweep drops pids it cannot verify as members; the cgroup itself must list no live process.
+	pids, err := cgroupMembers(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("scope cgroup %s: %w", path, err)
+	}
+	var left []int
+	for _, p := range pids {
+		if st, _, err := procStat(p); err == nil && st != "Z" {
+			left = append(left, p)
+		}
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("scope cgroup %s still lists live processes %v", path, left)
+	}
+	return nil
+}
+
+// scopeState returns the ActiveState ("inactive" for a unit that is not loaded) and the ControlGroup
+// ("" when it has none) of a unit.
+func scopeState(unit string) (state, cgroup string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := systemdCmd(ctx, "systemctl", "--user", "show", "--property=ActiveState", "--value", unit).Output()
+	out, err := systemdCmd(ctx, systemctlBin, "--user", "show", "--property=ActiveState", "--property=ControlGroup", unit).Output()
 	if err != nil {
-		return "", fmt.Errorf("systemctl --user show %s: %w", unit, err)
+		return "", "", fmt.Errorf("systemctl --user show %s: %w", unit, err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	for _, l := range strings.Split(string(out), "\n") {
+		k, v, _ := strings.Cut(strings.TrimSpace(l), "=")
+		switch k {
+		case "ActiveState":
+			state = v
+		case "ControlGroup":
+			cgroup = v
+		}
+	}
+	return state, cgroup, nil
 }

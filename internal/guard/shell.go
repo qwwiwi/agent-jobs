@@ -20,6 +20,7 @@ type simpleCmd struct {
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
+	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -103,6 +104,7 @@ func (p *parser) endWord() {
 	case redirFile:
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
+			p.cmd.outDyn = append(p.cmd.outDyn, p.dyn)
 		}
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})

@@ -215,3 +215,44 @@ func ResolveModel(kind, model, complexity string) (string, error) {
 	}
 	return model, nil
 }
+
+// PinScopeRequired sets cgroup_scope to "required" in <state>/config.json when the file does not set it
+// yet and a transient user scope can be created right now (the installer runs it: on a host where scopes
+// work, a job never silently falls back to the weaker session containment). Other keys are kept. It
+// returns what it did, for the installer's output.
+func PinScopeRequired(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, "config.json")
+	raw := map[string]json.RawMessage{}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return "", fmt.Errorf("read config: %w", err)
+	default:
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return "", fmt.Errorf("parse config.json: %w", err)
+		}
+	}
+	if v, ok := raw["cgroup_scope"]; ok {
+		return "cgroup_scope already set (" + string(v) + "), left as is", nil
+	}
+	if err := probeScope(); err != nil {
+		return "cgroup_scope left at auto (no user scope on this host: " + err.Error() + ")", nil
+	}
+	raw["cgroup_scope"] = json.RawMessage(`"required"`)
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return "cgroup_scope set to required (user scopes work on this host): " + path, nil
+}

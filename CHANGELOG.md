@@ -15,12 +15,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Nested-job prevention: job marker `AGENT_JOBS_JOB`; the binary refuses control commands under the marker, under a wrapper ancestor, in a wrapper's session or in a running job's session; guard rules against `agent-jobs` as a command and against changing `AGENT_JOBS_*` (incl. `mapfile`/`readarray`, `printf -v`).
 - Session sweep: after claude exits the wrapper ends every other process of the job's session before writing `exit_code`. Signals go through a pidfd opened before the membership check, so a reused pid is never signalled; without pidfd support nothing is signalled. If processes survive or the sweep fails, the wrapper writes a `sweep_incomplete` marker and the daemon fails the job with «processes survived the job», which the job-done line repeats.
 - Cgroup containment on Linux: the daemon launches each wrapper in its own transient systemd user scope (`systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope`); control commands refuse when `/proc/self/cgroup` names a job scope; the wrapper sweeps the scope's cgroup (pidfd, sub-cgroups included) before `exit_code`; cancel, timeout and every collection stop the whole unit (`systemctl --user stop`), and a failed stop fails the job with «processes survived the job». Config `cgroup_scope` (`auto` default, `required`, `off`; env `AGENT_JOBS_CGROUP_SCOPE`); store column `scope_unit`. Without `systemd-run --user` the session containment stays, documented as weaker.
+- Containment is visible: `status` (`contain:`), `list` (`CONTAIN` column), MCP `job_status` (`containment`) and the job-done line (`session only`, `stop pending`).
+- A failed scope stop is recorded (`scope_pending` column) before the row turns terminal and retried every tick until the unit is gone; without the user bus the daemon sweeps the scope's cgroup itself; worktree cleanup waits meanwhile.
+- `init --pin-scope` (run by `scripts/install-linux.sh`): sets `cgroup_scope: required` in `config.json` when unset and user scopes work on the host.
+- Test-only build tag `agentjobs_testhooks` honours `AGENT_JOBS_TEST_OUTER_WRAPPER`, so the repository's own test suite runs inside a job; release builds have no such hook (tested).
 
 ### Changed
+- In `auto`/`required`, a probe failure on a host where a scope worked before requeues the job every tick for up to 10 minutes instead of silently downgrading or refusing it.
+- A timeout whose scope stop failed keeps the `timeout` status (with the survivors note) instead of turning into `failed`.
+- The wrapper sweeps from its scope even when it was moved into a sub-cgroup of it; a `failed` unit counts as stopped only when its cgroup is empty.
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
 
 ### Security
 - A job's environment no longer carries `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`; the guard and the deny rules reject `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus`, `qdbus`, `dbus-run-session` (guard also behind wrappers, `xargs`, and as words inside other programs' arguments) and writes into the cgroup file system in any spelling (cleaned, relative, symlinked, through `/proc/<pid>/root`, control-file base names; `cd` into `/sys` or `/sys/fs`), the direct ways out of a job's scope.
+- Owner decision 2026-10-17: the guard and the deny rules also reject `crontab`, `at`, `batch`, `tmux`, `screen`, `pm2`, `docker`, `docker-compose`, `podman`, `podman-compose`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`, `qdbus-qt5`, `qdbus6` (daemons, schedulers and namespaces that run processes outside the job's scope).
+- Guard: cgroup-file-system write targets are resolved through variables/backticks (fail closed), `~`, cd/pushd/popd chains in one call (CDPATH, `cd -`), and symlinks to `/`, `/sys`, `/sys/fs`; `cgroup.kill`, `cgroup.freeze` and the other cgroup core files count as control files.
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 

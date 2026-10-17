@@ -325,6 +325,12 @@ func TestJobToolsLifecycle(t *testing.T) {
 		!slices.Contains(res.Artifacts, filepath.Join(dir, "commits.patch")) || !slices.Contains(res.Artifacts, filepath.Join(dir, "report.md")) {
 		t.Fatalf("job_result: %+v", res)
 	}
+	// Containment is visible: the weaker session fallback, a scope, or nothing before launch.
+	var doneSt JobView
+	call(t, cs, "job_status", map[string]any{"id": done.ID}, &doneSt)
+	if doneSt.Containment != "session only" || st.Containment != "" || !strings.HasSuffix(res.DoneLine, " · session only") {
+		t.Fatalf("containment: done %q, queued %q, line %q", doneSt.Containment, st.Containment, res.DoneLine)
+	}
 
 	var list JobListOutput
 	call(t, cs, "job_list", map[string]any{}, &list)

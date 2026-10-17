@@ -1249,3 +1249,82 @@ func TestCheckUserManagerAndCgroupFS(t *testing.T) {
 		})
 	}
 }
+
+// Fix loop 1 of PR #10: writes whose target reaches the cgroup file system only after a variable, a
+// `~`, a cd chain or a symlink, and the programs that start processes outside the job's scope
+// (owner decision 2026-10-17).
+func TestCgroupWritesResolvedAndOutOfScopeTools(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	scope := "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice"
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"variable redirect target", `D=` + scope + `/cgroup.procs; echo $$ > $D`, true},
+		{"quoted variable target", `D="` + scope + `/cgroup.procs"; echo $$ > "$D"`, true},
+		{"backtick target", "echo 1 > `cat f`/cgroup.procs", true},
+		{"variable tee target", `D=` + scope + `/x; echo 1 | tee $D`, true},
+		{"variable dd of=", `D=` + scope + `/x; echo 1 | dd of=$D`, true},
+		{"var base name", `f=cgroup.procs; cd ~/../../sys && echo 1 > fs/cgroup/x/$f`, true},
+		{"tilde cd to sys", `cd ~/../../sys`, true},
+		{"tilde redirect", `echo 1 > ~/../../sys/fs/cgroup/x/pids.max`, true},
+		{"cd chain", `cd /; cd sys; cd fs/cgroup/x/agent-jobs-a-1.scope; echo 1 > cgroup.kill`, true},
+		{"cd chain freeze", `cd /; cd sys; cd fs; echo 1 > cgroup/x/y`, true},
+		{"cd chain pids.max", `cd /sys/fs/cgroup/x.scope; echo 0 > pids.max`, true},
+		{"cd / then relative", `cd / && echo 1 > sys/fs/cgroup/x/memory.max`, true},
+		{"cd in sh -c", `sh -c 'cd /; cd sys; cd fs/cgroup; echo 1 > x/pids.max'`, true},
+		{"CDPATH", `CDPATH=/ cd sys`, true},
+		{"cd -", `cd -; echo 1 > fs/cgroup/x`, true},
+		{"cd variable then relative write", `cd "$X" && echo 1 > pids.max`, true},
+		{"popd then relative write", `popd; echo 1 > memory.max`, true},
+		{"cgroup.kill relative", `echo 1 > x/cgroup.kill`, true},
+		{"ln -s /sys", `ln -s /sys cg`, true},
+		{"ln -s /", `ln -s / r && cd r/sys`, true},
+		{"ln -s /sys/fs", `ln -sf /sys/fs cg`, true},
+		{"crontab", `echo '* * * * * true' | crontab -`, true},
+		{"at", `echo true | at now`, true},
+		{"batch", `echo true | batch`, true},
+		{"tmux", `tmux new -d sleep 999`, true},
+		{"screen", `screen -dmS x sleep 999`, true},
+		{"pm2", `pm2 start sleep -- 999`, true},
+		{"docker", `docker run -d alpine sleep 999`, true},
+		{"docker-compose", `docker-compose up -d`, true},
+		{"podman", `podman run -d alpine sleep 9`, true},
+		{"ssh", `ssh localhost sleep 999`, true},
+		{"machinectl", `machinectl shell .host`, true},
+		{"loginctl", `loginctl enable-linger`, true},
+		{"unshare", `unshare -rC sh -c id`, true},
+		{"nsenter", `nsenter -t 1 -a`, true},
+		{"qdbus-qt5", `qdbus-qt5 org.freedesktop.systemd1`, true},
+		{"qdbus6", `qdbus6 org.freedesktop.systemd1`, true},
+		{"nohup tmux", `nohup tmux new -d x &`, true},
+		{"xargs crontab", `echo f | xargs crontab`, true},
+		{"find -exec tmux", `find . -exec tmux new -d {} \;`, true},
+		{"python crontab", `python3 -c 'import os; os.system("crontab -l")'`, true},
+		{"rsync -e ssh", `rsync -e ssh a b:`, true},
+		// Ordinary calls stay allowed.
+		{"variable redirect elsewhere", `echo 1 > "$OUT"`, false},
+		{"tee variable elsewhere", `go test ./... 2>&1 | tee "$LOG"`, false},
+		{"cd literal then write", `cd sub && echo 1 > out.txt 2>&1`, false},
+		{"cd tilde then write", `cd ~/work && make > build.log 2>&1`, false},
+		{"cd literal then go test", `cd internal && go test ./...`, false},
+		{"cd variable then reader", `cd "$X" && ls -la`, false},
+		{"cd variable then fd dup", `cd "$X" && make 2>&1`, false},
+		{"ln literal", `ln -s ../shared x`, false},
+		{"grep tmux", `grep -rn tmux docs`, false},
+		{"echo at", `echo look at this`, false},
+		{"git log", `git log --oneline -3`, false},
+		{"cat proc self cgroup", `cat /proc/self/cgroup`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
