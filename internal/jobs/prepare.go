@@ -66,6 +66,11 @@ var denyRules = []string{
 	"Bash(bun x:*)",
 	"Bash(pipx run:*)",
 	"Bash(uv tool run:*)",
+	// File tools never write inside a .git directory (also checked by the guard, symlinks resolved).
+	"Edit(**/.git/**)",
+	"Write(**/.git/**)",
+	"MultiEdit(**/.git/**)",
+	"NotebookEdit(**/.git/**)",
 	// Tools that reach a human or outlive the run (own schedules, notifications).
 	"CronCreate",
 	"RemoteTrigger",

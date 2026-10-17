@@ -265,10 +265,16 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch"} {
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch",
+		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
 		}
+	}
+	// The hook is registered for every tool (file tools included), not only Bash.
+	hooks, _ := json.Marshal(m.Settings("general")["hooks"])
+	if !strings.Contains(string(hooks), `"matcher":"*"`) {
+		t.Fatalf("guard hook must match every tool: %s", hooks)
 	}
 	if strings.Contains(deny("research"), "WebFetch") || strings.Contains(deny("research"), "WebSearch") {
 		t.Fatal("research must allow web tools")
@@ -293,6 +299,25 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 	}
 	if code := run(`go test ./...`); code != 0 {
 		t.Fatalf("plain command: exit %d, want 0", code)
+	}
+	// File tools go through the same hook command.
+	runFile := func(tool, path string) int {
+		in, _ := json.Marshal(map[string]any{"tool_name": tool, "cwd": t.TempDir(), "tool_input": map[string]string{"file_path": path}})
+		c := exec.Command("sh", "-c", m.GuardCommand())
+		c.Stdin = bytes.NewReader(in)
+		var ee *exec.ExitError
+		if err := c.Run(); errors.As(err, &ee) {
+			return ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+	if code := runFile("Write", "/repo/.git/hooks/pre-commit"); code != 2 {
+		t.Fatalf("Write into .git: exit %d, want 2", code)
+	}
+	if code := runFile("Edit", "/repo/main.go"); code != 0 {
+		t.Fatalf("Edit elsewhere: exit %d, want 0", code)
 	}
 }
 

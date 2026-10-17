@@ -53,9 +53,14 @@ type HookInput struct {
 	ToolName  string `json:"tool_name"`
 	Cwd       string `json:"cwd"`
 	ToolInput struct {
-		Command string `json:"command"`
+		Command      string `json:"command"`
+		FilePath     string `json:"file_path"`
+		NotebookPath string `json:"notebook_path"`
 	} `json:"tool_input"`
 }
+
+// fileTools write the file named in their input (file_path, or notebook_path for NotebookEdit).
+var fileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
 
 // Decide parses the hook JSON and returns a non-empty reason when the call must be blocked.
 func Decide(r io.Reader, cfg Config) (string, error) {
@@ -63,13 +68,75 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	if err := json.NewDecoder(r).Decode(&in); err != nil {
 		return "", fmt.Errorf("guard: parse hook input: %w", err)
 	}
-	if in.ToolName != "Bash" {
-		return "", nil
-	}
 	if cfg.Dir == "" {
 		cfg.Dir = in.Cwd
 	}
+	if fileTools[in.ToolName] {
+		p := in.ToolInput.FilePath
+		if in.ToolName == "NotebookEdit" {
+			p = in.ToolInput.NotebookPath
+		}
+		return CheckFileWrite(in.ToolName, p, cfg.Dir), nil
+	}
+	if in.ToolName != "Bash" {
+		return "", nil
+	}
 	return Check(in.ToolInput.Command, cfg), nil
+}
+
+// resolvePath returns path made absolute (against dir), cleaned, with symlinks resolved on its
+// longest existing prefix (the file itself when it exists, else the nearest existing parent). A
+// dangling symlink on the way is followed by its target text (Write would create that target).
+func resolvePath(path, dir string) string { return resolveDepth(path, dir, 0) }
+
+func resolveDepth(path, dir string, depth int) string {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, path)
+	}
+	path = filepath.Clean(path)
+	rest := ""
+	for p := path; ; p = filepath.Dir(p) {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(r, rest)
+		}
+		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 && depth < 40 {
+			if target, err := os.Readlink(p); err == nil {
+				return resolveDepth(filepath.Join(target, rest), filepath.Dir(p), depth+1)
+			}
+		}
+		if p == filepath.Dir(p) {
+			return path
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+	}
+}
+
+// inGitDir reports a path with a `.git` segment: the git dir itself, a file in it, or a worktree's
+// `.git` file.
+func inGitDir(p string) bool {
+	return slices.ContainsFunc(strings.Split(filepath.ToSlash(p), "/"), func(s string) bool {
+		return strings.EqualFold(s, ".git")
+	})
+}
+
+// CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
+// would write inside a `.git` directory: config, hooks, a worktree's admin dir. Both the path as given
+// and the path with symlinks resolved are checked (a link in the job dir pointing into .git).
+func CheckFileWrite(tool, path, dir string) string {
+	if path == "" {
+		return ""
+	}
+	given := filepath.Clean(path)
+	if !filepath.IsAbs(given) {
+		given = filepath.Join(dir, given)
+	}
+	for _, p := range []string{given, resolvePath(path, dir)} {
+		if inGitDir(p) || gitFile(p) {
+			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
+				"(git would run programs from its config and hooks)."
+		}
+	}
+	return ""
 }
 
 // Check returns a non-empty reason when the shell command must be blocked.
@@ -174,19 +241,26 @@ func parseGit(argv []string) (gitCall, bool) {
 }
 
 // ghPositional returns the argv indices of the first two positional words of a `gh` call.
-func ghPositional(argv []string) []int {
-	var pos []int
+// Before the subcommand only `-R`/`--repo`/`--hostname` with their value (separate, `=` or attached
+// `-Rowner/repo`) are understood; any other flag there could take a value and shift which words are
+// read as the subcommand, so it is returned as unknown (the caller rejects the call as unverifiable).
+func ghPositional(argv []string) (pos []int, unknown string) {
 	for i := 1; i < len(argv) && len(pos) < 2; i++ {
 		a := argv[i]
 		switch {
 		case a == "-R" || a == "--repo" || a == "--hostname":
 			i++
+		case strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "--hostname=") ||
+			(strings.HasPrefix(a, "-R") && len(a) > 2):
+		case (a == "--version" || a == "--help" || a == "-h") && len(pos) == 0 && i == len(argv)-1:
+			// `gh --version` / `gh --help` alone only print.
 		case strings.HasPrefix(a, "-"):
+			return pos, a
 		default:
 			pos = append(pos, i)
 		}
 	}
-	return pos
+	return pos, ""
 }
 
 // parseGh returns the first two positional words of a `gh` call (group, subcommand).
@@ -194,8 +268,12 @@ func parseGh(argv []string) (string, string, bool) {
 	if len(argv) == 0 || !isProg(argv[0], "gh") {
 		return "", "", false
 	}
+	idx, unknown := ghPositional(argv)
+	if unknown != "" { // rejected as unverifiable first; never read as an allowed group
+		return "unverifiable " + unknown, "", true
+	}
 	pos := []string{"", ""}
-	for k, i := range ghPositional(argv) {
+	for k, i := range idx {
 		pos[k] = argv[i]
 	}
 	return pos[0], pos[1], true
@@ -418,7 +496,11 @@ func unverifiable(sc *script, c *simpleCmd) string {
 			}
 			return ""
 		}
-		for _, k := range ghPositional(argv) {
+		pos, unknown := ghPositional(argv)
+		if unknown != "" {
+			return cannot("gh flag " + unknown + " before the subcommand (only -R/--repo/--hostname)")
+		}
+		for _, k := range pos {
 			if dyn[k] {
 				return cannot("gh subcommand from a variable")
 			}
@@ -728,7 +810,7 @@ var ghRead = map[string]map[string]bool{
 	"workflow": {"": true, "view": true, "list": true},
 	"gist":     {"": true, "view": true, "list": true, "clone": true},
 	"label":    {"": true, "list": true},
-	"auth":     {"": true, "status": true},
+	"auth":     {"": true}, // no `auth status`: its -t/--show-token prints the token
 	"alias":    {"": true, "list": true},
 }
 
