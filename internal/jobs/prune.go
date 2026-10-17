@@ -69,8 +69,9 @@ type PruneReport struct {
 // patches are not saved), and a worktree that cleanup deliberately kept for a human (repository
 // drivers) is not touched. Symlinks are removed as links, never followed. With dryRun nothing is
 // removed. Before anything is removed, the job's records for analysis move into the log archive
-// (archiveJob); a failed archive leaves the folder untouched. Archived months older than the
-// retention are removed. Runs under the lifecycle lock, so it never races a tick's cleanup.
+// (archiveJob); a failed archive keeps the files it would have moved (the rest is pruned and the job
+// reports the error). Archived months older than the retention are removed (archive roots with the
+// marker only). Runs under the lifecycle lock, so it never races a tick's cleanup.
 func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
 	unlock, err := m.lock()
@@ -133,26 +134,35 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Skipped = "worktree cleanup has not run yet (patches not saved), not touched"
 		return pj
 	}
-	if !dryRun && fi.Mode().Perm()&0o700 != 0o700 {
+	if !dryRun {
 		// The job could chmod its own folder; its entries cannot be removed from a read-only dir.
-		if err := os.Chmod(dir, 0o700); err != nil {
+		if err := writableJobDir(dir); err != nil {
 			pj.Error = err.Error()
 			return pj
 		}
 	}
 	aj := m.archiveJob(j, dir, dryRun)
-	if aj.Error != "" {
-		pj.Error = "log archive: " + aj.Error
+	// A failed archive keeps the files it would have moved; the rest of the folder is still pruned,
+	// so a full or missing archive disk does not stop prune from freeing space.
+	archiveFailed := aj.Error != ""
+	fail := func(err string) PruneJob {
+		if archiveFailed {
+			err = "log archive: " + aj.Error + "; " + err
+		}
+		pj.Error = err
 		return pj
 	}
-	pj.Archived = aj.Moved
-	if !aj.Already {
-		pj.ArchiveDest = aj.Dest
+	if archiveFailed {
+		pj.Error = "log archive: " + aj.Error
+	} else {
+		pj.Archived = aj.Moved
+		if !aj.Already {
+			pj.ArchiveDest = aj.Dest
+		}
 	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		pj.Error = err.Error()
-		return pj
+		return fail(err.Error())
 	}
 	for _, e := range ents {
 		name := e.Name()
@@ -160,10 +170,13 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		if slices.ContainsFunc(pj.Archived, func(a PruneEntry) bool { return a.Path == p }) {
 			continue // dry run: listed as moved to the archive
 		}
+		if archiveFailed && slices.Contains(archiveGzip, name) {
+			pj.Kept = append(pj.Kept, name)
+			continue
+		}
 		keep, reason, err := pruneDecide(p, name, j)
 		if err != nil {
-			pj.Error = err.Error()
-			return pj
+			return fail(err.Error())
 		}
 		if keep {
 			if reason != "" && pj.Skipped == "" {
@@ -175,8 +188,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		size := treeSize(p)
 		if !dryRun {
 			if err := removeTree(p); err != nil {
-				pj.Error = err.Error()
-				return pj
+				return fail(err.Error())
 			}
 		}
 		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})

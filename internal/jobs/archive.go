@@ -27,6 +27,11 @@ var (
 	reMonth     = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}$`)
 )
 
+// archiveMarker is written into an archive root the archive created. Retention and the 0700 chmod
+// act only on a root that holds it: an existing folder the owner pointed log_archive_dir at (a
+// synced folder with its own month dirs) is archived into but never expired or chmodded.
+const archiveMarker = ".agent-jobs-archive"
+
 // ArchiveJob is what the archive does to one job.
 type ArchiveJob struct {
 	ID    string       `json:"id"`
@@ -91,22 +96,37 @@ func realDir(p string, create bool) (ok bool, err error) {
 	return true, nil
 }
 
-// archiveRoot checks the archive root (a real directory, created on demand) and keeps it private:
-// the logs carry tool output, so the root is 0700.
-func (m *Manager) archiveRoot(create bool) (bool, error) {
+// archiveRoot checks the archive root (a real directory, created on demand with the marker) and
+// keeps a root of ours private: the logs carry tool output, so it is 0700. owned reports the marker;
+// an existing root without it is used as it is (never chmodded).
+func (m *Manager) archiveRoot(create bool) (ok, owned bool, err error) {
 	root := m.ArchiveDir()
-	ok, err := realDir(root, create)
-	if err != nil || !ok {
-		return ok, err
+	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) && create {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return false, false, err
+		}
+		f, err := os.OpenFile(filepath.Join(root, archiveMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return false, false, err
+		}
+		_, err = f.WriteString("Log archive of agent-jobs: prune expires the <YYYY-MM> dirs here.\n")
+		if err := errors.Join(err, f.Close()); err != nil {
+			return false, false, err
+		}
 	}
-	if create {
+	if ok, err = realDir(root, false); err != nil || !ok {
+		return ok, false, err
+	}
+	fi, err := os.Lstat(filepath.Join(root, archiveMarker))
+	owned = err == nil && fi.Mode().IsRegular()
+	if create && owned {
 		if fi, err := os.Lstat(root); err == nil && fi.Mode().Perm() != 0o700 {
 			if err := os.Chmod(root, 0o700); err != nil {
-				return false, err
+				return false, owned, err
 			}
 		}
 	}
-	return true, nil
+	return true, owned, nil
 }
 
 // Archive moves the records of every job prune would clean now into the archive and enforces the
@@ -172,7 +192,13 @@ func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 			}
 		}
 	}
-	if _, err := m.archiveRoot(!dryRun); err != nil {
+	if !dryRun {
+		if err := writableJobDir(dir); err != nil {
+			aj.Error = err.Error()
+			return aj
+		}
+	}
+	if _, _, err := m.archiveRoot(!dryRun); err != nil {
 		aj.Error = err.Error()
 		return aj
 	}
@@ -186,6 +212,12 @@ func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 		aj.Error = err.Error()
 		return aj
 	case done:
+		// The rename is the completeness signal, but the dir may have been recreated or emptied
+		// since (a sync tool, a partial restore): an original goes only when its copy is there.
+		if err := archivedCopies(dir, aj.Dest); err != nil {
+			aj.Error = err.Error()
+			return aj
+		}
 		aj.Already = true
 		moved("already archived in " + aj.Dest + ", leftover removed")
 	case dryRun:
@@ -215,11 +247,67 @@ func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 	return aj
 }
 
-// writeArchive builds the archive of one job in a temporary dir next to dest and renames it into place.
+// writableJobDir makes a job folder the job made read-only 0700 again: its entries cannot be
+// removed from a read-only dir.
+func writableJobDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm()&0o700 != 0o700 {
+		return os.Chmod(dir, 0o700)
+	}
+	return nil
+}
+
+// archivedCopies checks that an existing archive dest is complete for the originals still in the
+// job folder: dest/meta.json and dest/<name>.gz for every one of them, as regular files.
+func archivedCopies(dir, dest string) error {
+	need := []string{"meta.json"}
+	for _, name := range archiveGzip {
+		if fi, err := os.Lstat(filepath.Join(dir, name)); err == nil && fi.Mode().IsRegular() {
+			need = append(need, name+".gz")
+		}
+	}
+	for _, name := range need {
+		fi, err := os.Lstat(filepath.Join(dest, name))
+		if err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s exists but has no %s: originals kept (move the incomplete dir aside to archive again)", dest, name)
+		}
+	}
+	return nil
+}
+
+// syncDir fsyncs a directory, so its entries (a rename into it) are durable before the originals
+// go. A filesystem that cannot sync a directory (EINVAL, ENOTSUP) is accepted as it is.
+func syncDir(p string) error {
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+		err = nil
+	}
+	return errors.Join(err, f.Close())
+}
+
+// writeArchive builds the archive of one job in a temporary dir next to dest and renames it into
+// place. Temporary dirs of this job left by an interrupted pass are removed first; the temporary dir
+// and the month dir are fsynced, so the archive is durable before the caller removes the originals.
 func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 	monthDir := filepath.Dir(dest)
 	if _, err := realDir(monthDir, true); err != nil {
 		return err
+	}
+	stale, err := filepath.Glob(filepath.Join(monthDir, "."+j.ID+".tmp-*"))
+	if err != nil {
+		return err
+	}
+	for _, p := range stale {
+		if err := removeTree(p); err != nil {
+			return err
+		}
 	}
 	tmp, err := os.MkdirTemp(monthDir, "."+j.ID+".tmp-")
 	if err != nil {
@@ -251,11 +339,15 @@ func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 	if err := os.Chmod(tmp, 0o700); err != nil {
 		return err
 	}
+	if err := syncDir(tmp); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return err
 	}
 	ok = true
-	return nil
+	// The month dir holds the rename; the root holds a month dir this pass may have created.
+	return errors.Join(syncDir(monthDir), syncDir(filepath.Dir(monthDir)))
 }
 
 // openRegular opens a regular file without following a link or blocking on a FIFO. ok=false (no
@@ -306,6 +398,7 @@ func archiveFile(src, dst string, gz bool) error {
 
 // expireArchive removes archived months whose last day is older than the retention (none with 0).
 // Only top-level <YYYY-MM> entries are considered; a symlink is removed as a link, never followed.
+// A root without the marker (not created by the archive) is never expired.
 func (m *Manager) expireArchive(dryRun bool) ([]PruneEntry, error) {
 	out := []PruneEntry{}
 	days := m.Cfg.ArchiveDays()
@@ -313,7 +406,7 @@ func (m *Manager) expireArchive(dryRun bool) ([]PruneEntry, error) {
 		return out, nil
 	}
 	root := m.ArchiveDir()
-	if ok, err := realDir(root, false); err != nil || !ok {
+	if ok, owned, err := m.archiveRoot(false); err != nil || !ok || !owned {
 		return out, err
 	}
 	cutoff := m.Now().Add(-time.Duration(days) * 24 * time.Hour)

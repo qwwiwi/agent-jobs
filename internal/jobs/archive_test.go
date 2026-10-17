@@ -147,8 +147,8 @@ func TestArchiveConfiguredDir(t *testing.T) {
 	}
 }
 
-// A symlinked archive root (or month dir) is refused: nothing is written through it and nothing is
-// removed from the job folder.
+// A symlinked archive root (or month dir) is refused: nothing is written through it and the stream
+// stays in the job folder (the rest of the folder is still pruned).
 func TestArchiveRefusesSymlink(t *testing.T) {
 	for _, where := range []string{"root", "month"} {
 		t.Run(where, func(t *testing.T) {
@@ -172,10 +172,10 @@ func TestArchiveRefusesSymlink(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "symlink") {
 				t.Fatalf("prune through a symlinked archive: %v", err)
 			}
-			if len(rep.Jobs) != 1 || rep.Jobs[0].Error == "" || len(rep.Jobs[0].Removed) != 0 {
+			if len(rep.Jobs) != 1 || rep.Jobs[0].Error == "" || len(rep.Jobs[0].Removed) != 1 {
 				t.Fatalf("report: %+v", rep.Jobs)
 			}
-			if got := names(m.JobDir("s")); !slices.Equal(got, []string{"stream.jsonl", "work"}) {
+			if got := names(m.JobDir("s")); !slices.Equal(got, []string{"stream.jsonl"}) {
 				t.Fatalf("job dir touched: %v", got)
 			}
 			if ents, _ := os.ReadDir(target); len(ents) != 0 {
@@ -185,13 +185,14 @@ func TestArchiveRefusesSymlink(t *testing.T) {
 	}
 }
 
-// Archive retention: months whose last day is older than log_archive_days are deleted by prune;
-// newer months, non-month entries and everything with 0 (forever) stay.
+// Archive retention: in a root with the marker, months whose last day is older than log_archive_days
+// are deleted by prune; newer months, non-month entries and everything with 0 (forever) stay.
 func TestArchiveRetention(t *testing.T) {
 	m := newManager(t)
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	m.Now = func() time.Time { return now }
 	root := m.ArchiveDir()
+	writeFile(t, filepath.Join(root, archiveMarker), nil, 0o600)
 	for _, d := range []string{"2025-09/j1", "2025-10/j2", "2025-11/j3", "2026-10/j4", "notes"} {
 		writeFile(t, filepath.Join(root, d, "meta.json"), []byte("{}"), 0o600)
 	}
@@ -207,13 +208,13 @@ func TestArchiveRetention(t *testing.T) {
 	}
 	m.Cfg.LogArchiveDays = nil // default 365: cutoff 2025-10-17
 	dry, err := m.Prune(true)
-	if err != nil || len(dry.ArchiveExpired) != 2 || len(names(root)) != 6 {
+	if err != nil || len(dry.ArchiveExpired) != 2 || len(names(root)) != 7 {
 		t.Fatalf("dry: %+v %v %v", dry.ArchiveExpired, err, names(root))
 	}
 	if _, err := m.Prune(false); err != nil {
 		t.Fatal(err)
 	}
-	if got := names(root); !slices.Equal(got, []string{"2025-10", "2025-11", "2026-10", "notes"}) {
+	if got := names(root); !slices.Equal(got, []string{archiveMarker, "2025-10", "2025-11", "2026-10", "notes"}) {
 		t.Fatalf("after retention: %v", got)
 	}
 	if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
@@ -269,5 +270,162 @@ func TestArchiveAndStatsCLI(t *testing.T) {
 	var rep StatsReport
 	if err := json.Unmarshal([]byte(run("stats", "--agent", "test", "--json")), &rep); err != nil || rep.Totals.Jobs != 1 {
 		t.Fatalf("stats --json: %+v %v", rep, err)
+	}
+}
+
+// An archive root agent-jobs did not create (no marker) is used for archiving but never expired or
+// chmodded: an owner's folder with month-named dirs keeps them. A root the archive creates gets the
+// marker.
+func TestArchiveRootWithoutMarker(t *testing.T) {
+	m := newManager(t)
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	m.Now = func() time.Time { return now }
+	root := filepath.Join(t.TempDir(), "Dropbox")
+	m.Cfg.LogArchiveDir = root
+	writeFile(t, filepath.Join(root, "2024-03", "photo.jpg"), []byte("x"), 0o600)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-72 * time.Hour)
+	insertJob(t, m, "a", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("a"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	rep, err := m.Prune(false)
+	if err != nil || len(rep.ArchiveExpired) != 0 {
+		t.Fatalf("prune: %+v %v", rep.ArchiveExpired, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "2024-03", "photo.jpg")); err != nil {
+		t.Fatalf("owner's month folder removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, old.UTC().Format("2006-01"), "a", "stream.jsonl.gz")); err != nil {
+		t.Fatalf("not archived into the existing root: %v", err)
+	}
+	if fi, _ := os.Lstat(root); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("existing root chmodded to %v", fi.Mode().Perm())
+	}
+	if _, err := os.Lstat(filepath.Join(root, archiveMarker)); !os.IsNotExist(err) {
+		t.Fatalf("marker written into an existing root: %v", err)
+	}
+
+	m.Cfg.LogArchiveDir = filepath.Join(t.TempDir(), "fresh")
+	insertJob(t, m, "b", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("b"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	if _, err := m.Archive(false); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(filepath.Join(m.Cfg.LogArchiveDir, archiveMarker)); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("created root has no marker: %v", err)
+	}
+}
+
+// A failing write (an unreadable stream) keeps the originals and leaves no temporary dir.
+func TestArchiveFailedWriteKeepsOriginals(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file")
+	}
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "f", store.StatusSucceeded, &old, nil)
+	stream := filepath.Join(m.JobDir("f"), "stream.jsonl")
+	writeFile(t, stream, []byte("{}\n"), 0o600)
+	writeFile(t, filepath.Join(m.JobDir("f"), "stderr.log"), []byte("e\n"), 0o600)
+	if err := os.Chmod(stream, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(stream, 0o600)
+	if _, err := m.Archive(false); err == nil {
+		t.Fatal("archive of an unreadable stream succeeded")
+	}
+	if got := names(m.JobDir("f")); !slices.Equal(got, []string{"stderr.log", "stream.jsonl"}) {
+		t.Fatalf("originals: %v", got)
+	}
+	month := filepath.Join(m.ArchiveDir(), old.UTC().Format("2006-01"))
+	if got := names(month); len(got) != 0 {
+		t.Fatalf("month dir after a failed write: %v", got)
+	}
+}
+
+// "Already archived" counts only when the destination holds meta.json and the gzipped copy: an empty
+// destination keeps the original and reports an error; a complete one lets the leftover go.
+func TestArchiveAlreadyArchivedNeedsCopy(t *testing.T) {
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "d", store.StatusSucceeded, &old, nil)
+	stream := filepath.Join(m.JobDir("d"), "stream.jsonl")
+	writeFile(t, stream, []byte("{}\n"), 0o600)
+	dest := m.archiveJobDir(&store.Job{ID: "d", FinishedAt: &old})
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Archive(false); err == nil || !strings.Contains(err.Error(), "originals kept") {
+		t.Fatalf("empty destination: %v", err)
+	}
+	if _, err := os.Lstat(stream); err != nil {
+		t.Fatalf("original removed with an empty destination: %v", err)
+	}
+	writeFile(t, filepath.Join(dest, "meta.json"), []byte("{}"), 0o600)
+	writeFile(t, filepath.Join(dest, "stream.jsonl.gz"), []byte("gz"), 0o600)
+	rep, err := m.Archive(false)
+	if err != nil || len(rep.Jobs) != 1 || !rep.Jobs[0].Already || len(rep.Jobs[0].Moved) != 1 {
+		t.Fatalf("complete destination: %+v %v", rep.Jobs, err)
+	}
+	if _, err := os.Lstat(stream); !os.IsNotExist(err) {
+		t.Fatalf("leftover kept: %v", err)
+	}
+}
+
+// When the archive cannot be written, prune still frees the rest of the job folder; only the files
+// that would have been archived stay.
+func TestPruneWhenArchiveFails(t *testing.T) {
+	m := newManager(t)
+	writeFile(t, m.ArchiveDir(), []byte("not a dir"), 0o600)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "p", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("p"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	writeFile(t, filepath.Join(m.JobDir("p"), "stderr.log"), []byte("e\n"), 0o600)
+	writeFile(t, filepath.Join(m.JobDir("p"), "work", "big.bin"), []byte("\x00"), 0o600)
+	rep, err := m.Prune(false)
+	if err == nil || !strings.Contains(err.Error(), "log archive") {
+		t.Fatalf("prune: %v", err)
+	}
+	if len(rep.Jobs) != 1 || rep.Jobs[0].Error == "" || len(rep.Jobs[0].Removed) != 1 || len(rep.Jobs[0].Archived) != 0 {
+		t.Fatalf("report: %+v", rep.Jobs)
+	}
+	if got := names(m.JobDir("p")); !slices.Equal(got, []string{"stderr.log", "stream.jsonl"}) {
+		t.Fatalf("job dir: %v", got)
+	}
+}
+
+// Temporary dirs of an interrupted pass are removed before the next write.
+func TestArchiveRemovesStaleTemp(t *testing.T) {
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "t", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("t"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	month := filepath.Join(m.ArchiveDir(), old.UTC().Format("2006-01"))
+	writeFile(t, filepath.Join(month, ".t.tmp-123", "stream.jsonl.gz"), []byte("partial"), 0o600)
+	writeFile(t, filepath.Join(month, ".tx.tmp-1", "keep"), []byte("other job"), 0o600)
+	if _, err := m.Archive(false); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(month); !slices.Equal(got, []string{".tx.tmp-1", "t"}) {
+		t.Fatalf("month dir: %v", got)
+	}
+}
+
+// `agent-jobs archive` works on a job folder the job made read-only.
+func TestArchiveReadOnlyJobDir(t *testing.T) {
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "r", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("r"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	if err := os.Chmod(m.JobDir("r"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(m.JobDir("r"), 0o700)
+	if _, err := m.Archive(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(m.JobDir("r"), "stream.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("stream still in the job dir: %v", err)
 	}
 }

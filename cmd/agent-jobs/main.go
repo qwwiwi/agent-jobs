@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
@@ -765,7 +767,7 @@ func cmdStats(args []string) error {
 	}
 	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tDUR MEDIAN\tDUR P90\tREFUSALS")
 	for _, g := range rep.Groups {
-		row(g.Key, g.StatsSummary)
+		row(shown(g.Key), g.StatsSummary)
 	}
 	row("total", rep.Totals)
 	if err := w.Flush(); err != nil {
@@ -774,16 +776,25 @@ func cmdStats(args []string) error {
 	if len(rep.GuardRules) > 0 {
 		fmt.Println("\nguard refusals by rule:")
 		for _, r := range rep.GuardRules {
-			fmt.Printf("  %-22s %d\n", r.Name, r.Count)
+			fmt.Printf("  %-22s %d\n", shown(r.Name), r.Count)
 		}
 	}
 	if len(rep.Skills) > 0 {
 		fmt.Println("\nskills (uses, jobs, success rate):")
 		for _, s := range rep.Skills {
-			fmt.Printf("  %-22s %d  %d  %.0f%%\n", s.Name, s.Uses, s.Jobs, s.SuccessRate*100)
+			fmt.Printf("  %-22s %d  %d  %.0f%%\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100)
 		}
 	}
 	return nil
+}
+
+// shown prints a name taken from a job's stream (a skill, a guard rule, a group key): as it is when
+// every rune is printable, quoted otherwise, so a job cannot plant terminal escape sequences.
+func shown(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0 {
+		return s
+	}
+	return strconv.Quote(s)
 }
 
 func cmdDoctor(args []string) error {
