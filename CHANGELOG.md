@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- MCP server `agent-jobs mcp --role orchestrator|job --agent A` (stdio, `github.com/modelcontextprotocol/go-sdk` v1.8.0) with a tool registry of two audiences; the job role is an allowlist, and the server itself refuses hidden tools and filters the tool list.
+- Orchestrator tools `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` over the existing Manager; `job_result` reads `report.md` only as a regular file (no FIFO, symlink or directory), capped at 256 KB.
+- Each job's `mcp.json` now names the job-role server instead of an empty stub.
+- Store columns `complexity`, `runner`, `owner_waits`, `resumed_from`, `schedule_id`, `billing` (tolerant migrations).
+- `tmux_socket` config: notify on a named tmux socket (`tmux -L`).
+- Nested-job prevention: job marker `AGENT_JOBS_JOB`; the binary refuses control commands under the marker, under a wrapper ancestor, in a wrapper's session or in a running job's session; guard rules against `agent-jobs` as a command and against changing `AGENT_JOBS_*` (incl. `mapfile`/`readarray`, `printf -v`).
+- Session sweep: after claude exits the wrapper ends every other process of the job's session before writing `exit_code`.
+
+### Changed
+- A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
+
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 
 ### Added
