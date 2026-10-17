@@ -69,30 +69,70 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
   export XDG_RUNTIME_DIR
 fi
 
+# The unit resolves its env file via %E (the user manager's XDG_CONFIG_HOME, normally ~/.config).
+if [ -n "${XDG_CONFIG_HOME:-}" ] && [ "$XDG_CONFIG_HOME" != "$HOME/.config" ]; then
+  echo "WARNING: XDG_CONFIG_HOME=$XDG_CONFIG_HOME differs from $HOME/.config; the unit and env file go there," >&2
+  echo "         so the systemd user manager must see the same XDG_CONFIG_HOME (else it ignores them)." >&2
+fi
+
 sc() {
   echo "+ systemctl --user $*"
   "$SYSTEMCTL" --user "$@"
 }
 
+# One installer at a time (two concurrent runs would race on the binary and the unit).
+mkdir -p "$BIN_DIR"
+exec 9>"$BIN_DIR/.agent-jobs.install.lock"
+if ! flock -n 9; then
+  echo "install-linux: another install-linux.sh is running (lock $BIN_DIR/.agent-jobs.install.lock)" >&2
+  exit 1
+fi
+
+# running_wrappers prints the number of job wrappers of this user started from $BIN. Every running job's
+# PreToolUse guard hook is "$BIN guard …": removing $BIN makes the hook exit 127, which Claude Code
+# treats as non-blocking, so the job would run unguarded.
+running_wrappers() {
+  local n
+  n="$(pgrep -u "$(id -u)" -f -- "$BIN run-wrapper " 2>/dev/null | wc -l)" || true
+  echo "${n:-0}"
+}
+
+# other_instances lists agent-jobs@ instances other than $UNIT that are enabled (wants symlink) or
+# loaded/active right now (list-units), so the shared template and binary stay while one needs them.
+other_instances() {
+  {
+    if [ -d "$UNIT_DIR/default.target.wants" ]; then
+      find "$UNIT_DIR/default.target.wants" -maxdepth 1 -name 'agent-jobs@*.service' -printf '%f\n' 2>/dev/null || true
+    fi
+    "$SYSTEMCTL" --user list-units --plain --no-legend 'agent-jobs@*.service' 2>/dev/null |
+      awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^agent-jobs@.*\.service$/) { print $i; break } }' || true
+  } | grep -vxF -- "$UNIT" | sort -u | tr '\n' ' ' || true
+}
+
 if [ "$UNINSTALL" = 1 ]; then
   echo "== uninstall $UNIT"
-  # disable --now stops only the daemon (KillMode=process): running jobs finish on their own and are
-  # collected by the next daemon for this agent, if one is ever started again.
+  # disable --now stops only the daemon (KillMode=process): running jobs go on WITHOUT timeout
+  # enforcement or collection until a daemon for this agent starts again.
   sc disable --now "$UNIT" || echo "  (unit was not enabled/active)"
-  others=""
-  if [ -d "$UNIT_DIR/default.target.wants" ]; then
-    others="$(find "$UNIT_DIR/default.target.wants" -maxdepth 1 -name 'agent-jobs@*.service' ! -name "$UNIT" -printf '%f ' 2>/dev/null || true)"
-  fi
+  others="$(other_instances)"
+  rc=0
   if [ -n "$others" ]; then
-    echo "  other instances still enabled ($others): keeping $UNIT_DST and $BIN"
+    echo "  other instances still enabled or active ($others): keeping $UNIT_DST and $BIN"
   else
     if [ -f "$UNIT_DST" ]; then rm -f "$UNIT_DST"; echo "  removed $UNIT_DST"; fi
-    if [ -f "$BIN" ]; then rm -f "$BIN"; echo "  removed $BIN"; fi
+    n="$(running_wrappers)"
+    if [ "$n" -gt 0 ]; then
+      echo "  $n jobs still running — cancel or wait, then rerun --uninstall (keeping $BIN: it is their guard hook)" >&2
+      rc=1
+    elif [ -f "$BIN" ]; then
+      rm -f "$BIN"
+      echo "  removed $BIN"
+    fi
   fi
   sc daemon-reload
   echo "  kept: env file $ENV_FILE (if any) and state (~/.agent-jobs/$INSTANCE or \$AGENT_JOBS_HOME)"
-  echo "uninstall done"
-  exit 0
+  if [ "$rc" = 0 ]; then echo "uninstall done"; else echo "uninstall incomplete"; fi
+  exit "$rc"
 fi
 
 if [ ! -f "$UNIT_SRC" ]; then
@@ -141,7 +181,9 @@ echo "== unit $UNIT_DST"
 if [ -f "$UNIT_DST" ] && cmp -s "$UNIT_SRC" "$UNIT_DST"; then
   echo "  unchanged"
 else
-  install -m 0644 "$UNIT_SRC" "$UNIT_DST"
+  utmp="$UNIT_DST.new.$$"
+  install -m 0644 "$UNIT_SRC" "$utmp"
+  mv -f "$utmp" "$UNIT_DST"
   changed=1
   echo "  installed"
 fi
@@ -150,6 +192,7 @@ echo "== env file $ENV_FILE"
 if [ -e "$ENV_FILE" ]; then
   echo "  exists, left as is"
 else
+  (
   umask 077
   cat >"$ENV_FILE" <<ENVFILE
 # Environment for agent-jobs@$INSTANCE (systemd EnvironmentFile: KEY=VALUE lines, no 'export').
@@ -157,16 +200,21 @@ else
 # AGENT_JOBS_CLAUDE_BIN=$HOME/.local/bin/claude
 # AGENT_JOBS_TMUX_BIN=/usr/bin/tmux
 ENVFILE
+  )
   echo "  created (all settings commented out)"
 fi
 
 echo "== state (agent-jobs init --agent $INSTANCE)"
 # Same environment as the service: the env file may move the state root.
+# Parsed, never sourced: only KEY=VALUE lines (systemd EnvironmentFile syntax, optional quotes).
 (
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+    export "$key=$val"
+  done <"$ENV_FILE"
   "$BIN" init --agent "$INSTANCE"
 ) | sed 's/^/  /'
 
