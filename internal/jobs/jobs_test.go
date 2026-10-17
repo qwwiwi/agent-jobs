@@ -114,7 +114,80 @@ if [[ $prompt == *FAKE_SURVIVOR* ]]; then
   # A leftover in the wrapper's session (re-parented sleep); the test makes it unkillable.
   ( sleep 60 & echo $! > ../survivor.pid )
 fi
+if [[ $prompt == *FAKE_IDLE* ]]; then
+  # Idle-after-result modes: pause blocks on a FIFO held open read-write (bash builtin, no child).
+  mkfifo ../pause.fifo; exec 9<>../pause.fifo
+  pause() { read -r -t "$1" -u 9 || true; }
+  report='## Summary\nidle ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing'
+  if [[ $prompt == *FAKE_IDLE_MCP* ]]; then
+    # The job MCP server stand-in: this binary in the job role, kept alive by a FIFO writer.
+    mkfifo ../mcp.fifo
+    "$AGENT_JOBS_SELF" mcp --role job --agent test < ../mcp.fifo > /dev/null 2>&1 &
+    echo $! > ../mcp.pid
+    exec 8> ../mcp.fifo
+  fi
+  if [[ $prompt == *FAKE_IDLE_OK* ]]; then
+    echo '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$report"'"}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"Background agents are still running."}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":6,"total_cost_usd":0.75,"result":"All done."}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_OWNREPORT* ]]; then
+    # The job wrote report.md itself and ends with a short final message.
+    printf '## Summary\nown report\n' > ../report.md
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"Report written to report.md"}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_SHORT* ]]; then
+    # A report result, then 3 s of silence before claude exits by itself.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.1,"result":"'"$report"'"}'
+    pause 3
+  fi
+  if [[ $prompt == *FAKE_IDLE_NOREPORT* ]]; then
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"done, no report"}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_FAIL* ]]; then
+    echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9,"total_cost_usd":0.9,"result":""}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_CHILD* ]]; then
+    # A live background child after the result, silent stream: not closed until it is gone.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    sleep 3 & wait
+  fi
+  if [[ $prompt == *FAKE_IDLE_CHATTY* ]]; then
+    # No children, but the stream keeps growing after the result: not closed.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    for _ in $(seq 15); do pause 0.2; echo '{"type":"system","subtype":"task_progress"}'; done
+  fi
+  if [[ $prompt == *FAKE_IDLE_BGTASK* ]]; then
+    # An in-process background task is still listed after the result: not closed.
+    echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1"}]}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    pause 3
+    echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+  fi
+fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
+if [[ $prompt == *FAKE_ASSISTANT_REPORT* ]]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_SUBAGENT_REPORT* ]]; then
+  # Only a subagent's text and a quoted heading carry the report sections; the result text is empty.
+  echo '{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"text","text":"## Summary\nfrom subagent"}]}}'
+  echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Template: ## Summary"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_NONSUCCESS_REPORT* ]]; then
+  # A report text, then a non-success result that is not flagged as an error.
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+  echo '{"type":"result","subtype":"error_max_budget_usd","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0

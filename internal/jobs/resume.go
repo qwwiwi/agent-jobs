@@ -36,7 +36,7 @@ const (
 // attemptFiles are the per-attempt run files moved to attempts/<n>/ before the next attempt runs.
 // report.md is kept at the top level as report.attempt-<n>.md (prune keeps small text files there).
 var attemptFiles = []string{"stream.jsonl", "stderr.log", "exit_code", "wrapper.json", SweepMarker,
-	FallbackMarker, "stream-resume-failed.jsonl", resumePromptFile, fallbackPromptFile}
+	FallbackMarker, IdleClosedMarker, "stream-resume-failed.jsonl", resumePromptFile, fallbackPromptFile}
 
 // Caps of what goes from earlier attempts into a fallback prompt.
 const (
