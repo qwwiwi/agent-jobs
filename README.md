@@ -25,15 +25,14 @@ It is a single Go binary with one SQLite file per agent, running on Linux (syste
 
 Subagents are useful, and jobs do not replace them for short work the session needs right now. The case for jobs is about **where the context lives and who pays to re-read it**.
 
-**The measured part.** Over five days of real work ending 2026-10-15, one of our agents' long-lived main session re-read about **7.2 billion** cached tokens; all of its subagents together re-read about **2.3 billion**. The cause: the main session's context sat near 95% of its 1M-token window, and every call re-reads all of it. The dominant cost is not the work itself, it is the long-lived parent's context being read again and again.
+**The measured part.** Over five days of real work ending 2026-10-15, the long-lived main session of one of our agents re-read about **7.2 billion** cached tokens; all of its subagents together re-read about **2.3 billion**. The cause: the main session's context sat near 95% of its 1M-token window, and every call re-reads all of it. The dominant cost is not the work itself, it is the long-lived parent's context being read again and again.
 
 That is what a job avoids:
 
 - **A subagent's result lands in the parent** and is re-read on every following call until the next compaction. A job writes its result to a file; the parent gets one line and reads the report on demand.
 - **Notifications and result turns re-read the full parent.** A job costs the parent one short line when it finishes, and one read of the report.
 - **A foreground subagent keeps the parent's turn open.** The session cannot talk or decide until it returns. A job returns an id at once and the session stays free.
-- **A job can start lean.** It runs with `--strict-mcp-config` and only the MCP servers it is given. A subagent cannot be started that lean.
-- **A job has hard caps.** `--max-turns`, `--max-budget-usd` and a wall-clock timeout, enforced by the daemon. Subagents have none.
+- **A job is its own process with hard limits.** Subagents can be scoped too (turn limits, tool allowlists, MCP servers). What a job adds is the combination: a separate `claude -p` process with its own full context, its own git worktree, a USD budget (`--max-budget-usd`) and a wall-clock timeout enforced by the daemon, survival across a restart of the parent, and a fixed report contract.
 - **A job outlives the session.** Subagents die with their session; a job runs in its own process group and survives a session or daemon restart. Resuming an interrupted job from its saved patches is planned (Wave B).
 - **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most two run per agent) and, with schedules (planned, Wave B), can run when the window is quiet.
 - **A job is a full session.** A subagent starts with only its prompt and is often routed to a cheaper model. A job is a full top-level Claude Code run with its own model choice and the full tool set, inside the limits above.
@@ -149,7 +148,7 @@ The last section is mandatory and is read first: it makes the job name what it d
 | `diffstat.txt` | `git diff --stat <base>` plus the untracked list |
 | `commits.patch` | the job's commits (`git format-patch <base>..HEAD`) |
 | `staged.patch` | staged changes |
-| `uncommitted.patch` | unstaged changes (`git diff --binary`) |
+| `uncommitted.patch` | working tree vs `HEAD`, staged changes included (`git diff --binary HEAD`) |
 | `untracked.tar` | untracked, not ignored files |
 
 and sets the ref `refs/agent-jobs/jobs/<id>` in the source repository to the job's last commit. Restoring the work in a fresh worktree at the base commit is four commands; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#flows). If the repository config names a filter, diff command or textconv, no patch is made (a diff would run that program); the worktree is kept for a human and the reason is logged.
@@ -176,7 +175,7 @@ Full rule list: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#rules-enforcement).
 
 ## MCP tools
 
-The agent drives jobs through an MCP server in two roles: `orchestrator` for the main session, `job` for the jobs themselves. The job role is an allowlist: a new tool stays closed to jobs until it is opened on purpose, and the server refuses hidden tools itself.
+Planned (PR #4): the agent will drive jobs through an MCP server in two roles, `orchestrator` for the main session and `job` for the jobs themselves. The job role will be an allowlist: a new tool stays closed to jobs until it is opened on purpose, and the server itself will refuse hidden tools. On `main` today a job's `mcp.json` is empty and the CLI is the interface.
 
 **Job tools, in review ([PR #4](https://github.com/qwwiwi/agent-jobs/pull/4)):**
 
@@ -204,7 +203,7 @@ The agent drives jobs through an MCP server in two roles: `orchestrator` for the
 | Owner | `notify_owner` | none | planned, Wave B |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
-Memory, tasks and team tools keep the reference's names but are backed by a shared team memory service instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)).
+Memory, tasks and team tools will keep the reference's names but will be backed by a shared team memory service instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)); not built yet.
 
 ---
 
@@ -306,4 +305,4 @@ Built on a reference design for orchestrating background `claude -p` jobs (see [
 
 MIT (see [LICENSE](LICENSE)).
 
-[@qwwiwi](https://github.com/qwwiwi) (Dashi Eshiev) · EdgeLab AI. Issues and PRs welcome.
+[@qwwiwi](https://github.com/qwwiwi) (Dashi Eshiev), Telegram channel «Записки AI-энтузиаста» · EdgeLab AI. Issues and PRs welcome.
