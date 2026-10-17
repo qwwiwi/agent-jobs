@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -62,6 +63,9 @@ if [[ $prompt == *FAKE_GITENV* ]]; then
   git add hooked.txt
   git commit -qm "env commit" 2>> ../commit.err
   git log -1 --format='%an <%ae>' > ../author.txt
+  echo changed >> tracked.txt
+  git diff > ../diff.out 2>> ../commit.err
+  git status > /dev/null 2>> ../commit.err
 fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
@@ -77,6 +81,13 @@ printf '\n' >> "$FAKE_TMUX_LOG"
 `
 
 func TestMain(m *testing.M) {
+	// Under a git hook (pre-push runs scripts/check.sh) git exports GIT_DIR, GIT_INDEX_FILE, …: every
+	// `git -C <tempdir>` in these tests would then act on the real repository (re-init, config, commit).
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "GIT_") {
+			_ = os.Unsetenv(k)
+		}
+	}
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
@@ -1273,6 +1284,15 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch "+marker+"\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Repo-local config the job could write directly: each program would leave a marker if run.
+	ranDir := t.TempDir()
+	for _, k := range []string{"core.fsmonitor", "core.pager", "core.sshCommand", "credential.helper", "core.editor"} {
+		script := filepath.Join(ranDir, k+".sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+filepath.Join(ranDir, k+".ran")+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		gitT(t, repo, "config", k, script)
+	}
 	t.Setenv("GIT_PAGER", "evil-pager")
 	t.Setenv("EDITOR", "evil-editor")
 	t.Setenv("GIT_CONFIG_PARAMETERS", "'core.pager'='evil'")
@@ -1287,15 +1307,50 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	}
 	abs, _ := filepath.Abs(dir)
 	want := []string{
-		"EDITOR=true", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_GLOBAL=" + filepath.Join(abs, "gitconfig"),
-		"GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_VALUE_0=" + filepath.Join(abs, "no-hooks"),
-		"GIT_EDITOR=true", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "PAGER=cat", "VISUAL=true",
+		"EDITOR=true", "GIT_CONFIG_GLOBAL=" + filepath.Join(abs, "gitconfig"), "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_EDITOR=true", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "PAGER=cat", "VISUAL=true", "GIT_CONFIG_COUNT=6",
 	}
-	if got := strings.Fields(read("gitenv.txt")); strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Fatalf("git env:\n got %v\nwant %v", got, want)
+	for i, kv := range [][2]string{{"core.hooksPath", filepath.Join(abs, "no-hooks")}, {"core.fsmonitor", "false"},
+		{"core.sshCommand", "false"}, {"credential.helper", ""}, {"core.pager", "cat"}, {"core.editor", "true"}} {
+		want = append(want, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
+	}
+	slices.Sort(want)
+	if got := strings.Split(strings.TrimSpace(read("gitenv.txt")), "\n"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("git env:\n got %q\nwant %q", got, want)
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("repository pre-commit hook ran")
+	}
+	ran, _ := filepath.Glob(filepath.Join(ranDir, "*.ran"))
+	if len(ran) > 0 {
+		t.Fatalf("repo-local config ran programs: %v", ran)
+	}
+	if !strings.Contains(read("diff.out"), "+changed") {
+		t.Fatalf("git diff inside the job broken: %q, err: %s", read("diff.out"), read("commit.err"))
+	}
+	// Daemon side: a diff.external / textconv the job put into the repo config does not run in cleanup.
+	extDiff := filepath.Join(ranDir, "diff.external.sh")
+	if err := os.WriteFile(extDiff, []byte("#!/bin/sh\ntouch "+filepath.Join(ranDir, "diff.external.ran")+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "config", "diff.external", extDiff)
+	gitT(t, repo, "config", "diff.txt.textconv", extDiff)
+	if err := os.WriteFile(filepath.Join(dir, "work", ".gitattributes"), []byte("*.txt diff=txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(31 * time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if get(t, m, j.ID).CleanedAt == nil {
+		t.Fatal("cleanup did not run")
+	}
+	if ran, _ := filepath.Glob(filepath.Join(ranDir, "*.ran")); len(ran) > 0 {
+		t.Fatalf("daemon git ran programs from the repo config: %v", ran)
+	}
+	if !strings.Contains(read("uncommitted.patch"), "+changed") {
+		t.Fatalf("uncommitted.patch lacks the internal diff: %q", read("uncommitted.patch"))
 	}
 	if a := strings.TrimSpace(read("author.txt")); a != "Job Bot <bot@example.com>" {
 		t.Fatalf("author %q (commit.err: %s)", a, read("commit.err"))
@@ -1309,5 +1364,14 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("precondition: hook did not run without the scrub")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = exec.Command("git", "-C", repo, "diff").CombinedOutput()
+	for _, k := range []string{"diff.external", "core.fsmonitor"} {
+		if _, err := os.Stat(filepath.Join(ranDir, k+".ran")); err != nil {
+			t.Fatalf("precondition: repo-local %s did not run without the overrides", k)
+		}
 	}
 }

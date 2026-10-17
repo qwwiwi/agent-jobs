@@ -117,8 +117,29 @@ func newID(now time.Time) string {
 	return now.Format("060102-150405") + "-" + hex.EncodeToString(b)
 }
 
+// daemonGitEnv is the environment of the daemon's own git calls (worktree add/remove, diff,
+// format-patch, update-ref): the job may have edited the repository config, so the same command-line
+// overrides as in the job (no hooks, fsmonitor, ssh command, credential helper, pager, editor) win
+// over it; diffs additionally pass --no-ext-diff --no-textconv. The owner's global config still applies; inherited GIT_* variables are dropped.
+func daemonGitEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); !strings.HasPrefix(k, "GIT_") {
+			out = append(out, kv)
+		}
+	}
+	overrides := gitOverrides(os.DevNull)
+	out = append(out, "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "GIT_EDITOR=true",
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))
+	for i, kv := range overrides {
+		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
+	}
+	return out
+}
+
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = daemonGitEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError

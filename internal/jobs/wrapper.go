@@ -260,7 +260,8 @@ const (
 
 // GitEnv returns env without any GIT_*, PAGER, EDITOR, VISUAL variable, plus the job's git
 // environment: no system config, <jobdir>/gitconfig as the only global config, cat as pager, true as
-// editor, no terminal prompt, and core.hooksPath=<jobdir>/no-hooks at command-line level (via
+// editor, no terminal prompt, and the gitOverrides (core.hooksPath=<jobdir>/no-hooks, no fsmonitor,
+// ssh command or credential helper; cat/true as pager/editor) at command-line level (via
 // GIT_CONFIG_COUNT), which wins over any repository config. So git run by the job does not execute
 // hooks, a pager, an editor or a credential prompt the guard does not see.
 func GitEnv(jobDir string, env []string) ([]string, error) {
@@ -280,16 +281,38 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		}
 		out = append(out, kv)
 	}
-	return append(out,
+	out = append(out,
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL="+cfg,
 		"GIT_PAGER=cat", "PAGER=cat",
 		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
 		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=core.hooksPath",
-		"GIT_CONFIG_VALUE_0="+hooks,
-	), nil
+	)
+	overrides := gitOverrides(hooks)
+	out = append(out, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))
+	for i, kv := range overrides {
+		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
+	}
+	return out, nil
+}
+
+// gitOverrides are set at command-line level (GIT_CONFIG_COUNT), which beats repository config: a
+// repo-local config the job edits directly cannot bring back hooks, an fsmonitor or ssh command, a
+// credential helper, a pager or an editor.
+//
+// diff.external is deliberately NOT overridden: git has no value that disables it (an empty value
+// makes every `git diff` fail with "cannot run : No such file or directory"). The daemon's own diffs
+// pass --no-ext-diff --no-textconv instead; inside the job a repo-local diff.external is only reachable
+// by editing .git/config directly, which the guard rejects as a direct spelling (not a sandbox).
+func gitOverrides(hooks string) [][2]string {
+	return [][2]string{
+		{"core.hooksPath", hooks},
+		{"core.fsmonitor", "false"},
+		{"core.sshCommand", "false"},
+		{"credential.helper", ""}, // an empty value resets the helper list
+		{"core.pager", "cat"},
+		{"core.editor", "true"},
+	}
 }
 
 // ensureGitFiles creates an empty read-only gitconfig and an empty read-only hooks dir when missing.

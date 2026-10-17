@@ -10,6 +10,9 @@
 //   - git configuration that runs programs (hooks, pager, editor, ssh command, credential helper,
 //     external diff, aliases …): `git -c` / `git config` only for an allowlist of harmless keys, and no
 //     change to the git environment the wrapper sets up (GIT_*, PAGER, EDITOR, VISUAL; env -i / -u, unset);
+//   - git subcommands outside git's own command list (aliases, external git-*) or that run commands
+//     (rebase -x, submodule foreach, bisect run, difftool, filter-branch, …), and writes into
+//     .git/config, .git/hooks or $GIT_DIR;
 //   - nested agents (claude, codex, gemini, aider, cursor-agent): a job is a leaf.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
@@ -73,7 +76,7 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkNothingOut, checkGitEnv, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -343,6 +346,17 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if v.splitString {
 		return cannot("env -S")
 	}
+	if v.envUnknown != "" {
+		return cannot("abbreviated or unknown env option " + v.envUnknown)
+	}
+	// A glob/brace in any word that decides which program runs (wrappers, their option values, the
+	// timeout duration, the program itself) is expanded by the shell into words the guard never sees.
+	// Leading keywords (`{`, `!`) and shell assignments (not glob-expanded) are exempt, as are `[`/`[[`.
+	for i := v.lead; i <= v.start && i < len(c.words); i++ {
+		if w := c.words[i]; w != "[" && w != "[[" && hasGlob(w) {
+			return cannot("glob/brace in the command or its wrappers: " + w)
+		}
+	}
 	if v.start >= len(c.words) {
 		return ""
 	}
@@ -350,9 +364,6 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	name := strings.ToLower(base(argv[0]))
 	if dyn[0] {
 		return cannot("command name from a variable or substitution")
-	}
-	if hasGlob(argv[0]) && argv[0] != "[" && argv[0] != "[[" {
-		return cannot("glob/brace in command name " + argv[0])
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
@@ -520,6 +531,51 @@ func checkGitEnv(scripts []*script, _ string, _ Config) string {
 	return ""
 }
 
+// reGitFiles matches the git files that make git run programs: the repository config, hooks and a
+// worktree's own config (also via $GIT_DIR / ${GIT_DIR}).
+var reGitFiles = regexp.MustCompile(`(?i)((^|/)\.git/(config|hooks|worktrees/[^/]+/(config|hooks))|\$\{?GIT_DIR\b)`)
+
+// gitFileReaders only read the files named by their arguments, so naming .git/config there is harmless.
+var gitFileReaders = map[string]bool{
+	"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true, "rg": true, "cat": true,
+	"ls": true, "head": true, "tail": true, "wc": true, "file": true, "stat": true, "test": true, "[": true,
+	"less": true, "diff": true,
+}
+
+// checkGitFiles rejects writes into the repository config, hooks or $GIT_DIR: an output redirection
+// to such a path (any program), or such a path as an argument of a program that is not a plain reader
+// (tee, cp, mv, ln, sed -i, chmod, …). git itself is checked by the config allowlist instead.
+func checkGitFiles(scripts []*script, _ string, _ Config) string {
+	blocked := func(p string) string {
+		return "blocked by guard: `" + p + "` is git's config, hooks or $GIT_DIR; a job does not write there " +
+			"(git would run programs from it)."
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				for _, t := range c.outRedirs {
+					if reGitFiles.MatchString(t) {
+						return blocked(t)
+					}
+				}
+				argv := argvOf(c.words)
+				if len(argv) == 0 {
+					continue
+				}
+				if name := strings.ToLower(base(argv[0])); isGitName(name) || gitFileReaders[name] {
+					continue
+				}
+				for _, a := range argv[1:] {
+					if reGitFiles.MatchString(a) {
+						return blocked(a)
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // ghRead is the only gh surface a job may use: read-only subcommands. Everything else is rejected
 // (fail closed): writes that publish or reach a human (pr/issue create, comment, edit, merge, review,
 // close/reopen --comment, gist, repo, label, secret, workflow run, release, api, alias set …) and
@@ -560,8 +616,103 @@ func outside(what string) string {
 		"the orchestrator publishes after reading the report and the diff."
 }
 
-// gitOutside are git subcommands that publish or reach another repository.
-var gitOutside = map[string]bool{"push": true, "tag": true, "send-pack": true, "http-push": true}
+// gitOutside are git subcommands that publish, mail, serve or reach another system.
+var gitOutside = map[string]bool{
+	"push": true, "tag": true, "send-pack": true, "http-push": true, "send-email": true, "imap-send": true,
+	"svn": true, "p4": true, "daemon": true, "request-pull": true, "instaweb": true, "web--browse": true,
+	"cvsexportcommit": true, "cvsimport": true, "cvsserver": true, "archimport": true, "http-backend": true,
+	"upload-pack": true, "receive-pack": true, "upload-archive": true, "shell": true,
+}
+
+// gitRunsCmd are git subcommands that run arbitrary commands, other git commands the guard does
+// not see (for-each-repo), or that install or outlive the run (maintenance start, daemons).
+var gitRunsCmd = map[string]bool{
+	"filter-branch": true, "filter-repo": true, "difftool": true, "difftool--helper": true, "mergetool": true,
+	"for-each-repo": true, "maintenance": true, "hook": true, "remote-ext": true, "remote-fd": true,
+	"credential-cache--daemon": true, "fsmonitor--daemon": true,
+}
+
+// gitKnown are git's own commands (`git --list-cmds=main`, git 2.43, plus later built-ins). A
+// subcommand outside this list is an alias or an external git-* program: rejected, so an alias in
+// a config the guard does not see cannot resolve to anything.
+var gitKnown = func() map[string]bool {
+	m := map[string]bool{}
+	for _, c := range strings.Fields(`add am annotate apply archive bisect blame branch bugreport bundle cat-file
+		check-attr check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry
+		cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential
+		credential-cache credential-store describe diagnose diff diff-files diff-index diff-tree fast-export
+		fast-import fetch fetch-pack fmt-merge-msg for-each-ref format-patch fsck fsck-objects gc
+		get-tar-commit-id grep hash-object help http-fetch index-pack init init-db interpret-trailers log
+		ls-files ls-remote ls-tree mailinfo mailsplit merge merge-base merge-file merge-index merge-octopus
+		merge-one-file merge-ours merge-recursive merge-recursive-ours merge-recursive-theirs merge-resolve
+		merge-subtree merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects pack-redundant
+		pack-refs patch-id pickaxe prune prune-packed pull quiltimport range-diff read-tree rebase reflog remote
+		repack replace rerere reset restore rev-list rev-parse revert rm shortlog show show-branch show-index
+		show-ref sparse-checkout stage stash status stripspace submodule submodule--helper subtree switch
+		symbolic-ref unpack-file unpack-objects update-index update-ref update-server-info var verify-commit
+		verify-pack verify-tag version whatchanged worktree write-tree replay refs backfill last-modified repo`) {
+		m[c] = true
+	}
+	return m
+}()
+
+// longPrefixOf reports a long option `--n[=v]` whose name n is a prefix of one of full: git's
+// parse-options accepts unique abbreviations (`git rebase --ex=cmd` is `--exec=cmd`).
+func longPrefixOf(a string, full ...string) bool {
+	n, ok := strings.CutPrefix(a, "--")
+	if !ok || n == "" {
+		return false
+	}
+	n, _, _ = strings.Cut(n, "=")
+	return slices.ContainsFunc(full, func(f string) bool { return strings.HasPrefix(f, n) })
+}
+
+// gitRunForm returns the form of a known subcommand that runs a command, or "".
+func gitRunForm(g gitCall) string {
+	var pos []string
+	for _, a := range g.args {
+		if longPrefixOf(a, "upload-pack", "receive-pack") {
+			return g.sub + " --upload-pack/--receive-pack"
+		}
+		if !strings.HasPrefix(a, "-") {
+			pos = append(pos, a)
+		}
+	}
+	switch g.sub {
+	case "rebase":
+		for _, a := range g.args {
+			if longPrefixOf(a, "exec") || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'x')) {
+				return "rebase -x/--exec"
+			}
+		}
+	case "submodule":
+		if slices.Contains(pos, "foreach") {
+			return "submodule foreach"
+		}
+	case "bisect":
+		if len(pos) > 0 && pos[0] == "run" {
+			return "bisect run"
+		}
+	case "archive":
+		for _, a := range g.args {
+			if longPrefixOf(a, "exec", "remote") {
+				return "archive --exec/--remote"
+			}
+		}
+	case "clone":
+		for _, a := range g.args {
+			if a == "-u" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 'u')) {
+				return "clone -u"
+			}
+		}
+	}
+	return ""
+}
+
+func gitRunsBlocked(what string) string {
+	return "blocked by guard: `git " + what + "` runs commands or git subcommands the guard does not see " +
+		"(or is not one of git's own commands: aliases and external git-* programs are not allowed)."
+}
 
 // gitConfigSafe are the git config keys a job may set (`git -c`, `git config`): none of them makes
 // git run a program. Everything else is rejected (fail closed): core.hooksPath, core.pager,
@@ -596,6 +747,12 @@ func checkNothingOut(scripts []*script, _ string, _ Config) string {
 			}
 			if gitOutside[g.sub] {
 				return outside("git " + g.sub)
+			}
+			if g.sub != "" && (gitRunsCmd[g.sub] || !gitKnown[g.sub]) {
+				return gitRunsBlocked(g.sub)
+			}
+			if f := gitRunForm(g); f != "" {
+				return gitRunsBlocked(f)
 			}
 			if g.sub == "config" {
 				if slices.Contains(g.args, "--rename-section") || slices.Contains(g.args, "rename-section") {

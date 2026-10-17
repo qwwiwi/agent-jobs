@@ -18,6 +18,8 @@ type simpleCmd struct {
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
+	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
+	outRedirs []string
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -72,6 +74,7 @@ type parser struct {
 	dyn      bool // current word contains an expansion
 	quoted   bool // current word contains quoting
 	redir    redirKind
+	redirOut bool // the pending redirFile target is written to
 	heredocs []pendingHeredoc
 	paren    int    // current `( … )` depth
 	sep      string // separator that ended the previous pipeline
@@ -97,11 +100,15 @@ func (p *parser) endWord() {
 	case redirNone:
 		p.cmd.words = append(p.cmd.words, w)
 		p.cmd.dyn = append(p.cmd.dyn, p.dyn)
+	case redirFile:
+		if p.redirOut {
+			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
+		}
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
 	}
 	p.started, p.dyn, p.quoted = false, false, false
-	p.redir = redirNone
+	p.redir, p.redirOut = redirNone, false
 }
 
 func (p *parser) endCmd() {
@@ -299,7 +306,7 @@ func (p *parser) run() {
 			if p.peek(0) == '>' {
 				p.i++
 			}
-			p.redir = redirFile
+			p.redir, p.redirOut = redirFile, true
 		case c == '&':
 			p.endPipeline("&")
 			p.i++
@@ -348,6 +355,7 @@ func (p *parser) redirect() {
 	p.endWord()
 	op := p.src[p.i]
 	p.i++
+	out := op == '>'
 	if op == '<' {
 		p.cmd.stdin = true
 	}
@@ -364,9 +372,10 @@ func (p *parser) redirect() {
 			kind = redirHeredoc
 		}
 	} else if p.peek(0) == '>' || p.peek(0) == '&' || p.peek(0) == '|' {
+		out = out || p.peek(0) == '>' // `<>file` opens it for writing too
 		p.i++
 	}
-	p.redir = kind
+	p.redir, p.redirOut = kind, out
 }
 
 func (p *parser) double() {
@@ -513,6 +522,8 @@ type cmdView struct {
 	splitString bool     // `env -S` / `--split-string`: the program comes from a string the guard cannot see
 	envClear    bool     // `env -i` / `env -` / `--ignore-environment` / `exec -c`: the program runs with an emptied environment
 	envUnset    []string // variables removed by `env -u NAME` / `-uNAME` / `--unset[=]NAME`
+	envUnknown  string   // first env long option that is not a full known spelling (abbreviation, unknown)
+	lead        int      // number of leading keywords and shell assignments (before any program word)
 }
 
 // split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
@@ -530,6 +541,7 @@ func split(words []string) cmdView {
 		}
 		i++
 	}
+	v.lead = i
 	for i < len(words) {
 		name := strings.ToLower(base(words[i]))
 		vf, ok := wrapperValueFlags[name]
@@ -557,15 +569,28 @@ func split(words []string) cmdView {
 				long, attached := strings.HasPrefix(w, "--"), false
 				switch {
 				case name == "env" && long:
-					v.splitString = v.splitString || strings.HasPrefix(w, "--split-string")
-					v.envClear = v.envClear || w == "--ignore-environment"
-					if u, ok := strings.CutPrefix(w, "--unset="); ok {
-						v.envUnset = append(v.envUnset, u)
-					} else if (w == "--unset" || w == "--chdir") && i+1 < len(words) {
-						if w == "--unset" {
-							v.envUnset = append(v.envUnset, words[i+1])
+					// GNU getopt accepts any unambiguous prefix (`--ign`, `--unse=X`): only the full
+					// spellings below are read; anything else is recorded and rejected (fail closed).
+					opt, val, hasVal := strings.Cut(w[2:], "=")
+					switch opt {
+					case "ignore-environment":
+						v.envClear = true
+					case "split-string":
+						v.splitString = true
+					case "unset", "chdir":
+						if !hasVal && i+1 < len(words) {
+							i++ // value of the long option
+							val = words[i]
 						}
-						i++ // value of the long option
+						if opt == "unset" {
+							v.envUnset = append(v.envUnset, val)
+						}
+					case "null", "debug", "help", "version", "list-signal-handling",
+						"block-signal", "default-signal", "ignore-signal":
+					default:
+						if v.envUnknown == "" {
+							v.envUnknown = w
+						}
 					}
 				case name == "env":
 					v.splitString = v.splitString || strings.ContainsRune(w, 'S')

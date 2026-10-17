@@ -213,7 +213,8 @@ func (m *Manager) Cleanup(j *store.Job) error {
 			files = append(files, f)
 		}
 	}
-	stat, err := git(work, "diff", "--stat", j.BaseCommit)
+	// --no-ext-diff --no-textconv: the job may have set diff.external / a textconv in the repo config.
+	stat, err := git(work, "diff", "--no-ext-diff", "--no-textconv", "--stat", j.BaseCommit)
 	if err != nil {
 		return err
 	}
@@ -227,9 +228,9 @@ func (m *Manager) Cleanup(j *store.Job) error {
 		file string
 		args []string
 	}{
-		{"commits.patch", []string{"format-patch", j.BaseCommit + "..HEAD", "--stdout"}},
-		{"staged.patch", []string{"diff", "--cached", "--binary", "HEAD"}},
-		{"uncommitted.patch", []string{"diff", "--binary", "HEAD"}},
+		{"commits.patch", []string{"format-patch", "--no-ext-diff", "--no-textconv", j.BaseCommit + "..HEAD", "--stdout"}},
+		{"staged.patch", []string{"diff", "--no-ext-diff", "--no-textconv", "--cached", "--binary", "HEAD"}},
+		{"uncommitted.patch", []string{"diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"}},
 	} {
 		out, err := gitRaw(work, p.args...)
 		if err != nil {
@@ -314,6 +315,7 @@ func writeTar(dst, root string, files []string) error {
 // gitRaw returns raw stdout (patches must not be trimmed).
 func gitRaw(dir string, args ...string) ([]byte, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = daemonGitEnv()
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()

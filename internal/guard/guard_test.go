@@ -647,3 +647,104 @@ func TestCheckSecurityReview(t *testing.T) {
 		})
 	}
 }
+
+// Automated security review of the fix-loop guard commit: env abbreviations, glob/brace in wrapper
+// words, incomplete git denylist (unknown subcommands, command-running forms), writes into git files.
+func TestCheckSecurityReview2(t *testing.T) {
+	cfg := Config{OwnerNames: []string{"Dashi"}, GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// 1: env long options: GNU getopt abbreviations, two-word --unset; unknown long options fail closed.
+		{"env --ign", "env --ign ./run.sh", true},
+		{"env --ignore-env", "env --ignore-env git status", true},
+		{"env --unse=", "env --unse=GIT_CONFIG_GLOBAL ./run.sh", true},
+		{"env --uns sep", "env --uns GIT_DIR ./run.sh", true},
+		{"env --unset sep GIT", "env --unset GIT_CONFIG_GLOBAL ./run.sh", true},
+		{"env --spl", "env --spl 'git push'", true},
+		{"env unknown long", "env --frobnicate ./run.sh", true},
+		{"env --chdir ok", "env --chdir=/tmp ./run.sh", false},
+		{"env --unset other ok", "env --unset LANG ./run.sh", false},
+		{"env --null ok", "env --null", false},
+		// 2: glob/brace in any word up to the program: wrapper option values, the timeout duration.
+		{"timeout glob duration", "timeout 5* git push", true},
+		{"timeout brace duration", "timeout {5,git} push", true},
+		{"env -C brace", "env -C {x,git} push", true},
+		{"nice -n brace", "nice -n {1,git} push", true},
+		{"stdbuf brace value", "stdbuf -o {L,git} push", true},
+		{"sudo -u glob", "sudo -u r* git status", true},
+		{"brace keyword ok", "{ go test ./...; }", false},
+		{"assignment glob ok", "FILES=*.go go vet ./...", false},
+		{"timeout ok", "timeout 60 go test ./...", false},
+		// 3: git subcommands: more outside verbs, command-running forms, unknown subcommands (aliases).
+		{"git send-email", "git send-email x.patch", true},
+		{"git imap-send", "git imap-send", true},
+		{"git svn", "git svn dcommit", true},
+		{"git p4", "git p4 submit", true},
+		{"git daemon", "git daemon --export-all", true},
+		{"git request-pull", "git request-pull v1 origin", true},
+		{"git instaweb", "git instaweb", true},
+		{"git-send-email binary", "/usr/lib/git-core/git-send-email x", true},
+		{"rebase -x", "git rebase -x 'sh x' HEAD~1", true},
+		{"rebase --exec", "git rebase --exec='sh x' HEAD~1", true},
+		{"rebase --ex abbrev", "git rebase --ex 'sh x' HEAD~1", true},
+		{"rebase -ix cluster", "git rebase -ix 'sh x' HEAD~1", true},
+		{"rebase ok", "git rebase main", false},
+		{"submodule foreach", "git submodule foreach 'sh x'", true},
+		{"submodule --quiet foreach", "git submodule --quiet foreach 'sh x'", true},
+		{"submodule status ok", "git submodule status", false},
+		{"bisect run", "git bisect run ./test.sh", true},
+		{"bisect start ok", "git bisect start", false},
+		{"difftool", "git difftool -x 'sh x'", true},
+		{"difftool --extcmd", "git difftool --extcmd='sh x'", true},
+		{"mergetool", "git mergetool", true},
+		{"filter-branch", "git filter-branch --tree-filter 'sh x'", true},
+		{"filter-repo", "git filter-repo --path x", true},
+		{"for-each-repo", "git for-each-repo --config=x -- push", true},
+		{"maintenance start", "git maintenance start", true},
+		{"hook run", "git hook run pre-commit", true},
+		{"fetch --upload-pack", "git fetch --upload-pack='sh x' origin", true},
+		{"ls-remote --upload-pack abbrev", "git ls-remote --upload='sh x' origin", true},
+		{"clone -u", "git clone -u 'sh x' https://x/y", true},
+		{"archive --exec", "git archive --exec='sh x' HEAD", true},
+		{"unknown subcommand alias", "git p origin", true},
+		{"unknown subcommand lfs", "git lfs push origin", true},
+		{"git-lfs binary", "git-lfs push origin", true},
+		{"git --version ok", "git --version", false},
+		{"git help ok", "git help commit", false},
+		{"git worktree list ok", "git worktree list", false},
+		{"git fetch ok", "git fetch origin", false},
+		{"git log ok", "git log --until=yesterday --reverse", false},
+		{"git add -u ok", "git add -u", false},
+		// 4: writes and redirects into git config, hooks, $GIT_DIR.
+		{"redirect .git/config", "echo '[core]' >> .git/config", true},
+		{"redirect hook", "printf 'x' > .git/hooks/pre-commit", true},
+		{"redirect abs config", "echo x >> /repo/.git/config", true},
+		{"redirect worktree config", "echo x > /repo/.git/worktrees/w/config.worktree", true},
+		{"redirect GIT_DIR", `echo x > "$GIT_DIR/config"`, true},
+		{"redirect GIT_DIR braces", "echo x > ${GIT_DIR}/hooks/post-commit", true},
+		{"redirect &>", "make &> .git/hooks/pre-push", true},
+		{"redirect <>", "cat <> .git/config", true},
+		{"tee config", "echo x | tee -a .git/config", true},
+		{"cp hook", "cp evil.sh .git/hooks/pre-commit", true},
+		{"ln hook", "ln -s ../../evil.sh .git/hooks/pre-commit", true},
+		{"sed -i config", "sed -i 's/x/y/' .git/config", true},
+		{"chmod hook", "chmod +x .git/hooks/pre-commit", true},
+		{"cat config ok", "cat .git/config", false},
+		{"grep config ok", "grep -n hooksPath .git/config", false},
+		{"redirect from config ok", "wc -l < .git/config", false},
+		{"redirect elsewhere ok", "go test ./... > /tmp/out.txt 2>&1", false},
+		{"index.lock ok", "rm -f .git/index.lock", false},
+		{"git config --file ok", "git config --file .git/config commit.gpgsign false", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
