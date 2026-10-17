@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ func TestMain(m *testing.M) {
 			_ = os.Unsetenv(k)
 		}
 	}
+	_ = os.Unsetenv(jobs.JobEnvVar) // the tests set the job marker themselves where they need it
 	dir, err := os.MkdirTemp("", "agent-jobs-mcp-test-")
 	if err != nil {
 		log.Fatal(err)
@@ -389,5 +391,115 @@ func TestStdioSubcommand(t *testing.T) {
 	if out, err := exec.Command(selfBin, "mcp", "--role", "admin", "--agent", "test").CombinedOutput(); err == nil ||
 		!strings.Contains(string(out), "role") {
 		t.Fatalf("unknown role: %v %s", err, out)
+	}
+}
+
+// No nested jobs, layer 1: under the job marker the real binary refuses every control command; only
+// the job's own MCP server, the guard hook and help run.
+func TestBinaryRefusesInsideJob(t *testing.T) {
+	home := t.TempDir()
+	env := append(os.Environ(), "AGENT_JOBS_HOME="+home, jobs.JobEnvVar+"=261017-000000-abcd")
+	for _, args := range [][]string{
+		{"start", "--agent", "test", "--title", "t", "--model", "opus", "--brief", "b"},
+		{"cancel", "--agent", "test", "x"},
+		{"tick", "--agent", "test"},
+		{"daemon", "--agent", "test"},
+		{"init", "--agent", "test"},
+		{"status", "--agent", "test", "x"},
+		{"list", "--agent", "test"},
+		{"result", "--agent", "test", "x"},
+		{"prune", "--agent", "test"},
+		{"mcp", "--role", "orchestrator", "--agent", "test"},
+		{"mcp", "--agent", "test", "--role=orchestrator"},
+		{"mcp", "--agent", "test"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, selfBin, args...)
+		cmd.Env = env
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err == nil || !strings.Contains(string(out), "refused: running inside job") {
+			t.Fatalf("%v under the marker: err=%v out=%s", args, err, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "test")); err == nil {
+		t.Fatal("a refused command created the agent's state dir")
+	}
+	// The guard hook still runs under the marker.
+	cmd := exec.Command(selfBin, "guard")
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(`{"tool_name":"Bash","tool_input":{"command":"ls"}}`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("guard under the marker: %v %s", err, out)
+	}
+	// The job's own MCP server still runs under the marker and refuses orchestrator tools.
+	mc := exec.Command(selfBin, "mcp", "--role", "job", "--agent", "test")
+	mc.Env = env
+	cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "0"}, nil).
+		Connect(context.Background(), &sdk.CommandTransport{Command: mc}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	if msg := callErr(t, cs, "job_start", startArgs(nil)); !strings.Contains(msg, "not available to the job role") {
+		t.Fatalf("job role under the marker: %q", msg)
+	}
+	// Serve refuses the orchestrator role under the marker even when called directly.
+	t.Setenv(jobs.JobEnvVar, "x")
+	if err := Serve(context.Background(), RoleOrchestrator, "test"); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("Serve orchestrator under the marker: %v", err)
+	}
+}
+
+// job_result never blocks on, follows or reads a non-regular report.md (the job dir is the job's to
+// write): a FIFO or a symlink is reported as missing, and non-regular artifacts are not listed.
+func TestJobResultRefusesNonRegularFiles(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i, mk := range []func(string) error{
+		func(p string) error { return syscall.Mkfifo(p, 0o600) },
+		func(p string) error { return os.Symlink(secret, p) },
+		func(p string) error { return os.Mkdir(p, 0o700) },
+	} {
+		j := &store.Job{ID: "261017-12000" + string(rune('0'+i)) + "-f1f0", Agent: "test", Title: "t", Kind: "general",
+			Brief: "b", Status: store.StatusSucceeded, Model: "opus", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1,
+			CreatedAt: now, FinishedAt: &now}
+		if err := m.Store.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+		dir := m.JobDir(j.ID)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := mk(filepath.Join(dir, "report.md")); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(filepath.Join(dir, "commits.patch"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan JobResultOutput, 1)
+		go func() {
+			var out JobResultOutput
+			call(t, cs, "job_result", map[string]any{"id": j.ID}, &out)
+			done <- out
+		}()
+		select {
+		case out := <-done:
+			if !out.ReportMissing || out.Report != "" || !strings.Contains(out.Note, "not a regular file") ||
+				len(out.Artifacts) != 0 || strings.Contains(out.Report, "SECRET") {
+				t.Fatalf("case %d: %+v", i, out)
+			}
+		case <-time.After(10 * time.Second):
+			// Unblock the stuck open (a writer arrives) so the test fails instead of hanging.
+			if w, err := os.OpenFile(filepath.Join(dir, "report.md"), os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+				_ = w.Close()
+			}
+			t.Fatalf("case %d: job_result blocked on a non-regular report.md", i)
+		}
 	}
 }

@@ -28,6 +28,7 @@ const fakeClaude = `#!/bin/bash
 set -u
 prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
+printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
@@ -88,6 +89,9 @@ func TestMain(m *testing.M) {
 			_ = os.Unsetenv(k)
 		}
 	}
+	// Run inside a job (a job working on this repository), the binary under test would refuse its
+	// control commands; the tests set the marker themselves where they need it.
+	_ = os.Unsetenv(JobEnvVar)
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
@@ -551,6 +555,20 @@ func TestNotifyUsesTmuxSocket(t *testing.T) {
 		if _, err := LoadConfig(dir); err == nil {
 			t.Fatalf("tmux_socket %q accepted", bad)
 		}
+	}
+}
+
+// The wrapper marks the job's claude with AGENT_JOBS_JOB=<id>, replacing an inherited value.
+func TestWrapperSetsJobMarker(t *testing.T) {
+	m := newManager(t)
+	t.Setenv(JobEnvVar, "inherited")
+	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "marker.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(b)); got != j.ID {
+		t.Fatalf("claude ran with %s=%q, want %q", JobEnvVar, got, j.ID)
 	}
 }
 

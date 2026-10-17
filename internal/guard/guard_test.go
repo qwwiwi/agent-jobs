@@ -1028,3 +1028,76 @@ func TestCheckSecurityReview2(t *testing.T) {
 		})
 	}
 }
+
+// No nested jobs (PR #4 review): agent-jobs is rejected as a command in every form except the job's
+// own MCP server, and the AGENT_JOBS_* environment (the job marker) cannot be changed.
+func TestCheckNoNestedJobs(t *testing.T) {
+	cfg := Config{GitName: "Job Bot", GitEmail: "bot@example.com"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"start", `agent-jobs start --agent thrall --title t --model opus --brief x`, true},
+		{"mcp orchestrator", `agent-jobs mcp --role orchestrator --agent thrall`, true},
+		{"mcp role=orchestrator", `agent-jobs mcp --role=orchestrator`, true},
+		{"mcp two roles", `agent-jobs mcp --role job --role orchestrator`, true},
+		{"mcp no role", `agent-jobs mcp --agent thrall`, true},
+		{"mcp extra flag", `agent-jobs mcp --role job --agent thrall --x y`, true},
+		{"mcp extra positional", `agent-jobs mcp --role job start`, true},
+		{"cancel", `agent-jobs cancel --agent thrall 261017-1`, true},
+		{"tick", `agent-jobs tick --agent thrall`, true},
+		{"daemon", `agent-jobs daemon --agent thrall`, true},
+		{"list", `agent-jobs list --agent thrall`, true},
+		{"bare", `agent-jobs`, true},
+		{"path", `/home/u/.local/bin/agent-jobs start --title t`, true},
+		{"relative path", `./agent-jobs tick`, true},
+		{"upper", `AGENT-JOBS tick`, true},
+		{"suffix build", `./agent-jobs-linux tick`, true},
+		{"env wrapper", `env FOO=1 agent-jobs tick`, true},
+		{"command wrapper", `command agent-jobs tick`, true},
+		{"nohup", `nohup agent-jobs daemon --agent thrall &`, true},
+		{"timeout", `timeout 5 agent-jobs tick`, true},
+		{"bash -c", `bash -c 'agent-jobs tick'`, true},
+		{"sh -c", `sh -c "agent-jobs start --title t"`, true},
+		{"substitution", `echo $(agent-jobs list)`, true},
+		{"backticks", "x=`agent-jobs list`", true},
+		{"eval", `eval 'agent-jobs tick'`, true},
+		{"after &&", `true && agent-jobs tick`, true},
+		{"in pipeline", `echo x | agent-jobs start --title t`, true},
+		{"find -exec", `find . -exec agent-jobs tick \;`, true},
+		{"xargs", `echo tick | xargs agent-jobs`, true},
+		{"python -c", `python3 -c 'import subprocess; subprocess.run(["agent-jobs", "tick"])'`, true},
+		{"cp binary", `cp /home/u/.local/bin/agent-jobs ./x`, true},
+		{"mcp job role ok", `agent-jobs mcp --role job --agent thrall`, false},
+		{"mcp job role= ok", `agent-jobs mcp --agent=thrall --role=job`, false},
+		{"which ok", `which agent-jobs`, false},
+		{"grep ok", `grep -rn agent-jobs docs`, false},
+		{"echo ok", `echo agent-jobs`, false},
+		// The job marker and the other AGENT_JOBS_* variables.
+		{"unset marker", `unset AGENT_JOBS_JOB; ./run.sh`, true},
+		{"env -u marker", `env -u AGENT_JOBS_JOB ./run.sh`, true},
+		{"env -u attached", `env -uAGENT_JOBS_JOB ./run.sh`, true},
+		{"env --unset", `env --unset AGENT_JOBS_JOB ./run.sh`, true},
+		{"prefix empty", `AGENT_JOBS_JOB= ./run.sh`, true},
+		{"prefix home", `AGENT_JOBS_HOME=/tmp/x ./run.sh`, true},
+		{"export", `export AGENT_JOBS_JOB=`, true},
+		{"export bare", `export -n AGENT_JOBS_JOB`, true},
+		{"declare", `declare +x AGENT_JOBS_JOB`, true},
+		{"read", `read AGENT_JOBS_JOB < /dev/null`, true},
+		{"printf -v", `printf -v AGENT_JOBS_JOB ''`, true},
+		{"expand assign", `echo ${AGENT_JOBS_JOB:=x}`, true},
+		{"env assign", `env AGENT_JOBS_JOB= ./run.sh`, true},
+		{"env -i", `env -i ./run.sh`, true},
+		{"read marker ok", `echo "$AGENT_JOBS_JOB"`, false},
+		{"grep marker ok", `grep -rn AGENT_JOBS_JOB docs`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

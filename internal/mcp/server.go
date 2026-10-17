@@ -115,6 +115,9 @@ func enforceRole(role Role) sdk.Middleware {
 // The orchestrator role opens the agent's job manager; the job role opens nothing.
 func Serve(ctx context.Context, role Role, agent string) error {
 	var d Deps
+	if id, inside := jobs.InsideJob(); inside && role != RoleJob {
+		return fmt.Errorf("refused: the %s role does not run inside job %q (%s is set)", role, id, jobs.JobEnvVar)
+	}
 	if role == RoleOrchestrator {
 		m, err := jobs.Open(agent)
 		if err != nil {

@@ -13,7 +13,9 @@
 //   - git subcommands outside git's own command list (aliases, external git-*) or that run commands
 //     (rebase -x, submodule foreach, bisect run, difftool, filter-branch, …), and writes into
 //     .git/config, .git/hooks or $GIT_DIR;
-//   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf.
+//   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf;
+//   - agent-jobs itself in any form except `agent-jobs mcp --role job` (no nested jobs), and any change
+//     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets).
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
@@ -179,7 +181,7 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -352,7 +354,44 @@ func isAgent(b string) bool {
 // execName reports a lower-cased base name that, as an argument, names something that runs commands
 // the guard would not see: git (any git-<sub>), gh, a shell, a wrapper/indirect program, a package
 // runner or an agent.
-func execName(b string) bool { return indirect[b] || shells[b] || isAgent(b) || isGitName(b) }
+func execName(b string) bool {
+	return indirect[b] || shells[b] || isAgent(b) || isGitName(b) || isSelf(b)
+}
+
+// isSelf reports a lower-cased base name that runs agent-jobs (also `agent-jobs-<suffix>` builds).
+func isSelf(b string) bool { return b == "agent-jobs" || strings.HasPrefix(b, "agent-jobs-") }
+
+// jobRoleMCP reports whether args (after the program name) are exactly `mcp --role job` with an
+// optional --agent value: the one agent-jobs form a job may run (it is the job's own MCP server).
+func jobRoleMCP(args []string) bool {
+	if len(args) == 0 || args[0] != "mcp" {
+		return false
+	}
+	roles, agent := 0, 0
+	for k := 1; k < len(args); k++ {
+		name, val, eq := strings.Cut(strings.TrimLeft(args[k], "-"), "=")
+		if !strings.HasPrefix(args[k], "-") || (name != "role" && name != "agent") {
+			return false
+		}
+		if !eq {
+			if k+1 >= len(args) {
+				return false
+			}
+			k++
+			val = args[k]
+		}
+		switch name {
+		case "role":
+			if val != "job" {
+				return false
+			}
+			roles++
+		case "agent":
+			agent++
+		}
+	}
+	return roles == 1 && agent <= 1
+}
 
 // mentionsExec reports a word (e.g. a substitution `$(which git)`) that names an execName program.
 func mentionsExec(w string) bool {
@@ -461,7 +500,7 @@ var (
 	// (`npx @anthropic-ai/claude-code`, `node …/claude-code/cli.js`).
 	// Agent names may carry a `-suffix` (`gemini-cli`, `aider-chat`, `@google/gemini-cli`, `codex-cli`).
 	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((git|gh|sh|bash|zsh|dash|fish)($|[^a-z0-9_-])|` +
-		`(claude|codex|gemini|aider|cursor-agent)($|[^a-z0-9_]))`)
+		`(claude|codex|gemini|aider|cursor-agent|agent-jobs)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
 )
 
@@ -647,6 +686,66 @@ func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 		}
 		return ""
 	})
+}
+
+// checkSelf: no nested jobs. agent-jobs as a command (by name or path, behind env/command/exec/nohup,
+// inside sh -c, eval or a substitution) is rejected unless it is exactly `agent-jobs mcp --role job`;
+// as an argument of another program it is caught by the indirect scan in unverifiable.
+func checkSelf(scripts []*script, _ string, _ Config) string {
+	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		if len(argv) > 0 && isSelf(strings.ToLower(base(argv[0]))) && !jobRoleMCP(argv[1:]) {
+			return "blocked by guard: `" + base(argv[0]) + "` controls jobs. A job never starts, cancels or manages jobs " +
+				"(no nested jobs); only the orchestrator does."
+		}
+		return ""
+	})
+}
+
+var (
+	// jobEnv are the agent-jobs variables: AGENT_JOBS_JOB marks every process of a job, the others
+	// select state (AGENT_JOBS_HOME, AGENT_JOBS_AGENT, binaries).
+	reJobVar    = regexp.MustCompile(`^AGENT_JOBS_[A-Za-z0-9_]*$`)
+	reJobAssign = regexp.MustCompile(`^AGENT_JOBS_[A-Za-z0-9_]*\+?=`)
+	reJobExpand = regexp.MustCompile(`\$\{AGENT_JOBS_[A-Za-z0-9_]*:?=`)
+)
+
+// varSetters take bare variable names that they set, export or remove.
+var varSetters = map[string]bool{
+	"unset": true, "export": true, "declare": true, "typeset": true, "local": true, "readonly": true,
+	"read": true, "printf": true, "env": true,
+}
+
+// checkJobEnv keeps the job marker: an unset (`unset`, `env -u`), an assignment (prefix, export,
+// declare, ${VAR:=…}) or a setter naming an AGENT_JOBS_* variable is rejected in any call. Emptying
+// the whole environment (`env -i`) is rejected by checkGitEnv.
+func checkJobEnv(scripts []*script, _ string, _ Config) string {
+	blocked := func(what string) string {
+		return "blocked by guard: `" + what + "` changes the agent-jobs environment of the job (AGENT_JOBS_JOB marks " +
+			"the job's processes). Leave AGENT_JOBS_* unchanged."
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				v := split(c.words)
+				for _, u := range v.envUnset {
+					if reJobVar.MatchString(u) {
+						return blocked("env -u " + u)
+					}
+				}
+				setter := false
+				if v.start < len(c.words) {
+					setter = varSetters[strings.ToLower(base(c.words[v.start]))]
+				}
+				for _, w := range c.words {
+					if reJobAssign.MatchString(w) || reJobExpand.MatchString(w) || (setter && reJobVar.MatchString(w)) {
+						name, _, _ := strings.Cut(w, "=")
+						return blocked(name)
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 var (

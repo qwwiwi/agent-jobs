@@ -48,7 +48,7 @@ Optional `~/.agent-jobs/<agent>/config.json`:
 - `owner_names` must never appear in a job's commit.
 - `git_name`/`git_email` is the job's git identity: the wrapper writes it into `<jobdir>/gitconfig` and points `GIT_CONFIG_GLOBAL` at it (repo-local `user.*` still wins, as in git). A job cannot override it (`-c user.*`, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, `--author` are rejected; `git config user.*` only with the same value). Empty = no identity from agent-jobs.
 - Timings are fixed by the reference and not configurable: the daemon ticks every minute, a worktree is removed 30 minutes after the job-done line was delivered.
-- Env overrides: `AGENT_JOBS_HOME` (state root), `AGENT_JOBS_AGENT` (default `--agent`), `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`.
+- Env overrides: `AGENT_JOBS_HOME` (state root), `AGENT_JOBS_AGENT` (default `--agent`), `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job: under it the binary refuses everything except `mcp --role job`, `guard` and `run-wrapper`.
 
 ## CLI
 

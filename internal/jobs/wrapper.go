@@ -234,6 +234,11 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
 		return 127
 	}
+	env, err = JobEnv(jobDir, env)
+	if err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
+		return 127
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
@@ -250,6 +255,29 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		return 127
 	}
 	return 0
+}
+
+// JobEnvVar marks every process of a job: the wrapper sets AGENT_JOBS_JOB=<job id> on claude, and
+// children inherit it. The agent-jobs binary refuses its control commands under it (no nested jobs);
+// doctor procs will find a job's processes by it. The guard rejects unsetting or changing it.
+const JobEnvVar = "AGENT_JOBS_JOB"
+
+// InsideJob returns the job id when this process runs inside a job (the marker is set, even empty).
+func InsideJob() (string, bool) { return os.LookupEnv(JobEnvVar) }
+
+// JobEnv returns env without any inherited marker, plus AGENT_JOBS_JOB=<id of jobDir>.
+func JobEnv(jobDir string, env []string) ([]string, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar {
+			out = append(out, kv)
+		}
+	}
+	return append(out, JobEnvVar+"="+filepath.Base(abs)), nil
 }
 
 // Job git environment: files in the job dir (written by prepare; created empty here if missing).

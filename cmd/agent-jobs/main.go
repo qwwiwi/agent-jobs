@@ -48,6 +48,10 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if reason := refuseInsideJob(cmd, args); reason != "" {
+		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
+		os.Exit(1)
+	}
 	var err error
 	switch cmd {
 	case "run-wrapper":
@@ -83,6 +87,38 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agent-jobs:", err)
 		os.Exit(1)
 	}
+}
+
+// refuseInsideJob: no nested jobs. Under the job marker (AGENT_JOBS_JOB, set by the wrapper on every
+// job) only the job's own MCP server (`mcp --role job`), the guard hook, run-wrapper and help run;
+// every command that reads or changes the agent's jobs is refused.
+func refuseInsideJob(cmd string, args []string) string {
+	id, inside := jobs.InsideJob()
+	if !inside {
+		return ""
+	}
+	switch cmd {
+	case "run-wrapper", "guard", "-h", "--help", "help":
+		return ""
+	case "mcp":
+		if mcpRole(args) == string(mcp.RoleJob) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("refused: running inside job %q (%s is set); a job never starts, cancels or manages jobs, "+
+		"only the orchestrator does", id, jobs.JobEnvVar)
+}
+
+// mcpRole returns the --role value of `mcp` args ("" when absent or unparsable).
+func mcpRole(args []string) string {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = fs.String("agent", "", "")
+	role := fs.String("role", "", "")
+	if _, err := parse(fs, args); err != nil {
+		return ""
+	}
+	return *role
 }
 
 func runWrapper(args []string) int {

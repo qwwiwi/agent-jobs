@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,7 +27,8 @@ const (
 // MaxReportBytes caps the report returned by job_result; the full file stays in the job dir.
 const MaxReportBytes = 256 << 10
 
-// artifactFiles are the files job_result points at when they exist (what the job changed).
+// artifactFiles are the files job_result points at when they exist (what the job changed). They are
+// only listed (lstat, regular files only), never read; report.md is the one file read (readCapped).
 var artifactFiles = []string{"report.md", "diffstat.txt", "commits.patch", "staged.patch", "uncommitted.patch",
 	"untracked.tar", "stream.jsonl", "stderr.log"}
 
@@ -165,13 +167,29 @@ type JobResultOutput struct {
 	Note            string   `json:"note,omitempty"`
 }
 
-// readCapped reads at most max bytes of path; truncated reports whether there was more.
+// errNotRegular marks a job file that is not a regular file (FIFO, device, socket, directory, symlink).
+var errNotRegular = errors.New("not a regular file")
+
+// readCapped reads at most max bytes of path; truncated reports whether there was more. The job dir
+// is writable by the job, so the file is opened without following a symlink and without blocking
+// (a FIFO would otherwise hang the open forever), the opened fd is checked to be a regular file,
+// and only then read.
 func readCapped(path string, max int) (string, bool, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return "", false, fmt.Errorf("%s: %w (symlink)", path, errNotRegular)
+		}
 		return "", false, err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%s: %w (%s)", path, errNotRegular, fi.Mode().Type())
+	}
 	b, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
 	if err != nil {
 		return "", false, err
@@ -211,6 +229,9 @@ func addJobResult(s *sdk.Server, d Deps) {
 		case errors.Is(err, os.ErrNotExist):
 			out.ReportMissing = true
 			out.Note = "no report.md; see " + filepath.Join(dir, "stderr.log")
+		case errors.Is(err, errNotRegular):
+			out.ReportMissing = true
+			out.Note = "report.md is not a regular file, not read: " + err.Error()
 		case err != nil:
 			return nil, JobResultOutput{}, fmt.Errorf("read report: %w", err)
 		default:
