@@ -15,7 +15,9 @@
 //     .git/config, .git/hooks or $GIT_DIR;
 //   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf;
 //   - agent-jobs itself in any form except `agent-jobs mcp --role job` (no nested jobs), and any change
-//     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets).
+//     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets);
+//   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
+//     (isolation worktree/remote, background run, agent team).
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
@@ -49,6 +51,9 @@ type Config struct {
 	GitEmail   string   // allowed git user.email ("" = no identity override allowed)
 	GitDirs    []string // the job worktree's real git dirs (admin dir, common dir): file tools never write there
 	Dir        string   // working directory of the call (resolves `git commit -F <file>`)
+	// SubagentLog is the job's subagent log (one line per allowed subagent, at most MaxSubagentsPerJob).
+	// Empty = subagents are refused.
+	SubagentLog string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -60,6 +65,8 @@ type HookInput struct {
 		FilePath     string `json:"file_path"`
 		NotebookPath string `json:"notebook_path"`
 	} `json:"tool_input"`
+	// RawInput is tool_input as sent (subagent calls are checked on fields of their own).
+	RawInput json.RawMessage `json:"-"`
 }
 
 // fileTools write the file named in their input (file_path, or notebook_path for NotebookEdit).
@@ -67,10 +74,21 @@ var fileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, 
 
 // Decide parses the hook JSON and returns a non-empty reason when the call must be blocked.
 func Decide(r io.Reader, cfg Config) (string, error) {
+	var raw struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return "", fmt.Errorf("guard: read hook input: %w", err)
+	}
 	var in HookInput
-	if err := json.NewDecoder(r).Decode(&in); err != nil {
+	if err := json.Unmarshal(b, &in); err != nil {
 		return "", fmt.Errorf("guard: parse hook input: %w", err)
 	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return "", fmt.Errorf("guard: parse hook input: %w", err)
+	}
+	in.RawInput = raw.ToolInput
 	if cfg.Dir == "" {
 		cfg.Dir = in.Cwd
 	}
@@ -80,6 +98,9 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 			p = in.ToolInput.NotebookPath
 		}
 		return CheckFileWrite(in.ToolName, p, cfg), nil
+	}
+	if IsSubagentTool(in.ToolName) {
+		return CheckSubagent(in.RawInput, cfg), nil
 	}
 	if in.ToolName != "Bash" {
 		return "", nil

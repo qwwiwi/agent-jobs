@@ -193,6 +193,11 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if len(matches) != 0 {
 		t.Errorf("temp binary left behind: %v", matches)
 	}
+	// The agent-jobs skill goes to the agent's default skills dir, byte for byte.
+	skillDst := filepath.Join(e.home, ".claude/skills/agent-jobs/SKILL.md")
+	if e.read(skillDst) != e.read("skills/agent-jobs/SKILL.md") {
+		t.Error("installed skill differs from skills/agent-jobs/SKILL.md")
+	}
 
 	// Second install, nothing changed, daemon active: no restart, the edited env file survives.
 	e.write(envFile, "AGENT_JOBS_TMUX_BIN=/x/tmux\n", 0o600)
@@ -203,6 +208,18 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	}
 	if strings.Contains(e.calls(), "restart") {
 		t.Errorf("unchanged re-install restarted the daemon:\n%s", e.calls())
+	}
+	if !strings.Contains(out, "== skill "+skillDst+"\n  unchanged") {
+		t.Errorf("unchanged re-install rewrote the skill:\n%s", out)
+	}
+	// A stale skill is replaced, without a daemon restart.
+	e.write(skillDst, "old skill\n", 0o644)
+	e.resetCalls()
+	if out, err = e.run("--instance", "t1", "--binary", e.bin); err != nil {
+		t.Fatalf("re-install: %v\n%s", err, out)
+	}
+	if e.read(skillDst) != e.read("skills/agent-jobs/SKILL.md") || strings.Contains(e.calls(), "restart") {
+		t.Errorf("stale skill not replaced, or the daemon restarted for it:\n%s", e.calls())
 	}
 	if e.read(envFile) != "AGENT_JOBS_TMUX_BIN=/x/tmux\n" {
 		t.Error("re-install overwrote the env file")
@@ -234,7 +251,7 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if !strings.Contains(e.calls(), "--user disable --now agent-jobs@t1.service") {
 		t.Errorf("uninstall did not disable --now:\n%s", e.calls())
 	}
-	for _, p := range []string{unitDst, binDst, envFile} {
+	for _, p := range []string{unitDst, binDst, envFile, skillDst} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("%s removed while another instance is enabled: %v", p, err)
 		}
@@ -289,7 +306,7 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if out, err = e.run("--instance", "t1", "--uninstall"); err != nil {
 		t.Fatalf("uninstall: %v\n%s", err, out)
 	}
-	for _, p := range []string{unitDst, binDst} {
+	for _, p := range []string{unitDst, binDst, skillDst, filepath.Dir(skillDst)} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%s still present after the last uninstall", p)
 		}
@@ -339,6 +356,39 @@ func TestInstallLinuxEnvFileParsedNotSourced(t *testing.T) {
 	want := "init --agent t1 home=" + filepath.Join(e.home, "state") + "\n"
 	if got := e.read(filepath.Join(e.fake, "bin.log")); got != want {
 		t.Errorf("init saw %q, want %q", got, want)
+	}
+}
+
+// --skills-dir puts the skill into the agent's own Claude config; --no-skill leaves skills alone; an
+// edited skill survives uninstall.
+func TestInstallLinuxSkillDirOptions(t *testing.T) {
+	e := newInstallEnv(t)
+	dir := filepath.Join(e.home, "agent-config/skills")
+	if out, err := e.run("--instance", "t1", "--binary", e.bin, "--skills-dir", dir); err != nil {
+		t.Fatalf("install: %v\n%s", err, out)
+	}
+	skill := filepath.Join(dir, "agent-jobs/SKILL.md")
+	if e.read(skill) != e.read("skills/agent-jobs/SKILL.md") {
+		t.Fatal("skill not installed into --skills-dir")
+	}
+	if _, err := os.Stat(filepath.Join(e.home, ".claude")); !os.IsNotExist(err) {
+		t.Error("default skills dir touched although --skills-dir was given")
+	}
+	e.write(skill, "edited by the agent's owner\n", 0o644)
+	out, err := e.run("--instance", "t1", "--uninstall", "--skills-dir", dir)
+	if err != nil {
+		t.Fatalf("uninstall: %v\n%s", err, out)
+	}
+	if e.read(skill) != "edited by the agent's owner\n" || !strings.Contains(out, "differs from the shipped one: kept") {
+		t.Errorf("edited skill not kept on uninstall:\n%s", out)
+	}
+
+	e2 := newInstallEnv(t)
+	if out, err := e2.run("--instance", "t2", "--binary", e2.bin, "--no-skill"); err != nil {
+		t.Fatalf("install --no-skill: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(e2.home, ".claude")); !os.IsNotExist(err) {
+		t.Error("--no-skill installed a skill")
 	}
 }
 

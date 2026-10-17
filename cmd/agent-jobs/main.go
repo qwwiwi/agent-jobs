@@ -34,13 +34,20 @@ const usage = `usage: agent-jobs <command> [flags]
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
   cancel     --agent A <id>
+  profile    --agent A --from FILE [--from FILE]... [--force] [--dry-run]
+                                           generate the job profile (owner rules, <= 8 KB) from the
+                                           sections of the agent's own rules marked
+                                           <!-- agent-jobs:profile --> ... <!-- /agent-jobs:profile -->
+  card new   --agent A --repo PATH [--name N]   write a project card template for a repository
+  card list  --agent A [--repo PATH]       list project cards (with --repo: the ones a job there gets)
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
-  guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
+  guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
+                                           (PreToolUse hook, JSON on stdin)
 `
 
 // version is set at build time: go build -ldflags "-X main.version=$(git describe --tags --always --dirty)".
@@ -74,6 +81,10 @@ func main() {
 		err = cmdResult(args)
 	case "cancel":
 		err = cmdCancel(args)
+	case "profile":
+		err = cmdProfile(args)
+	case "card":
+		err = cmdCard(args)
 	case "tick":
 		err = cmdTick(args)
 	case "daemon":
@@ -148,10 +159,13 @@ func runGuard(args []string, stdin io.Reader) int {
 	email := fs.String("git-email", "", "allowed git user.email")
 	var gitDirs multi
 	fs.Var(&gitDirs, "git-dir", "the job worktree's git dir; file tools never write inside it (repeatable)")
+	subagentLog := fs.String("subagent-log", "", "the job's subagent log (at most 3 subagents per job; empty = none)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	reason, err := guard.Decide(stdin, guard.Config{OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs})
+	reason, err := guard.Decide(stdin, guard.Config{
+		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
+	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
 		fmt.Fprintln(os.Stderr, err)
@@ -408,6 +422,93 @@ func cmdCancel(args []string) error {
 	}
 	fmt.Println("cancelled", id)
 	return nil
+}
+
+func cmdProfile(args []string) error {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	var from multi
+	fs.Var(&from, "from", "an instruction file of the agent with marked profile sections (repeatable)")
+	force := fs.Bool("force", false, "replace a hand-written owner-rules file")
+	dry := fs.Bool("dry-run", false, "print the profile instead of writing it")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	if *dry {
+		out, err := jobs.GenerateProfile(from)
+		if err != nil {
+			return err
+		}
+		fmt.Print(out)
+		fmt.Fprintf(os.Stderr, "job profile: %d of %d bytes\n", len(out), jobs.MaxOwnerRulesBytes)
+		return nil
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	p, n, err := m.WriteProfile(from, *force)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("job profile written: %s (%d of %d bytes)\n", p, n, jobs.MaxOwnerRulesBytes)
+	return nil
+}
+
+func cmdCard(args []string) error {
+	if len(args) == 0 {
+		return errors.New("card: want `card new` or `card list`")
+	}
+	sub, args := args[0], args[1:]
+	fs := flag.NewFlagSet("card "+sub, flag.ContinueOnError)
+	agent := agentFlag(fs)
+	repo := fs.String("repo", "", "repository path")
+	var name *string
+	if sub == "new" {
+		name = fs.String("name", "", "card name (default: the repository directory name)")
+	}
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	switch sub {
+	case "new":
+		if *repo == "" {
+			return errors.New("card new: --repo is required")
+		}
+		p, err := m.NewCard(*repo, *name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("project card written: %s (fill in the four sections; at most %d bytes)\n", p, jobs.MaxCardBytes)
+		return nil
+	case "list":
+		var cards []jobs.Card
+		if *repo != "" {
+			top, err := jobs.RepoTopLevel(*repo)
+			if err != nil {
+				return err
+			}
+			if cards, err = m.CardsFor(top); err != nil {
+				return err
+			}
+		} else if cards, err = m.LoadCards(); err != nil {
+			return err
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(w, "CARD\tBYTES\tMATCHES\tPATH")
+		for _, c := range cards {
+			keys := append(append([]string{}, c.Repos...), c.Remotes...)
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", c.Name, len(c.Body), strings.Join(keys, ","), c.Path)
+		}
+		return w.Flush()
+	}
+	return fmt.Errorf("card: unknown subcommand %q (want new or list)", sub)
 }
 
 func cmdTick(args []string) error {

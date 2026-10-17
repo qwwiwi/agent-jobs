@@ -6,7 +6,8 @@
 #
 # Idempotent: an unchanged binary/unit leaves a running daemon alone. Touches only
 # ~/.local/bin/agent-jobs, ~/.config/systemd/user/agent-jobs@.service, ~/.config/agent-jobs/<instance>.env
-# (created once, never overwritten) and the unit agent-jobs@<instance>.service. State (~/.agent-jobs)
+# (created once, never overwritten), the unit agent-jobs@<instance>.service and the agent's skill
+# <skills dir>/agent-jobs/SKILL.md (default ${CLAUDE_CONFIG_DIR:-~/.claude}/skills). State (~/.agent-jobs)
 # and the env file are kept on --uninstall.
 #
 # Test hooks: AGENT_JOBS_SYSTEMCTL (systemctl replacement), --binary PATH (install a prebuilt binary).
@@ -14,9 +15,12 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: install-linux.sh --instance AGENT [--binary PATH] [--uninstall]
+usage: install-linux.sh --instance AGENT [--binary PATH] [--skills-dir DIR | --no-skill] [--uninstall]
   --instance AGENT  agent name = systemd instance (agent-jobs@AGENT); default $AGENT_JOBS_AGENT
   --binary PATH     install this prebuilt binary instead of building from the repo
+  --skills-dir DIR  the agent's Claude Code skills dir; the agent-jobs skill goes to DIR/agent-jobs/SKILL.md
+                    (default ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills)
+  --no-skill        do not install (or remove) the agent-jobs skill
   --uninstall       stop + disable agent-jobs@AGENT; remove the unit template and the binary
                     when no other agent-jobs@ instance is enabled (state and env file are kept)
 USAGE
@@ -25,12 +29,17 @@ USAGE
 INSTANCE="${AGENT_JOBS_AGENT:-}"
 BINARY=""
 UNINSTALL=0
+SKILLS_DIR=""
+NO_SKILL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --instance) [ $# -ge 2 ] || { usage >&2; exit 2; }; INSTANCE="$2"; shift 2 ;;
     --instance=*) INSTANCE="${1#*=}"; shift ;;
     --binary) [ $# -ge 2 ] || { usage >&2; exit 2; }; BINARY="$2"; shift 2 ;;
     --binary=*) BINARY="${1#*=}"; shift ;;
+    --skills-dir) [ $# -ge 2 ] || { usage >&2; exit 2; }; SKILLS_DIR="$2"; shift 2 ;;
+    --skills-dir=*) SKILLS_DIR="${1#*=}"; shift ;;
+    --no-skill) NO_SKILL=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install-linux: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -62,6 +71,10 @@ ENV_DIR="$CONFIG_HOME/agent-jobs"
 ENV_FILE="$ENV_DIR/$INSTANCE.env"
 UNIT="agent-jobs@$INSTANCE.service"
 SYSTEMCTL="${AGENT_JOBS_SYSTEMCTL:-systemctl}"
+SKILLS_EXPLICIT=0
+if [ -n "$SKILLS_DIR" ]; then SKILLS_EXPLICIT=1; else SKILLS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"; fi
+SKILL_SRC="$REPO_ROOT/skills/agent-jobs/SKILL.md"
+SKILL_DST="$SKILLS_DIR/agent-jobs/SKILL.md"
 
 # systemctl --user needs the user manager's bus; non-login shells (tmux, ssh -c) often lack it.
 if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
@@ -116,6 +129,21 @@ if [ "$UNINSTALL" = 1 ]; then
   sc disable --now "$UNIT" || echo "  (unit was not enabled/active)"
   others="$(other_instances)"
   rc=0
+  # The skill is per agent: removed with an explicit --skills-dir, or from the shared default dir when
+  # no other instance is left; only when it is still the shipped file (a local edit is kept).
+  if [ "$NO_SKILL" = 1 ]; then
+    echo "  skill: left as is (--no-skill)"
+  elif [ ! -f "$SKILL_DST" ]; then
+    :
+  elif [ "$SKILLS_EXPLICIT" = 0 ] && [ -n "$others" ]; then
+    echo "  skill: other instances still enabled or active: keeping $SKILL_DST"
+  elif [ -f "$SKILL_SRC" ] && cmp -s "$SKILL_SRC" "$SKILL_DST"; then
+    rm -f "$SKILL_DST"
+    rmdir "$(dirname "$SKILL_DST")" 2>/dev/null || true
+    echo "  removed $SKILL_DST"
+  else
+    echo "  skill: $SKILL_DST differs from the shipped one: kept"
+  fi
   if [ -n "$others" ]; then
     echo "  other instances still enabled or active ($others): keeping $UNIT_DST and $BIN"
   else
@@ -187,6 +215,24 @@ else
   install -m 0644 "$UNIT_SRC" "$utmp"
   mv -f "$utmp" "$UNIT_DST"
   changed=1
+  echo "  installed"
+fi
+
+echo "== skill $SKILL_DST"
+# Installed per agent: teaches the MCP tools and when to do work yourself, use a subagent or start a job.
+# Shipped file, rewritten when it changes (like orchestrator.md); never needs a daemon restart.
+if [ "$NO_SKILL" = 1 ]; then
+  echo "  skipped (--no-skill)"
+elif [ ! -f "$SKILL_SRC" ]; then
+  echo "install-linux: skill not found: $SKILL_SRC" >&2
+  exit 1
+elif [ -f "$SKILL_DST" ] && cmp -s "$SKILL_SRC" "$SKILL_DST"; then
+  echo "  unchanged"
+else
+  mkdir -p "$(dirname "$SKILL_DST")"
+  stmp="$SKILL_DST.new.$$"
+  install -m 0644 "$SKILL_SRC" "$stmp"
+  mv -f "$stmp" "$SKILL_DST"
   echo "  installed"
 fi
 
