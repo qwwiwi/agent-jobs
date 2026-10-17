@@ -539,17 +539,29 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 	if reason := sweepFailure(dir); reason != "" {
 		return store.StatusFailed, reason
 	}
+	// Closed by the idle-after-result rule: the wrapper judged the last result (exit_code 0/1); the
+	// row records the rule either way.
+	if reason := idleClosedReason(dir); reason != "" {
+		if code != 0 || res.IsError || !hasReport(dir) {
+			return store.StatusFailed, reason
+		}
+		return store.StatusSucceeded, reason
+	}
 	if code != 0 {
 		return store.StatusFailed, fmt.Sprintf("claude exited with code %d", code)
 	}
 	if res.IsError {
 		return store.StatusFailed, "claude result is an error: " + res.Subtype
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
-	if err != nil || strings.TrimSpace(string(b)) == "" {
+	if !hasReport(dir) {
 		return store.StatusFailed, "exit 0 without a report"
 	}
 	return store.StatusSucceeded, ""
+}
+
+func hasReport(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
+	return err == nil && strings.TrimSpace(string(b)) != ""
 }
 
 // Cancel stops a queued or running job. Final statuses cannot be cancelled.
