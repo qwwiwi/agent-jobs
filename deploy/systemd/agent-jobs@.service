@@ -1,0 +1,28 @@
+# systemd USER unit template: one daemon per agent, instance name = agent name.
+# Installed by scripts/install-linux.sh into ~/.config/systemd/user/ (never system-wide).
+#   systemctl --user enable --now agent-jobs@thrall
+#   journalctl --user -u agent-jobs@thrall -f
+#
+# %h = the user's home, %E = $XDG_CONFIG_HOME (default ~/.config), %i = agent name.
+[Unit]
+Description=agent-jobs daemon (agent %i)
+Documentation=https://github.com/qwwiwi/agent-jobs
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-jobs daemon --agent %i
+# claude and git must be found by the daemon and the jobs it starts.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional per-agent overrides (AGENT_JOBS_HOME, AGENT_JOBS_CLAUDE_BIN, AGENT_JOBS_TMUX_BIN, ...).
+EnvironmentFile=-%E/agent-jobs/%i.env
+# Stop/restart signals ONLY the daemon. Jobs (run-wrapper + claude) run in their own sessions
+# but stay in this unit's cgroup; the default KillMode=control-group would kill them on every
+# restart. With KillMode=process they keep running and the next daemon adopts and collects them.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

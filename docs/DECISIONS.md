@@ -1,0 +1,12 @@
+# Owner decisions
+
+Every owner «да» that shapes the project, one dated row each. Source of truth for scope; deviations from the reference live in [`DEVIATIONS.md`](DEVIATIONS.md).
+
+| Date | Decision | Source |
+|---|---|---|
+| 2026-10-17 | **Economical order approved.** Wave A = MCP job tools (S2-M0 + S2-M1) + Linux port (Thrall) + prune/doctor (S2-M3). Wave B = resume (S2-M5), schedules + notify_owner (S2-M4, S3-M2), codex runner (S3-M1). | owner msgs 62583/62589, 13:07Z |
+| 2026-10-17 | **Deferred until a separate owner «да»:** heartbeat (S3-M3), memory notes (S3-M4), owner-waits hook (S3-M5), API-credit fallback (S3-M6), HTTP API (S3-M7), acceptance (S3-M9), Autopilot items 23-27, S2-M2 gbrain tools unless Wave A needs them. | owner msgs 62583/62589, 13:07Z |
+| 2026-10-17 | **Control = MCP.** Agents operate jobs through MCP tools; the owner goes through Telegram → agent. The CLI stays for manual use. | owner msgs 62583/62589, 13:07Z |
+| 2026-10-17 | **Review:** single reviewer; dual review only for guard/permissions and doctor kill/trash. | owner msgs 62583/62589, 13:07Z |
+| 2026-10-17 | **Jobs may use subagents** (Task tool is not denied in stage 1): at most 3 subagents per job, within the job's turn/time limits; no nested jobs. Regulation = `prompts/orchestrator.md` (launcher) + preamble (job) + a new skill `agent-jobs` (SKILL.md, installed per agent, teaches the MCP tools) – added to Wave A. | owner msg 62594, 13:08Z |
+| 2026-10-17 | **Install nowhere except Thrall for now:** test only on Thrall (`agent-jobs@thrall`). No skill / MCP / daemon on other agents (arthas, Mac mini) until the owner says roll out. | owner msg 62599, 13:10Z |
