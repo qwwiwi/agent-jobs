@@ -60,6 +60,11 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 - **Code-graph index.** The reference's separate MCP server that indexes code as a graph; jobs can read and index. Research first: pick or build the indexer, then integrate.
 
+**Log archive and per-job stats** (owner approved 2026-10-17, see [DECISIONS.md](DECISIONS.md); the stats part of E7 and Wave D observability).
+
+- Prune moves a cleaned job's logs into `<archive>/<YYYY-MM>/<id>/` (gzip) instead of deleting them; `log_archive_dir`, `log_archive_days` (default 365, 0 = forever); `agent-jobs archive --dry-run`.
+- Table `job_stats`, one row per finished job; `agent-jobs stats [--since] [--by kind|model|skill] [--json] [--backfill]` and the orchestrator tool `job_stats`.
+
 ## Wave D
 
 Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.md](DECISIONS.md)); built after Wave C:
@@ -88,7 +93,7 @@ Each item waits for a separate owner go; it is not part of the current mandate (
   - Discovery and selection: MCP tool `skill_list(scope?, kind?, repo?)`. Defaults (the `core` skills for the job kind plus the project card's skills) are attached automatically; `job_start(skills=[...])` only adds or excludes (`+name`, `-name`); an unknown name refuses the start. Deterministic matching by kind and project first, hard budget of 5-8 skills per job; semantic retrieval only if matching proves insufficient.
   - Pre-launch skill hook: a PreToolUse hook in the orchestrator session on `job_start`, installed by the agent-jobs skill installer. Without `skills_decision` it denies once with up to about 8 candidates (status and a one-line description each); the orchestrator re-calls with `skills=[...]` or `skills_decision='defaults'`. No model call in the hook (the classifier was rejected, see DECISIONS). One extra round trip per job; deprecated/draft names refused unless explicit; the decision is stored in job metadata.
   - Lifecycle: `status: core | active | draft | deprecated`, `owner`, `last_verified`. deprecated is never loaded; draft only on explicit request. Staleness: not used for 60 days or not verified for 90 days goes to a review list; a weekly digest to the orchestrator.
-  - Stats: skills used (Skill tool calls in the job's session log) and the job outcome go to SQLite; `agent-jobs skills stats` shows uses, success rate, last used, and feeds the sort order of `skill_list`.
+  - Stats: skills used (Skill tool calls in the job's session log) and the job outcome go to SQLite; `agent-jobs skills stats` shows uses, success rate, last used, and feeds the sort order of `skill_list`. Built ahead of the rest (owner approved, see In progress): the `job_stats` table records skills used per job and `agent-jobs stats --by skill` shows uses and success rate.
   - Delivery: copy only the selected skill directories (no symlinks, size cap, sha in job metadata) into the job's project `.claude/skills`; the report lists the skills used. Skills whose scripts reach the network or secrets are flagged; the guard and deny rules still apply; never the whole tree.
   - Native controls: `disable-model-invocation` for side-effect skills, `paths:` globs, `/skill-doctor` for context cost and never-invoked skills, `claude plugin eval` for trigger accuracy of 3-5 critical skills. Not adopted as a base: skills.sh, openskills, skillport (they widen distribution; the goal is narrowing); skillport's «metadata first» idea is borrowed.
   - Evidence, cited, to verify: arXiv 2604.04323 (from a market scan): with many weakly relevant skills the gain drops to near the no-skill baseline; skills refined to the task restore most of it (Terminal-Bench 2.0 57.7% → 65.5%).

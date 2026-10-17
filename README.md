@@ -153,7 +153,9 @@ The last section is mandatory and is read first: it makes the job name what it d
 
 and sets the ref `refs/agent-jobs/jobs/<id>` in the source repository to the job's last commit. Restoring the work in a fresh worktree at the base commit is four commands; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#flows). If the repository config names a filter, diff command or textconv, no patch is made (a diff would run that program); the worktree is kept for a human and the reason is logged.
 
-**Prune.** `agent-jobs prune --agent A [--dry-run]` cleans the folders of jobs that finished more than 48 hours ago: the records (`report.md`, the patches, `base_commit`, `diffstat.txt`) and small top-level text files (≤ 1 MiB, e.g. `prompt.md`, `stderr.log`) stay; subdirectories (the work dir, caches, builds), binaries, large files and symlinks go (a link is removed, never followed). A repo job whose cleanup has not run yet is skipped, and a worktree cleanup kept for a human is left alone.
+**Prune.** `agent-jobs prune --agent A [--dry-run]` cleans the folders of jobs that finished more than 48 hours ago: the records (`report.md`, the patches, `base_commit`, `diffstat.txt`) and small top-level text files (≤ 1 MiB, e.g. `prompt.md`) stay; subdirectories (the work dir, caches, builds), binaries, large files and symlinks go (a link is removed, never followed). A repo job whose cleanup has not run yet is skipped, and a worktree cleanup kept for a human is left alone. Before anything goes, the job's logs move into the log archive (below).
+
+**Log archive and job stats.** When prune cleans a job folder it moves the records for later analysis into `<archive>/<YYYY-MM>/<id>/` instead of deleting them: `stream.jsonl.gz` and `stderr.log.gz` (gzipped, removed from the job folder), `prompt.md`, `report.md`, `diffstat.txt` and `meta.json` (the job row). `<archive>` is `~/.agent-jobs/<agent>/archive` unless `log_archive_dir` says otherwise (another disk, a synced folder); archived months older than `log_archive_days` (default 365, 0 = forever) are deleted by prune. The archive lies outside the job folders, so cleaning jobs never touches it, and an external backup of the state dir (e.g. a nightly restic or rsync of the home dir) carries it off the machine. The logs contain tool output (file contents, command output), so keep the archive private: it is created 0700 and a symlinked archive path is refused. `agent-jobs archive --agent A --dry-run` shows what would move. Every finished job also gets one row in the `job_stats` table (written when the job ends): kind, model, status, turns, cost, duration, times, repository name, tool calls by tool, skills used (Skill calls and reads under a `skills/<name>/` dir), guard refusals by rule, subagents, whether a report exists, the result subtype. `agent-jobs stats --agent A [--since 7d] [--by kind|model|skill] [--json]` summarizes them; `--backfill` first writes the rows of jobs that ended earlier, from their folders or the archive.
 
 **Ghost processes.** `agent-jobs doctor procs --agent A [--kill]` finds processes that outlived their job or session (processes still carrying a finished job's `AGENT_JOBS_JOB` marker, markerless leftovers in a finished job's session; either way started while the job ran, in the current boot), *leaders* (a marked process that daemonized into its own session, e.g. a tmux server, which may now host other people's work, and marked processes running under such a daemon), running rows with a dead wrapper pid, and *suspects*: preview servers, browsers and wait loops whose session leader is gone. It only reports; `--kill` ends the processes proven to belong to a finished job (SIGTERM, then SIGKILL, through a pidfd re-checked against the scanned start time). Leaders and suspects are never killed. Running both once a day on their own is planned (Wave B).
 
@@ -216,6 +218,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
+| `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate; `since`, `by` = kind \| model \| skill (same as `agent-jobs stats --json`) |
 
 **System and file tools** (orchestrator only):
 
@@ -231,7 +234,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | group | orchestrator tools | job gets | status |
 |---|---|---|---|
-| Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` | none | built |
+| Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel`, `job_stats` | none | built |
 | Jobs | `job_resume` | none | planned, Wave B |
 | Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
 | Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
@@ -291,6 +294,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
+- `log_archive_dir`: absolute path of the log archive (default `<state>/archive`); `log_archive_days`: how long archived months are kept (default 365, 0 = forever).
 - Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Run the daemon on Linux (systemd user service)**
@@ -325,6 +329,8 @@ agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
 agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs finished > 48 h ago
+agent-jobs archive --agent my-agent --dry-run        # what prune would move into the log archive
+agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
@@ -332,7 +338,7 @@ agent-jobs version                      # also --version
 
 `start` needs `--model` or `--complexity`; with neither the job is rejected.
 
-**When a job fails**, look in `~/.agent-jobs/<agent>/jobs/<id>/`: `stderr.log` first, then `stream.jsonl`, `exit_code`, `report.md`.
+**When a job fails**, look in `~/.agent-jobs/<agent>/jobs/<id>/`: `stderr.log` first, then `stream.jsonl`, `exit_code`, `report.md` (after prune: `stream.jsonl.gz` and `stderr.log.gz` in the log archive).
 
 ---
 

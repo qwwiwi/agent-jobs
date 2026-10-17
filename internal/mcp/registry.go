@@ -38,6 +38,7 @@ var OrchestratorOnly = []string{
 	"job_result",
 	"job_list",
 	"job_cancel",
+	"job_stats",
 	// System and files (reference, «MCP-тулы»: not available to a job).
 	"system_doctor",
 	"system_logs",

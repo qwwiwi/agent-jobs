@@ -44,7 +44,15 @@ const usage = `usage: agent-jobs <command> [flags]
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
   prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
-                                           small top-level text files stay)
+                                           small top-level text files stay; stream.jsonl, stderr.log
+                                           move gzipped into the log archive, see archive)
+  archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
+                                           archive (<archive>/<YYYY-MM>/<id>/) and drop months past
+                                           log_archive_days; --dry-run shows what would move
+  stats      --agent A [--since D] [--by kind|model|skill] [--json] [--backfill [--all]]
+                                           per-job summary: counts, success rate, cost and duration
+                                           (median, p90), guard refusal rules, skills; --backfill
+                                           first writes missing rows from job dirs and the archive
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
@@ -97,6 +105,10 @@ func main() {
 		err = cmdDaemon(args)
 	case "prune":
 		err = cmdPrune(args)
+	case "archive":
+		err = cmdArchive(args)
+	case "stats":
+		err = cmdStats(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "version", "--version":
@@ -648,7 +660,130 @@ func cmdPrune(args []string) error {
 		}
 	}
 	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, *dry)
 	return perr
+}
+
+func printArchived(bytes int64, expired []jobs.PruneEntry, dry bool) {
+	verb, gone := "moved", "removed"
+	if dry {
+		verb, gone = "would move", "would remove"
+	}
+	fmt.Printf("archive: %s %d bytes into the log archive\n", verb, bytes)
+	for _, e := range expired {
+		fmt.Printf("archive: %s %s  %d  %s\n", gone, e.Path, e.Bytes, e.Reason)
+	}
+}
+
+func cmdArchive(args []string) error {
+	fs := flag.NewFlagSet("archive", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "only list what would move")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, aerr := m.Archive(*dry)
+	if *asJSON {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+		return aerr
+	}
+	keep := "forever"
+	if rep.Days > 0 {
+		keep = fmt.Sprintf("%d days", rep.Days)
+	}
+	fmt.Printf("archive: %s (kept %s)\n", rep.Dir, keep)
+	var n int64
+	for _, j := range rep.Jobs {
+		fmt.Printf("%s  -> %s", j.ID, j.Dest)
+		if j.Already {
+			fmt.Print("  [already archived]")
+		}
+		if j.Error != "" {
+			fmt.Printf("  error: %s", j.Error)
+		}
+		fmt.Println()
+		for _, e := range j.Moved {
+			n += e.Bytes
+			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
+		}
+	}
+	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
+	printArchived(n, rep.Expired, *dry)
+	return aerr
+}
+
+func cmdStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
+	by := fs.String("by", "kind", "group by kind|model|skill")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	backfill := fs.Bool("backfill", false, "first write the missing summary rows from job dirs and the archive")
+	all := fs.Bool("all", false, "with --backfill: rewrite every row, not only the missing ones")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	t, err := jobs.ParseSince(*since, m.Now())
+	if err != nil {
+		return err
+	}
+	if *backfill {
+		b, err := m.BackfillStats(*all)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "backfill: %d rows written, %d present, %d errors\n", b.Recorded, b.Present, len(b.Errors))
+		for _, e := range b.Errors {
+			fmt.Fprintln(os.Stderr, "backfill:", e)
+		}
+	}
+	rep, err := m.Stats(t, *by)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(rep)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	row := func(key string, s jobs.StatsSummary) {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%ds\t%ds\t%d\n", key, s.Jobs,
+			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
+			s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+	}
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	for _, g := range rep.Groups {
+		row(g.Key, g.StatsSummary)
+	}
+	row("total", rep.Totals)
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if len(rep.GuardRules) > 0 {
+		fmt.Println("\nguard refusals by rule:")
+		for _, r := range rep.GuardRules {
+			fmt.Printf("  %-22s %d\n", r.Name, r.Count)
+		}
+	}
+	if len(rep.Skills) > 0 {
+		fmt.Println("\nskills (uses, jobs, success rate):")
+		for _, s := range rep.Skills {
+			fmt.Printf("  %-22s %d  %d  %.0f%%\n", s.Name, s.Uses, s.Jobs, s.SuccessRate*100)
+		}
+	}
+	return nil
 }
 
 func cmdDoctor(args []string) error {

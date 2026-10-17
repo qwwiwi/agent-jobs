@@ -286,6 +286,7 @@ func (m *Manager) launchQueued() error {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
 				running-- // the failed launch no longer occupies a slot
+				m.recordStatsOf(j.ID)
 			}
 		}
 	}
@@ -499,6 +500,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int,
 		return
 	}
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+	m.recordStatsOf(j.ID)
 }
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
@@ -560,5 +562,9 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
-	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now); err != nil {
+		return err
+	}
+	m.recordStatsOf(id)
+	return nil
 }

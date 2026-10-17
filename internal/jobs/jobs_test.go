@@ -81,6 +81,10 @@ if [[ $prompt == *FAKE_SURVIVOR* ]]; then
   # A leftover in the wrapper's session (re-parented sleep); the test makes it unkillable.
   ( sleep 60 & echo $! > ../survivor.pid )
 fi
+if [[ $prompt == *FAKE_TOOLS* ]]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Skill","input":{"skill":"deploy"}},{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git push"}}]}}'
+  echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"PreToolUse:Bash hook error: [guard]: blocked by guard: ` + "`git push`" + ` reaches outside the job. A job commits locally only"}]}}'
+fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'

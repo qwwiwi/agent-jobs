@@ -411,6 +411,8 @@ func TestBinaryRefusesInsideJob(t *testing.T) {
 		{"list", "--agent", "test"},
 		{"result", "--agent", "test", "x"},
 		{"prune", "--agent", "test"},
+		{"archive", "--agent", "test", "--dry-run"},
+		{"stats", "--agent", "test", "--backfill"},
 		{"mcp", "--role", "orchestrator", "--agent", "test"},
 		{"mcp", "--agent", "test", "--role=orchestrator"},
 		{"mcp", "--agent", "test"},

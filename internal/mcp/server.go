@@ -37,6 +37,7 @@ var toolDefs = []toolDef{
 	{"job_result", addJobResult},
 	{"job_list", addJobList},
 	{"job_cancel", addJobCancel},
+	{"job_stats", addJobStats},
 	{"system_doctor", addSystemDoctor},
 	{"system_logs", addSystemLogs},
 	{"activity_report", addActivityReport},

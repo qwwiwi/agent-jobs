@@ -60,6 +60,22 @@ type Config struct {
 	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
 	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
 	TrashRoots []string `json:"trash_roots"`
+	// LogArchiveDir is where prune moves the records of a cleaned job for later analysis
+	// (<dir>/<YYYY-MM>/<id>/). Default: <state>/archive. Absolute; may be another disk or a synced folder.
+	LogArchiveDir string `json:"log_archive_dir"`
+	// LogArchiveDays is how long archived months are kept (prune deletes older ones). Nil = 365, 0 = forever.
+	LogArchiveDays *int `json:"log_archive_days"`
+}
+
+// DefaultLogArchiveDays is the archive retention when log_archive_days is not set.
+const DefaultLogArchiveDays = 365
+
+// ArchiveDays returns the archive retention in days (0 = forever).
+func (c Config) ArchiveDays() int {
+	if c.LogArchiveDays == nil {
+		return DefaultLogArchiveDays
+	}
+	return *c.LogArchiveDays
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -123,6 +139,15 @@ func LoadConfig(stateDir string) (Config, error) {
 		if !filepath.IsAbs(r) {
 			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
 		}
+	}
+	if c.LogArchiveDir != "" && !filepath.IsAbs(c.LogArchiveDir) {
+		return c, fmt.Errorf("config.json: log_archive_dir %q must be an absolute path", c.LogArchiveDir)
+	}
+	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
+		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.LogArchiveDir == "" {
+		c.LogArchiveDir = filepath.Join(stateDir, "archive")
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
