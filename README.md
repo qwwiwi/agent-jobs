@@ -93,7 +93,18 @@ One main session, many workers. The session writes a brief for a stranger (a job
 7. **Review and push.** The session checks the diff against `base_commit` itself. A report is a claim, not a result. Only then does it push or publish.
 8. **Cleanup.** 30 minutes after the line was delivered, the worktree is removed and the work is kept as patches (below).
 
-Only `queued` and `running` rows can change status; `succeeded`, `failed`, `timeout` and `cancelled` are final.
+Only `queued` and `running` rows can change status; `succeeded` and `cancelled` are final. A `stopped`, `timeout` or `failed` job can be resumed (below); a `stopped` job can also be cancelled.
+
+### Change course: amend, stop and resume
+
+Every job runs in a claude session whose id is assigned before launch (`claude -p --session-id <uuid>`), and the session is kept on disk, so a job can be corrected without losing what it already knows and did:
+
+- **Amend** a job that is still `queued`: `job_amend(id, context)` appends the context to its brief under «Orchestrator update»; it keeps its place in the queue.
+- **Stop** a running (or queued) job: `job_stop(id, reason?)` sends SIGTERM to its process group (SIGKILL after 10 s), like cancel, but the job ends `stopped`: its worktree, uncommitted changes and session are kept, and its turns (and cost, when claude reported it) so far are recorded. A stopped job gets no job-done line and no cleanup.
+- **Resume** a `stopped`, `timeout` or `failed` job: `job_resume(id, context, limits?)` queues the next attempt of the **same job id** in the same work dir. Claude continues the same session (`claude -p --resume <session id>`) with one new message: «Orchestrator update», your context, «Continue the task with this update; keep the report contract». Kind, guard, profile, MCP config and owner rules stay the same. Limits default to what the previous attempt left (turns, budget, minutes); pass new ones, within the ceilings, when nothing is left (after a timeout, `timeout_minutes`). If the session is gone, or `--resume` fails before any turn, the attempt starts a fresh session in the same work dir with the original brief, a summary of the previous attempt (its report, else its last messages) and your context, and the report says so. A worktree that cleanup already removed is restored from the saved ref and patches first. The job-done line of a later attempt says `resumed (attempt N)`; `job_result` lists every attempt (earlier reports stay as `report.attempt-<n>.md`).
+- **Cancel** gives the job up: queued or running as before, and a `stopped` job is cleaned up like any finished one.
+
+Use amend while a job waits, stop and resume when a running job needs new facts or a changed plan, and cancel when its work is no longer wanted. A job stopped before it ever ran has no session: resuming it appends the context to its brief and starts it normally.
 
 ---
 
@@ -215,7 +226,10 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
 | `job_list` | recent jobs, filterable by status |
-| `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
+| `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL; a stopped job is given up |
+| `job_stop` | stop a queued or running job, keep its worktree and session: status `stopped` (resumable) |
+| `job_resume` | continue a stopped, timeout or failed job in the same session with an «Orchestrator update»; limits default to what is left |
+| `job_amend` | append context to a queued job's brief; it keeps its place in the queue |
 
 **System and file tools** (orchestrator only):
 
@@ -232,7 +246,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | group | orchestrator tools | job gets | status |
 |---|---|---|---|
 | Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` | none | built |
-| Jobs | `job_resume` | none | planned, Wave B |
+| Jobs | `job_stop`, `job_resume` (same session), `job_amend` | none | built (Wave E2) |
 | Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
 | Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
 | Team | `send_message`, `inbox` | none | planned, Wave A |
@@ -324,6 +338,9 @@ agent-jobs list   --agent my-agent
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
+agent-jobs amend  --agent my-agent <id> --context "the API moved to v2"   # queued job: add to its brief
+agent-jobs stop   --agent my-agent <id> --reason "plan changed"           # keep worktree + session
+agent-jobs resume --agent my-agent <id> --context-file update.md [--timeout-minutes 30]
 agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs finished > 48 h ago
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session

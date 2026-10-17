@@ -1,6 +1,6 @@
 ---
 name: agent-jobs
-description: Run long work as background agent-jobs (one-shot `claude -p` jobs with their own worktree, limits and report) through the agent-jobs MCP tools job_start, job_status, job_result, job_list, job_cancel. Use when deciding whether to do a task yourself, hand it to a subagent, or start a job; when starting a job (a model or a complexity is mandatory); when a "[jobs:job-done]" line arrives; and when reading or verifying a job's report.
+description: Run long work as background agent-jobs (one-shot `claude -p` jobs with their own worktree, limits and report) through the agent-jobs MCP tools job_start, job_status, job_result, job_list, job_cancel, job_stop, job_resume, job_amend. Use when deciding whether to do a task yourself, hand it to a subagent, or start a job; when starting a job (a model or a complexity is mandatory); when a job needs new context or a changed plan (amend, stop and resume, or cancel); when a "[jobs:job-done]" line arrives; and when reading or verifying a job's report.
 ---
 
 # agent-jobs: background jobs for this agent
@@ -44,8 +44,28 @@ Inside a job:
 |---|---|
 | `job_status` | status, turns, cost, time of one job |
 | `job_list` | recent jobs, optionally by status |
-| `job_cancel` | cancel a queued job at once, a running one with SIGTERM then SIGKILL |
-| `job_result` | the job-done line, the report and the paths of the saved patches |
+| `job_cancel` | cancel a queued job at once, a running one with SIGTERM then SIGKILL; give up a stopped one |
+| `job_result` | the job-done line, the report, the paths of the saved patches and, for a resumed job, every attempt |
+| `job_amend` | add context to a job that is still queued (it keeps its place) |
+| `job_stop` | stop a queued or running job but keep its worktree, uncommitted work and session (status `stopped`) |
+| `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
+
+## Change a job's course
+
+New facts, a changed plan or a correction while a job exists:
+
+| the job is | and | do this |
+|---|---|---|
+| `queued` | the update fits the brief | `job_amend(id, context)`: appended under «Orchestrator update» |
+| `running` | its work so far is still useful | `job_stop(id, reason)`, then `job_resume(id, context)` |
+| `stopped`, `timeout`, `failed` | the work so far is worth keeping | `job_resume(id, context, limits?)` |
+| any | the work is no longer wanted, or the brief was wrong from the start | `job_cancel(id)` (and start a new job) |
+
+- Resume runs the **same job id** in the same worktree and the same claude session: the job keeps what it read and did, including turns that produced no commit. It receives one message, «Orchestrator update» + your context + «continue, keep the report contract». Write the context like a brief delta: what changed, what to do now, what to drop.
+- Limits of the continuation default to what the previous attempt left. After a timeout nothing is left of the time: pass `timeout_minutes` (and other limits as needed), within the ceilings.
+- If the session cannot be resumed (it was pruned, or `--resume` fails), the attempt starts a fresh session in the same worktree with the brief, a summary of the previous attempt and your context; the job-done line says `fresh session` and the report must say so.
+- Succeeded and cancelled jobs cannot be resumed; start a new job (put the old report's findings in its brief).
+- A stopped job holds its worktree and gets no job-done line until you resume or cancel it: do not leave it.
 
 ## When a job is done
 

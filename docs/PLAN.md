@@ -32,6 +32,14 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #13).
 - Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
 
+**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #14). Built on a branch, on review.
+
+- Every job gets a session id before launch (`--session-id`); `--no-session-persistence` is gone.
+- `job_stop` / `agent-jobs stop`: a running or queued job ends `stopped`, keeping its worktree, uncommitted work and session.
+- `job_resume` / `agent-jobs resume`: the next attempt of the same job id, same work dir, same session (`--resume`) with an «Orchestrator update»; limits default to what is left; a fresh session with the brief + a summary of the previous attempt when the session is gone or cannot be resumed; a cleaned worktree is restored from the ref and patches.
+- `job_amend` / `agent-jobs amend`: append context to a queued job's brief, queue position kept.
+- `prune` also removes the claude session files of the jobs it prunes.
+
 ## Wave A
 
 - **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
@@ -45,7 +53,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 ## Wave B
 
-- **Resume.** `job_resume` and `agent-jobs resume <id>`: a new job with the same brief, the old commits and diff carried over from the saved patches, and a note at the top of the brief saying what was carried and what was not.
+- **Resume.** `job_resume` and `agent-jobs resume <id>`: a new job with the same brief, the old commits and diff carried over from the saved patches, and a note at the top of the brief saying what was carried and what was not. *Superseded by E2* (built): resume continues the same job id and session; the carry-over survives as its fallback (fresh session in the worktree restored from the ref and patches, with a summary of the previous attempt).
 - **Schedules.** `schedule_add`, `schedule_list`, `schedule_remove`. A cron expression in local time plus a prompt, checked every minute, delivered one of two ways:
   - into the live session as a tagged message (several due at once arrive as one message: «these are different instructions, do each one»);
   - as a job, when the schedule has a kind; the session then only sees the job-done line.
@@ -71,12 +79,12 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
 - **Acceptance from a clean clone.** The whole install and a test job are replayed from a fresh clone before a release.
 - **Autopilot items 23-27:** risky-first review, a Progress section in reports, a job size check, secret redaction in reports and logs, an `acceptance_cmd` a job must pass.
 
-## Wave E: borrowed ideas (planned, not approved)
+## Wave E: borrowed ideas (planned; E2 approved and built)
 
-Each item waits for a separate owner go; it is not part of the current mandate (see [DECISIONS.md](DECISIONS.md)). Items that diverge from the reference have a «proposed, not approved» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-not-approved-wave-e). Sources are open-source projects from the 2026-10-17 market scan. The Codex runner and schedules, also seen in those projects, are already in Wave B; Wave E does not change them.
+Each item waits for a separate owner go (E2 has it, see [DECISIONS.md](DECISIONS.md)); it is not part of the current mandate (see [DECISIONS.md](DECISIONS.md)). Items that diverge from the reference have a «proposed, not approved» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-not-approved-wave-e). Sources are open-source projects from the 2026-10-17 market scan. The Codex runner and schedules, also seen in those projects, are already in Wave B; Wave E does not change them.
 
 - **E1. Subscription limit: wait for the reset and resume.** Keep the last rate-limit event; hold new launches when the window is near its limit; on a usage-limit error wait for the reset + 60 s + jitter and resume the same session (needs E2). Why: subscription windows, not dollar budgets, stop overnight jobs; `--max-budget-usd` is a client-side estimate, not a subscription cap. Source: arbab. Related: Wave D API-credit fallback (E1 waits, the fallback pays). Priority: high. DEVIATIONS E1.
-- **E2. True session resume.** Assign `--session-id` before launch and drop `--no-session-persistence`, so `job_resume` continues the same claude session instead of starting a fresh job from the saved patches. Why: a timed-out or killed job keeps its context, including turns that produced no commit. Source: agent-dispatch. Related: Wave B Resume (patch carry-over stays as the fallback). Priority: high. DEVIATIONS E2.
+- **E2. True session resume.** Assign `--session-id` before launch and drop `--no-session-persistence`, so `job_resume` continues the same claude session instead of starting a fresh job from the saved patches. Why: a timed-out or killed job keeps its context, including turns that produced no commit. Source: agent-dispatch. Related: Wave B Resume (patch carry-over stays as the fallback). Priority: high. **Status: approved by the owner as a priority and built (stop, resume, amend; see In progress); DEVIATIONS #14.**
 - **E3. Structured outcome.** Next to `report.md`, a machine-readable outcome (via `--json-schema`): status `done | partial | blocked`, changed files, checks with their exit codes, a not-verified list. Why: the orchestrator can triage without reading the report, and a job cannot claim a pass the outcome does not show. Source: arbab (fixed report schema), agent-dispatch (`STATUS: done|partial|blocked`). Related: the report contract (Done, PR #1); Wave D Progress section. Priority: high. DEVIATIONS E3.
 - **E4. Verify by exit codes.** Check results are taken from tool exit codes in `stream.jsonl`, never from the model's summary; optionally a separate read-only verify job (no edit tools) runs the checks after a fix. Why: a report is a claim; exit codes are evidence. Source: arbab (verify / probe role). Related: Wave D `acceptance_cmd`. Priority: medium-high. DEVIATIONS E4.
 - **E5. Claude Code native sandbox on top of the guard hook.** No network, no writes to `.git`, enforced by the OS rather than by command parsing (arbab: sandbox with `failIfUnavailable`, `dontAsk` plus an allowlist). Starts as a research spike on Linux (bubblewrap): what works under `claude -p` and what breaks (worktree git dirs, the job store, MCP). Why: the docs say the guard is not a sandbox (DEVIATIONS #9, #12); this would close part of that gap. Source: arbab. Related: Wave A cgroup containment, the guard. Priority: medium. DEVIATIONS E5 (only if adopted).

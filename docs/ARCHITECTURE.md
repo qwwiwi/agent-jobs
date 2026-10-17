@@ -10,7 +10,10 @@ Implements [`docs/REFERENCE.md`](REFERENCE.md), section «How to do it yourself 
 | job_status | orchestrator | `Store.Get` |
 | job_result | orchestrator | `Store.Get` + `DoneLine` + `report.md` (capped at 256 KB; opened with `O_NONBLOCK|O_NOFOLLOW` and read only if the opened fd is a regular file – a FIFO, symlink or directory planted by the job is reported as missing, never waited on) + paths of the patches/logs that exist (lstat, regular files only, never read) |
 | job_list | orchestrator | `Store.List` / `Store.ListRecentByStatus`, newest first, limit 1..200 |
-| job_cancel | orchestrator | `Manager.Cancel` |
+| job_cancel | orchestrator | `Manager.Cancel` (also gives up a `stopped` job) |
+| job_stop | orchestrator | `Manager.Stop` – kill like cancel, status `stopped`, work dir and session kept |
+| job_resume | orchestrator | `Manager.Resume` – next attempt of the same id in the same session (or the fallback), limits default to what is left |
+| job_amend | orchestrator | `Manager.Amend` – append to a queued job's brief |
 | system_doctor | orchestrator | `Manager.Disk` (statfs of the state dir + a prune dry run) + `Queue` + `DoctorProcs(false)` (never kills) + `Hooks` (the guard command from settings.json run through `sh -c` with a `git push` payload → must exit 2, `ls` → 0; owner rules readable and ≤ 8 KB; `tmux has-session` on the notify target) → `ok` and a problem list (disk ≥ 90 % used or < 2 GiB free, a failing hook, job ghosts, dead running rows) |
 | system_logs | orchestrator | last 1..2000 lines (default 100) of `<state>/daemon.log` (launchd) or `journalctl --user --unit agent-jobs@<agent>.service` (systemd, DEVIATIONS #11); with `job_id` the job's `stderr.log`, opened `O_NOFOLLOW|O_NONBLOCK`, regular files only, last 1 MiB |
 | activity_report | orchestrator | `Store.ListActivity`: jobs created or finished in the window (1..720 h, default 24) plus all queued/running, at most 1000; counts by status, cost/turns/time of the finished ones |
@@ -22,7 +25,7 @@ Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed
 
 | component | where | what it does |
 |---|---|---|
-| store | `internal/store` | SQLite table `jobs` (modernc.org/sqlite, WAL, busy_timeout). Only `queued`/`running` rows can change status. A tick claims a job (`queued → running` + random `launch_token`) before anything is spawned, and its terminal update is `WHERE status='running' AND launch_token=?` – a tick can never finish another tick's job. Only an explicit cancel finishes by id alone. |
+| store | `internal/store` | SQLite table `jobs` (modernc.org/sqlite, WAL, busy_timeout). Only `queued`/`running` rows can change status, except `job_resume` (`stopped`/`timeout`/`failed` → `queued`, the previous attempt archived in the `attempts` table) and the cancel of a `stopped` row. A tick claims a job (`queued → running` + random `launch_token`) before anything is spawned, and its terminal update is `WHERE status='running' AND launch_token=?` – a tick can never finish another tick's job. Only an explicit cancel or stop finishes by id alone. |
 | manager | `internal/jobs` | enqueue (validation, defaults, ceilings), launch, collect, timeout, cancel, notify, cleanup. |
 | wrapper | `agent-jobs run-wrapper` | holds `wrapper.lock` (a second wrapper for the job refuses); under `admit.lock` checks that the job row is still `running` with its launch token (otherwise exits 4: no claude, no exit_code) and registers itself in `wrapper.json` (pid, pgid, launch token); then runs claude with a scrubbed git environment (below) and prompt.md on stdin, writes stream.jsonl / stderr.log, extracts report.md, writes exit_code last. |
 | guard | `internal/guard`, `agent-jobs guard` | PreToolUse hook (exit 2 = block, reason on stderr). |
@@ -55,6 +58,9 @@ Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed
 | admit.lock | admission handshake: wrapper (check row + register), `cancel` and the launch-grace failure take it, so a late wrapper never runs claude for a terminal row |
 | worktree.json | path, admin gitdir and base of the worktree this job created (ownership check before cleanup) |
 | exit_code | written by the wrapper when claude exits (written last) |
+| resume.md, fallback.md | stdin of a resumed attempt: the update (same session) / brief + previous attempt + update (fresh session) |
+| fallback_session | the fresh session id when the wrapper fell back from a failed `--resume` |
+| attempts/<n>/, report.attempt-<n>.md | run files and report of earlier attempts of a resumed job |
 | report.md | the job's final message (`result` of the last stream `result` event) |
 | diffstat.txt, commits.patch, staged.patch, uncommitted.patch, untracked.tar | what the job changed; written right before the worktree is removed (when the repository config names filter/diff drivers: only `diffstat.txt` with the reason, worktree kept) |
 
@@ -74,7 +80,33 @@ Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed
 
 **Daemon restart.** The wrapper lives in its own session and writes `exit_code` itself; the daemon keeps no in-memory state. Killing the daemon (even SIGKILL) leaves the job running; the next daemon/tick finds `exit_code` and collects it (tested with the real binary).
 
-**Cancel** (under the lifecycle lock and the job's `admit.lock`). `queued` → `cancelled`; `running` → TERM group / 10 s / KILL → `cancelled`. Terminal jobs cannot be cancelled.
+**Cancel** (under the lifecycle lock and the job's `admit.lock`). `queued` → `cancelled`; `running` → TERM group / 10 s / KILL → `cancelled`; `stopped` → `cancelled` (turns/cost of the stop kept; notify and cleanup then run as for any finished job). Other terminal jobs cannot be cancelled.
+
+**States** (Wave E2, DEVIATIONS #14):
+
+```
+queued    ──tick claims──────────►  running      (attempt + 1)
+queued    ──job_amend────────────►  queued       (brief += update, queue position kept)
+queued    ──job_stop─────────────►  stopped      (attempt 0: no session yet)
+queued    ──job_cancel───────────►  cancelled
+running   ──exit_code + verdict──►  succeeded | failed
+running   ──past timeout─────────►  timeout
+running   ──job_stop─────────────►  stopped      (work dir + session kept, not notified, not cleaned)
+running   ──job_cancel───────────►  cancelled
+stopped   ──job_resume───────────►  queued       (next attempt of the same id)
+timeout   ──job_resume───────────►  queued       (next attempt of the same id)
+failed    ──job_resume───────────►  queued       (next attempt of the same id)
+stopped   ──job_cancel───────────►  cancelled    (then notified and cleaned up)
+succeeded, cancelled: final
+```
+
+**Stop** (`job_stop` / `agent-jobs stop`, under the lifecycle lock and `admit.lock`). `queued` → `stopped` (attempt 0, no session yet). `running` → the process group is killed exactly as for cancel; the turns come from the stream's `result` event or, when the job was killed before it, from the number of distinct assistant messages in `stream.jsonl` (cost then unknown, said in the error field); the row ends `stopped` with the reason. A job whose `exit_code` already exists is collected with its real verdict instead (the stop is refused). A stopped job is not notified and not cleaned up (PendingNotify / PendingCleanup skip it; prune skips it): its worktree, uncommitted files and session stay until it is resumed or cancelled.
+
+**Resume** (`job_resume` / `agent-jobs resume`, under the lifecycle lock). Only `stopped`, `timeout` and `failed`; a job that never prepared its folder (refused to start) is refused. The same job id runs its next attempt: `Store.Requeue` archives the current attempt into the `attempts` table (number, mode, status, model, limits, usage, error, context, session id, times), resets the run fields (pid, token, finished/notified/cleaned, usage, error) and queues the row again with the new limits and the update (`pending_context`); `created_at` is kept, so the job keeps its original queue position. Limits: each one given explicitly (within the ceilings, never clamped) or what the previous attempt left of its own (turns − used, budget − cost, minutes − elapsed); nothing left and nothing given is an error. A job stopped while queued (attempt 0) gets the update appended to its brief and starts as a first attempt. Same id, not a new linked job: claude finds a session by the cwd's project directory, so the attempt must run in the same `<jobdir>/work`, which belongs to the job id. On launch (`Claim` counts `attempt`), `prepareResume`: moves the previous run files to `attempts/<n>/` and its report to `report.attempt-<n>.md` (prune keeps small top-level text files), rewrites `settings.json`, `mcp.json`, `gitconfig`, `no-hooks/` from the config (the job dir is writable by the job; a filled `no-hooks/` refuses), restores the worktree if cleanup removed it (`git worktree add` at `refs/agent-jobs/jobs/<id>`, then `staged.patch` with `git apply --cached`, `uncommitted.patch` with `git apply`, `untracked.tar` extracted without `..`, absolute names or writes through symlinks; the owner mark re-written) and verifies it as cleanup does, then writes `resume.md` (the update: «Orchestrator update», the context, «Continue the task with this update; keep the report contract», the attempt's limits) and `fallback.md` (the prompt rebuilt from the database brief, owner rules and cards, plus «Previous attempt»: status, turns, error, its report or else its last assistant text, where its commits are, plus the update and «say so in Not done / uncertain»). If the session transcript is on disk, the wrapper runs `claude … --resume <session id>` with `resume.md` on stdin and `--fallback-prompt fallback.md --fallback-session <new id>`; if not, a fresh session (`--session-id <new id>`, stdin `fallback.md`, run mode `fallback`). The wrapper falls back by itself when a resume exits non-zero (not by a signal) before any `assistant` or `result` event: the failed stream is kept as `stream-resume-failed.jsonl`, `fallback_session` records the new id (the daemon validates it and stores it on the row when it collects), and claude runs once more in the fresh session. The job-done line of attempt N > 1 ends `· resumed (attempt N)` (`, fresh session` in fallback mode); `job_result` lists all attempts. The subagent cap stays per job (the counter is monotonic across attempts).
+
+**Amend** (`job_amend` / `agent-jobs amend`, under the lifecycle lock): `UPDATE … SET brief = brief || <update> WHERE status='queued'`; the row's `created_at`/rowid, so its queue position, are unchanged. Any other status is refused.
+
+**Sessions on disk.** Without `--no-session-persistence` claude keeps each job's transcript in `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd with every non-alphanumeric character replaced by '-'>/<session id>.jsonl` plus a `<session id>/` directory (tool results, subagent transcripts); typically tens of KB to a few MB per job. `SessionPaths` finds them by the job's session id (glob over `projects/*/`, the id is a UUID the daemon generated), and `prune` removes them for the jobs it prunes (every attempt's session), never anything else in the claude config dir.
 
 **Process-group kills** (timeout, cancel). `wrapper.json` lies in the job dir, which the job can write, so a pgid is never trusted: before any signal the daemon requires pgid > 1, pgid ≠ its own process group and `getpgid(wrapper pid) == pgid`; otherwise it refuses and logs (the row is still finished). Adoption from `wrapper.json` refuses a pgid ≤ 1, the daemon's own group, or a live pid that does not lead that group (the job then fails after the launch grace).
 
@@ -91,7 +123,7 @@ tar -xf "$J/untracked.tar"
 
 Then `git update-ref refs/agent-jobs/jobs/<id> <job HEAD>` in the source repo, then `git worktree remove --force <jobdir>/work` – only that path. Any failure before the removal keeps the worktree and retries next tick.
 
-## Launch command (reference, 1:1)
+## Launch command (reference, except DEVIATIONS #14)
 
 ```
 claude -p --output-format stream-json --verbose --model M \
@@ -99,8 +131,10 @@ claude -p --output-format stream-json --verbose --model M \
   --permission-mode bypassPermissions \
   --settings <jobdir>/settings.json --setting-sources project \
   --mcp-config <jobdir>/mcp.json --strict-mcp-config \
-  --no-session-persistence --add-dir <jobdir> < prompt.md
+  --add-dir <jobdir> --session-id <uuid> < prompt.md
 ```
+
+The reference pins `--no-session-persistence`; here the session id is assigned before launch and stored on the row (`session_id`), so the job can be resumed: a resumed attempt replaces `--session-id <uuid>` with `--resume <uuid>` and reads `resume.md` instead of `prompt.md` (see Resume).
 
 cwd = `<jobdir>/work`. Checked against claude 2.1.301: all flags accepted; `--max-turns` is not listed in `claude --help` but is accepted (real smoke run finished normally with it).
 
@@ -152,6 +186,6 @@ What this is and is not: the deny rules and the guard block the *direct spelling
 
 ## Not built yet
 
-MCP tools for memory, tasks and team, `job_resume`, daily runs of `prune` and `doctor procs`, cgroup containment, memory notes in the brief, the "owner waits" Stop-hook, schedules, heartbeat, codex runner, HTTP API, the separate code-graph MCP server (reference: code index as a graph, jobs read and index) – later stages, see `docs/PLAN.md`.
+MCP tools for memory, tasks and team, daily runs of `prune` and `doctor procs`, cgroup containment, memory notes in the brief, the "owner waits" Stop-hook, schedules, heartbeat, codex runner, HTTP API, the separate code-graph MCP server (reference: code index as a graph, jobs read and index) – later stages, see `docs/PLAN.md`.
 
 Main-session duties (reference: the orchestrator reads the report, «Not done / uncertain» first, checks the diff, publishes only after that; cleanup after reading) cannot be enforced from the job side. They ship as `prompts/orchestrator.md` (verbatim quotes), which `agent-jobs init` writes to `<state>/orchestrator.md` for the agent's instructions. Cleanup stays «через 30 минут после уведомления» (the detailed rule); «удалять worktree после прочтения, сохранив патчи» from the minimum list is met because the patches and the ref survive, so a report read after cleanup loses nothing. Tying cleanup to a read mark would contradict the 30-minute rule, so it is not done.
