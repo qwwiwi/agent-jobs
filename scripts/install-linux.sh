@@ -164,7 +164,9 @@ else
     exit 1
   fi
   echo "  building from $REPO_ROOT"
-  (cd "$REPO_ROOT" && go build -trimpath -o "$tmp" ./cmd/agent-jobs)
+  version="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
+  echo "  version $version"
+  (cd "$REPO_ROOT" && go build -trimpath -ldflags "-X main.version=$version" -o "$tmp" ./cmd/agent-jobs)
 fi
 chmod 0755 "$tmp"
 if [ -f "$BIN" ] && cmp -s "$tmp" "$BIN"; then

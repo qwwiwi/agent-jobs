@@ -11,7 +11,9 @@
 [![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-555.svg)](#quick-start)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#license-and-author)
 
-**Leaner context. A free main session. Full-strength workers.** Agent Jobs lets a long-lived Claude Code session hand heavy work to background `claude -p` processes. The main session talks, decides and checks; everything longer than a few steps becomes a *job*: a one-shot, full top-level Claude run with its own git worktree, hard turn / budget / time limits and a guard on every tool call. A small daemon queues, launches, watches and cleans up jobs. When a job finishes, the session receives exactly one line, and reads the report only when it is ready to. Jobs never push, publish or message anyone; only the main session goes outside, after it has read the report and checked the diff.
+**Cheaper. Faster. Full-strength.**
+
+Agent Jobs lets a long-lived Claude Code session hand heavy work to background `claude -p` processes. The main session talks, decides and checks; everything longer than a few steps becomes a *job*: a one-shot, full top-level Claude run with its own git worktree, hard turn / budget / time limits and a guard on every tool call. A small daemon queues, launches, watches and cleans up jobs. When a job finishes, the session receives exactly one line, and reads the report only when it is ready to. Jobs never push, publish or message anyone; only the main session goes outside, after it has read the report and checked the diff.
 
 It is a single Go binary with one SQLite file per agent, running on Linux (systemd user service) and macOS (launchd).
 
@@ -273,6 +275,7 @@ agent-jobs list   --agent my-agent
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
+agent-jobs version                      # also --version
 ```
 
 **When a job fails**, look in `~/.agent-jobs/<agent>/jobs/<id>/`: `stderr.log` first, then `stream.jsonl`, `exit_code`, `report.md`.
@@ -290,7 +293,7 @@ agent-jobs cancel --agent my-agent <id>
 
 ## Versioning
 
-Versioning: [SemVer](https://semver.org/); every release is listed in [CHANGELOG.md](CHANGELOG.md).
+Versioning: [SemVer](https://semver.org/); every release is listed in [CHANGELOG.md](CHANGELOG.md). `agent-jobs version` prints the build; `scripts/install-linux.sh` stamps it with `git describe --tags --always --dirty`, a plain `go build` reports `dev`.
 
 ## Roadmap
 

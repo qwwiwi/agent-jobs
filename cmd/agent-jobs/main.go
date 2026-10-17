@@ -35,9 +35,13 @@ const usage = `usage: agent-jobs <command> [flags]
   cancel     --agent A <id>
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
+  version                                  print the version (also --version)
   run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]...   (PreToolUse hook, JSON on stdin)
 `
+
+// version is set at build time: go build -ldflags "-X main.version=$(git describe --tags --always --dirty)".
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -67,6 +71,9 @@ func main() {
 		err = cmdTick(args)
 	case "daemon":
 		err = cmdDaemon(args)
+	case "version", "--version":
+		fmt.Printf("agent-jobs %s\n", version)
+		return
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
