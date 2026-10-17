@@ -514,7 +514,7 @@ var (
 	reAssign = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	keywords = map[string]bool{
 		"if": true, "then": true, "else": true, "elif": true, "do": true, "while": true,
-		"until": true, "!": true, "{": true, "}": true, "time": true, "fi": true, "done": true,
+		"until": true, "!": true, "coproc": true, "{": true, "}": true, "time": true, "fi": true, "done": true,
 	}
 )
 

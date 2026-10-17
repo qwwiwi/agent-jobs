@@ -1426,3 +1426,58 @@ func TestDynamicWriteTargetsAndScopeToolMentions(t *testing.T) {
 		})
 	}
 }
+
+// Final fix of PR #10: a cgroup path split by an unset variable or spelled with ANSI-C quoting is
+// refused like the plain path; coproc runs its command like a plain command word; a sed script is not
+// a write target (only its file operands and w/W file targets are).
+func TestCgroupPathSplitCoprocAndSedScripts(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	procs := "/user.slice/user-1000.slice/user@1000.service/app.slice/cg${N}roup.procs"
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"braced unset variable", `echo $$ > /sy${N}s/fs/cg${N}roup` + procs, true},
+		{"quoted unset variable", `echo $$ > /sy"$N"s/fs/cg"$N"roup/x/cg"$N"roup.procs`, true},
+		{"default expansion split", `echo $$ > /sy${N:-}s/fs/cg${N-}roup/x/y`, true},
+		{"positional split", `echo $$ > /sy"$1"s/fs/cg"$1"roup/x/y`, true},
+		{"tee split", `echo $$ | tee /sy${N}s/fs/cg${N}roup/x/y`, true},
+		{"cp split", `cp f /sy${N}s/fs/cg${N}roup/x/y`, true},
+		{"ansi-c plain", `echo $$ > /sy$'s'/fs/cg$'r'oup/x/y`, true},
+		{"ansi-c escapes", `echo $$ > $'/\x73ys/fs/c\x67roup/x/y'`, true},
+		{"ansi-c escape tee", `echo $$ | tee $'\x2fsys/fs/x/y'`, true},
+		{"split control file name", `echo $$ > x/cgroup${N}.procs`, true},
+		{"coproc docker", `coproc docker run x`, true},
+		{"coproc tmux", `coproc tmux new -d`, true},
+		{"coproc systemd-run", `coproc systemd-run --user sleep 1`, true},
+		{"sed w to computed", `sed -n "w $(cat t)" f`, true},
+		{"sed s///w to computed", `P=$(cat t); sed "s/a/b/w $P" f`, true},
+		{"sed w to cgroup", `sed -n 'w /sys/fs/cgroup/x/cgroup.procs' f`, true},
+		{"sed file operand computed", `sed -i s/a/b/ "$(cat t)"`, true},
+		{"sed -e then computed file", `V=1; sed -e "s/x/$V/" "$(cat t)"`, true},
+		// Allowed.
+		{"sed version bump", `V=1.2.3; sed -i "s/old/$V/" version.txt`, false},
+		{"sed changelog date", `sed -i "s/x/$(date +%F)/" CHANGELOG.md`, false},
+		{"sed -e substitution", `sed -i -e "s/x/$(date +%F)/" -e 's/a/b/' CHANGELOG.md`, false},
+		{"sed --expression=", `V=2; sed --expression="s/v1/$V/" f`, false},
+		{"sed -E -i cluster", `V=2; sed -Ei "s/v1/$V/" f`, false},
+		{"touch empty word", `touch ''`, false},
+		{"sed bsd empty suffix", `V=2; sed -i '' "s/old/$V/" f`, false},
+		{"sed script after unknown cd", `cd "$X" && sed -i s/a/b/ /home/u/work/f.txt`, false},
+		{"sed file after unknown cd", `cd "$X" && sed -i s/a/b/ f.txt`, true},
+		{"env variable braces", `echo 1 >> "${OUT}"`, false},
+		{"ansi-c newline elsewhere", `printf $'a\n' > out.txt`, false},
+		{"coproc plain", `coproc cat`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

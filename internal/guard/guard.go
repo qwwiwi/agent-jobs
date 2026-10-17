@@ -823,7 +823,7 @@ func pathForms(w, dir string) [][]string {
 	return forms
 }
 
-// cgroupPath reports a word naming the cgroup file system or one of its control files in any spelling:
+// cgroupPath reports a word naming the cgroup file system or one of its control files in the spellings:
 // a sys/fs/cgroup segment run (also after `//`, `/./`, `x/..`, relative to the call's directory, or
 // through a symlink), a cgroup core file base name (cgroupControlFiles), or any path through
 // /proc/<pid>/root or /proc/<pid>/cwd.
@@ -846,7 +846,11 @@ func sysDirTarget(w, dir string, root bool) bool {
 	if dir == "" && !filepath.IsAbs(optValue(w)) {
 		return false
 	}
-	for _, segs := range pathForms(w, dir)[1:] {
+	forms := pathForms(w, dir)
+	if len(forms) == 0 { // an empty word (`touch ''`)
+		return false
+	}
+	for _, segs := range forms[1:] {
 		if slices.Equal(segs, []string{"sys"}) || slices.Equal(segs, []string{"sys", "fs"}) || (root && len(segs) == 0) {
 			return true
 		}
@@ -869,9 +873,27 @@ var (
 	// reCgroupMention is a call that names the cgroup file system or /sys in some spelling: an
 	// unresolvable write target there could land in it.
 	reCgroupMention = regexp.MustCompile(`(?i)cgroup|(^|[^a-z0-9_.-])sys/|/sys($|[^a-z0-9_.-])|/proc/[^/\s]+/(root|cwd)`)
+	// reMaybeEmpty is an expansion that may be empty: `${…}`, `$NAME`, a positional or special
+	// parameter (an unset one splits a literal path unseen: `/sy${N}s/fs/cg"$N"roup`).
+	reMaybeEmpty = regexp.MustCompile(`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!-]`)
+	// reAnsiEscape is ANSI-C quoting with an escape (`$'\x73ys'`): its value is not decoded here.
+	reAnsiEscape = regexp.MustCompile(`\$'[^']*\\`)
 	// reHomeSet is a call that may change HOME (then `~` is not the guard's HOME).
 	reHomeSet = regexp.MustCompile(`(^|[^$A-Za-z0-9_{])HOME([^A-Za-z0-9_]|$)`)
 )
+
+// cgroupMention reports a call that names the cgroup file system or /sys (reCgroupMention) as written,
+// with ANSI-C quoting that has an escape, or once quotes, backslashes and expansions that may be empty
+// are removed (`/sy${N}s/fs/cg"$N"roup`, `/sy$'s'/fs`).
+func cgroupMention(cmd string) bool {
+	if reCgroupMention.MatchString(cmd) || reAnsiEscape.MatchString(cmd) {
+		return true
+	}
+	s := strings.NewReplacer("$'", "'", `$"`, `"`).Replace(cmd)
+	s = reMaybeEmpty.ReplaceAllString(s, "")
+	s = strings.NewReplacer(`"`, "", "'", "", `\`, "").Replace(s)
+	return reCgroupMention.MatchString(s)
+}
 
 // cgroupWriters are programs whose arguments name files they write or create: a dynamic argument of one
 // of them is an unresolvable write target.
@@ -1176,13 +1198,14 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 }
 
 // checkCgroupWrites rejects any write into the cgroup file system: an output redirection there, or such
-// a path as an argument of a program that is not a plain reader (cgroupPath: every spelling), checked
+// a path as an argument of a program that is not a plain reader (cgroupPath), checked
 // against every directory a cd/pushd of the call may have moved to (cdView); a cd/pushd into /sys,
 // /sys/fs or the cgroup file system, and a symlink to /, /sys or /sys/fs. Fail closed: a redirection
 // target or a writer's argument (cgroupWriters) computed in the call (computedTarget) or written after an
 // ln with a dynamic argument is rejected in any call; any variable, `~user` or relative-after-an-
-// unresolvable-cd target is rejected when the call mentions the cgroup file system (reCgroupMention) or
-// has a cd the guard cannot resolve.
+// unresolvable-cd target is rejected when the call mentions the cgroup file system (cgroupMention) or
+// has a cd the guard cannot resolve. A sed script is not a write target unless it may hold a w/W file
+// (sedScriptArgs, reSedWrite); sed's file operands are.
 func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 	v := newCdView(scripts, cmd, cfg)
 	for _, d := range v.dirs[1:] {
@@ -1194,7 +1217,7 @@ func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 		return "blocked by guard: a cd with CDPATH set in the same call resolves where the guard cannot see; " +
 			"cd to an absolute or ./relative path."
 	}
-	risky := v.unknown || reCgroupMention.MatchString(cmd)
+	risky := v.unknown || cgroupMention(cmd)
 	names, allVars := localVars(scripts, cmd, v.sawCD)
 	links := dynLinkCmds(scripts)
 	var cur *simpleCmd
@@ -1207,6 +1230,14 @@ func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 		if dyn {
 			if write && (risky || computedTarget(w, names, allVars)) {
 				return unresolvedBlocked(w)
+			}
+			if write {
+				// An unset variable may hide a cgroup control file name (`x/cgroup${N}.procs`).
+				for _, d := range v.dirs {
+					if cgroupPath(reMaybeEmpty.ReplaceAllString(w, ""), d) {
+						return cgroupBlocked(w)
+					}
+				}
 			}
 			return ""
 		}
@@ -1248,15 +1279,23 @@ func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 				if gitFileReaders[name] {
 					continue
 				}
+				var sedArgs map[int]bool
+				if name == "sed" {
+					sedArgs = sedScriptArgs(argv)
+				}
 				for k := 1; k < len(argv); k++ {
 					a := argv[k]
+					write := cgroupWriters[name]
+					if script, ok := sedArgs[k]; ok {
+						write = script && reSedWrite.MatchString(a)
+					}
 					if name == "cd" || name == "pushd" || name == "popd" || name == "chdir" {
 						if !dyn[k] && cgroupPath(a, "") {
 							return cgroupBlocked(a)
 						}
 						continue // resolved by cdView
 					}
-					if r := check(a, dyn[k], cgroupWriters[name]); r != "" {
+					if r := check(a, dyn[k], write); r != "" {
 						return r
 					}
 					if !dyn[k] {
@@ -1271,6 +1310,70 @@ func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 		}
 	}
 	return ""
+}
+
+// reSedWrite is a sed script that may hold a w/W command or an s///w flag (a file sed writes): a w at the
+// start or after `;`, a brace, a newline, an address, `!` or a closing delimiter with flags. Approximate,
+// errs toward a write.
+var reSedWrite = regexp.MustCompile(`(^|[;{}\n/0-9$!,]\s*|/[gpiImMe0-9]*)[wW]`)
+
+// sedScriptArgs returns the indices of sed's arguments that are not file operands: true for a script
+// (the first operand without -e/-f, the value of -e/--expression), false for an option value that is no
+// write target (-f/--file, -l/--line-length, an empty BSD -i suffix).
+func sedScriptArgs(argv []string) map[int]bool {
+	out := map[int]bool{}
+	explicit, operand := false, false
+	firstOperand := func(k int) {
+		if !explicit && !operand {
+			out[k], operand = true, true
+		}
+	}
+	for k := 1; k < len(argv); k++ {
+		a := argv[k]
+		switch {
+		case a == "--":
+			for k++; k < len(argv); k++ {
+				firstOperand(k)
+			}
+		case strings.HasPrefix(a, "--"):
+			opt, _, hasVal := strings.Cut(a[2:], "=")
+			switch opt {
+			case "expression", "file":
+				explicit = true
+				if !hasVal && k+1 < len(argv) {
+					k++
+				}
+				out[k] = opt == "expression"
+			case "line-length":
+				if !hasVal && k+1 < len(argv) {
+					k++
+					out[k] = false
+				}
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				if c == 'i' { // the rest is the backup suffix; BSD takes it as the next word (`-i ''`)
+					if j == len(a)-1 && k+1 < len(argv) && argv[k+1] == "" {
+						k++
+						out[k] = false
+					}
+					break
+				}
+				if c == 'e' || c == 'f' || c == 'l' { // the rest, or the next word, is the value
+					explicit = explicit || c != 'l'
+					if j == len(a)-1 && k+1 < len(argv) {
+						k++
+					}
+					out[k] = c == 'e'
+					break
+				}
+			}
+		default:
+			firstOperand(k)
+		}
+	}
+	return out
 }
 
 // checkSelf: no nested jobs. agent-jobs as a command (by name or path, behind env/command/exec/nohup,
