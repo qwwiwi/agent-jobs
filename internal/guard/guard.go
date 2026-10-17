@@ -45,6 +45,7 @@ type Config struct {
 	OwnerNames []string // names that must never appear in a commit
 	GitName    string   // allowed git user.name ("" = no identity override allowed)
 	GitEmail   string   // allowed git user.email ("" = no identity override allowed)
+	GitDirs    []string // the job worktree's real git dirs (admin dir, common dir): file tools never write there
 	Dir        string   // working directory of the call (resolves `git commit -F <file>`)
 }
 
@@ -76,7 +77,7 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 		if in.ToolName == "NotebookEdit" {
 			p = in.ToolInput.NotebookPath
 		}
-		return CheckFileWrite(in.ToolName, p, cfg.Dir), nil
+		return CheckFileWrite(in.ToolName, p, cfg), nil
 	}
 	if in.ToolName != "Bash" {
 		return "", nil
@@ -119,19 +120,54 @@ func inGitDir(p string) bool {
 	})
 }
 
+// within reports whether p is d or lies inside it (both absolute and clean).
+func within(p, d string) bool {
+	rel, err := filepath.Rel(d, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// inJobGitDir reports a path inside one of the job's real git dirs (as given or symlinks resolved):
+// they need not be named .git (a separate git dir, a worktree admin dir).
+func inJobGitDir(p string, gitDirs []string) bool {
+	for _, d := range gitDirs {
+		if d == "" {
+			continue
+		}
+		d = filepath.Clean(d)
+		if within(p, d) {
+			return true
+		}
+		if r, err := filepath.EvalSymlinks(d); err == nil && within(p, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDotDot reports a `..` segment in a path as written: the kernel resolves `link/..` after the
+// symlink, while filepath.Clean drops it lexically, so such a path is not checked, it is rejected.
+func hasDotDot(path string) bool {
+	return slices.Contains(strings.Split(filepath.ToSlash(path), "/"), "..")
+}
+
 // CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
-// would write inside a `.git` directory: config, hooks, a worktree's admin dir. Both the path as given
-// and the path with symlinks resolved are checked (a link in the job dir pointing into .git).
-func CheckFileWrite(tool, path, dir string) string {
+// would write inside a git dir: any `.git` directory, the job's own git dirs (cfg.GitDirs), git
+// config/hooks paths. A path with a `..` segment is rejected outright; otherwise both the path as
+// given and the path with symlinks resolved are checked (a link in the job dir pointing into .git).
+func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
 	}
+	if hasDotDot(path) {
+		return "blocked by guard: " + tool + " path `" + path + "` contains `..`; write the path without `..` " +
+			"(through a symlink `..` is resolved by the kernel, not as written)."
+	}
 	given := filepath.Clean(path)
 	if !filepath.IsAbs(given) {
-		given = filepath.Join(dir, given)
+		given = filepath.Join(cfg.Dir, given)
 	}
-	for _, p := range []string{given, resolvePath(path, dir)} {
-		if inGitDir(p) || gitFile(p) {
+	for _, p := range []string{given, resolvePath(path, cfg.Dir)} {
+		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
 				"(git would run programs from its config and hooks)."
 		}

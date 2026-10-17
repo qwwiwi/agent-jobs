@@ -321,6 +321,55 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 	}
 }
 
+// Codex review of PR #3: the guard of a repo job knows the worktree's real git dirs (admin dir and
+// common dir), so a file tool cannot write there whatever they are called.
+func TestGuardKnowsJobGitDirs(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	admin := gitT(t, work, "rev-parse", "--absolute-git-dir")
+	common := gitT(t, work, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s struct {
+		Hooks struct {
+			PreToolUse []struct {
+				Hooks []struct{ Command string } `json:"hooks"`
+			} `json:"PreToolUse"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil || len(s.Hooks.PreToolUse) == 0 || len(s.Hooks.PreToolUse[0].Hooks) == 0 {
+		t.Fatalf("settings.json: %v %s", err, b)
+	}
+	cmd := s.Hooks.PreToolUse[0].Hooks[0].Command
+	for _, d := range []string{admin, common} {
+		if !strings.Contains(cmd, "--git-dir "+shellQuote(d)) {
+			t.Fatalf("guard command lacks --git-dir %s: %s", d, cmd)
+		}
+	}
+	run := func(path string) int {
+		in, _ := json.Marshal(map[string]any{"tool_name": "Write", "cwd": work, "tool_input": map[string]string{"file_path": path}})
+		c := exec.Command("sh", "-c", cmd)
+		c.Stdin = bytes.NewReader(in)
+		var ee *exec.ExitError
+		if err := c.Run(); errors.As(err, &ee) {
+			return ee.ExitCode()
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	}
+	if code := run(filepath.Join(admin, "config.worktree")); code != 2 {
+		t.Fatalf("Write into the admin dir: exit %d, want 2", code)
+	}
+	if code := run(filepath.Join(work, "main.go")); code != 0 {
+		t.Fatalf("Write into the work tree: exit %d, want 0", code)
+	}
+}
+
 func TestExitZeroWithoutReportFails(t *testing.T) {
 	m := newManager(t)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_NOREPORT", nil).ID)

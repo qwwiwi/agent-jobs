@@ -698,9 +698,21 @@ func TestFileToolsGuarded(t *testing.T) {
 	if err := os.Symlink(filepath.Join(repo, ".git", "config"), filepath.Join(work, "cfg")); err != nil {
 		t.Fatal(err)
 	}
+	// hl -> .git/hooks: `hl/../config` is opened by the kernel as .git/config, though Clean says work/config.
+	if err := os.Symlink(filepath.Join(repo, ".git", "hooks"), filepath.Join(work, "hl")); err != nil {
+		t.Fatal(err)
+	}
+	// A real git dir not named .git (a separate git dir / worktree admin dir), told to the guard.
+	sep := filepath.Join(t.TempDir(), "store")
+	if err := os.MkdirAll(filepath.Join(sep, "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sep, filepath.Join(work, "s")); err != nil {
+		t.Fatal(err)
+	}
 	decide := func(tool, key, path string) string {
 		in, _ := json.Marshal(map[string]any{"tool_name": tool, "cwd": work, "tool_input": map[string]string{key: path}})
-		r, err := Decide(strings.NewReader(string(in)), Config{})
+		r, err := Decide(strings.NewReader(string(in)), Config{GitDirs: []string{sep}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -715,7 +727,15 @@ func TestFileToolsGuarded(t *testing.T) {
 		{"MultiEdit", "file_path", filepath.Join(repo, ".git", "info", "attributes"), true},
 		{"NotebookEdit", "notebook_path", filepath.Join(repo, ".git", "x.ipynb"), true},
 		{"Write", "file_path", filepath.Join(repo, ".GIT", "config"), true},
-		{"Write", "file_path", filepath.Join(repo, "sub", "..", ".git", "config"), true},
+		{"Write", "file_path", repo + "/sub/../.git/config", true}, // literal: Join would drop sub/..
+		{"Write", "file_path", work + "/hl/../config", true},       // symlink then .. = .git/config
+		{"Write", "file_path", "hl/../config", true},               // same, relative
+		{"Write", "file_path", "notes/../x.md", true},              // any .. is rejected
+		{"Write", "file_path", filepath.Join(sep, "config"), true}, // job git dir not named .git
+		{"Edit", "file_path", filepath.Join(sep, "hooks", "pre-commit"), true},
+		{"Write", "file_path", filepath.Join(work, "s", "config"), true}, // symlink into that git dir
+		{"Write", "file_path", sep, true},
+		{"Write", "file_path", filepath.Join(filepath.Dir(sep), "other"), false}, // next to it is fine
 		{"Write", "file_path", ".git/config", true},
 		{"Write", "file_path", filepath.Join(repo, ".git"), true},
 		{"Write", "file_path", "g/hooks/pre-commit", true},                         // symlinked dir into .git
