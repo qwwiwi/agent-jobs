@@ -65,6 +65,11 @@ type Config struct {
 	LogArchiveDir string `json:"log_archive_dir"`
 	// LogArchiveDays is how long archived months are kept (prune deletes older ones). Nil = 365, 0 = forever.
 	LogArchiveDays *int `json:"log_archive_days"`
+	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
+	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
+	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
+	// the rule off (claude's own exit or the timeout ends the job).
+	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
 }
 
 // DefaultLogArchiveDays is the archive retention when log_archive_days is not set.
@@ -76,6 +81,20 @@ func (c Config) ArchiveDays() int {
 		return DefaultLogArchiveDays
 	}
 	return *c.LogArchiveDays
+}
+
+// IdleAfterResultOff is the idle_after_result_seconds value that turns the rule off.
+const IdleAfterResultOff = -1
+
+// IdleAfterResult returns the idle-after-result grace; 0 means the rule is off.
+func (c Config) IdleAfterResult() time.Duration {
+	if c.IdleAfterResultSeconds == IdleAfterResultOff {
+		return 0
+	}
+	if c.IdleAfterResultSeconds > 0 {
+		return time.Duration(c.IdleAfterResultSeconds) * time.Second
+	}
+	return DefaultIdleAfterResult
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -134,6 +153,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
+	}
+	if c.IdleAfterResultSeconds < IdleAfterResultOff {
+		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
 	}
 	for _, r := range c.TrashRoots {
 		if !filepath.IsAbs(r) {
