@@ -23,7 +23,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - The caller must give a model or a complexity: no classifier, no guessing.
 - tmux socket support for the job-done line.
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
-- Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`.
+- Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
 ## Wave A
 
