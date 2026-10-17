@@ -33,9 +33,13 @@ func protectedSetup(t *testing.T) (state, logf, db string, cfg Config) {
 	return state, logf, db, cfg
 }
 
-// N1-N4: every form the control review found ALLOWED is refused.
+// N1-N4, A-C: every form the control review found ALLOWED is refused.
 func TestProtectedProbeAllowedRowsRefused(t *testing.T) {
 	state, logf, db, cfg := protectedSetup(t)
+	home := filepath.Dir(filepath.Dir(state))
+	if err := os.Symlink(filepath.Join(state, "subagents"), filepath.Join(cfg.Dir, "S")); err != nil {
+		t.Fatal(err)
+	}
 	tl := "~/.agent-jobs/thrall/subagents/j.log"
 	tdb := "~/.agent-jobs/thrall/jobs.db"
 	for _, c := range []string{
@@ -84,6 +88,33 @@ func TestProtectedProbeAllowedRowsRefused(t *testing.T) {
 		"cp evil " + state,
 		"cp evil " + state + "/",
 		"cd $X && rm -r .agent-jobs",
+		// A: relative protected paths inside option values and inline code (cwd = <state>/jobs/j/work)
+		"dd if=/dev/null of=../../../jobs.db",
+		"python3 -c \"open('../../../jobs.db','w')\"",
+		"perl -e 'unlink q(../../../jobs.db)'",
+		"sqlite3 'file:../../../jobs.db' 'UPDATE jobs SET subagents=0'",
+		"sqlite3 'file:../../../jobs.db?mode=rw' .dump",
+		"python3 -c \"open('../../../subagents/j.log','w')\"",
+		"cd .. && dd if=/dev/null of=../../jobs.db",
+		// B: non-normalized spellings of an absolute protected path
+		"rm " + home + "/.agent-jobs//thrall/jobs.db",
+		"dd if=/dev/null of=" + home + "/.agent-jobs//thrall/jobs.db",
+		"dd if=/dev/null of=" + home + "/.agent-jobs/./thrall/jobs.db",
+		"dd if=/dev/null of=" + home + "/x/../.agent-jobs/thrall/jobs.db",
+		"python3 -c \"open('" + home + "/.agent-jobs//thrall/jobs.db','w')\"",
+		"python3 -c \"open('" + state + "/./subagents/j.log','w')\"",
+		"perl -e 'unlink q(" + home + "/x/../.agent-jobs/thrall/jobs.db)'",
+		"node -e \"require('fs').writeFileSync('~/.agent-jobs//thrall/jobs.db','')\"",
+		"sqlite3 'file:" + state + "//jobs.db' .dump",
+		"python3 -c \"open('" + state + "/jobs/../jobs.db','w')\"",
+		// physical `..`: S -> <state>/subagents, so S/../jobs.db is <state>/jobs.db for the kernel
+		"rm S/../jobs.db",
+		"dd if=/dev/null of=S/../jobs.db",
+		"python3 -c \"open('S/../jobs.db','w')\"",
+		// C: destination ancestors that do reach state
+		"cp -r thrall ~/.agent-jobs",
+		"cp -rT evil ~/.agent-jobs",
+		"ln -s x " + state,
 	} {
 		if Check(c, cfg) == "" {
 			t.Errorf("%q allowed", c)
@@ -116,6 +147,13 @@ func TestProtectedProbeBlockedAndReaders(t *testing.T) {
 		"cd $X && git status", "find build -name x.o -delete", "cp a b", "mv a b && ls",
 		"git commit -m 'fix jobs dir'", "ls " + state, "cd ~ && ls", "cd ~/project && rm -r out",
 		"printf 'a\\n' | xargs rm", "cat list | xargs rm",
+		// C: home (an ancestor of state) as a destination writes only home/<name>
+		"cp out.txt ~", "cp out.txt ~/", "cp -r dist ~/", "install -m 644 out.txt ~", "ln -s x ~/",
+		"cp -t ~ out.txt", "cp ~/.agent-jobs/thrall/jobs/j/report.md out.md",
+		"cat ~/.agent-jobs/thrall/jobs/j/report.md", "rm -rf build tmp", "tar -xf a.tar -C build",
+		"rsync -a src/ build/", "make test", "npm test", "go vet ./...", "git add -A && git status",
+		"python3 -c \"print('ok')\"", "dd if=a of=b", "python3 -c \"open('../out.txt','w')\"",
+		"sqlite3 'file:test.db' .dump", "cd sub && dd if=a of=../b",
 	} {
 		if r := Check(c, cfg); r != "" {
 			t.Errorf("%q refused: %s", c, r)
@@ -148,5 +186,24 @@ func TestExpandAllHomes(t *testing.T) {
 	}
 	if !strings.HasPrefix(s.expandAllHomes("~/x"), "/h/") {
 		t.Fatal("leading ~/ not expanded")
+	}
+}
+
+// C: an ancestor of state given where it is reached is refused with a message that says so.
+func TestProtectedAncestorMessage(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{"rm -r " + state, "rm -rf ~/.agent-jobs", "cp -r ~ /tmp/x"} {
+		if r := Check(c, cfg); !strings.Contains(r, "an ancestor of agent-jobs state") {
+			t.Errorf("%q: %q", c, r)
+		}
+	}
+}
+
+// A `key=value` word is checked by its value, also by the git-file check.
+func TestKeyValueGitFile(t *testing.T) {
+	for _, c := range []string{"dd if=/dev/null of=.git/config", "dd if=x of=.git/hooks/pre-commit"} {
+		if Check(c, Config{Dir: t.TempDir()}) == "" {
+			t.Errorf("%q allowed", c)
+		}
 	}
 }

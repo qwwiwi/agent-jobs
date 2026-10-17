@@ -161,16 +161,26 @@ func (s *pathScope) expandAllHomes(w string) string {
 // hit returns the protected path a path word reaches: the word itself is protected or inside a
 // protected path, or, with tree set (rm -r, mv, chmod -R, find -delete, …), a protected path lies
 // inside the word's directory. A word the guard cannot resolve (`~user/…`, a relative word after an
-// unresolved cd) is a hit when its segments could lead to a protected path from some directory.
+// unresolved cd) is a hit when its segments could lead to a protected path from some directory. A
+// `key=value` word is checked as written and by its value.
 func (s *pathScope) hit(w string, tree bool) (string, bool) {
-	p := pathOf(w)
-	if p == "." && !tree {
+	if q, ok := s.hitPath(w, tree); ok {
+		return q, true
+	}
+	if v := wordValue(w); v != w {
+		return s.hitPath(v, tree)
+	}
+	return "", false
+}
+
+func (s *pathScope) hitPath(w string, tree bool) (string, bool) {
+	if filepath.Clean(w) == "." && !tree {
 		return "", false
 	}
-	exp, ok := s.expandHome(p)
+	exp, ok := s.expandHome(w)
 	if !ok {
 		rest := ""
-		if _, r, found := strings.Cut(p, "/"); found {
+		if _, r, found := strings.Cut(filepath.Clean(w), "/"); found {
 			rest = r
 		}
 		if s.couldReach(rest, tree) {
@@ -178,23 +188,54 @@ func (s *pathScope) hit(w string, tree bool) (string, bool) {
 		}
 		return "", false
 	}
-	if filepath.IsAbs(exp) {
-		return s.match(exp, tree)
+	if q, ok := s.match(s.candidates(exp), tree); ok {
+		return q, true
 	}
-	for _, d := range s.dirs {
-		if q, ok := s.match(filepath.Join(d, exp), tree); ok {
-			return q, true
-		}
-	}
-	if s.dynamic != "" && s.couldReach(exp, tree) {
+	if !filepath.IsAbs(exp) && s.dynamic != "" && s.couldReach(exp, tree) {
 		return w + " (after cd " + s.dynamic + ")", true
 	}
 	return "", false
 }
 
-// match checks an absolute path, as written (cleaned) and with symlinks resolved.
-func (s *pathScope) match(abs string, tree bool) (string, bool) {
-	for _, p := range []string{filepath.Clean(abs), resolvePath(abs, "/")} {
+// candidates returns the absolute paths a home-expanded path may name: against every known directory
+// when relative; cleaned, with symlinks resolved, and, with a `..`, walked the way the kernel does.
+func (s *pathScope) candidates(exp string) []string {
+	bases := []string{exp}
+	if !filepath.IsAbs(exp) {
+		bases = bases[:0]
+		for _, d := range s.dirs {
+			bases = append(bases, d+"/"+exp)
+		}
+	}
+	var out []string
+	for _, b := range bases {
+		out = append(out, filepath.Clean(b), resolvePath(b, "/"))
+		if hasDotDot(b) {
+			out = append(out, resolvePath(physical(b), "/"))
+		}
+	}
+	return out
+}
+
+// physical walks an absolute path like the kernel: `..` leaves the directory its prefix resolves to
+// (symlinks followed), while filepath.Clean drops `link/..` lexically.
+func physical(abs string) string {
+	cur := "/"
+	for _, seg := range strings.Split(filepath.ToSlash(abs), "/") {
+		switch seg {
+		case "", ".":
+		case "..":
+			cur = filepath.Dir(resolvePath(cur, "/"))
+		default:
+			cur = filepath.Join(cur, seg)
+		}
+	}
+	return cur
+}
+
+// match checks absolute candidate paths against the protected paths.
+func (s *pathScope) match(cands []string, tree bool) (string, bool) {
+	for _, p := range cands {
 		if inJobGitDir(p, s.protected) {
 			return p, true
 		}
@@ -212,24 +253,14 @@ func (s *pathScope) match(abs string, tree bool) (string, bool) {
 // parentHit reports a word that resolves to the directory holding a protected path: a destination
 // directory (`cp f <dir>`, `unzip -d <dir>`) writes join(dir, name), which is protected for that name.
 func (s *pathScope) parentHit(w string) (string, bool) {
-	exp, ok := s.expandHome(pathOf(w))
+	exp, ok := s.expandHome(wordValue(w))
 	if !ok {
 		return "", false
 	}
-	var cands []string
-	if filepath.IsAbs(exp) {
-		cands = []string{exp}
-	} else {
-		for _, d := range s.dirs {
-			cands = append(cands, filepath.Join(d, exp))
-		}
-	}
-	for _, c := range cands {
-		for _, p := range []string{filepath.Clean(c), resolvePath(c, "/")} {
-			for _, q := range s.protected {
-				if filepath.Join(p, filepath.Base(q)) == q {
-					return q, true
-				}
+	for _, p := range s.candidates(exp) {
+		for _, q := range s.protected {
+			if filepath.Join(p, filepath.Base(q)) == q {
+				return q, true
 			}
 		}
 	}
@@ -260,22 +291,48 @@ func (s *pathScope) couldReach(rel string, tree bool) bool {
 	return false
 }
 
-// contains returns the protected path that a word of a non-reader mentions anywhere in its text, as
-// an absolute path (homes expanded) or relative to a directory a literal cd led to: an option value
-// (`dd of=…`, `--file=…`) or inline code (`python3 -c`, `perl -e`, `node -e`).
+// contains returns the protected path that a word of a non-reader names inside its text: an option
+// value (`dd of=…`, `--file=…`, `file:…`) or inline code (`python3 -c`, `perl -e`, `node -e`). It
+// matches the protected path as a substring, absolute (homes expanded) or relative to any known
+// directory (`../../../jobs.db`), and resolves every path-like token of the word like an argument
+// (`//`, `/./`, `..` normalized); a token spelled with `//`, `/./` or `..` is also refused when it
+// is an ancestor of a protected path.
 func (s *pathScope) contains(w string) (string, bool) {
 	w = s.expandAllHomes(w)
 	for _, q := range s.protected {
 		if strings.Contains(w, q) {
 			return q, true
 		}
-		for _, d := range s.dirs[1:] { // the call's own dir is checked by hit on each word
-			if rel, err := filepath.Rel(d, q); err == nil && d != q && within(q, d) && strings.Contains(w, rel) {
+		for _, d := range s.dirs {
+			if rel, err := filepath.Rel(d, q); err == nil && !onlyDotDot(rel) && strings.Contains(w, rel) {
 				return q, true
 			}
 		}
 	}
+	for _, t := range pathTokens(w) {
+		odd := strings.Contains(t, "//") || strings.Contains(t, "/./") || strings.HasPrefix(t, "./") || hasDotDot(t)
+		if q, ok := s.hitPath(t, odd); ok {
+			return q, true
+		}
+	}
 	return "", false
+}
+
+// onlyDotDot reports a relative path made of `.` and `..` segments only: from a directory inside a
+// protected path (itself refused as a cd target) such a path would match any text.
+func onlyDotDot(rel string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg != ".." && seg != "." {
+			return false
+		}
+	}
+	return true
+}
+
+// pathTokens splits a word into the pieces a program may open as paths: on white space, quotes,
+// brackets and `=`, `:`, `,`, `;`, `<`, `>`, `|`, `&`, `?` (`of=…`, `file:…?mode=rw`, `open('…')`).
+func pathTokens(w string) []string {
+	return strings.FieldsFunc(w, func(r rune) bool { return strings.ContainsRune(" \t\r\n'\"`=:,;()[]{}<>|&?", r) })
 }
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
@@ -291,4 +348,128 @@ func findActs(args []string) bool {
 	return slices.ContainsFunc(args, func(a string) bool {
 		return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 	})
+}
+
+// destCopiers take sources and a destination: the ancestor rule applies to the sources only.
+var destCopiers = map[string]bool{"cp": true, "install": true, "ln": true}
+
+// copyArgs is the split of cp/install/ln arguments into sources and destinations.
+type copyArgs struct {
+	dests   []string     // destination paths: the -t directory, else the last operand (`.` for `ln src`)
+	destIdx map[int]bool // indexes of the arguments that hold a destination
+	srcs    []string     // source operands
+	whole   bool         // -T: the destination itself is replaced, so it is checked as an ancestor too
+}
+
+// copyLongVals are the long options of cp/install/ln whose value may be the next word.
+var copyLongVals = map[string]bool{
+	"--suffix": true, "--mode": true, "--owner": true, "--group": true, "--no-preserve": true,
+	"--sparse": true, "--strip-program": true,
+}
+
+// parseCopyArgs splits cp/install/ln arguments like getopt: short clusters, `-t DIR`, `-tDIR`,
+// `--target-directory[=]DIR` (and its abbreviations), `--`; with `install -d` every operand is a
+// directory to create, so a destination.
+func parseCopyArgs(name string, args []string) copyArgs {
+	valOpts := "tS"
+	if name == "install" {
+		valOpts = "tSmog"
+	}
+	ca := copyArgs{destIdx: map[int]bool{}}
+	var ops []int
+	tdir, dirs := -1, false
+	tval := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			for j := i + 1; j < len(args); j++ {
+				ops = append(ops, j)
+			}
+			i = len(args)
+		case strings.HasPrefix(a, "--"):
+			key, v, hasV := strings.Cut(a, "=")
+			switch {
+			case len(key) > 2 && strings.HasPrefix("--target-directory", key):
+				if hasV {
+					tdir, tval = i, v
+				} else if i+1 < len(args) {
+					i++
+					tdir, tval = i, args[i]
+				}
+			case len(key) > 4 && strings.HasPrefix("--no-target-directory", key):
+				ca.whole = true
+			case name == "install" && len(key) > 2 && strings.HasPrefix("--directory", key):
+				dirs = true
+			case !hasV && copyLongVals[key]:
+				i++
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			for k := 1; k < len(a); k++ {
+				c := a[k]
+				if c == 'T' {
+					ca.whole = true
+				}
+				if c == 'd' && name == "install" {
+					dirs = true
+				}
+				if strings.IndexByte(valOpts, c) >= 0 {
+					v, idx := a[k+1:], i
+					if v == "" && i+1 < len(args) {
+						i++
+						v, idx = args[i], i
+					}
+					if c == 't' {
+						tdir, tval = idx, v
+					}
+					break
+				}
+			}
+		default:
+			ops = append(ops, i)
+		}
+	}
+	operands := func(ix []int) (out []string) {
+		for _, j := range ix {
+			out = append(out, args[j])
+		}
+		return out
+	}
+	switch {
+	case dirs:
+		ca.dests = operands(ops)
+		for _, j := range ops {
+			ca.destIdx[j] = true
+		}
+	case tdir >= 0:
+		ca.dests, ca.destIdx[tdir], ca.srcs = []string{tval}, true, operands(ops)
+	case len(ops) >= 2:
+		last := ops[len(ops)-1]
+		ca.dests, ca.destIdx[last], ca.srcs = []string{args[last]}, true, operands(ops[:len(ops)-1])
+	case name == "ln" && len(ops) == 1:
+		ca.dests, ca.srcs = []string{"."}, operands(ops)
+	default:
+		ca.srcs = operands(ops)
+	}
+	return ca
+}
+
+// checkDest refuses a cp/install/ln destination that is or holds a protected path, whose
+// <dest>/<source name> reaches one (`cp -r thrall ~/.agent-jobs`), or, with -T, that is an ancestor.
+func (s *pathScope) checkDest(d string, ca copyArgs) string {
+	if p, ok := s.hitPath(d, false); ok {
+		return protectedBlocked(p)
+	}
+	if p, ok := s.parentHit(d); ok {
+		return protectedBlocked(p)
+	}
+	if p, ok := s.hitPath(d, true); ok && ca.whole {
+		return ancestorBlocked(d, p)
+	}
+	for _, src := range ca.srcs {
+		if p, ok := s.hitPath(d+"/"+filepath.Base(filepath.Clean(src)), true); ok {
+			return protectedBlocked(p)
+		}
+	}
+	return ""
 }
