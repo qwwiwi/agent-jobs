@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased] – Wave A part 1: Linux port
+
+### Added
+- Linux support: systemd user unit template `deploy/systemd/agent-jobs@.service` (instance = agent, `KillMode=process`, `Restart=on-failure`, env file `$XDG_CONFIG_HOME/agent-jobs/<agent>.env`) and `scripts/install-linux.sh` (idempotent build/install/enable/restart, `--uninstall`, no sudo, current user only).
+- Tests for the unit template and the install script (fake systemctl, sandboxed HOME): idempotent re-install, restart only on change, env file never overwritten, uninstall keeps shared files while another instance is enabled.
+- `docs/DECISIONS.md`: owner decisions 2026-10-17 (wave A/B order, deferred items, MCP control, subagents ≤ 3 per job, Thrall-only install).
+
+### Docs
+- README: Linux section; DEVIATIONS #11 (systemd user service on Linux).
+
+### Fixed (fix-loop 1, Fable review of PR #2)
+- `--uninstall` keeps the binary while job wrappers started from it run (it is their guard hook; exit 1 with «N jobs still running»).
+- «Other instances» also counts active-but-not-enabled `agent-jobs@` units (`list-units`); no systemctl call touches them.
+- Env file parsed (`KEY=VALUE` only), never sourced; `umask 077` scoped to the env-file write; installer lock (`flock -n`); unit written via tmp + rename; warning on a non-default `XDG_CONFIG_HOME`.
+- Tests: `systemd-analyze --user verify` of the template when available; running-wrapper, active-instance and env-file cases.
+
 ## [Unreleased] – fix-loop 2 (Codex + Fable review, conformance walk)
 
 ### Fixed
