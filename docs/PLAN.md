@@ -25,6 +25,12 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
 - Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
+**[PR #PRNUM](https://github.com/qwwiwi/agent-jobs/pull/PRNUM): `agent-jobs` skill, subagents in jobs, job context** (moved out of Wave A).
+
+- **`agent-jobs` skill.** `skills/agent-jobs/SKILL.md`, installed per agent by `scripts/install-linux.sh` (`--skills-dir`, default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`; idempotent; removed on uninstall only while unchanged). Teaches the MCP tools, the mandatory model-or-complexity, the routing rule (yourself: minutes; subagent: the session needs the result now; job: long, background, overnight, must survive a restart) and how to read a result («Not done / uncertain» first, check the diff before anything leaves the machine).
+- **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs. The brief says so; the subagent tool is not denied; the guard counts Agent/Task calls per job (`<state>/subagents/<id>.log`, locked), refuses the fourth; only the input keys `description`, `prompt`, `subagent_type`, `model` pass (exact, case-sensitive; no `isolation`, `run_in_background`, team).
+- **Job context.** The job profile is the reference's ≤ 8 KB owner-rules file, generated with `agent-jobs profile --from <file>...` from the sections of the agent's own rules marked `<!-- agent-jobs:profile -->`; larger than 8 KB is refused. Project cards (`<state>/cards/<name>.md`, ≤ 4 KB, `agent-jobs card new|list`) are matched by repository path or remote and attached to the brief; a broken card refuses the start. Example: `cards/example-agent-jobs.md`.
+
 ## Wave A
 
 - **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
@@ -33,15 +39,12 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
   3. On wrapper exit, cancel or timeout the whole scope is stopped (`systemctl --user stop` / kill the unit) before `exit_code` is written, so no descendant survives.
   4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): today's sid sweep plus the marker, ancestry, session and store checks. That path is documented as weaker.
   5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
-- **`agent-jobs` skill.** A SKILL.md, installed per agent, that teaches the MCP tools and the routing rule: do it yourself (minutes), a subagent (the session needs the result now), or a job (long, background, overnight, must survive a restart).
-- **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs.
 - **`prune`.** Clean folders of jobs finished more than 48 hours ago; keep the records (report, patches, `base_commit`) and small top-level text files, drop binaries, caches and builds.
 - **`doctor procs`.** Find processes that outlived their job or session: preview servers, browsers, wait loops, running rows with a dead pid. Reports by default, kills only on a flag.
 - **System tools:** `system_doctor` (disk, processes, hooks), `system_logs`, `activity_report`.
 - **Files:** `trash_move`, `trash_restore`: reversible deletion instead of `rm`.
 - **Memory, tasks and team tools via the shared brain.** `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
 - **Memory notes in the brief.** The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
-- **Job context.** A general job profile (≤ 8 KB) generated from the agent's own rules, plus short per-project cards (stack, check runner, what not to touch, known traps).
 
 ## Wave B
 

@@ -14,9 +14,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `tmux_socket` config: notify on a named tmux socket (`tmux -L`).
 - Nested-job prevention: job marker `AGENT_JOBS_JOB`; the binary refuses control commands under the marker, under a wrapper ancestor, in a wrapper's session or in a running job's session; guard rules against `agent-jobs` as a command and against changing `AGENT_JOBS_*` (incl. `mapfile`/`readarray`, `printf -v`).
 - Session sweep: after claude exits the wrapper ends every other process of the job's session before writing `exit_code`. Signals go through a pidfd opened before the membership check, so a reused pid is never signalled; without pidfd support nothing is signalled. If processes survive or the sweep fails, the wrapper writes a `sweep_incomplete` marker and the daemon fails the job with «processes survived the job», which the job-done line repeats.
+- `agent-jobs` skill (`skills/agent-jobs/SKILL.md`): the MCP job tools, the mandatory model-or-complexity, the routing rule (do it yourself, a subagent, or a job), the subagent cap and how to read a result. `scripts/install-linux.sh` installs it per agent (`--skills-dir DIR`, default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`; `--no-skill`), idempotently, and removes it on uninstall only while it is unchanged.
+- Jobs may use subagents: at most three per job, inside the job's own limits. The brief carries a «Subagents» section; the guard hook counts Agent/Task calls in `<state>/subagents/<id>.log` and refuses the fourth (DEVIATIONS #12).
+- Job profile: `agent-jobs profile --agent A --from FILE... [--force] [--dry-run]` generates the owner-rules file from the sections of the agent's own rules marked `<!-- agent-jobs:profile -->` … `<!-- /agent-jobs:profile -->`; over 8 KB is refused and nothing is written.
+- Project cards: `<state>/cards/<name>.md` (config `cards_dir`), front matter `repo:` / `remote:`, ≤ 4 KB each; cards matching a job's repository are attached to its brief (≤ 8 KB together). `agent-jobs card new --repo PATH [--name N]` writes one from the template, `agent-jobs card list [--repo PATH]` shows them. Example card: `cards/example-agent-jobs.md`.
+- The orchestrator MCP instructions and `prompts/orchestrator.md` state the routing rule and the subagent cap.
 
 ### Changed
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
+- A job with a repository refuses to start («refused to start: project card …») when a card in the cards directory is unreadable, unparsable or over 4 KB, or when its matching cards exceed 8 KB, like unreadable owner rules.
+
+### Security
+- Guard: a job's subagent must stay inside the job. Its input may carry only the string keys `description`, `prompt`, `subagent_type` and `model`, matched exactly and case-sensitively by a token walk (encoding/json would match `Isolation` to `isolation` and let a later duplicate win); duplicate keys and every other key (`isolation`, `run_in_background`, `team_name`, …) are refused. Without a subagent log every subagent is refused. The hook input must be a single JSON object.
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 

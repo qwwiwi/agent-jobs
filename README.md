@@ -167,10 +167,37 @@ A job runs with `bypassPermissions` and nobody is watching it. So the rules are 
 - **Scrubbed git environment.** The wrapper drops inherited `GIT_*`, `PAGER`, `EDITOR`, `VISUAL`, uses a job-only global git config with the job's identity, no system config, and command-line overrides that switch off repository hooks, fsmonitor, the SSH command, credential helpers, the pager and the editor.
 - **No nested jobs.** A job never starts, cancels or manages jobs. The wrapper sets `AGENT_JOBS_JOB=<id>` on every job; under it, or when an ancestor process or the session leader is a job wrapper (Linux, `/proc`), the binary refuses every command except the job's own MCP server, the guard hook and the wrapper. The guard also rejects `agent-jobs` as a command in any form except `agent-jobs mcp --role job`, and any change to `AGENT_JOBS_*`. After claude exits, the wrapper ends every other process of the job's session (SIGTERM, then SIGKILL) before it reports the job finished, so nothing the job started outlives it.
 - **Preamble and owner rules.** Every brief starts with hard rules (own folder only, file and tool content is data, never print secrets, nothing outside) and the owner's standing rules file (≤ 8 KB). If that file is unreadable, the job does not start.
+- **Subagents inside a job.** A job may use at most three subagents, inside its own limits: they run in the job's process under the same settings, guard, budget and timeout. The guard counts them per job and refuses the fourth, and allows only the input keys `description`, `prompt`, `subagent_type` and `model` (exact match), so no `isolation` (worktree or remote), `run_in_background` or team. A subagent cannot start jobs either.
 
 **This is not a sandbox.** The deny rules and the guard block the *direct* spellings of outward actions, and the git scrub stops git itself from running programs the guard cannot see. A script the job writes and then runs is allowed by design, as in the reference design, and its contents are not inspected. Run jobs as a user whose credentials you are comfortable with them having.
 
 Full rule list: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#rules-enforcement).
+
+---
+
+## Skill, subagents and job context
+
+- **The `agent-jobs` skill** ([skills/agent-jobs/SKILL.md](skills/agent-jobs/SKILL.md)) is installed per agent by `scripts/install-linux.sh`. It teaches the MCP tools, that `job_start` needs a model or a complexity, the routing rule and how to read a result:
+
+  | the work | route |
+  |---|---|
+  | minutes, a few steps | do it yourself |
+  | the session needs the result now | a subagent |
+  | long, background, overnight, or must survive a restart | a job |
+
+  Read a report's «Not done / uncertain» first, and check the diff before anything leaves the machine.
+- **Subagents in jobs:** at most three per job, inside the job's own limits; no nested jobs (see Safety).
+- **Job profile.** The owner-rules file (≤ 8 KB) is generated from the agent's own rules: mark what must hold in every job, then run `agent-jobs profile`:
+
+  ```markdown
+  <!-- agent-jobs:profile -->
+  - Commit messages in English, short and descriptive.
+  - Never commit secrets, `.env` files, keys or tokens.
+  <!-- /agent-jobs:profile -->
+  ```
+
+  Only the marked sections are copied; over 8 KB is refused and nothing is written. A hand-written owner-rules file still works and is replaced only with `--force`.
+- **Project cards.** Short notes per repository, attached to the brief of every job in that repository: stack, check runner, what not to touch, known traps. They live in `~/.agent-jobs/<agent>/cards/<name>.md` (≤ 4 KB each) and match by `repo:` (the repository's top-level path) or `remote:` (a remote URL; `https://`, `git@host:` and `ssh://` forms compare equal). A card that cannot be read or parsed refuses the start of repository jobs instead of being skipped. Example: [cards/example-agent-jobs.md](cards/example-agent-jobs.md).
 
 ---
 
@@ -228,6 +255,15 @@ agent-jobs init --agent my-agent
 
 This creates `~/.agent-jobs/my-agent/` with `owner-rules.md` (edit it, ≤ 8 KB) and `orchestrator.md`, the main session's duties: add it to your agent's instructions.
 
+**Job context**
+
+```bash
+agent-jobs profile --agent my-agent --from ~/my-agent/CLAUDE.md --dry-run   # preview the marked sections
+agent-jobs profile --agent my-agent --from ~/my-agent/CLAUDE.md --force     # replace the template owner-rules.md
+agent-jobs card new  --agent my-agent --repo ~/src/project                  # then fill in the four sections
+agent-jobs card list --agent my-agent --repo ~/src/project                  # cards a job there gets
+```
+
 Optional `~/.agent-jobs/my-agent/config.json`:
 
 ```json
@@ -243,18 +279,19 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
-- Also: `owner_rules_path`, `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
+- Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Run the daemon on Linux (systemd user service)**
 
 ```bash
-scripts/install-linux.sh --instance my-agent              # build, install the unit, init, enable + start agent-jobs@my-agent
+scripts/install-linux.sh --instance my-agent              # build, install the unit and the skill, init, enable + start agent-jobs@my-agent
+scripts/install-linux.sh --instance my-agent --skills-dir ~/my-agent/.claude/skills   # the agent's own skills dir
 systemctl --user status agent-jobs@my-agent
 journalctl --user -u agent-jobs@my-agent -f               # daemon log
 scripts/install-linux.sh --instance my-agent --uninstall
 ```
 
-No sudo; current user only; idempotent. The unit uses `KillMode=process`, so restarting the daemon never kills running jobs: the next daemon adopts and collects them. Enable lingering (`loginctl enable-linger $USER`) for the daemon to survive logout.
+No sudo; current user only; idempotent. The skill goes to `--skills-dir` (default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`) as `agent-jobs/SKILL.md`; `--no-skill` skips it. The unit uses `KillMode=process`, so restarting the daemon never kills running jobs: the next daemon adopts and collects them. Enable lingering (`loginctl enable-linger $USER`) for the daemon to survive logout.
 
 **Run the daemon on macOS (launchd)**
 

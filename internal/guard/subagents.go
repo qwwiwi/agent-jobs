@@ -2,8 +2,11 @@ package guard
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"syscall"
@@ -20,45 +23,71 @@ var subagentTools = map[string]bool{"Agent": true, "Task": true}
 // IsSubagentTool reports whether a tool call starts a subagent.
 func IsSubagentTool(name string) bool { return subagentTools[name] }
 
-// subagentInput is the part of an Agent/Task call the guard checks.
-type subagentInput struct {
-	Description     string          `json:"description"`
-	SubagentType    string          `json:"subagent_type"`
-	Isolation       json.RawMessage `json:"isolation"`
-	RunInBackground json.RawMessage `json:"run_in_background"`
-	TeamName        json.RawMessage `json:"team_name"`
-}
+// subagentKeys are the only Agent/Task input keys a job may send, all of them strings. Every other
+// key is refused, among them isolation (worktree, remote), run_in_background and team_name, which
+// would take the subagent out of the job.
+var subagentKeys = map[string]bool{"description": true, "prompt": true, "subagent_type": true, "model": true}
 
-// present reports a JSON field that is set to something other than null, false or "".
-func present(v json.RawMessage) bool {
-	s := strings.TrimSpace(string(v))
-	return s != "" && s != "null" && s != "false" && s != `""`
+// parseSubagentInput reads the tool input with an exact, case-sensitive key match, as Claude Code
+// does: a token walk, because encoding/json matches keys case-insensitively and lets the last
+// duplicate win, so {"isolation":"worktree","Isolation":""} would look harmless to a struct decode.
+// It refuses a key outside subagentKeys, a duplicate key and a non-string value.
+func parseSubagentInput(raw json.RawMessage) (map[string]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, errors.New("tool input is not a JSON object")
+	}
+	out := map[string]string{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		k, ok := kt.(string)
+		if !ok {
+			return nil, errors.New("tool input key is not a string")
+		}
+		if !subagentKeys[k] {
+			return nil, fmt.Errorf("key %q is not allowed (only description, prompt, subagent_type, model)", k)
+		}
+		if _, dup := out[k]; dup {
+			return nil, fmt.Errorf("duplicate key %q", k)
+		}
+		vt, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		v, ok := vt.(string)
+		if !ok {
+			return nil, fmt.Errorf("key %q must be a string", k)
+		}
+		out[k] = v
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, errors.New("tool input is not a JSON object")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after the tool input")
+	}
+	return out, nil
 }
 
 // CheckSubagent decides an Agent/Task call of a job. A subagent runs inside the job's own process,
-// so it shares the job's budget, timeout, settings and this guard; it stays a foreground subagent of
-// the job (no background run, no team, no isolation: a remote or worktree subagent would run or
-// write outside the job). Each allowed call is recorded in the log file; the fourth is refused.
-// With no log file configured every subagent is refused (fail closed: the cap cannot be counted).
+// so it shares the job's budget, timeout, settings and this guard; it stays a plain foreground
+// subagent of the job: the input may carry only description, prompt, subagent_type and model (no
+// isolation, background run or team, which would run or write outside the job). Each allowed call is
+// recorded in the log file; the fourth is refused. With no log file configured every subagent is
+// refused (fail closed: the cap cannot be counted).
 func CheckSubagent(raw json.RawMessage, cfg Config) string {
-	var in subagentInput
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &in); err != nil {
-			return "agent-jobs guard: unreadable subagent call input"
-		}
-	}
-	switch {
-	case present(in.Isolation):
-		return "agent-jobs guard: a job's subagent runs in the job itself; isolation (worktree, remote) is not allowed"
-	case present(in.RunInBackground):
-		return "agent-jobs guard: a job's subagent runs in the foreground, so its work is finished before the job's report"
-	case present(in.TeamName):
-		return "agent-jobs guard: a job does not start agent teams; at most three plain subagents"
+	in, err := parseSubagentInput(raw)
+	if err != nil {
+		return "agent-jobs guard: a job's subagent runs in the foreground inside the job: " + err.Error()
 	}
 	if cfg.SubagentLog == "" {
 		return "agent-jobs guard: subagents are not counted for this call (no job subagent log), so none may start"
 	}
-	n, err := reserveSubagent(cfg.SubagentLog, in.SubagentType, in.Description)
+	n, err := reserveSubagent(cfg.SubagentLog, in["subagent_type"], in["description"])
 	if err != nil {
 		return "agent-jobs guard: subagent log: " + err.Error()
 	}

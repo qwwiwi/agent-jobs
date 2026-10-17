@@ -54,24 +54,50 @@ func TestSubagentCapThreePerJob(t *testing.T) {
 func TestSubagentMustStayInsideTheJob(t *testing.T) {
 	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
 	for name, in := range map[string]map[string]any{
-		"remote":     {"prompt": "p", "isolation": "remote"},
-		"worktree":   {"prompt": "p", "isolation": "worktree"},
-		"background": {"prompt": "p", "run_in_background": true},
-		"team":       {"prompt": "p", "team_name": "crew"},
+		"remote":           {"prompt": "p", "isolation": "remote"},
+		"worktree":         {"prompt": "p", "isolation": "worktree"},
+		"empty isolation":  {"prompt": "p", "isolation": ""},
+		"background":       {"prompt": "p", "run_in_background": true},
+		"background false": {"prompt": "p", "run_in_background": false},
+		"team":             {"prompt": "p", "team_name": "crew"},
+		"unknown key":      {"prompt": "p", "mode": "plan"},
+		"non-string":       {"prompt": 1},
 	} {
 		if decide(t, subagentCall(t, "Agent", in), cfg) == "" {
 			t.Errorf("%s subagent allowed", name)
 		}
 	}
-	if _, err := os.Stat(cfg.SubagentLog); err == nil {
-		b, _ := os.ReadFile(cfg.SubagentLog)
-		if len(b) != 0 {
-			t.Fatalf("refused subagents were counted:\n%s", b)
+	if b, err := os.ReadFile(cfg.SubagentLog); err == nil && len(b) != 0 {
+		t.Fatalf("refused subagents were counted:\n%s", b)
+	}
+}
+
+// Claude Code matches keys case-sensitively, encoding/json does not and lets the last duplicate win:
+// the guard reads the raw keys, so neither a case variant nor a duplicate can hide a denied field.
+func TestSubagentInputKeyDifferentials(t *testing.T) {
+	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+	for name, input := range map[string]string{
+		"case variant hides isolation": `{"prompt":"p","isolation":"worktree","Isolation":""}`,
+		"case variant of allowed key":  `{"Prompt":"p"}`,
+		"duplicate key":                `{"prompt":"p","prompt":"q"}`,
+		"duplicate description":        `{"description":"a","prompt":"p","description":"b"}`,
+		"unknown key":                  `{"prompt":"p","cwd":"/"}`,
+		"not an object":                `["prompt"]`,
+		"null":                         `null`,
+	} {
+		payload := `{"tool_name":"Agent","cwd":"/tmp","tool_input":` + input + `}`
+		// An error fails closed too: the hook exits 2 on it.
+		if r, err := Decide(strings.NewReader(payload), cfg); r == "" && err == nil {
+			t.Errorf("%s: allowed", name)
 		}
 	}
-	// Explicit defaults are fine.
-	if r := decide(t, subagentCall(t, "Agent", map[string]any{"prompt": "p", "run_in_background": false, "isolation": ""}), cfg); r != "" {
-		t.Fatalf("plain foreground subagent refused: %s", r)
+	// Each allowed key alone passes (the cap is not reached: four keys, so use a fresh log each time).
+	for _, k := range []string{"description", "prompt", "subagent_type", "model"} {
+		c := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+		payload := `{"tool_name":"Task","cwd":"/tmp","tool_input":{"` + k + `":"v"}}`
+		if r := decide(t, payload, c); r != "" {
+			t.Errorf("key %s alone refused: %s", k, r)
+		}
 	}
 }
 
