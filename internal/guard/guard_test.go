@@ -1165,6 +1165,25 @@ func TestJobMarkerSurvivesAllowedCommands(t *testing.T) {
 	}
 }
 
+// Relative paths are resolved against the call's directory.
+func TestCgroupPathRelativeToCallDir(t *testing.T) {
+	for _, c := range []struct {
+		dir, cmd string
+		block    bool
+	}{
+		{"/sys/fs", `echo $$ > cgroup/x/y`, true},
+		{"/sys", `tee fs/cgroup/x/y < f`, true},
+		{"/", `cd sys`, true},
+		{"/", `cd sys/fs`, true},
+		{"/home/u/repo", `cd sys`, false},
+		{"/home/u/repo", `echo x > fs/cgroup/y`, false},
+	} {
+		if got := Check(c.cmd, Config{Dir: c.dir}); (got != "") != c.block {
+			t.Errorf("Check(%q) in %s = %q, want block=%v", c.cmd, c.dir, got, c.block)
+		}
+	}
+}
+
 // A job stays in its cgroup scope: no new units through the user's service manager or bus, no writes
 // into the cgroup file system (docs/ARCHITECTURE.md, «Cgroup containment»).
 func TestCheckUserManagerAndCgroupFS(t *testing.T) {
@@ -1190,6 +1209,32 @@ func TestCheckUserManagerAndCgroupFS(t *testing.T) {
 		{"echo into cgroup.procs", `echo $$ > /sys/fs/cgroup/user.slice/cgroup.procs`, true},
 		{"tee into cgroup", `echo 1 | tee /sys/fs/cgroup/x/cgroup.procs`, true},
 		{"cd into cgroupfs", `cd /sys/fs/cgroup/user.slice`, true},
+		// Respelled cgroup paths (security review of PR #10).
+		{"double slash", `echo $$ > /sys//fs/cgroup/user.slice/cgroup.procs`, true},
+		{"dot segment", `echo $$ > /sys/fs/./cgroup/x/cgroup.procs`, true},
+		{"dotdot", `echo $$ > /sys/fs/x/../cgroup/y/cgroup.procs`, true},
+		{"proc root", `echo $$ > /proc/1/root/sys/fs/cgroup/x/cgroup.procs`, true},
+		{"proc self root", `tee /proc/self/root/s/cgroup.x < f`, true},
+		{"proc cwd", `cp f /proc/1/cwd/x`, true},
+		{"relative after cd", `cd /sys/fs && echo $$ > cgroup/app.slice/cgroup.procs`, true},
+		{"cd /sys", `cd /sys`, true},
+		{"cd /sys/fs", `cd /sys/fs/`, true},
+		{"pushd /sys/fs", `pushd //sys/./fs`, true},
+		{"relative cgroup.threads", `echo 1 > x/cgroup.threads`, true},
+		{"subtree_control", `echo +pids > cgroup.subtree_control`, true},
+		{"--opt=value", `install --target-directory=/sys/fs/cgroup/x f`, true},
+		{"ln to cgroupfs", `ln -s /sys/fs/cgroup c`, true},
+		// Indirect and wrapped spellings of the user manager tools.
+		{"xargs systemctl", `echo --user start x | xargs systemctl`, true},
+		{"xargs qdbus", `echo x | xargs qdbus`, true},
+		{"sudo systemctl --user", `sudo systemctl --user start x`, true},
+		{"env systemctl --user", `env A=1 systemctl --user start x`, true},
+		{"timeout systemd-run", `timeout 5 systemd-run --user sleep 9`, true},
+		{"env qdbus", `env qdbus org.x /`, true},
+		{"python systemctl", `python3 -c 'import os; os.system("systemctl --user start x")'`, true},
+		{"python systemd-run", `python3 -c 'import subprocess; subprocess.run(["systemd-run", "--user", "x"])'`, true},
+		{"find -exec systemctl", `find . -exec systemctl --user start {} \;`, true},
+		{"cd sys in repo ok", `cd sys`, false},
 		{"systemctl status ok", `systemctl status nginx`, false},
 		{"systemctl --runtime ok", `systemctl --runtime status nginx`, false},
 		{"cat cgroup ok", `cat /sys/fs/cgroup/cgroup.controllers`, false},

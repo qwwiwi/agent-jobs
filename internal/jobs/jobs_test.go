@@ -296,7 +296,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "Bash(systemd-run:*)", "Bash(systemctl --user:*)", "Bash(busctl:*)", "Bash(dbus-send:*)", "Bash(gdbus:*)", "WebFetch", "WebSearch",
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "Bash(systemd-run:*)", "Bash(systemctl --user:*)", "Bash(busctl:*)", "Bash(dbus-send:*)", "Bash(gdbus:*)", "Bash(qdbus:*)", "Bash(dbus-run-session:*)", "WebFetch", "WebSearch",
 		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)

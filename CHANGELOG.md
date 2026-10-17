@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.
 
 ### Security
-- A job's environment no longer carries `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`; the guard and the deny rules reject `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus` (guard also `qdbus`, `dbus-run-session`, and writes under `/sys/fs/cgroup`), the direct ways out of a job's scope.
+- A job's environment no longer carries `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`; the guard and the deny rules reject `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus`, `qdbus`, `dbus-run-session` (guard also behind wrappers, `xargs`, and as words inside other programs' arguments) and writes into the cgroup file system in any spelling (cleaned, relative, symlinked, through `/proc/<pid>/root`, control-file base names; `cd` into `/sys` or `/sys/fs`), the direct ways out of a job's scope.
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 

@@ -328,7 +328,8 @@ var indirect = map[string]bool{
 	"git": true, "gh": true, "eval": true, "env": true, "xargs": true, "exec": true, "command": true,
 	"nohup": true, "sudo": true, "doas": true, "timeout": true, "nice": true, "stdbuf": true, "source": true,
 	"npx": true, "pnpx": true, "bunx": true, "uvx": true,
-	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "dbus-run-session": true,
+	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "dbus-run-session": true,
+	"systemctl": true,
 }
 
 // agents are coding agents a job must not start: a job is a leaf, nested agents would run outside
@@ -501,7 +502,7 @@ var (
 	// (`npx @anthropic-ai/claude-code`, `node …/claude-code/cli.js`).
 	// Agent names may carry a `-suffix` (`gemini-cli`, `aider-chat`, `@google/gemini-cli`, `codex-cli`).
 	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((git|gh|sh|bash|zsh|dash|fish)($|[^a-z0-9_-])|` +
-		`(claude|codex|gemini|aider|cursor-agent|agent-jobs)($|[^a-z0-9_]))`)
+		`(claude|codex|gemini|aider|cursor-agent|agent-jobs|systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
 )
 
@@ -542,6 +543,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	name := strings.ToLower(base(argv[0]))
 	if dyn[0] {
 		return cannot("command name from a variable or substitution")
+	}
+	if name == "systemctl" && slices.Contains(v.wrappers, "xargs") {
+		return cannot("xargs systemctl (its arguments, e.g. --user, come from stdin)")
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
@@ -695,20 +699,111 @@ var userManagerTools = map[string]bool{
 	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "dbus-run-session": true,
 }
 
-// cgroupFS is the cgroup file system: writing a pid into a cgroup.procs there moves it out of the scope.
-const cgroupFS = "/sys/fs/cgroup"
+// cgroupControlFiles move processes between cgroups (or enable controllers on a subtree): writing a pid
+// there takes it out of the job's scope, wherever the file system is mounted.
+var cgroupControlFiles = map[string]bool{"cgroup.procs": true, "cgroup.threads": true, "cgroup.subtree_control": true}
+
+// pathSegs returns the non-empty segments of a cleaned slash path.
+func pathSegs(p string) []string {
+	var out []string
+	for _, s := range strings.Split(filepath.ToSlash(filepath.Clean(p)), "/") {
+		if s != "" && s != "." {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// hasSegs reports whether want occurs as consecutive segments of segs.
+func hasSegs(segs []string, want ...string) bool {
+	for i := 0; i+len(want) <= len(segs); i++ {
+		if slices.Equal(segs[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
+}
+
+// viaProcRoot reports a path through /proc/<pid>/root or /proc/<pid>/cwd (another process's view of
+// the file system, which a lexical check cannot follow).
+func viaProcRoot(segs []string) bool {
+	for i := 0; i+2 < len(segs); i++ {
+		if segs[i] == "proc" && (segs[i+2] == "root" || segs[i+2] == "cwd") {
+			return true
+		}
+	}
+	return false
+}
+
+// pathForms returns the spellings of a word a cgroup check must see: the value (of `--opt=value`) as
+// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved.
+func pathForms(w, dir string) [][]string {
+	if strings.HasPrefix(w, "-") {
+		if _, v, ok := strings.Cut(w, "="); ok {
+			w = v
+		}
+	}
+	if w == "" {
+		return nil
+	}
+	forms := [][]string{pathSegs(w)}
+	if dir != "" || filepath.IsAbs(w) {
+		abs := w
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(dir, abs)
+		}
+		forms = append(forms, pathSegs(abs), pathSegs(resolvePath(abs, "/")))
+	}
+	return forms
+}
+
+// cgroupPath reports a word naming the cgroup file system or one of its control files in any spelling:
+// a sys/fs/cgroup segment run (also after `//`, `/./`, `x/..`, relative to the call's directory, or
+// through a symlink), a cgroup.procs / cgroup.threads / cgroup.subtree_control base name, or any path
+// through /proc/<pid>/root or /proc/<pid>/cwd.
+func cgroupPath(w, dir string) bool {
+	for _, segs := range pathForms(w, dir) {
+		if len(segs) == 0 {
+			continue
+		}
+		if hasSegs(segs, "sys", "fs", "cgroup") || cgroupControlFiles[segs[len(segs)-1]] || viaProcRoot(segs) {
+			return true
+		}
+	}
+	return false
+}
+
+// sysDirTarget reports a directory argument of cd/pushd that is /sys or /sys/fs (from there a relative
+// path reaches the cgroup file system unseen), absolute or relative to the call's directory.
+func sysDirTarget(w, dir string) bool {
+	if dir == "" && !filepath.IsAbs(w) {
+		return false
+	}
+	for _, segs := range pathForms(w, dir)[1:] {
+		if slices.Equal(segs, []string{"sys"}) || slices.Equal(segs, []string{"sys", "fs"}) {
+			return true
+		}
+	}
+	return false
+}
+
+func cgroupBlocked(w string) string {
+	return "blocked by guard: `" + w + "` reaches the cgroup file system; a job does not move processes out of its scope."
+}
 
 // checkUserManager: a job stays in its cgroup scope. systemd-run, busctl, dbus-send, gdbus, qdbus,
-// dbus-run-session are rejected as commands; `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
-// `--user=…`) too (the system manager, without --user, cannot start units for the job); and any write
-// under /sys/fs/cgroup: an output redirection there, or such a path as an argument of a program that
-// is not a plain reader. As an argument of another program these tools are caught by the indirect scan.
-// Not a sandbox: a script the job writes is not inspected.
-func checkUserManager(scripts []*script, _ string, _ Config) string {
+// dbus-run-session are rejected as commands (behind wrappers too: argvOf strips env/sudo/timeout/…);
+// as an argument or a word inside an argument of another program (xargs, find -exec, python -c) they
+// and systemctl are caught by the indirect scan in unverifiable. `systemctl --user` (also abbreviated
+// `--u`, `--us`, `--use`, `--user=…`) is rejected (the system manager, without --user, cannot start
+// units for the job), and so is any write into the cgroup file system: an output redirection there, or
+// such a path as an argument of a program that is not a plain reader (cgroupPath: every spelling), and
+// cd/pushd into /sys or /sys/fs. Not a sandbox: a script the job writes is not inspected.
+func checkUserManager(scripts []*script, _ string, cfg Config) string {
 	return eachCmd(scripts, func(c *simpleCmd, argv []string) string {
 		for _, t := range c.outRedirs {
-			if strings.Contains(t, cgroupFS) {
-				return "blocked by guard: `" + t + "` is the cgroup file system; a job does not move processes out of its scope."
+			if cgroupPath(t, cfg.Dir) {
+				return cgroupBlocked(t)
 			}
 		}
 		if len(argv) == 0 {
@@ -728,11 +823,12 @@ func checkUserManager(scripts []*script, _ string, _ Config) string {
 				}
 			}
 		}
-		if !gitFileReaders[name] {
-			for _, a := range argv[1:] {
-				if strings.Contains(a, cgroupFS) {
-					return "blocked by guard: `" + a + "` is the cgroup file system; a job does not move processes out of its scope."
-				}
+		if gitFileReaders[name] {
+			return ""
+		}
+		for _, a := range argv[1:] {
+			if cgroupPath(a, cfg.Dir) || ((name == "cd" || name == "pushd") && sysDirTarget(a, cfg.Dir)) {
+				return cgroupBlocked(a)
 			}
 		}
 		return ""

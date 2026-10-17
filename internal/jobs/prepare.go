@@ -62,6 +62,8 @@ var denyRules = []string{
 	"Bash(busctl:*)",
 	"Bash(dbus-send:*)",
 	"Bash(gdbus:*)",
+	"Bash(qdbus:*)",
+	"Bash(dbus-run-session:*)",
 	// Package runners fetch and run a package by name (also rejected by the guard).
 	"Bash(npx:*)",
 	"Bash(pnpx:*)",
