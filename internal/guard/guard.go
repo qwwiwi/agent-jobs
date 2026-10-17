@@ -690,7 +690,9 @@ var gitRunsCmd = map[string]bool{
 
 // gitKnown are git's own commands (`git --list-cmds=main`, git 2.43, plus later built-ins). A
 // subcommand outside this list is an alias or an external git-* program: rejected, so an alias in
-// a config the guard does not see cannot resolve to anything.
+// a config the guard does not see cannot resolve to anything. The commands denied by name
+// (gitOutside, gitRunsCmd) are listed too (second block), so their own check decides and names the
+// reason, and dropping one from its deny list is not hidden by this one.
 var gitKnown = func() map[string]bool {
 	m := map[string]bool{}
 	for _, c := range strings.Fields(`add am annotate apply archive bisect blame branch bugreport bundle cat-file
@@ -706,7 +708,11 @@ var gitKnown = func() map[string]bool {
 		repack replace rerere reset restore rev-list rev-parse revert rm shortlog show show-branch show-index
 		show-ref sparse-checkout stage stash status stripspace submodule submodule--helper subtree switch
 		symbolic-ref unpack-file unpack-objects update-index update-ref update-server-info var verify-commit
-		verify-pack verify-tag version whatchanged worktree write-tree replay refs backfill last-modified repo`) {
+		verify-pack verify-tag version whatchanged worktree write-tree replay refs backfill last-modified repo
+		push tag send-pack http-push send-email imap-send svn p4 daemon request-pull instaweb web--browse
+		cvsexportcommit cvsimport cvsserver archimport http-backend upload-pack receive-pack upload-archive shell
+		filter-branch filter-repo difftool difftool--helper mergetool for-each-repo maintenance hook remote-ext
+		remote-fd credential-cache--daemon fsmonitor--daemon`) {
 		m[c] = true
 	}
 	return m

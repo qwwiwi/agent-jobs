@@ -650,6 +650,32 @@ func TestCheckSecurityReview(t *testing.T) {
 
 // Automated security review of the fix-loop guard commit: env abbreviations, glob/brace in wrapper
 // words, incomplete git denylist (unknown subcommands, command-running forms), writes into git files.
+// Every subcommand denied by name is blocked by its own check (not only by the git-command allowlist),
+// so its message names the real reason and dropping it from its deny list fails here.
+func TestGitDeniedByName(t *testing.T) {
+	cfg := Config{GitName: "Job Bot", GitEmail: "bot@example.com"}
+	outsideMsg, runsMsg := "reaches outside the job", "runs commands or git subcommands"
+	for _, c := range []struct{ sub, want string }{
+		{"push", outsideMsg}, {"tag", outsideMsg}, {"send-pack", outsideMsg}, {"http-push", outsideMsg},
+		{"send-email", outsideMsg}, {"imap-send", outsideMsg}, {"svn", outsideMsg}, {"p4", outsideMsg},
+		{"daemon", outsideMsg}, {"request-pull", outsideMsg}, {"instaweb", outsideMsg}, {"web--browse", outsideMsg},
+		{"cvsexportcommit", outsideMsg}, {"cvsimport", outsideMsg}, {"cvsserver", outsideMsg},
+		{"archimport", outsideMsg}, {"http-backend", outsideMsg}, {"upload-pack", outsideMsg},
+		{"receive-pack", outsideMsg}, {"upload-archive", outsideMsg}, {"shell", outsideMsg},
+		{"filter-branch", runsMsg}, {"filter-repo", runsMsg}, {"difftool", runsMsg}, {"difftool--helper", runsMsg},
+		{"mergetool", runsMsg}, {"for-each-repo", runsMsg}, {"maintenance", runsMsg}, {"hook", runsMsg},
+		{"remote-ext", runsMsg}, {"remote-fd", runsMsg}, {"credential-cache--daemon", runsMsg},
+		{"fsmonitor--daemon", runsMsg},
+	} {
+		if !gitKnown[c.sub] {
+			t.Errorf("%s missing from gitKnown: its deny list would be hidden by the allowlist", c.sub)
+		}
+		if got := Check("git "+c.sub+" x", cfg); !strings.Contains(got, c.want) || !strings.Contains(got, "`git "+c.sub+"`") {
+			t.Errorf("git %s: %q, want %q naming it", c.sub, got, c.want)
+		}
+	}
+}
+
 // Fable control round of PR #1 (fix loop 2): agents and shells inside interpreter code and package
 // paths, clone/init --template, grep -O, `.git` respelled or as a directory target, merge strategies,
 // fetch-pack/ls-remote --exec, clone -c values.
