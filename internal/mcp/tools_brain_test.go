@@ -115,7 +115,7 @@ func TestMemoryToolsWithFake(t *testing.T) {
 	// The orchestrator cannot forge a job tag either: caller tags with the prefix are dropped.
 	call(t, cs, "memory_write", map[string]any{"kind": "decision", "title": "T", "body": "B",
 		"tags": []string{"x", brain.JobTagPrefix + "261017-000000-dead"}}, &w)
-	if w.Result["path"] == nil || len(f.Written) != 1 || !slices.Equal(f.Written[0].Tags, []string{"x"}) || f.Written[0].Author != "" {
+	if w.Result["result"] == nil || len(f.Written) != 1 || !slices.Equal(f.Written[0].Tags, []string{"x"}) || f.Written[0].Author != "" {
 		t.Fatalf("memory_write: %+v %+v", w, f.Written)
 	}
 	for _, a := range []map[string]any{

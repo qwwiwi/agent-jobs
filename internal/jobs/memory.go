@@ -69,6 +69,17 @@ func (m *Manager) MarkJobNotes(notes []brain.Note) error {
 	return nil
 }
 
+// OrchestratorWrote clears the job mark of the note the orchestrator just wrote (answer o): its
+// reviewed rewrite is the agent's own. Only a note the brain created or updated is cleared; an answer
+// without a path, or "exists"/"unchanged", leaves any mark in place.
+func (m *Manager) OrchestratorWrote(o brain.Object) error {
+	r, err := brain.ParseWriteResult(o)
+	if err != nil || !r.Written() {
+		return nil
+	}
+	return m.Store.DeleteJobNote(r.Path)
+}
+
 // LookupMemoryNotes asks the shared brain for the notes closest to j's brief. It never fails: an
 // error or a timeout (MemoryTimeout) is returned inside MemoryNotes, and the job starts anyway.
 // Notes written by jobs are left out (counted in FromJobs): a job's note never reaches a later

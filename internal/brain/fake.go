@@ -20,6 +20,8 @@ type Fake struct {
 	Sent    []Object
 	Pending []Object
 	Acked   []string
+	// WriteAnswer, when set, is Write's answer instead of the real brain's {"result": "created: <path>"}.
+	WriteAnswer Object
 }
 
 var _ Brain = (*Fake)(nil)
@@ -53,7 +55,7 @@ func (f *Fake) Search(ctx context.Context, query string, limit int) ([]Note, err
 	return n, nil
 }
 
-// Write records the note.
+// Write records the note and answers as the real brain does: {"result": "created: <path>"}.
 func (f *Fake) Write(ctx context.Context, n NoteInput) (Object, error) {
 	if err := f.enter(ctx); err != nil {
 		return nil, err
@@ -64,7 +66,10 @@ func (f *Fake) Write(ctx context.Context, n NoteInput) (Object, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Written = append(f.Written, n)
-	return Object{"path": fmt.Sprintf("fake/%s/%d.md", n.Kind, len(f.Written))}, nil
+	if f.WriteAnswer != nil {
+		return cloneObj(f.WriteAnswer), nil
+	}
+	return Object{"result": fmt.Sprintf("created: fake/%s/%d.md", n.Kind, len(f.Written))}, nil
 }
 
 // CreateTask adds a task with status new.

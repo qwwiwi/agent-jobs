@@ -131,7 +131,15 @@ func addMemoryWrite(s *sdk.Server, d Deps) {
 			return ObjectOutput{}, err
 		}
 		o, err := b.Write(ctx, n)
-		return ObjectOutput{Result: o}, err
+		if err != nil {
+			return ObjectOutput{}, err
+		}
+		if d.JobID == "" && d.Manager != nil {
+			if err := d.Manager.OrchestratorWrote(o); err != nil {
+				return ObjectOutput{Result: o}, fmt.Errorf("the note was written, but its job mark was not cleared: %w", err)
+			}
+		}
+		return ObjectOutput{Result: o}, nil
 	})
 }
 

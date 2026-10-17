@@ -16,6 +16,9 @@ import (
 // BrainSocketName is the daemon's brain proxy socket in the state directory.
 const BrainSocketName = "brain.sock"
 
+// errJobWritesOff refuses job writes after one could not be tracked (see HandleBrainRequest).
+var errJobWritesOff = errors.New("brain proxy: job writes are off until the daemon restarts: a job's note could not be tracked")
+
 // maxProxyConns bounds the proxy calls served at once.
 const maxProxyConns = 8
 
@@ -118,14 +121,23 @@ func (m *Manager) HandleBrainRequest(ctx context.Context, r brain.SocketRequest)
 		if err != nil {
 			return fail(err)
 		}
+		if m.jobWritesOff.Load() {
+			return fail(errJobWritesOff)
+		}
 		o, err := m.Brain.Write(ctx, n)
 		if err != nil {
 			return fail(err)
 		}
-		if path, ok := o["path"].(string); ok && path != "" {
-			if err := m.Store.AddJobNote(path, j.ID, m.Now()); err != nil {
-				m.Log.Printf("job %s: %v (the note's marker line still marks it)", j.ID, err)
-			}
+		// Fail closed: a job's note the daemon cannot record could reach a later brief unmarked
+		// (its snippet need not carry the marker line), so no job writes another until a restart.
+		r, err := brain.ParseWriteResult(o)
+		if err == nil {
+			err = m.Store.AddJobNote(r.Path, j.ID, m.Now())
+		}
+		if err != nil {
+			m.jobWritesOff.Store(true)
+			m.Log.Printf("ERROR brain proxy: job %s wrote a note that cannot be tracked (%v); job writes are off until the daemon restarts", j.ID, err)
+			return fail(fmt.Errorf("the note was written but could not be tracked as this job's (%v); %w", err, errJobWritesOff))
 		}
 		return brain.SocketResponse{Result: o}
 	}

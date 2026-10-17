@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,8 @@ type Manager struct {
 
 	memMu        sync.Mutex
 	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
+
+	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.

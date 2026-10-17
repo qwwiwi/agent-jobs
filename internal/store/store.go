@@ -196,6 +196,14 @@ func (s *Store) AddJobNote(path, jobID string, now time.Time) error {
 	return nil
 }
 
+// DeleteJobNote forgets that a job wrote the note at path (the orchestrator wrote it again).
+func (s *Store) DeleteJobNote(path string) error {
+	if _, err := s.db.Exec(`DELETE FROM job_notes WHERE path = ?`, path); err != nil {
+		return fmt.Errorf("forget job note: %w", err)
+	}
+	return nil
+}
+
 // JobNotes returns, for those of paths a job wrote, the job's id by path.
 func (s *Store) JobNotes(paths []string) (map[string]string, error) {
 	out := map[string]string{}
