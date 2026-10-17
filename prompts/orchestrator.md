@@ -54,7 +54,7 @@ Not in the reference; recorded as owner decisions and in `docs/DEVIATIONS.md` #1
 Not in the reference. When a job needs new facts, a changed plan or a correction:
 
 - **Queued:** `job_amend(id, context)` appends the context to its brief; the job keeps its place.
-- **Running, and its work so far is useful:** `job_stop(id, reason)`, then `job_resume(id, context)`. Resume continues the same job id in the same worktree and the same claude session with one message, «Orchestrator update» + your context; limits default to what the previous attempt left.
+- **Running, and its work so far is useful:** `job_stop(id, reason)`, then `job_resume(id, context)`. Resume continues the same job id in the same worktree and the same claude session with one message, «Orchestrator update» + your context; limits default to what the previous attempt left (a stopped attempt's cost is unknown and counts at its whole budget, so pass `max_budget_usd`).
 - **Timed out or failed, and the work is worth keeping:** `job_resume(id, context, limits)`; after a timeout pass a new `timeout_minutes`.
 - **Not wanted any more, or the brief was wrong from the start:** `job_cancel(id)` (a stopped job too); start a new job if needed.
 

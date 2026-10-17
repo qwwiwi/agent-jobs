@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,18 +101,151 @@ func SessionPaths(sessionID string) ([]string, error) {
 	return out, nil
 }
 
-// sessionExists reports whether the transcript of the session is on disk (claude --resume needs it).
-func sessionExists(sessionID string) bool {
-	paths, err := SessionPaths(sessionID)
-	if err != nil {
-		return false
+// maxProjectDirName is the longest project directory name claude uses as is; a longer one is cut
+// to this length and gets a hash suffix ("-<hash>").
+const maxProjectDirName = 200
+
+var nonAlnumRe = regexp.MustCompile(`[^A-Za-z0-9]`)
+
+// ProjectDirName is claude's directory name for a project: the path with every non-alphanumeric
+// character replaced by '-'.
+func ProjectDirName(path string) string { return nonAlnumRe.ReplaceAllString(path, "-") }
+
+// transcriptPath returns the job's session transcript, <config>/projects/<project of the job's work
+// dir>/<session id>.jsonl, when it is a regular file; "" otherwise. Only the job's own project dir
+// counts: a transcript with the same id elsewhere (another job can write there) is not the job's.
+func (m *Manager) transcriptPath(j *store.Job) string {
+	if !ValidSessionID(j.SessionID) {
+		return ""
 	}
-	for _, p := range paths {
-		if strings.HasSuffix(p, ".jsonl") {
-			return true
+	cfg, err := ClaudeConfigDir()
+	if err != nil {
+		return ""
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	names := []string{ProjectDirName(work)}
+	if r, err := filepath.EvalSymlinks(work); err == nil && r != work {
+		names = append(names, ProjectDirName(r)) // claude sees the physical cwd
+	}
+	for _, name := range names {
+		cands := []string{filepath.Join(cfg, "projects", name, j.SessionID+".jsonl")}
+		if len(name) > maxProjectDirName {
+			// The name is [A-Za-z0-9-] only: no glob metacharacters.
+			cands, _ = filepath.Glob(filepath.Join(cfg, "projects", name[:maxProjectDirName]+"-*", j.SessionID+".jsonl"))
+		}
+		for _, p := range cands {
+			if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+				return p
+			}
 		}
 	}
-	return false
+	return ""
+}
+
+// sessionDigest is the SHA-256 of a session's transcript and of the <id>/ directory next to it (tool
+// results, subagent transcripts): names, types, symlink targets and regular files' contents.
+func sessionDigest(transcript, sessionID string) (string, error) {
+	h := sha256.New()
+	add := func(path string) error {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", path)
+		}
+		_, err = io.Copy(h, f)
+		return err
+	}
+	if err := add(transcript); err != nil {
+		return "", err
+	}
+	root := filepath.Join(filepath.Dir(transcript), sessionID)
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if errors.Is(err, os.ErrNotExist) && p == root {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		fmt.Fprintf(h, "\x00%s\x00%s\x00", rel, d.Type())
+		switch {
+		case d.Type()&os.ModeSymlink != 0:
+			t, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			h.Write([]byte(t))
+		case d.Type().IsRegular():
+			return add(p)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sessionIntact reports whether the job's session can be resumed: its transcript is in the job's
+// project dir and has the digest recorded when the previous attempt ended (else why not).
+func (m *Manager) sessionIntact(j *store.Job) (bool, string) {
+	p := m.transcriptPath(j)
+	if p == "" {
+		return false, "not found on disk"
+	}
+	d, err := sessionDigest(p, j.SessionID)
+	switch {
+	case err != nil:
+		return false, "unreadable: " + err.Error()
+	case j.SessionDigest == "":
+		return false, "has no digest recorded at the end of the previous attempt"
+	case d != j.SessionDigest:
+		return false, "changed after the previous attempt ended"
+	}
+	return true, ""
+}
+
+// checkProjectClaude refuses to run the next attempt when what claude loads from the project at
+// start may have changed since the job began: claude reads <work>/.claude (settings, local settings,
+// hooks, skills, agents), and those run outside the guard. For a repository job it must equal the
+// job's base commit (nothing changed, staged, untracked or ignored there); a job without a repository
+// has none; the job dir (--add-dir) never has one.
+func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
+	refuse := func(what string) error {
+		return fmt.Errorf("%s: claude loads settings, hooks, skills and agents from it at start, outside the guard, "+
+			"so this job cannot be resumed (remove it, or start a new job)", what)
+	}
+	if _, err := os.Lstat(filepath.Join(m.JobDir(j.ID), ".claude")); err == nil {
+		return refuse("the job dir has a .claude")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := os.Lstat(work); errors.Is(err, os.ErrNotExist) {
+		return nil // restored from the saved ref before the launch, then checked again
+	}
+	if j.RepoPath == "" {
+		if _, err := os.Lstat(filepath.Join(work, ".claude")); err == nil {
+			return refuse("work/.claude exists in a job without a repository")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	st, err := git(work, "status", "--porcelain", "--ignored", "--untracked-files=all", "--", ".claude")
+	if err != nil {
+		return err
+	}
+	diff, err := git(work, "diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--", ".claude")
+	if err != nil {
+		return err
+	}
+	if st != "" || diff != "" {
+		return refuse("work/.claude differs from the job's base commit")
+	}
+	return nil
 }
 
 // Stop ends a queued or running job on purpose: a running job's process group gets SIGTERM, then
@@ -166,13 +301,22 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	m.killRunning(j)
 	res := parseStream(filepath.Join(dir, "stream.jsonl"))
 	if !res.Found {
-		// Killed before its result event: count the assistant turns written so far; cost is unknown.
+		// Killed before its result event: count the assistant turns written so far; cost is unknown
+		// (recorded as such: a resume counts this attempt at its whole budget).
 		res.Turns = streamTurns(filepath.Join(dir, "stream.jsonl"))
 		msg += " (cost so far unknown: no result event)"
 	}
 	m.noteFallback(j)
 	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		return nil, err
+	}
+	m.recordAttemptEnd(j, res)
+	// Only now (the row is no longer running) does a process left in the job's session count as a ghost.
+	if note := m.sweepEscaped(id); note != "" {
+		msg += "; " + note
+		if err := m.Store.AppendError(id, note); err != nil {
+			m.Log.Printf("job %s: record note: %v", id, err)
+		}
 	}
 	m.Log.Printf("job %s stopped (%s)", id, msg)
 	return m.Store.Get(id)
@@ -256,19 +400,46 @@ type Limits struct {
 	TimeoutMinutes int
 }
 
+// chargedCost is what an attempt counts against the budget: its cost, or its whole budget when the
+// cost is unknown (it ended without a result event).
+func chargedCost(cost float64, unknown bool, budget float64) float64 {
+	if unknown {
+		return math.Max(cost, budget)
+	}
+	return cost
+}
+
 // resumeLimits returns the next attempt's limits: each field given explicitly (within the
-// ceilings, never clamped), else what the previous attempt left of its own limit. Nothing left and
-// nothing given is an error that names the field to pass.
-func resumeLimits(j *store.Job, l Limits) (store.ResumeLimits, error) {
+// ceilings, never clamped), else what the previous attempt (the job row j) left of its own limit.
+// All attempts together (earlier ones archived, j, the next one) stay within the ceilings; an
+// attempt whose cost is unknown counts at its whole budget. Nothing left and nothing given is an
+// error that names the field to pass.
+func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.ResumeLimits, error) {
 	var errs []string
+	cents := func(v float64) float64 { return math.Floor(v*100+1e-6) / 100 }
+	prevCost := chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD)
+	usedTurns, usedCost, usedMin := j.Turns, prevCost, (j.DurationSec+59)/60
+	for _, a := range earlier {
+		usedTurns += a.Turns
+		usedCost += chargedCost(a.CostUSD, a.CostUnknown, a.MaxBudgetUSD)
+		usedMin += (a.DurationSec + 59) / 60
+	}
+	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
 	out := store.ResumeLimits{
-		MaxTurns:       j.MaxTurns - j.Turns,
-		MaxBudgetUSD:   math.Floor((j.MaxBudgetUSD-j.CostUSD)*100) / 100,
-		TimeoutMinutes: j.TimeoutMinutes - (j.DurationSec+59)/60,
+		MaxTurns:       min(j.MaxTurns-j.Turns, leftTurns),
+		MaxBudgetUSD:   math.Min(cents(j.MaxBudgetUSD-prevCost), leftBudget),
+		TimeoutMinutes: min(j.TimeoutMinutes-(j.DurationSec+59)/60, leftMin),
+	}
+	unknown := ""
+	if j.CostUnknown {
+		unknown = " (its cost is unknown: it ended without a result event, so it counts at its whole budget)"
 	}
 	switch {
 	case l.MaxTurns < 0 || l.MaxTurns > CeilingMaxTurns:
 		errs = append(errs, fmt.Sprintf("max_turns %d is outside 1..%d", l.MaxTurns, CeilingMaxTurns))
+	case l.MaxTurns > leftTurns:
+		errs = append(errs, fmt.Sprintf("max_turns %d exceeds what the %d-turn ceiling leaves across this job's attempts (%d used, %d left)",
+			l.MaxTurns, CeilingMaxTurns, usedTurns, max(leftTurns, 0)))
 	case l.MaxTurns > 0:
 		out.MaxTurns = l.MaxTurns
 	case out.MaxTurns < 1:
@@ -277,14 +448,20 @@ func resumeLimits(j *store.Job, l Limits) (store.ResumeLimits, error) {
 	switch {
 	case l.MaxBudgetUSD < 0 || l.MaxBudgetUSD > CeilingMaxBudgetUSD:
 		errs = append(errs, fmt.Sprintf("max_budget_usd %.2f is outside 0..%.0f", l.MaxBudgetUSD, CeilingMaxBudgetUSD))
+	case l.MaxBudgetUSD > leftBudget+1e-9:
+		errs = append(errs, fmt.Sprintf("max_budget_usd %.2f exceeds what the $%.0f ceiling leaves across this job's attempts ($%.2f counted, $%.2f left)",
+			l.MaxBudgetUSD, CeilingMaxBudgetUSD, usedCost, math.Max(leftBudget, 0)))
 	case l.MaxBudgetUSD > 0:
 		out.MaxBudgetUSD = l.MaxBudgetUSD
 	case out.MaxBudgetUSD < 0.01:
-		errs = append(errs, "no budget left of the previous limit: pass max_budget_usd")
+		errs = append(errs, "no budget left of the previous limit"+unknown+": pass max_budget_usd")
 	}
 	switch {
 	case l.TimeoutMinutes < 0 || l.TimeoutMinutes > CeilingTimeoutMinutes:
 		errs = append(errs, fmt.Sprintf("timeout_minutes %d is outside 1..%d", l.TimeoutMinutes, CeilingTimeoutMinutes))
+	case l.TimeoutMinutes > leftMin:
+		errs = append(errs, fmt.Sprintf("timeout_minutes %d exceeds what the %d-minute ceiling leaves across this job's attempts (%d used, %d left)",
+			l.TimeoutMinutes, CeilingTimeoutMinutes, usedMin, max(leftMin, 0)))
 	case l.TimeoutMinutes > 0:
 		out.TimeoutMinutes = l.TimeoutMinutes
 	case out.TimeoutMinutes < 1:
@@ -344,11 +521,23 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
-	lim, err := resumeLimits(j, l)
+	if err := m.checkProjectClaude(j, filepath.Join(m.JobDir(id), "work")); err != nil {
+		return nil, err
+	}
+	earlier, err := m.Store.Attempts(id)
 	if err != nil {
 		return nil, err
 	}
-	if err := m.Store.Requeue(id, lim, strings.TrimSpace(context), ""); err != nil {
+	lim, err := resumeLimits(j, earlier, l)
+	if err != nil {
+		return nil, err
+	}
+	update := strings.TrimSpace(context)
+	if j.StartedAt == nil && strings.TrimSpace(j.PendingContext) != "" {
+		// A resume stopped while still queued never ran: its update is kept, this one follows.
+		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
+	}
+	if err := m.Store.Requeue(id, lim, update, ""); err != nil {
 		return nil, err
 	}
 	m.Log.Printf("job %s: resume queued (attempt %d)", id, j.Attempt+1)
@@ -369,7 +558,9 @@ func pickF(v, d float64) float64 {
 	return d
 }
 
-// Amend appends the orchestrator's update to the brief of a queued job; its queue position is kept.
+// Amend appends the orchestrator's update to a queued job; its queue position is kept. A queued
+// first attempt gets it in its brief; a queued resume in its pending update (what the resumed session
+// gets as its new message, and a fresh-session fallback too).
 func (m *Manager) Amend(id, context string) (*store.Job, error) {
 	if strings.TrimSpace(context) == "" {
 		return nil, errors.New("context is required")
@@ -387,7 +578,12 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s is %s: only a queued job can be amended (stop and resume a running one): %w",
 			id, j.Status, store.ErrImmutable)
 	}
-	if err := m.Store.Amend(id, "\n\n"+updateBlock(context)); err != nil {
+	if j.Attempt > 0 {
+		err = m.Store.AmendContext(id, "\n\n"+strings.TrimSpace(context))
+	} else {
+		err = m.Store.Amend(id, "\n\n"+updateBlock(context))
+	}
+	if err != nil {
 		return nil, err
 	}
 	return m.Store.Get(id)
@@ -524,6 +720,9 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	} else if err := os.MkdirAll(work, 0o700); err != nil {
 		return launchPlan{}, err
 	}
+	if err := m.checkProjectClaude(j, work); err != nil {
+		return launchPlan{}, err
+	}
 	if err := m.refreshJobFiles(j, dir, gitDirs...); err != nil {
 		return launchPlan{}, err
 	}
@@ -542,7 +741,8 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{}, err
 	}
 	fresh := NewSessionID()
-	if j.SessionID != "" && sessionExists(j.SessionID) {
+	intact, why := m.sessionIntact(j)
+	if intact {
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunResume); err != nil {
 			return launchPlan{}, err
 		}
@@ -550,7 +750,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{args: ResumeClaudeArgs(j, dir), wrapper: []string{"--prompt", resumePromptFile,
 			"--fallback-prompt", fallbackPromptFile, "--fallback-session", fresh}}, nil
 	}
-	m.Log.Printf("job %s: session %q not found on disk, attempt %d starts a fresh session", j.ID, j.SessionID, j.Attempt)
+	m.Log.Printf("job %s: session %q %s, attempt %d starts a fresh session", j.ID, j.SessionID, why, j.Attempt)
 	j.SessionID, j.RunMode = fresh, store.RunFallback
 	if err := m.Store.SetSession(j.ID, token, fresh, store.RunFallback); err != nil {
 		return launchPlan{}, err

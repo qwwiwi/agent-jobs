@@ -224,9 +224,10 @@ type Activity struct {
 	ByStatus    map[string]int `json:"by_status"`
 	Started     int            `json:"started"`  // jobs created in the window
 	Finished    int            `json:"finished"` // jobs finished in the window
-	CostUSD     float64        `json:"cost_usd"` // of jobs finished in the window
+	CostUSD     float64        `json:"cost_usd"` // of jobs and earlier attempts finished in the window
 	Turns       int            `json:"turns"`
 	DurationSec int            `json:"duration_sec"`
+	Attempts    int            `json:"earlier_attempts,omitempty"` // earlier attempts of resumed jobs finished in the window
 	Jobs        []*store.Job   `json:"-"`
 	Truncated   bool           `json:"truncated,omitempty"`
 }
@@ -259,6 +260,12 @@ func (m *Manager) ActivityReport(window time.Duration) (Activity, error) {
 			a.DurationSec += j.DurationSec
 		}
 	}
+	// A resumed job's row holds only its current attempt; the earlier ones are in the attempts table.
+	n, turns, cost, dur, err := m.Store.AttemptTotals(since)
+	if err != nil {
+		return a, err
+	}
+	a.Attempts, a.Turns, a.CostUSD, a.DurationSec = n, a.Turns+turns, a.CostUSD+cost, a.DurationSec+dur
 	a.Jobs = list
 	return a, nil
 }

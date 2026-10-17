@@ -534,7 +534,62 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int,
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
 	}
+	m.recordAttemptEnd(j, res)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+}
+
+// recordAttemptEnd records, for a finished attempt, whether its cost is unknown (claude ran but no
+// result event came) and the digest of its session transcript (checked before the session is resumed).
+func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult) {
+	dir := m.JobDir(j.ID)
+	if fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl")); !res.Found && err == nil && fi.Size() > 0 {
+		if err := m.Store.SetCostUnknown(j.ID); err != nil {
+			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
+		}
+	}
+	digest := ""
+	if p := m.transcriptPath(j); p != "" {
+		d, err := sessionDigest(p, j.SessionID)
+		if err != nil {
+			m.Log.Printf("job %s: session digest: %v", j.ID, err)
+		}
+		digest = d
+	}
+	if err := m.Store.SetSessionDigest(j.ID, digest); err != nil {
+		m.Log.Printf("job %s: record session digest: %v", j.ID, err)
+	}
+}
+
+// sweepEscaped ends what a stopped or cancelled job left outside its process group (a process that
+// called setpgid, found by the job marker or the job's session, as doctor procs --kill does) and
+// returns a note for the job: what was killed, what was left running (a process leading its own
+// session may host other work and is never killed), or that it could not be checked.
+func (m *Manager) sweepEscaped(id string) string {
+	rep, err := m.doctorProcs(true, id)
+	if err != nil {
+		return "processes outside the job's process group not checked: " + err.Error()
+	}
+	if !rep.Supported {
+		return "processes outside the job's process group not checked (needs Linux /proc)"
+	}
+	var notes, left []string
+	if rep.Killed > 0 {
+		notes = append(notes, fmt.Sprintf("%d process(es) outside the job's process group killed", rep.Killed))
+	}
+	for _, g := range rep.Ghosts {
+		if g.Killed {
+			continue
+		}
+		why := "leads its own session, never killed"
+		if g.KillError != "" {
+			why = g.KillError
+		}
+		left = append(left, fmt.Sprintf("pid %d %s (%s)", g.PID, Printable(g.Cmdline, 80), why))
+	}
+	if len(left) > 0 {
+		notes = append(notes, "left running: "+strings.Join(left, ", ")+"; see doctor procs")
+	}
+	return strings.Join(notes, "; ")
 }
 
 // killRunning ends a running job's process group (SIGTERM, KillGrace, SIGKILL). Callers hold the
@@ -606,5 +661,16 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
-	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now); err != nil {
+		return err
+	}
+	if j.Status == store.StatusRunning {
+		if note := m.sweepEscaped(id); note != "" {
+			m.Log.Printf("job %s cancelled: %s", id, note)
+			if err := m.Store.AppendError(id, note); err != nil {
+				m.Log.Printf("job %s: record note: %v", id, err)
+			}
+		}
+	}
+	return nil
 }

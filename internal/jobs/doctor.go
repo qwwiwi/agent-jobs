@@ -235,7 +235,10 @@ func liveJob(j *store.Job) bool {
 // wrapper is dead. It only reports, unless kill is set: then every job ghost (never a leader or a
 // suspect) gets SIGTERM, DoctorKillGrace, SIGKILL – through a pidfd opened first and only after its
 // start time and session were re-read and found unchanged, so a reused pid is never signalled.
-func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
+func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) { return m.doctorProcs(kill, "") }
+
+// doctorProcs is DoctorProcs; with only set, it reports (and kills) the ghosts of that job only.
+func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 	rep := ProcsReport{Kill: kill, Ghosts: []Ghost{}, DeadRows: []DeadRow{}}
 	running, err := m.Store.ListByStatus(store.StatusRunning)
 	if err != nil {
@@ -371,6 +374,9 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) {
 			g.Kind = GhostSuspect
 			g.Reason = kind + " whose session leader is gone (not tied to a job: reported, never killed)"
 		default:
+			continue
+		}
+		if only != "" && g.JobID != only {
 			continue
 		}
 		rep.Ghosts = append(rep.Ghosts, g)

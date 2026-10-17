@@ -69,7 +69,7 @@ func TestStopRunningThenResumeSameSession(t *testing.T) {
 		!ValidSessionID(st.SessionID) || st.Attempt != 1 || st.RunMode != store.RunNew {
 		t.Fatalf("stopped row: %+v", st)
 	}
-	if !sessionExists(st.SessionID) {
+	if m.transcriptPath(st) == "" || st.SessionDigest == "" || !st.CostUnknown {
 		t.Fatal("the session transcript must be on disk")
 	}
 	if _, err := os.Stat(filepath.Join(work, "wip.txt")); err != nil {
@@ -89,12 +89,13 @@ func TestStopRunningThenResumeSameSession(t *testing.T) {
 		t.Fatalf("second stop: %v", err)
 	}
 
-	r, err := m.Resume(st.ID, "NEW_FACT_42: use the other API", Limits{})
+	// Stopped before its result event: the cost is unknown, so the budget must be given.
+	r, err := m.Resume(st.ID, "NEW_FACT_42: use the other API", Limits{MaxBudgetUSD: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.Status != store.StatusQueued || r.MaxTurns != DefaultMaxTurns-1 || r.TimeoutMinutes != DefaultTimeoutMinutes-(st.DurationSec+59)/60 ||
-		r.MaxBudgetUSD != DefaultMaxBudgetUSD || r.PendingContext != "NEW_FACT_42: use the other API" {
+		r.MaxBudgetUSD != 4 || r.PendingContext != "NEW_FACT_42: use the other API" {
 		t.Fatalf("resumed row: %+v", r)
 	}
 	j := runToEnd(t, m, st.ID)
@@ -254,7 +255,7 @@ func TestResumeMissingSessionFallsBack(t *testing.T) {
 	sessionsHome(t, false) // the fake claude keeps no transcripts
 	repo := newRepo(t)
 	st := startAndStop(t, m, func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
-	if _, err := m.Resume(st.ID, "FALLBACK_UPDATE", Limits{}); err != nil {
+	if _, err := m.Resume(st.ID, "FALLBACK_UPDATE", Limits{MaxBudgetUSD: 4}); err != nil {
 		t.Fatal(err)
 	}
 	j := runToEnd(t, m, st.ID)
@@ -284,7 +285,7 @@ func TestResumeFailureFallsBackInWrapper(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, true)
 	st := startAndStop(t, m, nil)
-	if _, err := m.Resume(st.ID, "FAKE_RESUME_FAIL please", Limits{}); err != nil {
+	if _, err := m.Resume(st.ID, "FAKE_RESUME_FAIL please", Limits{MaxBudgetUSD: 4}); err != nil {
 		t.Fatal(err)
 	}
 	j := runToEnd(t, m, st.ID)
@@ -327,7 +328,7 @@ func TestResumeRestoresCleanedWorktree(t *testing.T) {
 	if _, err := os.Stat(work); !os.IsNotExist(err) {
 		t.Fatal("precondition: worktree removed")
 	}
-	r, err := m.Resume(j.ID, "fix the exit code", Limits{})
+	r, err := m.Resume(j.ID, "fix the exit code", Limits{MaxBudgetUSD: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,18 +352,18 @@ func TestResumeRestoresCleanedWorktree(t *testing.T) {
 // Default limits are what the previous attempt left; nothing left needs explicit limits.
 func TestResumeLimits(t *testing.T) {
 	j := &store.Job{MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, Turns: 30, CostUSD: 2.505, DurationSec: 61}
-	l, err := resumeLimits(j, Limits{})
+	l, err := resumeLimits(j, nil, Limits{})
 	if err != nil || l.MaxTurns != 50 || l.MaxBudgetUSD != 7.49 || l.TimeoutMinutes != 43 {
 		t.Fatalf("remaining: %+v %v", l, err)
 	}
 	timedOut := &store.Job{MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, Turns: 30, CostUSD: 1, DurationSec: 45*60 + 20}
-	if _, err := resumeLimits(timedOut, Limits{}); err == nil || !strings.Contains(err.Error(), "pass timeout_minutes") {
+	if _, err := resumeLimits(timedOut, nil, Limits{}); err == nil || !strings.Contains(err.Error(), "pass timeout_minutes") {
 		t.Fatalf("timed out without new time: %v", err)
 	}
-	if l, err := resumeLimits(timedOut, Limits{TimeoutMinutes: 30}); err != nil || l.TimeoutMinutes != 30 || l.MaxTurns != 50 {
+	if l, err := resumeLimits(timedOut, nil, Limits{TimeoutMinutes: 30}); err != nil || l.TimeoutMinutes != 30 || l.MaxTurns != 50 {
 		t.Fatalf("explicit timeout: %+v %v", l, err)
 	}
-	if _, err := resumeLimits(j, Limits{MaxBudgetUSD: CeilingMaxBudgetUSD + 1}); err == nil {
+	if _, err := resumeLimits(j, nil, Limits{MaxBudgetUSD: CeilingMaxBudgetUSD + 1}); err == nil {
 		t.Fatal("budget above the ceiling accepted")
 	}
 }
@@ -376,7 +377,10 @@ func TestPruneRemovesJobSessions(t *testing.T) {
 	if err != nil || len(paths) != 1 || filepath.Dir(filepath.Dir(paths[0])) != filepath.Join(cfg, "projects") {
 		t.Fatalf("session paths %v %v", paths, err)
 	}
-	other := filepath.Join(cfg, "projects", "fake", NewSessionID()+".jsonl")
+	other := filepath.Join(cfg, "projects", "-other-project", NewSessionID()+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(other), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(other, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}

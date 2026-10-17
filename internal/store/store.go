@@ -87,6 +87,12 @@ type Job struct {
 	RunMode string
 	// PendingContext is the orchestrator update the current (or next) attempt was resumed with.
 	PendingContext string
+	// CostUnknown marks an attempt that ran claude but ended without its result event (stopped or
+	// killed): CostUSD is then 0 and the attempt counts at its whole budget against the limits.
+	CostUnknown bool
+	// SessionDigest is the digest of the session transcript recorded when the attempt ended; a resume
+	// continues the session only while the transcript still has it.
+	SessionDigest string
 }
 
 // Attempt is one earlier attempt of a resumed job (the current attempt is the job row itself).
@@ -101,6 +107,7 @@ type Attempt struct {
 	TimeoutMinutes int
 	Turns          int
 	CostUSD        float64
+	CostUnknown    bool
 	DurationSec    int
 	Error          string
 	Context        string
@@ -262,6 +269,9 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN run_mode TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN pending_context TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ReserveSubagent counts one more subagent for running job id unless max are already used. It
@@ -308,7 +318,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context`
+	pending_context, cost_unknown, session_digest`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -325,13 +335,13 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -348,7 +358,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest)
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +479,36 @@ func (s *Store) Amend(id, text string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET brief = brief || ? WHERE id=? AND status='queued'`, text, id))
 }
 
+// AmendContext appends text to the pending update of a queued resume (what the resumed session gets).
+func (s *Store) AmendContext(id, text string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET pending_context = pending_context || ? WHERE id=? AND status='queued'
+		AND attempt > 0`, text, id))
+}
+
+// SetCostUnknown marks the cost of a finished attempt as unknown (it ended without a result event).
+func (s *Store) SetCostUnknown(id string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET cost_unknown=1 WHERE id=? AND status NOT IN ('queued','running')`, id))
+}
+
+// SetSessionDigest records the digest of the job's session transcript.
+func (s *Store) SetSessionDigest(id, digest string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET session_digest=? WHERE id=?`, digest, id))
+}
+
+// AppendError appends a note to the error of a job that is no longer running.
+func (s *Store) AppendError(id, note string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET error = CASE error WHEN '' THEN ? ELSE error || '; ' || ? END
+		WHERE id=? AND status NOT IN ('queued','running')`, note, note, id))
+}
+
+// AttemptTotals sums the archived attempts that finished at or after since: how many, their turns,
+// cost and duration (the current attempt of each job is its row).
+func (s *Store) AttemptTotals(since time.Time) (n, turns int, cost float64, durationSec int, err error) {
+	err = s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(turns),0), COALESCE(SUM(cost_usd),0), COALESCE(SUM(duration_sec),0)
+		FROM attempts WHERE finished_at >= ?`, since.Unix()).Scan(&n, &turns, &cost, &durationSec)
+	return n, turns, cost, durationSec, err
+}
+
 // ResumeLimits are the limits of the next attempt.
 type ResumeLimits struct {
 	MaxTurns       int
@@ -477,7 +517,8 @@ type ResumeLimits struct {
 }
 
 // Requeue queues the next attempt of a stopped, timed-out or failed job: the current attempt is
-// archived in the attempts table (when it ran), then the row goes back to queued with the new limits
+// archived in the attempts table when it ran (started_at set: a resume stopped while still queued
+// never ran, and its attempt number is already archived), then the row goes back to queued with the new limits
 // and context, its run fields reset (notify and cleanup start over). brief, when not empty, replaces
 // the brief (a job stopped before it ever ran gets the update appended to its brief instead).
 // It keeps created_at, so the job keeps its original queue position.
@@ -489,14 +530,14 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	defer func() { _ = tx.Rollback() }()
 	const resumable = `status IN ('stopped','timeout','failed')`
 	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
-		timeout_minutes, turns, cost_usd, duration_sec, error, context, session_id, started_at, finished_at)
+		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
-		max_budget_usd, timeout_minutes, turns, cost_usd, duration_sec, error, pending_context, session_id,
-		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND `+resumable, id); err != nil {
+		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, pending_context, session_id,
+		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		cleaned_at=NULL, turns=0, cost_usd=0, duration_sec=0, error='', max_turns=?, max_budget_usd=?,
+		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
@@ -513,7 +554,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 // Attempts returns the archived attempts of a job, oldest first (the current one is the job row).
 func (s *Store) Attempts(id string) ([]Attempt, error) {
 	rows, err := s.db.Query(`SELECT job_id, n, mode, status, model, max_turns, max_budget_usd, timeout_minutes,
-		turns, cost_usd, duration_sec, error, context, session_id, started_at, finished_at
+		turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at
 		FROM attempts WHERE job_id=? ORDER BY n`, id)
 	if err != nil {
 		return nil, fmt.Errorf("query attempts: %w", err)
@@ -524,7 +565,7 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 		var a Attempt
 		var started, finished sql.NullInt64
 		if err := rows.Scan(&a.JobID, &a.N, &a.Mode, &a.Status, &a.Model, &a.MaxTurns, &a.MaxBudgetUSD,
-			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
+			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.CostUnknown, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
 			&started, &finished); err != nil {
 			return nil, fmt.Errorf("scan attempt: %w", err)
 		}

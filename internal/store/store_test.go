@@ -225,3 +225,53 @@ func TestRequeueArchivesAttemptAndAmend(t *testing.T) {
 		t.Fatalf("attempt 1: %+v", a)
 	}
 }
+
+// A requeued attempt that is stopped before it ran is not archived again by the next Requeue (it
+// would collide with the attempt already archived); its update is kept by the caller.
+func TestRequeueOfNeverRunAttemptSkipsArchive(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Unix(1760000000, 0)
+	if err := st.Insert(&Job{ID: "j", Agent: "a", Title: "t", Kind: "fix", Brief: "b", Status: StatusQueued, Model: "m",
+		MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim("j", "tok", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Finish("j", "", StatusStopped, 1, 0, 60, "stopped", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Requeue("j", ResumeLimits{MaxTurns: 9, MaxBudgetUSD: 3, TimeoutMinutes: 30}, "u1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AmendContext("j", "\n\nu2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Finish("j", "", StatusStopped, 0, 0, 0, "stopped while queued", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Requeue("j", ResumeLimits{MaxTurns: 9, MaxBudgetUSD: 3, TimeoutMinutes: 30}, "u1\n\nu2\n\nu3", ""); err != nil {
+		t.Fatalf("second requeue: %v", err)
+	}
+	atts, err := st.Attempts("j")
+	if err != nil || len(atts) != 1 || atts[0].Status != StatusStopped {
+		t.Fatalf("attempts: %+v %v", atts, err)
+	}
+	j, err := st.Get("j")
+	if err != nil || j.Status != StatusQueued || j.PendingContext != "u1\n\nu2\n\nu3" {
+		t.Fatalf("row: %+v %v", j, err)
+	}
+	if err := st.SetCostUnknown("j"); err == nil {
+		t.Fatal("cost unknown set on a queued row")
+	}
+	if err := st.SetSessionDigest("j", "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if j, _ := st.Get("j"); j.SessionDigest != "abc" {
+		t.Fatalf("digest: %+v", j)
+	}
+}

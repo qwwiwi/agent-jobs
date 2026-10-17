@@ -466,7 +466,11 @@ func cmdResult(args []string) error {
 		return err
 	}
 	for _, a := range atts {
-		fmt.Printf("attempt %d: %s %s · %d turns · $%.2f · %ds · %s\n", a.N, a.Mode, a.Status, a.Turns, a.CostUSD,
+		cost := fmt.Sprintf("$%.2f", a.CostUSD)
+		if a.CostUnknown {
+			cost = "cost unknown"
+		}
+		fmt.Printf("attempt %d: %s %s · %d turns · %s · %ds · %s\n", a.N, a.Mode, a.Status, a.Turns, cost,
 			a.DurationSec, filepath.Join(m.JobDir(id), jobs.AttemptReportName(a.N)))
 	}
 	if len(atts) > 0 {

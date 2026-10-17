@@ -148,7 +148,10 @@ func (m *Manager) settings(kind, guardCmd string) map[string]any {
 		deny = append(deny, webTools...)
 	}
 	return map[string]any{
-		"permissions": map[string]any{"deny": deny},
+		// Settings given with --settings outrank project settings: a .claude/settings.json in the work dir
+		// (the repository's, or one the job wrote before a resume) cannot turn the guard hook off.
+		"disableAllHooks": false,
+		"permissions":     map[string]any{"deny": deny},
 		"hooks": map[string]any{
 			"PreToolUse": []any{
 				map[string]any{

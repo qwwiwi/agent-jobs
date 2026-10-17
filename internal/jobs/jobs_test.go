@@ -40,12 +40,25 @@ sid=""; resume=""; args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[i]}" in --session-id) sid="${args[i+1]}" ;; --resume) resume="${args[i+1]}" ;; esac
 done
+# As claude: the project dir is the physical cwd with every non-alphanumeric character as '-'.
+proj="${FAKE_SESSIONS-}/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')"
 if [[ -n "${FAKE_SESSIONS-}" ]]; then
-  if [[ -n $resume && ( ! -f "$FAKE_SESSIONS/projects/fake/$resume.jsonl" || $prompt == *FAKE_RESUME_FAIL* ) ]]; then
+  if [[ -n $resume && ( ! -f "$proj/$resume.jsonl" || $prompt == *FAKE_RESUME_FAIL* ) ]]; then
     echo "No conversation found with session ID: $resume" >&2
     exit 1
   fi
-  if [[ -n $sid ]]; then mkdir -p "$FAKE_SESSIONS/projects/fake" && echo '{}' > "$FAKE_SESSIONS/projects/fake/$sid.jsonl"; fi
+  if [[ -n $sid ]]; then mkdir -p "$proj" && echo '{}' > "$proj/$sid.jsonl"; fi
+  if [[ -n $resume ]]; then echo '{"resumed":true}' >> "$proj/$resume.jsonl"; fi
+fi
+if [[ $prompt == *FAKE_ESCAPE* ]]; then
+  # A process that leaves the job's process group but stays in its session (setpgid).
+  python3 -c 'import os,sys,time; os.setpgid(0,0); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(120)' \
+    ../escaped.pid </dev/null >/dev/null 2>&1 &
+fi
+if [[ $prompt == *FAKE_DAEMON* ]]; then
+  # A process that leads its own session (setsid): reported, never killed.
+  setsid python3 -c 'import os,sys,time; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(120)' \
+    ../daemon.pid </dev/null >/dev/null 2>&1 &
 fi
 if [[ $prompt == *FAKE_WIP* ]]; then
   echo wip > wip.txt

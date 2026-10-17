@@ -62,7 +62,7 @@ New facts, a changed plan or a correction while a job exists:
 | any | the work is no longer wanted, or the brief was wrong from the start | `job_cancel(id)` (and start a new job) |
 
 - Resume runs the **same job id** in the same worktree and the same claude session: the job keeps what it read and did, including turns that produced no commit. It receives one message, «Orchestrator update» + your context + «continue, keep the report contract». Write the context like a brief delta: what changed, what to do now, what to drop.
-- Limits of the continuation default to what the previous attempt left. After a timeout nothing is left of the time: pass `timeout_minutes` (and other limits as needed), within the ceilings.
+- Limits of the continuation default to what the previous attempt left. After a timeout nothing is left of the time: pass `timeout_minutes` (and other limits as needed). A stopped or timed-out attempt usually has no reported cost and counts at its whole budget: pass `max_budget_usd`. All attempts of a job together stay within the ceilings.
 - If the session cannot be resumed (it was pruned, or `--resume` fails), the attempt starts a fresh session in the same worktree with the brief, a summary of the previous attempt and your context; the job-done line says `fresh session` and the report must say so.
 - Succeeded and cancelled jobs cannot be resumed; start a new job (put the old report's findings in its brief).
 - A stopped job holds its worktree and gets no job-done line until you resume or cancel it: do not leave it.
