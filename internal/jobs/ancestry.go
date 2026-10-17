@@ -3,15 +3,11 @@ package jobs
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -179,69 +175,3 @@ func procStat(pid int) (state string, sid int, err error) {
 	sid, err = strconv.Atoi(f[3])
 	return f[0], sid, err
 }
-
-// sessionMembers lists the live (non-zombie) processes of session sid other than this process.
-func sessionMembers(sid int) []int {
-	ents, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil
-	}
-	self := os.Getpid()
-	var out []int
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		if st, s, err := procStat(pid); err == nil && s == sid && st != "Z" {
-			out = append(out, pid)
-		}
-	}
-	return out
-}
-
-// SweepGrace is the wait between SIGTERM and SIGKILL of a finished job's leftover processes.
-var SweepGrace = 3 * time.Second
-
-// sweepSession ends every other process of the wrapper's session once claude has exited: SIGTERM,
-// up to SweepGrace, then SIGKILL, repeated until the session is empty (bounded). The wrapper leads
-// the session (setsid), so this catches processes in other process groups and orphans re-parented
-// away from it. Linux reads /proc; elsewhere only the wrapper's process group gets SIGTERM (the
-// wrapper ignores it meanwhile). It returns how many processes were signalled.
-func sweepSession(log io.Writer) int {
-	sid, err := unix.Getsid(0)
-	if err != nil || sid != os.Getpid() {
-		return 0 // not a session leader (e.g. run by hand): nothing of ours to sweep
-	}
-	if runtime.GOOS != "linux" {
-		signalIgnore(syscall.SIGTERM)
-		_ = syscall.Kill(-sid, syscall.SIGTERM)
-		return 0
-	}
-	signalled := map[int]bool{}
-	for round := 0; round < 5; round++ {
-		pids := sessionMembers(sid)
-		if len(pids) == 0 {
-			return len(signalled)
-		}
-		for _, p := range pids {
-			signalled[p] = true
-			_ = syscall.Kill(p, syscall.SIGTERM)
-		}
-		deadline := time.Now().Add(SweepGrace)
-		for time.Now().Before(deadline) && len(sessionMembers(sid)) > 0 {
-			time.Sleep(50 * time.Millisecond)
-		}
-		for _, p := range sessionMembers(sid) {
-			_ = syscall.Kill(p, syscall.SIGKILL)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if left := sessionMembers(sid); len(left) > 0 {
-		fmt.Fprintf(log, "run-wrapper: %d process(es) of the session survived the sweep: %v\n", len(left), left)
-	}
-	return len(signalled)
-}
-
-// signalIgnore is signal.Ignore; a variable so the non-Linux sweep stays testable.
-var signalIgnore = signal.Ignore

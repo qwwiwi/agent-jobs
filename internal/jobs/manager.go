@@ -503,7 +503,11 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int,
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
 // exit 0 without a report is a failure.
+// A sweep marker (processes outlived claude) fails the job whatever claude's exit was.
 func Verdict(code int, res StreamResult, dir string) (string, string) {
+	if reason := sweepFailure(dir); reason != "" {
+		return store.StatusFailed, reason
+	}
 	if code != 0 {
 		return store.StatusFailed, fmt.Sprintf("claude exited with code %d", code)
 	}

@@ -40,9 +40,14 @@ func Printable(s string, max int) string {
 }
 
 // DoneLine is the one line delivered to the agent's live session.
+// A job failed because processes survived it says so at the end of the line.
 func DoneLine(j *store.Job) string {
-	return fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
+	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
 		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
+	if strings.HasPrefix(j.Error, ReasonSurvivors) {
+		line += " · " + ReasonSurvivors
+	}
+	return line
 }
 
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the

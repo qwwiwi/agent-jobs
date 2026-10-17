@@ -206,8 +206,18 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
-	if n := sweepSession(stderrLog); n > 0 {
-		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", n)
+	sw := sweepSession(stderrLog)
+	if sw.Signalled > 0 {
+		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
+	}
+	if sw.Incomplete() {
+		// Fail closed: exit_code is still written (the job is over for the daemon), but the marker makes
+		// the daemon fail the job instead of reporting a clean success.
+		fmt.Fprintf(stderrLog, "run-wrapper: sweep incomplete: survivors %v, error: %v\n", sw.Survivors, sw.Err)
+		if err := writeSweepMarker(jobDir, sw); err != nil {
+			fmt.Fprintln(stderrLog, "run-wrapper: write sweep marker:", err)
+			return 2 // no exit_code: the daemon fails the job as a dead wrapper
+		}
 	}
 	res := ParseStream(filepath.Join(jobDir, "stream.jsonl"))
 	if res.Text != "" {

@@ -77,6 +77,10 @@ if [[ $prompt == *FAKE_ORPHAN* ]]; then
     env -u AGENT_JOBS_JOB "$AGENT_JOBS_SELF" start --agent agentb --title t --model opus --brief b > "$JOBDIR/orphan.out" 2>&1
     echo "exit=$?" >> "$JOBDIR/orphan.out"' & )
 fi
+if [[ $prompt == *FAKE_SURVIVOR* ]]; then
+  # A leftover in the wrapper's session (re-parented sleep); the test makes it unkillable.
+  ( sleep 60 & echo $! > ../survivor.pid )
+fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
