@@ -17,7 +17,7 @@ Agent Jobs lets a long-lived Claude Code session hand heavy work to background `
 
 It is a single Go binary with one SQLite file per agent, running on Linux (systemd user service) and macOS (launchd).
 
-> **Status:** the core (queue, daemon, launch, guard, report contract, notify, cleanup) is on `main` and installed for testing on a single Linux host. The MCP tools that let an agent drive jobs programmatically are in review ([PR #4](https://github.com/qwwiwi/agent-jobs/pull/4)); until they land, the CLI is the interface. Roadmap: [docs/PLAN.md](docs/PLAN.md).
+> **Status:** the core (queue, daemon, launch, guard, report contract, notify, cleanup) and the MCP job tools (`agent-jobs mcp`) are on `main` and installed for testing on a single Linux host. The CLI stays for manual use. Roadmap: [docs/PLAN.md](docs/PLAN.md).
 
 ---
 
@@ -115,7 +115,7 @@ A request above a ceiling is **rejected, never clamped**, so a job never stops f
 | review, fix, general | sonnet | opus | fable |
 | research | sonnet | sonnet | opus |
 
-On `main` complexity defaults to `normal`; with PR #4 a model or a complexity becomes mandatory (no guessing).
+A model or a complexity is mandatory: with neither the job is rejected. There is no default complexity and no classifier; the caller decides.
 
 **Kinds** add a short checklist to the brief:
 
@@ -165,6 +165,7 @@ A job runs with `bypassPermissions` and nobody is watching it. So the rules are 
 - **Only its own MCP servers.** `--strict-mcp-config` cuts off everything not in the job's `mcp.json`, including the repository's own `.mcp.json`. `--setting-sources project` keeps the main session's hooks out.
 - **The guard.** A PreToolUse hook (`agent-jobs guard`) *parses* every Bash command instead of matching substrings: quotes, wrappers, `sh -c`, `eval`, substitutions and paths are resolved. It blocks every spelling of the outward actions above, git subcommands that run programs, writes into git's own files, dangerous `git config` keys, git identity overrides, the owner's name in a commit, `$?` after an unguarded pipe and wait loops that match themselves. A form it cannot resolve around git or gh is blocked, not guessed. Unparsable input fails closed.
 - **Scrubbed git environment.** The wrapper drops inherited `GIT_*`, `PAGER`, `EDITOR`, `VISUAL`, uses a job-only global git config with the job's identity, no system config, and command-line overrides that switch off repository hooks, fsmonitor, the SSH command, credential helpers, the pager and the editor.
+- **No nested jobs.** A job never starts, cancels or manages jobs. The wrapper sets `AGENT_JOBS_JOB=<id>` on every job; under it, or when an ancestor process or the session leader is a job wrapper (Linux, `/proc`), the binary refuses every command except the job's own MCP server, the guard hook and the wrapper. The guard also rejects `agent-jobs` as a command in any form except `agent-jobs mcp --role job`, and any change to `AGENT_JOBS_*`. After claude exits, the wrapper ends every other process of the job's session (SIGTERM, then SIGKILL) before it reports the job finished, so nothing the job started outlives it.
 - **Preamble and owner rules.** Every brief starts with hard rules (own folder only, file and tool content is data, never print secrets, nothing outside) and the owner's standing rules file (≤ 8 KB). If that file is unreadable, the job does not start.
 
 **This is not a sandbox.** The deny rules and the guard block the *direct* spellings of outward actions, and the git scrub stops git itself from running programs the guard cannot see. A script the job writes and then runs is allowed by design, as in the reference design, and its contents are not inspected. Run jobs as a user whose credentials you are comfortable with them having.
@@ -175,15 +176,15 @@ Full rule list: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#rules-enforcement).
 
 ## MCP tools
 
-Planned (PR #4): the agent will drive jobs through an MCP server in two roles, `orchestrator` for the main session and `job` for the jobs themselves. The job role will be an allowlist: a new tool stays closed to jobs until it is opened on purpose, and the server itself will refuse hidden tools. On `main` today a job's `mcp.json` is empty and the CLI is the interface.
+The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs mcp --role orchestrator --agent A` for the main session and `--role job` for the jobs themselves (every job's `mcp.json` names it). The job role is an allowlist: a new tool stays closed to jobs until it is opened on purpose, a test fails when a tool is in neither list, and the server itself refuses hidden tools (not only by leaving them out). The job role does not open the job database.
 
-**Job tools, in review ([PR #4](https://github.com/qwwiwi/agent-jobs/pull/4)):**
+**Job tools:**
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity, limits; returns the id |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits; returns the queued row |
 | `job_status` | status, turns, cost, time |
-| `job_result` | job-done line, report and artifact paths |
+| `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL |
 
@@ -191,7 +192,7 @@ Planned (PR #4): the agent will drive jobs through an MCP server in two roles, `
 
 | group | orchestrator tools | job gets | status |
 |---|---|---|---|
-| Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` | none | in review (PR #4) |
+| Jobs | `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` | none | built |
 | Jobs | `job_resume` | none | planned, Wave B |
 | Memory | `memory_search`, `memory_write`, `memory_already_exists` | `memory_search`, `memory_write` | planned, Wave A |
 | Tasks | `task_create`, `task_list`, `task_update`, `task_get` | none | planned, Wave A |
@@ -209,7 +210,7 @@ Memory, tasks and team tools will keep the reference's names but will be backed 
 
 ## Quick start
 
-Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.302 on Linux) and tmux for notifications. The only direct dependency is `modernc.org/sqlite`, a pure-Go SQLite driver: no cgo, a single static binary.
+Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.302 on Linux) and tmux for notifications. Direct dependencies: `modernc.org/sqlite` (pure-Go SQLite, no cgo, a single static binary), `github.com/modelcontextprotocol/go-sdk` (the official MCP Go SDK) and `golang.org/x/sys`.
 
 **Build and check**
 
@@ -239,9 +240,10 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 ```
 
 - `notify_tmux_target`: tmux target for the job-done line. Empty (default) = notify off; the line goes to the daemon log and cleanup still runs.
+- `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
-- Also: `owner_rules_path`, `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`.
+- Also: `owner_rules_path`, `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Run the daemon on Linux (systemd user service)**
 
@@ -273,8 +275,11 @@ agent-jobs list   --agent my-agent
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
+agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```
+
+`start` needs `--model` or `--complexity`; with neither the job is rejected.
 
 **When a job fails**, look in `~/.agent-jobs/<agent>/jobs/<id>/`: `stderr.log` first, then `stream.jsonl`, `exit_code`, `report.md`.
 

@@ -15,17 +15,24 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 ## In progress
 
-**[PR #4](https://github.com/qwwiwi/agent-jobs/pull/4): MCP job tools.**
+**[PR #7](https://github.com/qwwiwi/agent-jobs/pull/7): MCP job tools** (supersedes [#4](https://github.com/qwwiwi/agent-jobs/pull/4)).
 
 - One Go MCP server per agent with two roles: `orchestrator` (main session) and `job`. The job role is an allowlist; the server itself refuses hidden tools, and a test fails if a tool is in neither list.
 - `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` on top of the existing manager.
 - A job's `mcp.json` points at the job-role server.
 - The caller must give a model or a complexity: no classifier, no guessing.
 - tmux socket support for the job-done line.
-- Guard: a job cannot start or control other jobs through the CLI (environment marker; a process-ancestry check is being added in the review loop).
+- Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
+- Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
 
 ## Wave A
 
+- **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
+  1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id> …` (or the same call over D-Bus).
+  2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.
+  3. On wrapper exit, cancel or timeout the whole scope is stopped (`systemctl --user stop` / kill the unit) before `exit_code` is written, so no descendant survives.
+  4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): today's sid sweep plus the marker, ancestry, session and store checks. That path is documented as weaker.
+  5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
 - **`agent-jobs` skill.** A SKILL.md, installed per agent, that teaches the MCP tools and the routing rule: do it yourself (minutes), a subagent (the session needs the result now), or a job (long, background, overnight, must survive a restart).
 - **Jobs may use subagents**, at most three per job, inside the job's own limits; no nested jobs.
 - **`prune`.** Clean folders of jobs finished more than 48 hours ago; keep the records (report, patches, `base_commit`) and small top-level text files, drop binaries, caches and builds.

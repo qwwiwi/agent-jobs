@@ -203,6 +203,22 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	}
 	defer stderrLog.Close()
 	code := runClaude(jobDir, argv, stderrLog)
+	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
+	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
+	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
+	sw := sweepSession(stderrLog)
+	if sw.Signalled > 0 {
+		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
+	}
+	if sw.Incomplete() {
+		// Fail closed: exit_code is still written (the job is over for the daemon), but the marker makes
+		// the daemon fail the job instead of reporting a clean success.
+		fmt.Fprintf(stderrLog, "run-wrapper: sweep incomplete: survivors %v, error: %v\n", sw.Survivors, sw.Err)
+		if err := writeSweepMarker(jobDir, sw); err != nil {
+			fmt.Fprintln(stderrLog, "run-wrapper: write sweep marker:", err)
+			return 2 // no exit_code: the daemon fails the job as a dead wrapper
+		}
+	}
 	res := ParseStream(filepath.Join(jobDir, "stream.jsonl"))
 	if res.Text != "" {
 		if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(res.Text+"\n")); err != nil {
@@ -234,6 +250,11 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
 		return 127
 	}
+	env, err = JobEnv(jobDir, env)
+	if err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
+		return 127
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
@@ -250,6 +271,29 @@ func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
 		return 127
 	}
 	return 0
+}
+
+// JobEnvVar marks every process of a job: the wrapper sets AGENT_JOBS_JOB=<job id> on claude, and
+// children inherit it. The agent-jobs binary refuses its control commands under it (no nested jobs);
+// doctor procs will find a job's processes by it. The guard rejects unsetting or changing it.
+const JobEnvVar = "AGENT_JOBS_JOB"
+
+// InsideJob returns the job id when this process runs inside a job (the marker is set, even empty).
+func InsideJob() (string, bool) { return os.LookupEnv(JobEnvVar) }
+
+// JobEnv returns env without any inherited marker, plus AGENT_JOBS_JOB=<id of jobDir>.
+func JobEnv(jobDir string, env []string) ([]string, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar {
+			out = append(out, kv)
+		}
+	}
+	return append(out, JobEnvVar+"="+filepath.Base(abs)), nil
 }
 
 // Job git environment: files in the job dir (written by prepare; created empty here if missing).
