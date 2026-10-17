@@ -30,15 +30,28 @@ type toolDef struct {
 	add  func(s *sdk.Server, d Deps)
 }
 
-// definitions is every tool this binary can serve. Each name must be in exactly one audience list.
-func definitions() []toolDef {
-	return []toolDef{
-		{"job_start", addJobStart},
-		{"job_status", addJobStatus},
-		{"job_result", addJobResult},
-		{"job_list", addJobList},
-		{"job_cancel", addJobCancel},
-	}
+// toolDefs is every tool this binary can serve. Each name must be in exactly one audience list.
+var toolDefs = []toolDef{
+	{"job_start", addJobStart},
+	{"job_status", addJobStatus},
+	{"job_result", addJobResult},
+	{"job_list", addJobList},
+	{"job_cancel", addJobCancel},
+}
+
+func definitions() []toolDef { return toolDefs }
+
+// addManagerTool registers a tool whose handler uses d.Manager. The job role runs without a manager,
+// so a tool made job-visible later fails as a clean tool error instead of a nil dereference.
+func addManagerTool[In, Out any](s *sdk.Server, d Deps, t *sdk.Tool, h sdk.ToolHandlerFor[In, Out]) {
+	name := t.Name
+	sdk.AddTool(s, t, func(ctx context.Context, req *sdk.CallToolRequest, in In) (*sdk.CallToolResult, Out, error) {
+		if d.Manager == nil {
+			var zero Out
+			return nil, zero, fmt.Errorf("tool %s needs the job database, which this server does not open (job role)", name)
+		}
+		return h(ctx, req, in)
+	})
 }
 
 const orchestratorInstructions = `agent-jobs runs long work as background "claude -p" jobs.
@@ -115,8 +128,10 @@ func enforceRole(role Role) sdk.Middleware {
 // The orchestrator role opens the agent's job manager; the job role opens nothing.
 func Serve(ctx context.Context, role Role, agent string) error {
 	var d Deps
-	if id, inside := jobs.InsideJob(); inside && role != RoleJob {
-		return fmt.Errorf("refused: the %s role does not run inside job %q (%s is set)", role, id, jobs.JobEnvVar)
+	if role != RoleJob {
+		if err := jobs.CheckNotInJob(); err != nil {
+			return fmt.Errorf("%s role: %w", role, err)
+		}
 	}
 	if role == RoleOrchestrator {
 		m, err := jobs.Open(agent)
@@ -124,6 +139,9 @@ func Serve(ctx context.Context, role Role, agent string) error {
 			return err
 		}
 		defer m.Close()
+		if err := m.CheckNotInJobSession(); err != nil {
+			return fmt.Errorf("%s role: %w", role, err)
+		}
 		d.Manager = m
 	} else if _, err := jobs.StateDir(agent); err != nil {
 		return err // validates the agent name

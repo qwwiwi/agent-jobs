@@ -3,6 +3,7 @@ package guard
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1038,17 +1039,17 @@ func TestCheckNoNestedJobs(t *testing.T) {
 		cmd   string
 		block bool
 	}{
-		{"start", `agent-jobs start --agent thrall --title t --model opus --brief x`, true},
-		{"mcp orchestrator", `agent-jobs mcp --role orchestrator --agent thrall`, true},
+		{"start", `agent-jobs start --agent agent1 --title t --model opus --brief x`, true},
+		{"mcp orchestrator", `agent-jobs mcp --role orchestrator --agent agent1`, true},
 		{"mcp role=orchestrator", `agent-jobs mcp --role=orchestrator`, true},
 		{"mcp two roles", `agent-jobs mcp --role job --role orchestrator`, true},
-		{"mcp no role", `agent-jobs mcp --agent thrall`, true},
-		{"mcp extra flag", `agent-jobs mcp --role job --agent thrall --x y`, true},
+		{"mcp no role", `agent-jobs mcp --agent agent1`, true},
+		{"mcp extra flag", `agent-jobs mcp --role job --agent agent1 --x y`, true},
 		{"mcp extra positional", `agent-jobs mcp --role job start`, true},
-		{"cancel", `agent-jobs cancel --agent thrall 261017-1`, true},
-		{"tick", `agent-jobs tick --agent thrall`, true},
-		{"daemon", `agent-jobs daemon --agent thrall`, true},
-		{"list", `agent-jobs list --agent thrall`, true},
+		{"cancel", `agent-jobs cancel --agent agent1 261017-1`, true},
+		{"tick", `agent-jobs tick --agent agent1`, true},
+		{"daemon", `agent-jobs daemon --agent agent1`, true},
+		{"list", `agent-jobs list --agent agent1`, true},
 		{"bare", `agent-jobs`, true},
 		{"path", `/home/u/.local/bin/agent-jobs start --title t`, true},
 		{"relative path", `./agent-jobs tick`, true},
@@ -1056,7 +1057,7 @@ func TestCheckNoNestedJobs(t *testing.T) {
 		{"suffix build", `./agent-jobs-linux tick`, true},
 		{"env wrapper", `env FOO=1 agent-jobs tick`, true},
 		{"command wrapper", `command agent-jobs tick`, true},
-		{"nohup", `nohup agent-jobs daemon --agent thrall &`, true},
+		{"nohup", `nohup agent-jobs daemon --agent agent1 &`, true},
 		{"timeout", `timeout 5 agent-jobs tick`, true},
 		{"bash -c", `bash -c 'agent-jobs tick'`, true},
 		{"sh -c", `sh -c "agent-jobs start --title t"`, true},
@@ -1069,8 +1070,8 @@ func TestCheckNoNestedJobs(t *testing.T) {
 		{"xargs", `echo tick | xargs agent-jobs`, true},
 		{"python -c", `python3 -c 'import subprocess; subprocess.run(["agent-jobs", "tick"])'`, true},
 		{"cp binary", `cp /home/u/.local/bin/agent-jobs ./x`, true},
-		{"mcp job role ok", `agent-jobs mcp --role job --agent thrall`, false},
-		{"mcp job role= ok", `agent-jobs mcp --agent=thrall --role=job`, false},
+		{"mcp job role ok", `agent-jobs mcp --role job --agent agent1`, false},
+		{"mcp job role= ok", `agent-jobs mcp --agent=agent1 --role=job`, false},
 		{"which ok", `which agent-jobs`, false},
 		{"grep ok", `grep -rn agent-jobs docs`, false},
 		{"echo ok", `echo agent-jobs`, false},
@@ -1089,6 +1090,23 @@ func TestCheckNoNestedJobs(t *testing.T) {
 		{"expand assign", `echo ${AGENT_JOBS_JOB:=x}`, true},
 		{"env assign", `env AGENT_JOBS_JOB= ./run.sh`, true},
 		{"env -i", `env -i ./run.sh`, true},
+		{"mapfile", `mapfile AGENT_JOBS_JOB < /dev/null`, true},
+		{"mapfile -t", `mapfile -t AGENT_JOBS_JOB < /dev/null`, true},
+		{"mapfile -d -u", `mapfile -d , -u 3 AGENT_JOBS_JOB 3< /dev/null`, true},
+		{"mapfile attached", `mapfile -tAGENT_JOBS_JOB < /dev/null`, true},
+		{"readarray", `readarray AGENT_JOBS_JOB < /dev/null`, true},
+		{"readarray -t", `readarray -t AGENT_JOBS_HOME < /dev/null`, true},
+		{"builtin unset", `builtin unset AGENT_JOBS_JOB`, true},
+		{"command unset", `command unset AGENT_JOBS_JOB`, true},
+		{"builtin declare", `builtin declare +x AGENT_JOBS_JOB`, true},
+		{"builtin mapfile", `builtin mapfile AGENT_JOBS_JOB < /dev/null`, true},
+		{"unset -v", `unset -v AGENT_JOBS_JOB`, true},
+		{"local", `f() { local AGENT_JOBS_JOB; ./run.sh; }; f`, true},
+		{"printf -v attached", `printf -vAGENT_JOBS_JOB ''`, true},
+		{"printf -v after --", `printf -- -v AGENT_JOBS_JOB`, false},
+		{"printf arg ok", `printf '%s\n' AGENT_JOBS_JOB`, false},
+		{"printf -v other ok", `printf -v X '%s' AGENT_JOBS_JOB`, false},
+		{"mapfile other ok", `mapfile -t lines < AGENT_JOBS_JOB.txt`, false},
 		{"read marker ok", `echo "$AGENT_JOBS_JOB"`, false},
 		{"grep marker ok", `grep -rn AGENT_JOBS_JOB docs`, false},
 	}
@@ -1099,5 +1117,50 @@ func TestCheckNoNestedJobs(t *testing.T) {
 				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
 			}
 		})
+	}
+}
+
+// The marker rule against a real bash: every command the guard lets through keeps AGENT_JOBS_JOB in a
+// child's environment, and every one it rejects really removes it (so the rule targets real losses).
+func TestJobMarkerSurvivesAllowedCommands(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	cfg := Config{}
+	child := `; printenv AGENT_JOBS_JOB || echo GONE`
+	for _, c := range []struct {
+		cmd     string
+		allowed bool
+	}{
+		{`printf '%s\n' AGENT_JOBS_JOB`, true},
+		{`printf -v X '%s' AGENT_JOBS_JOB`, true},
+		{`mapfile -t lines < /dev/null`, true},
+		{`echo "$AGENT_JOBS_JOB"`, true},
+		{`mapfile AGENT_JOBS_JOB < /dev/null`, false},
+		{`readarray -t AGENT_JOBS_JOB < /dev/null`, false},
+		{`unset AGENT_JOBS_JOB`, false},
+		{`builtin unset AGENT_JOBS_JOB`, false},
+		{`command unset AGENT_JOBS_JOB`, false},
+		{`declare +x AGENT_JOBS_JOB`, false},
+		{`export -n AGENT_JOBS_JOB`, false},
+		{`printf -v AGENT_JOBS_JOB ''`, false},
+	} {
+		if got := Check(c.cmd, cfg) == ""; got != c.allowed {
+			t.Fatalf("Check(%q) allowed=%v, want %v", c.cmd, got, c.allowed)
+		}
+		cmd := exec.Command(bash, "-c", c.cmd+child)
+		cmd.Env = append(os.Environ(), "AGENT_JOBS_JOB=job-1")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%q: %v", c.cmd, err)
+		}
+		kept := strings.Contains(string(out), "job-1\n") && !strings.Contains(string(out), "GONE")
+		if c.allowed && !kept {
+			t.Fatalf("allowed %q dropped the marker: %q", c.cmd, out)
+		}
+		if !c.allowed && kept {
+			t.Fatalf("rejected %q does not drop the marker in bash (rule needless?): %q", c.cmd, out)
+		}
 	}
 }

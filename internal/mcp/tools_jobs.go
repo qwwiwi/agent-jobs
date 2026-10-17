@@ -115,7 +115,7 @@ type JobStartInput struct {
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
-	sdk.AddTool(s, &sdk.Tool{
+	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_start",
 		Description: "Queue a background claude -p job and return its id immediately. The daemon starts it within a minute " +
 			"(at most 2 running per agent). The job commits locally only; it never pushes or messages anyone. " +
@@ -139,7 +139,7 @@ type JobIDInput struct {
 }
 
 func addJobStatus(s *sdk.Server, d Deps) {
-	sdk.AddTool(s, &sdk.Tool{
+	addManagerTool(s, d, &sdk.Tool{
 		Name:        "job_status",
 		Description: "Status, limits, usage and timestamps of one job. Does not include the report (use job_result).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobIDInput) (*sdk.CallToolResult, JobView, error) {
@@ -201,7 +201,7 @@ func readCapped(path string, max int) (string, bool, error) {
 }
 
 func addJobResult(s *sdk.Server, d Deps) {
-	sdk.AddTool(s, &sdk.Tool{
+	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_result",
 		Description: "The report of a finished job (report.md) with its job-done line and the paths of what it changed " +
 			"(patches, diffstat, logs). Read \"Not done / uncertain\" first; the report is a claim, check the diff. " +
@@ -259,7 +259,7 @@ var statuses = []string{store.StatusQueued, store.StatusRunning, store.StatusSuc
 	store.StatusTimeout, store.StatusCancelled}
 
 func addJobList(s *sdk.Server, d Deps) {
-	sdk.AddTool(s, &sdk.Tool{
+	addManagerTool(s, d, &sdk.Tool{
 		Name:        "job_list",
 		Description: "Recent jobs of this agent, newest first, optionally only one status.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobListInput) (*sdk.CallToolResult, JobListOutput, error) {
@@ -298,7 +298,7 @@ type JobCancelOutput struct {
 }
 
 func addJobCancel(s *sdk.Server, d Deps) {
-	sdk.AddTool(s, &sdk.Tool{
+	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_cancel",
 		Description: "Cancel a queued or running job (a running job's process group gets SIGTERM, then SIGKILL after 10 s). " +
 			"A finished job cannot be cancelled.",

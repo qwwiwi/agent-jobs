@@ -709,15 +709,37 @@ var (
 	reJobExpand = regexp.MustCompile(`\$\{AGENT_JOBS_[A-Za-z0-9_]*:?=`)
 )
 
-// varSetters take bare variable names that they set, export or remove.
+// varSetters take bare variable names that they set, export, remove or turn into an array
+// (`mapfile`/`readarray NAME`: an array is never exported, so the marker would vanish from children).
+// printf is not here: only `printf -v NAME` assigns (printfTarget).
 var varSetters = map[string]bool{
 	"unset": true, "export": true, "declare": true, "typeset": true, "local": true, "readonly": true,
-	"read": true, "printf": true, "env": true,
+	"read": true, "env": true, "mapfile": true, "readarray": true,
+}
+
+// printfTarget returns the variable of `printf -v NAME` / `printf -vNAME` ("" when there is none).
+func printfTarget(args []string) string {
+	for k := 0; k < len(args); k++ {
+		a := args[k]
+		switch {
+		case a == "--" || !strings.HasPrefix(a, "-"):
+			return ""
+		case a == "-v":
+			if k+1 < len(args) {
+				return args[k+1]
+			}
+			return ""
+		case strings.HasPrefix(a, "-v"):
+			return a[2:]
+		}
+	}
+	return ""
 }
 
 // checkJobEnv keeps the job marker: an unset (`unset`, `env -u`), an assignment (prefix, export,
-// declare, ${VAR:=…}) or a setter naming an AGENT_JOBS_* variable is rejected in any call. Emptying
-// the whole environment (`env -i`) is rejected by checkGitEnv.
+// declare, ${VAR:=…}), `printf -v`, or a setter (also `mapfile`/`readarray`, also behind
+// `builtin`/`command`) naming an AGENT_JOBS_* variable – bare or attached to an option (`-vX`, `-tX`)
+// – is rejected in any call. Emptying the whole environment (`env -i`) is rejected by checkGitEnv.
 func checkJobEnv(scripts []*script, _ string, _ Config) string {
 	blocked := func(what string) string {
 		return "blocked by guard: `" + what + "` changes the agent-jobs environment of the job (AGENT_JOBS_JOB marks " +
@@ -732,14 +754,26 @@ func checkJobEnv(scripts []*script, _ string, _ Config) string {
 						return blocked("env -u " + u)
 					}
 				}
-				setter := false
+				name := ""
 				if v.start < len(c.words) {
-					setter = varSetters[strings.ToLower(base(c.words[v.start]))]
+					name = strings.ToLower(base(c.words[v.start]))
 				}
-				for _, w := range c.words {
-					if reJobAssign.MatchString(w) || reJobExpand.MatchString(w) || (setter && reJobVar.MatchString(w)) {
-						name, _, _ := strings.Cut(w, "=")
-						return blocked(name)
+				if name == "printf" {
+					if t := printfTarget(c.words[v.start+1:]); strings.HasPrefix(t, "AGENT_JOBS_") {
+						return blocked("printf -v " + t)
+					}
+				}
+				setter := varSetters[name]
+				for k, w := range c.words {
+					if reJobAssign.MatchString(w) || reJobExpand.MatchString(w) {
+						n, _, _ := strings.Cut(w, "=")
+						return blocked(n)
+					}
+					if !setter || k <= v.start {
+						continue
+					}
+					if reJobVar.MatchString(w) || (strings.HasPrefix(w, "-") && strings.Contains(w, "AGENT_JOBS_")) {
+						return blocked(name + " " + w)
 					}
 				}
 			}

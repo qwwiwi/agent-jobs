@@ -535,15 +535,15 @@ func TestNotifyUsesTmuxSocket(t *testing.T) {
 	logf := filepath.Join(t.TempDir(), "tmux.log")
 	t.Setenv("FAKE_TMUX_LOG", logf)
 	m.Cfg.NotifyTmuxTarget = "fake-session"
-	m.Cfg.TmuxSocket = "arthas"
+	m.Cfg.TmuxSocket = "agent2"
 	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
 	b, err := os.ReadFile(logf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "-L|arthas|send-keys|-t|fake-session|-l|[jobs:job-done] job "+j.ID) ||
-		lines[1] != "-L|arthas|send-keys|-t|fake-session|Enter|" {
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "-L|agent2|send-keys|-t|fake-session|-l|[jobs:job-done] job "+j.ID) ||
+		lines[1] != "-L|agent2|send-keys|-t|fake-session|Enter|" {
 		t.Fatalf("tmux calls:\n%s", b)
 	}
 	for _, bad := range []string{"/tmp/sock", "-S", "../x", "a b"} {

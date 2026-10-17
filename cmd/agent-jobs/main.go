@@ -89,14 +89,11 @@ func main() {
 	}
 }
 
-// refuseInsideJob: no nested jobs. Under the job marker (AGENT_JOBS_JOB, set by the wrapper on every
-// job) only the job's own MCP server (`mcp --role job`), the guard hook, run-wrapper and help run;
-// every command that reads or changes the agent's jobs is refused.
+// refuseInsideJob: no nested jobs. Inside a job – the env marker AGENT_JOBS_JOB is set (the wrapper
+// sets it on every job) or an ancestor process is the job wrapper (Linux /proc) – only the job's own
+// MCP server (`mcp --role job`), the guard hook, run-wrapper and help run; every command that reads or
+// changes the agent's jobs is refused. open() adds the session check once the agent is known.
 func refuseInsideJob(cmd string, args []string) string {
-	id, inside := jobs.InsideJob()
-	if !inside {
-		return ""
-	}
 	switch cmd {
 	case "run-wrapper", "guard", "-h", "--help", "help":
 		return ""
@@ -105,8 +102,10 @@ func refuseInsideJob(cmd string, args []string) string {
 			return ""
 		}
 	}
-	return fmt.Sprintf("refused: running inside job %q (%s is set); a job never starts, cancels or manages jobs, "+
-		"only the orchestrator does", id, jobs.JobEnvVar)
+	if err := jobs.CheckNotInJob(); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // mcpRole returns the --role value of `mcp` args ("" when absent or unparsable).
@@ -182,7 +181,15 @@ func open(agent string) (*jobs.Manager, error) {
 	if agent == "" {
 		return nil, errors.New("--agent is required")
 	}
-	return jobs.Open(agent)
+	m, err := jobs.Open(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.CheckNotInJobSession(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
+	return m, nil
 }
 
 func cmdInit(args []string) error {

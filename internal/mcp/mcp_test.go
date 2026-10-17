@@ -3,11 +3,13 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -501,5 +503,124 @@ func TestJobResultRefusesNonRegularFiles(t *testing.T) {
 			}
 			t.Fatalf("case %d: job_result blocked on a non-regular report.md", i)
 		}
+	}
+}
+
+// No nested jobs, layer 2 (process-based): with the env marker gone, a control command started under
+// a (fake, script) job wrapper is still refused by the ppid walk, while the guard hook still runs.
+func TestBinaryRefusesUnderWrapperAncestor(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ancestry check is Linux-only (/proc)")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "agent-jobs")
+	body := "#!/bin/bash\n\"$REAL_BIN\" $CHILD_ARGS\necho \"exit=$?\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(childArgs string, stdin string) string {
+		cmd := exec.Command(script, "run-wrapper", filepath.Join(dir, "jobs", "x"), "--token", "t", "--", "claude")
+		cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+dir, "REAL_BIN="+selfBin, "CHILD_ARGS="+childArgs)
+		cmd.Stdin = strings.NewReader(stdin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("fake wrapper: %v %s", err, out)
+		}
+		return string(out)
+	}
+	for _, args := range []string{"list --agent test", "tick --agent test", "start --agent test --title t --model opus --brief b",
+		"mcp --role orchestrator --agent test"} {
+		if out := run(args, ""); !strings.Contains(out, "refused: running under the job wrapper") || strings.Contains(out, "exit=0") {
+			t.Fatalf("%s under a wrapper ancestor: %s", args, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "test")); err == nil {
+		t.Fatal("a refused command created the agent's state dir")
+	}
+	if out := run("guard", `{"tool_name":"Bash","tool_input":{"command":"ls"}}`); !strings.Contains(out, "exit=0") {
+		t.Fatalf("guard under a wrapper ancestor: %s", out)
+	}
+	// Without the wrapper in the chain the same command runs.
+	cmd := exec.Command(selfBin, "list", "--agent", "test")
+	cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("list without a wrapper: %v %s", err, out)
+	}
+}
+
+// No nested jobs, layer 3: a process in the session of a running job (the wrapper's setsid session,
+// recorded as the job's pgid) is refused even without the marker and outside the wrapper's subtree.
+func TestBinaryRefusesInJobSession(t *testing.T) {
+	m := newManager(t)
+	home := os.Getenv("AGENT_JOBS_HOME")
+	cmd := exec.Command("bash", "-c", `read x; exec "$REAL_BIN" list --agent test`)
+	cmd.Env = append(os.Environ(), "REAL_BIN="+selfBin)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := m.Store.Insert(&store.Job{ID: "261017-130000-5e55", Agent: "test", Title: "t", Kind: "general", Brief: "b",
+		Status: store.StatusRunning, Model: "opus", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1, CreatedAt: now,
+		StartedAt: &now, PID: cmd.Process.Pid, PGID: cmd.Process.Pid}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(stdin, "\n")
+	_ = stdin.Close()
+	err = cmd.Wait()
+	if err == nil || !strings.Contains(out.String(), "refused: running inside a job's session") {
+		t.Fatalf("list in a job's session: %v %s (home %s)", err, out.String(), home)
+	}
+}
+
+func TestIsWrapperCmdline(t *testing.T) {
+	for _, c := range []struct {
+		argv []string
+		want bool
+	}{
+		{[]string{"/home/u/.local/bin/agent-jobs", "run-wrapper", "/s/jobs/1", "--token", "t", "--", "claude"}, true},
+		{[]string{"/bin/bash", "/tmp/agent-jobs", "run-wrapper", "/s/jobs/1", "--token", "t"}, true},
+		{[]string{"agent-jobs", "run-wrapper"}, false},
+		{[]string{"agent-jobs", "list", "run-wrapper", "x", "--token"}, false},
+		{[]string{"vim", "x", "y", "run-wrapper", "a", "--token"}, false},
+	} {
+		if got := jobs.IsWrapperCmdline(c.argv); got != c.want {
+			t.Fatalf("%v = %v", c.argv, got)
+		}
+	}
+}
+
+// A tool made job-visible that needs the manager fails as a tool error in the job role (no manager),
+// not with a nil dereference that would kill the job's MCP server.
+func TestJobRoleToolWithoutManagerFailsCleanly(t *testing.T) {
+	savedDefs, savedAllowed := toolDefs, JobAllowed
+	t.Cleanup(func() { toolDefs, JobAllowed = savedDefs, savedAllowed })
+	toolDefs = append(slices.Clone(savedDefs), toolDef{"dummy_count", func(s *sdk.Server, d Deps) {
+		addManagerTool(s, d, &sdk.Tool{Name: "dummy_count", Description: "test"},
+			func(_ context.Context, _ *sdk.CallToolRequest, _ JobListInput) (*sdk.CallToolResult, JobCancelOutput, error) {
+				n, err := d.Manager.Store.CountRunning()
+				return nil, JobCancelOutput{ID: fmt.Sprint(n)}, err
+			})
+	}})
+	JobAllowed = []string{"dummy_count"}
+	s, err := NewServer(RoleJob, Deps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, s)
+	if got := toolNames(t, cs); !slices.Equal(got, []string{"dummy_count"}) {
+		t.Fatalf("job tools %v", got)
+	}
+	if msg := callErr(t, cs, "dummy_count", map[string]any{}); !strings.Contains(msg, "needs the job database") {
+		t.Fatalf("dummy tool without a manager: %q", msg)
+	}
+	if got := toolNames(t, cs); len(got) != 1 { // the server survived the call
+		t.Fatalf("after the call: %v", got)
 	}
 }
