@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Job profile: `agent-jobs profile --agent A --from FILE... [--force] [--dry-run]` generates the owner-rules file from the sections of the agent's own rules marked `<!-- agent-jobs:profile -->` … `<!-- /agent-jobs:profile -->`; over 8 KB is refused and nothing is written.
 - Project cards: `<state>/cards/<name>.md` (config `cards_dir`), front matter `repo:` / `remote:`, ≤ 4 KB each; cards matching a job's repository are attached to its brief (≤ 8 KB for the rendered section, headings included). Remotes match as identities: network `host/path` (host case ignored, path case kept, scheme/user/port/`.git` ignored) or a local absolute path (relative remotes resolved against the repository), so a relative local remote never matches a network one. `agent-jobs card new --repo PATH [--name N]` writes one from the template, `agent-jobs card list [--repo PATH]` shows them. Example card: `cards/example-agent-jobs.md`.
 - The orchestrator MCP instructions and `prompts/orchestrator.md` state the routing rule and the subagent cap.
+- Docs: `docs/WORKFLOW.md` (Russian: `docs/WORKFLOW.ru.md`), how the main session works as an orchestrator: routing between itself, subagents and jobs, the pipeline, review policy, reading results, known limits; optional reminder hook `examples/hooks/prefer-jobs-reminder.sh`.
 
 ### Changed
 - A job needs an explicit model or a complexity; with neither it is rejected (no default complexity, no classifier). Limits keep their defaults and ceilings.

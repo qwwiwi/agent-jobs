@@ -325,6 +325,7 @@ agent-jobs version                      # also --version
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): internals, state layout, flows, the full rule list
+- [docs/WORKFLOW.md](docs/WORKFLOW.md): working as an orchestrator: routing, the pipeline, review policy
 - [docs/REFERENCE.md](docs/REFERENCE.md): the reference design, translated ([original in Russian](docs/REFERENCE.ru.md))
 - [docs/DEVIATIONS.md](docs/DEVIATIONS.md): every approved deviation from the reference
 - [docs/DECISIONS.md](docs/DECISIONS.md): owner decisions that shape scope
