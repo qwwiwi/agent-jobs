@@ -16,7 +16,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 ## In progress
 
-**[PR #PRNUM](https://github.com/qwwiwi/agent-jobs/pull/PRNUM): cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
+**[PR #10](https://github.com/qwwiwi/agent-jobs/pull/10): cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
 
 1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope` (config `cgroup_scope`: `auto` by default, `required`, `off`).
 2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.

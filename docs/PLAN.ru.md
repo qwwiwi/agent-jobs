@@ -16,7 +16,7 @@ Agent Jobs реализует [эталонный дизайн](REFERENCE.ru.md)
 
 ## В работе
 
-**[PR #PRNUM](https://github.com/qwwiwi/agent-jobs/pull/PRNUM): изоляция джоб в cgroup (усиление).** Проверки сессии и родителя обходятся через `setsid` и смену родителя; cgroup так не обойти. На Linux:
+**[PR #10](https://github.com/qwwiwi/agent-jobs/pull/10): изоляция джоб в cgroup (усиление).** Проверки сессии и родителя обходятся через `setsid` и смену родителя; cgroup так не обойти. На Linux:
 
 1. Демон запускает каждую обёртку в её собственном временном пользовательском scope systemd, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope` (настройка `cgroup_scope`: по умолчанию `auto`, ещё `required` и `off`).
 2. Управляющие команды отказывают, когда `/proc/self/cgroup` называет scope джобы `agent-jobs-*`. setsid, двойной fork и смена родителя остаются внутри cgroup.
