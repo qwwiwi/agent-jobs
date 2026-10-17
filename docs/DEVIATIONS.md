@@ -1,5 +1,7 @@
 # Approved deviations from REFERENCE.md
 
+Reference: [`REFERENCE.md`](REFERENCE.md) (English translation), original [`REFERENCE.ru.md`](REFERENCE.ru.md).
+
 Only these. Anything else must match the reference 1:1. New deviation = owner's explicit OK, recorded here.
 
 | # | Reference | Ours | Why / approved |
@@ -17,4 +19,4 @@ Only these. Anything else must match the reference 1:1. New deviation = owner's 
 | 11 | Scheduler «по launchd или cron» (macOS) | + Linux: the same daemon as a systemd **user** service `agent-jobs@<agent>` (`deploy/systemd/agent-jobs@.service`, `scripts/install-linux.sh`), `KillMode=process` so a daemon restart never kills running jobs (systemd counterpart of launchd `AbandonProcessGroup`), `Restart=on-failure`, daemon log in the user journal instead of `daemon.log` | platform port only, lifecycle unchanged; owner approved Linux port in Wave A and Thrall-only test install 2026-10-17 (see `docs/DECISIONS.md`) |
 
 ## Conformance check (owner 2026-10-15: «все сверки делай»)
-After every stage, before merge: Codex `gpt-6.1-sol` high walks REFERENCE.md line by line → for each claim: implemented? where (file:line)? 1:1 / deviation. Any deviation not in the table above = blocker, no merge. Result table goes to the owner.
+After every stage, before merge: Codex `gpt-6.1-sol` high walks the reference (original `REFERENCE.ru.md`) line by line → for each claim: implemented? where (file:line)? 1:1 / deviation. Any deviation not in the table above = blocker, no merge. Result table goes to the owner.
