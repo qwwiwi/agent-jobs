@@ -308,3 +308,5 @@ agent-jobs version                      # или --version
 MIT (см. [LICENSE](LICENSE)).
 
 [@qwwiwi](https://github.com/qwwiwi) (Даши Ешиев), Telegram-канал «Записки AI-энтузиаста» · EdgeLab AI. Issues и PR приветствуются.
+
+Сделано вместе с [@qdanik](https://github.com/qdanik) (Даниил Янковский): его схема – [референс](docs/REFERENCE.ru.md), по которому построен проект.

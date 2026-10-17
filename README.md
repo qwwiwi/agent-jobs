@@ -306,3 +306,5 @@ Built on a reference design for orchestrating background `claude -p` jobs (see [
 MIT (see [LICENSE](LICENSE)).
 
 [@qwwiwi](https://github.com/qwwiwi) (Dashi Eshiev), Telegram channel «Записки AI-энтузиаста» · EdgeLab AI. Issues and PRs welcome.
+
+Built together with [@qdanik](https://github.com/qdanik) (Daniil Yankouski), whose design is the [reference](docs/REFERENCE.md) this project follows.
