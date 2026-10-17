@@ -1328,3 +1328,101 @@ func TestCgroupWritesResolvedAndOutOfScopeTools(t *testing.T) {
 		})
 	}
 }
+
+// Fix loop 2 of PR #10: a write target built inside the call (substitution, a variable assigned in the
+// same call, a symlink to a dynamic target) is rejected without any cgroup mention; the out-of-scope
+// tool names count only where they run (command word, code strings, -exec argv, runners), so build and
+// test calls that merely name a package or directory after them stay allowed; a cd to a resolved
+// directory and a trailing popd make no plain variable target risky.
+func TestDynamicWriteTargetsAndScopeToolMentions(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// Write targets that get their value inside the call.
+		{"redirect to substitution", `echo $$ > $(cat t)`, true},
+		{"assigned from substitution", `P=$(cat t); echo $$ > $P`, true},
+		{"read into variable", `read p < t; echo $$ > $p`, true},
+		{"redirect to $(< f)", `echo $$ > "$(< t)"`, true},
+		{"tee substitution", `echo $$ | tee $(cat t)`, true},
+		{"dd of= substitution", `dd of=$(cat t)`, true},
+		{"base64 target", `echo $$ > $(base64 -d <<< L3N5cy9mcy9jZ3JvdXAvY2dyb3VwLnByb2Nz)`, true},
+		{"backtick target", "echo $$ > `cat t`", true},
+		{"process substitution target", `echo $$ > >(cat > x)`, true},
+		{"mapfile", `mapfile -t a < t; echo $$ > "$a"`, true},
+		{"readarray", `readarray a < t; echo $$ > $a`, true},
+		{"for loop variable", `for p in $(cat t); do echo $$ > $p; done`, true},
+		{"declare", `declare p; p=$(cat t); echo $$ > "$p"`, true},
+		{"export assignment", `export P=$(cat t) && echo $$ > "$P"`, true},
+		{"local", `f() { local p; read p < t; echo $$ > $p; }; f`, true},
+		{"typeset", `typeset p; read p < t; tee "$p" < /dev/null`, true},
+		{"printf -v", `printf -v p %s "$(cat t)"; echo $$ > $p`, true},
+		{"default expansion assigns", `: ${P:=x}; echo $$ > $P`, true},
+		{"indirect expansion", `echo $$ > ${!X}`, true},
+		{"positional after set", `set -- $(cat t); echo $$ > $1`, true},
+		{"positional in sh -c", `bash -c 'echo $$ > $1' _ "$(cat t)"`, true},
+		{"last argument", `cat $(cat t) >/dev/null; echo $$ > $_`, true},
+		{"sourced variables", `. ./vars.sh; echo $$ > "$P"`, true},
+		{"cp to substitution", `cp f "$(cat t)"`, true},
+		{"mkdir substitution", `mkdir -p $(cat t)/x`, true},
+		{"symlink to dynamic target then write", `ln -s $S x && echo 1 > x/y/memory.max`, true},
+		{"symlink to dynamic target then tee", `ln -s "$S" x; echo 1 | tee x/y/pids.max`, true},
+		{"symlink to substitution", `ln -s $(cat t) x`, true},
+		// Plain environment variables stay allowed.
+		{"env variable redirect", `echo 1 > "$OUT"`, false},
+		{"env variable braces", `echo 1 >> "${OUT}"`, false},
+		{"env variable tee", `go test ./... 2>&1 | tee "$LOG"`, false},
+		{"env variable cp", `cp a.txt "$OUT"`, false},
+		{"other variable assigned", `X=1 make > "$OUT"`, false},
+		{"substitution not a target", `echo "$(date)" > out.txt`, false},
+		{"symlink to env alone", `ln -s "$S" x`, false},
+		// Out-of-scope tool names as data (false refusals of fix loop 1).
+		{"go test ssh package", `go test ./internal/ssh/...`, false},
+		{"go build docker package", `go build ./pkg/docker/`, false},
+		{"go test -run Tmux", `go test -run Tmux ./internal/jobs/`, false},
+		{"sed ssh url", `sed -i s/ssh:/https:/ README.md`, false},
+		{"make -C docker", `make -C docker`, false},
+		{"make docker-build", `make docker-build`, false},
+		{"npm run docker", `npm run docker`, false},
+		// ... and where they run, still refused.
+		{"ssh host", `ssh host`, true},
+		{"docker run", `docker run x`, true},
+		{"tmux new", `tmux new -d`, true},
+		{"nohup tmux", `nohup tmux new -d x &`, true},
+		{"xargs docker", `echo x | xargs docker rm`, true},
+		{"find -exec ssh", `find . -exec ssh h {} \;`, true},
+		{"python -c tmux", `python3 -c "subprocess.run(['tmux'])"`, true},
+		{"bash -c pm2", `bash -c 'pm2 start x'`, true},
+		{"node -e docker", `node -e 'require("child_process").execSync("docker run x")'`, true},
+		{"perl -e cluster", `perl -ne 'system("tmux new -d x")' f`, true},
+		{"rsync -e ssh", `rsync -e ssh a b:`, true},
+		{"go test -exec", `go test -exec 'tmux new -d' ./...`, true},
+		{"setsid tmux", `setsid tmux new -d x`, true},
+		{"watch tmux", `watch 'tmux new -d x'`, true},
+		{"awk system", `awk 'BEGIN { system("crontab f") }'`, true},
+		{"trap tmux", `trap 'tmux new -d x' EXIT`, true},
+		{"cp tmux binary", `cp /usr/bin/tmux ./x`, true},
+		// cd to a resolved directory, trailing popd.
+		{"cd then cp to env", `cd sub && cp a.txt "$OUT"`, false},
+		{"cd then touch env", `cd sub && touch $F`, false},
+		{"cd then tee env", `cd x && go test ./... 2>&1 | tee "$LOG"`, false},
+		{"pushd make popd", `pushd sub && make > log && popd`, false},
+		{"popd then write", `pushd sub && popd && echo 1 > memory.max`, true},
+		{"popd then substitution", `pushd sub; popd; echo "$(echo 1 > memory.max)"`, true},
+		{"popd in loop", `for i in 1 2; do echo 1 > memory.max; popd; done`, true},
+		{"popd then function", `f() { echo 1 > memory.max; }; popd; f`, true},
+		{"popd with trap", `trap 'echo 1 > memory.max' EXIT; popd`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

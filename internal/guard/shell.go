@@ -488,6 +488,14 @@ func parseAll(src string) []*script {
 					if code, ok := shellCode(argv); ok {
 						walk(code, depth+1)
 					}
+				case name == "trap":
+					// `trap 'code' SIG…`: the code runs later in this shell (also after the last command).
+					for _, a := range argv[1:] {
+						if !strings.HasPrefix(a, "-") {
+							walk(a, depth+1)
+							break
+						}
+					}
 				default:
 					for _, code := range runnerCode(name, argv) {
 						walk(code, depth+1)

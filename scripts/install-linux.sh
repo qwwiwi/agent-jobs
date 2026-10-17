@@ -166,7 +166,12 @@ else
   echo "  building from $REPO_ROOT"
   version="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
   echo "  version $version"
-  (cd "$REPO_ROOT" && go build -trimpath -ldflags "-X main.version=$version" -o "$tmp" ./cmd/agent-jobs)
+  # No go env file and no GOFLAGS: a release build never picks up build tags (test hooks) from them.
+  (cd "$REPO_ROOT" && GOENV=off GOFLAGS= go build -trimpath -ldflags "-X main.version=$version" -o "$tmp" ./cmd/agent-jobs)
+  if go version -m "$tmp" | grep -qE '^[[:space:]]+build[[:space:]]+-tags='; then
+    echo "install-linux: the built binary has build tags (test hooks); refusing to install it" >&2
+    exit 1
+  fi
 fi
 chmod 0755 "$tmp"
 if [ -f "$BIN" ] && cmp -s "$tmp" "$BIN"; then
