@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -27,6 +28,25 @@ var procRoot = "/proc"
 
 // maxAncestry bounds the ppid walk (a loop in a corrupt /proc must not hang the check).
 const maxAncestry = 256
+
+// outerWrappers are job wrappers the in-job checks do not count: the job that runs this repository's
+// own test suite (a job working on agent-jobs). Always empty in a release build: only test code sets it,
+// in process (TestMain) or, in a binary built with -tags agentjobs_testhooks, from
+// AGENT_JOBS_TEST_OUTER_WRAPPER (outer_testhooks.go). A wrapper a test starts itself is never in it.
+var outerWrappers []int
+
+// isOuterWrapper reports a pid in outerWrappers.
+func isOuterWrapper(pid int) bool { return pid > 0 && slices.Contains(outerWrappers, pid) }
+
+// isOuterScope reports the job scope of an outer wrapper (read from its /proc/<pid>/cgroup).
+func isOuterScope(unit string) bool {
+	for _, pid := range outerWrappers {
+		if b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup")); err == nil && jobScopeIn(string(b)) == unit {
+			return true
+		}
+	}
+	return false
+}
 
 // IsWrapperCmdline reports an argv of the wrapper: `run-wrapper <jobdir> --token <T>` at position 1,
 // or at position 2 behind an interpreter running an agent-jobs script. The binary itself is matched by
@@ -82,7 +102,7 @@ func WrapperAncestor() (pid int, ok bool) {
 		if err != nil {
 			return 0, true // the ancestor exited meanwhile: the chain above it is unknown, nothing found
 		}
-		if IsWrapperCmdline(argv) {
+		if IsWrapperCmdline(argv) && !isOuterWrapper(p) {
 			return p, true
 		}
 		if p, err = procParent(p); err != nil {
@@ -100,7 +120,7 @@ func CheckNotInJob() error {
 		return fmt.Errorf("refused: running inside job %q (%s is set); a job never starts, cancels or manages jobs, "+
 			"only the orchestrator does", id, JobEnvVar)
 	}
-	if unit, _ := JobScope(); unit != "" {
+	if unit, _ := JobScope(); unit != "" && !isOuterScope(unit) {
 		return fmt.Errorf("refused: running in the cgroup of job scope %s; a job never starts, cancels or manages jobs, "+
 			"only the orchestrator does", unit)
 	}
@@ -135,7 +155,7 @@ func WrapperSession() (sid int, ok bool) {
 	if err != nil {
 		return 0, true // the leader exited: the store check (CheckNotInJobSession) still applies
 	}
-	if IsWrapperCmdline(argv) {
+	if IsWrapperCmdline(argv) && !isOuterWrapper(sid) {
 		return sid, true
 	}
 	return 0, true

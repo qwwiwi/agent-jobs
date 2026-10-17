@@ -117,12 +117,15 @@ func TestMain(m *testing.M) {
 	// Run inside a job (a job working on this repository), the binary under test would refuse its
 	// control commands; the tests set the marker themselves where they need it.
 	_ = os.Unsetenv(JobEnvVar)
+	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
+	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
+	ignoreOuterJob()
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
+	out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
 	if err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
@@ -136,6 +139,23 @@ func TestMain(m *testing.M) {
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
+
+// ignoreOuterJob records the wrapper of a job this test process runs in (ancestor or session leader)
+// as outer: not counted by the in-job checks of this process and of the hooked binary under test.
+func ignoreOuterJob() {
+	var pids []string
+	for _, find := range []func() (int, bool){WrapperAncestor, WrapperSession} {
+		if pid, _ := find(); pid > 1 && !isOuterWrapper(pid) {
+			outerWrappers = append(outerWrappers, pid)
+			pids = append(pids, fmt.Sprint(pid))
+		}
+	}
+	if len(pids) > 0 {
+		_ = os.Setenv(outerWrapperEnv, strings.Join(pids, ","))
+	}
+}
+
+const outerWrapperEnv = "AGENT_JOBS_TEST_OUTER_WRAPPER"
 
 func newManager(t *testing.T) *Manager {
 	t.Helper()

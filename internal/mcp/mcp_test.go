@@ -31,12 +31,22 @@ func TestMain(m *testing.M) {
 		}
 	}
 	_ = os.Unsetenv(jobs.JobEnvVar) // the tests set the job marker themselves where they need it
+	// Run inside a job, the binary under test (hooked build) does not count that job's wrapper.
+	var outer []string
+	for _, find := range []func() (int, bool){jobs.WrapperAncestor, jobs.WrapperSession} {
+		if pid, _ := find(); pid > 1 && !slices.Contains(outer, fmt.Sprint(pid)) {
+			outer = append(outer, fmt.Sprint(pid))
+		}
+	}
+	if len(outer) > 0 {
+		_ = os.Setenv("AGENT_JOBS_TEST_OUTER_WRAPPER", strings.Join(outer, ","))
+	}
 	dir, err := os.MkdirTemp("", "agent-jobs-mcp-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	if out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	code := m.Run()
