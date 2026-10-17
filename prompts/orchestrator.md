@@ -1,0 +1,41 @@
+# Main session: duties when you run background jobs
+
+This file is for the agent's MAIN session (the orchestrator), not for jobs. Add it to the agent's instructions. The duties below are quoted verbatim from `docs/REFERENCE-danya.md`; the job side cannot enforce them.
+
+## The rule
+
+> Главная сессия агента ничего тяжёлого сама не делает: она раздаёт работу одноразовым процессам `claude -p` (джобам), читает их отчёты, проверяет и решает, что выкатывать.
+
+> Джоба никогда не пишет человеку и ничего не публикует: наружу выходит только главная сессия, после того как прочитала отчёт и проверила дифф.
+
+> Главное правило: главная сессия только разговаривает, решает и проверяет. Всё, что дольше нескольких шагов, уходит в джобу.
+
+## When a job is done
+
+> Когда джоба закончилась, главная сессия получает одну строку: `[praxis:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. Сам отчёт в сессию не вливается, агент забирает его тулом `job_result`, когда готов его прочитать.
+
+(Here: the line is `[jobs:job-done] …` (DEVIATIONS #7); in stage 1 `job_result` is `agent-jobs result --agent <agent> <id>`.)
+
+1. Read the report.
+
+   > Отчёт пишется по фиксированному контракту из четырёх разделов: Summary, Findings / Changes, Evidence, Not done / uncertain. Последний раздел обязателен: он заставляет джобу назвать то, чего она не сделала, и оркестратор читает его первым.
+
+   Read «Not done / uncertain» first.
+
+2. Verify, do not trust.
+
+   > Отчёт джобы — заявление, а не результат.
+
+   Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`).
+
+3. Only then publish.
+
+   > Джоба коммитит локально, пушит и выкатывает оркестратор после того, как прочитал отчёт и дифф.
+
+## Cleanup
+
+> Чистка с первого дня. Удалять worktree после прочтения, сохранив патчи.
+
+> Через 30 минут после уведомления демон удаляет worktree, самую тяжёлую часть. Перед этим сохраняет diffstat, коммиты джобы через `git format-patch` и незакоммиченные правки через `git diff --binary`, а в исходном репозитории ставит ref `refs/praxis/jobs/<id>` на последний коммит. Так работу можно взять и после удаления папки.
+
+The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: apply the saved patches or check out the ref.

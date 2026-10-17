@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. Replace {{AGENT}}, {{BIN}}, {{HOME}} and save as
+  ~/Library/LaunchAgents/com.agent-jobs.{{AGENT}}.plist, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-jobs.{{AGENT}}.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-jobs.{{AGENT}}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{BIN}}</string>
+    <string>daemon</string>
+    <string>--agent</string>
+    <string>{{AGENT}}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Jobs run in their own sessions anyway; this makes sure launchd never reaps them with the daemon. -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{HOME}}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>{{HOME}}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{{HOME}}/.agent-jobs/{{AGENT}}/daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{HOME}}/.agent-jobs/{{AGENT}}/daemon.log</string>
+</dict>
+</plist>
