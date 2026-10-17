@@ -1,6 +1,6 @@
 # Main session: duties when you run background jobs
 
-This file is for the agent's MAIN session (the orchestrator), not for jobs. Add it to the agent's instructions. The duties below are quoted verbatim from `docs/REFERENCE.md`; the job side cannot enforce them.
+This file is for the agent's MAIN session (the orchestrator), not for jobs. Add it to the agent's instructions. The duties below are quoted verbatim from the Russian original of the reference, `docs/REFERENCE.ru.md` (English translation: `docs/REFERENCE.md`); the job side cannot enforce them.
 
 ## The rule
 

@@ -1,6 +1,6 @@
 # Architecture (stage 1 – core)
 
-Implements `docs/REFERENCE.md`, section «Как сделать у себя (минимум)», items 1–6. Deviations are only those in `docs/DEVIATIONS.md` (#6 model by kind × complexity, #7 naming are used here).
+Implements [`docs/REFERENCE.md`](REFERENCE.md), section «How to do it yourself (minimum)», items 1–6. Quotes in Russian below are from the original, [`docs/REFERENCE.ru.md`](REFERENCE.ru.md) (section «Как сделать у себя (минимум)»). Deviations are only those in `docs/DEVIATIONS.md` (#6 model by kind × complexity, #7 naming are used here).
 
 **MCP tools are Stage 2.** The reference starts jobs with the MCP tool `job_start` and reads reports with `job_result`. In stage 1 the CLI is the stand-in (`agent-jobs start` = job_start, `agent-jobs result` = job_result, plus status/list/cancel); the Go MCP server exposing `job_*` lands in stage 2 on top of the same Manager.
 
