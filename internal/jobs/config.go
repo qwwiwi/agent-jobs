@@ -40,6 +40,9 @@ type Config struct {
 	OwnerRulesPath string `json:"owner_rules_path"`
 	// NotifyTmuxTarget is the tmux target (e.g. "channel-silvana") for the job-done line. Empty = notify disabled.
 	NotifyTmuxTarget string `json:"notify_tmux_target"`
+	// TmuxSocket is the tmux socket name (`tmux -L <name>`) of the server that holds NotifyTmuxTarget.
+	// Empty = tmux's default socket. Needed for agents whose session runs on a named socket.
+	TmuxSocket string `json:"tmux_socket"`
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
 	// GitName / GitEmail is the job's git identity: written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL of
@@ -106,6 +109,9 @@ func LoadConfig(stateDir string) (Config, error) {
 			}
 		}
 	}
+	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
+		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
+	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
 	}
@@ -122,6 +128,17 @@ func (c Config) claudeBin() string {
 	return "claude"
 }
 
+// reTmuxSocket is a tmux socket name: a plain file name, never a path or a flag.
+var reTmuxSocket = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
+
+// tmuxArgs prefixes args with `-L <socket>` when a socket is configured.
+func (c Config) tmuxArgs(args ...string) []string {
+	if c.TmuxSocket == "" {
+		return args
+	}
+	return append([]string{"-L", c.TmuxSocket}, args...)
+}
+
 func (c Config) tmuxBin() string {
 	if b := os.Getenv("AGENT_JOBS_TMUX_BIN"); b != "" {
 		return b
@@ -132,6 +149,9 @@ func (c Config) tmuxBin() string {
 	return "tmux"
 }
 
+// Complexities a caller may state instead of a model.
+var Complexities = []string{"light", "normal", "hard"}
+
 // defaultModels implements DEVIATIONS #6: model chosen by kind × complexity.
 var defaultModels = map[string]map[string]string{
 	// "fable" is the claude CLI alias of the latest Fable model (claude-fable-5-1 on 2026-10-15).
@@ -141,14 +161,49 @@ var defaultModels = map[string]map[string]string{
 	"general":  {"light": "sonnet", "normal": "opus", "hard": "fable"},
 }
 
-// ModelFor returns the default model for kind × complexity.
+// ModelFor returns the model for kind × complexity. The complexity must be stated: there is no
+// default complexity and no classifier (owner 2026-10-17, docs/DECISIONS.md).
 func ModelFor(kind, complexity string) (string, error) {
 	if complexity == "" {
-		complexity = "normal"
+		return "", errors.New("complexity is required to pick a model (light|normal|hard)")
 	}
 	m, ok := defaultModels[kind][complexity]
 	if !ok {
 		return "", fmt.Errorf("unknown kind/complexity %q/%q (complexity: light|normal|hard)", kind, complexity)
 	}
 	return m, nil
+}
+
+// reModel is the shape of a model name or alias passed to `claude --model` (e.g. "opus",
+// "claude-opus-4-6", "claude-sonnet-4-6[1m]"). It never starts with "-", so it cannot become a flag.
+var reModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}$`)
+
+// ValidateModel rejects a malformed explicit model.
+func ValidateModel(model string) error {
+	if !reModel.MatchString(model) {
+		return fmt.Errorf("model %q is not a model name or alias", model)
+	}
+	return nil
+}
+
+// ResolveModel returns the model for a request: the explicit model if given (a stated complexity
+// must still be valid), else the kind × complexity table. Neither given = rejected, never guessed.
+func ResolveModel(kind, model, complexity string) (string, error) {
+	if model == "" && complexity == "" {
+		return "", errors.New("model or complexity is required: state an explicit model or a complexity " +
+			"(light|normal|hard); there is no default and no classifier")
+	}
+	if complexity != "" {
+		m, err := ModelFor(kind, complexity)
+		if err != nil {
+			return "", err
+		}
+		if model == "" {
+			return m, nil
+		}
+	}
+	if err := ValidateModel(model); err != nil {
+		return "", err
+	}
+	return model, nil
 }

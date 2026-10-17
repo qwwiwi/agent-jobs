@@ -40,9 +40,14 @@ func Printable(s string, max int) string {
 }
 
 // DoneLine is the one line delivered to the agent's live session.
+// A job failed because processes survived it says so at the end of the line.
 func DoneLine(j *store.Job) string {
-	return fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
+	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
 		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
+	if strings.HasPrefix(j.Error, ReasonSurvivors) {
+		line += " · " + ReasonSurvivors
+	}
+	return line
 }
 
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
@@ -76,14 +81,15 @@ func (m *Manager) notifyPending() error {
 	return nil
 }
 
-// sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key.
+// sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
+// on the configured tmux socket (-L) when there is one.
 func (m *Manager) sendTmux(target, line string) error {
 	bin := m.Cfg.tmuxBin()
 	line = Printable(line, 0)
-	if out, err := exec.Command(bin, "send-keys", "-t", target, "-l", line).CombinedOutput(); err != nil {
+	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "-l", line)...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send-keys: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if out, err := exec.Command(bin, "send-keys", "-t", target, "Enter").CombinedOutput(); err != nil {
+	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "Enter")...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send-keys Enter: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
