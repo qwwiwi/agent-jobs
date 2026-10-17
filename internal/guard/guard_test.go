@@ -249,7 +249,7 @@ func TestCheckFixLoop2(t *testing.T) {
 		{"upper-case git", "GIT push", true},
 		{"dynamic commit message", `git commit -m "$MSG"`, true},
 		{"owner via variable", `M=Alex; git commit -m "$M"`, true},
-		{"ansi-c quoted message", `git commit -m $'Da\x73hi'`, true},
+		{"ansi-c quoted message", `git commit -m $'Al\x65x'`, true},
 		{"static heredoc message", "git commit -m \"$(cat <<'EOF'\nИсправил лимиты\nEOF\n)\"", false},
 		{"static heredoc message with owner", "git commit -m \"$(cat <<'EOF'\nfix for Alex\nEOF\n)\"", true},
 		{"dynamic -C dir ok", `git -C "$dir" status`, false},
