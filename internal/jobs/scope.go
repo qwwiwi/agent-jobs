@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -336,19 +337,86 @@ var errScopeActive = errors.New("scope still active after stop")
 // systemctlBin is the systemctl the daemon calls; a variable so tests can make a stop fail.
 var systemctlBin = "systemctl"
 
+// cgroupDirOwner returns the owner uid of a cgroup directory; a variable so tests can stand in.
+var cgroupDirOwner = func(fi fs.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
+}
+
 // scopeCgroupPath is the cgroup v2 path a job scope gets from `systemd-run --user --scope` (the user
-// manager's app.slice): the daemon can reach it without the bus. The user manager's cgroup is read from
-// the daemon's own cgroup (the manager need not sit under user.slice, e.g. in a custom system slice);
-// when the daemon is not under one, it is the default /user.slice/user-<uid>.slice/user@<uid>.service.
+// manager's app.slice): the daemon can reach it without the bus. The manager need not sit under user.slice
+// (e.g. a custom system slice), and the caller need not run under it (the orchestrator's MCP server runs
+// in a system service), so the manager's cgroup is taken from the caller's own cgroup when it is under
+// it, else found by a scan of the cgroup tree; failing both, it is /user.slice/user-<uid>.slice/user@<uid>.service.
 func scopeCgroupPath(unit string) string {
 	uid := os.Getuid()
 	mgr := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service", uid, uid)
-	if b, err := os.ReadFile(cgroupFile); err == nil {
-		if p, ok := userManagerCgroup(string(b), uid); ok {
-			mgr = p
-		}
+	if p, ok := ownUserManagerCgroup(uid); ok {
+		mgr = p
+	} else if p, ok := findUserManagerCgroup(cgroupRoot, uid); ok {
+		mgr = p
 	}
 	return mgr + "/app.slice/" + unit
+}
+
+// ownUserManagerCgroup returns the user manager's cgroup when this process runs under it.
+func ownUserManagerCgroup(uid int) (string, bool) {
+	b, err := os.ReadFile(cgroupFile)
+	if err != nil {
+		return "", false
+	}
+	return userManagerCgroup(string(b), uid)
+}
+
+// userManagerScanDepth bounds the scan for the user manager's cgroup: user.slice/user-<uid>.slice/
+// user@<uid>.service is depth 3, a manager in a custom slice depth 2.
+const userManagerScanDepth = 4
+
+// findUserManagerCgroup scans the cgroup tree at root (depth <= userManagerScanDepth, symlinks not
+// followed) for a directory named user@<uid>.service owned by uid, and returns its path relative to root
+// only when there is exactly one. The scan does not descend into a match: below the manager the user can
+// create cgroups of any name. Zero matches (no manager, or deeper than the bound) or several (the user may
+// also create such a directory in another subtree delegated to it, so which one is real is unknown) give
+// false, and the caller falls back to the default path: a wrong guess would only make the sweep fail, but
+// a decoy must not be swept as the scope.
+func findUserManagerCgroup(root string, uid int) (string, bool) {
+	want := fmt.Sprintf("user@%d.service", uid)
+	var found []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if p == root {
+				return err
+			}
+			return nil // an unreadable or vanished cgroup: skip it
+		}
+		if !d.IsDir() || p == root {
+			return nil // WalkDir reports a symlink as a non-dir and does not follow it
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return fs.SkipDir
+		}
+		depth := strings.Count(rel, string(filepath.Separator)) + 1
+		if d.Name() == want {
+			if fi, ierr := d.Info(); ierr == nil {
+				if owner, ok := cgroupDirOwner(fi); ok && owner == uid {
+					found = append(found, "/"+filepath.ToSlash(rel))
+				}
+			}
+			return fs.SkipDir
+		}
+		if depth >= userManagerScanDepth {
+			return fs.SkipDir
+		}
+		return nil
+	})
+	if len(found) != 1 {
+		return "", false
+	}
+	return found[0], true
 }
 
 // userManagerCgroup returns the cgroup v2 path of the user manager (user@<uid>.service) a
