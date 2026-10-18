@@ -328,6 +328,7 @@ var migrationBackfills = map[string]string{
 		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
 			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
 	checksAlertStateAlter: checksAlertStateFill,
+	checksAlertsMoved:     checksAlertsFill,
 }
 
 // migrate runs one migration and its backfill, if any, in one transaction; a column that is already

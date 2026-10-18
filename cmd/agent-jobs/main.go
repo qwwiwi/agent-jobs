@@ -1163,6 +1163,11 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
+	if c.MarkResult == store.MarkNotStored {
+		fmt.Printf("check %s: %s (its window already holds %d marks; this one was not stored)\n",
+			c.Name, store.MarkNotStored, store.MaxMarksPerWindow)
+		return nil
+	}
 	fmt.Printf("check %s marked at %s\n", c.Name, fmtTime(c.LastMarkAt))
 	return nil
 }

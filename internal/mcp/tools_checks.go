@@ -72,9 +72,9 @@ func addCheckAdd(s *sdk.Server, d Deps) {
 		Name: "check_add",
 		Description: "Add a dead-man's switch check: a name, a cron in local time saying when something that stays silent " +
 			"while healthy must have reported, and a grace (default 60 minutes). That something calls check_mark (a job can) " +
-			"or `agent-jobs check mark NAME`. When an expected time plus its grace passes with no mark since the previous " +
-			"expected time (each mark counts for one expected time only), this session gets one line " +
-			"\"[jobs:check-missed] ...\" (once per expected time; a failed delivery is retried up to 5 times). " +
+			"or `agent-jobs check mark NAME`. A mark belongs to one expected time: the earliest whose time plus grace is not " +
+			"before the mark. When an expected time plus its grace passes and no mark belongs to it, this session gets " +
+			"\"[jobs:check-missed] ...\" (once per expected time, several in one line; a failed delivery is retried up to 5 times). " +
 			"Expected times before the check was added never alert. Checks never expire.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in CheckAddInput) (*sdk.CallToolResult, CheckOutput, error) {
 		c, err := d.Manager.AddCheck(in.Name, in.Cron, in.GraceMinutes)
@@ -90,7 +90,8 @@ func addCheckSet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "check_set",
 		Description: "Edit a check in place: its cron, its grace, enabled (false pauses it), or several. A new cron or grace, " +
-			"or enabling it, re-arms the check: expected times before now never alert.",
+			"or enabling it, re-arms the check: expected times before now never alert and marks before now never count. " +
+			"Any check_set acknowledges the check's failed alerts (they leave system_doctor); pending ones are still delivered.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in CheckSetInput) (*sdk.CallToolResult, CheckOutput, error) {
 		c, err := d.Manager.SetCheck(in.Name, in.Cron, in.GraceMinutes, in.Enabled)
 		if err != nil {
@@ -106,7 +107,8 @@ func addCheckList(s *sdk.Server, d Deps) {
 		Name: "check_list",
 		Description: "List this agent's checks, oldest first: state (ok, missed, waiting, disabled) for the latest expected " +
 			"time whose grace has passed (missed stays missed after a late mark: late_mark_at), the next expected time, " +
-			"the last mark and the last missed alert with its delivery (alert_state pending, delivered or failed).",
+			"the last mark, the newest missed alert with its delivery (alert_state pending, delivered or failed) and " +
+			"alerts_pending / alerts_failed (failed and not acknowledged by check_set) over all its alerts.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ CheckListInput) (*sdk.CallToolResult, ChecksOutput, error) {
 		list, err := d.Manager.CheckViews()
 		if err != nil {
@@ -133,7 +135,8 @@ func addCheckMark(s *sdk.Server, d Deps) {
 	sdk.AddTool(s, &sdk.Tool{
 		Name: "check_mark",
 		Description: "Leave a completion mark for a check (dead-man's switch): call it when the watched work finished well. " +
-			"An optional one-line note (at most 300 characters) is stored with it. The check must exist (check_add).",
+			"An optional one-line note (at most 300 characters) is stored with it. The check must exist (check_add). " +
+			"mark \"ok, already marked\" means the mark was accepted but not stored (its window already holds 20).",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in CheckMarkInput) (*sdk.CallToolResult, CheckMarkOutput, error) {
 		if d.JobID != "" {
 			if d.JobMarker == nil {

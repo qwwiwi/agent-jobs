@@ -48,7 +48,7 @@ func TestCheckMarkSatisfiesOneExpectedOnly(t *testing.T) {
 }
 
 // Codex review (fix loop 1, item 2): an evaluated expected time is never re-judged from marks, so
-// many marks after a satisfied daily E (more than MaxMarksPerCheck) never turn it into missed.
+// many marks after a satisfied daily E (more than a window stores) never turn it into missed.
 func TestCheckManyMarksKeepEvaluatedOK(t *testing.T) {
 	m, now, logf := scheduleManager(t, time.UTC) // 09:00
 	addCheck(t, m, "daily", "0 10 * * *", 30)

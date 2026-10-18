@@ -187,14 +187,15 @@ func TestCheckNoAlertBeforeCreation(t *testing.T) {
 	}
 }
 
-// After a long downtime only the latest missed expected time alerts, once.
+// After a long downtime every missed expected time is judged (10:00 on the first day through 08:00
+// two days later) and the alert collapses them into one line, once.
 func TestCheckDowntimeCollapsesToOneAlert(t *testing.T) {
 	m, now, logf := scheduleManager(t, time.UTC)
 	addCheck(t, m, "hourly", "0 * * * *", 10)
 	*now = time.Date(2026, 10, 21, 9, 5, 0, 0, time.UTC) // two days later
 	watch(t, m)
 	got := missedLines(t, logf)
-	if len(got) != 1 || !strings.Contains(got[0], "hourly expected 2026-10-21 08:00 UTC") {
+	if len(got) != 1 || got[0] != "[jobs:check-missed] hourly: 47 missed, latest 2026-10-21 08:00 UTC (no mark within 10m)" {
 		t.Fatalf("lines %q", got)
 	}
 	watch(t, m)

@@ -1,9 +1,11 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -13,28 +15,37 @@ import (
 
 // Dead-man's switch (PLAN Wave B): a check is a named expectation, a cron expression in local time
 // saying when something that stays silent while healthy must have reported, plus a grace. That
-// something leaves a completion mark (check_mark, `agent-jobs check mark`). In every daemon tick
-// the watchdog takes each enabled check's latest expected time E whose E+grace has passed and
-// judges it once: E is ok when a mark lies in its window (P, E+grace], P the previous expected
-// time (unbounded for the first one; no mark predates the check), and missed otherwise. Windows of
-// consecutive expected times overlap (E1's grace lies in E2's window), so each mark satisfies at
-// most one E: the earliest mark in the window that did not already satisfy an earlier E counts,
-// and the mark that satisfied E is the floor for every later one. The judgement is the evaluation
-// watermark stored on the check (E, its local minute, ok or missed, the counted mark), claimed in
-// one statement conditional on the check's revision (a check_set in between voids it) and on the
-// schedules' watermark rule (absolute time and local wall-clock minute strictly later), so an E is
-// judged once across restarts and daemons and never re-judged from marks: marks are pruned only
-// below the watermark. Only the latest E is looked at, so a long downtime gives at most one alert,
-// and expected times before the check was armed are never judged. Expected times follow the
-// schedules' DST rule: a skipped wall-clock minute is not expected, a repeated one is expected once
-// (its first instant).
+// something leaves a completion mark (check_mark, `agent-jobs check mark`).
 //
-// A missed E becomes a pending alert. Delivery runs after the tick released the lifecycle lock,
-// under tmux.lock only (sendTmuxLocked, bounded by TmuxDeliveryTimeout): each attempt is claimed
-// first (attempt counter and next-attempt time in one statement), then the line is typed, then the
-// outcome is stored. A failure is retried with backoff (1, 2, 4, 8 minutes) for up to
-// MaxCheckAlertAttempts attempts, then the alert is failed. Delivery is at-least-once: a crash
-// after the line was typed and before "delivered" was stored types it again at the next attempt.
+// Mark ownership is a pure function of the mark time and the check's cron, grace and arm time A
+// (creation, or the last change of the cron or the grace, or enabling): the expected times are the
+// cron's instants E > A (a repeated DST minute once, a skipped one never), the window of E is
+// (P+grace, E+grace] with P the previous expected time, or [A, E+grace] for the first one, and
+// the windows partition the time from A on. owner(m) is the E whose window holds m, i.e. the
+// earliest E > A with E >= m-grace; a mark before A has none. E is satisfied iff a stored mark has
+// owner E. No consumption state: the result depends neither on insertion order nor on what was
+// evaluated before or on downtime.
+//
+// In every daemon tick (lifecycle lock) the watchdog walks each enabled check's unevaluated expected
+// times in chronological order, every E with E+grace+1 s <= now after the evaluation watermark (at
+// most MaxCheckEvaluationsPerTick per check and tick; the rest the next tick), judges each from the
+// marks and claims them in one transaction conditional on the check's revision (a check_set in
+// between voids it) and the schedules' watermark rule (absolute time and local minute strictly
+// later), so each E is judged once across restarts and daemons. Each missed E becomes its own
+// pending alert row. A mark is pruned only once its owner is evaluated (or it predates A); a window
+// stores at most store.MaxMarksPerWindow marks (later ones are accepted, not stored).
+//
+// Delivery runs after the tick released the lifecycle lock (deliverCheckAlerts): each due pending
+// row is claimed (attempt counter, backoff, an attempt token) in one conditional statement; under
+// tmux.lock the rows still holding the token are re-read right before typing (a paused stale
+// attempt whose rows were claimed again or delivered meanwhile types nothing), the line is typed
+// and the outcome stored before tmux.lock is released. A check's due rows go as one part of the line
+// ("<name>: 3 missed, latest <E>"). A failure is retried with backoff (1, 2, 4, 8 minutes) per row
+// for up to MaxCheckAlertAttempts attempts, then the row is failed; no notify target counts as a
+// failed attempt. Failed rows stay in status and system_doctor until a check_set acknowledges them
+// (a later healthy E does not). Disabling a check pauses its evaluation; alerts already pending are
+// still delivered. Delivery is at-least-once: a crash after typing and before "delivered" was
+// stored types it again at the next attempt.
 
 // CheckMissedTag starts the watchdog's line in the session.
 const CheckMissedTag = "[jobs:check-missed]"
@@ -260,7 +271,9 @@ func (m *Manager) RemoveCheck(name string) error {
 }
 
 // MarkCheck records a completion mark for the check now, with an optional one-line note; jobID is
-// the job that marked it through the daemon's proxy ("" = the orchestrator or the CLI).
+// the job that marked it through the daemon's proxy ("" = the orchestrator or the CLI). A mark
+// whose window already holds store.MaxMarksPerWindow marks is accepted but not stored
+// (MarkResult "ok, already marked").
 func (m *Manager) MarkCheck(name, note, jobID string) (*store.Check, error) {
 	name, err := CheckName(name)
 	if err != nil {
@@ -269,11 +282,78 @@ func (m *Manager) MarkCheck(name, note, jobID string) (*store.Check, error) {
 	if note, err = MarkNote(note); err != nil {
 		return nil, err
 	}
-	c, err := m.Store.AddMark(name, note, jobID, m.Now())
+	at := m.Now()
+	c, err := m.Store.AddMark(name, note, jobID, at, func(ck *store.Check) (store.MarkWindow, error) {
+		s, err := m.specOf(ck)
+		if err != nil {
+			return store.MarkWindow{}, err
+		}
+		e, ok := s.owner(at)
+		if !ok {
+			return store.MarkWindow{}, nil
+		}
+		lo, hi := s.window(e)
+		return store.MarkWindow{Lo: lo, Hi: hi, OK: true}, nil
+	})
 	if errors.Is(err, store.ErrCheckNotFound) {
 		return nil, fmt.Errorf("check %q not found (check_add creates it)", name)
 	}
 	return c, err
+}
+
+// checkSpec is what mark ownership depends on: the cron, the grace and the arm time, in the
+// manager's location.
+type checkSpec struct {
+	cron  *Cron
+	grace time.Duration
+	arm   time.Time
+	loc   *time.Location
+}
+
+func (m *Manager) specOf(ck *store.Check) (checkSpec, error) {
+	c, err := ParseCron(ck.Cron)
+	if err != nil {
+		return checkSpec{}, fmt.Errorf("check %s: %w", ck.Name, err)
+	}
+	loc := m.loc()
+	return checkSpec{cron: c, grace: time.Duration(ck.GraceMinutes) * time.Minute, arm: ck.ArmedAt.In(loc), loc: loc}, nil
+}
+
+// firstExpectedFrom is the first expected time at or after t, false when there is none.
+func firstExpectedFrom(c *Cron, t time.Time) (time.Time, bool) {
+	up := t.Truncate(time.Minute)
+	if up.Before(t) {
+		up = up.Add(time.Minute)
+	}
+	return nextExpected(c, up.Add(-time.Minute)) // Next is strictly after its argument's minute
+}
+
+// armed reports whether e is an expected time of the current configuration: strictly after the
+// arm time (an expected time at the arm instant would give the watched work no time at all).
+func (s checkSpec) armed(e time.Time) bool { return e.After(s.arm) }
+
+// owner is the expected time whose window holds a mark at m (second resolution, as stored): the
+// earliest armed E >= m-grace; false for a mark before the arm time.
+func (s checkSpec) owner(m time.Time) (time.Time, bool) {
+	m = time.Unix(m.Unix(), 0).In(s.loc)
+	if m.Before(s.arm) {
+		return time.Time{}, false
+	}
+	from := m.Add(-s.grace)
+	if !s.armed(from) {
+		from = s.arm.Add(time.Second)
+	}
+	return firstExpectedFrom(s.cron, from)
+}
+
+// window is the owner window of expected time e, [lo, hi] in seconds: (P+grace, e+grace] with P
+// the previous expected time, or [arm, e+grace] when e is the first one since the arm time.
+func (s checkSpec) window(e time.Time) (lo, hi time.Time) {
+	hi = e.Add(s.grace)
+	if p, ok := latestExpected(s.cron, e.Add(-time.Minute)); ok && s.armed(p) {
+		return p.Add(s.grace + time.Second), hi
+	}
+	return s.arm, hi
 }
 
 // Check states in a CheckView.
@@ -284,8 +364,12 @@ const (
 	CheckDisabled = "disabled"
 )
 
-// MaxCheckAlertAttempts bounds the delivery attempts of one missed alert.
+// MaxCheckAlertAttempts bounds the delivery attempts of one missed alert row.
 const MaxCheckAlertAttempts = 5
+
+// MaxCheckEvaluationsPerTick bounds the expected times one tick judges per check (the rest wait
+// for the next tick).
+const MaxCheckEvaluationsPerTick = 1000
 
 // checkAlertBackoff is the wait after delivery attempt n (1-based) before the next one may start.
 func checkAlertBackoff(n int) time.Duration {
@@ -315,60 +399,59 @@ type CheckView struct {
 	loc      *time.Location
 }
 
-// evaluation is a check's latest expected time whose grace has passed (ok=false when none since
-// it was armed) and the mark that satisfies it (nil = missed).
-type evaluation struct {
-	expected time.Time
-	ok       bool
-	mark     *store.MarkRef
-}
-
 // dueExpected is the latest expected time of the check whose grace has passed at now, false when
 // none since it was armed. One second past E+grace: a mark stored in the same second as E+grace
 // (unix seconds) is already in the store when E is looked at, so an alert never contradicts the
 // window.
-func dueExpected(ck *store.Check, c *Cron, now time.Time) (time.Time, bool) {
-	grace := time.Duration(ck.GraceMinutes) * time.Minute
-	e, ok := latestExpected(c, now.Add(-grace-time.Second))
-	if !ok || e.Before(ck.ArmedAt) {
+func dueExpected(s checkSpec, now time.Time) (time.Time, bool) {
+	e, ok := latestExpected(s.cron, now.Add(-s.grace-time.Second))
+	if !ok || !s.armed(e) {
 		return time.Time{}, false
 	}
 	return e, true
 }
 
-// evaluateCheck judges the latest due expected time E from the marks: the earliest mark in
-// (P, E+grace] above the mark counted for the last time judged ok.
-func (m *Manager) evaluateCheck(ck *store.Check, c *Cron, now time.Time) (evaluation, error) {
-	e, ok := dueExpected(ck, c, now)
-	if !ok {
-		return evaluation{}, nil
+// unevaluated are the expected times of the check after its evaluation watermark (or from the arm
+// time, when the watermark belongs to an earlier configuration) whose grace has passed at now, in
+// chronological order, at most limit.
+func unevaluated(ck *store.Check, s checkSpec, now time.Time, limit int) []time.Time {
+	until := now.Add(-s.grace - time.Second)
+	var e time.Time
+	var ok bool
+	if ck.EvaluatedAt != nil && s.armed(*ck.EvaluatedAt) {
+		e, ok = nextExpected(s.cron, ck.EvaluatedAt.In(s.loc))
+	} else {
+		e, ok = firstExpectedFrom(s.cron, s.arm.Add(time.Second))
 	}
-	var from time.Time // unbounded below when there is no P
-	if p, ok := latestExpected(c, e.Add(-time.Minute)); ok {
-		from = p
+	var out []time.Time
+	for ok && !e.After(until) && len(out) < limit {
+		out = append(out, e)
+		e, ok = nextExpected(s.cron, e)
 	}
-	mark, err := m.Store.FirstMark(ck.ID, ck.CountedMarkID, from, e.Add(time.Duration(ck.GraceMinutes)*time.Minute))
-	if err != nil {
-		return evaluation{}, err
-	}
-	return evaluation{expected: e, ok: true, mark: mark}, nil
+	return out
+}
+
+// hasMarkIn reports whether a time of the ascending marks lies in [lo, hi].
+func hasMarkIn(marks []time.Time, lo, hi time.Time) bool {
+	i := sort.Search(len(marks), func(i int) bool { return !marks[i].Before(lo) })
+	return i < len(marks) && !marks[i].After(hi)
 }
 
 // CheckViewOf is the view of a check now.
 func (m *Manager) CheckViewOf(ck *store.Check) (CheckView, error) {
 	v := CheckView{Check: ck, State: CheckDisabled, loc: m.loc()}
-	c, err := ParseCron(ck.Cron)
+	s, err := m.specOf(ck)
 	if err != nil {
-		return v, fmt.Errorf("check %s: %w", ck.Name, err)
+		return v, err
 	}
 	now := m.Now().In(m.loc())
 	if !ck.Enabled {
 		return v, nil
 	}
-	if n, ok := nextExpected(c, now); ok {
+	if n, ok := nextExpected(s.cron, now); ok {
 		v.NextExpectedAt = n.Format(time.RFC3339)
 	}
-	e, ok := dueExpected(ck, c, now)
+	e, ok := dueExpected(s, now)
 	if !ok {
 		v.State = CheckWaiting
 		return v, nil
@@ -377,18 +460,19 @@ func (m *Manager) CheckViewOf(ck *store.Check) (CheckView, error) {
 	if ck.EvaluatedAt != nil && ck.EvaluatedAt.Equal(e) {
 		missed = ck.EvaluatedResult == store.EvalMissed
 	} else {
-		ev, err := m.evaluateCheck(ck, c, now)
+		lo, hi := s.window(e)
+		marks, err := m.Store.MarkTimes(ck.ID, lo, hi)
 		if err != nil {
 			return v, err
 		}
-		missed = ev.mark == nil
+		missed = len(marks) == 0
 	}
 	v.expected = e
 	v.LastExpectedAt = e.Format(time.RFC3339)
 	v.State = CheckOK
 	if missed {
 		v.State = CheckMissed
-		if until := e.Add(time.Duration(ck.GraceMinutes) * time.Minute); ck.LastMarkAt != nil && ck.LastMarkAt.After(until) {
+		if until := e.Add(s.grace); ck.LastMarkAt != nil && ck.LastMarkAt.After(until) {
 			late := ck.LastMarkAt.In(m.loc())
 			v.LateMarkAt = &late
 		}
@@ -415,12 +499,13 @@ func (m *Manager) CheckViews() ([]CheckView, error) {
 }
 
 // MissedChecks are the enabled checks whose latest expected time passed its grace without a mark
-// (a late mark keeps them here), and any check whose missed alert is still pending delivery.
+// (a late mark keeps them here), and any check with a missed alert still pending delivery or
+// failed and not acknowledged by a check_set.
 func (m *Manager) MissedChecks() ([]CheckView, error) {
 	all, err := m.CheckViews()
 	out := []CheckView{}
 	for _, v := range all {
-		if v.State == CheckMissed || v.AlertState == store.AlertPending {
+		if v.State == CheckMissed || v.AlertsPending > 0 || v.AlertsFailed > 0 {
 			out = append(out, v)
 		}
 	}
@@ -437,7 +522,8 @@ func CheckStateText(v CheckView) string {
 }
 
 // CheckViewText is one line of status and system_doctor for a missed check (MissedChecks): the
-// state, the expected time and the delivery of the last missed alert.
+// state, the expected time, the delivery of the newest missed alert and the other pending or
+// failed ones.
 func CheckViewText(v CheckView) string {
 	var b strings.Builder
 	b.WriteString(v.Name + " " + CheckStateText(v))
@@ -451,25 +537,45 @@ func CheckViewText(v CheckView) string {
 	if v.LastMissedAt != nil && (v.State != CheckMissed || !v.LastMissedAt.Equal(v.expected)) {
 		fmt.Fprintf(&b, "; missed %s", v.LastMissedAt.In(loc).Format(checkShownLayout))
 	}
+	if v.AlertMerged > 0 {
+		fmt.Fprintf(&b, " (with %d earlier missed times)", v.AlertMerged)
+	}
+	pending, failed := v.AlertsPending, v.AlertsFailed
 	switch v.AlertState {
 	case store.AlertDelivered:
 		b.WriteString("; alert delivered")
 	case store.AlertPending:
 		fmt.Fprintf(&b, "; alert pending (%d of %d attempts made)", v.AlertAttempts, MaxCheckAlertAttempts)
+		pending -= 1 + v.AlertMerged
 	case store.AlertFailed:
 		fmt.Fprintf(&b, "; alert not delivered after %d attempts", v.AlertAttempts)
+		if v.AlertAcknowledged {
+			b.WriteString(" (acknowledged)")
+		} else {
+			failed -= 1 + v.AlertMerged
+		}
 	}
 	if v.LastAlertError != "" && v.AlertState != store.AlertDelivered {
 		b.WriteString(": " + Printable(v.LastAlertError, 120))
 	}
+	if pending > 0 {
+		fmt.Fprintf(&b, "; %d earlier alerts pending", pending)
+	}
+	if failed > 0 {
+		fmt.Fprintf(&b, "; %d earlier alerts not delivered after %d attempts", failed, MaxCheckAlertAttempts)
+	}
+	if v.AlertsFailed > 0 {
+		b.WriteString(" (check_set acknowledges failed alerts)")
+	}
 	return b.String()
 }
 
-// missedItem is one missed expected time in the alert line.
+// missedItem is one check's part of the alert line: count missed expected times, the latest one.
 type missedItem struct {
 	name     string
 	expected time.Time
 	grace    int
+	count    int
 }
 
 // CheckMissedText is how one missed expected time reads in the alert line.
@@ -480,14 +586,36 @@ func CheckMissedText(name string, expected time.Time, grace int) string {
 func checkMissedLine(items []missedItem) string {
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
+		if it.count > 1 {
+			parts = append(parts, fmt.Sprintf("%s: %d missed, latest %s (no mark within %dm)",
+				it.name, it.count, it.expected.Format(checkShownLayout), it.grace))
+			continue
+		}
 		parts = append(parts, CheckMissedText(it.name, it.expected, it.grace))
 	}
 	return CheckMissedTag + " " + strings.Join(parts, "; ")
 }
 
+// missedItems groups alert rows (ordered by check) into one item per check.
+func (m *Manager) missedItems(rows []*store.CheckAlert) []missedItem {
+	var out []missedItem
+	for _, a := range rows {
+		e := a.Expected.In(m.loc())
+		if n := len(out); n > 0 && out[n-1].name == a.Name {
+			out[n-1].count += 1 + a.Merged
+			if e.After(out[n-1].expected) {
+				out[n-1].expected = e
+			}
+			continue
+		}
+		out = append(out, missedItem{name: a.Name, expected: e, grace: a.Grace, count: 1 + a.Merged})
+	}
+	return out
+}
+
 // watchChecks is the watchdog's judging half, run in every daemon tick under the lifecycle lock:
-// each enabled check's latest due expected time not judged yet is judged and claimed (judgeCheck).
-// A missed one becomes a pending alert; deliverCheckAlerts types it, outside the lifecycle lock.
+// each enabled check's unevaluated expected times are judged and claimed (judgeCheck). A missed one
+// becomes a pending alert row; deliverCheckAlerts types it, outside the lifecycle lock.
 func (m *Manager) watchChecks() error {
 	list, err := m.Store.ListChecks(true)
 	if err != nil || len(list) == 0 {
@@ -503,93 +631,136 @@ func (m *Manager) watchChecks() error {
 	return errors.Join(errs...)
 }
 
-// judgeCheck judges ck (as read, at its revision) at now and claims the judgement; true when this
-// call stored a new judgement.
+// judgeCheck judges ck's unevaluated expected times (as read, at its revision) at now, in
+// chronological order, and claims the judgements; true when this call stored them.
 func (m *Manager) judgeCheck(ck *store.Check, now time.Time) (bool, error) {
-	c, err := ParseCron(ck.Cron)
+	s, err := m.specOf(ck)
 	if err != nil {
-		m.Log.Printf("check %s: %v", ck.Name, err)
+		m.Log.Printf("%v", err)
 		return false, nil
 	}
-	e, ok := dueExpected(ck, c, now)
-	if !ok || (ck.EvaluatedAt != nil && !e.After(*ck.EvaluatedAt)) {
+	es := unevaluated(ck, s, now, MaxCheckEvaluationsPerTick)
+	if len(es) == 0 {
 		return false, nil
 	}
-	ev, err := m.evaluateCheck(ck, c, now)
-	if err != nil || !ev.ok {
+	lo, _ := s.window(es[0])
+	marks, err := m.Store.MarkTimes(ck.ID, lo, es[len(es)-1].Add(s.grace))
+	if err != nil {
 		return false, err
 	}
-	claimed, err := m.Store.ClaimCheckEvaluation(ck.ID, ck.Revision, ev.expected, ev.expected.Format(checkLocalLayout), ev.mark)
+	outs := make([]store.EvalOutcome, len(es))
+	var missed []string
+	for i, e := range es {
+		if i > 0 { // consecutive expected times: the previous window ends where this one starts
+			lo = es[i-1].Add(s.grace + time.Second)
+		}
+		ok := hasMarkIn(marks, lo, e.Add(s.grace))
+		outs[i] = store.EvalOutcome{Expected: e, Local: e.Format(checkLocalLayout), OK: ok}
+		if !ok {
+			missed = append(missed, e.Format(checkShownLayout))
+		}
+	}
+	claimed, err := m.Store.ClaimCheckEvaluations(ck.ID, ck.Revision, outs)
 	if err != nil || !claimed {
 		return false, err // !claimed: judged already, or edited since it was read
 	}
-	if ev.mark == nil {
-		m.Log.Printf("check watchdog: %s missed, alert pending", CheckMissedText(ck.Name, ev.expected, ck.GraceMinutes))
+	if len(missed) > 0 {
+		m.Log.Printf("check watchdog: %s missed %d expected times (latest %s, no mark within %dm), alert pending",
+			ck.Name, len(missed), missed[len(missed)-1], ck.GraceMinutes)
 	}
 	return true, nil
 }
 
-// deliverCheckAlerts types the pending missed alerts whose next attempt is due as one line through
-// the bounded delivery (sendTmuxLocked: tmux.lock, TmuxDeliveryTimeout). It must run without the
-// lifecycle lock. Each attempt is claimed before the line is typed, so two daemons never make the
-// same attempt; a failure stays pending until MaxCheckAlertAttempts, then the alert is failed. An
-// attempt cut short (a crash after its claim) is retried after its backoff; one cut short after
-// the line was typed types it again (at-least-once).
+// deliverCheckAlerts types the pending alert rows whose next attempt is due as one line. It must
+// run without the lifecycle lock: claimCheckAlerts takes the attempts under a fresh token,
+// sendCheckAlerts types the rows still holding it under tmux.lock.
 func (m *Manager) deliverCheckAlerts() error {
-	now := m.Now().In(m.loc())
-	list, err := m.Store.PendingCheckAlerts(now)
-	if err != nil || len(list) == 0 {
+	token, err := m.claimCheckAlerts()
+	if token == "" {
 		return err
 	}
-	var items []missedItem
-	var taken []*store.Check
+	return errors.Join(err, m.sendCheckAlerts(token))
+}
+
+// claimCheckAlerts claims the next attempt of every due pending alert row under one new token ("" =
+// none claimed). A row that already made MaxCheckAlertAttempts attempts (the last one cut short
+// before its outcome was stored) is failed instead.
+func (m *Manager) claimCheckAlerts() (string, error) {
+	now := m.Now()
+	due, err := m.Store.DueCheckAlerts(now)
+	if err != nil || len(due) == 0 {
+		return "", err
+	}
+	token := newToken()
+	claimed := 0
 	var errs []error
-	for _, ck := range list {
-		if ck.LastMissedAt == nil {
-			continue
-		}
-		if ck.AlertAttempts >= MaxCheckAlertAttempts {
-			// The last attempt was cut short before its outcome was stored.
-			errText := ck.LastAlertError
+	for _, a := range due {
+		if a.Attempts >= MaxCheckAlertAttempts {
+			errText := a.Error
 			if errText == "" {
 				errText = "delivery interrupted"
 			}
-			if err := m.Store.RecordCheckAlert(ck.ID, *ck.LastMissedAt, errText, true); err != nil {
+			if err := m.Store.FailCheckAlert(a.ID, a.Attempts, errText); err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
-		n := ck.AlertAttempts + 1
-		ok, err := m.Store.ClaimCheckAlertAttempt(ck.ID, *ck.LastMissedAt, ck.AlertAttempts, now.Add(checkAlertBackoff(n)))
+		ok, err := m.Store.ClaimCheckAlertAttempt(a.ID, a.Attempts, token, now, now.Add(checkAlertBackoff(a.Attempts+1)))
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		if !ok {
-			continue // another daemon took this attempt, or a new missed time replaced it
+		if ok {
+			claimed++
 		}
-		ck.AlertAttempts = n
-		items = append(items, missedItem{name: ck.Name, expected: ck.LastMissedAt.In(m.loc()), grace: ck.GraceMinutes})
-		taken = append(taken, ck)
 	}
-	if len(items) == 0 {
-		return errors.Join(errs...)
+	if claimed == 0 {
+		return "", errors.Join(errs...)
 	}
-	line, ferr := checkMissedLine(items), ""
-	if t := m.Cfg.NotifyTmuxTarget; t == "" {
-		ferr = "notify off (notify_tmux_target not configured)"
-		m.Log.Printf("check watchdog: %s: %s", ferr, line)
-	} else if err := m.sendTmuxLocked(t, line); err != nil {
-		ferr = err.Error()
-		m.Log.Printf("check watchdog: alert not delivered: %v: %s", err, line)
-	} else {
+	return token, errors.Join(errs...)
+}
+
+// sendCheckAlerts types the alert rows claimed under token. The fence: under tmux.lock the rows
+// still pending with this token are re-read right before typing, and the outcome is stored before
+// tmux.lock is released, so an attempt paused after its claim (whose rows were claimed again, or
+// delivered, meanwhile) types nothing. A failed attempt keeps the error on the rows it still holds
+// (failed after MaxCheckAlertAttempts); one that could not take tmux.lock typed nothing and counts
+// as failed the same way.
+func (m *Manager) sendCheckAlerts(token string) error {
+	target := m.Cfg.NotifyTmuxTarget
+	if target == "" {
+		ferr := "notify off (notify_tmux_target not configured)"
+		if rows, err := m.Store.TokenCheckAlerts(token); err == nil && len(rows) > 0 {
+			m.Log.Printf("check watchdog: %s: %s", ferr, checkMissedLine(m.missedItems(rows)))
+		}
+		return m.Store.FailCheckAlertAttempt(token, ferr, MaxCheckAlertAttempts)
+	}
+	done := false
+	err := m.withTmuxLock(func(ctx context.Context) error {
+		rows, err := m.Store.TokenCheckAlerts(token)
+		if err != nil {
+			return err
+		}
+		done = true
+		if len(rows) == 0 {
+			m.Log.Printf("check watchdog: a stale delivery attempt typed nothing (its alerts were claimed again or delivered)")
+			return nil
+		}
+		line := checkMissedLine(m.missedItems(rows))
+		if serr := m.sendTmux(ctx, target, line); serr != nil {
+			m.Log.Printf("check watchdog: alert not delivered: %v: %s", serr, line)
+			return m.Store.FailCheckAlertAttempt(token, serr.Error(), MaxCheckAlertAttempts)
+		}
 		m.Log.Printf("check watchdog: %s", line)
-	}
-	for _, ck := range taken {
-		final := ferr != "" && ck.AlertAttempts >= MaxCheckAlertAttempts
-		if err := m.Store.RecordCheckAlert(ck.ID, *ck.LastMissedAt, ferr, final); err != nil {
-			errs = append(errs, err)
+		ids := make([]int64, len(rows))
+		for i, a := range rows {
+			ids[i] = a.ID
 		}
+		return m.Store.DeliverCheckAlerts(ids)
+	})
+	if done {
+		return err
 	}
-	return errors.Join(errs...)
+	m.Log.Printf("check watchdog: alert not delivered: %v", err)
+	return m.Store.FailCheckAlertAttempt(token, err.Error(), MaxCheckAlertAttempts)
 }
