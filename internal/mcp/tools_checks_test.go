@@ -53,6 +53,7 @@ func TestCheckToolRoles(t *testing.T) {
 // The orchestrator adds, lists, edits, marks and removes checks; a missed one shows in system_doctor.
 func TestCheckToolsOrchestrator(t *testing.T) {
 	m := newManager(t)
+	m.SelfBin = selfBin // system_doctor's hook probe runs the real binary, not this test binary
 	m.Cfg.NotifyTmuxTarget = ""
 	now := time.Date(2026, 10, 19, 9, 0, 0, 0, time.UTC)
 	m.Now, m.Loc = func() time.Time { return now }, time.UTC
