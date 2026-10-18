@@ -55,13 +55,21 @@ func TestSystemDoctor(t *testing.T) {
 	if out.OK || out.Disk.TotalBytes == 0 || out.Disk.Path != m.StateDir {
 		t.Fatalf("doctor: %+v", out)
 	}
+	if out.Queue.ConfiguredMaxRunning != jobs.DefaultMaxRunningPerAgent {
+		t.Fatalf("doctor queue: %+v", out.Queue)
+	}
 	if err := os.WriteFile(m.Cfg.OwnerRulesPath, []byte("- rule\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A broken guard binary is a problem too.
+	// A broken guard binary is a problem too; the queue shows the configured max_running.
 	m.SelfBin = filepath.Join(t.TempDir(), "missing-agent-jobs")
+	six := 6
+	m.Cfg.MaxRunning = &six
 	out = SystemDoctorOutput{}
 	call(t, cs, "system_doctor", map[string]any{}, &out)
+	if out.Queue.ConfiguredMaxRunning != 6 {
+		t.Fatalf("doctor queue: %+v", out.Queue)
+	}
 	for _, c := range out.Hooks {
 		if c.Name == "guard hook" && c.OK {
 			t.Fatal("a missing guard binary passed the hook check")
