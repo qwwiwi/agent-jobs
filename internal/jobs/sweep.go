@@ -277,7 +277,7 @@ func writeSweepMarker(jobDir string, r SweepResult) error {
 		fmt.Fprintf(&b, "%d\n", p)
 	}
 	if r.Err != nil {
-		fmt.Fprintf(&b, "error: %s\n", Printable(r.Err.Error(), 300))
+		fmt.Fprintf(&b, "error: %s\n", RedactPrintable(r.Err.Error(), 300))
 	}
 	return writeAtomic(filepath.Join(jobDir, SweepMarker), []byte(b.String()))
 }

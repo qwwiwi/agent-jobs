@@ -708,7 +708,8 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request, id string) {
 			a.m.Log.Printf("http api: job %s: report: %v", j.ID, err)
 			out.ReportError = "report.md is not readable (not a regular file of this user, or no access)"
 		default:
-			out.Report, out.ReportTruncated = text, truncated
+			// Redacted on the fly, like job_result: the in-place redaction may still be pending.
+			out.Report, out.ReportTruncated = jobs.RedactRead(text, truncated), truncated
 		}
 	default:
 		writeError(w, http.StatusBadRequest, "report must be 0 or 1")

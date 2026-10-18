@@ -210,6 +210,17 @@ if [[ $prompt == *FAKE_NONSUCCESS_REPORT* ]]; then
   echo '{"type":"result","subtype":"error_max_budget_usd","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
 fi
+if [[ $prompt == *FAKE_SECRET_REPORT* ]]; then
+  tok="ghp_$(printf 'Q%.0s' {1..36})"
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.01,"result":"## Summary\nused '"$tok"'\n\n## Not done / uncertain\nnothing\n\n## Progress\n- 10:00 UTC started"}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_SECRET_SUBTYPE* ]]; then
+  # An error result whose subtype carries a token: it ends up in the job's error and the finish log.
+  tok="ghp_$(printf 'W%.0s' {1..36})"
+  echo '{"type":"result","subtype":"error_'"$tok"'","is_error":true,"num_turns":1,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0

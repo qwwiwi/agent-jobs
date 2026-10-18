@@ -78,13 +78,14 @@ func CheckName(s string) (string, error) {
 	}
 	if len(s) > MaxCheckNameLen || !reCheckName.MatchString(s) {
 		return "", fmt.Errorf("name %q must be a slug (a-z, 0-9, '-', '_'; starting with a letter or digit) of at most %d characters",
-			Printable(s, 80), MaxCheckNameLen)
+			RedactPrintable(s, 80), MaxCheckNameLen)
 	}
 	return s, nil
 }
 
 // MarkNote validates a mark's optional note: valid UTF-8, one line (no control or format character,
-// bidi overrides included), at most MaxMarkNoteRunes, then Printable and defanged (defangTags).
+// bidi overrides included), at most MaxMarkNoteRunes, then redacted, Printable (RedactPrintable) and
+// defanged (defangTags).
 func MarkNote(s string) (string, error) {
 	if !utf8.ValidString(s) {
 		return "", errors.New("note is not valid UTF-8")
@@ -95,7 +96,7 @@ func MarkNote(s string) (string, error) {
 	if n := utf8.RuneCountInString(s); n > MaxMarkNoteRunes {
 		return "", fmt.Errorf("note has %d characters, at most %d", n, MaxMarkNoteRunes)
 	}
-	return defangTags(Printable(s, 0)), nil
+	return defangTags(RedactPrintable(s, 0)), nil
 }
 
 func checkGrace(g int, def bool) (int, error) {

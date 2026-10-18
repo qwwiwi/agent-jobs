@@ -18,7 +18,7 @@ import (
 
 // Log archive: when prune cleans a job folder, the job's records for later analysis move into
 // <archive>/<YYYY-MM>/<id>/ (stream.jsonl, stderr.log and stream-resume-failed.jsonl gzipped,
-// prompt.md, report.md, diffstat.txt copied, meta.json = the job row; for a resumed job also every
+// prompt.md, report.md (redacted, see archiveReport), diffstat.txt copied, meta.json = the job row; for a resumed job also every
 // earlier attempt's attempts/<n>/ run files and report.attempt-<n>.md). The archive lies outside the job folders, so cleaning jobs never
 // touches it; prune deletes archived months older than log_archive_days.
 var (
@@ -404,7 +404,11 @@ func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 		}
 	}
 	for _, name := range cp {
-		if err := archiveFile(filepath.Join(dir, name), filepath.Join(tmp, name), false); err != nil {
+		copyFn := func(src, dst string) error { return archiveFile(src, dst, false) }
+		if isReportName(name) {
+			copyFn = archiveReport
+		}
+		if err := copyFn(filepath.Join(dir, name), filepath.Join(tmp, name)); err != nil {
 			return err
 		}
 	}
@@ -444,6 +448,33 @@ func openRegular(p string) (f *os.File, ok bool, err error) {
 		return nil, false, err
 	}
 	return f, true, nil
+}
+
+// isReportName reports whether name (relative to a job folder) is report.md or an earlier attempt's
+// report.attempt-<n>.md.
+func isReportName(name string) bool {
+	return name == "report.md" || reAttemptReport.MatchString(name)
+}
+
+// archiveReport copies a report (a regular file of the job folder, never followed) to dst redacted
+// on the fly: its in-place redaction may still be pending (a failed rewrite, a daemon that died
+// before it, a job from before redaction), and the archive never holds an unredacted report. An
+// already redacted report is copied unchanged (redaction is idempotent); an oversized one gets the
+// same cut and unscanned note as in place. A missing or non-regular src is skipped.
+func archiveReport(src, dst string) error {
+	in, ok, err := openRegular(src)
+	if err != nil || !ok {
+		return err
+	}
+	defer in.Close()
+	out, _, _, err := redactFile(in)
+	if err == nil {
+		err = createSynced(dst, []byte(out))
+	}
+	if err != nil {
+		return fmt.Errorf("archive %s: %w", src, err)
+	}
+	return nil
 }
 
 // createSynced writes data into the new file p (O_EXCL, never through a link), fsynced before close.
