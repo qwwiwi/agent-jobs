@@ -27,8 +27,8 @@ func StateLayout(subagentLog string) (state, own string, ok bool) {
 }
 
 // readTools read the files named in their input: Read (file_path), Grep (path, recursive), Glob
-// (path and pattern).
-var readTools = map[string]bool{"Read": true, "Grep": true, "Glob": true}
+// (path and pattern), LS (path).
+var readTools = map[string]bool{"Read": true, "Grep": true, "Glob": true, "LS": true}
 
 // recursiveReaders read (or list) every file under a directory argument (`rg x ~`, `tar c ~`,
 // `rsync -a ~ x`, `tree ~`), so an ancestor of the state dir reaches it.

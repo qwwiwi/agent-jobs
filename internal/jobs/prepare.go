@@ -99,10 +99,28 @@ var denyRules = []string{
 	"Write(**/.git/**)",
 	"MultiEdit(**/.git/**)",
 	"NotebookEdit(**/.git/**)",
-	// Tools that reach a human or outlive the run (own schedules, notifications).
+	// Tools that reach a person or another session (messages, notifications, questions), that schedule
+	// or wake the job (its lifetime belongs to the daemon), or that run commands outside the Bash
+	// guard's checks (Monitor runs its own command or opens a WebSocket; worktrees). The guard refuses
+	// every tool outside its allowlist (guard.ToolAllowed); these rules name the known ones.
 	"CronCreate",
+	"CronDelete",
+	"CronList",
+	"ScheduleWakeup",
 	"RemoteTrigger",
 	"PushNotification",
+	"SendMessage",
+	"ListAgents",
+	"Monitor",
+	"Workflow",
+	"EnterWorktree",
+	"ExitWorktree",
+	"AskUserQuestion",
+	"ExitPlanMode",
+	"Artifact",
+	"ArtifactData",
+	"ArtifactComments",
+	"ArtifactCheck",
 }
 
 // webTools are closed for every kind except research.
