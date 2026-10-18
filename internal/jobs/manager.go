@@ -316,8 +316,8 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 
 // Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops and report redactions
 // that failed, fire the schedules due this minute, judge the checks (dead-man's switch), start queued
-// ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
-// cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
+// ones (at most max_running running, default 2), send job-done lines, and clean up worktrees whose
+// notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
 	err := m.tickLocked()
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
@@ -405,8 +405,9 @@ func (m *Manager) launchQueued() error {
 	if err != nil {
 		return err
 	}
+	limit := m.Cfg.MaxRunningJobs()
 	for _, j := range queued {
-		if running >= MaxRunningPerAgent {
+		if running >= limit {
 			return nil
 		}
 		token := newToken()

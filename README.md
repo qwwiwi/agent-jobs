@@ -34,7 +34,7 @@ That is what a job avoids:
 - **A foreground subagent keeps the parent's turn open.** The session cannot talk or decide until it returns. A job returns an id at once and the session stays free.
 - **A job is its own process with hard limits.** Subagents can be scoped too (turn limits, tool allowlists, MCP servers). What a job adds is the combination: a separate `claude -p` process with its own full context, its own git worktree, a USD budget (`--max-budget-usd`) and a wall-clock timeout enforced by the daemon, survival across a restart of the parent, and a fixed report contract.
 - **A job outlives the session.** Subagents die with their session; a job runs in its own process group and survives a session or daemon restart. Resuming an interrupted job from its saved patches is planned (Wave B).
-- **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most two run per agent) and, with schedules (planned, Wave B), can run when the window is quiet.
+- **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most `max_running` run per agent, default two) and, with schedules (planned, Wave B), can run when the window is quiet.
 - **A job is a full session.** A subagent starts with only its prompt and is often routed to a cheaper model. A job is a full top-level Claude Code run with its own model choice and the full tool set, inside the limits above.
 
 We do not publish an "N× cheaper" or "N× faster" figure yet, because we have not measured one per task. The benchmark below is how we will.
@@ -65,7 +65,7 @@ Results will be filled in here when the runs are done.
 
 <p align="center"><img src="docs/images/swarm.png" alt="The main session hands work to many jobs and gets a check mark back from each" width="100%"></p>
 
-One main session, many workers. The session writes a brief for a stranger (a job has no conversation context), starts a job and goes back to talking. Each job works alone in its own folder and comes back with a report. The picture is illustrative: jobs wait in a queue, and at most two run at a time per agent.
+One main session, many workers. The session writes a brief for a stranger (a job has no conversation context), starts a job and goes back to talking. Each job works alone in its own folder and comes back with a report. The picture is illustrative: jobs wait in a queue, and at most `max_running` (default two) run at a time per agent.
 
 ### Components
 
@@ -84,7 +84,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 <p align="center"><img src="docs/images/lifecycle.png" alt="job_start, queued, running, report, job-done line, job_result, review and push, cleanup" width="100%"></p>
 
 1. **Start.** The session starts a job with a title, kind, brief, repo, model and limits. The call validates everything, inserts a `queued` row and returns the id. Nothing runs yet.
-2. **Queued.** On the next tick, if fewer than two jobs are running for this agent, the daemon claims it.
+2. **Queued.** On the next tick, if fewer than `max_running` (default two) jobs are running for this agent, the daemon claims it.
 3. **Running.** The daemon prepares the folder (brief with memory notes, settings, worktree) and launches the wrapper detached, in its own session. The wrapper runs `claude -p` and writes `exit_code` last.
 4. **Report.** The job's final message is saved as `report.md`. Exit code 0 with a report is `succeeded`; a non-zero exit, a turn or budget stop, or no report is `failed`; past the timeout the process group gets SIGTERM, then SIGKILL after 10 s, and the job is `timeout`. `cancelled` comes only from an explicit cancel.
 5. **Job-done line.** The session receives one line via `tmux send-keys`:
@@ -418,6 +418,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `idle_after_result_seconds`: grace of the idle-after-result rule (default 180). A job whose claude printed its final `result`, then stays silent this long with no live child but the job MCP server, is ended and judged by that result instead of waiting for the timeout (Linux). `-1` turns the rule off.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
+- `max_running`: how many jobs of this agent run at once (1..8, default 2 when absent); the rest wait in the queue. A value outside 1..8 is refused at config load, never clamped. `system_doctor`, `agent-jobs status --agent A` (no id) and `/v1/health` show the effective value.
 - `daily_hour`: local hour (0..23, default 4) after which the daemon runs `prune` and `doctor procs` (report only) once a day; `daily_off: true` turns that off. `agent-jobs status --agent A` (no id) shows the last run.
 - `log_archive_dir`: absolute path of the log archive (default `<state>/archive`); `log_archive_days`: how long archived months are kept (default 365, 0 = forever).
 - `keep_raw_reports`: keep the unredacted report as `report.raw.md` (0600) next to the redacted `report.md` (default false).

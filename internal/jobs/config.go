@@ -27,8 +27,14 @@ const (
 	CeilingMaxTurns       = 200
 	CeilingMaxBudgetUSD   = 50.0
 	CeilingTimeoutMinutes = 180
-	MaxRunningPerAgent    = 2
 	MaxOwnerRulesBytes    = 8 * 1024
+)
+
+// Running jobs per agent (config max_running): the default and the hard ceiling. A value outside
+// 1..CeilingMaxRunningPerAgent is a config error, never clamped.
+const (
+	DefaultMaxRunningPerAgent = 2
+	CeilingMaxRunningPerAgent = 8
 )
 
 // Reference timings («раз в минуту», «через 30 минут после уведомления»): fixed, not configurable.
@@ -98,6 +104,9 @@ type Config struct {
 	// DailyHour is the local hour (0..23) after which the daemon runs the daily automation (prune and
 	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
 	DailyHour *int `json:"daily_hour"`
+	// MaxRunning is how many jobs of this agent run at once; the rest wait in the queue.
+	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8).
+	MaxRunning *int `json:"max_running"`
 	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
 	DailyOff bool `json:"daily_off"`
 	// KeepRawReports keeps the unredacted report of a job as report.raw.md (0600) next to the redacted
@@ -197,6 +206,14 @@ func ValidateHTTPListen(listen string) error {
 			"the API is local only", listen, host)
 	}
 	return nil
+}
+
+// MaxRunningJobs returns how many jobs of the agent may run at once (max_running, default 2).
+func (c Config) MaxRunningJobs() int {
+	if c.MaxRunning == nil {
+		return DefaultMaxRunningPerAgent
+	}
+	return *c.MaxRunning
 }
 
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
@@ -324,6 +341,10 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.OrchestratorDir != "" && (!filepath.IsAbs(c.OrchestratorDir) || filepath.Clean(c.OrchestratorDir) == "/") {
 		return c, fmt.Errorf("config.json: orchestrator_dir %q must be an absolute path other than /", c.OrchestratorDir)
+	}
+	if c.MaxRunning != nil && (*c.MaxRunning < 1 || *c.MaxRunning > CeilingMaxRunningPerAgent) {
+		return c, fmt.Errorf("config.json: max_running %d must be 1..%d (absent = default %d)", *c.MaxRunning,
+			CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
