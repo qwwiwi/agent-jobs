@@ -28,6 +28,11 @@ func TestToolAllowlistRefusesOthers(t *testing.T) {
 		"DesignSync", "ReportFindings",
 		// an unknown future tool and MCP tools of other servers
 		"SomeFutureTool", "mcp__other__send", "mcp__agent-jobs", "mcp__agent-jobs-x__job_start", "",
+		// only the exact job-role tool names of server "agent-jobs": not another server whose name
+		// starts with "agent-jobs__", not an empty or unknown suffix, not an orchestrator-only tool
+		"mcp__agent-jobs__other__send", "mcp__agent-jobs__other__memory_search", "mcp__agent-jobs__",
+		"mcp__agent-jobs__unknown_tool", "mcp__agent-jobs__job_start", "mcp__agent-jobs__send_message",
+		"mcp__agent-jobs__schedule_add", "mcp__agent-jobs__memory_search_x", "mcp__agent-jobs__memory_search__x",
 	}
 	for _, tool := range refused {
 		r := decideTool(t, tool, map[string]any{})
@@ -97,5 +102,24 @@ func TestLSStateReadChecked(t *testing.T) {
 	r, err := Decide(strings.NewReader(string(b)), cfg)
 	if err != nil || r == "" {
 		t.Fatalf("LS of the state dir: %q %v, want refused", r, err)
+	}
+}
+
+// Monitor and ScheduleWakeup are what jobs reached for to wait on a build: the refusal tells the
+// job how to wait instead, so it falls back at once.
+func TestWaitToolRefusalsAreActionable(t *testing.T) {
+	for _, tool := range []string{"Monitor", "ScheduleWakeup"} {
+		r := decideTool(t, tool, map[string]any{})
+		for _, want := range []string{"not allowed in a job", "foreground", "bounded"} {
+			if !strings.Contains(r, want) {
+				t.Errorf("%s: reason %q lacks %q", tool, r, want)
+			}
+		}
+	}
+	if r := decideTool(t, "Monitor", map[string]any{}); !strings.Contains(r, "outside the Bash guard") {
+		t.Errorf("Monitor: reason %q does not say why", r)
+	}
+	if r := decideTool(t, "ScheduleWakeup", map[string]any{}); !strings.Contains(r, "daemon") {
+		t.Errorf("ScheduleWakeup: reason %q does not say why", r)
 	}
 }

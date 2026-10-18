@@ -115,6 +115,8 @@ Ideas recorded for later; none is approved or scheduled. Each needs an owner go 
   - Why: some failures are capability limits, not bad luck. Lives in: daemon retry policy. Source: Autopilot, phases/5-subagents.md, 6-review.md.
 - I7. Leave time spent waiting for the owner out of job_stats durations.
   - Why: durations then measure work, not owner latency. Lives in: job_stats. Source: Autopilot, phases/8-final.md.
+- I8. Allow `Monitor` in jobs once its command goes through the same guard checks as a Bash command (and a WebSocket monitor is refused or checked). Today it is refused: it runs its own command outside the Bash guard (CONFORMANCE U1).
+  - Why: job history shows jobs reaching for `Monitor` (11 calls) and `ScheduleWakeup` (12) to wait for builds; a checked `Monitor` would give them a native wait. `ScheduleWakeup` stays refused (the daemon owns a job's lifetime). Lives in: `internal/guard/toolallow.go`, `internal/jobs/prepare.go`. Source: Codex review of the U1 fix, 2026-10-18.
 
 Source for all: the public "Autopilot" skill, https://github.com/nick-vels/skills (skills/autopilot, version 2.x, read 2026-10-18), files phases/1-manifest.md, 2-briefing.md, 4-plan.md, 5-subagents.md, 6-review.md, 8-final.md, 9-memory.md, prompts/executor.md, prompts/review.md.
 

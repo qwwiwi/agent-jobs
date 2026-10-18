@@ -99,9 +99,10 @@ var denyRules = []string{
 	"Write(**/.git/**)",
 	"MultiEdit(**/.git/**)",
 	"NotebookEdit(**/.git/**)",
-	// Tools that reach a person or another session, or outlive the run (own schedules, wakeups,
-	// messages, notifications, monitors, worktrees, questions). The guard refuses every tool outside
-	// its allowlist (guard.ToolAllowed); these rules name the known ones.
+	// Tools that reach a person or another session (messages, notifications, questions), that schedule
+	// or wake the job (its lifetime belongs to the daemon), or that run commands outside the Bash
+	// guard's checks (Monitor runs its own command or opens a WebSocket; worktrees). The guard refuses
+	// every tool outside its allowlist (guard.ToolAllowed); these rules name the known ones.
 	"CronCreate",
 	"CronDelete",
 	"CronList",
