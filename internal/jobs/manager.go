@@ -231,6 +231,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if strings.TrimSpace(r.Brief) == "" {
 		return nil, errors.New("brief is required")
 	}
+	if err := m.Cfg.checkBriefSize(r.Brief); err != nil {
+		return nil, err
+	}
 	if !slices.Contains(Kinds, r.Kind) {
 		return nil, fmt.Errorf("kind %q must be one of %s", r.Kind, strings.Join(Kinds, "|"))
 	}
@@ -391,7 +394,7 @@ func (m *Manager) launchQueued() error {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
 				running-- // the failed launch no longer occupies a slot
-				m.recordStatsOf(j.ID)
+				m.settled(j.ID)
 			}
 		}
 	}
@@ -780,7 +783,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	}
 	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
-	m.recordStatsOf(j.ID)
+	m.settled(j.ID)
 }
 
 // noteSweep appends the sweep's note (if any) to a job that is no longer running.
@@ -926,7 +929,7 @@ func (m *Manager) Cancel(id string) error {
 		if err := m.Store.Finish(id, "", store.StatusCancelled, j.Turns, j.CostUSD, j.DurationSec, "cancelled after stop", m.Now()); err != nil {
 			return err
 		}
-		m.recordStatsOf(id) // the job's stats row turns from stopped into cancelled
+		m.settled(id) // the job's stats row turns from stopped into cancelled
 		return nil
 	case store.StatusRunning:
 		m.killRunning(j)
@@ -939,7 +942,7 @@ func (m *Manager) Cancel(id string) error {
 		if err := m.Store.Finish(id, "", store.StatusCancelled, 0, 0, 0, "cancelled", now); err != nil {
 			return err
 		}
-		m.recordStatsOf(id)
+		m.settled(id)
 		return nil
 	}
 	dur := 0
@@ -962,6 +965,6 @@ func (m *Manager) Cancel(id string) error {
 		}
 	}
 	m.noteSweep(id, m.sweepEscaped(id))
-	m.recordStatsOf(id)
+	m.settled(id)
 	return nil
 }

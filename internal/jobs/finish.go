@@ -87,7 +87,7 @@ func DoneLine(j *store.Job) string {
 		}
 		line += ")"
 	}
-	return line
+	return RedactText(line) // the title and the error come from the brief and the job
 }
 
 // Containment says how a launched job's processes were contained: "scope <unit>" (its own systemd user
