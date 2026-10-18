@@ -247,9 +247,11 @@ func addJobResult(s *sdk.Server, d Deps) {
 		case err != nil:
 			return nil, JobResultOutput{}, fmt.Errorf("read report: %w", err)
 		default:
-			out.Report, out.ReportTruncated = jobs.RedactText(report), truncated
-			out.NotDone, _ = jobs.ReportSection(out.Report, jobs.SectionNotDone)
-			out.Progress, _ = jobs.ReportSection(out.Report, jobs.SectionProgress)
+			// Always redacted on the fly: the report of a job whose in-place redaction is still pending
+			// (or of a running job) may hold raw secrets.
+			out.Report, out.ReportTruncated = jobs.RedactRead(report, truncated), truncated
+			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress)
+			out.NotDone, out.Progress = secs[0], secs[1]
 			if truncated {
 				out.Note = fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md"))
 			}

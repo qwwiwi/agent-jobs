@@ -20,9 +20,12 @@ type BriefSize struct {
 	Headings int // lines starting with "## "
 }
 
-// reFileToken is a path-like token with a file extension: "main.go", "docs/PLAN.md", "./a/b.test.ts".
-// The name before the extension has at least two characters, so "e.g" and "i.e" are not files.
-var reFileToken = regexp.MustCompile(`^[A-Za-z0-9_.~/-]*[A-Za-z0-9_-]{2}\.[A-Za-z][A-Za-z0-9]{0,9}$`)
+// reFileToken is a path-like token with a file extension: "main.go", "x.go", "docs/PLAN.md",
+// "./a/b.test.ts". Abbreviations that look like one ("e.g", "i.e") are excluded by notFiles.
+var reFileToken = regexp.MustCompile(`^[A-Za-z0-9_.~/-]*[A-Za-z0-9_-]\.[A-Za-z][A-Za-z0-9]{0,9}$`)
+
+// notFiles are abbreviations shaped like a file name (lower case; the trailing dot already trimmed).
+var notFiles = map[string]bool{"e.g": true, "i.e": true, "a.k.a": true, "a.m": true, "p.m": true}
 
 // MeasureBrief estimates the size of a brief: bytes, files named, "## " headings.
 func MeasureBrief(brief string) BriefSize {
@@ -39,7 +42,7 @@ func MeasureBrief(brief string) BriefSize {
 			if strings.Contains(f, "://") {
 				continue // a URL, not a file
 			}
-			if f, _, _ = strings.Cut(f, ":"); reFileToken.MatchString(f) { // "a.go:12" names a.go
+			if f, _, _ = strings.Cut(f, ":"); reFileToken.MatchString(f) && !notFiles[strings.ToLower(f)] { // "a.go:12" names a.go
 				files[f] = true
 			}
 		}

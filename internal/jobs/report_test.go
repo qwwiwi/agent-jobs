@@ -3,6 +3,7 @@ package jobs
 import (
 	"strings"
 	"testing"
+	"time"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 )
@@ -48,5 +49,27 @@ func TestReadFirst(t *testing.T) {
 	}
 	if plain := "no sections at all\n"; ReadFirst(plain) != plain {
 		t.Fatal("a report without sections must stay as is")
+	}
+}
+
+// Section parsing is linear: a report of 200k short lines in one section parses well under a second.
+func TestReportSectionLinear(t *testing.T) {
+	big := "## Summary\nok\n## Evidence\n" + strings.Repeat("- line\n", 200000) + "## Progress\n- 10:00 UTC done\n"
+	start := time.Now()
+	if s, ok := ReportSection(big, SectionProgress); !ok || s != "- 10:00 UTC done" {
+		t.Fatalf("progress: %q %v", s, ok)
+	}
+	if out := ReadFirst(big); !strings.HasPrefix(out, "## Progress") {
+		t.Fatalf("read first: %q", out[:40])
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("parsing took %v", d)
+	}
+}
+
+func TestReportSections(t *testing.T) {
+	got := ReportSections(sampleReport, SectionNotDone, SectionProgress, "Missing")
+	if len(got) != 3 || got[0] != "nothing" || !strings.HasPrefix(got[1], "- 10:00 UTC") || got[2] != "" {
+		t.Fatalf("sections: %q", got)
 	}
 }

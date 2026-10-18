@@ -143,7 +143,7 @@ func (m *Manager) notifyPending() error {
 			}
 		}
 		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
-			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
+			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {
 				// A stalled tmux (or lock holder) would cost every other line the same wait: the
 				// rest are retried next tick, the tick goes on.
@@ -231,7 +231,7 @@ func (m *Manager) cleanupDue() error {
 			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
 		if err := m.Cleanup(j); err != nil {
-			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %v", j.ID, err)
+			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", j.ID, RedactText(err.Error()))
 			continue
 		}
 		if err := m.Store.MarkCleaned(j.ID, now); err != nil {
