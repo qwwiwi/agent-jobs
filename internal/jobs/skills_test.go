@@ -335,6 +335,24 @@ func TestSkillWarningsForBadRoots(t *testing.T) {
 	}
 }
 
+func TestSkillWarningsNameMalformedEntryNotRoot(t *testing.T) {
+	m := newManager(t)
+	root := skillCatalog(t,
+		map[string]any{"name": "golang", "status": "core", "kinds": []string{"code"},
+			"origin": map[string]any{"host": "example.org", "path": "skills/golang"}},
+		map[string]any{"name": "broken", "status": "core", "kinds": "code"},
+	)
+	m.Cfg.SkillRoots = []string{root}
+	w := m.SkillWarnings()
+	if len(w) != 1 || !strings.Contains(w[0], `entry 1 ("broken")`) || !strings.Contains(w[0], "kinds") ||
+		!strings.HasSuffix(w[0], ", skipped") || strings.Contains(w[0], "parse index.json") {
+		t.Fatalf("warnings %q", w)
+	}
+	if got := skills.Names(m.Catalog().Entries); !slices.Equal(got, []string{"golang"}) {
+		t.Fatalf("entries %v", got)
+	}
+}
+
 func TestSkillsConfigLimits(t *testing.T) {
 	dir := t.TempDir()
 	for body, want := range map[string]string{
