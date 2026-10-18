@@ -99,12 +99,31 @@ type Config struct {
 	DailyHour *int `json:"daily_hour"`
 	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
 	DailyOff bool `json:"daily_off"`
+	// OwnerWaitsMaxHours is how long an «owner reply pending» record of an owner-waits job may hold
+	// the orchestrator's Stop hook before it expires on its own. 0 = DefaultOwnerWaitsMaxHours (6).
+	OwnerWaitsMaxHours int `json:"owner_waits_max_hours"`
+	// OrchestratorDir is the absolute directory the orchestrator session works in. `hook bind`
+	// accepts a session only when its cwd lies inside it (and it runs in the pane of
+	// NotifyTmuxTarget). Empty = binding refused: the owner-waits Stop hook then never blocks.
+	OrchestratorDir string `json:"orchestrator_dir"`
 	// HTTPAPI is the read-only HTTP API for a jobs dashboard (DEVIATIONS #8), served by the daemon.
 	// Off by default; the listen address must be loopback or a unix socket path.
 	HTTPAPI HTTPAPIConfig `json:"http_api"`
 	// AcceptanceTimeoutMinutes is the time limit of a job's acceptance command (acceptance_cmd).
 	// 0 = DefaultAcceptanceTimeoutMinutes (15); at most CeilingAcceptanceTimeoutMinutes (60).
 	AcceptanceTimeoutMinutes int `json:"acceptance_timeout_minutes"`
+}
+
+// DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
+// owner_waits_max_hours is not set.
+const DefaultOwnerWaitsMaxHours = 6
+
+// OwnerWaitsMaxAge returns how long an «owner reply pending» record lives before it expires.
+func (c Config) OwnerWaitsMaxAge() time.Duration {
+	if c.OwnerWaitsMaxHours > 0 {
+		return time.Duration(c.OwnerWaitsMaxHours) * time.Hour
+	}
+	return DefaultOwnerWaitsMaxHours * time.Hour
 }
 
 // HTTPAPIConfig is the http_api section of config.json.
@@ -265,6 +284,12 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
 		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.OwnerWaitsMaxHours < 0 {
+		return c, fmt.Errorf("config.json: owner_waits_max_hours %d must be 0 (default %d) or positive", c.OwnerWaitsMaxHours, DefaultOwnerWaitsMaxHours)
+	}
+	if c.OrchestratorDir != "" && (!filepath.IsAbs(c.OrchestratorDir) || filepath.Clean(c.OrchestratorDir) == "/") {
+		return c, fmt.Errorf("config.json: orchestrator_dir %q must be an absolute path other than /", c.OrchestratorDir)
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)

@@ -139,6 +139,7 @@ type JobStartInput struct {
 	Runner          string  `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
 	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
 	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only: one-line shell command (max 1 KB) run in the job worktree after claude exits 0; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
+	OwnerWaits      bool    `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -153,6 +154,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
+			OwnerWaits: in.OwnerWaits,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)

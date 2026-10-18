@@ -230,7 +230,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits and `acceptance_cmd`; returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd`, `owner_waits` (the owner asked for it, see *Owner waits*); returns the queued row |
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome |
 | `job_list` | recent jobs, filterable by status |
@@ -291,6 +291,31 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 |---|---|
 | `notify_owner` | ask for the owner's attention: `text` (one line, ≤ 300 characters, control characters refused, `[jobs:` inside it defanged), optional `urgency` (normal \| high). agent-jobs sends nothing to a messenger itself: one line `[jobs:notify-owner] …` (with `job <id>:` from a job) is typed into the notify target like the job-done line, and the agent's session relays it over its own channel. A job: at most 3, at most one a minute (through the daemon); the agent: at most 20 an hour. Every admitted call is stored; a refused one (invalid text or urgency, over a limit) is an error and stores nothing. An undelivered one (no target, tmux refused or not done within 10 s) is an error and shows in `agent-jobs status` and `system_doctor`. CLI: `agent-jobs notify-owner --agent A --text T [--urgency high]` |
 
+**Owner waits** (built, unreleased): a job started at the owner's request is marked (`job_start` with `owner_waits: true`, `agent-jobs start --owner-waits`). Its job-done line ends with `· owner waits`. When the job has finished, it is recorded as «owner reply pending» for the agent *before* its line is typed into the session, so the session never sees the line without the record. A Stop hook in the orchestrator session, `agent-jobs hook stop --agent A`, then blocks the end of a turn (`{"decision":"block","reason":"…"}`) until the session has written to the owner and called `owner_replied`; it blocks at most once per turn (with `stop_hook_active` it always allows, so it never loops) and fails open (any error, and any incomplete hook input, allows the stop).
+
+The hook holds **only the orchestrator session**: `agent-jobs hook bind --agent A`, run from that session's SessionStart hook, records its `session_id`. A bind is accepted only when all hold: (a) it runs in the tmux pane of `notify_tmux_target` (`$TMUX_PANE` equals the pane tmux resolves the target to); (b) the hook input's `cwd` is inside `orchestrator_dir` (config); (c) it is not inside a job. With no `notify_tmux_target` or no `orchestrator_dir` configured every bind is refused, and the Stop hook then never blocks. Replacing a binding obeys the same checks: a new session, `/clear` or a resume in the same pane and directory rebinds, while another project's session with the same hooks, or a process elsewhere, cannot take it over; a refused bind keeps the old binding. A process the orchestrator itself starts in that pane and directory (its own subagent) is inside the orchestrator's trust domain and is not defended against. The Stop hook blocks only when its input's `session_id` equals the bound one; with no session bound, or in any other session that has the hook configured, it allows.
+
+Records are kept per job attempt (a resumed job's new line holds again). `owner_replied` clears a record whether its line was already delivered or is still being delivered; with a `job_id` it acknowledges every attempt of that job, including a finished attempt whose line has not gone out yet (that line then holds nothing). A record expires on its own after `owner_waits_max_hours` (config, default 6); an expired or acknowledged attempt is never reopened, also when its delivery is retried. With notify off (no `notify_tmux_target`) the record is still created when the job finishes, but no job-done line arrives: the hook's reason says so and asks the session to check the job with `job_status`. Pending records (with how far their line got: `delivering`, `delivered`, `notify_off`) and the bound session show in `agent-jobs status` (no id) and `system_doctor` (`owner_reply_pending`, `owner_hook_session`).
+
+| tool | what it does |
+|---|---|
+| `owner_replied` | orchestrator only: after writing to the owner, clear the «owner reply pending» record of `job_id`, or of every job without it; returns the cleared ids and what is still pending |
+
+Register both hooks in the orchestrator's Claude Code settings (the `settings.json` the agent's session loads, never a job's; agent-jobs does not edit it), and set `notify_tmux_target` and `orchestrator_dir` in the agent's `config.json` (below). Without a successful SessionStart bind the Stop hook holds nothing:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "agent-jobs hook bind --agent A" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "agent-jobs hook stop --agent A" } ] }
+    ]
+  }
+}
+```
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -305,6 +330,7 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
+| Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---
@@ -345,6 +371,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 ```json
 {
   "notify_tmux_target": "my-agent-session",
+  "orchestrator_dir": "/home/me/my-agent",
   "owner_names": ["Owner"],
   "git_name": "Agent Bot",
   "git_email": "agent@example.com"
@@ -353,6 +380,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 
 - `notify_tmux_target`: tmux target for the job-done line. Empty (default) = notify off; the line goes to the daemon log and cleanup still runs.
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
+- `orchestrator_dir`: absolute directory the orchestrator session works in. `hook bind` (owner waits) binds only a session whose `cwd` is inside it and that runs in the pane of `notify_tmux_target`; empty (default) = binding refused, the owner-waits Stop hook never blocks. `owner_waits_max_hours`: how long an «owner reply pending» record holds (default 6).
 - `idle_after_result_seconds`: grace of the idle-after-result rule (default 180). A job whose claude printed its final `result`, then stays silent this long with no live child but the job MCP server, is ended and judged by that result instead of waiting for the timeout (Linux). `-1` turns the rule off.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.

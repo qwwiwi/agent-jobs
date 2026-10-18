@@ -74,7 +74,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.md](DECISIONS.md)); built after Wave C:
 
 - **Heartbeat.** The daemon decides whether to wake the agent for its own goals: a cheap Go check (time, daily limit, night), then a small model decides (DEVIATIONS #1).
-- **«Owner waits» Stop hook.** A job started at the owner's request is marked; until the orchestrator has written to the owner, a Stop hook does not let the session end its turn silently.
+- **«Owner waits» Stop hook.** A job started at the owner's request is marked; until the orchestrator has written to the owner, a Stop hook does not let the session end its turn silently. *Status: built, unreleased; `internal/jobs/ownerwaits.go`, `internal/store/ownerwaits.go`, `internal/mcp/tools_ownerwaits.go`.* `job_start` `owner_waits` / `agent-jobs start --owner-waits` (store column `owner_waits`); the job-done line ends with `· owner waits`, and the finished job records «owner reply pending» before that line is delivered (table `owner_pending`, marked delivered in the same transaction as `notified_at`); `agent-jobs hook bind --agent A` (SessionStart) binds the orchestrator session, and `agent-jobs hook stop --agent A`, its Stop hook, blocks only that session, once per turn while a record is pending (never with `stop_hook_active`, fails open, also on incomplete input); the orchestrator tool `owner_replied` (job id or all) clears it; a record expires after `owner_waits_max_hours` (default 6); `agent-jobs status` and `system_doctor` show pending ones.
 - **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. Built switched off; turning it on (real money) needs its own owner «да».
 - **Read-only HTTP API** for a jobs dashboard (DEVIATIONS #8). *Status: built, unreleased; `internal/httpapi`.* Off by default (`http_api.enabled`), loopback or unix socket only, bearer token `<state>/http-api.token` (`agent-jobs http-api token --rotate`) on every endpoint; GET only: `/v1/health`, `/v1/jobs`, `/v1/jobs/{id}` (`?report=1`, 64 KB cap), `/v1/stats`, `/v1/schedules`; no briefs, prompts, env, config or paths outside the agent state; server timeouts, 8 KB headers, 10 requests/s per client.
 - **Acceptance from a clean clone.** The whole install and a test job are replayed from a fresh clone before a release.
@@ -103,6 +103,29 @@ Each item waits for a separate owner go (E2 has it, see [DECISIONS.md](DECISIONS
   - Native controls: `disable-model-invocation` for side-effect skills, `paths:` globs, `/skill-doctor` for context cost and never-invoked skills, `claude plugin eval` for trigger accuracy of 3-5 critical skills. Not adopted as a base: skills.sh, openskills, skillport (they widen distribution; the goal is narrowing); skillport's «metadata first» idea is borrowed.
   - Evidence, cited, to verify: arXiv 2604.04323 (from a market scan): with many weakly relevant skills the gain drops to near the no-skill baseline; skills refined to the task restore most of it (Terminal-Bench 2.0 57.7% → 65.5%).
   - Why: jobs get the right procedural knowledge without loading hundreds of skills. Source: owner request; market scan 2026-10-17. Related: Wave A `agent-jobs` skill and project cards. Priority: high. DEVIATIONS E7.
+
+## Ideas (not approved)
+
+Ideas recorded for later; none is approved or scheduled. Each needs an owner go before work starts.
+
+- I1. Requirement ledger: the owner's words kept verbatim and split into numbered requirements R01..Rn in a feature brief; the report gives each a status (done / partial / missing / placeholder); only the owner may drop a requirement; later changes are appended, never rewritten.
+  - Why: nothing the owner asked for is silently lost or reinterpreted. Lives in: the orchestrator's brief habit and the report contract. Source: Autopilot, phases/1-manifest.md, 2-briefing.md, 8-final.md.
+- I2. Blind acceptance job: a separate job gets only the original brief and the merged code (not our briefs or spec), installs from a clean clone, runs the product, and reports done / partial / no per requirement with the commands it ran. Only for new products or large features.
+  - Why: checks the result against what was asked, not against what we planned. Lives in: a new job kind or prompt. Source: Autopilot, phases/6-review.md, 8-final.md, prompts/review.md.
+- I3. Per-repo progress file and glossary: PROGRESS.md (settled / not done / known bugs) rewritten when work lands, and CONTEXT.md listing domain terms and synonyms to avoid.
+  - Why: a fresh job starts from the real state and uses one vocabulary. Lives in: target repos, linked from project cards. Source: Autopilot, phases/9-memory.md, 4-plan.md.
+- I4. Wide changes in three steps: add the new beside the old, migrate, remove the old, so the project never breaks midway.
+  - Why: every intermediate commit still builds and passes checks. Lives in: kind-fix / kind-general prompts. Source: Autopilot, phases/4-plan.md, 5-subagents.md.
+- I5. Executor discipline: show the new test failing before writing the code; visible placeholders instead of invented facts; a one-line STATUS: DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT (overlaps E3).
+  - Why: fewer false "done" reports and invented details. Lives in: prompts. Source: Autopilot, prompts/executor.md, phases/5-subagents.md.
+- I6. Retry a failed job once on a stronger model.
+  - Why: some failures are capability limits, not bad luck. Lives in: daemon retry policy. Source: Autopilot, phases/5-subagents.md, 6-review.md.
+- I7. Leave time spent waiting for the owner out of job_stats durations.
+  - Why: durations then measure work, not owner latency. Lives in: job_stats. Source: Autopilot, phases/8-final.md.
+
+Source for all: the public "Autopilot" skill, https://github.com/nick-vels/skills (skills/autopilot, version 2.x, read 2026-10-18), files phases/1-manifest.md, 2-briefing.md, 4-plan.md, 5-subagents.md, 6-review.md, 8-final.md, 9-memory.md, prompts/executor.md, prompts/review.md.
+
+Not taken: a local HTML dashboard (agent-first API instead), a shared working tree for parallel writers (we isolate each job in a worktree), prompt-only safety (we keep the guard), update checks over the network on every start.
 
 ## Conformance check against the reference after every wave
 
