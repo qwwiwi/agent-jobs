@@ -42,8 +42,8 @@ const usage = `usage: agent-jobs <command> [flags]
                                            pass in its worktree after claude exits 0
                                            (needs config acceptance_allowed)
   status     --agent A [<id>]              a job; without an id: the daily automation
-                                           (prune + doctor procs) and its last run, undelivered
-                                           owner notifications, owner replies pending
+                                           (prune + doctor procs) and its last run, missed checks,
+                                           undelivered owner notifications, owner replies pending
   list       --agent A [--limit N] [--status S] [--json]
                                            newest jobs first; --json: the HTTP API's /v1/jobs view
   result     --agent A <id>                print report.md
@@ -77,6 +77,9 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
                                            time, delivery (session or job kind), next and last firing
+  checks     --agent A [--json]            the agent's dead-man's switch checks (check_* MCP tools):
+                                           cron, grace, state (ok/late/missed/waiting), last mark
+  check mark --agent A NAME [--note T]     leave a completion mark for the check NAME
   notify-owner --agent A --text T [--urgency normal|high]
                                            one "[jobs:notify-owner] T" line into the notify target
                                            for the session to relay (rate limited, stored)
@@ -155,6 +158,10 @@ func main() {
 		err = cmdIntentions(args)
 	case "schedules":
 		err = cmdSchedules(args)
+	case "checks":
+		err = cmdChecks(args)
+	case "check":
+		err = cmdCheck(args)
 	case "notify-owner":
 		err = cmdNotifyOwner(args)
 	case "doctor":
@@ -470,6 +477,9 @@ func cmdStatus(args []string) error {
 		if err := printDaily(m); err != nil {
 			return err
 		}
+		if err := printMissedChecks(m); err != nil {
+			return err
+		}
 		printHTTPAPI(m)
 		if err := printUndelivered(m); err != nil {
 			return err
@@ -566,6 +576,25 @@ func printUndelivered(m *jobs.Manager) error {
 			from = "job " + n.JobID
 		}
 		fmt.Printf("  #%d %s %s (%s): %s · error: %s\n", n.ID, fmtTime(&n.CreatedAt), from, n.Urgency, n.Text, n.Error)
+	}
+	return nil
+}
+
+// printMissedChecks is part of `status` without a job id: the checks whose latest expected time
+// passed its grace without a mark (a late mark shown, the time stays missed) and the missed
+// alerts still pending, with their delivery state.
+func printMissedChecks(m *jobs.Manager) error {
+	list, err := m.MissedChecks()
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("checks:    no missed checks")
+		return nil
+	}
+	fmt.Printf("checks:    %d missed or alert pending\n", len(list))
+	for _, v := range list {
+		fmt.Printf("  %s · last mark %s\n", jobs.CheckViewText(v), fmtTime(v.LastMarkAt))
 	}
 	return nil
 }
@@ -1182,6 +1211,73 @@ func cmdSchedules(args []string) error {
 			jobs.Printable(v.Prompt, 80))
 	}
 	return w.Flush()
+}
+
+func cmdChecks(args []string) error {
+	fs := flag.NewFlagSet("checks", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	asJSON := fs.Bool("json", false, "print the list as JSON (same as check_list)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	list, err := m.CheckViews()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(mcp.ChecksOutput{Checks: list})
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tSTATE\tCRON\tGRACE\tEXPECTED\tNEXT\tLAST MARK\tNOTE")
+	for _, v := range list {
+		exp, next := v.LastExpectedAt, v.NextExpectedAt
+		if exp == "" {
+			exp = "-"
+		}
+		if next == "" {
+			next = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\n", v.Name, jobs.CheckStateText(v), v.Cron, v.GraceMinutes, exp, next,
+			fmtTime(v.LastMarkAt), jobs.Printable(v.LastMarkNote, 60))
+	}
+	return w.Flush()
+}
+
+func cmdCheck(args []string) error {
+	if len(args) == 0 || args[0] != "mark" {
+		return errors.New("usage: agent-jobs check mark --agent A NAME [--note T]")
+	}
+	fs := flag.NewFlagSet("check mark", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	note := fs.String("note", "", "optional one-line note (at most 300 characters)")
+	pos, err := parse(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("exactly one check name expected")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	c, err := m.MarkCheck(pos[0], *note, "")
+	if err != nil {
+		return err
+	}
+	if c.MarkResult == store.MarkNotStored {
+		fmt.Printf("check %s: %s (its window already holds %d marks; this one was not stored)\n",
+			c.Name, store.MarkNotStored, store.MaxMarksPerWindow)
+		return nil
+	}
+	fmt.Printf("check %s marked at %s\n", c.Name, fmtTime(c.LastMarkAt))
+	return nil
 }
 
 func cmdNotifyOwner(args []string) error {
