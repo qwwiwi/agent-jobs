@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,10 +41,12 @@ const (
 	CeilingAcceptanceTimeoutMinutes = 60
 	AcceptanceLogBytes              = 64 << 10
 	AcceptanceLog                   = "acceptance.log"
-	acceptanceKillGrace             = 5 * time.Second
-	acceptanceDeadlineGrace         = 2 * time.Minute // the wrapper's kill, sweep and bookkeeping after the timeout
-	acceptanceReasonPrefix          = "acceptance "
-	acceptanceHome                  = "acceptance-home" // HOME (and TMPDIR under it) of the acceptance command
+	// acceptanceReadCap bounds a read of acceptance.log: the kept output and its header line.
+	acceptanceReadCap       = AcceptanceLogBytes + 1<<10
+	acceptanceKillGrace     = 5 * time.Second
+	acceptanceDeadlineGrace = 2 * time.Minute // the wrapper's kill, sweep and bookkeeping after the timeout
+	acceptanceReasonPrefix  = "acceptance "
+	acceptanceHome          = "acceptance-home" // HOME (and TMPDIR under it) of the acceptance command
 	// acceptanceSignalled is runAcceptanceCmd's result when the wrapper was told to stop (SIGTERM,
 	// SIGINT, SIGHUP) while the command ran: the group is killed and nothing is recorded.
 	acceptanceSignalled = -2
@@ -151,11 +154,11 @@ func acceptanceNote(j *store.Job) string {
 	if !IsAcceptanceFailure(j.Error) {
 		return ""
 	}
-	note := j.Error
+	note := RedactText(j.Error) // before any cut: a value cut short no longer matches its format
 	if i := strings.IndexAny(note, "(:;"); i > 0 {
 		note = note[:i]
 	}
-	return Printable(strings.TrimSpace(note), 80)
+	return RedactPrintable(strings.TrimSpace(note), 80)
 }
 
 // verdict is Verdict, then a succeeded verdict turns into a failure when the job's acceptance command
@@ -284,9 +287,16 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
 	out := &tailBuffer{max: AcceptanceLogBytes}
 	exit := runAcceptanceCmd(ctx, jobDir, cmdline, timeout, out, log, onStart)
 	dur := time.Since(start)
-	body := out.Bytes()
-	if out.dropped > 0 {
-		body = append([]byte(fmt.Sprintf("[... %d earlier bytes cut, last %d kept ...]\n", out.dropped, len(out.buf))), body...)
+	body, dropped := out.Bytes(), out.dropped
+	if dropped > 0 {
+		// The first kept line was cut at its start: drop it whole, so a value split by the cut leaves
+		// no part of itself (too short to match its format) in the log.
+		cut := bytes.IndexByte(body, '\n') + 1
+		if cut == 0 {
+			cut = len(body)
+		}
+		body, dropped = body[cut:], dropped+int64(cut)
+		body = append([]byte(fmt.Sprintf("[... %d earlier bytes cut, last %d kept ...]\n", dropped, len(body))), body...)
 	}
 	if err := writeAtomic(filepath.Join(jobDir, AcceptanceLog), body); err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance: write log:", err)
@@ -405,8 +415,10 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 // Bytes returns the kept tail.
 func (t *tailBuffer) Bytes() []byte { return append([]byte(nil), t.buf...) }
 
-// ReadAcceptanceLogTail returns the last max bytes of <stateDir>/jobs/<id>/acceptance.log as valid
-// UTF-8. The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
+// ReadAcceptanceLogTail returns the end of <stateDir>/jobs/<id>/acceptance.log, at most max bytes, as
+// valid UTF-8 with secret-looking values redacted (like report.md: at most acceptanceReadCap bytes
+// are read, and the text is redacted before it is cut to max; a line cut at the start of the read or
+// of the tail is dropped whole, so no part of a value split by a cut is shown). The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
 // following a symlinked jobs or job dir or log, and only a regular file of this user with one link).
 func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 	f, size, err := OpenJobFile(stateDir, id, AcceptanceLog, os.Getuid())
@@ -414,14 +426,37 @@ func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	if off := size - max; off > 0 {
+	off := size - acceptanceReadCap
+	if off > 0 {
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			return "", err
 		}
 	}
-	b, err := io.ReadAll(io.LimitReader(f, max))
+	b, err := io.ReadAll(io.LimitReader(f, acceptanceReadCap))
 	if err != nil {
 		return "", err
 	}
-	return strings.ToValidUTF8(string(b), "�"), nil
+	s := strings.ToValidUTF8(string(b), "�")
+	if off > 0 {
+		s = dropFirstLine(s)
+	}
+	s = RedactText(s)
+	if cut := int64(len(s)) - max; cut > 0 {
+		head := s[cut-1]
+		s = s[cut:]
+		if head != '\n' {
+			s = dropFirstLine(s)
+		}
+	}
+	return s, nil
+}
+
+// dropFirstLine drops the first line of s, cut at its start, whole: everything up to and including
+// its first line break, all of s when it has none.
+func dropFirstLine(s string) string {
+	i := strings.IndexByte(s, '\n')
+	if i < 0 {
+		return ""
+	}
+	return s[i+1:]
 }

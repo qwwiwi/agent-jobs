@@ -84,3 +84,33 @@ func TestResultBoundedRegularReport(t *testing.T) {
 		t.Fatal("result blocked on a FIFO report.md")
 	}
 }
+
+// `result` of a job whose acceptance failure carries a token (cut short on the done line): no part
+// of the token is printed.
+func TestResultAcceptanceRedacted(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tok := "ghp_" + strings.Repeat("Q", 36)
+	j := &store.Job{ID: "261018-120000-acce", Agent: "test", Title: "t", Kind: "fix", Brief: "b",
+		Status: store.StatusFailed, Model: "sonnet", TimeoutMinutes: 45, CreatedAt: now, StartedAt: &now, FinishedAt: &now,
+		AcceptanceCmd: "make test", Error: "acceptance did not run " + strings.Repeat("x", 50) + " " + tok + " (see stderr.log)"}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	dir := m.JobDir(j.ID)
+	_ = m.Close()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("## Summary\nok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return cmdResult([]string{"--agent", "test", j.ID}) })
+	if strings.Contains(out, "ghp_") || strings.Contains(out, "QQQQ") || !strings.Contains(out, "acceptance did not run") {
+		t.Fatalf("result:\n%s", out)
+	}
+}
