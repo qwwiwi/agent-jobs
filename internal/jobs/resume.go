@@ -374,6 +374,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s ended before the stop (%s): %w", id, cur.Status, store.ErrImmutable)
 	}
 	m.killRunning(j)
+	m.removeSkills(j)
 	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
 	// resume counts this attempt at its whole budget), whatever result line the stream holds.
 	res, killed := killedResult(j.Runner, dir)
@@ -830,6 +831,9 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{}, err
 	}
 	if err := m.checkProjectClaude(j, work); err != nil {
+		return launchPlan{}, err
+	}
+	if err := m.deliverSkills(j, token, work); err != nil {
 		return launchPlan{}, err
 	}
 	if err := m.refreshJobFiles(j, dir, gitDirs...); err != nil {

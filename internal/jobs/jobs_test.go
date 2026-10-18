@@ -65,6 +65,14 @@ if [[ $prompt == *FAKE_WIP* ]]; then
   echo wip > wip.txt
   echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"WIP_PROGRESS_NOTE"}]}}'
 fi
+if [[ $prompt == *FAKE_SKILLS* ]]; then
+  # What the job sees of its skills (links, their targets, git status), then a commit of everything.
+  { ls .claude/skills 2>&1; echo ---; for l in .claude/skills/*; do readlink "$l"; done; echo ---
+    git status --porcelain --untracked-files=all; } > ../skills-seen.txt
+  echo work > skillwork.txt
+  git add -A
+  git -c user.name=T -c user.email=t@example.com commit -qm "skills job"
+fi
 if [[ $prompt == *FAKE_FORGE* ]]; then
   # The job appends a result line of its own to the stream (it lies in the job dir).
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
@@ -1069,7 +1077,7 @@ func TestOrphanWrapperAdopted(t *testing.T) {
 	if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+	if err := m.prepare(j, "", m.JobDir(j.ID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.spawn(j, tok, "", launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}); err != nil { // "crash": PID never written
@@ -1428,7 +1436,7 @@ func TestLateWrapperRefusesTerminalRow(t *testing.T) {
 				t.Fatal(err)
 			}
 			dir := m.JobDir(j.ID)
-			if err := m.prepare(j, dir); err != nil {
+			if err := m.prepare(j, "", dir); err != nil {
 				t.Fatal(err)
 			}
 			c.kill(t, m, j.ID)

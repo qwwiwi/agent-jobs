@@ -54,6 +54,7 @@ var toolDefs = []toolDef{
 	{"job_resume", addJobResume},
 	{"job_amend", addJobAmend},
 	{"job_stats", addJobStats},
+	{"skill_list", addSkillList},
 	{"memory_search", addMemorySearch},
 	{"memory_write", addMemoryWrite},
 	{"memory_already_exists", addMemoryAlreadyExists},

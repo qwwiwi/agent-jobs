@@ -103,6 +103,14 @@ type Job struct {
 	// ScopePending is set when stopping the job's scope failed: the row is terminal, but processes of
 	// the job may live on; every tick retries the stop until the unit is gone.
 	ScopePending bool
+	// Skills are the catalog skills selected for the job at job_start (E7), sorted by name.
+	Skills []string
+	// SkillsDelivered are the skills linked into the job's work dir for the current attempt (removed
+	// when the attempt ends; the record stays). A selected skill the repository already has is not
+	// linked (the repository wins); a codex job gets none.
+	SkillsDelivered []string
+	// SkillsNote says why a selected skill was not delivered (repository wins, codex runner), "" otherwise.
+	SkillsNote string
 }
 
 // CostIsUnknown reports whether the job's cost is not known: a codex job always (codex reports no
@@ -228,6 +236,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: schedules: %w", err)
 	}
+	if err := migrate(db, `ALTER TABLE schedules ADD COLUMN skills TEXT NOT NULL DEFAULT ''`); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: schedules: %w", err)
+	}
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
@@ -316,6 +328,10 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN skills_delivered TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN skills_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN skills_delivered TEXT NOT NULL DEFAULT ''`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -430,7 +446,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort`
+	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
+	skills, skills_delivered, skills_note`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -447,13 +464,14 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
+		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -466,14 +484,17 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned sql.NullInt64
+	var skills, delivered string
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
+		&skills, &delivered, &j.SkillsNote)
 	if err != nil {
 		return nil, err
 	}
+	j.Skills, j.SkillsDelivered = SplitNames(skills), SplitNames(delivered)
 	j.CreatedAt = time.Unix(created, 0)
 	j.StartedAt, j.FinishedAt, j.NotifiedAt, j.CleanedAt = convTS(started), convTS(finished), convTS(notified), convTS(cleaned)
 	return &j, nil
@@ -729,6 +750,24 @@ func (s *Store) SetPID(id, token string, pid, pgid int) error {
 func (s *Store) SetScope(id, token, unit string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET scope_unit=? WHERE id=? AND status='running' AND launch_token=?`,
 		unit, id, token))
+}
+
+// SetSkillsDelivered records the skills linked into the work dir of the running attempt (token) and
+// why a selected one was not (note).
+func (s *Store) SetSkillsDelivered(id, token string, delivered []string, note string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET skills_delivered=?, skills_note=? WHERE id=? AND status='running' AND launch_token=?`,
+		JoinNames(delivered), note, id, token))
+}
+
+// JoinNames stores a list of skill names (names never contain a comma) as one column.
+func JoinNames(names []string) string { return strings.Join(names, ",") }
+
+// SplitNames is the inverse of JoinNames ("" = none).
+func SplitNames(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
 }
 
 // SetScopePending records whether the job's scope still has to be stopped (a failed stop is retried
