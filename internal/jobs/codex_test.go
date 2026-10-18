@@ -27,6 +27,7 @@ prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
 printf '%s' "$prompt" > ../stdin.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
+env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true
 echo '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
 echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
@@ -61,6 +62,23 @@ func newCodexManager(t *testing.T) *Manager {
 }
 
 func codexReview(r *StartRequest) { r.Kind, r.Model = "review", "gpt-6.1-sol" }
+
+// The fork subagent override is claude-only: a codex job gets the daemon's value unchanged.
+func TestCodexKeepsForkSubagentEnv(t *testing.T) {
+	m := newCodexManager(t)
+	t.Setenv(ForkSubagentEnvVar, "1")
+	j := runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "forkenv.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != ForkSubagentEnvVar+"=1\n" {
+		t.Fatalf("codex fork subagent env %q", got)
+	}
+}
 
 func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 	m := newCodexManager(t)

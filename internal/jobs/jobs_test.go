@@ -109,6 +109,7 @@ fi
 if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
+if [[ $prompt == *FAKE_FORKENV* ]]; then env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true; fi
 if [[ $prompt == *FAKE_GITENV* ]]; then
   env | grep -E '^(GIT_|PAGER=|EDITOR=|VISUAL=)' | sort > ../gitenv.txt
   echo h > hooked.txt
@@ -1741,6 +1742,32 @@ func TestCleanupSkipsRepoDrivers(t *testing.T) {
 
 // Security review H2: claude runs with a scrubbed git environment: own global config (job identity
 // only), no system config, repository hooks never run, cat/true as pager/editor; inherited GIT_* gone.
+// A claude job always runs with fork subagents off: exactly one CLAUDE_CODE_FORK_SUBAGENT=0, whatever
+// the daemon inherited.
+func TestWrapperDisablesForkSubagents(t *testing.T) {
+	m := newManager(t)
+	t.Setenv(ForkSubagentEnvVar, "1")
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_FORKENV", nil).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s %q", j.Status, j.Error)
+	}
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "forkenv.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != ForkSubagentEnvVar+"=0\n" {
+		t.Fatalf("fork subagent env %q", got)
+	}
+}
+
+func TestForkSubagentEnvReplacesEveryEntry(t *testing.T) {
+	got := ForkSubagentEnv([]string{"A=1", ForkSubagentEnvVar + "=1", "B=2", ForkSubagentEnvVar + "=true", ForkSubagentEnvVar})
+	want := []string{"A=1", "B=2", ForkSubagentEnvVar + "=0"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestWrapperScrubsGitEnv(t *testing.T) {
 	m := newManager(t)
 	m.Cfg.GitName, m.Cfg.GitEmail = "Job Bot", "bot@example.com"
