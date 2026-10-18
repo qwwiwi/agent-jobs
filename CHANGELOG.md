@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-18
+
 ### Added
 - Acceptance from a clean clone (Wave D): `scripts/acceptance-clean-clone.sh [REF] [--from PATH|URL] [--no-tests] [--real-model M] [--wait-minutes N] [--keep] [--inside-job]` clones the repository into a fresh temp dir, builds, runs `scripts/check.sh`, installs with `install-linux.sh` into a sandbox HOME (stub `systemctl`, `cgroup_scope` off; `init` on macOS), starts an isolated foreground daemon for a throwaway `accept-<random>` agent, checks `status`, `doctor procs`, `list` and `/v1/health`, runs one job in a scratch repository (a stub `claude` via `AGENT_JOBS_CLAUDE_BIN` by default, a real model with `--real-model`) and checks its status, `report.md` and `agent-jobs result`; prints PASS / FAIL per step and keeps the temp dir on failure. Inside a job it runs only with `--inside-job` (test-hooks build). Isolation: inherited `GIT_*` repository overrides are dropped before the first git command, and HOME, `AGENT_JOBS_*`, `XDG_*_HOME` and `CLAUDE_CONFIG_DIR` are the sandbox's before any clone code is built or run (the installer gets an explicit `--skills-dir`; with `--real-model` only the daemon gets the caller's HOME and `CLAUDE_CONFIG_DIR`, and that claude's session data lands there); steps, the daemon and each teardown command run under a supervisor that leads a process group of its own: the script only writes `stop` to its FIFO and waits for it, the supervisor signals only its own group (`kill 0`), so no PID or group id is signalled after it could be reused; the teardown (active step, then the sandbox's queued/running jobs, each `list`/`cancel` with a 10 s deadline, a stuck one failing the run, then the daemon) is idempotent, bounded and survives repeated signals; the installed binary must equal the build and runs the later steps; curl and the real-model marker are required. Tests: `acceptance_clean_clone_test.go`, `acceptance_fake_repo_test.go` (a fake repository: sentinel Git/XDG/Claude/agent-jobs settings, installed bytes, interruption also before a supervisor started, hanging teardown commands, a failing HTTP check; every run under a child-subreaper helper that ends only its own orphans and reports them). README «Release checklist».
 - Config `max_running` (integer, 1..8, default 2 when absent): how many jobs of the agent run at once; the rest stay queued. A value outside 1..8 is a config error at load time, never clamped. The effective value shows in `system_doctor` (`queue.max_running`), `agent-jobs status` (no id, `queue:` line) and `GET /v1/health` (`max_running`).
@@ -31,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 - README benchmark method (EN and RU): report `cache_creation` tokens separately from input, cache read and output, add a priced total per run (list price, each field at its own rate) as the primary number, and use the same acceptance check for all three modes.
 - PLAN: ideas section (not approved) with sources.
+- Docs: conformance check against the reference (`docs/CONFORMANCE.md`) and refreshed PLAN status lines (#27); PLAN for v1.0.0, agent-jobs as a Claude Code plugin (#28); stale status lines fixed for v0.4.0 in PLAN and WORKFLOW (#34).
 - Claude jobs run with fork subagents off: the wrapper drops any inherited `CLAUDE_CODE_FORK_SUBAGENT` and sets `CLAUDE_CODE_FORK_SUBAGENT=0` on claude (owner decision 2026-10-18); codex jobs are unchanged, ordinary subagents keep the per-job cap.
 - `prune` takes the lifecycle lock per job (re-reading the row under it) instead of once for the whole pass, and stops between jobs when its context ends (`PruneContext`).
 
@@ -162,6 +165,7 @@ No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released her
 - File tools (Write/Edit/MultiEdit/NotebookEdit) cannot write inside `.git` or the job's own git dirs (symlinks resolved, `..` rejected).
 - Wrapper starts claude with a scrubbed git environment (job-only global config with the job identity, no system config, hooks/fsmonitor/ssh/credential helper/pager/editor overridden); the daemon's own git calls use the same overrides, and cleanup makes no patch when the repository config names a filter, diff command or textconv.
 
-[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/qwwiwi/agent-jobs/releases/tag/v0.1.0
