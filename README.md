@@ -281,7 +281,7 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 | `schedule_set` | edit in place by `id`: `cron`, `prompt`, `enabled` (false pauses) |
 | `schedule_remove` | delete by `id`, only on the owner's instruction |
 
-A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts included: a firing must be later than the last one on the local wall clock too, so in the hour repeated when DST ends `*/30 2 * * *` fires at 02:00 and 02:30 once each. `agent-jobs schedules --agent A [--json]` lists them.
+A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts included: a firing must be later than the last one on the local wall clock too, so in the hour repeated when DST ends `*/30 2 * * *` fires at 02:00 and 02:30 once each. If the system clock is set back, schedules pause until the clock passes both persisted watermarks (the instant and the local wall-clock minute of the last firing); a restart does not reset them, and `next_fire_at` shows the firing that resumes them. `agent-jobs schedules --agent A [--json]` lists them.
 
 **Owner** (orchestrator and job):
 

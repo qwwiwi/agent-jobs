@@ -92,6 +92,28 @@ func TestScheduleNextFireRespectsWatermark(t *testing.T) {
 	}
 }
 
+// Codex review (PR #25): after the clock is stepped back three days, an every-minute schedule is
+// paused by the persisted watermark but still advertises its next firing (the minute after the
+// last one), not nil.
+func TestScheduleNextFireAfterClockRollback(t *testing.T) {
+	m, now, _ := scheduleManager(t, time.UTC)
+	sc := addSchedule(t, m, ScheduleRequest{Cron: "* * * * *", Prompt: "tick"})
+	last := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	*now = last
+	fire(t, m)
+	row, err := m.Store.GetSchedule(sc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	*now = last.Add(-3 * 24 * time.Hour)
+	want := last.Add(time.Minute)
+	within(t, 5*time.Second, "NextFire", func() {
+		if n := m.NextFire(row); n == nil || !n.Equal(want) {
+			t.Errorf("after a three-day rollback: next %v, want %s", n, want)
+		}
+	})
+}
+
 // Codex review (PR #25): America/Havana springs forward at midnight (2027-03-14 00:00 does not
 // exist and normalises back to 03-13 23:00); add, set and list must not hang on such a day.
 func TestScheduleHavanaMidnightGapNeverHangs(t *testing.T) {

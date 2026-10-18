@@ -148,7 +148,9 @@ const maxNextFireSkips = 2 * 24 * 60
 // NextFire is the next minute the schedule fires (nil when disabled, it never fires, or the
 // watermark suppresses every firing within maxNextFireSkips). Like the claim, it skips a due
 // minute whose instant or local wall-clock minute is not later than the last firing's, so a
-// suppressed second pass of a repeated DST hour is never advertised.
+// suppressed second pass of a repeated DST hour is never advertised. The walk starts at the later
+// of now and the last firing, so a clock stepped back past the watermark (by any amount) still
+// shows the firing that resumes the schedule instead of exhausting the skips on suppressed minutes.
 func (m *Manager) NextFire(sc *store.Schedule) *time.Time {
 	if !sc.Enabled {
 		return nil
@@ -157,7 +159,11 @@ func (m *Manager) NextFire(sc *store.Schedule) *time.Time {
 	if err != nil {
 		return nil
 	}
-	t := m.Now().In(m.loc())
+	t := m.Now()
+	if sc.LastFiredAt != nil && sc.LastFiredAt.After(t) {
+		t = *sc.LastFiredAt
+	}
+	t = t.In(m.loc())
 	for i := 0; i < maxNextFireSkips; i++ {
 		n, err := c.Next(t)
 		if err != nil {
