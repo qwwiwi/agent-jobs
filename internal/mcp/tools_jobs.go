@@ -226,7 +226,7 @@ type AcceptanceView struct {
 	Exit        int  `json:"exit"`
 	TimedOut    bool `json:"timed_out,omitempty"`
 	DurationSec int  `json:"duration_sec"`
-	// LogTail is the end of acceptance.log (stdout and stderr), at most MaxAcceptanceTailBytes; not redacted.
+	// LogTail is the end of acceptance.log (stdout and stderr), at most MaxAcceptanceTailBytes, redacted like report.md.
 	LogTail string `json:"log_tail,omitempty"`
 }
 

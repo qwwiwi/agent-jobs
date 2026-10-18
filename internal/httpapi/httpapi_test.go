@@ -562,3 +562,30 @@ func TestJobReportRedacted(t *testing.T) {
 		t.Fatalf("report: %q", r)
 	}
 }
+
+// A job whose acceptance output and failure carry a token: the HTTP job view shows neither (the
+// acceptance log is not served, the failure is a code).
+func TestAcceptanceNotLeaked(t *testing.T) {
+	f := newFixture(t)
+	tok := "ghp_" + strings.Repeat("Q", 36)
+	now := time.Now()
+	exit := 2
+	j := &store.Job{ID: "261018-100001-dddd", Agent: "test", Title: "t", Kind: "fix", Brief: "b", Status: store.StatusFailed,
+		Model: "opus", MaxTurns: 10, MaxBudgetUSD: 1, TimeoutMinutes: 5, CreatedAt: now, StartedAt: &now, FinishedAt: &now,
+		Error: "acceptance failed (exit 2) " + tok, AcceptanceCmd: "make test", AcceptanceExit: &exit}
+	if err := f.m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	dir := f.m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, jobs.AcceptanceLog), []byte("export GH "+tok+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/v1/jobs/" + j.ID, "/v1/jobs/" + j.ID + "?report=1", "/v1/jobs?limit=10"} {
+		if b := f.body(t, p); strings.Contains(b, "QQQQQQQQ") {
+			t.Fatalf("%s carries the token: %s", p, b)
+		}
+	}
+}

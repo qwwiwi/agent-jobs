@@ -46,7 +46,9 @@ func TestAcceptanceTools(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	log := strings.Repeat("x", MaxAcceptanceTailBytes) + "FAIL: TestSomething\n"
+	// A token in the output, and a line cut by the tail cap: the tail shows neither.
+	tok := "ghp_" + strings.Repeat("Q", 36)
+	log := "export GH " + tok + "\n" + strings.Repeat("x", MaxAcceptanceTailBytes) + "\nFAIL: TestSomething " + tok + "\n"
 	if err := os.WriteFile(filepath.Join(dir, jobs.AcceptanceLog), []byte(log), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +56,7 @@ func TestAcceptanceTools(t *testing.T) {
 	call(t, cs, "job_result", map[string]any{"id": done.ID}, &res)
 	a := res.Acceptance
 	if a == nil || a.Cmd != "make test" || !a.Ran || a.Exit != 2 || a.TimedOut || a.DurationSec != 4 ||
-		!strings.HasSuffix(a.LogTail, "FAIL: TestSomething\n") || len(a.LogTail) != MaxAcceptanceTailBytes {
+		a.LogTail != "FAIL: TestSomething [redacted:github]\n" {
 		t.Fatalf("acceptance view: %+v", a)
 	}
 	if !strings.Contains(res.DoneLine, "acceptance failed (exit 2)") {
