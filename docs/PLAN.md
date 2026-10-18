@@ -54,7 +54,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
   - as a job, when the schedule has a kind; the session then only sees the job-done line.
   Schedules store their model and limits at creation. A missed firing is lost, not queued, so check windows overlap. Schedule rows never expire; they are edited in place and deleted only by the owner.
 - **Dead-man's switch.** Checks that stay silent when all is well leave a completion mark; a watchdog compares the marks with the schedule.
-- **Intentions.** `intention_add`, `intention_list`, `intention_set`: the agent's own goals.
+- **Intentions.** *Status: built on branch `feature/intentions` (unreleased); `internal/store/intentions.go`, `internal/jobs/intentions.go`, `internal/mcp/tools_intentions.go`.* `intention_add`, `intention_list`, `intention_set`: the agent's own goals, a table `intentions` in the agent's store (text one line, ≤ 500 characters; optional due date and priority; status `open` / `done` / `dropped`, edited in place, never deleted). Orchestrator only; `agent-jobs intentions [--status] [--json]` lists them.
 - **`notify_owner`.** A message to the owner through the agent's existing channel (DEVIATIONS #4).
 - **Daily automation.** `prune` and `doctor procs` run once a day on their own.
 - **Codex runner.** A job can run on `codex exec` instead of `claude -p` (DEVIATIONS #5); without turn or budget caps there, so the timeout is the limit.

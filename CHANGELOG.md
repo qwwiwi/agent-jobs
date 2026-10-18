@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Intentions, the agent's own goals: orchestrator MCP tools `intention_add` (text, optional due date and priority; returns the id), `intention_list` (optional status filter) and `intention_set` (status and/or text, in place; statuses `open`, `done`, `dropped`; no delete), table `intentions` in the agent's store (created on Open, so older databases gain it), text one line (control characters refused) and capped at 500 characters; `agent-jobs intentions --agent A [--status S] [--json]` lists them.
+
 ## [0.3.0] - 2026-10-18
 
 No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released here in 0.3.0.

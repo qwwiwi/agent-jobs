@@ -55,6 +55,10 @@ var OrchestratorOnly = []string{
 	"activity_report",
 	"trash_move",
 	"trash_restore",
+	// The agent's own goals: a job does not set or read them.
+	"intention_add",
+	"intention_list",
+	"intention_set",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
