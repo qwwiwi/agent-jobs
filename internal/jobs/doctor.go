@@ -90,13 +90,14 @@ type ProcsReport struct {
 // procInfo is what the scan reads about one process.
 type procInfo struct {
 	pid, ppid, sid int
+	pgid           int
 	state          string
 	start          uint64
 	cmdline        []string
 	marker         string
 }
 
-// procStatFull parses /proc/<pid>/stat: state, ppid, session and starttime.
+// procStatFull parses /proc/<pid>/stat: state, ppid, process group, session and starttime.
 func procStatFull(pid int) (procInfo, error) {
 	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
 	if err != nil {
@@ -113,6 +114,9 @@ func procStatFull(pid int) (procInfo, error) {
 	}
 	p := procInfo{pid: pid, state: f[0]}
 	if p.ppid, err = strconv.Atoi(f[1]); err != nil {
+		return procInfo{}, err
+	}
+	if p.pgid, err = strconv.Atoi(f[2]); err != nil {
 		return procInfo{}, err
 	}
 	if p.sid, err = strconv.Atoi(f[3]); err != nil {
