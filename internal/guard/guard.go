@@ -106,9 +106,13 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 		cfg.Dir = in.Cwd
 	}
 	if cfg.StateDir == "" {
-		if state, own, ok := StateLayout(cfg.SubagentLog); ok {
-			cfg.StateDir, cfg.OwnDir = state, own
+		state, own, ok := StateLayout(cfg.SubagentLog)
+		if !ok && cfg.SubagentLog != "" {
+			// A misconfigured hook must not silently turn the state-read rule off: fail closed.
+			return "blocked by guard: the subagent log `" + cfg.SubagentLog + "` is not <state>/subagents/<id>.log, " +
+				"so the guard cannot derive the job's folder; every tool call is refused until the hook is fixed.", nil
 		}
+		cfg.StateDir, cfg.OwnDir = state, own
 	}
 	if readTools[in.ToolName] {
 		p, pattern := in.ToolInput.Path, ""

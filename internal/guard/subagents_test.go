@@ -19,6 +19,16 @@ func subagentCall(t *testing.T, tool string, input map[string]any) string {
 	return string(b)
 }
 
+// jobLog is a subagent log in the agent layout <state>/subagents/<id>.log (any other path is refused).
+func jobLog(t *testing.T) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "subagents")
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(d, "job.log")
+}
+
 func decide(t *testing.T, payload string, cfg Config) string {
 	t.Helper()
 	reason, err := Decide(strings.NewReader(payload), cfg)
@@ -30,7 +40,7 @@ func decide(t *testing.T, payload string, cfg Config) string {
 
 // Owner 2026-10-17: at most three subagents per job; Agent and its older name Task share one count.
 func TestSubagentCapThreePerJob(t *testing.T) {
-	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+	cfg := Config{SubagentLog: jobLog(t)}
 	for i, tool := range []string{"Agent", "Task", "Agent"} {
 		if r := decide(t, subagentCall(t, tool, map[string]any{"description": "part", "prompt": "p", "subagent_type": "general-purpose"}), cfg); r != "" {
 			t.Fatalf("subagent %d (%s) refused: %s", i+1, tool, r)
@@ -53,7 +63,7 @@ func TestSubagentCapThreePerJob(t *testing.T) {
 }
 
 func TestSubagentMustStayInsideTheJob(t *testing.T) {
-	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+	cfg := Config{SubagentLog: jobLog(t)}
 	for name, in := range map[string]map[string]any{
 		"remote":           {"prompt": "p", "isolation": "remote"},
 		"worktree":         {"prompt": "p", "isolation": "worktree"},
@@ -76,7 +86,7 @@ func TestSubagentMustStayInsideTheJob(t *testing.T) {
 // Claude Code matches keys case-sensitively, encoding/json does not and lets the last duplicate win:
 // the guard reads the raw keys, so neither a case variant nor a duplicate can hide a denied field.
 func TestSubagentInputKeyDifferentials(t *testing.T) {
-	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+	cfg := Config{SubagentLog: jobLog(t)}
 	for name, input := range map[string]string{
 		"case variant hides isolation": `{"prompt":"p","isolation":"worktree","Isolation":""}`,
 		"case variant of allowed key":  `{"Prompt":"p"}`,
@@ -94,7 +104,7 @@ func TestSubagentInputKeyDifferentials(t *testing.T) {
 	}
 	// Each allowed key alone passes (the cap is not reached: four keys, so use a fresh log each time).
 	for _, k := range []string{"description", "prompt", "subagent_type", "model"} {
-		c := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+		c := Config{SubagentLog: jobLog(t)}
 		payload := `{"tool_name":"Task","cwd":"/tmp","tool_input":{"` + k + `":"v"}}`
 		if r := decide(t, payload, c); r != "" {
 			t.Errorf("key %s alone refused: %s", k, r)
@@ -110,7 +120,7 @@ func TestSubagentWithoutLogRefused(t *testing.T) {
 }
 
 func TestSubagentLogSymlinkRefused(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Dir(jobLog(t))
 	target := filepath.Join(dir, "elsewhere")
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -126,7 +136,7 @@ func TestSubagentLogSymlinkRefused(t *testing.T) {
 
 // Parallel subagent calls of one message run the hook concurrently: the lock keeps the cap.
 func TestSubagentCapHoldsUnderConcurrency(t *testing.T) {
-	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log")}
+	cfg := Config{SubagentLog: jobLog(t)}
 	payload := subagentCall(t, "Agent", map[string]any{"prompt": "p"})
 	var mu sync.Mutex
 	allowed := 0
@@ -176,7 +186,7 @@ func TestSubagentCounterAndTamper(t *testing.T) {
 		count++
 		return count - 1, true, nil
 	}
-	cfg := Config{SubagentLog: filepath.Join(t.TempDir(), "job.log"), SubagentReserve: reserve}
+	cfg := Config{SubagentLog: jobLog(t), SubagentReserve: reserve}
 	call := subagentCall(t, "Agent", map[string]any{"prompt": "p"})
 	for i := 0; i < 2; i++ {
 		if r := decide(t, call, cfg); r != "" {
@@ -240,7 +250,7 @@ func TestProtectedPaths(t *testing.T) {
 // N6: the log line is written before the counter is reserved (a failed write leaves the counter
 // untouched), and a refusal by the counter takes the line back.
 func TestSubagentLogWrittenBeforeReserve(t *testing.T) {
-	logf := filepath.Join(t.TempDir(), "job.log")
+	logf := jobLog(t)
 	count, seen := 0, -1
 	reserve := func(max int) (int, bool, error) {
 		b, err := os.ReadFile(logf)

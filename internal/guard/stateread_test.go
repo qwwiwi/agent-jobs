@@ -180,3 +180,115 @@ func TestBareRedirection(t *testing.T) {
 		}
 	}
 }
+
+// stateRefusal reports a refusal by the state-read rule (not by another check of the guard).
+func stateRefusal(r string) bool {
+	return strings.Contains(r, "agent-jobs state") || strings.Contains(r, "contains `..`")
+}
+
+// Fix loop 1 of PR #24: symlink traversal, wildcards above the state dir, command-specific cwd and
+// recursive reads from an ancestor are refused by the state-read rule.
+func TestStateReadBypassesRefused(t *testing.T) {
+	_, own, cfg := stateReadSetup(t)
+	if err := os.Symlink(own, filepath.Join(cfg.Dir, "up")); err != nil { // up/.. is jobs/, not own/
+		t.Fatal(err)
+	}
+	for _, c := range []string{
+		// symlinks: `..` after a symlink, or after a component the call may create as one
+		"ln -s .. L && cat L/../k/report.md", "ln -s .. L; cat L/../k/report.md", "cat up/../k/new.md",
+		"cat up/../k/report.md", "ln -s ~/.agent-jobs A && cat A/thrall/jobs.db", "ln -s ../../../.. A",
+		"mkdir -p a/b && ln -s ../../../../k a/b", "ln -s ../../.. S", "ln -sf -t sub ../../../../k",
+		"cp -s ~/.agent-jobs/thrall/jobs.db x", "rm -r sub && ln -s up sub && cat sub/../k/report.md",
+		"cd up/.. && cat k/report.md", "cd -P up/.. && cat k/report.md",
+		// wildcards at or above the state dir
+		"cat ~/.agent-jobs/thr*/jobs.db", "cat ~/.agent-*/thrall/config.json", "ls ~/.agent-jobs/*",
+		"cat ~/.agent-jobs/thrall/jobs/[k]/report.md", "cat ~/.agent-jobs/thrall/jobs/{j,k}/report.md",
+		"cat ~/*/thrall/jobs.db", "cat ../../?/report.md", "cat ../*/../k/report.md", "cat ~/.agent-jobs/thrall/j*",
+		// command-specific working directory
+		"env -C .. cat ../k/report.md", "env --chdir=.. cat ../k/report.md", "env --chdir .. cat ../k/report.md",
+		"env -C ../.. cat k/report.md", "env -C../.. cat k/report.md", "git -C ../.. diff --no-index k/report.md j/prompt.md",
+		"git -C .. -C .. diff --no-index k/report.md j/prompt.md", "make -C ../.. -f k/report.md", "env -C $X cat jobs.db",
+		"chroot / cat x", "make --directory=../.. -f k/report.md", "go -C ../.. vet ./k", "sudo -D ../.. cat k/report.md",
+		// recursive reads from an ancestor of the state dir
+		"grep -a -d recurse '' \"$HOME\"", "grep -d recurse x ~", "grep -drecurse x ~", "grep --directories=recurse x ~",
+		"grep --directories recurse x ~", "grep --recur x ~", "grep --derefe x ~", "find \"$HOME\" -name report.md | xargs cat",
+		"find ~ -type f", "find ~/.agent-jobs", "echo ~/.agent-jobs | xargs -n1 ls",
+		"cp -r ~/.agent-jobs /tmp/x", "cp -a ~ /tmp/x", "tar czf /tmp/x.tgz ~/.agent-jobs", "rsync -a ~/ /tmp/x",
+		"cd ~ && rg token", "cd ~/.agent-jobs && grep -r token", "ls -R ~", "env -C ~ rg token",
+	} {
+		if r := Check(c, cfg); !stateRefusal(r) {
+			t.Errorf("%q: %q, want a state-read refusal", c, r)
+		}
+	}
+}
+
+// The tightened rule keeps ordinary job work readable: the job's own prompt and report, the worktree,
+// go test, git diff, globs inside the job's folder, links inside the worktree.
+func TestStateReadNoFalsePositives(t *testing.T) {
+	_, own, cfg := stateReadSetup(t)
+	if err := os.MkdirAll(filepath.Join(cfg.Dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []string{
+		"cat ../prompt.md; cd ..", "cat ../prompt.md && cd .. && ls", "head ../report.md; cd .. && cat prompt.md",
+		"go test -count=1 ./...", "go vet ./...", "git diff", "git diff --stat HEAD~1..HEAD", "git -C . status",
+		"git log main...HEAD", "env -C .. cat prompt.md", "env -C sub cat ../main.go", "ls *.go", "cat *.md",
+		"cat ../*.md", "ls ../../j/*", "cat " + own + "/*.md", "ln -s ../prompt.md p", "ln -s main.go m.go",
+		"ln -s ../prompt.md sub", "grep -r x ..", "grep -d skip x *.go", "find . -name '*.go' | xargs grep x",
+		"sed -e 's/a/b/' ../prompt.md", "cat ~/.bashrc", "ls ~/*.md", "cat sub/../main.go", "find .. -name '*.md'",
+		"cp -r sub /tmp/x", "rg x ..", "tar czf /tmp/x.tgz .", "ls -R .", "grep -rn TODO --include='*.go' .",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
+
+// Glob tool patterns that can reach the state dir through a wildcard at or above it are refused.
+func TestStateReadGlobWildcards(t *testing.T) {
+	state, own, cfg := stateReadSetup(t)
+	home := filepath.Dir(filepath.Dir(state))
+	for _, c := range []struct{ path, pattern string }{
+		{filepath.Dir(state), "thr*/jobs/*/report.md"},
+		{home, ".agent-jobs/*/jobs.db"},
+		{"", home + "/.agent-jobs/*/config.json"},
+		{own, "../[k]/report.md"},
+		{own, "../*/report.md"},
+		{home, "*/thrall/jobs.db"},
+		{state, "j*"},
+		{filepath.Dir(state), "*"},
+	} {
+		if r := CheckFileRead("Glob", c.path, c.pattern, cfg); !stateRefusal(r) {
+			t.Errorf("Glob %q in %q: %q, want a refusal", c.pattern, c.path, r)
+		}
+	}
+	for _, c := range []struct{ path, pattern string }{
+		{"", "**/*.go"}, {own, "*.md"}, {"", "../*.md"}, {home, "*.txt"}, {state + "/jobs/j", "**/*.md"},
+	} {
+		if r := CheckFileRead("Glob", c.path, c.pattern, cfg); r != "" {
+			t.Errorf("Glob %q in %q refused: %s", c.pattern, c.path, r)
+		}
+	}
+}
+
+// A configured subagent log that is not <state>/subagents/<id>.log refuses every tool call instead of
+// silently turning the state-read rule off.
+func TestStateReadInvalidLayoutRefusesAll(t *testing.T) {
+	for _, logPath := range []string{filepath.Join(t.TempDir(), "j.log"), "relative/subagents/j.log", "/x/subagents/.log"} {
+		cfg := Config{SubagentLog: logPath, Dir: t.TempDir()}
+		for _, in := range []map[string]any{
+			{"tool_name": "Bash", "cwd": cfg.Dir, "tool_input": map[string]any{"command": "ls"}},
+			{"tool_name": "Read", "cwd": cfg.Dir, "tool_input": map[string]any{"file_path": "/etc/hostname"}},
+			{"tool_name": "Agent", "cwd": cfg.Dir, "tool_input": map[string]any{"prompt": "p"}},
+		} {
+			b, _ := json.Marshal(in)
+			r, err := Decide(strings.NewReader(string(b)), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(r, "not <state>/subagents/<id>.log") {
+				t.Errorf("log %q, %v: %q, want the layout refusal", logPath, in["tool_name"], r)
+			}
+		}
+	}
+}
