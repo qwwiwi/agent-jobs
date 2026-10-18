@@ -68,8 +68,10 @@ type Job struct {
 	LaunchToken string
 	// Complexity is the stated light|normal|hard (picks the model when none was given), empty when only a model was given.
 	Complexity string
-	// Runner is the program that runs the job ("claude"; "codex" arrives with S3-M1).
+	// Runner is the program that runs the job: "claude" (claude -p) or "codex" (codex exec, S3-M1).
 	Runner string
+	// ReasoningEffort is the codex reasoning effort (low|medium|high) of a codex job, empty for claude.
+	ReasoningEffort string
 	// OwnerWaits marks a job the owner asked for (the Stop-hook that enforces it is S3-M5).
 	OwnerWaits bool
 	// ResumedFrom is the id of the job this one continues (S2-M5), empty otherwise.
@@ -101,6 +103,10 @@ type Job struct {
 	ScopePending bool
 }
 
+// CostIsUnknown reports whether the job's cost is not known: a codex job always (codex reports no
+// price, so even a queued or running one has no cost to show), a claude job when CostUnknown is set.
+func (j *Job) CostIsUnknown() bool { return j.CostUnknown || j.Runner == RunnerCodex }
+
 // Attempt is one earlier attempt of a resumed job (the current attempt is the job row itself).
 type Attempt struct {
 	JobID          string
@@ -125,6 +131,7 @@ type Attempt struct {
 // Runners and billing modes.
 const (
 	RunnerClaude        = "claude"
+	RunnerCodex         = "codex"
 	BillingSubscription = "subscription"
 )
 
@@ -202,7 +209,7 @@ func Open(path string) (*Store, error) {
 	// Tolerant migrations: databases created before a column existed get it with its default;
 	// "duplicate column" means the column is already there.
 	for _, alter := range migrations {
-		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		if err := migrate(db, alter); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate db: %w", err)
 		}
@@ -214,6 +221,10 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(intentionsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: intentions: %w", err)
+	}
+	if _, err := db.Exec(notificationsSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -289,6 +300,41 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+}
+
+// migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
+// they run in the same transaction as the ALTER, so only once, by the process that added the column.
+var migrationBackfills = map[string]string{
+	// The stats of a finished job whose cost is unknown (a codex job, or a job whose attempts all ended
+	// without a cost, as RecordStats computes it) must not count as a known $0.00. A stats row whose
+	// job was pruned keeps the default.
+	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`: `UPDATE job_stats SET cost_unknown=1
+		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
+			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
+}
+
+// migrate runs one migration and its backfill, if any, in one transaction; a column that is already
+// there ("duplicate column") is no error and is not backfilled again.
+func migrate(db *sql.DB, alter string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(alter); err != nil {
+		if strings.Contains(err.Error(), "duplicate column") {
+			return nil
+		}
+		return err
+	}
+	if fill, ok := migrationBackfills[alter]; ok {
+		if _, err := tx.Exec(fill); err != nil {
+			return fmt.Errorf("backfill: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // ReserveSubagent counts one more subagent for running job id unless max are already used. It
@@ -370,7 +416,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context, cost_unknown, session_digest, scope_unit, scope_pending`
+	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -387,13 +433,13 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -410,7 +456,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort)
 	if err != nil {
 		return nil, err
 	}

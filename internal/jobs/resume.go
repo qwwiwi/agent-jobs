@@ -364,7 +364,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	}
 	if code, ok := readExitCode(dir); ok {
 		// The job ended before the stop: collect it as the tick would.
-		res := parseStream(filepath.Join(dir, "stream.jsonl"))
+		res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 		status, verdict := Verdict(code, res, dir)
 		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
@@ -376,7 +376,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	m.killRunning(j)
 	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
 	// resume counts this attempt at its whole budget), whatever result line the stream holds.
-	res, killed := killedResult(dir)
+	res, killed := killedResult(j.Runner, dir)
 	if killed {
 		msg += " (cost so far unknown: ended by the stop)"
 	}
@@ -598,6 +598,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 			return nil, err
 		}
 		return m.Store.Get(id)
+	}
+	if j.Runner == store.RunnerCodex {
+		return nil, fmt.Errorf("job %s: %w", id, errCodexResume)
 	}
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)

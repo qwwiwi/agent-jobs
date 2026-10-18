@@ -269,3 +269,42 @@ func TestStatsRowWrittenOnJobEnd(t *testing.T) {
 		t.Fatalf("stats: %+v %v", rep, err)
 	}
 }
+
+// TestSummarizeUnknownCost: a job whose cost is unknown is counted apart and left out of the cost
+// total, median and p90 (it would otherwise count as $0).
+func TestSummarizeUnknownCost(t *testing.T) {
+	unknown := statsRow("3", "review", "gpt-6.1-sol", store.StatusSucceeded, 0, 100, nil, nil)
+	unknown.CostUnknown = true
+	rows := []*store.JobStats{
+		statsRow("1", "review", "opus", store.StatusSucceeded, 2, 100, nil, nil),
+		statsRow("2", "review", "opus", store.StatusSucceeded, 4, 100, nil, nil),
+		unknown,
+	}
+	rep, err := Summarize(rows, "model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tot := rep.Totals
+	if tot.Jobs != 3 || tot.CostUnknownJobs != 1 || tot.CostTotalUSD != 6 || tot.CostMedianUSD != 2 || tot.CostP90USD != 4 {
+		t.Fatalf("totals: %+v", tot)
+	}
+	for _, g := range rep.Groups {
+		if g.Key == "gpt-6.1-sol" && (g.CostUnknownJobs != 1 || g.CostTotalUSD != 0) {
+			t.Fatalf("codex group: %+v", g)
+		}
+	}
+}
+
+// TestStatsRowCodexCostUnknown: the stats row of a codex job carries cost_unknown through the store.
+func TestStatsRowCodexCostUnknown(t *testing.T) {
+	m := newCodexManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "review it", codexReview).ID)
+	st, err := m.Store.GetStats(j.ID)
+	if err != nil || !st.CostUnknown {
+		t.Fatalf("stats row: %+v %v", st, err)
+	}
+	rep, err := m.Stats(time.Time{}, "kind")
+	if err != nil || rep.Totals.CostUnknownJobs != 1 {
+		t.Fatalf("stats: %+v %v", rep, err)
+	}
+}

@@ -11,12 +11,15 @@ import (
 // JobStats is one row of the job_stats table: the summary of a finished job, written when the job
 // reaches a terminal status (or by a backfill from its job dir or the log archive).
 type JobStats struct {
-	ID          string     `json:"id"`
-	Kind        string     `json:"kind"`
-	Model       string     `json:"model"`
-	Status      string     `json:"status"`
-	Turns       int        `json:"turns"`
-	CostUSD     float64    `json:"cost_usd"`
+	ID      string  `json:"id"`
+	Kind    string  `json:"kind"`
+	Model   string  `json:"model"`
+	Status  string  `json:"status"`
+	Turns   int     `json:"turns"`
+	CostUSD float64 `json:"cost_usd"`
+	// CostUnknown: no attempt of the job reported its cost (a codex job); CostUSD is then not its cost,
+	// and the summaries leave it out of the cost figures.
+	CostUnknown bool       `json:"cost_unknown,omitempty"`
 	DurationSec int        `json:"duration_sec"`
 	CreatedAt   time.Time  `json:"created_at"`
 	StartedAt   *time.Time `json:"started_at,omitempty"`
@@ -66,7 +69,8 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 `
 
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
-	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at`
+	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
+	cost_unknown`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -86,10 +90,10 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
-		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix())
+		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -103,7 +107,7 @@ func scanStats(r scanner) (*JobStats, error) {
 	var tools, skills, rules string
 	if err := r.Scan(&st.ID, &st.Kind, &st.Model, &st.Status, &st.Turns, &st.CostUSD, &st.DurationSec, &created,
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
-		&st.ResultSubtype, &st.Source, &recorded); err != nil {
+		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown); err != nil {
 		return nil, err
 	}
 	st.CreatedAt, st.RecordedAt = time.Unix(created, 0), time.Unix(recorded, 0)
