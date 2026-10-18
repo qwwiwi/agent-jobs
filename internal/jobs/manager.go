@@ -31,6 +31,8 @@ type Manager struct {
 	SelfBin string
 	// Now is the clock (overridable in tests).
 	Now func() time.Time
+	// Loc is the time zone schedules are read in (nil = the local time zone; overridable in tests).
+	Loc *time.Location
 	// KillGrace is the wait between SIGTERM and SIGKILL of a job's process group.
 	KillGrace time.Duration
 	Log       *log.Logger
@@ -109,6 +111,8 @@ type StartRequest struct {
 	Runner string
 	// ReasoningEffort is the codex reasoning effort (low|medium|high); empty = config, else high.
 	ReasoningEffort string
+	// ScheduleID is the schedule that starts the job (set by the daemon, never by a caller).
+	ScheduleID string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -205,6 +209,19 @@ func git(dir string, args ...string) (string, error) {
 
 // Enqueue validates the request and inserts a queued job. It returns immediately.
 func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
+	j, err := m.newJob(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.Store.Insert(j); err != nil {
+		return nil, err
+	}
+	return j, nil
+}
+
+// newJob validates the request (the job_start rules: kind, limits, model, runner, codex rules,
+// repo and base) and returns the queued job row it would insert, with defaults applied.
+func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if strings.TrimSpace(r.Title) == "" {
 		return nil, errors.New("title is required")
 	}
@@ -267,15 +284,13 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
-	}
-	if err := m.Store.Insert(j); err != nil {
-		return nil, err
+		ScheduleID: r.ScheduleID,
 	}
 	return j, nil
 }
 
-// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, start
-// queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
+// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, fire the
+// schedules due this minute, start queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
 // cleanup delay.
 func (m *Manager) Tick() error {
 	unlock, err := m.lock()
@@ -289,6 +304,9 @@ func (m *Manager) Tick() error {
 	}
 	if err := m.retryScopeStops(); err != nil {
 		errs = append(errs, fmt.Errorf("scope stop: %w", err))
+	}
+	if err := m.fireSchedules(); err != nil {
+		errs = append(errs, fmt.Errorf("schedules: %w", err))
 	}
 	if err := m.launchQueued(); err != nil {
 		errs = append(errs, fmt.Errorf("launch: %w", err))
