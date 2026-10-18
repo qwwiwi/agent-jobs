@@ -525,12 +525,45 @@ func TestLoadSkipsMalformedEntryKeepsRoot(t *testing.T) {
 		t.Fatalf("roots %v", c.Roots)
 	}
 	w := strings.Join(c.Warnings, "\n")
-	for _, want := range []string{`entry 1 ("badkinds")`, `entry 2 ("badrisk")`, "entry 3 (", "entry 4 (", "kinds", "risk"} {
+	for _, want := range []string{`entry 1 ("badkinds")`, `entry 2 ("badrisk")`, "entry 3: ", "entry 4: ", "kinds", "risk"} {
 		if !strings.Contains(w, want) {
 			t.Errorf("warnings %q lack %q", w, want)
 		}
 	}
 	if strings.Contains(w, "parse index.json") || len(c.Warnings) != 4 {
+		t.Fatalf("warnings %q", w)
+	}
+}
+
+// A warning about an invalid entry names it by its index only: a name that fails ValidName (control
+// characters, a path, a long text) is not repeated; a valid name is.
+func TestLoadWarningOmitsInvalidName(t *testing.T) {
+	root := t.TempDir()
+	long := strings.Repeat("x", 200)
+	writeRawIndex(t, root, `{"version": 1, "skills": [
+		{"name": "ok", "path": "skills/ok", "status": "core"},
+		{"name": "evil\u001b[31mred\nline", "path": "skills/ok", "status": "core"},
+		{"name": "sub/dir-name", "path": "skills/ok", "status": "core"},
+		{"name": "`+long+`", "path": "skills/ok", "status": "core"},
+		{"name": "bad status", "path": "skills/ok", "status": 7},
+		{"name": "named", "path": "skills/named", "status": "nope"}
+	]}`, "ok")
+	c := Load([]string{root})
+	if got := names(c); !slices.Equal(got, []string{"ok"}) {
+		t.Fatalf("entries %v, warnings %v", got, c.Warnings)
+	}
+	w := strings.Join(c.Warnings, "\n")
+	for _, bad := range []string{"evil", "red", "\x1b", "dir-name", long[:65], "bad status"} {
+		if strings.Contains(w, bad) {
+			t.Errorf("warnings %q hold the invalid name part %q", w, bad)
+		}
+	}
+	for _, want := range []string{"entry 1: ", "entry 2: ", "entry 3: ", "entry 4: ", `entry 5 ("named")`} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warnings %q lack %q", w, want)
+		}
+	}
+	if len(c.Warnings) != 5 {
 		t.Fatalf("warnings %q", w)
 	}
 }
