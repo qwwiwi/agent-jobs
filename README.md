@@ -228,7 +228,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits; returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `owner_waits` (the owner asked for it, see *Owner waits*); returns the queued row |
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
 | `job_list` | recent jobs, filterable by status |
@@ -289,6 +289,24 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 |---|---|
 | `notify_owner` | ask for the owner's attention: `text` (one line, ≤ 300 characters, control characters refused, `[jobs:` inside it defanged), optional `urgency` (normal \| high). agent-jobs sends nothing to a messenger itself: one line `[jobs:notify-owner] …` (with `job <id>:` from a job) is typed into the notify target like the job-done line, and the agent's session relays it over its own channel. A job: at most 3, at most one a minute (through the daemon); the agent: at most 20 an hour. Every admitted call is stored; a refused one (invalid text or urgency, over a limit) is an error and stores nothing. An undelivered one (no target, tmux refused or not done within 10 s) is an error and shows in `agent-jobs status` and `system_doctor`. CLI: `agent-jobs notify-owner --agent A --text T [--urgency high]` |
 
+**Owner waits** (built, unreleased): a job started at the owner's request is marked (`job_start` with `owner_waits: true`, `agent-jobs start --owner-waits`). Its job-done line ends with `· owner waits`, and once that line is delivered the job is recorded as «owner reply pending» for the agent. A Stop hook in the orchestrator session, `agent-jobs hook stop --agent A`, then blocks the end of a turn (`{"decision":"block","reason":"…"}`) until the session has written to the owner and called `owner_replied`; it blocks at most once per turn (with `stop_hook_active` it always allows, so it never loops) and fails open (any error allows the stop). A record expires on its own after `owner_waits_max_hours` (config, default 6). Pending records show in `agent-jobs status` (no id) and `system_doctor` (`owner_reply_pending`).
+
+| tool | what it does |
+|---|---|
+| `owner_replied` | orchestrator only: after writing to the owner, clear the «owner reply pending» record of `job_id`, or of every job without it; returns the cleared ids and what is still pending |
+
+Register the hook in the orchestrator's Claude Code settings (`settings.json` of the agent's session, never of a job; agent-jobs does not edit it):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "agent-jobs hook stop --agent A" } ] }
+    ]
+  }
+}
+```
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -303,6 +321,7 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
+| Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---

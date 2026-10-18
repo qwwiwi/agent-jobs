@@ -72,7 +72,8 @@ type Job struct {
 	Runner string
 	// ReasoningEffort is the codex reasoning effort (low|medium|high) of a codex job, empty for claude.
 	ReasoningEffort string
-	// OwnerWaits marks a job the owner asked for (the Stop-hook that enforces it is S3-M5).
+	// OwnerWaits marks a job the owner asked for: its delivered job-done line records «owner reply
+	// pending» (owner_pending), which holds the orchestrator's Stop hook until owner_replied.
 	OwnerWaits bool
 	// ResumedFrom is the id of the job this one continues (S2-M5), empty otherwise.
 	ResumedFrom string
@@ -229,6 +230,10 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
+	}
+	if _, err := db.Exec(ownerPendingSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: owner pending: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -724,12 +729,6 @@ func (s *Store) Finish(id, token, status string, turns int, cost float64, durati
 		args = append(args, token)
 	}
 	return affected(s.db.Exec(q, args...))
-}
-
-// MarkNotified records that the job-done line was delivered.
-func (s *Store) MarkNotified(id string, now time.Time) error {
-	_, err := s.db.Exec(`UPDATE jobs SET notified_at=? WHERE id=?`, now.Unix(), id)
-	return err
 }
 
 // MarkCleaned records that the worktree cleanup ran.

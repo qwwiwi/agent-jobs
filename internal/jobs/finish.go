@@ -67,6 +67,7 @@ func LimitsText(j *store.Job) string {
 // DoneLine is the one line delivered to the agent's live session.
 // A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
+// An owner-waits job ends the line with OwnerWaitsMarker.
 func DoneLine(j *store.Job) string {
 	cost := CostText(j.CostUSD, j.CostIsUnknown())
 	if j.CostIsUnknown() {
@@ -86,6 +87,9 @@ func DoneLine(j *store.Job) string {
 			line += ", fresh session"
 		}
 		line += ")"
+	}
+	if j.OwnerWaits {
+		line += " · " + OwnerWaitsMarker
 	}
 	return line
 }
