@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -78,9 +79,29 @@ func sessionMembers(sid int) ([]int, error) {
 	return out, nil
 }
 
-// signalMember sends sig to pid only if, with a pidfd already open on it, pid is still a live
-// member of session sid. It reports whether the signal was sent.
-func signalMember(pid, sid int, sig syscall.Signal) (bool, error) {
+// inSession reports whether pid is a live (non-zombie) member of session sid.
+func inSession(sid int) func(int) bool {
+	return func(pid int) bool {
+		st, s, err := procStat(pid)
+		return err == nil && s == sid && st != "Z"
+	}
+}
+
+// inCgroup reports whether pid is a live (non-zombie) process in the cgroup subtree at path.
+func inCgroup(path string) func(int) bool {
+	return func(pid int) bool {
+		p, err := procCgroup(pid)
+		if err != nil || !inSubtree(p, path) {
+			return false
+		}
+		st, _, err := procStat(pid)
+		return err == nil && st != "Z"
+	}
+}
+
+// signalMember sends sig to pid only if, with a pidfd already open on it, pid is still a member
+// (isMember: of the session, or of the scope's cgroup). It reports whether the signal was sent.
+func signalMember(pid int, isMember func(int) bool, sig syscall.Signal) (bool, error) {
 	fd, err := pidfdOpen(pid)
 	if errors.Is(err, unix.ENOSYS) || errors.Is(err, errPidfdUnsupported) {
 		return false, errPidfdUnsupported
@@ -94,7 +115,7 @@ func signalMember(pid, sid int, sig syscall.Signal) (bool, error) {
 	defer unix.Close(fd)
 	// Checked only now: the descriptor pins one process, so this stat is of that process (or, if it
 	// died meanwhile, of a stranger, and then the send below fails with ESRCH).
-	if st, s, err := procStat(pid); err != nil || s != sid || st == "Z" {
+	if !isMember(pid) {
 		return false, nil
 	}
 	err = pidfdSend(fd, sig)
@@ -122,11 +143,43 @@ func (r SweepResult) Incomplete() bool { return len(r.Survivors) > 0 || r.Err !=
 
 // sweepSid runs the bounded rounds against session sid (Linux, /proc).
 func sweepSid(sid int, log io.Writer) SweepResult {
+	return sweepRoundsOf(func() ([]int, error) {
+		pids, err := sessionMembers(sid)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate session %d: %w", sid, err)
+		}
+		return pids, nil
+	}, inSession(sid), log)
+}
+
+// sweepCgroup runs the bounded rounds against the wrapper's scope cgroup (path is its cgroup v2 path,
+// sub-cgroups included). A cgroup is inherited by every descendant and survives setsid, double forks
+// and re-parenting, so this reaches what the session sweep cannot.
+func sweepCgroup(path string, log io.Writer) SweepResult {
+	isMember := inCgroup(path)
+	return sweepRoundsOf(func() ([]int, error) {
+		pids, err := cgroupMembers(path)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate cgroup %s: %w", path, err)
+		}
+		out := pids[:0]
+		for _, p := range pids {
+			if isMember(p) { // drop zombies and processes that left meanwhile
+				out = append(out, p)
+			}
+		}
+		return out, nil
+	}, isMember, log)
+}
+
+// sweepRoundsOf runs the bounded SIGTERM/SIGKILL rounds over the processes list returns; isMember
+// re-checks each one after its pidfd is open.
+func sweepRoundsOf(list func() ([]int, error), isMember func(int) bool, log io.Writer) SweepResult {
 	signalled := map[int]bool{}
 	var errs []error
 	send := func(pids []int, sig syscall.Signal) bool {
 		for _, p := range pids {
-			ok, err := signalMember(p, sid, sig)
+			ok, err := signalMember(p, isMember, sig)
 			if errors.Is(err, errPidfdUnsupported) {
 				fmt.Fprintln(log, "run-wrapper: pidfd unsupported by this kernel: leftover processes are not signalled")
 				errs = append(errs, err)
@@ -143,9 +196,9 @@ func sweepSid(sid int, log io.Writer) SweepResult {
 		return true
 	}
 	members := func() []int {
-		pids, err := sessionMembers(sid)
+		pids, err := list()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("enumerate session %d: %w", sid, err))
+			errs = append(errs, err)
 		}
 		return pids
 	}
@@ -197,6 +250,23 @@ func sweepSession(log io.Writer) SweepResult {
 		return SweepResult{}
 	}
 	return sweepSid(sid, log)
+}
+
+// sweepJob is the wrapper's sweep before exit_code. In its own job scope (the daemon launched it with
+// systemd-run) it first ends every other process of the scope's cgroup, then sweeps the session as
+// well (a process that moved its pid into another cgroup by hand but kept the session); without a scope
+// only the session is swept (weaker: setsid leaves it).
+func sweepJob(jobDir string, log io.Writer) SweepResult {
+	path := ownJobScope(wrapperScope(jobDir))
+	if path == "" {
+		return sweepSession(log)
+	}
+	c := sweepCgroup(path, log)
+	s := sweepSession(log)
+	survivors := append(append([]int{}, c.Survivors...), s.Survivors...)
+	slices.Sort(survivors)
+	survivors = slices.Compact(survivors)
+	return SweepResult{Signalled: c.Signalled + s.Signalled, Survivors: survivors, Err: errors.Join(c.Err, s.Err)}
 }
 
 // writeSweepMarker records an incomplete sweep in the job dir: the survivor pids, one per line,

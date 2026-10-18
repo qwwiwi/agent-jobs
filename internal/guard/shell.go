@@ -20,6 +20,7 @@ type simpleCmd struct {
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
+	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -103,6 +104,7 @@ func (p *parser) endWord() {
 	case redirFile:
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
+			p.cmd.outDyn = append(p.cmd.outDyn, p.dyn)
 		}
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
@@ -486,6 +488,14 @@ func parseAll(src string) []*script {
 					if code, ok := shellCode(argv); ok {
 						walk(code, depth+1)
 					}
+				case name == "trap":
+					// `trap 'code' SIG…`: the code runs later in this shell (also after the last command).
+					for _, a := range argv[1:] {
+						if !strings.HasPrefix(a, "-") {
+							walk(a, depth+1)
+							break
+						}
+					}
 				default:
 					for _, code := range runnerCode(name, argv) {
 						walk(code, depth+1)
@@ -504,7 +514,7 @@ var (
 	reAssign = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 	keywords = map[string]bool{
 		"if": true, "then": true, "else": true, "elif": true, "do": true, "while": true,
-		"until": true, "!": true, "{": true, "}": true, "time": true, "fi": true, "done": true,
+		"until": true, "!": true, "coproc": true, "{": true, "}": true, "time": true, "fi": true, "done": true,
 	}
 )
 

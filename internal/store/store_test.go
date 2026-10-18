@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +52,48 @@ func TestOpenMigratesStage1Database(t *testing.T) {
 			t.Fatalf("migrated row: %+v", j)
 		}
 		_ = st.Close()
+	}
+}
+
+// Databases created by either parallel branch (one with `subagents` but no scope columns, one with the
+// scope columns but no `subagents`) open, gain the missing columns, and reopen as a no-op.
+func TestOpenMigratesEitherBranchDatabase(t *testing.T) {
+	for name, skip := range map[string]string{"subagents only": "scope_", "scope only": "subagents"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "jobs.db")
+			raw, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(stage1Schema); err != nil {
+				t.Fatal(err)
+			}
+			for _, alter := range migrations {
+				if !strings.Contains(alter, "COLUMN "+skip) {
+					if _, err := raw.Exec(alter); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_ = raw.Close()
+			for range 2 {
+				st, err := Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, err := st.SubagentCount("old-1"); err != nil || n != 0 {
+					t.Fatalf("subagents = %d, %v", n, err)
+				}
+				j, err := st.Get("old-1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if j.ScopeUnit != "" || j.ScopePending {
+					t.Fatalf("scope columns: %+v", j)
+				}
+				_ = st.Close()
+			}
+		})
 	}
 }
 

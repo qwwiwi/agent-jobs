@@ -31,12 +31,22 @@ func TestMain(m *testing.M) {
 		}
 	}
 	_ = os.Unsetenv(jobs.JobEnvVar) // the tests set the job marker themselves where they need it
+	// Run inside a job, the binary under test (hooked build) does not count that job's wrapper.
+	var outer []string
+	for _, find := range []func() (int, bool){jobs.WrapperAncestor, jobs.WrapperSession} {
+		if pid, _ := find(); pid > 1 && !slices.Contains(outer, fmt.Sprint(pid)) {
+			outer = append(outer, fmt.Sprint(pid))
+		}
+	}
+	if len(outer) > 0 {
+		_ = os.Setenv("AGENT_JOBS_TEST_OUTER_WRAPPER", strings.Join(outer, ","))
+	}
 	dir, err := os.MkdirTemp("", "agent-jobs-mcp-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	if out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	code := m.Run()
@@ -315,6 +325,12 @@ func TestJobToolsLifecycle(t *testing.T) {
 		!slices.Contains(res.Artifacts, filepath.Join(dir, "commits.patch")) || !slices.Contains(res.Artifacts, filepath.Join(dir, "report.md")) {
 		t.Fatalf("job_result: %+v", res)
 	}
+	// Containment is visible: the weaker session fallback, a scope, or nothing before launch.
+	var doneSt JobView
+	call(t, cs, "job_status", map[string]any{"id": done.ID}, &doneSt)
+	if doneSt.Containment != "session only" || st.Containment != "" || !strings.HasSuffix(res.DoneLine, " · session only") {
+		t.Fatalf("containment: done %q, queued %q, line %q", doneSt.Containment, st.Containment, res.DoneLine)
+	}
 
 	var list JobListOutput
 	call(t, cs, "job_list", map[string]any{}, &list)
@@ -361,6 +377,9 @@ func TestStdioSubcommand(t *testing.T) {
 	run := func(role string) *sdk.ClientSession {
 		cmd := exec.Command(selfBin, "mcp", "--role", role, "--agent", "test")
 		cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home)
+		if role == "job" {
+			cmd.Env = append(cmd.Env, jobs.JobEnvVar+"=261017-120000-beef") // the job role runs only inside a job
+		}
 		cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "0"}, nil).
 			Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
 		if err != nil {
@@ -610,19 +629,19 @@ func TestJobRoleToolWithoutManagerFailsCleanly(t *testing.T) {
 				return nil, JobCancelOutput{ID: fmt.Sprint(n)}, err
 			})
 	}})
-	JobAllowed = []string{"dummy_count"}
+	JobAllowed = append(slices.Clone(savedAllowed), "dummy_count")
 	s, err := NewServer(RoleJob, Deps{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cs := connect(t, s)
-	if got := toolNames(t, cs); !slices.Equal(got, []string{"dummy_count"}) {
+	if got := toolNames(t, cs); !slices.Contains(got, "dummy_count") || len(got) != len(JobAllowed) {
 		t.Fatalf("job tools %v", got)
 	}
 	if msg := callErr(t, cs, "dummy_count", map[string]any{}); !strings.Contains(msg, "needs the job database") {
 		t.Fatalf("dummy tool without a manager: %q", msg)
 	}
-	if got := toolNames(t, cs); len(got) != 1 { // the server survived the call
+	if got := toolNames(t, cs); len(got) != len(JobAllowed) { // the server survived the call
 		t.Fatalf("after the call: %v", got)
 	}
 }
