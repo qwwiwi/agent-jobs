@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -336,11 +338,137 @@ var errScopeActive = errors.New("scope still active after stop")
 // systemctlBin is the systemctl the daemon calls; a variable so tests can make a stop fail.
 var systemctlBin = "systemctl"
 
+// cgroupDirOwner returns the owner uid of a cgroup directory; a variable so tests can stand in.
+var cgroupDirOwner = func(fi fs.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
+}
+
+// systemctlCandidates are the only places the system-manager lookup takes systemctl from: never the
+// daemon's PATH.
+var systemctlCandidates = []string{"/usr/bin/systemctl", "/bin/systemctl"}
+
+// systemManagerBin returns the systemctl that asks the system manager for the user manager's cgroup,
+// resolved once from systemctlCandidates; apart from systemctlBin (the user-bus calls a test makes fail)
+// so the lookup stays real in such a test. A variable so tests can stand in a stub.
+var systemManagerBin = sync.OnceValues(func() (string, error) { return trustedBinary(systemctlCandidates) })
+
+// systemManagerEnv is the whole environment of the lookup: nothing of the daemon's (no DBUS_* that could
+// point it at another bus, no LD_*).
+var systemManagerEnv = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+
+// systemManagerTimeout bounds the lookup; systemManagerWaitDelay bounds the wait for its pipes after the
+// process exits or is killed (a descendant holding stdout would otherwise block Output). Variables for tests.
+var (
+	systemManagerTimeout   = 10 * time.Second
+	systemManagerWaitDelay = 2 * time.Second
+)
+
+// trustedBinary returns the first candidate that resolves to a regular root-owned file, not group- or
+// world-writable, in a root-owned directory that is not group- or world-writable.
+func trustedBinary(candidates []string) (string, error) {
+	var errs []error
+	for _, c := range candidates {
+		p, err := filepath.EvalSymlinks(c)
+		if err == nil {
+			err = rootOwnedUnwritable(p, false)
+		}
+		if err == nil {
+			err = rootOwnedUnwritable(filepath.Dir(p), true)
+		}
+		if err == nil {
+			return p, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", c, err))
+	}
+	return "", fmt.Errorf("no trusted systemctl: %w", errors.Join(errs...))
+}
+
+// rootOwnedUnwritable checks that p (not followed) is a directory (dir) or a regular file, owned by root
+// and not writable by group or others.
+func rootOwnedUnwritable(p string, dir bool) error {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if dir && !fi.IsDir() || !dir && !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s: wrong file type %s", p, fi.Mode().Type())
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s: group or world writable", p)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 {
+		return fmt.Errorf("%s: not owned by root", p)
+	}
+	return nil
+}
+
+// userManagerUnitCgroup returns the ControlGroup of user@<uid>.service as the system manager reports it;
+// a variable so tests can stand in. The system manager is asked (not the user bus, which may be the broken
+// one): it placed the unit, and no process of the user can change its answer.
+var userManagerUnitCgroup = systemManagerUnitCgroup
+
+// systemManagerUnitCgroup asks the system manager through the trusted systemctl, with a fixed minimal
+// environment, bounded by systemManagerTimeout plus systemManagerWaitDelay.
+func systemManagerUnitCgroup(uid int) (string, error) {
+	bin, err := systemManagerBin()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), systemManagerTimeout)
+	defer cancel()
+	unit := fmt.Sprintf("user@%d.service", uid)
+	cmd := exec.CommandContext(ctx, bin, "--system", "show", unit, "--property=ControlGroup", "--value")
+	cmd.Env = systemManagerEnv
+	cmd.WaitDelay = systemManagerWaitDelay
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("systemctl --system show %s: %w", unit, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // scopeCgroupPath is the cgroup v2 path a job scope gets from `systemd-run --user --scope` (the user
-// manager's app.slice): the daemon can reach it without the bus.
-func scopeCgroupPath(unit string) string {
+// manager's app.slice): the daemon can reach it without the bus. The manager need not sit under user.slice
+// (e.g. a custom system slice) and the caller need not run under it (the orchestrator's MCP server runs in
+// a system service), so the manager's cgroup comes from the system manager. When that answer is missing
+// or malformed, the default /user.slice/user-<uid>.slice/user@<uid>.service is used only if that cgroup
+// exists and is owned by the uid; otherwise ok is false and the caller must not sweep anything: a cgroup
+// path the user could have planted (e.g. a user@<uid>.service decoy inside a delegated subtree) is never
+// guessed.
+func scopeCgroupPath(unit string) (path string, ok bool) {
 	uid := os.Getuid()
-	return fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/app.slice/%s", uid, uid, unit)
+	if p, err := userManagerUnitCgroup(uid); err == nil && validManagerCgroup(p, uid) {
+		return p + "/app.slice/" + unit, true
+	}
+	def := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service", uid, uid)
+	fi, err := os.Lstat(filepath.Join(cgroupRoot, def))
+	if err != nil || !fi.IsDir() {
+		return "", false
+	}
+	if owner, ok := cgroupDirOwner(fi); !ok || owner != uid {
+		return "", false
+	}
+	return def + "/app.slice/" + unit, true
+}
+
+// validManagerCgroup reports whether p is a usable cgroup v2 path of the user manager: absolute, no
+// empty, "." or ".." component anywhere (so no trailing "/" either), the last component exactly
+// user@<uid>.service.
+func validManagerCgroup(p string, uid int) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	parts := strings.Split(p[1:], "/")
+	for _, c := range parts {
+		if c == "" || c == "." || c == ".." {
+			return false
+		}
+	}
+	return parts[len(parts)-1] == fmt.Sprintf("user@%d.service", uid)
 }
 
 // stopScope stops a job's scope: systemd sends SIGTERM to every process in the unit's cgroup, waits
@@ -348,7 +476,8 @@ func scopeCgroupPath(unit string) string {
 // (the wrapper exited and the scope was collected) is fine; a failed unit only when its cgroup is empty
 // (a stop that timed out on unkillable processes leaves it failed with members). When systemctl cannot
 // stop it (no user bus, the manager busy), the daemon sweeps the scope's cgroup itself (pidfd, membership
-// re-checked) and accepts the stop only when the cgroup is then provably empty. The unit is always
+// re-checked) and accepts the stop only when the cgroup is then provably empty; without a trusted path to
+// that cgroup it sweeps nothing and the stop fails (stays pending). The unit is always
 // recomputed from the agent and the job id, never read from a file the job could write.
 func (m *Manager) stopScope(id string) error {
 	unit := ScopeUnit(m.Agent, id)
@@ -366,9 +495,15 @@ func (m *Manager) stopScope(id string) error {
 		return nil // a failed unit whose cgroup is gone
 	}
 	if cg == "" {
-		cg = scopeCgroupPath(unit)
+		cg, _ = scopeCgroupPath(unit)
 	}
-	if ferr := m.sweepScopeCgroup(id, cg); ferr == nil {
+	var ferr error
+	if cg == "" {
+		ferr = errors.New("no trusted cgroup path for the user manager: not swept")
+	} else {
+		ferr = m.sweepScopeCgroup(id, cg)
+	}
+	if ferr == nil {
 		return nil
 	} else if serr == nil && state == "failed" {
 		return fmt.Errorf("%s: failed with processes left: %w", unit, ferr)

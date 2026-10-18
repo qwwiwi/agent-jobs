@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -470,9 +472,29 @@ func TestFailedUnitWithMembersIsNotStopped(t *testing.T) {
 }
 
 // Cancel with a broken user bus does not rely on the wrapper's process group: the daemon sweeps the
-// scope's cgroup itself, so a setsid orphan (outside that group) dies too.
+// scope's cgroup itself, so a setsid orphan (outside that group) dies too. Only the user-bus systemctl
+// (systemctlBin) is broken: the manager's cgroup still comes from the real system manager
+// (systemManagerBin), so the swept path is the real one. The caller's own cgroup plays no part: the
+// cancel also works from a caller outside the user manager (the orchestrator's MCP server).
 func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
 	requireSetsid(t)
+	for _, caller := range []string{"own", "outside the user manager"} {
+		t.Run(caller, func(t *testing.T) {
+			if caller != "own" {
+				f := filepath.Join(t.TempDir(), "cgroup")
+				if err := os.WriteFile(f, []byte("0::/agents.slice/channel-thrall.service\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				old := cgroupFile
+				cgroupFile = f
+				t.Cleanup(func() { cgroupFile = old })
+			}
+			cancelWithoutBus(t)
+		})
+	}
+}
+
+func cancelWithoutBus(t *testing.T) {
 	m := scopedManager(t)
 	t.Setenv("AGENT_JOBS_SELF", selfBin)
 	j := enqueue(t, m, "FAKE_SETSID_ORPHAN FAKE_SLEEP=60", nil)
@@ -497,6 +519,283 @@ func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
 	}
 	if got := get(t, m, j.ID); got.Status != store.StatusCancelled || got.ScopePending {
 		t.Fatalf("cancel: %s pending=%v %q", got.Status, got.ScopePending, got.Error)
+	}
+}
+
+// fakeManagerCgroup makes the system manager answer cgroup (or fail with err) for user@<uid>.service,
+// and points cgroupRoot at a temp dir holding dirs (relative paths), for one test.
+func fakeManagerCgroup(t *testing.T, cgroup string, err error, dirs ...string) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, d := range dirs {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldLookup, oldRoot := userManagerUnitCgroup, cgroupRoot
+	userManagerUnitCgroup = func(int) (string, error) { return cgroup, err }
+	cgroupRoot = root
+	t.Cleanup(func() { userManagerUnitCgroup, cgroupRoot = oldLookup, oldRoot })
+	return root
+}
+
+// The scope's cgroup path follows the user manager's cgroup as the system manager reports it, wherever
+// the manager runs (user.slice or a custom slice) and wherever the caller runs. A missing or malformed
+// answer falls back to the default user.slice layout only when that cgroup exists and is owned by the
+// uid; otherwise there is no path and nothing is swept.
+func TestScopeCgroupPathFromSystemManager(t *testing.T) {
+	uid := os.Getuid()
+	mgr := fmt.Sprintf("user@%d.service", uid)
+	def := fmt.Sprintf("/user.slice/user-%d.slice/%s", uid, mgr)
+	unit := ScopeUnit("t", "261018-000000-0000")
+	failed := errors.New("exit status 1")
+	for _, tc := range []struct {
+		name, answer string
+		err          error
+		dirs         []string
+		want         string // "" = no path
+	}{
+		{"user.slice", def, nil, nil, def},
+		{"agents.slice", "/agents.slice/" + mgr, nil, nil, "/agents.slice/" + mgr},
+		// The answer wins over a planted decoy, and over the default layout.
+		{"decoy ignored", "/agents.slice/" + mgr, nil, []string{"deleg.slice/x.service/" + mgr, def[1:]}, "/agents.slice/" + mgr},
+		{"garbage, default exists", "not a cgroup", nil, []string{def[1:]}, def},
+		{"garbage, no default", "not a cgroup", nil, nil, ""},
+		{"empty answer (unit not loaded)", "", nil, nil, ""},
+		{"dot-dot", "/agents.slice/../" + mgr, nil, nil, ""},
+		{"wrong last component", "/agents.slice/" + mgr + "/app.slice", nil, nil, ""},
+		{"other uid", fmt.Sprintf("/agents.slice/user@%d.service", uid+1), nil, nil, ""},
+		{"command failure, default exists", "", failed, []string{def[1:]}, def},
+		// A decoy elsewhere is never guessed: no answer and no default means no sweep.
+		{"command failure, decoy only", "", failed, []string{"deleg.slice/x.service/" + mgr}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeManagerCgroup(t, tc.answer, tc.err, tc.dirs...)
+			got, ok := scopeCgroupPath(unit)
+			if tc.want == "" {
+				if ok || got != "" {
+					t.Fatalf("scopeCgroupPath = %q, %v, want no path", got, ok)
+				}
+				return
+			}
+			if want := tc.want + "/app.slice/" + unit; !ok || got != want {
+				t.Fatalf("scopeCgroupPath = %q, %v, want %q", got, ok, want)
+			}
+		})
+	}
+	t.Run("default owned by another uid", func(t *testing.T) {
+		fakeManagerCgroup(t, "", failed, def[1:])
+		old := cgroupDirOwner
+		cgroupDirOwner = func(fs.FileInfo) (int, bool) { return uid + 1, true }
+		t.Cleanup(func() { cgroupDirOwner = old })
+		if got, ok := scopeCgroupPath(unit); ok {
+			t.Fatalf("scopeCgroupPath = %q: a default cgroup of another uid was used", got)
+		}
+	})
+	t.Run("default is a symlink", func(t *testing.T) {
+		root := fakeManagerCgroup(t, "", failed, "elsewhere/"+mgr, fmt.Sprintf("user.slice/user-%d.slice", uid))
+		if err := os.Symlink(filepath.Join(root, "elsewhere", mgr), filepath.Join(root, def)); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := scopeCgroupPath(unit); ok {
+			t.Fatalf("scopeCgroupPath = %q: a symlinked default was followed", got)
+		}
+	})
+}
+
+// Every component of the manager's path is checked, not only those before user@<uid>.service.
+func TestValidManagerCgroup(t *testing.T) {
+	uid := os.Getuid()
+	mgr := fmt.Sprintf("user@%d.service", uid)
+	for _, tc := range []struct {
+		p  string
+		ok bool
+	}{
+		{"/user.slice/user-1.slice/" + mgr, true},
+		{"/agents.slice/" + mgr, true},
+		{"/" + mgr, true},
+		{"", false},
+		{"/", false},
+		{"agents.slice/" + mgr, false},
+		{"/agents.slice/" + mgr + "/", false},
+		{"/agents.slice/" + mgr + "/..", false},
+		{"/agents.slice/" + mgr + "/.", false},
+		{"/agents.slice/" + mgr + "//", false},
+		{"/agents.slice//" + mgr, false},
+		{"/agents.slice/./" + mgr, false},
+		{"/a/../" + mgr, false},
+		{"/agents.slice/" + mgr + "/app.slice", false},
+		{"/agents.slice/" + mgr + "x", false},
+		{fmt.Sprintf("/agents.slice/user@%d.service", uid+1), false},
+	} {
+		if got := validManagerCgroup(tc.p, uid); got != tc.ok {
+			t.Errorf("validManagerCgroup(%q) = %v, want %v", tc.p, got, tc.ok)
+		}
+	}
+}
+
+// With the user bus broken and no trusted systemctl for the system manager (so no answer) and no default
+// cgroup, the stop refuses: nothing is swept (not even a uid-owned user@<uid>.service decoy holding the
+// scope's name), the stop fails, and a cancelled job stays scope-pending.
+func TestStopScopeRefusesWithoutTrustedManagerCgroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cgroups are Linux")
+	}
+	m := newManager(t)
+	untrusted := stubSystemManager(t, "echo /agents.slice/user@0.service\n")
+	oldBin := systemManagerBin
+	systemManagerBin = func() (string, error) { return trustedBinary([]string{untrusted}) }
+	t.Cleanup(func() { systemManagerBin = oldBin })
+	if _, err := userManagerUnitCgroup(os.Getuid()); err == nil || !strings.Contains(err.Error(), "no trusted systemctl") {
+		t.Fatalf("lookup with only a user-owned systemctl = %v, want a refusal", err)
+	}
+	fakeSystemctl(t) // user bus broken, cgroupRoot an empty dir (no default cgroup)
+	root := cgroupRoot
+	mgr := fmt.Sprintf("user@%d.service", os.Getuid())
+	j := scopedRow(t, m)
+	unit := ScopeUnit(m.Agent, j.ID)
+	decoy := "deleg.slice/x.service/" + mgr + "/app.slice/" + unit
+	if err := os.MkdirAll(filepath.Join(root, decoy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// An empty decoy would count as swept; refusing must not depend on looking at it at all.
+	if err := os.WriteFile(filepath.Join(root, decoy, "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := m.stopScope(j.ID)
+	if err == nil || !strings.Contains(err.Error(), "no trusted cgroup path") {
+		t.Fatalf("stopScope = %v, want a refusal", err)
+	}
+	if err := m.Cancel(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, m, j.ID); got.Status != store.StatusCancelled || !got.ScopePending {
+		t.Fatalf("cancel without a trusted path: %s pending=%v %q, want cancelled and scope-pending", got.Status, got.ScopePending, got.Error)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !get(t, m, j.ID).ScopePending {
+		t.Fatal("a tick without a trusted path cleared the pending mark")
+	}
+}
+
+// stubSystemManager writes a bash stub with body and points systemManagerBin at it for one test.
+func stubSystemManager(t *testing.T, body string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := systemManagerBin
+	systemManagerBin = func() (string, error) { return bin, nil }
+	t.Cleanup(func() { systemManagerBin = old })
+	return bin
+}
+
+// killPidFile kills the pid a stub wrote to f (a sleeper it left behind).
+func killPidFile(t *testing.T, f string) {
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(f); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+}
+
+// At the command boundary the lookup passes exactly the documented arguments and an environment without
+// the daemon's DBUS_* or LD_* variables.
+func TestSystemManagerLookupBoundary(t *testing.T) {
+	dir := t.TempDir()
+	args, env := filepath.Join(dir, "args"), filepath.Join(dir, "env")
+	stubSystemManager(t, "printf '%s\\n' \"$@\" > "+args+"\nenv > "+env+"\necho ' /agents.slice/user@7.service '\n")
+	t.Setenv("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent/bus")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
+	t.Setenv("LD_LIBRARY_PATH", "/nonexistent")
+	got, err := systemManagerUnitCgroup(7)
+	if err != nil || got != "/agents.slice/user@7.service" {
+		t.Fatalf("lookup = %q, %v", got, err)
+	}
+	b, err := os.ReadFile(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "--system\nshow\nuser@7.service\n--property=ControlGroup\n--value\n"; string(b) != want {
+		t.Fatalf("args = %q, want %q", b, want)
+	}
+	b, err = os.ReadFile(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "DBUS_") || strings.HasPrefix(l, "LD_") {
+			t.Fatalf("lookup inherited %q; env:\n%s", l, b)
+		}
+	}
+	for _, want := range systemManagerEnv {
+		if !slices.Contains(lines, want) {
+			t.Fatalf("env lacks %q:\n%s", want, b)
+		}
+	}
+}
+
+// The lookup is bounded even when a descendant holds its stdout: after the process exits (WaitDelay) and
+// when it hangs (timeout, then WaitDelay).
+func TestSystemManagerLookupBounded(t *testing.T) {
+	for _, tc := range []struct{ name, tail string }{
+		{"exits, sleeper holds stdout", "echo /agents.slice/user@7.service\nexit 0\n"},
+		{"hangs, sleeper holds stdout", "exec sleep 30\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pid := filepath.Join(t.TempDir(), "pid")
+			killPidFile(t, pid)
+			stubSystemManager(t, "sleep 30 &\necho $! > "+pid+"\n"+tc.tail)
+			oldT, oldW := systemManagerTimeout, systemManagerWaitDelay
+			systemManagerTimeout, systemManagerWaitDelay = 500*time.Millisecond, 500*time.Millisecond
+			t.Cleanup(func() { systemManagerTimeout, systemManagerWaitDelay = oldT, oldW })
+			start := time.Now()
+			_, err := systemManagerUnitCgroup(7)
+			if d := time.Since(start); d > 5*time.Second {
+				t.Fatalf("lookup took %s (err %v), want it bounded", d, err)
+			}
+			if err == nil {
+				t.Fatal("lookup whose pipes stayed held succeeded")
+			}
+		})
+	}
+	if systemManagerWaitDelay <= 0 {
+		t.Fatal("systemManagerWaitDelay must be set")
+	}
+}
+
+// Only a root-owned, not group/world-writable regular file in such a directory is taken; the daemon's
+// PATH plays no part.
+func TestTrustedBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux paths")
+	}
+	own := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(own, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.Symlink(own, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(own))
+	for _, c := range [][]string{{own}, {link}, {"/nonexistent/systemctl"}, {"/usr/bin"}, nil} {
+		if p, err := trustedBinary(c); err == nil {
+			t.Errorf("trustedBinary(%q) = %q, want an error", c, p)
+		}
+	}
+	real, err := trustedBinary(systemctlCandidates)
+	if err != nil {
+		t.Skipf("no trusted systemctl on this host: %v", err)
+	}
+	if p, err := trustedBinary(append([]string{own, link, "/nonexistent/systemctl"}, systemctlCandidates...)); err != nil || p != real {
+		t.Fatalf("trustedBinary skipped the untrusted ones = %q, %v, want %q", p, err, real)
 	}
 }
 
