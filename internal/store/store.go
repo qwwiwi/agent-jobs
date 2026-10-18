@@ -256,6 +256,16 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate db: schedules: %w", err)
 		}
 	}
+	if _, err := db.Exec(checksSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: checks: %w", err)
+	}
+	for _, alter := range checksMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: checks: %w", err)
+		}
+	}
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
@@ -362,6 +372,8 @@ var migrationBackfills = map[string]string{
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`: `UPDATE job_stats SET cost_unknown=1
 		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
 			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
+	checksAlertStateAlter: checksAlertStateFill,
+	checksAlertsMoved:     checksAlertsFill,
 }
 
 // migrate runs one migration and its backfill, if any, in one transaction; a column that is already
