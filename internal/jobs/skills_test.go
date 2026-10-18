@@ -578,3 +578,80 @@ func TestSkillLinkUnlinkFailureTrackedAcrossResume(t *testing.T) {
 		t.Fatalf("exclude block kept after the link went:\n%s", b)
 	}
 }
+
+// .claude unreadable when the attempt ends: removal cannot even inspect the links, so they stay
+// tracked (exclude block kept); once readable again a resume adopts the leftover link, also when its
+// exclude line went missing in between (git then shows it untracked).
+func TestSkillLinkUnreadableParentAdoptedOnResume(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	m, _ := skillsManager(t)
+	t.Setenv("FAKE_SESSIONS", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", os.Getenv("FAKE_SESSIONS"))
+	repo := newRepo(t)
+	j := enqueue(t, m, "FAKE_WIP FAKE_SLEEP_ONCE=30", func(r *StartRequest) { r.Kind, r.RepoPath = "fix", repo })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	waitFor(t, "work in progress", 15*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(work, "wip.txt"))
+		return err == nil
+	})
+	claudeDir := filepath.Join(work, ".claude")
+	if err := os.Chmod(claudeDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(claudeDir, 0o755) })
+	if _, err := m.Stop(j.ID, "plan changed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(claudeDir, "skills", "golang")
+	exclude := filepath.Join(repo, ".git", "info", "exclude")
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link gone (%v)", err)
+	}
+	if b, _ := os.ReadFile(exclude); !strings.Contains(string(b), "\n/.claude/skills/golang\n") {
+		t.Fatalf("exclude block dropped while the link is there:\n%s", b)
+	}
+	if r := get(t, m, j.ID); !slices.Contains(r.SkillsDelivered, "golang") {
+		t.Fatalf("link no longer tracked: %v", r.SkillsDelivered)
+	}
+	// The exclude line lost meanwhile: git now shows the leftover link as untracked.
+	if err := updateExclude(repo, j.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if out := gitT(t, work, "status", "--porcelain", "--untracked-files=all"); !strings.Contains(out, "?? .claude/skills/golang") {
+		t.Fatalf("status %q", out)
+	}
+	if _, err := m.Resume(j.ID, "go on FAKE_SLEEP=1", Limits{MaxBudgetUSD: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := get(t, m, j.ID); r.Status != store.StatusRunning || !slices.Contains(r.SkillsDelivered, "golang") ||
+		strings.Contains(r.SkillsNote, "golang") {
+		t.Fatalf("resumed: %s %q delivered %v note %q", r.Status, r.Error, r.SkillsDelivered, r.SkillsNote)
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool {
+		_, ok := readExitCode(m.JobDir(j.ID))
+		return ok
+	})
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := get(t, m, j.ID); r.Status != store.StatusSucceeded {
+		t.Fatalf("after resume %s %q", r.Status, r.Error)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatal("link left after the resumed attempt")
+	}
+	if b, _ := os.ReadFile(exclude); strings.Contains(string(b), j.ID) {
+		t.Fatalf("exclude block kept after the link went:\n%s", b)
+	}
+}

@@ -243,7 +243,8 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 		return nil // restored from the saved ref before the launch, then checked again
 	}
 	// Skill links an earlier removal left behind are the daemon's, not the project's: the next
-	// attempt adopts them (deliverSkills), and they do not count as a change.
+	// attempt adopts them (deliverSkills), and they do not count as a change, whether git sees them
+	// ignored (their exclude line kept) or untracked (the line gone).
 	left := m.leftSkillLinks(j, work)
 	if j.RepoPath == "" {
 		found := ""
@@ -275,7 +276,10 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	}
 	var changed []string
 	for _, l := range strings.Split(st, "\n") {
-		if l != "" && !slices.ContainsFunc(left, func(n string) bool { return l == "!! "+skills.LinkDir+"/"+n }) {
+		if l != "" && !slices.ContainsFunc(left, func(n string) bool {
+			p := skills.LinkDir + "/" + n
+			return l == "!! "+p || l == "?? "+p
+		}) {
 			changed = append(changed, l)
 		}
 	}
