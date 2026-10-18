@@ -20,8 +20,6 @@ import (
 // PIDs cannot have been reused), and never infers ownership from a process group or a start time.
 const reaperEnv = "AGENT_JOBS_TEST_REAPER"
 
-const prSetChildSubreaper = 36
-
 func TestMain(m *testing.M) {
 	if report := os.Getenv(reaperEnv); report != "" {
 		os.Exit(reaperMain(report, os.Args[1:]))
@@ -40,8 +38,8 @@ func reaperMain(report string, argv []string) int {
 		fmt.Fprintln(os.Stderr, "reaper: no command")
 		return 125
 	}
-	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0); e != 0 {
-		fmt.Fprintln(os.Stderr, "reaper: PR_SET_CHILD_SUBREAPER:", e)
+	if err := setChildSubreaper(); err != nil {
+		fmt.Fprintln(os.Stderr, "reaper: PR_SET_CHILD_SUBREAPER:", err)
 		return 125
 	}
 	sigs := make(chan os.Signal, 16)
