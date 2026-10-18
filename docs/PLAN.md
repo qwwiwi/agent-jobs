@@ -99,11 +99,12 @@ Owner decision 2026-10-18 (see [DECISIONS.md](DECISIONS.md)): v0.4.0 ships as pl
 **Goal.** Anyone can install agent-jobs into their own Claude Code with one command (a plugin marketplace install). It arrives as an MCP server, hooks and a skill, and needs none of our private setup. It works in the plain terminal CLI and in the desktop app, without tmux. Inside a tmux session it gives the full mode we use today: job-done lines are pushed into the live session.
 
 **Autonomous loop.** Job statuses, results and errors reach the orchestrator's context without being asked for:
-- Hook `additionalContext` on each prompt: a compact summary of the jobs that finished, failed or are waiting since the last turn.
-- `asyncRewake` (exit code 2) wakes an idle session when a job ends.
-- Plugin monitors are an optional push channel in interactive sessions.
+Intended delivery path. Each item below is verified in P2 against the supported Claude Code versions and clients before it is relied on; none is a promise until then.
+- Hook `additionalContext` on each prompt (`UserPromptSubmit`): a compact summary of the jobs that finished, failed or are waiting since the last turn. This is the floor.
+- `asyncRewake`: a hook whose process exits with code 2 is meant to wake an idle session when a job ends. Async hooks are subject to timeouts, so the watcher lifecycle (start, restart, timeout, exit) must be verified.
+- Plugin monitors (`experimental.monitors` in the plugin manifest, experimental) are an optional push channel in interactive sessions.
 - tmux injection is kept only as the advanced mode.
-- Desktop and sessions without tmux degrade gracefully: nothing is lost, and the summary arrives with the next prompt.
+- Desktop and sessions without tmux are meant to degrade gracefully: events are retained by the daemon, and the summary arrives with the next prompt. P2 acceptance below defines what is checked.
 
 **Packaging.**
 - A plugin manifest, with the bundled MCP server registered by the plugin.
@@ -114,19 +115,20 @@ Owner decision 2026-10-18 (see [DECISIONS.md](DECISIONS.md)): v0.4.0 ships as pl
 
 **Milestones.**
 - **P1. Plugin skeleton + MCP + skill.** Manifest, MCP server registration, the `agent-jobs` skill. *Acceptance:* on a machine that already has the daemon, one install command makes the MCP job tools and the skill appear in a new Claude Code session, and `job_start` / `job_status` / `job_result` work end to end. Removing the plugin removes them.
-- **P2. Context feed hooks + asyncRewake.** *Acceptance:* a job that finishes, fails or waits shows up in the next prompt's `additionalContext` exactly once, as a compact summary with a size cap. An idle session is woken by `asyncRewake` when a job ends. With the hooks off or failing, Claude Code still works and nothing is reported twice. The behaviour is checked against the current Claude Code hook docs before the build.
+- **P2. Context feed hooks + asyncRewake.** *Acceptance:* a job that finishes, fails or waits shows up in the next prompt's `additionalContext` once per job transition and receiving session (the same transition may reach another session once, and is never repeated to the same one), as a compact summary with a size cap. An idle session is woken by `asyncRewake` when a job ends, on the supported versions and clients that P2 lists. With the hooks off or failing, Claude Code still works and nothing is reported twice. Loss and replay are checked explicitly: (1) events that occur while the hooks are disabled or failing are retained and delivered after recovery, once; (2) when more events are pending than the summary cap allows, the overflow is not dropped: the summary says how many remain and they arrive in later prompts, once each; (3) a job that completes between a rewake and the next-prompt delivery is reported once, not twice and not zero times. Before the build, the behaviour is checked against the current Claude Code hook and plugin docs (`UserPromptSubmit`, `asyncRewake` and its timeout limits, `experimental.monitors`), and the supported versions, clients and watcher lifecycle are recorded.
 - **P3. Daemon installer for Linux and macOS + doctor.** *Acceptance:* install, upgrade and uninstall are idempotent on Linux (user service) and macOS (launchd), and an upgrade never kills running jobs. `doctor` on a fresh install reports green; on a broken install (no daemon, stale binary, missing hook) it names the problem and the fix.
 - **P4. Clean-machine acceptance.** On a fresh user account with only Claude Code installed, it is checked in three modes: the terminal CLI, the desktop app, and a tmux session. *Acceptance:* in each mode, one install command, a test job, its result in the orchestrator's context without manual polling (tmux: a pushed job-done line; terminal and desktop: the summary on the next prompt or a rewake). No private names in config, logs or prompts.
 - **P5. Docs + release v1.0.0.** *Acceptance:* the README and the docs describe the plugin install as the primary path and the manual install as the alternative, with a migration note for v0.x. The CHANGELOG entry is written, the conformance check is published, and v1.0.0 is tagged after the owner's go.
 
 **Open questions.**
-- Windows support: not planned for v1.0.0 unless the owner decides otherwise. The daemon, the cgroup containment and the guard are Linux/macOS today.
+- Windows support: not planned for v1.0.0 unless the owner decides otherwise. The daemon and the guard run on Linux today. Cgroup containment is Linux-only (a Linux kernel facility); containment and guard behaviour on macOS must be verified in P3 before macOS is claimed as supported.
 - Channels (research preview, allowlist): not used as the default push path. They may be an opt-in later.
 - Upgrades from an existing v0.x install (systemd unit, MCP entry in the user config, the skill installed by hand): how the plugin finds it, takes it over or leaves it alone, without two MCP servers or two daemons.
 
 **Risks.**
 - Hooks may behave differently in the terminal and in the desktop app (which events fire, whether `additionalContext` and rewake are honoured). P4 tests each mode, and the next-prompt summary is the floor.
-- Monitors work only in interactive sessions. They are never the only channel.
+- Monitors are experimental and work only in interactive sessions. They are never the only channel.
+- `asyncRewake` hooks are subject to timeouts and may not wake a session in every client; the next-prompt summary stays the floor.
 
 ## Ideas (not approved)
 
