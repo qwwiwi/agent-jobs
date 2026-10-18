@@ -384,7 +384,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	// The scope is ended like a cancel's: nothing of the attempt may outlive it. A failed stop stays
 	// pending (retried every tick) and the job cannot be resumed until it succeeds.
 	if err := m.endScope(j); err != nil {
-		m.Log.Printf("job %s: %v", id, err)
+		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 	}
 	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, Printable(msg, 800), now); err != nil {
@@ -399,7 +399,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	if note != "" {
 		msg += "; " + note
 	}
-	m.Log.Printf("job %s stopped (%s)", id, msg)
+	m.Log.Printf("job %s stopped (%s)", id, RedactText(msg)) // the stop reason and the sweep note
 	return m.Store.Get(id)
 }
 

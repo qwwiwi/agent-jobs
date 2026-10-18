@@ -1,6 +1,10 @@
 package jobs
 
 import (
+	"bytes"
+	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,5 +154,198 @@ func TestRedactReportSkipsSymlink(t *testing.T) {
 	m.redactReport("x")
 	if b, _ := os.ReadFile(target); string(b) != body {
 		t.Fatalf("symlink target rewritten: %q", b)
+	}
+}
+
+// A Telegram token in the Bot API URL form (/bot<TOKEN>/getMe) and two tokens one space apart are
+// all replaced: the boundaries around a token are not consumed.
+func TestRedactTelegramBoundaries(t *testing.T) {
+	tok := func(c string) string { return "123456789:" + rep(c, 35) }
+	for _, in := range []string{
+		"curl https://api.telegram.org/bot" + tok("A") + "/getMe",
+		tok("A") + " " + tok("B"),
+		tok("A") + "," + tok("B") + "\n" + tok("C"),
+	} {
+		out, _ := Redact(in)
+		if strings.Contains(out, rep("A", 35)) || strings.Contains(out, rep("B", 35)) || strings.Contains(out, rep("C", 35)) {
+			t.Errorf("telegram token left: %q -> %q", in, out)
+		}
+	}
+	if out, _ := Redact("bot" + tok("A") + "/getMe"); out != "bot[redacted:telegram]/getMe" {
+		t.Errorf("url form: %q", out)
+	}
+}
+
+// A credential longer than any fixed bound is replaced whole, never only a prefix.
+func TestRedactLongValuesWhole(t *testing.T) {
+	long := rep("x", 1500)
+	for _, c := range []struct{ name, in, tail string }{
+		{"bearer", "Authorization: Bearer " + long + " end", " end"},
+		{"secret", "API_KEY=" + long + " end", " end"},
+		{"jwt", "eyJ" + long + "." + long + "." + long + " end", " end"},
+		{"anthropic", "sk-ant-" + long + " end", " end"},
+		{"openai", "sk-" + long + " end", " end"},
+		{"github", "ghp_" + long + " end", " end"},
+		{"github pat", "github_pat_" + long + " end", " end"},
+		{"slack", "xoxb-" + long + " end", " end"},
+	} {
+		out, n := Redact(c.in)
+		if n == 0 || strings.Contains(out, "xxxx") || !strings.HasSuffix(out, c.tail) {
+			t.Errorf("%s: %d value(s), out %q", c.name, n, out)
+		}
+	}
+}
+
+// An oversized report is never read past the scan cap: a sparse 1 GiB report.md is redacted from its
+// first MaxRedactBytes (+1) bytes and the rest becomes the unscanned note.
+func TestRedactReportBoundedRead(t *testing.T) {
+	m := newManager(t)
+	dir := m.JobDir("big")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(p, []byte("## Summary\nused ghp_"+rep("Q", 36)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(p, 1<<30); err != nil { // sparse: no disk, but 1 GiB to read
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, n, read, err := redactFile(f)
+	_ = f.Close()
+	if err != nil || read > MaxRedactBytes+1 || n < 2 || strings.Contains(out, "ghp_") ||
+		!strings.Contains(out, "unscanned") || len(out) > MaxRedactBytes+200 {
+		t.Fatalf("redactFile: err=%v read=%d n=%d len=%d", err, read, n, len(out))
+	}
+	if err := m.redactReport("big"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil || len(b) > MaxRedactBytes+200 || strings.Contains(string(b), "ghp_") ||
+		!strings.Contains(string(b), "unscanned") {
+		t.Fatalf("report.md after redaction: %d bytes, %v", len(b), err)
+	}
+}
+
+// The failure text of a job (here an error result subtype carrying a token) is redacted in the
+// daemon log line of the finish.
+func TestFinishLogRedacted(t *testing.T) {
+	m := newManager(t)
+	var buf bytes.Buffer
+	m.Log = log.New(&buf, "", 0)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_SECRET_SUBTYPE", nil).ID)
+	if j.Status != store.StatusFailed {
+		t.Fatalf("status %s", j.Status)
+	}
+	if l := buf.String(); strings.Contains(l, rep("W", 36)) || !strings.Contains(l, "[redacted:github]") {
+		t.Fatalf("daemon log:\n%s", l)
+	}
+}
+
+// Whatever sits at the old fixed temp name (here a directory) does not stop the rewrite.
+func TestRedactReportTmpInTheWay(t *testing.T) {
+	m := newManager(t)
+	dir := m.JobDir("x")
+	if err := os.MkdirAll(filepath.Join(dir, "report.md.tmp", "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(p, []byte("token ghp_"+rep("Q", 36)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.redactReport("x"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	fi, _ := os.Stat(p)
+	if strings.Contains(string(b), "ghp_") || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("report.md: %q %v", b, fi.Mode())
+	}
+	if ents, _ := filepath.Glob(filepath.Join(dir, ".report.md.*.tmp")); len(ents) != 0 {
+		t.Fatalf("temp files left: %v", ents)
+	}
+}
+
+// A failed rewrite leaves the job's redaction pending; the next tick retries until it succeeds.
+func TestRedactionPendingRetried(t *testing.T) {
+	m := newManager(t)
+	renameFile = func(string, string) error { return errors.New("disk says no") }
+	defer func() { renameFile = os.Rename }()
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_SECRET_REPORT", nil).ID)
+	p := filepath.Join(m.JobDir(j.ID), "report.md")
+	if b, _ := os.ReadFile(p); !strings.Contains(string(b), "ghp_") {
+		t.Fatalf("rewrite was meant to fail: %q", b)
+	}
+	if ids, err := m.Store.RedactionPending(); err != nil || len(ids) != 1 || ids[0] != j.ID {
+		t.Fatalf("pending: %v %v", ids, err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := m.Store.RedactionPending(); len(ids) != 1 {
+		t.Fatalf("pending cleared although the rewrite still fails: %v", ids)
+	}
+	renameFile = os.Rename
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); strings.Contains(string(b), "ghp_") || !strings.Contains(string(b), "[redacted:github]") {
+		t.Fatalf("not redacted on retry: %q", b)
+	}
+	if ids, err := m.Store.RedactionPending(); err != nil || len(ids) != 0 {
+		t.Fatalf("still pending: %v %v", ids, err)
+	}
+}
+
+// A daemon that died between the row turning terminal and the rewrite: the restarted daemon's first
+// tick redacts the report.
+func TestRedactionPendingAfterCrash(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "x", nil)
+	now := time.Now()
+	if err := m.Store.Claim(j.ID, "tok", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(m.JobDir(j.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(m.JobDir(j.ID), "report.md")
+	if err := os.WriteFile(p, []byte("## Summary\nused ghp_"+rep("Q", 36)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The crash: Finish ran, settled never did.
+	if err := m.Store.Finish(j.ID, "tok", store.StatusSucceeded, 1, 0.01, 1, "", now); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := Open("test") // the restarted daemon
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+	m2.SelfBin, m2.Log = selfBin, log.New(io.Discard, "", 0)
+	if err := m2.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); strings.Contains(string(b), "ghp_") {
+		t.Fatalf("not redacted after restart: %q", b)
+	}
+	if ids, err := m2.Store.RedactionPending(); err != nil || len(ids) != 0 {
+		t.Fatalf("still pending: %v %v", ids, err)
+	}
+}
+
+// Readers that stop at a byte cap drop the last partial line before redacting: a value cut by the
+// cap is not shown in part.
+func TestRedactReadTruncated(t *testing.T) {
+	s := "## Summary\nok\nAPI_KEY=" + rep("k", 10)
+	if out := RedactRead(s, true); strings.Contains(out, "kkkk") || out != "## Summary\nok\n" {
+		t.Fatalf("truncated: %q", out)
+	}
+	if out := RedactRead("ok\n", false); out != "ok\n" {
+		t.Fatalf("whole: %q", out)
 	}
 }

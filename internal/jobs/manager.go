@@ -298,7 +298,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	return j, nil
 }
 
-// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, fire the
+// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops and report redactions that failed, fire the
 // schedules due this minute, start queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
 // cleanup delay.
 func (m *Manager) Tick() error {
@@ -313,6 +313,9 @@ func (m *Manager) Tick() error {
 	}
 	if err := m.retryScopeStops(); err != nil {
 		errs = append(errs, fmt.Errorf("scope stop: %w", err))
+	}
+	if err := m.retryRedactions(); err != nil {
+		errs = append(errs, fmt.Errorf("redaction: %w", err))
 	}
 	if err := m.fireSchedules(); err != nil {
 		errs = append(errs, fmt.Errorf("schedules: %w", err))
@@ -386,13 +389,13 @@ func (m *Manager) launchQueued() error {
 		running++
 		j.Attempt++ // as Claim counted it
 		if err := m.launch(j, token); errors.Is(err, errScopeRetry) {
-			m.Log.Printf("job %s: %v", j.ID, err)
+			m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
 			if uerr := m.Store.Unclaim(j.ID, token); uerr != nil {
 				m.Log.Printf("job %s: requeue: %v", j.ID, uerr)
 			}
 			return nil // the next queued jobs would meet the same user manager
 		} else if err != nil {
-			m.Log.Printf("job %s refused to start: %v", j.ID, err)
+			m.Log.Printf("job %s refused to start: %s", j.ID, RedactText(err.Error()))
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
@@ -676,7 +679,7 @@ func (m *Manager) adopt(j *store.Job, now time.Time) bool {
 	// Same lock as the wrapper's admission: it either registered already or will see the failed row.
 	unlock, err := lockAdmitIfExists(m.JobDir(j.ID))
 	if err != nil {
-		m.Log.Printf("job %s: %v", j.ID, err)
+		m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
 		return false
 	}
 	defer unlock()
@@ -769,7 +772,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	// Whatever ended the job, nothing of it may outlive the row turning terminal.
 	if err := m.endScope(j); err != nil {
 		// Fail closed: the job is over for the daemon, but it must not count as a clean finish.
-		m.Log.Printf("job %s: %v", j.ID, err)
+		m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
 		note := ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 		if status == store.StatusTimeout {
 			msg = Printable(msg+"; "+note, 300)
@@ -785,7 +788,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
 	m.recordAttemptEnd(j, res, killed)
-	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
 }
 
@@ -794,7 +797,7 @@ func (m *Manager) noteSweep(id, note string) {
 	if note == "" {
 		return
 	}
-	m.Log.Printf("job %s: %s", id, note)
+	m.Log.Printf("job %s: %s", id, RedactText(note)) // command lines of processes the job left
 	if err := m.Store.AppendError(id, note); err != nil {
 		m.Log.Printf("job %s: record note: %v", id, err)
 	}
@@ -956,7 +959,7 @@ func (m *Manager) Cancel(id string) error {
 	res, killed := killedResult(j.Runner, m.JobDir(id))
 	msg := "cancelled"
 	if err := m.endScope(j); err != nil {
-		m.Log.Printf("job %s: %v", id, err)
+		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = Printable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
 	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {

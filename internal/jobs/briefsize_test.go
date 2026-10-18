@@ -87,3 +87,11 @@ func TestConfigBriefKeys(t *testing.T) {
 		t.Fatalf("defaults: %+v %v", c, err)
 	}
 }
+
+// Single-character stems are files ("x.go", "a.go:12", "pkg/x.ts"); "e.g" and "i.e" are not.
+func TestMeasureBriefShortStems(t *testing.T) {
+	s := MeasureBrief("Fix x.go and a.go:12, then pkg/x.ts. E.g. this, e.g. that, i.e. nothing; also E.G and I.E.\n")
+	if s.Files != 3 {
+		t.Fatalf("files: %+v", s)
+	}
+}

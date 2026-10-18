@@ -316,6 +316,7 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -601,8 +602,37 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	if token == "" {
 		return errors.New("claim: empty launch token")
 	}
+	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
+	// report of the ended attempt has been redacted (ClearRedactionPending).
 	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?,
-		attempt=attempt+1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+		attempt=attempt+1, redaction_pending=1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+}
+
+// RedactionPending returns the ids of the jobs that are no longer queued or running and whose
+// report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.
+func (s *Store) RedactionPending() ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM jobs WHERE redaction_pending != 0 AND status NOT IN ('queued','running')
+		ORDER BY created_at, rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ClearRedactionPending records that the report of the ended attempt is redacted. A job that was
+// requeued or claimed again meanwhile keeps the mark (its new attempt may write a new report).
+func (s *Store) ClearRedactionPending(id string) error {
+	_, err := s.db.Exec(`UPDATE jobs SET redaction_pending=0 WHERE id=? AND status NOT IN ('queued','running')`, id)
+	return err
 }
 
 // SetSession records the claude session id and run mode of the running launch that owns the job.

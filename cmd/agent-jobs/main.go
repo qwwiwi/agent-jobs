@@ -688,12 +688,21 @@ func cmdResult(args []string) error {
 	if len(atts) > 0 {
 		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
 	}
-	b, err := os.ReadFile(filepath.Join(m.JobDir(id), "report.md"))
-	if err != nil {
+	// The bounded reader of job_result: never through a link, never a FIFO or another non-regular
+	// file, at most the scan cap.
+	text, truncated, err := mcp.ReadJobReport(m.StateDir, id, jobs.MaxRedactBytes)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("no report.md (status %s): see %s", j.Status, filepath.Join(m.JobDir(id), "stderr.log"))
+	case err != nil:
+		return fmt.Errorf("report.md not read: %w", err)
 	}
-	// Redacted, "Not done / uncertain" first and "Progress" after it, like job_result.
-	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactText(string(b))))
+	// Redacted on the fly (the in-place redaction may be pending), "Not done / uncertain" first and
+	// "Progress" after it, like job_result.
+	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactRead(text, truncated)))
+	if truncated {
+		fmt.Printf("\n[report cut at %d bytes; full file: %s]\n", jobs.MaxRedactBytes, filepath.Join(m.JobDir(id), "report.md"))
+	}
 	return nil
 }
 

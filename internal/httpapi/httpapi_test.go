@@ -534,3 +534,22 @@ func TestServeRefusesWithoutSafeToken(t *testing.T) {
 		t.Fatalf("Serve with a 644 token file: %v", err)
 	}
 }
+
+// The report is redacted on the fly: a report.md whose in-place redaction is still pending (or of a
+// running job) never leaves the API with a raw token.
+func TestJobReportRedacted(t *testing.T) {
+	f := newFixture(t)
+	j := f.insert(t, "261018-100001-cccc", store.StatusSucceeded)
+	dir := f.m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tok := "ghp_" + strings.Repeat("Q", 36)
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("## Summary\nused "+tok+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := f.get(t, "/v1/jobs/"+j.ID+"?report=1", http.StatusOK)
+	if r, _ := out["report"].(string); strings.Contains(r, tok) || !strings.Contains(r, "[redacted:github]") {
+		t.Fatalf("report: %q", r)
+	}
+}
