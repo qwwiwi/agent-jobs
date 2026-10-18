@@ -17,11 +17,13 @@
 #   gets an explicit --skills-dir in the temp dir; the Go caches stay the caller's (pinned first);
 # - the agent name is a throwaway accept-<random>, config.json pins cgroup_scope=off (no systemd
 #   scope, no scope probe);
-# - every step and the daemon run in a process group of their own next to a holder process that keeps
-#   the group id (= the leader's PID) from being reused; on exit, failure or INT/TERM the active step
-#   is stopped first, then the sandbox's queued/running jobs are cancelled and the daemon is stopped.
-#   The teardown ignores INT/TERM (also a terminal's Ctrl-C to its commands), so repeated signals do
-#   not cut it short.
+# - every step, the daemon and each teardown command run under a supervisor, the leader of a process
+#   group of its own: the script only writes `stop` to the supervisor's FIFO and waits for it, and the
+#   supervisor signals only its own group (kill 0, as a member), so no PID or group id is signalled
+#   after it could have been reused; on exit, failure or INT/TERM the active step is stopped first,
+#   then the sandbox's queued/running jobs are cancelled (each list/cancel with a 10 s deadline) and
+#   the daemon is stopped. The teardown ignores INT/TERM (also a terminal's Ctrl-C to its commands),
+#   so repeated signals do not cut it short, and every wait in it is bounded.
 #
 # Test job: by default a stub stands in for claude (AGENT_JOBS_CLAUDE_BIN), so no model is called;
 # --real-model M runs one real job instead (1 turn, budget 0.2 USD): the daemon alone runs with the
@@ -208,91 +210,192 @@ fi
 
 STEP_NAMES=()
 STEP_CODES=()
-STEP_PID=""
-DAEMON_PID=""
 FAILED=0
 CLEANED=0
 SUMMARY_DONE=0
-# While CRITICAL=1 (a fork whose PID is not recorded yet, a group being ended) INT/TERM are held in
-# PENDING_SIGNAL and acted on right after, so the teardown never misses a group or signals a stale one.
+# While CRITICAL=1 (a supervisor forked whose PID is not recorded yet) INT/TERM are held in
+# PENDING_SIGNAL and acted on right after, so the teardown always knows which supervisor to wait for.
 CRITICAL=0
 PENDING_SIGNAL=""
+# Set once a cleanup list/cancel timed out: the binary is stuck, later job passes are skipped.
+CANCEL_STUCK=0
+SUP_DIR="$ROOT/sup"
+SUP_SEQ=0
+# The control fds of the live supervisors (closed in every child but their own supervisor).
+SUP_FDS=()
+# The active step's, the daemon's and a teardown command's supervisor (spawn PREFIX): PREFIX_PID,
+# PREFIX_FD (control fd) and PREFIX_RC (the file the exit code lands in).
+STEP_PID=""
+DAEMON_PID=""
+DAEMON_RC=""
+BOUNDED_PID=""
+REAP_RC=""
 
 record() { STEP_NAMES+=("$1"); STEP_CODES+=("$2"); }
 
-# spawn_group VAR CMD...: runs CMD in the background in a process group of its own (job control is on
-# for the fork only) and sets VAR to its PID, which is also the group id. A holder (sleep, INT/TERM
-# ignored) sits in the same group: while it lives the group id is in use, so neither the leader's PID
-# nor the group id can be handed to another process, even after the leader exited and was reaped;
-# stop_group ends the holder last. CMD's redirections are the caller's (`spawn_group V cmd >log`).
-spawn_group() {
-  local __var="$1"
-  shift
+# release_signal acts on an INT/TERM held while CRITICAL was set (once: the teardown that follows
+# spawns supervisors too).
+release_signal() {
+  local s="$PENDING_SIGNAL"
+  PENDING_SIGNAL=""
+  if [ -n "$s" ]; then exit "$s"; fi
+}
+
+# supervisor FD RCFILE TIMEOUT GRACE CMD...: the body of a supervisor, the leader of a process group
+# of its own (spawn). It runs CMD (INT/TERM back to default, explicit errexit) in its group and reads
+# its control fd, a FIFO the script holds open: `done RC` (CMD ended), `stop` (the script's teardown)
+# or `timeout` (TIMEOUT seconds passed, 0 = none) send TERM to the group (the supervisor ignores it),
+# GRACE seconds later `kill` ends the wait. Then it writes CMD's exit code (124 after a timeout, 143
+# when stopped before the start) to RCFILE and KILLs its own group: whatever CMD left behind, and the
+# supervisor itself. Only a member of the group signals the group (kill 0), so no group id is ever
+# signalled after it could have been reused; the script itself signals no process.
+supervisor() {
+  local fd="$1" rcf="$2" timeout="$3" grace="$4" line rc="" timed_out=0 f
+  shift 4
+  set +e
+  trap '' INT TERM
+  for f in "${SUP_FDS[@]}"; do [ "$f" = "$fd" ] || exec {f}>&-; done
+  # @acceptance-test-hook: supervisor start@
+  # A stop that arrived before the start: nothing runs.
+  if read -r -t 0 -u "$fd"; then
+    echo 143 >"$rcf"
+    exit 0
+  fi
+  {
+    (
+      for f in "${SUP_FDS[@]}"; do exec {f}>&-; done
+      trap - INT TERM
+      set -e
+      "$@"
+    )
+    echo "done $?" >&"$fd"
+  } &
+  if [ "$timeout" -gt 0 ]; then
+    { sleep "$timeout"; echo timeout >&"$fd"; } </dev/null >/dev/null 2>&1 &
+  fi
+  while read -r line <&"$fd"; do
+    case "$line" in
+      "done "*) rc="${line#done }"; break ;;
+      stop|timeout)
+        if [ "$line" = timeout ]; then
+          timed_out=1
+          echo "acceptance: timed out after ${timeout}s: $*" >&2
+        fi
+        kill -TERM 0
+        { sleep "$grace"; echo kill >&"$fd"; } </dev/null >/dev/null 2>&1 &
+        ;;
+      kill) break ;;
+    esac
+  done
+  if [ "$timed_out" = 1 ]; then rc=124; fi
+  echo "${rc:-137}" >"$rcf"
+  kill -KILL 0
+}
+
+# spawn PREFIX TIMEOUT GRACE CMD...: runs CMD under a supervisor in a process group of its own (job
+# control is on for the fork only) and sets PREFIX_PID (the supervisor, a child of this shell, only
+# ever waited for), PREFIX_FD and PREFIX_RC. CMD's redirections are the caller's
+# (`spawn P 0 5 cmd >log`); the caller calls release_signal once they are undone.
+spawn() {
+  local p="$1" timeout="$2" grace="$3" fifo fd
+  shift 3
+  SUP_SEQ=$((SUP_SEQ + 1))
+  mkdir -p "$SUP_DIR"
+  fifo="$SUP_DIR/$SUP_SEQ.ctl"
+  mkfifo -m 0600 "$fifo"
+  # Read-write: the open never blocks, writes never block or raise SIGPIPE, and a message sent
+  # before the supervisor reads waits in the FIFO. The name is not needed once open.
+  exec {fd}<>"$fifo"
+  rm -f "$fifo"
+  SUP_FDS+=("$fd")
+  printf -v "${p}_FD" '%s' "$fd"
+  printf -v "${p}_RC" '%s' "$SUP_DIR/$SUP_SEQ.rc"
   CRITICAL=1
   set -m
-  (
-    trap '' INT TERM
-    # No inherited fds: a pipe held open by the holder would keep a reader waiting.
-    # shellcheck disable=SC2217
-    sleep 2147483647 </dev/null >/dev/null 2>&1 &
-    trap - INT TERM
-    "$@"
-  ) &
-  printf -v "$__var" '%s' "$!"
+  supervisor "$fd" "$SUP_DIR/$SUP_SEQ.rc" "$timeout" "$grace" "$@" &
+  printf -v "${p}_PID" '%s' "$!"
   set +m
   CRITICAL=0
-  release_signal
 }
 
-# release_signal acts on an INT/TERM held while CRITICAL was set.
-release_signal() {
-  if [ -n "$PENDING_SIGNAL" ]; then exit "$PENDING_SIGNAL"; fi
+# reap PREFIX [stop]: (with stop: asks the supervisor to stop CMD,) waits for the supervisor, closes
+# its control fd and sets REAP_RC to CMD's exit code. Bounded by the supervisor's own timers.
+reap() {
+  local p="$1" pid fd rcf f keep=()
+  REAP_RC=""
+  pid="${p}_PID"
+  pid="${!pid:-}"
+  [ -n "$pid" ] || return 0
+  fd="${p}_FD" rcf="${p}_RC"
+  fd="${!fd}" rcf="${!rcf}"
+  if [ "${2:-}" = stop ]; then echo stop 2>/dev/null >&"$fd" || true; fi
+  wait "$pid" 2>/dev/null || true
+  printf -v "${p}_PID" '%s' ""
+  exec {fd}>&-
+  for f in "${SUP_FDS[@]}"; do [ "$f" = "$fd" ] || keep+=("$f"); done
+  SUP_FDS=(${keep[@]+"${keep[@]}"})
+  REAP_RC="$(cat "$rcf" 2>/dev/null || true)"
+  REAP_RC="${REAP_RC:-137}"
 }
 
-# stop_group PID SECONDS: TERM to the group (the holder ignores it), up to SECONDS for the leader to
-# exit, then KILL to the group (whatever the leader left behind, and the holder), and reap the leader.
-stop_group() {
-  local g="$1" n=$(($2 * 4))
-  kill -TERM -- "-$g" 2>/dev/null || true
-  while [ "$n" -gt 0 ] && kill -0 "$g" 2>/dev/null; do
-    sleep 0.25
-    n=$((n - 1))
-  done
-  kill -KILL -- "-$g" 2>/dev/null || true
-  wait "$g" 2>/dev/null || true
+# daemon_alive: the daemon has not exited (its supervisor has not written its exit code).
+daemon_alive() { [ -n "$DAEMON_RC" ] && [ ! -e "$DAEMON_RC" ]; }
+
+# bounded SECONDS OUT CMD...: CMD under a supervisor with a deadline (then TERM, 2 s, KILL), stdout to
+# OUT, stderr to the cancel log; returns CMD's exit code, 124 on the deadline.
+bounded() {
+  local secs="$1" out="$2"
+  shift 2
+  spawn BOUNDED "$secs" 2 "$@" >"$out" 2>>"$LOGS/cancel.log" </dev/null
+  reap BOUNDED
+  return "$REAP_RC"
 }
 
 # cancel_jobs cancels every queued or running job of the sandbox agent (one submitted by an
-# interrupted step included); a cancelled job's processes are ended by the binary.
+# interrupted step included); a cancelled job's processes are ended by the binary. Each list and
+# cancel has a deadline: a stuck binary never blocks the daemon's teardown (it fails the run).
 cancel_jobs() {
-  [ -x "$AJ" ] && [ -d "$STATE" ] || return 0
-  local st id
+  [ -x "$AJ" ] && [ -d "$STATE" ] && [ "$CANCEL_STUCK" = 0 ] || return 0
+  local st id rc out="$LOGS/cancel.list"
   for st in queued running; do
+    rc=0
+    bounded 10 "$out" "$AJ" list --agent "$AGENT" --status "$st" --limit 1000 || rc=$?
+    if [ "$rc" = 124 ]; then
+      cancel_stuck "list --status $st"
+      return 0
+    fi
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       echo "cancel $id ($st)" >>"$LOGS/cancel.log"
-      "$AJ" cancel --agent "$AGENT" "$id" >>"$LOGS/cancel.log" 2>&1 </dev/null || true
-    done < <("$AJ" list --agent "$AGENT" --status "$st" --limit 1000 2>>"$LOGS/cancel.log" </dev/null | awk 'NR > 1 { print $1 }' || true)
+      rc=0
+      bounded 10 /dev/null "$AJ" cancel --agent "$AGENT" "$id" || rc=$?
+      if [ "$rc" = 124 ]; then
+        cancel_stuck "cancel $id"
+        return 0
+      fi
+    done < <(awk 'NR > 1 { print $1 }' "$out")
   done
+}
+
+cancel_stuck() {
+  CANCEL_STUCK=1
+  FAILED=1
+  echo "acceptance: teardown: \`agent-jobs $1\` timed out; job cancel skipped, see $LOGS/cancel.log" >&2
 }
 
 # cleanup: the active step first (it may be submitting a job), then the sandbox's jobs, the daemon,
 # and once more the jobs (one the daemon launched meanwhile). Idempotent; CLEANED is set only once the
 # teardown ran to its end. INT, TERM and PIPE are ignored from here on, by this shell and by the
 # teardown's own commands (a terminal's Ctrl-C reaches the whole foreground group, and a closed
-# `| tee` must not end the shell mid-teardown); it is bounded (about 25 s) and KILL still works.
+# `| tee` must not end the shell mid-teardown); every wait is bounded by a supervisor's timers (step
+# 5 s, each list/cancel 10 s + 2 s, daemon 15 s after TERM) and KILL still works.
 cleanup() {
   [ "$CLEANED" = 0 ] || return 0
   trap '' INT TERM PIPE
-  if [ -n "$STEP_PID" ]; then
-    stop_group "$STEP_PID" 5
-    STEP_PID=""
-  fi
+  reap STEP stop
+  reap BOUNDED stop
   cancel_jobs
-  if [ -n "$DAEMON_PID" ]; then
-    stop_group "$DAEMON_PID" 15
-    DAEMON_PID=""
-  fi
+  reap DAEMON stop
   cancel_jobs
   CLEANED=1
 }
@@ -356,20 +459,17 @@ trap on_exit EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
-# run_step NAME FUNC: runs FUNC with errexit in a process group of its own (spawn_group; waited for,
-# not under a `||`, so errexit stays on), output to logs/NN-NAME.log; a failure ends the run. Whatever
-# the step left in its group is killed when it ends.
+# run_step NAME FUNC: runs FUNC with errexit under a supervisor in a process group of its own (spawn),
+# output to logs/NN-NAME.log; a failure ends the run. Whatever the step left in its group is killed
+# when it ends.
 run_step() {
-  local name="$1" fn="$2" log rc=0
+  local name="$1" fn="$2" log rc
   log="$LOGS/$(printf '%02d' "${#STEP_NAMES[@]}")-$name.log"
   echo "== $name"
-  spawn_group STEP_PID "$fn" >"$log" 2>&1 </dev/null
-  if wait "$STEP_PID"; then rc=0; else rc=$?; fi
-  CRITICAL=1
-  kill -KILL -- "-$STEP_PID" 2>/dev/null || true
-  STEP_PID=""
-  CRITICAL=0
+  spawn STEP 0 5 "$fn" >"$log" 2>&1 </dev/null
   release_signal
+  reap STEP
+  rc="$REAP_RC"
   record "$name" "$rc"
   if [ "$rc" != 0 ]; then
     FAILED=1
@@ -494,8 +594,8 @@ step_install() {
   test -f "$STATE/http-api.token"
 }
 
-# start_daemon: the daemon in a process group of its own (spawn_group), exec'd so its PID is the
-# group id. With --real-model it alone gets the caller's HOME and CLAUDE_CONFIG_DIR: the claude it
+# start_daemon: the daemon under a supervisor in a process group of its own (spawn; on stop TERM,
+# 15 s, KILL). With --real-model it alone gets the caller's HOME and CLAUDE_CONFIG_DIR: the claude it
 # runs needs the login there.
 start_daemon() {
   local env_cmd=()
@@ -503,17 +603,18 @@ start_daemon() {
     env_cmd=(env "HOME=$REAL_HOME")
     if [ "$REAL_CLAUDE_CONFIG_DIR_SET" = 1 ]; then env_cmd+=("CLAUDE_CONFIG_DIR=$REAL_CLAUDE_CONFIG_DIR"); fi
   fi
-  spawn_group DAEMON_PID exec ${env_cmd[@]+"${env_cmd[@]}"} "$AJ" daemon --agent "$AGENT" >"$LOGS/daemon.log" 2>&1 </dev/null
+  spawn DAEMON 0 15 exec ${env_cmd[@]+"${env_cmd[@]}"} "$AJ" daemon --agent "$AGENT" >"$LOGS/daemon.log" 2>&1 </dev/null
+  release_signal
 }
 
 step_daemon() {
   local i
   for i in $(seq 40); do
     if grep -q 'daemon started' "$LOGS/daemon.log" && [ -S "$STATE/http-api.sock" ]; then break; fi
-    kill -0 "$DAEMON_PID"
+    daemon_alive
     sleep 0.25
   done
-  kill -0 "$DAEMON_PID"
+  daemon_alive
   grep 'daemon started' "$LOGS/daemon.log"
   test -S "$STATE/http-api.sock"
 }
@@ -591,7 +692,7 @@ EOF
     grep -qx -- '--max-turns' "$STATE/jobs/$id/stub-argv.txt"
   fi
   "$AJ" doctor procs --agent "$AGENT"
-  kill -0 "$DAEMON_PID"
+  daemon_alive
 }
 
 # ---- run ----

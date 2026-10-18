@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -21,7 +22,9 @@ import (
 
 // fakeMain is the fake agent-jobs binary; %q is the record dir. It logs every call, answers what the
 // script asks, and behaves as the record dir's flag files say: hang-status (status blocks, with a
-// child), stubborn (the daemon ignores TERM).
+// child), stubborn (the daemon ignores TERM), hang-list / hang-cancel (list --status / cancel block,
+// ignoring TERM, with a child; with hang-cancel list --status queued shows one job), http-fail (the
+// HTTP API answers 500).
 const fakeMain = `package main
 
 import (
@@ -35,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var version = "dev"
@@ -79,17 +83,41 @@ func main() {
 			note("status.pid", strconv.Itoa(os.Getpid()))
 			note("status-child.pid", strconv.Itoa(c.Process.Pid))
 			note("status.started", "1")
-			select {}
+			for {
+				time.Sleep(time.Hour)
+			}
 		}
 		fmt.Println("http api:  on")
-	case "doctor", "cancel":
+	case "doctor":
+	case "cancel":
+		if flag("hang-cancel") {
+			hang("cancel")
+		}
 	case "list":
 		fmt.Println("ID  STATUS")
+		listed := strings.Contains(strings.Join(args, " "), "--status")
+		if listed && flag("hang-list") {
+			hang("list")
+		}
+		if listed && flag("hang-cancel") && strings.Contains(strings.Join(args, " "), "--status queued") {
+			fmt.Println("job-1  queued")
+		}
 	case "start":
 		fmt.Fprintln(os.Stderr, "fake: no jobs here")
 		os.Exit(1)
 	default:
 		os.Exit(2)
+	}
+}
+
+// hang blocks for good, ignoring INT and TERM, with a child.
+func hang(what string) {
+	signal.Ignore(syscall.SIGINT, syscall.SIGTERM)
+	c := exec.Command("sleep", "300")
+	_ = c.Start()
+	note(what+".hung", strconv.Itoa(os.Getpid()))
+	for {
+		time.Sleep(time.Hour)
 	}
 }
 
@@ -111,7 +139,14 @@ func daemon(st string) {
 	}
 	note("daemon.pid", strconv.Itoa(os.Getpid()))
 	fmt.Println("daemon started")
-	_ = http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "{}") }))
+	fail := flag("http-fail")
+	_ = http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail {
+			http.Error(w, "fake failure", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, "{}")
+	}))
 }
 `
 
@@ -201,6 +236,17 @@ func copyFile(t *testing.T, src, dst string, mode os.FileMode) {
 // its unit and skill), else that script; flags are record-dir flag files (hang-status, ...).
 func newFakeRepo(t *testing.T, installer string, flags ...string) fakeRepo {
 	t.Helper()
+	return newFakeRepoWith(t, installer, "", flags...)
+}
+
+// newFakeRepoHook is newFakeRepo with hook in place of the script's supervisor start hook line.
+func newFakeRepoHook(t *testing.T, hook string, flags ...string) fakeRepo {
+	t.Helper()
+	return newFakeRepoWith(t, "", hook, flags...)
+}
+
+func newFakeRepoWith(t *testing.T, installer, hook string, flags ...string) fakeRepo {
+	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only (the installer and /proc)")
 	}
@@ -214,6 +260,16 @@ func newFakeRepo(t *testing.T, installer string, flags ...string) fakeRepo {
 		writeFile(t, filepath.Join(r.rec, f), "1\n", 0o644)
 	}
 	copyFile(t, acceptanceScript, r.script, 0o755)
+	if hook != "" {
+		b, err := os.ReadFile(r.script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Count(b, []byte(supervisorHook)) != 1 {
+			t.Fatalf("%s: no single supervisor hook line %q", acceptanceScript, supervisorHook)
+		}
+		writeFile(t, r.script, strings.Replace(string(b), supervisorHook, hook, 1), 0o755)
+	}
 	writeFile(t, filepath.Join(r.dir, "go.mod"), "module fakeagentjobs\n\ngo 1.21\n", 0o644)
 	writeFile(t, filepath.Join(r.dir, "cmd/agent-jobs/main.go"), fmt.Sprintf(fakeMain, r.rec), 0o644)
 	writeFile(t, filepath.Join(r.dir, "scripts/check.sh"), fmt.Sprintf(fakeCheck, r.rec), 0o755)
@@ -423,16 +479,13 @@ func TestAcceptanceScriptCurlRequired(t *testing.T) {
 func TestAcceptanceScriptInterruptStep(t *testing.T) {
 	r := newFakeRepo(t, "", "hang-check")
 	args, extra := r.args()
-	cmd, out, since, done := startFake(t, r, extra, args...)
+	run := startFake(t, r, extra, args...)
 	r.waitFor(t, "check.pid", 60*time.Second)
-	procs := watch(t, since, r.pid(t, "check.pid"), r.pid(t, "check-child.pid"))
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	code := waitDone(t, done, out, 60*time.Second)
-	assertGone(t, out, procs)
-	if code != 143 || !strings.Contains(out.String(), "interrupted (exit 143)") {
-		t.Fatalf("exit %d\n%s", code, out)
+	ownGroups(t, r, "check.pid", "check-child.pid")
+	run.signal(t, syscall.SIGTERM)
+	code := run.wait(t, 60*time.Second)
+	if code != 143 || !strings.Contains(run.out.String(), "interrupted (exit 143)") {
+		t.Fatalf("exit %d\n%s", code, run.out)
 	}
 }
 
@@ -441,23 +494,18 @@ func TestAcceptanceScriptInterruptStep(t *testing.T) {
 func TestAcceptanceScriptInterruptTeardown(t *testing.T) {
 	r := newFakeRepo(t, "", "hang-status", "stubborn")
 	args, extra := r.args("--no-tests")
-	cmd, out, since, done := startFake(t, r, extra, args...)
+	run := startFake(t, r, extra, args...)
 	r.waitFor(t, "status.started", 60*time.Second)
-	procs := watch(t, since, r.pid(t, "status.pid"), r.pid(t, "status-child.pid"), r.pid(t, "daemon.pid"))
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
+	ownGroups(t, r, "status.pid", "status-child.pid", "daemon.pid")
+	run.signal(t, syscall.SIGTERM)
 	r.waitFor(t, "daemon.term", 30*time.Second)
 	for _, sig := range []os.Signal{syscall.SIGTERM, syscall.SIGINT} {
-		if err := cmd.Process.Signal(sig); err != nil {
-			t.Fatal(err)
-		}
+		run.signal(t, sig)
 		time.Sleep(200 * time.Millisecond)
 	}
-	code := waitDone(t, done, out, 60*time.Second)
-	assertGone(t, out, procs)
-	if code != 143 || !strings.Contains(out.String(), "interrupted (exit 143)") {
-		t.Fatalf("exit %d\n%s", code, out)
+	code := run.wait(t, 60*time.Second)
+	if code != 143 || !strings.Contains(run.out.String(), "interrupted (exit 143)") {
+		t.Fatalf("exit %d\n%s", code, run.out)
 	}
 	// The jobs were looked for after the step was stopped.
 	if calls := r.read(t, "calls.log"); !strings.Contains(calls, "list --agent") || !strings.Contains(calls, "--status running") {
@@ -465,31 +513,162 @@ func TestAcceptanceScriptInterruptTeardown(t *testing.T) {
 	}
 }
 
-func runFake(t *testing.T, r fakeRepo, extra []string, args ...string) (string, int) {
-	t.Helper()
-	b, err := acceptanceCmd(t, r.script, extra, nil, args...).CombinedOutput()
-	return string(b), exitCode(t, err)
+// supervisorHook is the line of the script where a supervisor starts, before CMD runs; the
+// fake repository's copy may replace it (newFakeRepoHook).
+const supervisorHook = "  # @acceptance-test-hook: supervisor start@\n"
+
+// TERM that reaches the script while the first step's supervisor is still starting (before it ran
+// anything): the teardown does not wait for a readiness it will never see, the step never runs, the
+// run ends with 143 and leaves nothing.
+func TestAcceptanceScriptInterruptBeforeStart(t *testing.T) {
+	once := filepath.Join(t.TempDir(), "hooked")
+	// $$ in the supervisor (a subshell) is the script itself.
+	hook := fmt.Sprintf("  if [ ! -e %[1]q ]; then : >%[1]q; kill -TERM $$; sleep 1; fi\n", once)
+	r := newFakeRepoHook(t, hook)
+	args, extra := r.args()
+	start := time.Now()
+	out, code := runFake(t, r, extra, args...)
+	if code != 143 || !strings.Contains(out, "interrupted (exit 143)") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(once); err != nil {
+		t.Fatalf("the hook did not run: %v\n%s", err, out)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Errorf("took %s", d)
+	}
+	// The clone step's payload never ran: its log is empty.
+	root := ""
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "temp dir: "); ok {
+			root = v
+		}
+	}
+	if root == "" {
+		t.Fatalf("no temp dir in the output\n%s", out)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "logs", "00-clone.log")); err != nil || len(b) != 0 {
+		t.Errorf("clone step ran: %q %v", b, err)
+	}
 }
 
-// startFake starts the script with its output in a file (no pipe a leftover process could hold);
-// since is the script's start time (clock ticks since boot).
-func startFake(t *testing.T, r fakeRepo, extra []string, args ...string) (*exec.Cmd, *outFile, uint64, chan error) {
+// A teardown command that hangs (list or cancel ignoring TERM, with a child) is ended at its
+// deadline: the daemon is still stopped, the run ends with FAIL and leaves nothing.
+func TestAcceptanceScriptTeardownHang(t *testing.T) {
+	for _, flag := range []string{"hang-list", "hang-cancel"} {
+		t.Run(flag, func(t *testing.T) {
+			t.Parallel()
+			r := newFakeRepo(t, "", flag)
+			args, extra := r.args("--no-tests")
+			run := startFake(t, r, extra, args...)
+			code := run.wait(t, 50*time.Second)
+			out := run.out.String()
+			if code != 1 || !strings.Contains(out, "RESULT: FAIL") || !strings.Contains(out, "timed out; job cancel skipped") {
+				t.Fatalf("exit %d\n%s", code, out)
+			}
+			calls := r.read(t, "calls.log")
+			if flag == "hang-cancel" && !strings.Contains(calls, "cancel --agent") {
+				t.Errorf("cancel never called:\n%s", calls)
+			}
+			if _, err := os.Stat(filepath.Join(r.rec, "daemon.pid")); err != nil {
+				t.Fatalf("no daemon ran: %v", err)
+			}
+		})
+	}
+}
+
+// A failing HTTP check (curl --fail on a 500) fails the status step with curl's exit code: errexit
+// holds inside the step; the job step never runs.
+func TestAcceptanceScriptHTTPFailure(t *testing.T) {
+	r := newFakeRepo(t, "", "http-fail")
+	args, extra := r.args("--no-tests")
+	out, code := runFake(t, r, extra, args...)
+	if code != 1 || !regexp.MustCompile(`FAIL\s+status\s+exit 22`).MatchString(out) || strings.Contains(out, "dry-job") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// runFake runs the script of the fake repository to its end under the reaper; a process the run
+// left behind fails the test.
+func runFake(t *testing.T, r fakeRepo, extra []string, args ...string) (string, int) {
+	t.Helper()
+	rp := newReaper(t)
+	b, err := acceptanceCmd(t, r.script, append(extra, rp.env), rp.argv0, args...).CombinedOutput()
+	out, code := string(b), exitCode(t, err)
+	if left := rp.leftovers(t); len(left) > 0 {
+		t.Errorf("processes survived the run: %v\n%s", left, out)
+	}
+	return out, code
+}
+
+// fakeRun is a script run started in the background under the reaper.
+type fakeRun struct {
+	cmd  *exec.Cmd
+	out  *outFile
+	done chan error
+	rp   reaper
+}
+
+// startFake starts the script under the reaper with its output in a file (no pipe a leftover process
+// could hold). Signals to cmd.Process reach the script (the reaper forwards TERM and INT); if the
+// test ends first, the reaper is told to KILL the script and end whatever it left.
+func startFake(t *testing.T, r fakeRepo, extra []string, args ...string) *fakeRun {
 	t.Helper()
 	f, err := os.Create(filepath.Join(t.TempDir(), "out"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.Close() })
-	cmd := acceptanceCmd(t, r.script, extra, nil, args...)
+	rp := newReaper(t)
+	cmd := acceptanceCmd(t, r.script, append(extra, rp.env), rp.argv0, args...)
 	cmd.Stdout, cmd.Stderr = f, f
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	since := startTicks(procStat(cmd.Process.Pid))
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-	return cmd, &outFile{f.Name()}, since, done
+	run := &fakeRun{cmd: cmd, out: &outFile{f.Name()}, done: make(chan error, 1), rp: rp}
+	go func() { run.done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		select {
+		case err := <-run.done:
+			run.done <- err
+			return
+		default:
+		}
+		// The reaper is this test's unreaped child while done is empty.
+		_ = cmd.Process.Signal(syscall.SIGHUP)
+		select {
+		case err := <-run.done:
+			run.done <- err
+		case <-time.After(30 * time.Second):
+			_ = cmd.Process.Kill()
+		}
+	})
+	return run
+}
+
+func (run *fakeRun) signal(t *testing.T, sig os.Signal) {
+	t.Helper()
+	if err := run.cmd.Process.Signal(sig); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wait waits up to d for the run to end and returns its exit code; a process the run left behind
+// fails the test.
+func (run *fakeRun) wait(t *testing.T, d time.Duration) int {
+	t.Helper()
+	var code int
+	select {
+	case err := <-run.done:
+		run.done <- err
+		code = exitCode(t, err)
+	case <-time.After(d):
+		t.Fatalf("still running after %s\n%s", d, run.out)
+	}
+	if left := run.rp.leftovers(t); len(left) > 0 {
+		t.Errorf("processes survived the run: %v\n%s", left, run.out)
+	}
+	return code
 }
 
 type outFile struct{ path string }
@@ -499,106 +678,18 @@ func (o *outFile) String() string {
 	return string(bytes.TrimSpace(b))
 }
 
-func waitDone(t *testing.T, done chan error, out *outFile, d time.Duration) int {
+// ownGroups: each recorded process (alive when the test looked) ran in a process group other than
+// this test's, i.e. its step had a group of its own. Read only: nothing is signalled by PID here.
+func ownGroups(t *testing.T, r fakeRepo, names ...string) {
 	t.Helper()
-	select {
-	case err := <-done:
-		return exitCode(t, err)
-	case <-time.After(d):
-		t.Fatalf("still running after %s\n%s", d, out)
-	}
-	return -1
-}
-
-// procStat is /proc/PID/stat after the comm: state (field 3), ppid, pgrp, ..., starttime (field 22).
-func procStat(pid int) []string {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return nil
-	}
-	s := string(b)
-	return strings.Fields(s[strings.LastIndexByte(s, ')')+1:])
-}
-
-func startTicks(f []string) uint64 {
-	if len(f) < 20 {
-		return 0
-	}
-	n, _ := strconv.ParseUint(f[19], 10, 64)
-	return n
-}
-
-// watched are processes of one run (pid and start time) and the process groups they were in.
-type watched struct {
-	since  uint64
-	pids   map[int]uint64
-	groups []int
-}
-
-// watch records pids (with their start times and groups) and reaps whatever of them and of their
-// groups is left when the test ends, also on a failure path.
-func watch(t *testing.T, since uint64, pids ...int) *watched {
-	t.Helper()
-	w := &watched{since: since, pids: map[int]uint64{}}
-	for _, p := range pids {
-		f := procStat(p)
-		if len(f) < 20 {
-			t.Fatalf("no /proc stat for %d", p)
+	own := strconv.Itoa(syscall.Getpgrp())
+	for _, n := range names {
+		f := procStat(r.pid(t, n))
+		if len(f) < 3 {
+			t.Fatalf("%s: no /proc stat", n)
 		}
-		w.pids[p] = startTicks(f)
-		g, _ := strconv.Atoi(f[2])
-		w.groups = append(w.groups, g)
-	}
-	t.Cleanup(func() { w.leftovers(true) })
-	return w
-}
-
-// leftovers lists (and with kill, SIGKILLs) the live processes of the run: a recorded pid with its
-// recorded start time, or a member of a recorded group started no earlier than the script. Zombies
-// are gone already (a subreaper may not have reaped them yet); this test's own group is never touched.
-func (w *watched) leftovers(kill bool) []string {
-	var left []string
-	add := func(pid int, why string) {
-		left = append(left, fmt.Sprintf("%d (%s)", pid, why))
-		if kill {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+		if f[2] == own {
+			t.Errorf("%s ran in this test's process group %s: its step had no group of its own", n, own)
 		}
-	}
-	for p, st := range w.pids {
-		if f := procStat(p); len(f) > 19 && f[0] != "Z" && startTicks(f) == st {
-			add(p, "recorded")
-		}
-	}
-	own := syscall.Getpgrp()
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		f := procStat(pid)
-		if len(f) < 20 || f[0] == "Z" || startTicks(f) < w.since {
-			continue
-		}
-		for _, g := range w.groups {
-			if g != own && f[2] == strconv.Itoa(g) {
-				add(pid, "group "+f[2])
-			}
-		}
-	}
-	return left
-}
-
-// assertGone: nothing of the run is left, and each step had a process group of its own.
-func assertGone(t *testing.T, out *outFile, w *watched) {
-	t.Helper()
-	own := syscall.Getpgrp()
-	for _, g := range w.groups {
-		if g == own {
-			t.Errorf("process group %d is this test's own: a step ran without a group of its own\n%s", g, out)
-		}
-	}
-	if left := w.leftovers(true); len(left) > 0 {
-		t.Errorf("processes survived the run: %v\n%s", left, out)
 	}
 }
