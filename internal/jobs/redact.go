@@ -169,31 +169,54 @@ func pemLine(line string) (pemLineKind, string) {
 			return pemEnd, t
 		}
 	}
+	p := pemStripPrefix(t)
 	switch {
 	case isBase64Line(pemBodyLine(t)):
 		return pemBase64, t
+	case p == "":
+		// Only a prefix: a quoted or commented blank line ("> ", "#").
+		return pemBlank, t
 	case t[0] == '[' && cutNoteRe.MatchString(t):
 		return pemNote, t
-	case pemHeaderRe.MatchString(t):
+	case pemHeaderRe.MatchString(p):
 		return pemHeader, t
 	}
 	return pemOther, t
 }
 
-// pemBodyLine is t without one diff or quote prefix character and a trailing quote or comma, as
-// key body lines appear in a diff or a quoted string ("+MIIE...", "\"MIIE...\","); t when it has none.
+// pemStripPrefix is t without the diff, quote or comment prefix a marker line may carry (a run of
+// "-+>#|*" and the blanks after it), so marker, header and body lines are read alike.
+func pemStripPrefix(t string) string {
+	i := 0
+	for i < len(t) && strings.IndexByte("-+>#|*", t[i]) >= 0 {
+		i++
+	}
+	if i == 0 {
+		return t
+	}
+	return strings.TrimLeft(t[i:], " \t")
+}
+
+// pemBodyLine is t without a diff, quote or comment prefix (pemStripPrefix), a leading quote and a
+// trailing quote or comma, as key body lines appear in a diff, a quote or a quoted string ("+MIIE...",
+// "> MIIE...", "\"MIIE...\","); t when it has none or is base64 as it is.
 func pemBodyLine(t string) string {
 	if isBase64Line(t) {
 		return t
 	}
-	b := strings.TrimRight(t, `"',`)
-	if b != "" && strings.IndexByte(`+->"'`, b[0]) >= 0 {
+	b := strings.TrimRight(pemStripPrefix(t), `"',`)
+	if b != "" && (b[0] == '"' || b[0] == '\'') {
 		b = b[1:]
 	}
 	if b == "" || !isBase64Line(b) {
 		return t
 	}
 	return b
+}
+
+// pemChecksum says a line is the PGP armor checksum line ("=Ab12"): a base64 line starting with "=".
+func pemChecksum(kind pemLineKind, t string) bool {
+	return kind == pemBase64 && pemBodyLine(t)[0] == '='
 }
 
 func isBase64Line(t string) bool {
@@ -282,7 +305,7 @@ func redactPEM(s string, open bool) (string, int) {
 				}
 				bodyFrom, b64From, b64Full = -1, -1, 0
 			case pemBase64, pemHeader, pemBlank:
-				if short {
+				if short && kind != pemBlank && !pemChecksum(kind, t) {
 					// A short base64 line is a key's last body line only right above its END line;
 					// with more lines after it, it is text ("ok"), and the run starts after it.
 					markerless(false)
@@ -313,8 +336,11 @@ func redactPEM(s string, open bool) (string, int) {
 		if kind != pemBase64 && kind != pemHeader && kind != pemBlank {
 			atStart = false
 		}
-		// The PGP checksum line ("=Ab12") is short too, and it can follow the body.
-		short = !open && kind == pemBase64 && len(pemBodyLine(t)) < pemFullMin && pemBodyLine(t)[0] != '='
+		// The PGP checksum line ("=Ab12") is short too, and it can follow the body. A short line stays
+		// pending across blank lines: it is the last body line if the checksum or END line comes next.
+		if kind != pemBlank {
+			short = !open && kind == pemBase64 && len(pemBodyLine(t)) < pemFullMin && !pemChecksum(kind, t)
+		}
 
 		if kind != pemBlank || prev != pemNote {
 			prev = kind
