@@ -533,6 +533,25 @@ agent-jobs version                      # или --version
 - [docs/PLAN.ru.md](docs/PLAN.ru.md): план
 - [CHANGELOG.md](CHANGELOG.md)
 
+## Чеклист релиза
+
+Перед тегом установка и тестовая джоба повторяются из свежего клона релизного коммита:
+
+```bash
+scripts/acceptance-clean-clone.sh [REF]          # по умолчанию HEAD этой копии, клон из origin
+scripts/acceptance-clean-clone.sh --from . REF    # клон этой копии (коммиты, которых ещё нет в origin)
+scripts/acceptance-clean-clone.sh --real-model sonnet   # тестовая джоба на настоящей модели (1 ход, 0.2 USD)
+```
+
+1. Клонирует репозиторий в свежую временную папку и переключается на REF; собирает там бинарник так же, как `install-linux.sh`.
+2. Запускает в клоне `scripts/check.sh` (gofmt, go vet, `go test -count=1 ./...`); `--no-tests` пропускает этот шаг.
+3. Ставит так, как поставил бы новый пользователь: `scripts/install-linux.sh --instance accept-<random>`, HOME, `AGENT_JOBS_HOME` и `systemctl` указывают во временную папку (на macOS: `agent-jobs init`), `config.json` выключает `cgroup_scope` и включает HTTP API только для чтения.
+4. Запускает `agent-jobs daemon` этого агента на переднем плане (без systemd; останавливается при выходе); `status`, `doctor procs`, `list` и `GET /v1/health` должны пройти.
+5. Запускает одну джобу в черновом git-репозитории и ждёт её: по умолчанию вместо `claude` работает заглушка (`AGENT_JOBS_CLAUDE_BIN`, без модели и без затрат); статус должен быть `succeeded`, `report.md` должен существовать, а `agent-jobs result` — показывать отчёт.
+6. Печатает PASS / FAIL с кодом выхода по каждому шагу. При успехе временная папка удаляется (`--keep` оставляет её); при провале остаётся, и печатается её путь.
+
+Копия вызывающего, его папка состояния, демон, юниты, tmux и конфиг не затрагиваются; общий только кэш сборки Go. С `--real-model` джоба оставляет настоящий HOME, чтобы `claude` нашёл свой логин. Внутри джобы бинарник отказывает в управляющих командах, поэтому скрипт там не запускается без `--inside-job`, который собирает с тестовыми хуками и релизной приёмкой не считается. `AGENT_JOBS_TEST_ACCEPTANCE=1 go test -run TestAcceptanceScriptRun .` запускает его (без набора тестов) как Go-тест.
+
 ## Версии
 
 Версии: [SemVer](https://semver.org/lang/ru/); все релизы перечислены в [CHANGELOG.md](CHANGELOG.md). `agent-jobs version` печатает версию сборки; `scripts/install-linux.sh` проставляет её из `git describe --tags --always --dirty`, обычный `go build` даёт `dev`.
