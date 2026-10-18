@@ -68,8 +68,10 @@ type Job struct {
 	LaunchToken string
 	// Complexity is the stated light|normal|hard (picks the model when none was given), empty when only a model was given.
 	Complexity string
-	// Runner is the program that runs the job ("claude"; "codex" arrives with S3-M1).
+	// Runner is the program that runs the job: "claude" (claude -p) or "codex" (codex exec, S3-M1).
 	Runner string
+	// ReasoningEffort is the codex reasoning effort (low|medium|high) of a codex job, empty for claude.
+	ReasoningEffort string
 	// OwnerWaits marks a job the owner asked for (the Stop-hook that enforces it is S3-M5).
 	OwnerWaits bool
 	// ResumedFrom is the id of the job this one continues (S2-M5), empty otherwise.
@@ -125,6 +127,7 @@ type Attempt struct {
 // Runners and billing modes.
 const (
 	RunnerClaude        = "claude"
+	RunnerCodex         = "codex"
 	BillingSubscription = "subscription"
 )
 
@@ -289,6 +292,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN session_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 }
 
 // ReserveSubagent counts one more subagent for running job id unless max are already used. It
@@ -370,7 +374,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context, cost_unknown, session_digest, scope_unit, scope_pending`
+	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -387,13 +391,13 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -410,7 +414,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort)
 	if err != nil {
 		return nil, err
 	}

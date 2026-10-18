@@ -99,6 +99,10 @@ type StartRequest struct {
 	MaxTurns       int    // 0 = default
 	MaxBudgetUSD   float64
 	TimeoutMinutes int
+	// Runner is claude or codex; empty = by model (gpt-* runs on codex, everything else on claude).
+	Runner string
+	// ReasoningEffort is the codex reasoning effort (low|medium|high); empty = config, else high.
+	ReasoningEffort string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -208,9 +212,29 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	model, err := ResolveModel(r.Kind, strings.TrimSpace(r.Model), r.Complexity)
+	model, err := resolveModel(m.Cfg.Models, r.Kind, strings.TrimSpace(r.Model), r.Complexity)
 	if err != nil {
 		return nil, err
+	}
+	runner, err := ResolveRunner(r.Runner, model)
+	if err != nil {
+		return nil, err
+	}
+	effort := strings.TrimSpace(r.ReasoningEffort)
+	if err := ValidateReasoningEffort(effort); err != nil {
+		return nil, err
+	}
+	if runner == store.RunnerCodex {
+		if r.MaxTurns != 0 || r.MaxBudgetUSD != 0 {
+			return nil, errors.New("max_turns and max_budget_usd do not apply to a codex job " +
+				"(codex has no turn or budget caps; the timeout is the limit)")
+		}
+		if err := m.Cfg.checkCodexJob(r.Kind); err != nil {
+			return nil, err
+		}
+		effort = m.Cfg.reasoningEffort(effort)
+	} else if effort != "" {
+		return nil, errors.New("reasoning_effort applies only to a codex job")
 	}
 	var repo, base string
 	if r.RepoPath != "" {
@@ -235,7 +259,7 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
-		Complexity: r.Complexity, Runner: store.RunnerClaude, Billing: store.BillingSubscription,
+		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err
@@ -369,8 +393,10 @@ func claudeBaseArgs(j *store.Job, jobDir string) []string {
 	}
 }
 
-// launchPlan is what one launch runs: claude's arguments and the wrapper's options.
+// launchPlan is what one launch runs: the program (empty = claude), its arguments and the wrapper's
+// options.
 type launchPlan struct {
+	bin     string
 	args    []string
 	wrapper []string // run-wrapper options before "--" (--prompt, --fallback-prompt, --fallback-session)
 }
@@ -383,6 +409,15 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return err
 	}
 	var plan launchPlan
+	if j.Runner == store.RunnerCodex {
+		if j.Attempt > 1 {
+			return errCodexResume
+		}
+		// The config may have changed since the job was queued.
+		if err := m.Cfg.checkCodexJob(j.Kind); err != nil {
+			return err
+		}
+	}
 	if j.Attempt > 1 {
 		p, err := m.prepareResume(j, token)
 		if err != nil {
@@ -400,6 +435,10 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			return err
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
+		if j.Runner == store.RunnerCodex {
+			plan = launchPlan{bin: m.Cfg.codexBin(), args: CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort)),
+				wrapper: []string{"--runner", store.RunnerCodex}}
+		}
 	}
 	if unit != "" || j.ScopeUnit != "" {
 		// Recorded before the spawn: a daemon that dies right after it still stops the scope later. A
@@ -422,7 +461,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	if unit != "" {
 		containment = "scope " + unit
 	}
-	m.Log.Printf("job %s started pid=%d model=%s containment=%s", j.ID, pid, j.Model, containment)
+	m.Log.Printf("job %s started pid=%d runner=%s model=%s containment=%s", j.ID, pid, j.Runner, j.Model, containment)
 	return nil
 }
 
@@ -432,7 +471,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
 	dir := m.JobDir(j.ID)
 	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
-	argv = append(append(argv, "--", m.Cfg.claudeBin()), plan.args...)
+	bin := plan.bin
+	if bin == "" {
+		bin = m.Cfg.claudeBin()
+	}
+	argv = append(append(argv, "--", bin), plan.args...)
 	if unit != "" {
 		argv = append(scopeArgv(unit, fmt.Sprintf("agent-jobs job %s (agent %s)", j.ID, m.Agent), m.KillGrace), argv...)
 	}
@@ -631,26 +674,26 @@ func (m *Manager) collect() error {
 		}
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
+			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 			status, msg := Verdict(code, res, dir)
 			m.finish(j, status, res, false, dur, msg, now)
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
 			m.killJob(j, j.PID, j.PGID)
-			res, killed := killedResult(dir)
+			res, killed := killedResult(j.Runner, dir)
 			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
 			if code, ok := readExitCode(dir); ok {
-				res := parseStream(filepath.Join(dir, "stream.jsonl"))
+				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 				status, msg := Verdict(code, res, dir)
 				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}
-			res, killed := killedResult(dir)
+			res, killed := killedResult(j.Runner, dir)
 			m.finish(j, store.StatusFailed, res, killed, dur, "wrapper died without writing exit_code (see stderr.log)", now)
 		}
 	}
@@ -661,10 +704,13 @@ func (m *Manager) collect() error {
 // Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
 // stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
 // the assistant turns are counted and the cost is unknown (killed is true).
-func killedResult(dir string) (res StreamResult, killed bool) {
+func killedResult(runner, dir string) (res StreamResult, killed bool) {
 	p := filepath.Join(dir, "stream.jsonl")
 	if _, ok := readExitCode(dir); ok {
-		return parseStream(p), false
+		return parseRunnerStream(runner, p), false
+	}
+	if runner == store.RunnerCodex {
+		return StreamResult{Runner: runner, Turns: ParseCodexStream(p).Turns}, true
 	}
 	return StreamResult{Turns: streamTurns(p)}, true
 }
@@ -712,7 +758,9 @@ func (m *Manager) noteSweep(id, note string) {
 // resumed). Call it after the sweep: nothing of the job may change the transcript after the digest.
 func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) {
 	dir := m.JobDir(j.ID)
-	if fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl")); killed || (!res.Found && err == nil && fi.Size() > 0) {
+	// Codex reports no price: a codex attempt's cost is always unknown.
+	fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl"))
+	if killed || j.Runner == store.RunnerCodex || (!res.Found && err == nil && fi.Size() > 0) {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
 		}
@@ -790,10 +838,10 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 		return store.StatusSucceeded, reason
 	}
 	if code != 0 {
-		return store.StatusFailed, fmt.Sprintf("claude exited with code %d", code)
+		return store.StatusFailed, fmt.Sprintf("%s exited with code %d", res.program(), code)
 	}
 	if res.IsError {
-		return store.StatusFailed, "claude result is an error: " + res.Subtype
+		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	if !hasReport(dir) {
 		return store.StatusFailed, "exit 0 without a report"
@@ -853,7 +901,7 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
-	res, killed := killedResult(m.JobDir(id))
+	res, killed := killedResult(j.Runner, m.JobDir(id))
 	msg := "cancelled"
 	if err := m.endScope(j); err != nil {
 		m.Log.Printf("job %s: %v", id, err)

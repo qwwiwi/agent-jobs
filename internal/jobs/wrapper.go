@@ -16,7 +16,8 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// StreamResult is the final `result` event of claude's stream-json output.
+// StreamResult is the final `result` event of claude's stream-json output (or, for a codex job, what
+// ParseCodexStream reads from codex's JSON events).
 type StreamResult struct {
 	Found   bool
 	Subtype string
@@ -24,6 +25,26 @@ type StreamResult struct {
 	Turns   int
 	CostUSD float64
 	Text    string
+	// Runner is the program that wrote the stream; empty = claude.
+	Runner string
+	// Token usage (codex streams only).
+	InputTokens, CachedInputTokens, OutputTokens int64
+}
+
+// program names the runner of a stream result in messages.
+func (r StreamResult) program() string {
+	if r.Runner == "" {
+		return store.RunnerClaude
+	}
+	return r.Runner
+}
+
+// parseRunnerStream parses a job's stream.jsonl with the parser of its runner.
+func parseRunnerStream(runner, path string) StreamResult {
+	if runner == store.RunnerCodex {
+		return ParseCodexStream(path)
+	}
+	return parseStream(path)
 }
 
 type resultEvent struct {
@@ -214,7 +235,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		return 2
 	}
 	defer stderrLog.Close()
-	idle := idleGrace(jobDir, stderrLog)
+	// The idle-after-result rule reads claude's result events; a codex job ends by itself or by the timeout.
+	idle := time.Duration(0)
+	if opts.Runner != store.RunnerCodex {
+		idle = idleGrace(jobDir, stderrLog)
+	}
 	code, idleClosed := runClaude(jobDir, opts.prompt(), argv, idle, stderrLog)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !streamProgressed(filepath.Join(jobDir, "stream.jsonl")) {
 		code, idleClosed = runFallback(jobDir, argv, opts, idle, stderrLog, code)
@@ -235,8 +260,9 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			return 2 // no exit_code: the daemon fails the job as a dead wrapper
 		}
 	}
-	res := ParseStream(filepath.Join(jobDir, "stream.jsonl"))
-	if idleClosed {
+	if opts.Runner == store.RunnerCodex {
+		writeCodexReport(jobDir, stderrLog)
+	} else if res := ParseStream(filepath.Join(jobDir, "stream.jsonl")); idleClosed {
 		code = finishIdleClosed(jobDir, res, stderrLog)
 	} else if text := res.Text; text != "" || !hasReport(jobDir) {
 		if text == "" && res.Found && !res.IsError && res.Subtype == "success" {
@@ -262,6 +288,7 @@ type WrapperOptions struct {
 	Prompt          string // stdin file name in the job dir; empty = prompt.md
 	FallbackPrompt  string // stdin file name for the fresh-session fallback; empty = no fallback
 	FallbackSession string // the fallback's session id
+	Runner          string // the program argv runs: claude (default) or codex
 }
 
 func (o WrapperOptions) prompt() string {
@@ -279,6 +306,15 @@ func (o WrapperOptions) validate() error {
 	}
 	if (o.FallbackPrompt == "") != (o.FallbackSession == "") {
 		return errors.New("--fallback-prompt and --fallback-session go together")
+	}
+	switch o.Runner {
+	case "", store.RunnerClaude:
+	case store.RunnerCodex:
+		if o.FallbackPrompt != "" {
+			return errors.New("a codex job has no resume fallback")
+		}
+	default:
+		return fmt.Errorf("runner %q must be claude or codex", o.Runner)
 	}
 	if o.FallbackSession != "" && !ValidSessionID(o.FallbackSession) {
 		return fmt.Errorf("fallback session %q is not a session id", o.FallbackSession)

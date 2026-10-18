@@ -57,6 +57,17 @@ type Config struct {
 	GitEmail string `json:"git_email"`
 	// ClaudeBin overrides the claude binary (env AGENT_JOBS_CLAUDE_BIN wins).
 	ClaudeBin string `json:"claude_bin"`
+	// CodexBin overrides the codex binary of codex jobs (env AGENT_JOBS_CODEX_BIN wins).
+	CodexBin string `json:"codex_bin"`
+	// CodexWriteAllowed lets codex jobs of kind fix/general run with the workspace-write sandbox. Off by
+	// default: the guard hook does not run inside codex, so only read-only codex jobs (review, research)
+	// are allowed unless the owner turns this on (DEVIATIONS #5).
+	CodexWriteAllowed bool `json:"codex_write_allowed"`
+	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
+	CodexReasoningEffort string `json:"codex_reasoning_effort"`
+	// Models overrides cells of the kind × complexity model table (DEVIATIONS #6), e.g.
+	// {"review": {"hard": "gpt-6.1-sol"}}. A gpt-* model runs the job on codex. Unset cells keep the defaults.
+	Models map[string]map[string]string `json:"models"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
 	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
@@ -184,6 +195,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
 		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
 	}
+	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
 	if c.LogArchiveDir == "" {
 		c.LogArchiveDir = filepath.Join(stateDir, "archive")
 	}
@@ -250,13 +264,19 @@ var defaultModels = map[string]map[string]string{
 
 // ModelFor returns the model for kind × complexity. The complexity must be stated: there is no
 // default complexity and no classifier (owner 2026-10-17, docs/DECISIONS.md).
-func ModelFor(kind, complexity string) (string, error) {
+func ModelFor(kind, complexity string) (string, error) { return modelFor(nil, kind, complexity) }
+
+// modelFor is ModelFor with the config's overrides (config models) applied first.
+func modelFor(overrides map[string]map[string]string, kind, complexity string) (string, error) {
 	if complexity == "" {
 		return "", errors.New("complexity is required to pick a model (light|normal|hard)")
 	}
 	m, ok := defaultModels[kind][complexity]
 	if !ok {
 		return "", fmt.Errorf("unknown kind/complexity %q/%q (complexity: light|normal|hard)", kind, complexity)
+	}
+	if o := overrides[kind][complexity]; o != "" {
+		return o, nil
 	}
 	return m, nil
 }
@@ -276,12 +296,16 @@ func ValidateModel(model string) error {
 // ResolveModel returns the model for a request: the explicit model if given (a stated complexity
 // must still be valid), else the kind × complexity table. Neither given = rejected, never guessed.
 func ResolveModel(kind, model, complexity string) (string, error) {
+	return resolveModel(nil, kind, model, complexity)
+}
+
+func resolveModel(overrides map[string]map[string]string, kind, model, complexity string) (string, error) {
 	if model == "" && complexity == "" {
 		return "", errors.New("model or complexity is required: state an explicit model or a complexity " +
 			"(light|normal|hard); there is no default and no classifier")
 	}
 	if complexity != "" {
-		m, err := ModelFor(kind, complexity)
+		m, err := modelFor(overrides, kind, complexity)
 		if err != nil {
 			return "", err
 		}

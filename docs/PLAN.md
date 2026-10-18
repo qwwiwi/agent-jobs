@@ -57,7 +57,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 - **Intentions.** *Status: built on branch `feature/intentions` (unreleased); `internal/store/intentions.go`, `internal/jobs/intentions.go`, `internal/mcp/tools_intentions.go`.* `intention_add`, `intention_list`, `intention_set`: the agent's own goals, a table `intentions` in the agent's store (text one line, ≤ 500 characters; optional due date and priority; status `open` / `done` / `dropped`, edited in place, never deleted). Orchestrator only; `agent-jobs intentions [--status] [--json]` lists them.
 - **`notify_owner`.** A message to the owner through the agent's existing channel (DEVIATIONS #4).
 - **Daily automation.** `prune` and `doctor procs` run once a day on their own.
-- **Codex runner.** A job can run on `codex exec` instead of `claude -p` (DEVIATIONS #5); without turn or budget caps there, so the timeout is the limit.
+- **Codex runner.** *Status: built on branch `feature/codex-runner` (unreleased); `internal/jobs/codex.go`.* A job can run on `codex exec` instead of `claude -p` (DEVIATIONS #5); without turn or budget caps there, so the timeout is the limit. Selected by a `gpt-*` model or `runner: codex`; read-only sandbox for review/research; write jobs refused unless `codex_write_allowed`; no guard inside codex (known limit); resume refused for now.
 
 ## Wave C
 

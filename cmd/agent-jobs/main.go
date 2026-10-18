@@ -33,6 +33,9 @@ const usage = `usage: agent-jobs <command> [flags]
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
+             [--runner claude|codex] [--reasoning-effort low|medium|high]
+                                           a gpt-* model runs on codex exec (read-only kinds
+                                           review/research unless codex_write_allowed)
   status     --agent A <id>
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
@@ -67,7 +70,7 @@ const usage = `usage: agent-jobs <command> [flags]
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] -- <claude> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -182,7 +185,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] -- <claude> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -197,6 +200,8 @@ func runWrapper(args []string) int {
 			opts.FallbackPrompt = rest[1]
 		case "--fallback-session":
 			opts.FallbackSession = rest[1]
+		case "--runner":
+			opts.Runner = rest[1]
 		default:
 			fmt.Fprintln(os.Stderr, u)
 			return 2
@@ -363,6 +368,8 @@ func cmdStart(args []string) error {
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
+	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
+	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}

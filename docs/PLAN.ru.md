@@ -57,7 +57,7 @@ Agent Jobs реализует [эталонный дизайн](REFERENCE.ru.md)
 - **Собственные цели.** *Статус: сделано в ветке `feature/intentions` (не выпущено); `internal/store/intentions.go`, `internal/jobs/intentions.go`, `internal/mcp/tools_intentions.go`.* `intention_add`, `intention_list`, `intention_set`: собственные цели агента, таблица `intentions` в хранилище агента (текст в одну строку, не длиннее 500 символов; необязательные срок и приоритет; статус `open` / `done` / `dropped`, правится на месте, не удаляется). Только оркестратор; `agent-jobs intentions [--status] [--json]` показывает список.
 - **`notify_owner`.** Сообщение владельцу через уже существующий канал агента (DEVIATIONS #4).
 - **Ежедневная автоматика.** `prune` и `doctor procs` раз в сутки сами.
-- **Раннер Codex.** Джоба может идти на `codex exec` вместо `claude -p` (DEVIATIONS #5); там нет потолков на ходы и бюджет, поэтому ограничитель — таймаут.
+- **Раннер Codex.** *Статус: сделано в ветке `feature/codex-runner` (не выпущено); `internal/jobs/codex.go`.* Джоба может идти на `codex exec` вместо `claude -p` (DEVIATIONS #5); там нет потолков на ходы и бюджет, поэтому ограничитель — таймаут. Выбирается моделью `gpt-*` или `runner: codex`; песочница read-only для review/research; пишущие джобы отклоняются без `codex_write_allowed`; guard внутри codex не работает (известное ограничение); resume пока отклоняется.
 
 ## Волна C
 
