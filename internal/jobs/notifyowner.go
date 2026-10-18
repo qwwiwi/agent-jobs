@@ -39,7 +39,8 @@ var NotifyLimits = store.NotifyLimits{PerJob: 3, JobInterval: time.Minute, PerAg
 const UndeliveredWindow = 24 * time.Hour
 
 // notifyText validates a notification's text: required, valid UTF-8, one line (no control or
-// format character, bidi overrides included), then Printable capped to MaxNotifyRunes and defanged
+// format character, bidi overrides included), then redacted and Printable capped to MaxNotifyRunes
+// (RedactPrintable) and defanged
 // so it cannot pass for another tag (defangTags).
 func notifyText(s string) (string, error) {
 	if !utf8.ValidString(s) {
@@ -48,7 +49,7 @@ func notifyText(s string) (string, error) {
 	if containsControl(s) {
 		return "", errors.New("text contains a control or format character (newline, tab, escape, bidi, …); a notification is one line")
 	}
-	t := defangTags(Printable(s, MaxNotifyRunes))
+	t := defangTags(RedactPrintable(s, MaxNotifyRunes))
 	if t == "" {
 		return "", errors.New("text is required")
 	}

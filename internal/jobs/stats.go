@@ -378,6 +378,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if n, err := m.Store.SubagentCount(j.ID); err == nil && n > st.Subagents {
 		st.Subagents = n
 	}
+	redactStats(st)
 	if err := m.Store.PutStats(st); err != nil {
 		return nil, err
 	}
