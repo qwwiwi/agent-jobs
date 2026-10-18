@@ -358,6 +358,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `log_archive_dir`: absolute path of the log archive (default `<state>/archive`); `log_archive_days`: how long archived months are kept (default 365, 0 = forever).
 - `brain`: the shared brain behind the memory, task and team tools and the memory notes of a brief (see «Shared brain» below). Absent = not configured.
 - `cgroup_scope`: `auto` (default: a transient systemd user scope per job when `systemd-run --user` works, else the weaker session containment), `required` (refuse jobs that cannot get a scope), `off`.
+- `http_api`: the read-only HTTP API, `{"enabled": false, "listen": "127.0.0.1:7781"}` by default (see «Read-only HTTP API» below).
 - Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Shared brain**
@@ -387,6 +388,25 @@ The memory, task and team tools and the memory notes of a brief talk to the team
 
 **Memory notes in the brief.** When a job is prepared, the daemon asks `recall` for up to six notes closest to the job's title and brief (the first 4000 bytes) and adds a «Memory notes» section after the project cards: path, scope, score and the snippet quoted line by line (a note cannot open a section of its own), marked as data written by others. The lookup has 5 seconds; on an error or a timeout the job starts anyway and the section says «Shared memory was unreachable when this job was prepared (reason)». No brain configured = no section. Notes written by jobs are left out and only counted («N close notes written by jobs were left out: they are unreviewed»): the daemon knows them by the paths it recorded when it wrote them for a job, or by the job's first line in the snippet. A job's note reaches a brief only after someone writes it again as the agent's own. After one lookup goes unanswered, lookups are skipped for a minute, so a hanging brain delays one launch, not every launch of a tick.
 
+**Read-only HTTP API (off by default)**
+
+For a jobs dashboard (DEVIATIONS #8) the daemon can serve a small JSON API. It is off unless the config turns it on, listens only on a loopback address (`127.0.0.0/8`, `[::1]`) or a unix socket path (any other address is refused at config load), and every request needs the agent's bearer token:
+
+```json
+{ "http_api": { "enabled": true, "listen": "127.0.0.1:7781" } }
+```
+
+```bash
+agent-jobs http-api token --agent my-agent --rotate   # writes <state>/http-api.token (mode 600), prints it once
+systemctl --user restart agent-jobs@my-agent           # the daemon starts the API
+curl -s -H "Authorization: Bearer $(cat ~/.agent-jobs/my-agent/http-api.token)" http://127.0.0.1:7781/v1/health
+```
+
+- `GET /v1/health`: version, start time, uptime, running and queued counts. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill`: the `job_stats` summary. `GET /v1/schedules`: schedules with their next firing.
+- Every endpoint needs the token, health included (401 without it or with a wrong one; constant-time compare; the file is read per request, so a rotation takes effect at once, and a token file readable by group or others fails closed). Any method but GET is 405; no endpoint changes state. No CORS headers.
+- Never returned: briefs, schedule prompts, session ids, env, config, the job dir or the repository path (only the repository's folder name; a job error has the repository path and the home directory masked). Only this agent's jobs.
+- Server limits: header read 5 s, read 10 s, write 30 s, idle 60 s, headers at most 8 KB, 10 requests per second per client (429 above).
+
 **Run the daemon on Linux (systemd user service)**
 
 ```bash
@@ -414,7 +434,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-jobs.$AGENT.pl
 agent-jobs start --agent my-agent --title "review auth" --kind review \
   --repo ~/src/project --base main --complexity normal \
   --brief-file brief.md                 # prints the job id at once
-agent-jobs list   --agent my-agent
+agent-jobs list   --agent my-agent [--status running] [--json]
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
@@ -426,6 +446,7 @@ agent-jobs archive --agent my-agent --dry-run        # what prune would move int
 agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs intentions --agent my-agent --status open  # the agent's own goals (--json)
+agent-jobs http-api token --agent my-agent --rotate   # token of the read-only HTTP API, printed once
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```

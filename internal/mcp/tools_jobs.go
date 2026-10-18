@@ -230,6 +230,10 @@ func readCapped(path string, max int) (string, bool, error) {
 	return string(b), false, nil
 }
 
+// ReadCapped is readCapped for the HTTP API: at most max bytes of a job file, never through a symlink,
+// a FIFO or any other non-regular file.
+func ReadCapped(path string, max int) (string, bool, error) { return readCapped(path, max) }
+
 func addJobResult(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_result",

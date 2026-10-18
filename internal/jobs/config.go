@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
@@ -96,6 +99,45 @@ type Config struct {
 	DailyHour *int `json:"daily_hour"`
 	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
 	DailyOff bool `json:"daily_off"`
+	// HTTPAPI is the read-only HTTP API for a jobs dashboard (DEVIATIONS #8), served by the daemon.
+	// Off by default; the listen address must be loopback or a unix socket path.
+	HTTPAPI HTTPAPIConfig `json:"http_api"`
+}
+
+// HTTPAPIConfig is the http_api section of config.json.
+type HTTPAPIConfig struct {
+	// Enabled starts the API inside the daemon. Default false.
+	Enabled bool `json:"enabled"`
+	// Listen is a loopback "ip:port" (127.0.0.0/8 or [::1]) or an absolute unix socket path.
+	// Empty = DefaultHTTPAPIListen.
+	Listen string `json:"listen"`
+}
+
+// DefaultHTTPAPIListen is the listen address of the HTTP API when http_api.listen is not set.
+const DefaultHTTPAPIListen = "127.0.0.1:7781"
+
+// ValidateHTTPListen accepts a loopback "ip:port" (an IP literal in 127.0.0.0/8 or ::1, port 0..65535)
+// or an absolute unix socket path; anything else (a wildcard, a LAN address, a host name) is refused.
+func ValidateHTTPListen(listen string) error {
+	if strings.HasPrefix(listen, "/") {
+		if filepath.Clean(listen) != listen || strings.ContainsRune(listen, 0) {
+			return fmt.Errorf("http_api.listen %q: a unix socket path must be absolute and clean", listen)
+		}
+		return nil
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("http_api.listen %q: want a loopback ip:port or an absolute unix socket path: %v", listen, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("http_api.listen %q: port %q is not 0..65535", listen, port)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("http_api.listen %q: the host must be a loopback IP (127.0.0.0/8 or ::1), not %q; "+
+			"the API is local only", listen, host)
+	}
+	return nil
 }
 
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
@@ -215,6 +257,12 @@ func LoadConfig(stateDir string) (Config, error) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if c.HTTPAPI.Listen == "" {
+		c.HTTPAPI.Listen = DefaultHTTPAPIListen
+	}
+	if err := ValidateHTTPListen(c.HTTPAPI.Listen); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if c.LogArchiveDir == "" {

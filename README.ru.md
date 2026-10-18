@@ -358,6 +358,7 @@ agent-jobs card list --agent my-agent --repo ~/src/project                  # к
 - `log_archive_dir`: абсолютный путь архива логов (по умолчанию `<state>/archive`); `log_archive_days`: сколько хранить архивные месяцы (по умолчанию 365, 0 — навсегда).
 - `brain`: общий мозг для тулов памяти, задач и команды и для заметок памяти в брифе (см. «Общий мозг» ниже). Нет блока — не настроен.
 - `cgroup_scope`: `auto` (по умолчанию: свой временный пользовательский scope systemd на каждую джобу, когда работает `systemd-run --user`, иначе более слабая изоляция по сессии), `required` (джобы, которым не досталось scope, не запускаются), `off`.
+- `http_api`: HTTP API только на чтение, по умолчанию `{"enabled": false, "listen": "127.0.0.1:7781"}` (см. «HTTP API только на чтение» ниже).
 - Ещё: `owner_rules_path`, `cards_dir` (по умолчанию `<state>/cards`), `claude_bin`, `tmux_bin`; переменные окружения `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`.
 
 **Общий мозг**
@@ -387,6 +388,25 @@ agent-jobs card list --agent my-agent --repo ~/src/project                  # к
 
 **Заметки памяти в брифе.** Когда джоба готовится, демон просит у `recall` до шести заметок, ближайших к заголовку и брифу джобы (первые 4000 байт), и добавляет раздел «Memory notes» после карточек проекта: путь, scope, оценка и фрагмент, процитированный построчно (заметка не может открыть свой раздел), с пометкой, что это данные, написанные другими. На поиск 5 секунд; при ошибке или таймауте джоба всё равно стартует, а раздел говорит «Shared memory was unreachable when this job was prepared (причина)». Мозг не настроен — раздела нет. Заметки, написанные джобами, не цитируются, только считаются («N close notes written by jobs were left out: they are unreviewed»): демон узнаёт их по путям, которые запомнил, когда писал их за джобу, или по первой строке джобы во фрагменте. Заметка джобы попадает в бриф только после того, как кто-то перепишет её как заметку самого агента. Если поиск не ответил, следующие поиски минуту пропускаются: зависший мозг задерживает один запуск, а не все запуски тика.
 
+**HTTP API только на чтение (по умолчанию выключен)**
+
+Для панели джоб (DEVIATIONS #8) демон может отдавать небольшой JSON API. Он выключен, пока конфиг его не включит, слушает только loopback-адрес (`127.0.0.0/8`, `[::1]`) или путь unix-сокета (любой другой адрес отклоняется при загрузке конфига), и каждый запрос требует bearer-токен агента:
+
+```json
+{ "http_api": { "enabled": true, "listen": "127.0.0.1:7781" } }
+```
+
+```bash
+agent-jobs http-api token --agent my-agent --rotate   # пишет <state>/http-api.token (права 600), печатает один раз
+systemctl --user restart agent-jobs@my-agent           # демон поднимает API
+curl -s -H "Authorization: Bearer $(cat ~/.agent-jobs/my-agent/http-api.token)" http://127.0.0.1:7781/v1/health
+```
+
+- `GET /v1/health`: версия, время старта, аптайм, число running и queued. `GET /v1/jobs?status=S&limit=N`: джобы, новые сверху (по умолчанию 20, максимум 200; тот же вид, что `agent-jobs list --json`). `GET /v1/jobs/{id}`: одна джоба; `?report=1` добавляет `report.md`, не больше 64 КБ (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill`: сводка `job_stats`. `GET /v1/schedules`: расписания со следующим срабатыванием.
+- Токен нужен на всех эндпоинтах, включая health (401 без него или с неверным; сравнение за постоянное время; файл читается на каждый запрос, так что ротация действует сразу, а файл токена, доступный группе или другим, закрывает доступ). Любой метод, кроме GET, получает 405; ни один эндпоинт не меняет состояние. Заголовков CORS нет.
+- Никогда не отдаются: брифы, промпты расписаний, id сессий, окружение, конфиг, папка джобы и путь репозитория (только имя папки репозитория; в ошибке джобы путь репозитория и домашняя папка замаскированы). Только джобы этого агента.
+- Ограничения сервера: чтение заголовков 5 с, чтение 10 с, запись 30 с, простой 60 с, заголовки до 8 КБ, 10 запросов в секунду на клиента (дальше 429).
+
 **Демон на Linux (пользовательская служба systemd)**
 
 ```bash
@@ -414,7 +434,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-jobs.$AGENT.pl
 agent-jobs start --agent my-agent --title "review auth" --kind review \
   --repo ~/src/project --base main --complexity normal \
   --brief-file brief.md                 # сразу печатает id джобы
-agent-jobs list   --agent my-agent
+agent-jobs list   --agent my-agent [--status running] [--json]
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # строка job-done + report.md
 agent-jobs cancel --agent my-agent <id>
@@ -426,6 +446,7 @@ agent-jobs archive --agent my-agent --dry-run        # что prune перене
 agent-jobs stats  --agent my-agent --since 30d --by skill   # сводка статистики джоб (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # призрачные процессы; без --kill только отчёт
 agent-jobs intentions --agent my-agent --status open  # собственные цели агента (--json)
+agent-jobs http-api token --agent my-agent --rotate   # токен HTTP API только на чтение, печатается один раз
 agent-jobs version                      # или --version
 ```
 
