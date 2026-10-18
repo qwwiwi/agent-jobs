@@ -31,12 +31,13 @@ type redactRule struct {
 // pemMarkerRe is a header or footer line of a PEM private key block (PKCS#1/#8, EC, OPENSSH,
 // ENCRYPTED, ...) or of an armored PGP private key block: the whole line (indentation and a CR
 // trimmed), so a marker quoted inside prose is none. Allowed around it is only what a file or a
-// listing puts there: a diff or quote prefix ("+", "-", ">", "#", "|"), an assignment ("KEY=",
+// listing puts there: diff, quote or comment prefixes ("+", "-", ">", "#", "|", nested as in
+// "> > "), an assignment ("KEY=",
 // "key: "), quotes, an escaped line break, a trailing comma. pemInlineRe is a whole block on one line
 // (a key with escaped line breaks, as in JSON); pemEscapedRe a BEGIN marker followed by an escaped
 // line break, the rest of the line (such a line cut off before its END).
 var (
-	pemMarkerRe = regexp.MustCompile(`^(?:[-+>#|*]+[ \t]*)?(?:[A-Za-z_][A-Za-z0-9_.-]{0,40}[ \t]*[:=][ \t]*)?["'` + "`" + `]?` +
+	pemMarkerRe = regexp.MustCompile(`^(?:[-+>#|*][ \t]*)*(?:[A-Za-z_][A-Za-z0-9_.-]{0,40}[ \t]*[:=][ \t]*)?["'` + "`" + `]?` +
 		`(-----(BEGIN|END) [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----)(?:\\r)?(?:\\n)?["'` + "`" + `]?[,;]?$`)
 	pemInlineRe  = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[^\n]*?-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`)
 	pemEscapedRe = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----(?:\\r)?\\n[^\n]*`)
@@ -184,17 +185,18 @@ func pemLine(line string) (pemLineKind, string) {
 	return pemOther, t
 }
 
-// pemStripPrefix is t without the diff, quote or comment prefix a marker line may carry (a run of
-// "-+>#|*" and the blanks after it), so marker, header and body lines are read alike.
+// pemStripPrefix is t without the diff, quote or comment prefix a marker line may carry (runs of
+// "-+>#|*", each with the blanks after it, nested as in "> > " or "+ > "), so marker, header and
+// body lines are read alike.
 func pemStripPrefix(t string) string {
 	i := 0
 	for i < len(t) && strings.IndexByte("-+>#|*", t[i]) >= 0 {
 		i++
+		for i < len(t) && (t[i] == ' ' || t[i] == '\t') {
+			i++
+		}
 	}
-	if i == 0 {
-		return t
-	}
-	return strings.TrimLeft(t[i:], " \t")
+	return t[i:]
 }
 
 // pemBodyLine is t without a diff, quote or comment prefix (pemStripPrefix), a leading quote and a

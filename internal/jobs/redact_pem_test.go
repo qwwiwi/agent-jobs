@@ -467,3 +467,89 @@ func TestRedactPEMDecoratedOrphan(t *testing.T) {
 		}
 	}
 }
+
+// A key block (whole, or with its BEGIN line gone) whose every line carries nested diff, quote or
+// comment prefixes separated by blanks ("> > ", "+ > "), as a quoted reply to a quote or a diff of
+// a quoted text holds it: the markers, header, blank and body lines are read through all of them.
+func TestRedactPEMNestedPrefixes(t *testing.T) {
+	keys := map[string]testPEM{
+		"rsa":     newTestPEM("RSA PRIVATE KEY"),
+		"openssh": newTestPEM("OPENSSH PRIVATE KEY"),
+		"rsa enc": newTestPEM("RSA PRIVATE KEY", "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0011AABB", ""),
+		"pgp":     newTestPEM("PGP PRIVATE KEY BLOCK", "Version: GnuPG v2", ""),
+	}
+	for kname, p := range keys {
+		lines := strings.Split(p.text, "\n")
+		end := len(lines) - 1
+		if strings.Contains(lines[0], "PGP") {
+			// The armor checksum line right above the END line.
+			lines = append(lines[:end:end], "=Ab12", lines[end])
+			end++
+		}
+		for _, prefix := range []string{"> > ", ">\t> ", "> # ", "+ > ", "| > ", "> > > ", "# > ", "- > ", ">  >\t"} {
+			deco := func(ls []string) string {
+				out := make([]string, len(ls))
+				for i, l := range ls {
+					out[i] = prefix + l
+				}
+				return strings.Join(out, "\n")
+			}
+			layouts := map[string]struct {
+				text  string
+				atEOF bool // nothing may follow it: the run ends at the text's end
+			}{
+				"whole":           {deco(lines), false},
+				"orphan":          {deco(lines[1:]), false},
+				"orphan no END":   {deco(lines[1:end]), true},
+				"no BEGIN or END": {deco(lines[1:end]) + "\n", true},
+			}
+			for lname, l := range layouts {
+				for bname, before := range map[string]string{
+					"prose":    "prose line\n",
+					"cut note": "[... 4096 earlier bytes cut]\n",
+					"none":     "",
+				} {
+					if l.atEOF && bname == "prose" {
+						// A markerless run after prose and before the end is not told from text
+						// unless it touches the start, the end or a cut note: "none" and "cut
+						// note" cover it.
+						continue
+					}
+					for _, crlf := range []bool{false, true} {
+						in := before + l.text
+						if !l.atEOF {
+							in += "\nafter\n"
+						}
+						if crlf {
+							in = strings.ReplaceAll(in, "\n", "\r\n")
+						}
+						out := RedactText(in)
+						want := before
+						if crlf {
+							want = strings.ReplaceAll(before, "\n", "\r\n")
+						}
+						if p.leaks(out) || !strings.HasPrefix(out, want) || !strings.Contains(out, "[redacted:private-key]") ||
+							(!l.atEOF && !strings.Contains(out, "after")) {
+							t.Errorf("%s %s prefix %q after %s crlf=%v: %q", kname, lname, prefix, bname, crlf, out)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Nested prefixes do not make a line of prose a key body line: "> > ok" and "> # note" are text,
+// and a short base64 word under them stays.
+func TestRedactPEMNestedPrefixProseKept(t *testing.T) {
+	for _, in := range []string{
+		"> > ok\n> > fine\n",
+		"> # note: see the -----BEGIN RSA PRIVATE KEY----- marker in docs\n",
+		"+ > hello world\n",
+		"| > abc\n| > def\n",
+	} {
+		if out := RedactText(in); out != in {
+			t.Errorf("%q -> %q", in, out)
+		}
+	}
+}
