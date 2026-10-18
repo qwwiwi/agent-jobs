@@ -59,7 +59,7 @@ func Link(work string, entries []Entry, maxKB float64) (Delivery, error) {
 		if fi, err := os.Lstat(filepath.Join(dir, SkillFile)); err != nil || !fi.Mode().IsRegular() {
 			return d, fmt.Errorf("skill %q: no regular %s", e.Name, SkillFile)
 		}
-		size, err := Measure(dir, e.Root)
+		size, err := Measure(dir)
 		if err != nil {
 			return d, fmt.Errorf("skill %q: %w", e.Name, err)
 		}

@@ -213,7 +213,7 @@ func within(p, dir string) bool {
 
 // validate turns an index entry into an Entry: a valid name and status, a relative path that stays
 // inside the root after symlink resolution, a directory named like the skill holding a regular
-// SKILL.md, and a tree whose symlinks (if any) stay inside the root.
+// SKILL.md, and a tree whose symlinks (if any) name regular files inside the skill directory.
 func validate(root string, r rawEntry) (Entry, error) {
 	if !ValidName(r.Name) {
 		return Entry{}, errors.New("name must be [A-Za-z0-9._-], at most 64, no ..")
@@ -240,7 +240,7 @@ func validate(root string, r rawEntry) (Entry, error) {
 	if fi, err := os.Lstat(filepath.Join(dir, SkillFile)); err != nil || !fi.Mode().IsRegular() {
 		return Entry{}, fmt.Errorf("no regular %s in %q", SkillFile, r.Path)
 	}
-	size, err := Measure(dir, root)
+	size, err := Measure(dir)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -274,10 +274,12 @@ func lower(in []string) []string {
 	return out
 }
 
-// Measure returns the size in KB of the regular files under dir (symlinks not followed). A symlink in
-// the tree whose target leaves root is an error: a job reads the skill through a link, so the tree
-// must not reach outside its catalog.
-func Measure(dir, root string) (float64, error) {
+// Measure returns the size in KB of the files under dir (resolved). A job reads the skill through a
+// link and may follow every symlink in it, so a symlink must name a regular file inside dir itself:
+// one to a directory (which could lead anywhere, also through further links), outside dir (another
+// skill, the rest of the catalog or beyond), dangling or looping is an error. The target of a file
+// symlink counts towards the size like a regular file.
+func Measure(dir string) (float64, error) {
 	var total int64
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -292,9 +294,14 @@ func Measure(dir, root string) (float64, error) {
 			total += fi.Size()
 		case t&fs.ModeSymlink != 0:
 			target, err := filepath.EvalSymlinks(p)
-			if err != nil || !within(target, root) {
-				return fmt.Errorf("symlink %s leaves the root", filepath.Base(p))
+			if err != nil || !within(target, dir) {
+				return fmt.Errorf("symlink %s leaves the skill directory (or does not resolve)", filepath.Base(p))
 			}
+			fi, err := os.Stat(target)
+			if err != nil || !fi.Mode().IsRegular() {
+				return fmt.Errorf("symlink %s does not point to a regular file", filepath.Base(p))
+			}
+			total += fi.Size()
 		case t.IsDir():
 		default:
 			return fmt.Errorf("%s is not a regular file or directory", filepath.Base(p))
