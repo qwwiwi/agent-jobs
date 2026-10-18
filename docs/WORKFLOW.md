@@ -44,7 +44,7 @@ A typical change goes through these steps. Each step says who does it.
 | 2 | Plan and plan review | Orchestrator writes the plan; a `review` job reviews it | For non-trivial work |
 | 3 | Owner approval | Owner | The plan, not every step of it |
 | 4 | Coding | `fix` or `general` job | Commits locally in its worktree |
-| 5 | Deterministic checks and a short audit | Orchestrator | `git diff --stat <base_commit>` (after cleanup: `diffstat.txt`), the repository's own checks (here `scripts/check.sh`), `doctor procs` (**planned**, PLAN Wave A); then a short read of the diff |
+| 5 | Deterministic checks and a short audit | Orchestrator | `git diff --stat <base_commit>` (after cleanup: `diffstat.txt`), the repository's own checks (here `scripts/check.sh`), `agent-jobs doctor procs` (the daemon also runs it once a day, report only); then a short read of the diff |
 | 6 | Review | One or two `review` jobs | On a different model than the coder |
 | 7 | Fix loops | `fix` jobs, at most two | Each fed with the review findings; after two, stop and rethink |
 | 8 | Push, PR, merge | Orchestrator | Bound to the reviewed head SHA: what was reviewed is what ships |
@@ -85,7 +85,6 @@ The worktree is removed 30 minutes after the job-done line. Reading later is fin
 - **The guard is a hook, not a sandbox.** It blocks the direct spellings of outward actions. A script a job writes and then runs is not inspected.
 - **Jobs run as the same unix user** as the orchestrator, with that user's credentials. Run agents as a user whose credentials you are comfortable a job having.
 - **Testing agent-jobs inside a job.** Tests of agent-jobs itself that spawn its CLI refuse to run inside a job (`refused: running under the job wrapper`), because a job never starts or manages jobs. Run this repository's full `scripts/check.sh` outside a job, from the orchestrator or by hand.
-- **Planned, not shipped yet** (PLAN Wave A): the `agent-jobs` skill that teaches these tools and the routing rule per agent; the documented cap of three subagents per job; `prune` and `doctor procs`; cgroup containment of jobs.
 
 ## Optional hook: a reminder before a subagent
 
