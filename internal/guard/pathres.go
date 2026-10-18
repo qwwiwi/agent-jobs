@@ -560,8 +560,9 @@ func codeArg(argv []string, k int) bool {
 	return false
 }
 
-// shellFlags are shell options that take no value (not -o/-O): `bash -ec <code>`.
-const shellFlags = "abefhklmnprstuvxBCEHPT"
+// shellFlags are shell options that take no value (not -o/-O), and `c`, which makes the first
+// operand the code: `bash -ec <code>`, `-ce`, `-xc`, `-e -c`.
+const shellFlags = "abcefhklmnprstuvxBCEHPT"
 
 // awks take their program as the first operand unless given -f.
 var awks = map[string]bool{"awk": true, "gawk": true, "mawk": true, "nawk": true, "busybox-awk": true}
@@ -573,16 +574,15 @@ var awks = map[string]bool{"awk": true, "gawk": true, "mawk": true, "nawk": true
 func inlineCode(name string, argv []string, k int) bool {
 	switch {
 	case shells[name]:
-		for i := 1; i < k; i++ {
-			a := argv[i]
+		// argv[k] is the first operand after flag clusters only, one of them holding `c`.
+		c := false
+		for _, a := range argv[1:k] {
 			if len(a) < 2 || a[0] != '-' || strings.Trim(a[1:], shellFlags) != "" {
 				return false
 			}
-			if i == k-1 {
-				return strings.HasSuffix(a, "c")
-			}
+			c = c || strings.Contains(a[1:], "c")
 		}
-		return false
+		return c
 	case awks[name]:
 		for i := 1; i < len(argv); i++ {
 			switch a := argv[i]; {
@@ -599,7 +599,7 @@ func inlineCode(name string, argv []string, k int) bool {
 		}
 		return false
 	}
-	_, code := interpProgram(name, argv[1:])
+	code := interpCode(name, argv[1:])
 	return code >= 0 && code+1 == k
 }
 

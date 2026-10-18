@@ -331,8 +331,7 @@ type interpSpec struct {
 	codeLong, valueLong                                        []string
 }
 
-// interpSpecs are the stdin interpreters that may run a program named on the command line (sqlite3
-// reads SQL from stdin unless given after the database, so it always counts as pipe-fed).
+// interpSpecs are the interpreters whose inline code inlineCode finds by their options.
 var interpSpecs = map[string]interpSpec{
 	"python": {codeShort: "cm", inlineShort: "c", valueShort: "WX", flagShort: "bBdEIOPqsSu",
 		valueLong: []string{"--check-hash-based-pycs"}},
@@ -343,21 +342,17 @@ var interpSpecs = map[string]interpSpec{
 	"php":  {codeShort: "rfBRFE", inlineShort: "rBRE", valueShort: "cdz", flagShort: "eHlnqsw"},
 }
 
-// scriptExts are the file extensions taken as a script operand: a bare word (`python3 -W ignore`)
-// may be the value of an option the guard does not know, a script name is not.
-var scriptExts = []string{".py", ".pyw", ".pyc", ".pyz", ".pl", ".pm", ".t", ".js", ".mjs", ".cjs", ".ts", ".rb", ".php"}
-
-// interpProgram parses an interpreter call by its interpSpec: given reports a program from its
-// arguments (a script file, -m, -c, -e, …) rather than from stdin, code is the args index of an
-// inline program word (`-c <code>`, `--eval <code>`), -1 if none. Any option not in the spec ends
-// the parse as not given: it may take the next word (`node --title x.js` runs stdin).
-func interpProgram(name string, args []string) (given bool, code int) {
+// interpCode parses an interpreter call by its interpSpec and returns the args index of its inline
+// program word (`-c <code>`, `--eval <code>`), -1 if none or after any option not in the spec (it
+// may take the next word). It does not tell whether the interpreter also runs stdin (`node -e 0
+// -i`, `node -p`): a pipe feeder into an interpreter is always scanned strictly.
+func interpCode(name string, args []string) int {
 	if strings.HasPrefix(name, "python") {
 		name = "python"
 	}
 	spec, ok := interpSpecs[name]
 	if !ok {
-		return false, -1
+		return -1
 	}
 	inline := func(i int) int {
 		if i < len(args) {
@@ -368,24 +363,22 @@ func interpProgram(name string, args []string) (given bool, code int) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
-		case a == "--":
-			return i+1 < len(args) && isScript(args[i+1]), -1
-		case a == "-":
-			return false, -1
+		case a == "--" || a == "-":
+			return -1
 		case strings.HasPrefix(a, "--"):
 			opt, _, eq := strings.Cut(a, "=")
 			switch {
 			case slices.Contains(spec.codeLong, opt):
 				if eq {
-					return true, -1
+					return -1
 				}
-				return true, inline(i + 1)
+				return inline(i + 1)
 			case slices.Contains(spec.valueLong, opt):
 				if !eq {
 					i++
 				}
 			default:
-				return false, -1
+				return -1
 			}
 		case strings.HasPrefix(a, "-"):
 		cluster:
@@ -393,9 +386,9 @@ func interpProgram(name string, args []string) (given bool, code int) {
 				switch c := a[j]; {
 				case strings.IndexByte(spec.codeShort, c) >= 0:
 					if j == len(a)-1 && strings.IndexByte(spec.inlineShort, c) >= 0 {
-						return true, inline(i + 1)
+						return inline(i + 1)
 					}
-					return true, -1
+					return -1
 				case strings.IndexByte(spec.valueShort, c) >= 0:
 					if j == len(a)-1 {
 						i++
@@ -404,27 +397,14 @@ func interpProgram(name string, args []string) (given bool, code int) {
 				case strings.IndexByte(spec.attachShort, c) >= 0:
 					break cluster
 				case strings.IndexByte(spec.flagShort, c) < 0:
-					return false, -1
+					return -1
 				}
 			}
 		default:
-			return isScript(a), -1
+			return -1
 		}
 	}
-	return false, -1
-}
-
-// programGiven reports an interpreter call whose program comes from its arguments (a script file,
-// -m, -c, -e, …) rather than from stdin.
-func programGiven(name string, args []string) bool {
-	given, _ := interpProgram(name, args)
-	return given
-}
-
-// isScript reports a word naming a script file by its extension.
-func isScript(w string) bool {
-	l := strings.ToLower(w)
-	return slices.ContainsFunc(scriptExts, func(e string) bool { return strings.HasSuffix(l, e) && len(l) > len(e) })
+	return -1
 }
 
 func (s *pathScope) checkScripts(scripts []*script) string {
@@ -481,17 +461,15 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
 					return h.reason()
 				}
-				feeder, tree := "", true
+				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
+				// -i`): its feeder gets the strict scan, ancestors included (`ls ~ | python3 x.py` is
+				// refused, a known false refusal).
+				feeder := ""
 				switch {
 				case slices.Contains(v.wrappers, "xargs"):
 					feeder = "`xargs " + name + "`"
 				case i > 0 && stdinInterpreter(name):
 					feeder = "`" + name + "` (its program may come from the pipe)"
-					// With its program in a script file, -m, -c or -e the pipe is data: only a
-					// protected path in it counts, not an ancestor (`ls ~ | python3 x.py`).
-					if programGiven(name, argv[1:]) {
-						feeder, tree = "`"+name+"`", false
-					}
 				}
 				if feeder == "" {
 					continue
@@ -500,9 +478,9 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					for j, w := range append(slices.Clone(prev.words), prev.heredoc) {
 						h := false
 						if j < len(prev.words) || !bigText(w) {
-							_, h = s.hit(w, tree)
+							_, h = s.hit(w, true)
 						}
-						_, m := s.contains(w, tree)
+						_, m := s.contains(w, true)
 						if w != "" && (h || m) {
 							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
 								"state (the subagent log or the job database); the guard cannot verify what it is fed."

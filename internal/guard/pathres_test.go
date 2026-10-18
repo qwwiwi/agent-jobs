@@ -466,17 +466,28 @@ func TestProtectedLongWordRefused(t *testing.T) {
 	}
 }
 
-// Final review of PR #12: an interpreter that runs a script file, -m, -c or -e does not read its
-// program from the pipe, so its feeder is checked for protected paths only, not for ancestors.
-func TestProtectedPipeSourceAllowed(t *testing.T) {
+// Final review 3 of PR #12: the arguments do not tell whether an interpreter reads its program from
+// the pipe (`node -p`, `node -e 0 -i`), so every feeder of a stdin interpreter gets the strict scan:
+// an ancestor of a protected path in it ($HOME, `../../..`) is refused too.
+func TestProtectedPipeSource(t *testing.T) {
 	_, _, _, cfg := protectedSetup(t)
 	for _, c := range []string{
+		"echo a/b | python3 x.py",
+		"ls /etc | node count.js",
+		"git log --oneline | python3 -c 'import sys; print(len(sys.stdin.readlines()))'",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+	for _, c := range []string{
+		// Known false refusals, fail closed: a feeder naming the home directory or another
+		// ancestor of agent-jobs state (docs/DEVIATIONS.md row 12).
 		"ls ~ | python3 -c 'print(1)'",
 		"du -sh ~ | python3 parse.py",
-		"find ~ -name '*.json' | python3 summarize.py",
 		"echo a/b | tr / '\\n' | python3 x.py",
 		"df -h / | python3 x.py",
-		"ls /home | node count.js",
+		"find ~ -name '*.json' | python3 summarize.py",
 		"ls -la ../../.. | python3 x.py",
 		"printf '%s\\n' \"$HOME\" | python3 x.py",
 		"ls ~ | python3 -m json.tool",
@@ -488,12 +499,6 @@ func TestProtectedPipeSourceAllowed(t *testing.T) {
 		"ls ~ | perl -i.bak -e 1",
 		"ls ~ | perl -I lib x.pl",
 		"ls ~ | node -r fs count.js",
-	} {
-		if r := Check(c, cfg); r != "" {
-			t.Errorf("%q refused: %s", c, r)
-		}
-	}
-	for _, c := range []string{
 		"echo ~/.agent-jobs/thrall/jobs.db | python3 x.py",
 		"ls ../../../jobs.db | node count.js",
 		"ls ~/.agent-jobs | python3 -W x.py",
@@ -556,6 +561,11 @@ func TestProtectedPipeUnknownOptionRefused(t *testing.T) {
 	for _, c := range []string{
 		feed + " | node --title x.js",
 		feed + " | node --title=t x.js",
+		// Final review 3: node runs stdin although a program seems given.
+		feed + " | node -p",
+		feed + " | node --print",
+		feed + " | node -e 0 -i",
+		feed + " | node --eval=0 --interactive",
 		"ls ~/.agent-jobs | python3 --unknown x.py",
 		"ls ~/.agent-jobs | python3 --unknown=1 x.py",
 		"ls ~/.agent-jobs | python3 -Z x.py",
@@ -566,5 +576,29 @@ func TestProtectedPipeUnknownOptionRefused(t *testing.T) {
 		if Check(c, cfg) == "" {
 			t.Errorf("%q allowed", c)
 		}
+	}
+}
+
+// Final review 3 of PR #12: `c` inside a shell flag cluster (`bash -ec`, `-ce`, `-xc`) introduces
+// inline code: over 4 KB it is resolved by its tokens, so a comment padding a path is allowed while
+// a token that reaches state is still refused.
+func TestProtectedShellClusterInlineCode(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	// Resolved whole, `printf ok # a/…/../../../../x y/../jobs.db` reaches jobs.db (`printf ok # a`
+	// is one segment); its tokens `a/…/x` and `y/../jobs.db` do not.
+	long := "a/" + padTo(4110, "../../../../x y/../jobs.db")
+	for _, f := range []string{"-c", "-ec", "-ce", "-xc", "-e -c"} {
+		if r := Check("bash "+f+" 'printf ok # "+long+"'", cfg); r != "" {
+			t.Errorf("bash %s, long comment refused: %s", f, r)
+		}
+		for _, code := range []string{"rm " + long + " ../../../jobs.db", "rm " + padTo(4110, "../../../jobs.db")} {
+			if c := "bash " + f + " \"" + code + "\""; Check(c, cfg) == "" {
+				t.Errorf("bash %s: %q allowed", f, c[len(c)-40:])
+			}
+		}
+	}
+	// Not inline code: an operand after an option taking a value is resolved whole.
+	if Check("bash -o pipefail '"+long+"'", cfg) == "" {
+		t.Error("bash -o pipefail <long path> allowed")
 	}
 }
