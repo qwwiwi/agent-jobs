@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -132,6 +133,94 @@ func writeExclude(path, id string, patterns []string) error {
 	return os.Rename(tmp, path)
 }
 
+// excludeLockFile is the lock file in a repository's common git dir that serializes updates of its
+// info/exclude.
+const excludeLockFile = "agent-jobs-exclude.lock"
+
+// updateExclude replaces job id's block in repo's info/exclude (none = removed) under an exclusive
+// flock on <common git dir>/agent-jobs-exclude.lock: the file is shared by every worktree of the
+// repository, so jobs of one repository (in this daemon or another process) rewrite it one at a time
+// and none drops another's block.
+func updateExclude(repo, id string, patterns []string) error {
+	path, err := excludePath(repo)
+	if err != nil {
+		return err
+	}
+	common, err := git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return err
+	}
+	if real, err := filepath.EvalSymlinks(common); err == nil {
+		common = real
+	}
+	f, err := os.OpenFile(filepath.Join(common, excludeLockFile), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return fmt.Errorf("open exclude lock: %w", err)
+	}
+	defer f.Close()
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("flock exclude lock: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	return writeExclude(path, id, patterns)
+}
+
+// committedSkillLinks returns the delivered skill links (names) that the job put into its index or
+// into a commit since its base: info/exclude only hides them from git status, git add -f still takes
+// them, and a symlink into a skill catalog must never reach a patch or the repository.
+func committedSkillLinks(work, base string, names []string) ([]string, error) {
+	var specs []string
+	for _, n := range names {
+		if skills.ValidName(n) {
+			specs = append(specs, ":(literal)"+skills.LinkDir+"/"+n)
+		}
+	}
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	staged, err := gitRaw(work, append([]string{"ls-files", "--cached", "-z", "--"}, specs...)...)
+	if err != nil {
+		return nil, err
+	}
+	committed, err := gitRaw(work, append([]string{"log", "--format=", "--name-only", "--no-renames", "-z",
+		base + "..HEAD", "--"}, specs...)...)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range strings.Split(string(staged)+"\x00"+string(committed), "\x00") {
+		if p != "" && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// checkSkillLinks refuses (an error) the attempt's result when the job staged or committed one of
+// the skill links delivered to it.
+func (m *Manager) checkSkillLinks(j *store.Job, delivered []string) error {
+	if j.RepoPath == "" || len(delivered) == 0 {
+		return nil
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	found, err := committedSkillLinks(work, j.BaseCommit, delivered)
+	if err != nil {
+		return fmt.Errorf("skill links in the job's index and commits not checked: %w", err)
+	}
+	if len(found) > 0 {
+		return fmt.Errorf("the job staged or committed its skill link %s (a symlink into the skill catalog); "+
+			"result refused, drop it from the index and the commits", strings.Join(found, ", "))
+	}
+	return nil
+}
+
 // deliverSkills links the job's selected skills into its work dir for this attempt (E7): each as
 // <work>/.claude/skills/<name> -> its catalog directory, hidden from git by the repository's
 // info/exclude. A skill the repository already has stays the repository's; a codex job gets none.
@@ -165,16 +254,12 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 		m.Log.Printf("job %s: %s", j.ID, j.SkillsNote)
 	}
 	if j.RepoPath != "" && len(d.Linked) > 0 {
-		path, err := excludePath(j.RepoPath)
-		if err == nil {
-			var pats []string
-			for _, n := range d.Linked {
-				// No trailing slash: git sees a symlink as a file, not a directory.
-				pats = append(pats, "/"+skills.LinkDir+"/"+n)
-			}
-			err = writeExclude(path, j.ID, pats)
+		var pats []string
+		for _, n := range d.Linked {
+			// No trailing slash: git sees a symlink as a file, not a directory.
+			pats = append(pats, "/"+skills.LinkDir+"/"+n)
 		}
-		if err != nil {
+		if err := updateExclude(j.RepoPath, j.ID, pats); err != nil {
 			skills.Unlink(work, d.Linked)
 			j.SkillsDelivered = nil
 			return fmt.Errorf("skills: info/exclude: %w", err)
@@ -201,11 +286,7 @@ func (m *Manager) removeSkills(j *store.Job) {
 		m.Log.Printf("job %s: skill links: %s", j.ID, strings.Join(left, "; "))
 	}
 	if j.RepoPath != "" {
-		path, err := excludePath(j.RepoPath)
-		if err == nil {
-			err = writeExclude(path, j.ID, nil)
-		}
-		if err != nil {
+		if err := updateExclude(j.RepoPath, j.ID, nil); err != nil {
 			m.Log.Printf("job %s: remove skill lines from info/exclude: %v", j.ID, err)
 		}
 	}

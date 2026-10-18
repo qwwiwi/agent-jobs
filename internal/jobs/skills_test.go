@@ -3,10 +3,12 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -400,5 +402,97 @@ func TestSkillsRelinkedOnResume(t *testing.T) {
 	}
 	if _, err := os.Lstat(link); !os.IsNotExist(err) {
 		t.Fatal("link left after the resumed attempt")
+	}
+}
+
+// Jobs of one repository update the shared info/exclude concurrently: every block survives.
+func TestSkillsExcludeConcurrentUpdates(t *testing.T) {
+	repo := newRepo(t)
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("job-%02d", i)
+			errs <- updateExclude(repo, id, []string{"/" + skills.LinkDir + "/" + id})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(repo, ".git", "info", "exclude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		id := fmt.Sprintf("job-%02d", i)
+		if !strings.Contains(string(b), skillExcludeBegin(id)+"\n/.claude/skills/"+id+"\n"+skillExcludeEnd(id)+"\n") {
+			t.Fatalf("block of %s lost:\n%s", id, b)
+		}
+	}
+	// Removal under the same lock keeps the other blocks.
+	var wg2 sync.WaitGroup
+	for i := 0; i < n; i += 2 {
+		wg2.Add(1)
+		go func() {
+			defer wg2.Done()
+			if err := updateExclude(repo, fmt.Sprintf("job-%02d", i), nil); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg2.Wait()
+	b, _ = os.ReadFile(filepath.Join(repo, ".git", "info", "exclude"))
+	for i := range n {
+		if has := strings.Contains(string(b), skillExcludeBegin(fmt.Sprintf("job-%02d", i))); has != (i%2 == 1) {
+			t.Fatalf("job-%02d block present=%v after removals:\n%s", i, has, b)
+		}
+	}
+}
+
+// A job that forces its skill link into a commit or the index is refused: its result would carry a
+// symlink into the catalog.
+func TestSkillLinkInCommitOrIndexRefused(t *testing.T) {
+	for _, brief := range []string{"FAKE_LINK_COMMIT", "FAKE_LINK_STAGE"} {
+		t.Run(brief, func(t *testing.T) {
+			m, _ := skillsManager(t)
+			repo := newRepo(t)
+			j := runToEnd(t, m, enqueue(t, m, brief, func(r *StartRequest) { r.Kind, r.RepoPath = "fix", repo }).ID)
+			if j.Status != store.StatusFailed || !strings.Contains(j.Error, ".claude/skills/golang") {
+				t.Fatalf("status %s %q", j.Status, j.Error)
+			}
+		})
+	}
+}
+
+// The guard refuses git add -f naming a skill link (an argument that is a protected path); a
+// whole-tree add (git add -f -A, git add -f .) names no link and passes, which the check at the end
+// of the attempt covers (TestSkillLinkInCommitOrIndexRefused).
+func TestSkillGuardAndForcedAdd(t *testing.T) {
+	m, root := skillsManager(t)
+	j := &store.Job{ID: "x", Kind: "fix", SkillsDelivered: []string{"golang"}}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if err := os.MkdirAll(filepath.Join(work, ".claude", "skills"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "skills", "golang"), filepath.Join(work, ".claude", "skills", "golang")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := guard.Config{Dir: work, Protected: append(m.ProtectedPaths(), m.skillProtected(j)...)}
+	for _, cmd := range []string{"git add -f .claude/skills/golang", "git add --force -- .claude/skills/golang"} {
+		if r := guard.Check(cmd, cfg); !strings.Contains(r, "skill catalog") {
+			t.Errorf("%q not refused: %q", cmd, r)
+		}
+	}
+	for _, cmd := range []string{"git add -f -A", "git add -f ."} {
+		if r := guard.Check(cmd, cfg); r != "" {
+			t.Errorf("%q refused (%q): update the docs, the end check is no longer the only cover", cmd, r)
+		}
 	}
 }

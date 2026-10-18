@@ -785,6 +785,7 @@ func killedResult(runner, dir string) (res StreamResult, killed bool) {
 // failed attempt can be resumed, so what it left outside its process group is swept first.
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) {
 	m.noteFallback(j)
+	delivered := slices.Clone(j.SkillsDelivered)
 	m.removeSkills(j)
 	// Whatever ended the job, nothing of it may outlive the row turning terminal.
 	if err := m.endScope(j); err != nil {
@@ -795,6 +796,14 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 			msg = Printable(msg+"; "+note, 300)
 		} else {
 			status, msg = store.StatusFailed, Printable(note, 300)
+		}
+	} else if err := m.checkSkillLinks(j, delivered); err != nil {
+		// Checked once nothing of the job runs any more.
+		m.Log.Printf("job %s: %v", j.ID, err)
+		if status == store.StatusTimeout {
+			msg = Printable(msg+"; "+err.Error(), 300)
+		} else {
+			status, msg = store.StatusFailed, Printable(err.Error(), 300)
 		}
 	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
