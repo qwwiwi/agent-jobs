@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -294,12 +295,22 @@ func TestCheckDenseCronAcrossFoldIsFast(t *testing.T) {
 	*now = time.Date(2026, 10, 24, 12, 0, 0, 0, loc)
 	addCheck(t, m, "dense", "* * * * *", 1)
 	start := time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC) // 02:30 CEST
-	for i := 0; i < 90; i++ {
+	// A cron search that walks the fold makes every tick slow, so the median catches it; a single
+	// slow tick on a loaded host does not. The per-tick limit only guards against a hang.
+	const ticks = 90
+	took := make([]time.Duration, 0, ticks)
+	for i := 0; i < ticks; i++ {
 		*now = start.Add(time.Duration(i) * time.Minute).In(loc)
 		if i%10 == 0 {
 			markAt(t, m, now, *now, "dense")
 		}
-		within(t, 2*time.Second, "watchdog tick in the fold", func() { watch(t, m) })
+		began := time.Now()
+		within(t, 30*time.Second, "watchdog tick in the fold", func() { watch(t, m) })
+		took = append(took, time.Since(began))
+	}
+	sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
+	if median := took[ticks/2]; median > 2*time.Second {
+		t.Fatalf("median watchdog tick in the fold %s, want ≤ 2s (slowest %s)", median, took[ticks-1])
 	}
 	if got := missedLines(t, logf); len(got) == 0 {
 		t.Fatal("an unmarked every-minute check never alerted")

@@ -116,6 +116,9 @@ type StartRequest struct {
 	ReasoningEffort string
 	// ScheduleID is the schedule that starts the job (set by the daemon, never by a caller).
 	ScheduleID string
+	// OwnerWaits marks a job started at the owner's request: when its job-done line is delivered the
+	// orchestrator's Stop hook holds the session until owner_replied (or the record expires).
+	OwnerWaits bool
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -287,7 +290,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
-		ScheduleID: r.ScheduleID,
+		ScheduleID: r.ScheduleID, OwnerWaits: r.OwnerWaits,
 	}
 	return j, nil
 }
