@@ -193,12 +193,12 @@ func (c *Catalog) loadRoot(root string) {
 	for i, b := range idx.Skills {
 		r, err := parseEntry(b)
 		if err != nil {
-			c.warn("skill root %s: entry %d (%q): %v, skipped", root, i, r.Name, err)
+			c.warn("skill root %s: %s: %v, skipped", root, entryLabel(i, r.Name), err)
 			continue
 		}
 		e, err := validate(real, r)
 		if err != nil {
-			c.warn("skill root %s: entry %d (%q): %v, skipped", root, i, r.Name, err)
+			c.warn("skill root %s: %s: %v, skipped", root, entryLabel(i, r.Name), err)
 			continue
 		}
 		if seen[e.Name] {
@@ -211,6 +211,15 @@ func (c *Catalog) loadRoot(root string) {
 		}
 		c.Entries = append(c.Entries, e)
 	}
+}
+
+// entryLabel names entry i of an index in a warning: by its index, and by its name only when the
+// name is valid (an invalid one may be any text the index holds).
+func entryLabel(i int, name string) string {
+	if ValidName(name) {
+		return fmt.Sprintf("entry %d (%q)", i, name)
+	}
+	return fmt.Sprintf("entry %d", i)
 }
 
 func readIndex(path string) (rawIndex, error) {
