@@ -77,7 +77,7 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
 - **Heartbeat.** The daemon decides whether to wake the agent for its own goals: a cheap Go check (time, daily limit, night), then a small model decides (DEVIATIONS #1).
 - **«Owner waits» Stop hook.** A job started at the owner's request is marked; until the orchestrator has written to the owner, a Stop hook does not let the session end its turn silently.
 - **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. Built switched off; turning it on (real money) needs its own owner «да».
-- **Read-only HTTP API** for a jobs dashboard (DEVIATIONS #8).
+- **Read-only HTTP API** for a jobs dashboard (DEVIATIONS #8). *Status: built, unreleased; `internal/httpapi`.* Off by default (`http_api.enabled`), loopback or unix socket only, bearer token `<state>/http-api.token` (`agent-jobs http-api token --rotate`) on every endpoint; GET only: `/v1/health`, `/v1/jobs`, `/v1/jobs/{id}` (`?report=1`, 64 KB cap), `/v1/stats`, `/v1/schedules`; no briefs, prompts, env, config or paths outside the agent state; server timeouts, 8 KB headers, 10 requests/s per client.
 - **Acceptance from a clean clone.** The whole install and a test job are replayed from a fresh clone before a release.
 - **Autopilot items 23-27:** risky-first review, a Progress section in reports, a job size check, secret redaction in reports and logs, an `acceptance_cmd` a job must pass.
 

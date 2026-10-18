@@ -85,7 +85,8 @@ func (m *Manager) guardProbe(command string) (int, error) {
 }
 
 // Hooks checks what every job depends on: the guard hook blocks and allows as it must, the owner
-// rules are readable (else no job starts), and the notify target exists when one is configured.
+// rules are readable (else no job starts), the notify target exists when one is configured, and the
+// HTTP API serves when http_api is enabled.
 func (m *Manager) Hooks() []Check {
 	var out []Check
 	g := Check{Name: "guard hook"}
@@ -118,6 +119,9 @@ func (m *Manager) Hooks() []Check {
 		n.OK, n.Detail = true, "tmux session "+t+" exists"
 	}
 	out = append(out, n)
+	if c, ok := m.HTTPAPICheck(); ok {
+		out = append(out, c)
+	}
 	return out
 }
 

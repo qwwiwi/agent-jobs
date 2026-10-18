@@ -276,3 +276,19 @@ func TestTrashToolsFailClosedAndProtected(t *testing.T) {
 	var e trash.Entry
 	call(t, cs, "trash_move", map[string]any{"path": free}, &e)
 }
+
+// With http_api enabled, an API that does not serve (here: the recorded bind failure) is a problem.
+func TestSystemDoctorHTTPAPINotServing(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin
+	m.Cfg.HTTPAPI = jobs.HTTPAPIConfig{Enabled: true, Listen: "127.0.0.1:7781"}
+	m.RecordHTTPAPI(jobs.HTTPAPIStatus{Reason: "http api: listen tcp 127.0.0.1:7781: bind: address already in use"})
+	cs := connect(t, mustServer(t, m))
+	var out SystemDoctorOutput
+	call(t, cs, "system_doctor", map[string]any{}, &out)
+	if !slices.ContainsFunc(out.Problems, func(p string) bool {
+		return strings.Contains(p, "http api not serving: http api: listen tcp 127.0.0.1:7781: bind: address already in use")
+	}) {
+		t.Fatalf("problems %q", out.Problems)
+	}
+}

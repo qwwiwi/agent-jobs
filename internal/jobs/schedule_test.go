@@ -354,3 +354,47 @@ func TestScheduleValidation(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// A job schedule without a title gets a neutral one ("schedule <id>"), never a prefix of its prompt,
+// and so do the jobs it fires; an older row whose title is the prompt prefix fires with the neutral
+// title too.
+func TestScheduleTitleNeverFromPrompt(t *testing.T) {
+	m, now, _ := scheduleManager(t, time.UTC)
+	const prompt = "PROMPT-SECRET nightly audit of the billing tables"
+	sc := addSchedule(t, m, ScheduleRequest{Cron: "30 9 * * *", Prompt: prompt, Kind: "review", Model: "sonnet"})
+	want := "schedule " + itoa(sc.ID)
+	if sc.Title != want || ScheduleTitle(sc) != want {
+		t.Fatalf("title %q (shown %q), want %q", sc.Title, ScheduleTitle(sc), want)
+	}
+	legacy := &store.Schedule{Cron: "31 9 * * *", Prompt: prompt, Enabled: true, Kind: "review", Model: sc.Model,
+		Runner: sc.Runner, MaxTurns: sc.MaxTurns, MaxBudgetUSD: sc.MaxBudgetUSD, TimeoutMinutes: sc.TimeoutMinutes,
+		Title: "schedule: " + Printable(prompt, 60)}
+	old, err := m.Store.AddSchedule(legacy, *now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ScheduleTitle(old); got != "schedule "+itoa(old.ID) {
+		t.Fatalf("legacy title shown as %q", got)
+	}
+	for _, minute := range []int{30, 31} {
+		*now = time.Date(2026, 10, 19, 9, minute, 0, 0, time.UTC)
+		fire(t, m)
+	}
+	queued, err := m.Store.ListByStatus(store.StatusQueued)
+	if err != nil || len(queued) != 2 {
+		t.Fatalf("queued %d, %v", len(queued), err)
+	}
+	for _, j := range queued {
+		if strings.Contains(j.Title, "PROMPT-SECRET") || j.Title != "schedule "+j.ScheduleID {
+			t.Fatalf("job %s title %q", j.ID, j.Title)
+		}
+	}
+	// A job row from before the change (title copied from the prompt) is shown neutral.
+	j := &store.Job{Title: "schedule: " + Printable(prompt, 60), ScheduleID: "7"}
+	if got := JobTitle(j); got != "schedule 7" {
+		t.Fatalf("legacy job title shown as %q", got)
+	}
+	if got := JobTitle(&store.Job{Title: "schedule: x"}); got != "schedule: x" {
+		t.Fatalf("a job without a schedule keeps its title: %q", got)
+	}
+}

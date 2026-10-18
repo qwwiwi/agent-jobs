@@ -21,6 +21,7 @@ import (
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
+	"github.com/qwwiwi/agent-jobs/internal/httpapi"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/mcp"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -39,7 +40,8 @@ const usage = `usage: agent-jobs <command> [flags]
   status     --agent A [<id>]              a job; without an id: the daily automation
                                            (prune + doctor procs) and its last run,
                                            missed checks, undelivered notifications
-  list       --agent A [--limit N]
+  list       --agent A [--limit N] [--status S] [--json]
+                                           newest jobs first; --json: the HTTP API's /v1/jobs view
   result     --agent A <id>                print report.md
   cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
   stop       --agent A <id> [--reason R]   stop a queued/running job, keep work dir and session (resumable)
@@ -79,6 +81,8 @@ const usage = `usage: agent-jobs <command> [flags]
                                            for the session to relay (rate limited, stored)
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
+  http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
+                                           (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -152,6 +156,8 @@ func main() {
 		err = cmdNotifyOwner(args)
 	case "doctor":
 		err = cmdDoctor(args)
+	case "http-api":
+		err = cmdHTTPAPI(args)
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -460,6 +466,7 @@ func cmdStatus(args []string) error {
 		if err := printMissedChecks(m); err != nil {
 			return err
 		}
+		printHTTPAPI(m)
 		return printUndelivered(m)
 	}
 	j, err := m.Store.Get(pos[0])
@@ -518,6 +525,19 @@ func printDaily(m *jobs.Manager) error {
 	return nil
 }
 
+// printHTTPAPI is the http api line of `status` without a job id, when http_api is enabled: where
+// it listens, or "http api not serving: <reason>".
+func printHTTPAPI(m *jobs.Manager) {
+	c, ok := m.HTTPAPICheck()
+	switch {
+	case !ok:
+	case c.OK:
+		fmt.Printf("http api:  %s\n", c.Detail)
+	default:
+		fmt.Println(c.Detail)
+	}
+}
+
 // printUndelivered is the end of `status` without a job id: notify_owner notifications of the last
 // 24 h that did not reach the session.
 func printUndelivered(m *jobs.Manager) error {
@@ -563,6 +583,8 @@ func cmdList(args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	limit := fs.Int("limit", 20, "max rows")
+	status := fs.String("status", "", "only jobs with this status")
+	asJSON := fs.Bool("json", false, "print the list as JSON (the HTTP API's /v1/jobs view)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -571,7 +593,19 @@ func cmdList(args []string) error {
 		return err
 	}
 	defer m.Close()
-	list, err := m.Store.List(*limit)
+	if *asJSON {
+		out, err := httpapi.ListJobs(context.Background(), m, *status, *limit)
+		if err != nil {
+			return err
+		}
+		return printJSON(out)
+	}
+	var list []*store.Job
+	if *status != "" {
+		list, err = m.Store.ListRecentByStatus(*status, *limit)
+	} else {
+		list, err = m.Store.List(*limit)
+	}
 	if err != nil {
 		return err
 	}
@@ -882,6 +916,17 @@ func cmdDaemon(args []string) error {
 			m.Log.Printf("%v (jobs get no memory tools and no notify_owner until the daemon restarts)", err)
 		}
 	}()
+	// The read-only HTTP API (off by default): served until ctx ends, waited for before the store closes.
+	httpDone := make(chan struct{})
+	go func() {
+		defer close(httpDone)
+		if !m.Cfg.HTTPAPI.Enabled {
+			return
+		}
+		if err := httpapi.Serve(ctx, m, version); err != nil {
+			m.Log.Printf("%v (no HTTP API until the daemon restarts)", err)
+		}
+	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
 	for {
@@ -897,6 +942,7 @@ func cmdDaemon(args []string) error {
 			// in progress stops between jobs (ctx) and is waited for before the store closes.
 			m.Log.Printf("daemon stopping; running jobs keep running")
 			m.WaitDaily()
+			<-httpDone
 			return nil
 		case <-t.C:
 		}
@@ -1317,6 +1363,35 @@ func cmdDoctor(args []string) error {
 		fmt.Print(" (report only; --kill ends the job ghosts)")
 	}
 	fmt.Println()
+	return nil
+}
+
+func cmdHTTPAPI(args []string) error {
+	if len(args) == 0 || args[0] != "token" {
+		return errors.New("usage: agent-jobs http-api token --agent A --rotate")
+	}
+	fs := flag.NewFlagSet("http-api token", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	rotate := fs.Bool("rotate", false, "write a new token (the old one stops working) and print it once")
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	if !*rotate {
+		return errors.New("the token is printed only when it is created: agent-jobs http-api token --agent A --rotate")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	tok, err := httpapi.RotateToken(m.StateDir)
+	if err != nil {
+		return err
+	}
+	fmt.Println(tok)
+	if !m.Cfg.HTTPAPI.Enabled {
+		fmt.Fprintln(os.Stderr, "note: http_api.enabled is false in config.json; the daemon does not serve the API")
+	}
 	return nil
 }
 
