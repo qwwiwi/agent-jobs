@@ -409,6 +409,9 @@ func cmdStart(args []string) error {
 		return err
 	}
 	fmt.Println(j.ID)
+	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
+		fmt.Fprintln(os.Stderr, "size_warning:", w)
+	}
 	return nil
 }
 
@@ -594,7 +597,7 @@ func cmdResult(args []string) error {
 	}
 	fmt.Println(jobs.DoneLine(j))
 	if j.Error != "" {
-		fmt.Println("error:", j.Error)
+		fmt.Println("error:", jobs.RedactText(j.Error))
 	}
 	atts, err := m.Store.Attempts(id)
 	if err != nil {
@@ -612,7 +615,8 @@ func cmdResult(args []string) error {
 	if err != nil {
 		return fmt.Errorf("no report.md (status %s): see %s", j.Status, filepath.Join(m.JobDir(id), "stderr.log"))
 	}
-	fmt.Print("\n" + string(b))
+	// Redacted, "Not done / uncertain" first and "Progress" after it, like job_result.
+	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactText(string(b))))
 	return nil
 }
 
