@@ -31,8 +31,8 @@ func TestMain(m *testing.M) {
 
 // reaperMain runs argv as its child and forwards TERM and INT to it (HUP: KILL, the test gave up).
 // Once the child exited it waits briefly for the dying, then KILLs every process still alive among
-// its children (the orphans of the run), again for their orphans, until it has none; the ones it
-// found are written to report, one per line. The exit code is the child's (128+N for a signal).
+// its children (the orphans of the run), again for their orphans, until it has none (at most 10 s);
+// the ones it found are written to report, one per line. The exit code is the child's (128+N for a signal).
 // Everything runs on one goroutine: a child is reaped only between the scans, never while it is
 // being signalled.
 func reaperMain(report string, argv []string) int {
@@ -75,13 +75,19 @@ func reaperMain(report string, argv []string) int {
 		}
 		code = reapAll(child, code)
 	}
-	signal.Stop(sigs)
-	// The members the run itself KILLed may still be on their way out.
+	// The members the run itself KILLed may still be on their way out; a signal now (the test gave
+	// up) skips the wait. The signals stay caught: a default HUP or TERM would end the reaper and
+	// hand the orphans to init.
 	for end := time.Now().Add(300 * time.Millisecond); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+		select {
+		case <-sigs:
+			end = time.Now()
+		default:
+		}
 		reapAll(0, 0)
 	}
 	var left []string
-	for {
+	for end := time.Now().Add(10 * time.Second); ; {
 		for _, pid := range liveChildren() {
 			left = append(left, describe(pid))
 			_ = syscall.Kill(pid, syscall.SIGKILL)
@@ -89,6 +95,10 @@ func reaperMain(report string, argv []string) int {
 		time.Sleep(20 * time.Millisecond)
 		reapAll(0, 0)
 		if _, err := syscall.Wait4(-1, nil, syscall.WNOHANG, nil); err == syscall.ECHILD {
+			break
+		}
+		if time.Now().After(end) {
+			left = append(left, "children still not reaped after 10 s (unkillable)")
 			break
 		}
 	}
