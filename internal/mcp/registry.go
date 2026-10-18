@@ -38,11 +38,37 @@ var OrchestratorOnly = []string{
 	"job_result",
 	"job_list",
 	"job_cancel",
+	"job_stop",
+	"job_resume",
+	"job_amend",
+	"job_stats",
+	"memory_already_exists",
+	"task_create",
+	"task_list",
+	"task_update",
+	"task_get",
+	"send_message",
+	"inbox",
+	// System and files (reference, «MCP-тулы»: not available to a job).
+	"system_doctor",
+	"system_logs",
+	"activity_report",
+	"trash_move",
+	"trash_restore",
+	// The agent's own goals: a job does not set or read them.
+	"intention_add",
+	"intention_list",
+	"intention_set",
 }
 
-// JobAllowed are tools a job may call (the orchestrator gets them too). Empty until S2-M2 opens
-// memory_search / memory_write (deferred by the owner 2026-10-17).
-var JobAllowed = []string{}
+// JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
+// team's shared memory, and notify_owner, which reaches the owner only through the agent's own
+// session (rate limited); nothing that reaches another agent.
+var JobAllowed = []string{
+	"memory_search",
+	"memory_write",
+	"notify_owner",
+}
 
 // Allowed reports whether role may see and call the tool.
 func Allowed(role Role, name string) bool {

@@ -62,28 +62,7 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
-				for _, w := range append(slices.Clone(c.words), c.heredoc) {
-					if strings.Contains(w, "CDPATH=") {
-						s.unknown("CDPATH=")
-					}
-					if strings.Contains(strings.ToLower(w), "symlink") {
-						s.makesLinks = true
-					}
-				}
-				argv := argvOf(c.words)
-				if len(argv) == 0 {
-					continue
-				}
-				switch strings.ToLower(base(argv[0])) {
-				case "cd", "pushd":
-					s.cd(argv, c.dyn[len(c.words)-len(argv):], cdpathEnv)
-				case "ln", "link":
-					s.makesLinks = true
-				case "cp":
-					s.makesLinks = s.makesLinks || slices.ContainsFunc(argv[1:], func(a string) bool {
-						return a == "--symbolic-link" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 's'))
-					})
-				}
+				s.step(c, cdpathEnv)
 			}
 		}
 	}
@@ -96,6 +75,33 @@ func (s *pathScope) over() bool {
 		s.expired = true
 	}
 	return s.expired
+}
+
+// step adds the directories one command leads to (a literal cd/pushd target; a CDPATH assignment
+// makes the directory unknown) and notes whether it may create a symlink.
+func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
+	for _, w := range append(slices.Clone(c.words), c.heredoc) {
+		if strings.Contains(w, "CDPATH=") {
+			s.unknown("CDPATH=")
+		}
+		if strings.Contains(strings.ToLower(w), "symlink") {
+			s.makesLinks = true
+		}
+	}
+	argv := argvOf(c.words)
+	if len(argv) == 0 {
+		return
+	}
+	switch strings.ToLower(base(argv[0])) {
+	case "cd", "pushd":
+		s.cd(argv, c.dyn[len(c.words)-len(argv):], cdpathEnv)
+	case "ln", "link":
+		s.makesLinks = true
+	case "cp":
+		s.makesLinks = s.makesLinks || slices.ContainsFunc(argv[1:], func(a string) bool {
+			return a == "--symbolic-link" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 's'))
+		})
+	}
 }
 
 func (s *pathScope) unknown(why string) {
@@ -146,10 +152,56 @@ func (s *pathScope) cd(argv []string, dyn []bool, cdpathEnv bool) {
 			s.unknown("too many cd")
 			return
 		}
-		if n := resolvePath(p, d); !slices.Contains(s.dirs, n) {
-			s.dirs = append(s.dirs, n)
+		// `cd` (logical) drops `x/..` lexically, `cd -P` lets the kernel resolve it after a symlink:
+		// both directories are possible. A `..` after a component that does not exist yet (it may be a
+		// symlink the call creates) leads somewhere the guard does not know.
+		targets := []string{resolvePath(p, d)}
+		if hasDotDot(p) {
+			raw := p
+			if !filepath.IsAbs(raw) {
+				raw = d + "/" + p
+			}
+			k, ok := kernelPath(raw)
+			if !ok {
+				s.unknown(t)
+				return
+			}
+			targets = append(targets, k)
+		}
+		for _, n := range targets {
+			if !slices.Contains(s.dirs, n) {
+				s.dirs = append(s.dirs, n)
+			}
 		}
 	}
+}
+
+// kernelPath resolves an absolute path as written (not cleaned) the way the kernel does: component
+// by component, each existing component replaced by its real path before a following `..` applies
+// (`link/..` is the parent of the link's target). ok is false when a component before a `..` does
+// not exist: at run time it may be a symlink the call creates, so where the path leads is unknown.
+func kernelPath(raw string) (string, bool) {
+	comps := strings.Split(filepath.ToSlash(raw), "/")
+	cur := "/"
+	for i, c := range comps {
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, c)
+		real, err := filepath.EvalSymlinks(next)
+		if err != nil {
+			if slices.Contains(comps[i+1:], "..") {
+				return "", false
+			}
+			return filepath.Join(append([]string{next}, comps[i+1:]...)...), true
+		}
+		cur = real
+	}
+	return cur, true
 }
 
 // expandHome expands a leading `~` / `~/` and $HOME / ${HOME} the way the shell would. ok is false

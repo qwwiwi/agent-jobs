@@ -60,6 +60,11 @@ type Config struct {
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
 	// database that holds the counter. File tools and literal Bash targets into them are refused.
 	Protected []string
+	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
+	// reads it, except its own folder OwnDir. Empty = reads are not checked.
+	StateDir string
+	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
+	OwnDir string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -70,6 +75,8 @@ type HookInput struct {
 		Command      string `json:"command"`
 		FilePath     string `json:"file_path"`
 		NotebookPath string `json:"notebook_path"`
+		Path         string `json:"path"`    // Grep, Glob
+		Pattern      string `json:"pattern"` // Glob (Grep's pattern is a regexp, not a path)
 	} `json:"tool_input"`
 	// RawInput is tool_input as sent (subagent calls are checked on fields of their own).
 	RawInput json.RawMessage `json:"-"`
@@ -97,6 +104,25 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	in.RawInput = raw.ToolInput
 	if cfg.Dir == "" {
 		cfg.Dir = in.Cwd
+	}
+	if cfg.StateDir == "" {
+		state, own, ok := StateLayout(cfg.SubagentLog)
+		if !ok && cfg.SubagentLog != "" {
+			// A misconfigured hook must not silently turn the state-read rule off: fail closed.
+			return "blocked by guard: the subagent log `" + cfg.SubagentLog + "` is not <state>/subagents/<id>.log, " +
+				"so the guard cannot derive the job's folder; every tool call is refused until the hook is fixed.", nil
+		}
+		cfg.StateDir, cfg.OwnDir = state, own
+	}
+	if readTools[in.ToolName] {
+		p, pattern := in.ToolInput.Path, ""
+		switch in.ToolName {
+		case "Read":
+			p = in.ToolInput.FilePath
+		case "Glob":
+			pattern = in.ToolInput.Pattern
+		}
+		return CheckFileRead(in.ToolName, p, pattern, cfg), nil
 	}
 	if fileTools[in.ToolName] {
 		p := in.ToolInput.FilePath
@@ -372,7 +398,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -630,7 +656,7 @@ func dataOnly(name string, args []string, dyn []bool) bool {
 				return false
 			}
 		}
-		return true
+		return scopeToolArg(name, args, dyn) == ""
 	case name == "find":
 		return !slices.ContainsFunc(args, func(a string) bool { return findExec[a] })
 	case name == "rg": // --pre runs a command on every file
@@ -692,6 +718,12 @@ var (
 	// Agent names may carry a `-suffix` (`gemini-cli`, `aider-chat`, `@google/gemini-cli`, `codex-cli`).
 	reMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((git|gh|sh|bash|zsh|dash|fish)($|[^a-z0-9_-])|` +
 		`(claude|codex|gemini|aider|cursor-agent|agent-jobs)($|[^a-z0-9_]))`)
+	// reScopeMention finds an out-of-scope tool (outOfScopeTools, systemctl) as a word inside code
+	// (`python3 -c '…["tmux", …]'`, `watch 'docker run …'`); not `at`, `batch`, `screen`: plain words.
+	// It is not used on every argument: a package, directory or make target named ssh or docker is data.
+	reScopeMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((ssh)($|[^a-z0-9_-])|` +
+		`(systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session|crontab|tmux|pm2|docker|podman|` +
+		`machinectl|loginctl|unshare|nsenter)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
 )
 
@@ -732,6 +764,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	name := strings.ToLower(base(argv[0]))
 	if dyn[0] {
 		return cannot("command name from a variable or substitution")
+	}
+	if name == "systemctl" && slices.Contains(v.wrappers, "xargs") {
+		return cannot("xargs systemctl (its arguments, e.g. --user, come from stdin)")
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
@@ -825,6 +860,53 @@ func unverifiable(sc *script, c *simpleCmd) string {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
 		}
 	}
+	if t := scopeToolArg(name, argv[1:], dyn[1:]); t != "" {
+		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
+	}
+	return ""
+}
+
+// scopeTool reports a lower-cased base name that starts processes outside the job's scope.
+func scopeTool(b string) bool { return outOfScopeTools[b] || b == "systemctl" }
+
+// execRunners run their positional arguments as a command (`setsid tmux …`, `flock f docker …`).
+var execRunners = map[string]bool{
+	"setsid": true, "watch": true, "flock": true, "chronic": true, "unbuffer": true, "strace": true, "ltrace": true,
+	"ionice": true, "taskset": true, "chrt": true, "prlimit": true, "chroot": true, "runuser": true, "su": true,
+	"script": true, "parallel": true, "entr": true, "systemd-inhibit": true, "caffeinate": true, "time": true,
+	"daemonize": true, "start-stop-daemon": true, "firejail": true, "bwrap": true, "fakeroot": true, "proot": true,
+	"faketime": true, "valgrind": true, "numactl": true, "cgexec": true, "sg": true, "expect": true,
+}
+
+// execOpts are options whose value is a command or code (`find -exec`, `rsync -e`, `go test -exec`,
+// `perl -e`, `node -e`, `python -c`, `--rsh=`).
+var execOpts = map[string]bool{
+	"-exec": true, "-execdir": true, "-ok": true, "-okdir": true, "-e": true, "-c": true, "-x": true,
+	"--exec": true, "--rsh": true, "--command": true, "--run": true, "--eval": true,
+}
+
+// scopeToolArg returns the out-of-scope tool an argument of name runs (as found in args), or "". Only the
+// places where it runs count: the value of an exec option, a positional of an execRunner, an absolute
+// path given to a copier (a renamed binary), a substitution naming it, or a word inside code (an
+// argument with spaces, quotes or parentheses). A package, directory, make target or test name such as
+// `./internal/ssh/...`, `make -C docker` or `-run Tmux` is data.
+func scopeToolArg(name string, args []string, dyn []bool) string {
+	for k, a := range args {
+		v := optValue(a)
+		b := strings.ToLower(base(v))
+		opt, _, _ := strings.Cut(a, "=")
+		switch {
+		case dyn[k] && reScopeMention.MatchString(a):
+		case scopeTool(b) && v != a && execOpts[opt]:
+		case scopeTool(b) && k > 0 && execOpts[args[k-1]]:
+		case scopeTool(b) && execRunners[name] && !strings.HasPrefix(a, "-"):
+		case scopeTool(b) && copiers[name] && filepath.IsAbs(v):
+		case strings.ContainsAny(a, " \t\n'\"(){};`") && reScopeMention.MatchString(a):
+		default:
+			continue
+		}
+		return a
+	}
 	return ""
 }
 
@@ -877,6 +959,638 @@ func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 		}
 		return ""
 	})
+}
+
+// outOfScopeTools start processes outside the job's cgroup scope: the user's service manager and session
+// bus (a new transient unit), and daemons or schedulers that run a command for the caller in their own
+// cgroup (cron, at, tmux/screen servers, pm2, containers, ssh, logind/machined), or a new namespace that
+// blinds the cgroup check (unshare, nsenter). Owner decision 2026-10-17 (docs/DECISIONS.md).
+var outOfScopeTools = map[string]bool{
+	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "qdbus-qt5": true,
+	"qdbus6": true, "dbus-run-session": true,
+	"crontab": true, "at": true, "batch": true, "tmux": true, "screen": true, "pm2": true, "docker": true,
+	"docker-compose": true, "podman": true, "podman-compose": true, "ssh": true, "machinectl": true,
+	"loginctl": true, "unshare": true, "nsenter": true,
+}
+
+// cgroupControlFiles are the cgroup v2 core files: writing there moves processes between cgroups
+// (procs, threads), kills or freezes a cgroup, or changes a subtree, wherever the file system is mounted.
+var cgroupControlFiles = map[string]bool{
+	"cgroup.procs": true, "cgroup.threads": true, "cgroup.subtree_control": true, "cgroup.kill": true,
+	"cgroup.freeze": true, "cgroup.type": true, "cgroup.max.depth": true, "cgroup.max.descendants": true,
+}
+
+// pathSegs returns the non-empty segments of a cleaned slash path.
+func pathSegs(p string) []string {
+	var out []string
+	for _, s := range strings.Split(filepath.ToSlash(filepath.Clean(p)), "/") {
+		if s != "" && s != "." {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// hasSegs reports whether want occurs as consecutive segments of segs.
+func hasSegs(segs []string, want ...string) bool {
+	for i := 0; i+len(want) <= len(segs); i++ {
+		if slices.Equal(segs[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
+}
+
+// viaProcRoot reports a path through /proc/<pid>/root or /proc/<pid>/cwd (another process's view of
+// the file system, which a lexical check cannot follow).
+func viaProcRoot(segs []string) bool {
+	for i := 0; i+2 < len(segs); i++ {
+		if segs[i] == "proc" && (segs[i+2] == "root" || segs[i+2] == "cwd") {
+			return true
+		}
+	}
+	return false
+}
+
+// optValue returns the value of `--opt=value`, else w.
+func optValue(w string) string {
+	if strings.HasPrefix(w, "-") {
+		if _, v, ok := strings.Cut(w, "="); ok {
+			return v
+		}
+	}
+	return w
+}
+
+// pathForms returns the spellings of a word a cgroup check must see: the value (of `--opt=value`) as
+// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved.
+func pathForms(w, dir string) [][]string {
+	w = optValue(w)
+	if w == "" {
+		return nil
+	}
+	forms := [][]string{pathSegs(w)}
+	if dir != "" || filepath.IsAbs(w) {
+		abs := w
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(dir, abs)
+		}
+		forms = append(forms, pathSegs(abs), pathSegs(resolvePath(abs, "/")))
+	}
+	return forms
+}
+
+// cgroupPath reports a word naming the cgroup file system or one of its control files in the spellings:
+// a sys/fs/cgroup segment run (also after `//`, `/./`, `x/..`, relative to the call's directory, or
+// through a symlink), a cgroup core file base name (cgroupControlFiles), or any path through
+// /proc/<pid>/root or /proc/<pid>/cwd.
+func cgroupPath(w, dir string) bool {
+	for _, segs := range pathForms(w, dir) {
+		if len(segs) == 0 {
+			continue
+		}
+		if hasSegs(segs, "sys", "fs", "cgroup") || cgroupControlFiles[segs[len(segs)-1]] || viaProcRoot(segs) {
+			return true
+		}
+	}
+	return false
+}
+
+// sysDirTarget reports a word that is /sys or /sys/fs (from there a relative path reaches the cgroup
+// file system unseen; as a symlink target it is a new name for it), absolute or relative to dir. With
+// root, / itself counts too (`ln -s / r` makes r/sys/fs/cgroup).
+func sysDirTarget(w, dir string, root bool) bool {
+	if dir == "" && !filepath.IsAbs(optValue(w)) {
+		return false
+	}
+	forms := pathForms(w, dir)
+	if len(forms) == 0 { // an empty word (`touch ''`)
+		return false
+	}
+	for _, segs := range forms[1:] {
+		if slices.Equal(segs, []string{"sys"}) || slices.Equal(segs, []string{"sys", "fs"}) || (root && len(segs) == 0) {
+			return true
+		}
+	}
+	return false
+}
+
+func cgroupBlocked(w string) string {
+	return "blocked by guard: `" + w + "` reaches the cgroup file system; a job does not move processes out of its scope."
+}
+
+func unresolvedBlocked(w string) string {
+	return "blocked by guard: guard cannot verify the write target `" + w + "`: it is computed in this call (a " +
+		"substitution, a variable set here, a positional or indirect expansion, a symlink to a variable target), or " +
+		"it is a variable, `~user` or a path relative after a `cd` the guard cannot follow in a call that mentions the " +
+		"cgroup file system; write the path out literally."
+}
+
+var (
+	// reCgroupMention is a call that names the cgroup file system or /sys in some spelling: an
+	// unresolvable write target there could land in it.
+	reCgroupMention = regexp.MustCompile(`(?i)cgroup|(^|[^a-z0-9_.-])sys/|/sys($|[^a-z0-9_.-])|/proc/[^/\s]+/(root|cwd)`)
+	// reMaybeEmpty is an expansion that may be empty: `${…}`, `$NAME`, a positional or special
+	// parameter (an unset one splits a literal path unseen: `/sy${N}s/fs/cg"$N"roup`).
+	reMaybeEmpty = regexp.MustCompile(`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!-]`)
+	// reAnsiEscape is ANSI-C quoting with an escape (`$'\x73ys'`): its value is not decoded here.
+	reAnsiEscape = regexp.MustCompile(`\$'[^']*\\`)
+	// reHomeSet is a call that may change HOME (then `~` is not the guard's HOME).
+	reHomeSet = regexp.MustCompile(`(^|[^$A-Za-z0-9_{])HOME([^A-Za-z0-9_]|$)`)
+)
+
+// cgroupMention reports a call that names the cgroup file system or /sys (reCgroupMention) as written,
+// with ANSI-C quoting that has an escape, or once quotes, backslashes and expansions that may be empty
+// are removed (`/sy${N}s/fs/cg"$N"roup`, `/sy$'s'/fs`).
+func cgroupMention(cmd string) bool {
+	if reCgroupMention.MatchString(cmd) || reAnsiEscape.MatchString(cmd) {
+		return true
+	}
+	s := strings.NewReplacer("$'", "'", `$"`, `"`).Replace(cmd)
+	s = reMaybeEmpty.ReplaceAllString(s, "")
+	s = strings.NewReplacer(`"`, "", "'", "", `\`, "").Replace(s)
+	return reCgroupMention.MatchString(s)
+}
+
+// cgroupWriters are programs whose arguments name files they write or create: a dynamic argument of one
+// of them is an unresolvable write target.
+var cgroupWriters = map[string]bool{
+	"tee": true, "dd": true, "cp": true, "mv": true, "install": true, "ln": true, "rsync": true, "truncate": true,
+	"sed": true, "mkdir": true, "rmdir": true, "touch": true, "chmod": true, "chown": true, "mkfifo": true,
+	"mknod": true, "rm": true,
+}
+
+// cdView resolves the directories a call may change to (cd/pushd/popd in any script of the call, in any
+// order: a cd inside a subshell or after a failing one still counts, fail closed).
+type cdView struct {
+	dirs    []string // candidate working directories ("" = the call's directory is unknown: lexical checks only)
+	unknown bool     // some cd target cannot be resolved statically (variable, `cd -`, popd, CDPATH, `~user`)
+	sawCD   bool
+	// PWD, OLDPWD and DIRSTACK change with a cd; they count as set in the call (localVars).
+	home string // HOME for `~` ("" = not usable)
+}
+
+// maxCdDirs bounds the candidate directories (each cd multiplies them).
+const maxCdDirs = 64
+
+// tilde expands a leading `~` / `~/…` with the guard's HOME; ok is false for `~user`, `~+`, `~-` or
+// when HOME may be changed by the call.
+func (v *cdView) tilde(w string) (string, bool) {
+	if !strings.HasPrefix(w, "~") {
+		return w, true
+	}
+	if v.home == "" || (w != "~" && !strings.HasPrefix(w, "~/")) {
+		return "", false
+	}
+	return v.home + w[1:], true
+}
+
+// cdTarget returns the directory argument of a cd/pushd/popd argv; ok is false when it cannot be
+// resolved statically.
+func (v *cdView) cdTarget(argv []string, dyn []bool, cdpath bool) (string, bool) {
+	name := strings.ToLower(base(argv[0]))
+	if name == "popd" {
+		return "", false
+	}
+	for k := 1; k < len(argv); k++ {
+		a := argv[k]
+		if a == "--" {
+			continue
+		}
+		if a == "-" || strings.HasPrefix(a, "+") || (name == "pushd" && strings.HasPrefix(a, "-") && len(a) > 1 && a[1] >= '0' && a[1] <= '9') {
+			return "", false // OLDPWD, the directory stack
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			continue // -L, -P, -e, -@, -n
+		}
+		if dyn[k] {
+			return "", false
+		}
+		t, ok := v.tilde(a)
+		if !ok {
+			return "", false
+		}
+		if cdpath && !filepath.IsAbs(t) && t != "." && t != ".." && !strings.HasPrefix(t, "./") && !strings.HasPrefix(t, "../") {
+			return "", false
+		}
+		return t, true
+	}
+	if name == "pushd" {
+		return "", false // swaps the top two directories
+	}
+	return v.home, v.home != "" // cd alone: HOME
+}
+
+func newCdView(scripts []*script, cmd string, cfg Config) cdView {
+	v := cdView{dirs: []string{cfg.Dir}}
+	if h := os.Getenv("HOME"); filepath.IsAbs(h) && !reHomeSet.MatchString(cmd) {
+		v.home = filepath.Clean(h)
+	}
+	cdpath := strings.Contains(cmd, "CDPATH") || os.Getenv("CDPATH") != "" || strings.Contains(cmd, "cdable_vars")
+	trailing := trailingPopd(scripts)
+	var targets []string
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				st := split(c.words).start
+				argv, dyn := c.words[st:], c.dyn[st:]
+				if len(argv) == 0 {
+					continue
+				}
+				switch strings.ToLower(base(argv[0])) {
+				case "cd", "pushd", "popd", "chdir":
+					v.sawCD = true
+					if c == trailing {
+						continue // nothing runs after it: where it goes does not matter
+					}
+					if t, ok := v.cdTarget(argv, dyn, cdpath); ok {
+						targets = append(targets, t)
+					} else {
+						v.unknown = true
+					}
+				}
+			}
+		}
+	}
+	// Every order of the targets: repeat until no new directory appears (bounded).
+	for round := 0; round <= len(targets) && !v.unknown; round++ {
+		grown := false
+		for _, t := range targets {
+			for _, d := range v.dirs {
+				nd := filepath.Clean(t)
+				if !filepath.IsAbs(t) {
+					if d == "" {
+						continue // the call's directory is unknown: relative targets stay lexical
+					}
+					nd = filepath.Join(d, t)
+				}
+				if !slices.Contains(v.dirs, nd) {
+					if len(v.dirs) >= maxCdDirs {
+						v.unknown = true
+						break
+					}
+					v.dirs, grown = append(v.dirs, nd), true
+				}
+			}
+		}
+		if !grown {
+			break
+		}
+	}
+	return v
+}
+
+// trailingPopd returns the popd that is the very last command of the call (`pushd d && make > log &&
+// popd`), or nil. A trap may run code after it, so a call with a trap has none; a popd inside a loop or a
+// function body is followed by `done` or `}`, so it is not last.
+func trailingPopd(scripts []*script) *simpleCmd {
+	if len(scripts) == 0 || len(scripts[0].pipelines) == 0 {
+		return nil
+	}
+	if eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		if len(argv) > 0 && strings.ToLower(base(argv[0])) == "trap" {
+			return "trap"
+		}
+		return ""
+	}) != "" {
+		return nil
+	}
+	pls := scripts[0].pipelines
+	cmds := pls[len(pls)-1].cmds
+	c := cmds[len(cmds)-1]
+	if argv := argvOf(c.words); len(argv) > 0 && strings.ToLower(base(argv[0])) == "popd" {
+		return c
+	}
+	return nil
+}
+
+var (
+	// reVarRef is a variable expansion `$NAME` / `${NAME…}`.
+	reVarRef = regexp.MustCompile(`\$\{?([A-Za-z_][A-Za-z0-9_]*)`)
+	// reSpecialRef is a positional (`$1`, `$@`, `$*`) or indirect (`${!X}`) expansion: set by the call.
+	reSpecialRef = regexp.MustCompile(`\$\{?[0-9@*]|\$\{!`)
+	// reDefaultAssign is `${NAME:=…}` / `${NAME=…}`: an expansion that assigns NAME.
+	reDefaultAssign = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*):?=`)
+	// reLocalAssign is an assignment word `NAME=`, `NAME+=`, `NAME[i]=`.
+	reLocalAssign = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)(\[[^]]*\])?\+?=`)
+	reIdent       = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+)
+
+// varNamers name the variables they set in their arguments (assignments, bare names, attached `-aNAME`).
+var varNamers = map[string]bool{
+	"export": true, "declare": true, "typeset": true, "local": true, "readonly": true, "read": true,
+	"mapfile": true, "readarray": true, "getopts": true,
+}
+
+// localVars returns the variables a call may set itself (assignments, export/declare/local/typeset/readonly
+// with a value or not, read, mapfile/readarray, getopts, for/select, printf -v, `${NAME:=…}`, a cd's PWD);
+// all is true when any variable may be set unseen (`.`/`source` a file, a `declare -n` name reference).
+func localVars(scripts []*script, cmd string, sawCD bool) (names map[string]bool, all bool) {
+	names = map[string]bool{}
+	add := func(w string) {
+		if m := reLocalAssign.FindStringSubmatch(w); m != nil {
+			names[m[1]] = true
+		} else if reIdent.MatchString(w) {
+			names[w] = true
+		}
+	}
+	for _, m := range reDefaultAssign.FindAllStringSubmatch(cmd, -1) {
+		names[m[1]] = true
+	}
+	if sawCD {
+		names["PWD"], names["OLDPWD"], names["DIRSTACK"] = true, true, true
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				v := split(c.words)
+				for _, w := range c.words[:v.start] { // prefix assignments, `env NAME=…`
+					if m := reLocalAssign.FindStringSubmatch(w); m != nil {
+						names[m[1]] = true
+					}
+				}
+				argv := c.words[v.start:]
+				if len(argv) == 0 {
+					continue
+				}
+				add(argv[0]) // `a[0]=x`, `a+=x` are not split off as assignments
+				switch name := strings.ToLower(base(argv[0])); {
+				case name == "." || name == "source":
+					all = true
+				case name == "for" || name == "select":
+					if len(argv) > 1 {
+						add(argv[1])
+					}
+					names["REPLY"] = true
+				case name == "printf":
+					if t := printfTarget(argv[1:]); t != "" {
+						add(strings.SplitN(t, "[", 2)[0])
+					}
+				case varNamers[name]:
+					names["REPLY"], names["MAPFILE"], names["OPTARG"] = true, true, true
+					for _, a := range argv[1:] {
+						if strings.HasPrefix(a, "-") {
+							if (name == "declare" || name == "typeset" || name == "local") && strings.ContainsRune(a, 'n') {
+								all = true // name reference: assigning it assigns another variable
+							}
+							if len(a) > 2 {
+								add(a[2:])
+							}
+							continue
+						}
+						add(a)
+					}
+				}
+			}
+		}
+	}
+	return names, all
+}
+
+// computedTarget reports a dynamic word whose value the call itself produces: a command or process
+// substitution, a positional, indirect or `$_` expansion, or a variable the call sets (localVars).
+// A plain variable from the environment (`"$OUT"`) is not computed.
+func computedTarget(w string, names map[string]bool, all bool) bool {
+	if strings.Contains(w, "$(") || strings.ContainsAny(w, "`") || strings.Contains(w, "<(") ||
+		strings.Contains(w, ">(") || reSpecialRef.MatchString(w) {
+		return true
+	}
+	for _, m := range reVarRef.FindAllStringSubmatch(w, -1) {
+		if all || m[1] == "_" || names[m[1]] {
+			return true
+		}
+	}
+	return false
+}
+
+// dynLinkCmds returns the ln commands of the call with a dynamic argument: after such a link any
+// literal path may lead into the cgroup file system (`ln -s "$S" x && echo 1 > x/y/pids.max`).
+func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
+	out := map[*simpleCmd]bool{}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				st := split(c.words).start
+				if st < len(c.words) && strings.ToLower(base(c.words[st])) == "ln" && slices.Contains(c.dyn[st+1:], true) {
+					out[c] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
+// checkUserManager: a job stays in its cgroup scope. The outOfScopeTools (service manager and session
+// bus clients, cron/at, tmux/screen, pm2, docker/podman, ssh, machinectl/loginctl, unshare/nsenter) are
+// rejected as commands (behind wrappers and xargs too: argvOf strips env/sudo/timeout/xargs/…); where
+// another program runs them (find -exec, setsid, python -c, a copied binary) they and systemctl are
+// caught by scopeToolArg in unverifiable. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
+// `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
+// cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
+func checkUserManager(scripts []*script, cmd string, cfg Config) string {
+	if r := eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+		if len(argv) == 0 {
+			return ""
+		}
+		name := strings.ToLower(base(argv[0]))
+		if outOfScopeTools[name] {
+			return "blocked by guard: `" + name + "` starts processes outside the job's cgroup scope (service manager, " +
+				"session bus, scheduler, terminal multiplexer, process manager, container, ssh or namespace); a job runs " +
+				"its processes itself, inside its scope."
+		}
+		if name == "systemctl" {
+			for _, a := range argv[1:] {
+				opt, _, _ := strings.Cut(a, "=")
+				if len(opt) >= 3 && strings.HasPrefix("--user", opt) {
+					return "blocked by guard: `systemctl --user` controls the user's service manager; a job does not start " +
+						"or stop units."
+				}
+			}
+		}
+		return ""
+	}); r != "" {
+		return r
+	}
+	return checkCgroupWrites(scripts, cmd, cfg)
+}
+
+// checkCgroupWrites rejects any write into the cgroup file system: an output redirection there, or such
+// a path as an argument of a program that is not a plain reader (cgroupPath), checked
+// against every directory a cd/pushd of the call may have moved to (cdView); a cd/pushd into /sys,
+// /sys/fs or the cgroup file system, and a symlink to /, /sys or /sys/fs. Fail closed: a redirection
+// target or a writer's argument (cgroupWriters) computed in the call (computedTarget) or written after an
+// ln with a dynamic argument is rejected in any call; any variable, `~user` or relative-after-an-
+// unresolvable-cd target is rejected when the call mentions the cgroup file system (cgroupMention) or
+// has a cd the guard cannot resolve. A sed script is not a write target unless it may hold a w/W file
+// (sedScriptArgs, reSedWrite); sed's file operands are.
+func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
+	v := newCdView(scripts, cmd, cfg)
+	for _, d := range v.dirs[1:] {
+		if sysDirTarget(d, "/", false) || cgroupPath(d, "/") {
+			return cgroupBlocked("cd " + d)
+		}
+	}
+	if v.sawCD && strings.Contains(cmd, "CDPATH") {
+		return "blocked by guard: a cd with CDPATH set in the same call resolves where the guard cannot see; " +
+			"cd to an absolute or ./relative path."
+	}
+	risky := v.unknown || cgroupMention(cmd)
+	names, allVars := localVars(scripts, cmd, v.sawCD)
+	links := dynLinkCmds(scripts)
+	var cur *simpleCmd
+	// check reports a word that reaches the cgroup file system, or that is unresolvable: computed in the
+	// call, written after a symlink to a dynamic target, or any variable in a risky call.
+	check := func(w string, dyn, write bool) string {
+		if write && len(links) > 0 && !links[cur] && !isDigits(w) && !strings.HasPrefix(w, "-") && w != "/dev/null" {
+			return unresolvedBlocked(w)
+		}
+		if dyn {
+			if write && (risky || computedTarget(w, names, allVars)) {
+				return unresolvedBlocked(w)
+			}
+			if write {
+				// An unset variable may hide a cgroup control file name (`x/cgroup${N}.procs`).
+				for _, d := range v.dirs {
+					if cgroupPath(reMaybeEmpty.ReplaceAllString(w, ""), d) {
+						return cgroupBlocked(w)
+					}
+				}
+			}
+			return ""
+		}
+		t, ok := v.tilde(optValue(w))
+		if !ok {
+			if write && risky {
+				return unresolvedBlocked(w)
+			}
+			return ""
+		}
+		if t != optValue(w) {
+			w = t
+		}
+		if v.unknown && write && !filepath.IsAbs(w) && !strings.HasPrefix(w, "-") && !isDigits(w) {
+			return unresolvedBlocked(w)
+		}
+		for _, d := range v.dirs {
+			if cgroupPath(w, d) {
+				return cgroupBlocked(w)
+			}
+		}
+		return ""
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				cur = c
+				for k, t := range c.outRedirs {
+					if r := check(t, c.outDyn[k], true); r != "" {
+						return r
+					}
+				}
+				st := split(c.words).start
+				argv, dyn := c.words[st:], c.dyn[st:]
+				if len(argv) == 0 {
+					continue
+				}
+				name := strings.ToLower(base(argv[0]))
+				if gitFileReaders[name] {
+					continue
+				}
+				var sedArgs map[int]bool
+				if name == "sed" {
+					sedArgs = sedScriptArgs(argv)
+				}
+				for k := 1; k < len(argv); k++ {
+					a := argv[k]
+					write := cgroupWriters[name]
+					if script, ok := sedArgs[k]; ok {
+						write = script && reSedWrite.MatchString(a)
+					}
+					if name == "cd" || name == "pushd" || name == "popd" || name == "chdir" {
+						if !dyn[k] && cgroupPath(a, "") {
+							return cgroupBlocked(a)
+						}
+						continue // resolved by cdView
+					}
+					if r := check(a, dyn[k], write); r != "" {
+						return r
+					}
+					if !dyn[k] {
+						for _, d := range v.dirs {
+							if sysDirTarget(a, d, name == "ln") {
+								return cgroupBlocked(a)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// reSedWrite is a sed script that may hold a w/W command or an s///w flag (a file sed writes): a w at the
+// start or after `;`, a brace, a newline, an address, `!` or a closing delimiter with flags. Approximate,
+// errs toward a write.
+var reSedWrite = regexp.MustCompile(`(^|[;{}\n/0-9$!,]\s*|/[gpiImMe0-9]*)[wW]`)
+
+// sedScriptArgs returns the indices of sed's arguments that are not file operands: true for a script
+// (the first operand without -e/-f, the value of -e/--expression), false for an option value that is no
+// write target (-f/--file, -l/--line-length, an empty BSD -i suffix).
+func sedScriptArgs(argv []string) map[int]bool {
+	out := map[int]bool{}
+	explicit, operand := false, false
+	firstOperand := func(k int) {
+		if !explicit && !operand {
+			out[k], operand = true, true
+		}
+	}
+	for k := 1; k < len(argv); k++ {
+		a := argv[k]
+		switch {
+		case a == "--":
+			for k++; k < len(argv); k++ {
+				firstOperand(k)
+			}
+		case strings.HasPrefix(a, "--"):
+			opt, _, hasVal := strings.Cut(a[2:], "=")
+			switch opt {
+			case "expression", "file":
+				explicit = true
+				if !hasVal && k+1 < len(argv) {
+					k++
+				}
+				out[k] = opt == "expression"
+			case "line-length":
+				if !hasVal && k+1 < len(argv) {
+					k++
+					out[k] = false
+				}
+			}
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			for j := 1; j < len(a); j++ {
+				c := a[j]
+				if c == 'i' { // the rest is the backup suffix; BSD takes it as the next word (`-i ''`)
+					if j == len(a)-1 && k+1 < len(argv) && argv[k+1] == "" {
+						k++
+						out[k] = false
+					}
+					break
+				}
+				if c == 'e' || c == 'f' || c == 'l' { // the rest, or the next word, is the value
+					explicit = explicit || c != 'l'
+					if j == len(a)-1 && k+1 < len(argv) {
+						k++
+					}
+					out[k] = c == 'e'
+					break
+				}
+			}
+		default:
+			firstOperand(k)
+		}
+	}
+	return out
 }
 
 // checkSelf: no nested jobs. agent-jobs as a command (by name or path, behind env/command/exec/nohup,
@@ -1072,6 +1786,10 @@ func gitFile(w string) bool { return reGitFiles.MatchString(w) || reGitFiles.Mat
 // gitDir reports a word naming a `.git` directory itself.
 func gitDir(w string) bool { return strings.EqualFold(filepath.Base(pathOf(w)), ".git") }
 
+// reBraceVar is a plain `${NAME}` expansion: its braces are not a brace expansion (its value is
+// globbed like that of `$NAME`).
+var reBraceVar = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
+
 // globBlocked is the reason for a glob/brace word where a write could land: the guard does not
 // evaluate globs (dotglob, braces and `*` can all resolve to `.git`), it rejects them.
 func globBlocked(w string) string {
@@ -1121,7 +1839,7 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 					if gitFile(t) || gitDir(t) {
 						return blocked(t)
 					}
-					if hasGlob(t) {
+					if hasGlob(reBraceVar.ReplaceAllString(t, "")) {
 						return globBlocked(t)
 					}
 				}
@@ -1144,7 +1862,7 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
-					if hasGlob(a) && !findFilter {
+					if hasGlob(reBraceVar.ReplaceAllString(a, "")) && !findFilter {
 						return globBlocked(a)
 					}
 				}

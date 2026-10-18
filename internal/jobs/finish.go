@@ -2,7 +2,9 @@ package jobs
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
+	"time"
 	"unicode"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -39,15 +43,66 @@ func Printable(s string, max int) string {
 	return out
 }
 
+// CostText is a cost for people: "unknown" when it is not known (a codex job, a killed attempt), never
+// $0.00 for it.
+func CostText(cost float64, unknown bool) string {
+	if unknown {
+		return "unknown"
+	}
+	return fmt.Sprintf("$%.2f", cost)
+}
+
+// CodexLimitsNA is how the turn and budget caps of a codex job are shown: codex has none, the timeout
+// is its only limit.
+const CodexLimitsNA = "n/a (codex)"
+
+// LimitsText is a job's limits for people: turns · budget · timeout.
+func LimitsText(j *store.Job) string {
+	if j.Runner == store.RunnerCodex {
+		return fmt.Sprintf("%s turns · %s budget · %dm", CodexLimitsNA, CodexLimitsNA, j.TimeoutMinutes)
+	}
+	return fmt.Sprintf("%d turns · $%g · %dm", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
+}
+
 // DoneLine is the one line delivered to the agent's live session.
-// A job failed because processes survived it says so at the end of the line.
+// A job failed because processes survived it says so at the end of the line; a resumed attempt
+// says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 func DoneLine(j *store.Job) string {
-	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
-		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
-	if strings.HasPrefix(j.Error, ReasonSurvivors) {
+	cost := CostText(j.CostUSD, j.CostIsUnknown())
+	if j.CostIsUnknown() {
+		cost = "cost " + cost
+	}
+	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
+		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
+	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
+		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
+	}
+	if strings.Contains(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
 	}
+	if j.Attempt > 1 {
+		line += fmt.Sprintf(" · resumed (attempt %d", j.Attempt)
+		if j.RunMode == store.RunFallback {
+			line += ", fresh session"
+		}
+		line += ")"
+	}
 	return line
+}
+
+// Containment says how a launched job's processes were contained: "scope <unit>" (its own systemd user
+// scope; "…, stop pending" while a failed stop is retried) or "session only" (the weaker fallback:
+// cgroup_scope off, or auto without a working user manager). "" for a job that never launched.
+func Containment(j *store.Job) string {
+	switch {
+	case j.ScopeUnit != "" && j.ScopePending:
+		return "scope " + j.ScopeUnit + ", stop pending"
+	case j.ScopeUnit != "":
+		return "scope " + j.ScopeUnit
+	case j.StartedAt == nil:
+		return ""
+	}
+	return "session only"
 }
 
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
@@ -70,8 +125,13 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	for _, j := range jobs {
-		if err := m.sendTmux(t, DoneLine(j)); err != nil {
+		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
+			if errors.Is(err, errTmuxTimeout) {
+				// A stalled tmux (or lock holder) would cost every other line the same wait: the
+				// rest are retried next tick, the tick goes on.
+				break
+			}
 			continue
 		}
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
@@ -82,17 +142,47 @@ func (m *Manager) notifyPending() error {
 }
 
 // sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
-// on the configured tmux socket (-L) when there is one.
-func (m *Manager) sendTmux(target, line string) error {
-	bin := m.Cfg.tmuxBin()
-	line = Printable(line, 0)
-	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "-l", line)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys: %w: %s", err, strings.TrimSpace(string(out)))
+// on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its
+// end the call's process group is killed and errTmuxTimeout returned.
+func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
+	line = tmuxArgEscape(Printable(line, 0))
+	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
+		return fmt.Errorf("tmux send-keys: %w", err)
 	}
-	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "Enter")...).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys Enter: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := m.runTmux(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+		return fmt.Errorf("tmux send-keys Enter: %w", err)
 	}
 	return nil
+}
+
+// tmuxArgEscape keeps a final ';' of an argument literal. tmux parses its command-line arguments
+// for command separators (cmd-parse.y, cmd_parse_from_arguments) by the argument's final byte: one
+// ending in ';' ends a command there, and how preceding backslashes are taken varies (tmux 3.4 types
+// both "a\;" and "a\\;" as "a;"). So a line ending in ';' gets one trailing space, which keeps the
+// final byte off ';' regardless of what precedes it. It runs after Printable, which would trim the
+// space. A ';' anywhere else is literal already.
+func tmuxArgEscape(s string) string {
+	if strings.HasSuffix(s, ";") {
+		return s + " "
+	}
+	return s
+}
+
+// runTmux runs one tmux command within ctx, in a process group of its own that is killed when ctx
+// ends (WaitDelay bounds the wait for pipes a straggler may hold open).
+func (m *Manager) runTmux(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, m.Cfg.tmuxBin(), m.Cfg.tmuxArgs(args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
+	}
+	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 }
 
 func (m *Manager) cleanupDue() error {
@@ -104,6 +194,9 @@ func (m *Manager) cleanupDue() error {
 	for _, j := range jobs {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
+		}
+		if j.ScopePending {
+			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
 		if err := m.Cleanup(j); err != nil {
 			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %v", j.ID, err)

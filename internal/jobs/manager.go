@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,9 +12,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -30,6 +34,23 @@ type Manager struct {
 	// KillGrace is the wait between SIGTERM and SIGKILL of a job's process group.
 	KillGrace time.Duration
 	Log       *log.Logger
+	// Brain is the shared brain from config (brain.Disabled when not configured).
+	Brain brain.Brain
+	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
+	MemoryTimeout time.Duration
+
+	memMu        sync.Mutex
+	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
+
+	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
+
+	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
+	dailyNoteMu  sync.Mutex     // guards dailyHeld and dailySkipped
+	dailyHeld    string         // the day whose run holds dailyMu
+	dailySkipped string         // the day a skip was last logged (at most one line per day)
+	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
+	dailyPruneFn func(context.Context) (PruneReport, error)
+	dailyProcsFn func(context.Context) (ProcsReport, error)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -49,6 +70,11 @@ func Open(agent string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	br, err := brain.New(cfg.Brain, agent)
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
 	self, err := os.Executable()
 	if err == nil {
 		self, err = filepath.EvalSymlinks(self)
@@ -59,7 +85,7 @@ func Open(agent string) (*Manager, error) {
 	}
 	return &Manager{
 		Agent: agent, StateDir: dir, Cfg: cfg, Store: st, SelfBin: self,
-		Now: time.Now, KillGrace: 10 * time.Second,
+		Now: time.Now, KillGrace: 10 * time.Second, Brain: br, MemoryTimeout: MemoryNotesTimeout,
 		Log: log.New(os.Stderr, "agent-jobs["+agent+"] ", log.LstdFlags),
 	}, nil
 }
@@ -82,6 +108,10 @@ type StartRequest struct {
 	MaxTurns       int    // 0 = default
 	MaxBudgetUSD   float64
 	TimeoutMinutes int
+	// Runner is claude or codex; empty = by model (gpt-* runs on codex, everything else on claude).
+	Runner string
+	// ReasoningEffort is the codex reasoning effort (low|medium|high); empty = config, else high.
+	ReasoningEffort string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -137,6 +167,31 @@ func daemonGitEnv() []string {
 	return out
 }
 
+// jobSpawnEnv is the daemon's environment without the brain token variable (brain.token_env): a job
+// reaches the brain only through the daemon's proxy and never holds the credential.
+func (m *Manager) jobSpawnEnv() []string {
+	env := os.Environ()
+	if name := m.Cfg.Brain.TokenEnv; name != "" {
+		env = slices.DeleteFunc(env, func(kv string) bool {
+			k, _, _ := strings.Cut(kv, "=")
+			return k == name
+		})
+	}
+	return env
+}
+
+// spawnEnv is the wrapper's start environment: jobSpawnEnv, plus the user bus fallback (userBusEnv)
+// when it starts through `systemd-run --user --scope`. A scope unit runs no process of its own:
+// systemd-run execs the wrapper with this environment, so the user manager's environment never
+// reaches the job.
+func (m *Manager) spawnEnv(unit string) []string {
+	env := m.jobSpawnEnv()
+	if unit != "" {
+		env = userBusEnv(env)
+	}
+	return env
+}
+
 func git(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = daemonGitEnv()
@@ -166,9 +221,30 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	model, err := ResolveModel(r.Kind, strings.TrimSpace(r.Model), r.Complexity)
+	model, err := resolveModel(m.Cfg.Models, r.Kind, strings.TrimSpace(r.Model), r.Complexity)
 	if err != nil {
 		return nil, err
+	}
+	runner, err := ResolveRunner(r.Runner, model)
+	if err != nil {
+		return nil, err
+	}
+	effort := strings.TrimSpace(r.ReasoningEffort)
+	if err := ValidateReasoningEffort(effort); err != nil {
+		return nil, err
+	}
+	if runner == store.RunnerCodex {
+		if r.MaxTurns != 0 || r.MaxBudgetUSD != 0 {
+			return nil, errors.New("max_turns and max_budget_usd do not apply to a codex job " +
+				"(codex has no turn or budget caps; the timeout is the limit)")
+		}
+		if err := m.Cfg.checkCodexJob(r.Kind); err != nil {
+			return nil, err
+		}
+		effort = m.Cfg.reasoningEffort(effort)
+		turns, budget = 0, 0 // not enforced on codex: stored as 0, shown as n/a (codex)
+	} else if effort != "" {
+		return nil, errors.New("reasoning_effort applies only to a codex job")
 	}
 	var repo, base string
 	if r.RepoPath != "" {
@@ -193,7 +269,7 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
-		Complexity: r.Complexity, Runner: store.RunnerClaude, Billing: store.BillingSubscription,
+		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err
@@ -201,8 +277,9 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	return j, nil
 }
 
-// Tick is one daemon pass: collect finished/timed-out jobs, start queued ones (≤2 running),
-// send job-done lines, and clean up worktrees whose notify is older than the cleanup delay.
+// Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, start
+// queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
+// cleanup delay.
 func (m *Manager) Tick() error {
 	unlock, err := m.lock()
 	if err != nil {
@@ -212,6 +289,9 @@ func (m *Manager) Tick() error {
 	var errs []error
 	if err := m.collect(); err != nil {
 		errs = append(errs, fmt.Errorf("collect: %w", err))
+	}
+	if err := m.retryScopeStops(); err != nil {
+		errs = append(errs, fmt.Errorf("scope stop: %w", err))
 	}
 	if err := m.launchQueued(); err != nil {
 		errs = append(errs, fmt.Errorf("launch: %w", err))
@@ -280,35 +360,119 @@ func (m *Manager) launchQueued() error {
 			return err
 		}
 		running++
-		if err := m.launch(j, token); err != nil {
+		j.Attempt++ // as Claim counted it
+		if err := m.launch(j, token); errors.Is(err, errScopeRetry) {
+			m.Log.Printf("job %s: %v", j.ID, err)
+			if uerr := m.Store.Unclaim(j.ID, token); uerr != nil {
+				m.Log.Printf("job %s: requeue: %v", j.ID, uerr)
+			}
+			return nil // the next queued jobs would meet the same user manager
+		} else if err != nil {
 			m.Log.Printf("job %s refused to start: %v", j.ID, err)
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
 				running-- // the failed launch no longer occupies a slot
+				m.recordStatsOf(j.ID)
 			}
 		}
 	}
 	return nil
 }
 
-// ClaudeArgs is the exact reference command line (prompt.md arrives on stdin).
+// ClaudeArgs is the reference command line (prompt.md arrives on stdin) with a pre-assigned session
+// id instead of --no-session-persistence (DEVIATIONS #15): the session stays on disk so the job can
+// be resumed in it.
 func ClaudeArgs(j *store.Job, jobDir string) []string {
+	return append(claudeBaseArgs(j, jobDir), "--session-id", j.SessionID)
+}
+
+// ResumeClaudeArgs continues the job's session: the same command line with --resume <session id>.
+func ResumeClaudeArgs(j *store.Job, jobDir string) []string {
+	return append(claudeBaseArgs(j, jobDir), "--resume", j.SessionID)
+}
+
+func claudeBaseArgs(j *store.Job, jobDir string) []string {
 	return []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
 		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
 		"--permission-mode", "bypassPermissions",
 		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", "project",
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
-		"--no-session-persistence", "--add-dir", jobDir,
+		"--add-dir", jobDir,
 	}
 }
 
+// launchPlan is what one launch runs: the program (empty = claude), its arguments and the wrapper's
+// options.
+type launchPlan struct {
+	bin     string
+	args    []string
+	wrapper []string // run-wrapper options before "--" (--prompt, --fallback-prompt, --fallback-session)
+}
+
 func (m *Manager) launch(j *store.Job, token string) error {
-	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+	// Containment first: a requeued job (errScopeRetry) has nothing prepared yet (no session, no
+	// archived attempt), so Unclaim can put it back as it was.
+	unit, err := m.scopeFor(j.ID)
+	if err != nil {
 		return err
 	}
-	pid, err := m.spawn(j, token)
+	var plan launchPlan
+	var codexCfg Config
+	if j.Runner == store.RunnerCodex {
+		if j.Attempt > 1 {
+			return errCodexResume
+		}
+		// The launch is authorized by config.json as it is now, not by the daemon's startup snapshot:
+		// codex_write_allowed may have been turned off while the job was queued.
+		if codexCfg, err = reloadCodexConfig(m.StateDir); err != nil {
+			return err
+		}
+		if err := codexCfg.checkCodexJob(j.Kind); err != nil {
+			return err
+		}
+	}
+	if j.Attempt > 1 {
+		p, err := m.prepareResume(j, token)
+		if err != nil {
+			return err
+		}
+		plan = p
+	} else {
+		if j.SessionID == "" {
+			j.SessionID = NewSessionID()
+		}
+		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunNew); err != nil {
+			return fmt.Errorf("record session: %w", err)
+		}
+		if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+			return err
+		}
+		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
+		if j.Runner == store.RunnerCodex {
+			// Fail closed on system/managed config layers and on MCP servers codex would load, read where
+			// and how the job would run.
+			if err := checkCodexSystemConfig(codexSystemConfigDir); err != nil {
+				return err
+			}
+			if err := checkCodexMCP(codexCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
+				return err
+			}
+			plan = launchPlan{bin: codexCfg.codexBin(), args: CodexArgs(j, codexCfg.reasoningEffort(j.ReasoningEffort)),
+				wrapper: []string{"--runner", store.RunnerCodex}}
+		}
+	}
+	if unit != "" || j.ScopeUnit != "" {
+		// Recorded before the spawn: a daemon that dies right after it still stops the scope later. A
+		// resumed attempt runs in a new scope (same unit name) or, with cgroup_scope off, in none: the
+		// previous attempt's unit is never taken for this one's.
+		if err := m.Store.SetScope(j.ID, token, unit); err != nil {
+			return fmt.Errorf("record scope: %w", err)
+		}
+		j.ScopeUnit = unit
+	}
+	pid, err := m.spawn(j, token, unit, plan)
 	if err != nil {
 		return err
 	}
@@ -316,16 +480,31 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	if err := m.Store.SetPID(j.ID, token, pid, pid); err != nil {
 		m.Log.Printf("job %s: record pid %d: %v (adopted next tick via wrapper.json)", j.ID, pid, err)
 	}
-	m.Log.Printf("job %s started pid=%d model=%s", j.ID, pid, j.Model)
+	containment := "session only"
+	if unit != "" {
+		containment = "scope " + unit
+	}
+	m.Log.Printf("job %s started pid=%d runner=%s model=%s containment=%s", j.ID, pid, j.Runner, j.Model, containment)
 	return nil
 }
 
 // spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
-func (m *Manager) spawn(j *store.Job, token string) (int, error) {
+// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
+// the new scope (same pid).
+func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
 	dir := m.JobDir(j.ID)
-	args := append([]string{"run-wrapper", dir, "--token", token, "--", m.Cfg.claudeBin()}, ClaudeArgs(j, dir)...)
-	cmd := exec.Command(m.SelfBin, args...)
+	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
+	bin := plan.bin
+	if bin == "" {
+		bin = m.Cfg.claudeBin()
+	}
+	argv = append(append(argv, "--", bin), plan.args...)
+	if unit != "" {
+		argv = append(scopeArgv(unit, fmt.Sprintf("agent-jobs job %s (agent %s)", j.ID, m.Agent), m.KillGrace), argv...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(dir, "work")
+	cmd.Env = m.spawnEnv(unit)
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
@@ -379,6 +558,57 @@ func verifyGroup(pid, pgid int) error {
 	}
 	if got != pgid {
 		return fmt.Errorf("wrapper pid %d is in process group %d, not %d", pid, got, pgid)
+	}
+	return nil
+}
+
+// killJob ends a running job (timeout, cancel): its whole scope when it has one, else (or when the
+// stop fails) its wrapper's process group.
+func (m *Manager) killJob(j *store.Job, pid, pgid int) {
+	if j.ScopeUnit != "" {
+		err := m.stopScope(j.ID)
+		if err == nil {
+			return
+		}
+		m.Log.Printf("job %s: stop scope: %v; falling back to the process group", j.ID, err)
+	}
+	if pgid != 0 {
+		m.killGroup(j.ID, pid, pgid)
+	}
+}
+
+// endScope stops a scoped job's unit before its row turns terminal (a no-op for an already collected
+// scope and for jobs without one). An error means the unit could still hold live processes: the stop is
+// then recorded as pending (before the row turns terminal) and retried every tick (retryScopeStops).
+func (m *Manager) endScope(j *store.Job) error {
+	if j.ScopeUnit == "" {
+		return nil
+	}
+	err := m.stopScope(j.ID)
+	if err != nil {
+		if perr := m.Store.SetScopePending(j.ID, true); perr != nil {
+			m.Log.Printf("job %s: record pending scope stop: %v", j.ID, perr)
+		}
+	}
+	return err
+}
+
+// retryScopeStops retries every pending scope stop (a stop that failed when the job ended) until the
+// unit is gone; only then is the pending mark cleared.
+func (m *Manager) retryScopeStops() error {
+	pending, err := m.Store.ScopePending()
+	if err != nil {
+		return err
+	}
+	for _, j := range pending {
+		if err := m.stopScope(j.ID); err != nil {
+			m.Log.Printf("job %s: scope stop still failing (retry next tick): %v", j.ID, err)
+			continue
+		}
+		if err := m.Store.SetScopePending(j.ID, false); err != nil {
+			return err
+		}
+		m.Log.Printf("job %s: scope stopped on retry", j.ID)
 	}
 	return nil
 }
@@ -444,7 +674,7 @@ func (m *Manager) adopt(j *store.Job, now time.Time) bool {
 		return true
 	}
 	if j.StartedAt != nil && now.Sub(*j.StartedAt) > LaunchGrace {
-		m.finish(j, store.StatusFailed, StreamResult{}, 0,
+		m.finish(j, store.StatusFailed, StreamResult{}, false, 0,
 			"launch interrupted: the wrapper never registered (no valid wrapper.json); work dir kept", now)
 	}
 	return false
@@ -467,61 +697,193 @@ func (m *Manager) collect() error {
 		}
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
+			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 			status, msg := Verdict(code, res, dir)
-			m.finish(j, status, res, dur, msg, now)
+			m.finish(j, status, res, false, dur, msg, now)
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
-			m.killGroup(j.ID, j.PID, j.PGID)
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
-			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
+			m.killJob(j, j.PID, j.PGID)
+			res, killed := killedResult(j.Runner, dir)
+			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
-			code, ok := readExitCode(dir)
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
-			if ok {
+			if code, ok := readExitCode(dir); ok {
+				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 				status, msg := Verdict(code, res, dir)
-				m.finish(j, status, res, dur, msg, now)
+				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}
-			m.finish(j, store.StatusFailed, res, dur, "wrapper died without writing exit_code (see stderr.log)", now)
+			res, killed := killedResult(j.Runner, dir)
+			m.finish(j, store.StatusFailed, res, killed, dur, "wrapper died without writing exit_code (see stderr.log)", now)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
+// killedResult is the stream result of an attempt the daemon ended by a kill, or whose wrapper died.
+// Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
+// stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
+// the assistant turns are counted and the cost is unknown (killed is true).
+func killedResult(runner, dir string) (res StreamResult, killed bool) {
+	p := filepath.Join(dir, "stream.jsonl")
+	if _, ok := readExitCode(dir); ok {
+		return parseRunnerStream(runner, p), false
+	}
+	if runner == store.RunnerCodex {
+		return StreamResult{Runner: runner, Turns: ParseCodexStream(p).Turns}, true
+	}
+	return StreamResult{Turns: streamTurns(p)}, true
+}
+
+// finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
+// failed attempt can be resumed, so what it left outside its process group is swept first.
+func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) {
+	m.noteFallback(j)
+	// Whatever ended the job, nothing of it may outlive the row turning terminal.
+	if err := m.endScope(j); err != nil {
+		// Fail closed: the job is over for the daemon, but it must not count as a clean finish.
+		m.Log.Printf("job %s: %v", j.ID, err)
+		note := ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
+		if status == store.StatusTimeout {
+			msg = Printable(msg+"; "+note, 300)
+		} else {
+			status, msg = store.StatusFailed, Printable(note, 300)
+		}
+	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
 	}
+	if status == store.StatusTimeout || status == store.StatusFailed {
+		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
+	}
+	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
+	m.recordStatsOf(j.ID)
+}
+
+// noteSweep appends the sweep's note (if any) to a job that is no longer running.
+func (m *Manager) noteSweep(id, note string) {
+	if note == "" {
+		return
+	}
+	m.Log.Printf("job %s: %s", id, note)
+	if err := m.Store.AppendError(id, note); err != nil {
+		m.Log.Printf("job %s: record note: %v", id, err)
+	}
+}
+
+// recordAttemptEnd records, for a finished attempt, whether its cost is unknown (killed, or claude ran
+// but no result event came) and the digest of its session transcript (checked before the session is
+// resumed). Call it after the sweep: nothing of the job may change the transcript after the digest.
+func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) {
+	dir := m.JobDir(j.ID)
+	// Codex reports no price: a codex attempt's cost is always unknown.
+	fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl"))
+	if killed || j.Runner == store.RunnerCodex || (!res.Found && err == nil && fi.Size() > 0) {
+		if err := m.Store.SetCostUnknown(j.ID); err != nil {
+			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
+		}
+	}
+	digest := ""
+	if p := m.transcriptPath(j); p != "" {
+		d, err := sessionDigest(p, j.SessionID)
+		if err != nil {
+			m.Log.Printf("job %s: session digest: %v", j.ID, err)
+		}
+		digest = d
+	}
+	if err := m.Store.SetSessionDigest(j.ID, digest); err != nil {
+		m.Log.Printf("job %s: record session digest: %v", j.ID, err)
+	}
+}
+
+// sweepEscaped ends what a stopped, cancelled, timed-out or failed job left outside its process group (a process that
+// called setpgid, found by the job marker or the job's session, as doctor procs --kill does) and
+// returns a note for the job: what was killed, what was left running (a process leading its own
+// session may host other work and is never killed), or that it could not be checked.
+func (m *Manager) sweepEscaped(id string) string {
+	rep, err := m.doctorProcs(true, id)
+	if err != nil {
+		return "processes outside the job's process group not checked: " + err.Error()
+	}
+	if !rep.Supported {
+		return "processes outside the job's process group not checked (needs Linux /proc)"
+	}
+	var notes, left []string
+	if rep.Killed > 0 {
+		notes = append(notes, fmt.Sprintf("%d process(es) outside the job's process group killed", rep.Killed))
+	}
+	for _, g := range rep.Ghosts {
+		if g.Killed {
+			continue
+		}
+		why := "leads its own session, never killed"
+		if g.KillError != "" {
+			why = g.KillError
+		}
+		left = append(left, fmt.Sprintf("pid %d %s (%s)", g.PID, Printable(g.Cmdline, 80), why))
+	}
+	if len(left) > 0 {
+		notes = append(notes, "left running: "+strings.Join(left, ", ")+"; see doctor procs")
+	}
+	return strings.Join(notes, "; ")
+}
+
+// killRunning ends a running job (cancel, stop): its whole scope when it has one, else its wrapper's
+// process group (SIGTERM, KillGrace, SIGKILL). Callers hold the lifecycle lock and the job's admit lock.
+func (m *Manager) killRunning(j *store.Job) {
+	pid, pgid := j.PID, j.PGID
+	if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
+		if w, err := ReadWrapperInfo(m.JobDir(j.ID)); err == nil && w.Token == j.LaunchToken {
+			pid, pgid = w.PID, w.PGID
+		}
+	}
+	m.killJob(j, pid, pgid)
 }
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
-// exit 0 without a report is a failure.
+// exit 0 without a report is a failure; so is a codex exit 0 whose stream has no terminal turn.completed.
 // A sweep marker (processes outlived claude) fails the job whatever claude's exit was.
 func Verdict(code int, res StreamResult, dir string) (string, string) {
 	if reason := sweepFailure(dir); reason != "" {
 		return store.StatusFailed, reason
 	}
+	// Closed by the idle-after-result rule: the wrapper judged the last result (exit_code 0/1); the
+	// row records the rule either way.
+	if reason := idleClosedReason(dir); reason != "" {
+		if code != 0 || res.IsError || !hasReport(dir) {
+			return store.StatusFailed, reason
+		}
+		return store.StatusSucceeded, reason
+	}
 	if code != 0 {
-		return store.StatusFailed, fmt.Sprintf("claude exited with code %d", code)
+		return store.StatusFailed, fmt.Sprintf("%s exited with code %d", res.program(), code)
 	}
 	if res.IsError {
-		return store.StatusFailed, "claude result is an error: " + res.Subtype
+		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
-	if err != nil || strings.TrimSpace(string(b)) == "" {
+	if res.Runner == store.RunnerCodex {
+		if reason := codexStreamFailure(res); reason != "" {
+			return store.StatusFailed, reason
+		}
+	}
+	if !hasReport(dir) {
 		return store.StatusFailed, "exit 0 without a report"
 	}
 	return store.StatusSucceeded, ""
 }
 
-// Cancel stops a queued or running job. Final statuses cannot be cancelled.
+func hasReport(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
+	return err == nil && strings.TrimSpace(string(b)) != ""
+}
+
+// Cancel stops a queued or running job, or gives up a stopped one (its work dir is then cleaned up
+// like any finished job's). Final statuses cannot be cancelled.
 func (m *Manager) Cancel(id string) error {
 	unlock, err := m.lock()
 	if err != nil {
@@ -541,24 +903,47 @@ func (m *Manager) Cancel(id string) error {
 	defer unlockAdmit()
 	switch j.Status {
 	case store.StatusQueued:
+	case store.StatusStopped:
+		// Nothing runs; keep the turns, cost and duration recorded at the stop.
+		if err := m.Store.Finish(id, "", store.StatusCancelled, j.Turns, j.CostUSD, j.DurationSec, "cancelled after stop", m.Now()); err != nil {
+			return err
+		}
+		m.recordStatsOf(id) // the job's stats row turns from stopped into cancelled
+		return nil
 	case store.StatusRunning:
-		pid, pgid := j.PID, j.PGID
-		if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
-			if w, err := ReadWrapperInfo(m.JobDir(id)); err == nil && w.Token == j.LaunchToken {
-				pid, pgid = w.PID, w.PGID
-			}
-		}
-		if pgid != 0 {
-			m.killGroup(id, pid, pgid)
-		}
+		m.killRunning(j)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}
 	now := m.Now()
+	if j.Status == store.StatusQueued {
+		// Never ran: stream.jsonl, if any, is the previous attempt's, already in the attempts table.
+		if err := m.Store.Finish(id, "", store.StatusCancelled, 0, 0, 0, "cancelled", now); err != nil {
+			return err
+		}
+		m.recordStatsOf(id)
+		return nil
+	}
 	dur := 0
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
-	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
-	return m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now)
+	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
+	res, killed := killedResult(j.Runner, m.JobDir(id))
+	msg := "cancelled"
+	if err := m.endScope(j); err != nil {
+		m.Log.Printf("job %s: %v", id, err)
+		msg = Printable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
+	}
+	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+		return err
+	}
+	if killed {
+		if err := m.Store.SetCostUnknown(id); err != nil {
+			m.Log.Printf("job %s: mark cost unknown: %v", id, err)
+		}
+	}
+	m.noteSweep(id, m.sweepEscaped(id))
+	m.recordStatsOf(id)
+	return nil
 }

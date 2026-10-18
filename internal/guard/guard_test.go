@@ -1164,3 +1164,320 @@ func TestJobMarkerSurvivesAllowedCommands(t *testing.T) {
 		}
 	}
 }
+
+// Relative paths are resolved against the call's directory.
+func TestCgroupPathRelativeToCallDir(t *testing.T) {
+	for _, c := range []struct {
+		dir, cmd string
+		block    bool
+	}{
+		{"/sys/fs", `echo $$ > cgroup/x/y`, true},
+		{"/sys", `tee fs/cgroup/x/y < f`, true},
+		{"/", `cd sys`, true},
+		{"/", `cd sys/fs`, true},
+		{"/home/u/repo", `cd sys`, false},
+		{"/home/u/repo", `echo x > fs/cgroup/y`, false},
+	} {
+		if got := Check(c.cmd, Config{Dir: c.dir}); (got != "") != c.block {
+			t.Errorf("Check(%q) in %s = %q, want block=%v", c.cmd, c.dir, got, c.block)
+		}
+	}
+}
+
+// A job stays in its cgroup scope: no new units through the user's service manager or bus, no writes
+// into the cgroup file system (docs/ARCHITECTURE.md, «Cgroup containment»).
+func TestCheckUserManagerAndCgroupFS(t *testing.T) {
+	cfg := Config{}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"systemd-run scope", `systemd-run --user --scope sleep 600`, true},
+		{"systemd-run path", `/usr/bin/systemd-run --user -t bash`, true},
+		{"systemd-run behind nohup", `nohup systemd-run --user sleep 9 &`, true},
+		{"systemd-run in sh -c", `sh -c 'systemd-run --user --scope sleep 9'`, true},
+		{"systemd-run find -exec", `find . -exec systemd-run --user {} \;`, true},
+		{"busctl", `busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 x y`, true},
+		{"dbus-send", `dbus-send --session --dest=org.freedesktop.systemd1 /x y`, true},
+		{"gdbus", `gdbus call --session -d org.freedesktop.systemd1 -o / -m x`, true},
+		{"dbus-run-session", `dbus-run-session -- ./run.sh`, true},
+		{"systemctl --user start", `systemctl --user start x.service`, true},
+		{"systemctl --user after verb", `systemctl start x.service --user`, true},
+		{"systemctl abbreviated", `systemctl --us start x.service`, true},
+		{"systemctl --user=", `systemctl --user=yes stop x`, true},
+		{"echo into cgroup.procs", `echo $$ > /sys/fs/cgroup/user.slice/cgroup.procs`, true},
+		{"tee into cgroup", `echo 1 | tee /sys/fs/cgroup/x/cgroup.procs`, true},
+		{"cd into cgroupfs", `cd /sys/fs/cgroup/user.slice`, true},
+		// Respelled cgroup paths (security review of PR #10).
+		{"double slash", `echo $$ > /sys//fs/cgroup/user.slice/cgroup.procs`, true},
+		{"dot segment", `echo $$ > /sys/fs/./cgroup/x/cgroup.procs`, true},
+		{"dotdot", `echo $$ > /sys/fs/x/../cgroup/y/cgroup.procs`, true},
+		{"proc root", `echo $$ > /proc/1/root/sys/fs/cgroup/x/cgroup.procs`, true},
+		{"proc self root", `tee /proc/self/root/s/cgroup.x < f`, true},
+		{"proc cwd", `cp f /proc/1/cwd/x`, true},
+		{"relative after cd", `cd /sys/fs && echo $$ > cgroup/app.slice/cgroup.procs`, true},
+		{"cd /sys", `cd /sys`, true},
+		{"cd /sys/fs", `cd /sys/fs/`, true},
+		{"pushd /sys/fs", `pushd //sys/./fs`, true},
+		{"relative cgroup.threads", `echo 1 > x/cgroup.threads`, true},
+		{"subtree_control", `echo +pids > cgroup.subtree_control`, true},
+		{"--opt=value", `install --target-directory=/sys/fs/cgroup/x f`, true},
+		{"ln to cgroupfs", `ln -s /sys/fs/cgroup c`, true},
+		// Indirect and wrapped spellings of the user manager tools.
+		{"xargs systemctl", `echo --user start x | xargs systemctl`, true},
+		{"xargs qdbus", `echo x | xargs qdbus`, true},
+		{"sudo systemctl --user", `sudo systemctl --user start x`, true},
+		{"env systemctl --user", `env A=1 systemctl --user start x`, true},
+		{"timeout systemd-run", `timeout 5 systemd-run --user sleep 9`, true},
+		{"env qdbus", `env qdbus org.x /`, true},
+		{"python systemctl", `python3 -c 'import os; os.system("systemctl --user start x")'`, true},
+		{"python systemd-run", `python3 -c 'import subprocess; subprocess.run(["systemd-run", "--user", "x"])'`, true},
+		{"find -exec systemctl", `find . -exec systemctl --user start {} \;`, true},
+		{"cd sys in repo ok", `cd sys`, false},
+		{"systemctl status ok", `systemctl status nginx`, false},
+		{"systemctl --runtime ok", `systemctl --runtime status nginx`, false},
+		{"cat cgroup ok", `cat /sys/fs/cgroup/cgroup.controllers`, false},
+		{"grep systemd-run ok", `grep -rn systemd-run docs`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
+// Fix loop 1 of PR #10: writes whose target reaches the cgroup file system only after a variable, a
+// `~`, a cd chain or a symlink, and the programs that start processes outside the job's scope
+// (owner decision 2026-10-17).
+func TestCgroupWritesResolvedAndOutOfScopeTools(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	scope := "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice"
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"variable redirect target", `D=` + scope + `/cgroup.procs; echo $$ > $D`, true},
+		{"quoted variable target", `D="` + scope + `/cgroup.procs"; echo $$ > "$D"`, true},
+		{"backtick target", "echo 1 > `cat f`/cgroup.procs", true},
+		{"variable tee target", `D=` + scope + `/x; echo 1 | tee $D`, true},
+		{"variable dd of=", `D=` + scope + `/x; echo 1 | dd of=$D`, true},
+		{"var base name", `f=cgroup.procs; cd ~/../../sys && echo 1 > fs/cgroup/x/$f`, true},
+		{"tilde cd to sys", `cd ~/../../sys`, true},
+		{"tilde redirect", `echo 1 > ~/../../sys/fs/cgroup/x/pids.max`, true},
+		{"cd chain", `cd /; cd sys; cd fs/cgroup/x/agent-jobs-a-1.scope; echo 1 > cgroup.kill`, true},
+		{"cd chain freeze", `cd /; cd sys; cd fs; echo 1 > cgroup/x/y`, true},
+		{"cd chain pids.max", `cd /sys/fs/cgroup/x.scope; echo 0 > pids.max`, true},
+		{"cd / then relative", `cd / && echo 1 > sys/fs/cgroup/x/memory.max`, true},
+		{"cd in sh -c", `sh -c 'cd /; cd sys; cd fs/cgroup; echo 1 > x/pids.max'`, true},
+		{"CDPATH", `CDPATH=/ cd sys`, true},
+		{"cd -", `cd -; echo 1 > fs/cgroup/x`, true},
+		{"cd variable then relative write", `cd "$X" && echo 1 > pids.max`, true},
+		{"popd then relative write", `popd; echo 1 > memory.max`, true},
+		{"cgroup.kill relative", `echo 1 > x/cgroup.kill`, true},
+		{"ln -s /sys", `ln -s /sys cg`, true},
+		{"ln -s /", `ln -s / r && cd r/sys`, true},
+		{"ln -s /sys/fs", `ln -sf /sys/fs cg`, true},
+		{"crontab", `echo '* * * * * true' | crontab -`, true},
+		{"at", `echo true | at now`, true},
+		{"batch", `echo true | batch`, true},
+		{"tmux", `tmux new -d sleep 999`, true},
+		{"screen", `screen -dmS x sleep 999`, true},
+		{"pm2", `pm2 start sleep -- 999`, true},
+		{"docker", `docker run -d alpine sleep 999`, true},
+		{"docker-compose", `docker-compose up -d`, true},
+		{"podman", `podman run -d alpine sleep 9`, true},
+		{"ssh", `ssh localhost sleep 999`, true},
+		{"machinectl", `machinectl shell .host`, true},
+		{"loginctl", `loginctl enable-linger`, true},
+		{"unshare", `unshare -rC sh -c id`, true},
+		{"nsenter", `nsenter -t 1 -a`, true},
+		{"qdbus-qt5", `qdbus-qt5 org.freedesktop.systemd1`, true},
+		{"qdbus6", `qdbus6 org.freedesktop.systemd1`, true},
+		{"nohup tmux", `nohup tmux new -d x &`, true},
+		{"xargs crontab", `echo f | xargs crontab`, true},
+		{"find -exec tmux", `find . -exec tmux new -d {} \;`, true},
+		{"python crontab", `python3 -c 'import os; os.system("crontab -l")'`, true},
+		{"rsync -e ssh", `rsync -e ssh a b:`, true},
+		// Ordinary calls stay allowed.
+		{"variable redirect elsewhere", `echo 1 > "$OUT"`, false},
+		{"tee variable elsewhere", `go test ./... 2>&1 | tee "$LOG"`, false},
+		{"cd literal then write", `cd sub && echo 1 > out.txt 2>&1`, false},
+		{"cd tilde then write", `cd ~/work && make > build.log 2>&1`, false},
+		{"cd literal then go test", `cd internal && go test ./...`, false},
+		{"cd variable then reader", `cd "$X" && ls -la`, false},
+		{"cd variable then fd dup", `cd "$X" && make 2>&1`, false},
+		{"ln literal", `ln -s ../shared x`, false},
+		{"grep tmux", `grep -rn tmux docs`, false},
+		{"echo at", `echo look at this`, false},
+		{"git log", `git log --oneline -3`, false},
+		{"cat proc self cgroup", `cat /proc/self/cgroup`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
+// Fix loop 2 of PR #10: a write target built inside the call (substitution, a variable assigned in the
+// same call, a symlink to a dynamic target) is rejected without any cgroup mention; the out-of-scope
+// tool names count only where they run (command word, code strings, -exec argv, runners), so build and
+// test calls that merely name a package or directory after them stay allowed; a cd to a resolved
+// directory and a trailing popd make no plain variable target risky.
+func TestDynamicWriteTargetsAndScopeToolMentions(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// Write targets that get their value inside the call.
+		{"redirect to substitution", `echo $$ > $(cat t)`, true},
+		{"assigned from substitution", `P=$(cat t); echo $$ > $P`, true},
+		{"read into variable", `read p < t; echo $$ > $p`, true},
+		{"redirect to $(< f)", `echo $$ > "$(< t)"`, true},
+		{"tee substitution", `echo $$ | tee $(cat t)`, true},
+		{"dd of= substitution", `dd of=$(cat t)`, true},
+		{"base64 target", `echo $$ > $(base64 -d <<< L3N5cy9mcy9jZ3JvdXAvY2dyb3VwLnByb2Nz)`, true},
+		{"backtick target", "echo $$ > `cat t`", true},
+		{"process substitution target", `echo $$ > >(cat > x)`, true},
+		{"mapfile", `mapfile -t a < t; echo $$ > "$a"`, true},
+		{"readarray", `readarray a < t; echo $$ > $a`, true},
+		{"for loop variable", `for p in $(cat t); do echo $$ > $p; done`, true},
+		{"declare", `declare p; p=$(cat t); echo $$ > "$p"`, true},
+		{"export assignment", `export P=$(cat t) && echo $$ > "$P"`, true},
+		{"local", `f() { local p; read p < t; echo $$ > $p; }; f`, true},
+		{"typeset", `typeset p; read p < t; tee "$p" < /dev/null`, true},
+		{"printf -v", `printf -v p %s "$(cat t)"; echo $$ > $p`, true},
+		{"default expansion assigns", `: ${P:=x}; echo $$ > $P`, true},
+		{"indirect expansion", `echo $$ > ${!X}`, true},
+		{"positional after set", `set -- $(cat t); echo $$ > $1`, true},
+		{"positional in sh -c", `bash -c 'echo $$ > $1' _ "$(cat t)"`, true},
+		{"last argument", `cat $(cat t) >/dev/null; echo $$ > $_`, true},
+		{"sourced variables", `. ./vars.sh; echo $$ > "$P"`, true},
+		{"cp to substitution", `cp f "$(cat t)"`, true},
+		{"mkdir substitution", `mkdir -p $(cat t)/x`, true},
+		{"symlink to dynamic target then write", `ln -s $S x && echo 1 > x/y/memory.max`, true},
+		{"symlink to dynamic target then tee", `ln -s "$S" x; echo 1 | tee x/y/pids.max`, true},
+		{"symlink to substitution", `ln -s $(cat t) x`, true},
+		// Plain environment variables stay allowed.
+		{"env variable redirect", `echo 1 > "$OUT"`, false},
+		{"env variable braces", `echo 1 >> "${OUT}"`, false},
+		{"env variable tee", `go test ./... 2>&1 | tee "$LOG"`, false},
+		{"env variable cp", `cp a.txt "$OUT"`, false},
+		{"other variable assigned", `X=1 make > "$OUT"`, false},
+		{"substitution not a target", `echo "$(date)" > out.txt`, false},
+		{"symlink to env alone", `ln -s "$S" x`, false},
+		// Out-of-scope tool names as data (false refusals of fix loop 1).
+		{"go test ssh package", `go test ./internal/ssh/...`, false},
+		{"go build docker package", `go build ./pkg/docker/`, false},
+		{"go test -run Tmux", `go test -run Tmux ./internal/jobs/`, false},
+		{"sed ssh url", `sed -i s/ssh:/https:/ README.md`, false},
+		{"make -C docker", `make -C docker`, false},
+		{"make docker-build", `make docker-build`, false},
+		{"npm run docker", `npm run docker`, false},
+		// ... and where they run, still refused.
+		{"ssh host", `ssh host`, true},
+		{"docker run", `docker run x`, true},
+		{"tmux new", `tmux new -d`, true},
+		{"nohup tmux", `nohup tmux new -d x &`, true},
+		{"xargs docker", `echo x | xargs docker rm`, true},
+		{"find -exec ssh", `find . -exec ssh h {} \;`, true},
+		{"python -c tmux", `python3 -c "subprocess.run(['tmux'])"`, true},
+		{"bash -c pm2", `bash -c 'pm2 start x'`, true},
+		{"node -e docker", `node -e 'require("child_process").execSync("docker run x")'`, true},
+		{"perl -e cluster", `perl -ne 'system("tmux new -d x")' f`, true},
+		{"rsync -e ssh", `rsync -e ssh a b:`, true},
+		{"go test -exec", `go test -exec 'tmux new -d' ./...`, true},
+		{"setsid tmux", `setsid tmux new -d x`, true},
+		{"watch tmux", `watch 'tmux new -d x'`, true},
+		{"awk system", `awk 'BEGIN { system("crontab f") }'`, true},
+		{"trap tmux", `trap 'tmux new -d x' EXIT`, true},
+		{"cp tmux binary", `cp /usr/bin/tmux ./x`, true},
+		// cd to a resolved directory, trailing popd.
+		{"cd then cp to env", `cd sub && cp a.txt "$OUT"`, false},
+		{"cd then touch env", `cd sub && touch $F`, false},
+		{"cd then tee env", `cd x && go test ./... 2>&1 | tee "$LOG"`, false},
+		{"pushd make popd", `pushd sub && make > log && popd`, false},
+		{"popd then write", `pushd sub && popd && echo 1 > memory.max`, true},
+		{"popd then substitution", `pushd sub; popd; echo "$(echo 1 > memory.max)"`, true},
+		{"popd in loop", `for i in 1 2; do echo 1 > memory.max; popd; done`, true},
+		{"popd then function", `f() { echo 1 > memory.max; }; popd; f`, true},
+		{"popd with trap", `trap 'echo 1 > memory.max' EXIT; popd`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
+// Final fix of PR #10: a cgroup path split by an unset variable or spelled with ANSI-C quoting is
+// refused like the plain path; coproc runs its command like a plain command word; a sed script is not
+// a write target (only its file operands and w/W file targets are).
+func TestCgroupPathSplitCoprocAndSedScripts(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	procs := "/user.slice/user-1000.slice/user@1000.service/app.slice/cg${N}roup.procs"
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		{"braced unset variable", `echo $$ > /sy${N}s/fs/cg${N}roup` + procs, true},
+		{"quoted unset variable", `echo $$ > /sy"$N"s/fs/cg"$N"roup/x/cg"$N"roup.procs`, true},
+		{"default expansion split", `echo $$ > /sy${N:-}s/fs/cg${N-}roup/x/y`, true},
+		{"positional split", `echo $$ > /sy"$1"s/fs/cg"$1"roup/x/y`, true},
+		{"tee split", `echo $$ | tee /sy${N}s/fs/cg${N}roup/x/y`, true},
+		{"cp split", `cp f /sy${N}s/fs/cg${N}roup/x/y`, true},
+		{"ansi-c plain", `echo $$ > /sy$'s'/fs/cg$'r'oup/x/y`, true},
+		{"ansi-c escapes", `echo $$ > $'/\x73ys/fs/c\x67roup/x/y'`, true},
+		{"ansi-c escape tee", `echo $$ | tee $'\x2fsys/fs/x/y'`, true},
+		{"split control file name", `echo $$ > x/cgroup${N}.procs`, true},
+		{"coproc docker", `coproc docker run x`, true},
+		{"coproc tmux", `coproc tmux new -d`, true},
+		{"coproc systemd-run", `coproc systemd-run --user sleep 1`, true},
+		{"sed w to computed", `sed -n "w $(cat t)" f`, true},
+		{"sed s///w to computed", `P=$(cat t); sed "s/a/b/w $P" f`, true},
+		{"sed w to cgroup", `sed -n 'w /sys/fs/cgroup/x/cgroup.procs' f`, true},
+		{"sed file operand computed", `sed -i s/a/b/ "$(cat t)"`, true},
+		{"sed -e then computed file", `V=1; sed -e "s/x/$V/" "$(cat t)"`, true},
+		// Allowed.
+		{"sed version bump", `V=1.2.3; sed -i "s/old/$V/" version.txt`, false},
+		{"sed changelog date", `sed -i "s/x/$(date +%F)/" CHANGELOG.md`, false},
+		{"sed -e substitution", `sed -i -e "s/x/$(date +%F)/" -e 's/a/b/' CHANGELOG.md`, false},
+		{"sed --expression=", `V=2; sed --expression="s/v1/$V/" f`, false},
+		{"sed -E -i cluster", `V=2; sed -Ei "s/v1/$V/" f`, false},
+		{"touch empty word", `touch ''`, false},
+		{"sed bsd empty suffix", `V=2; sed -i '' "s/old/$V/" f`, false},
+		{"sed script after unknown cd", `cd "$X" && sed -i s/a/b/ /home/u/work/f.txt`, false},
+		{"sed file after unknown cd", `cd "$X" && sed -i s/a/b/ f.txt`, true},
+		{"env variable braces", `echo 1 >> "${OUT}"`, false},
+		{"ansi-c newline elsewhere", `printf $'a\n' > out.txt`, false},
+		{"coproc plain", `coproc cat`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -54,8 +57,81 @@ type Config struct {
 	GitEmail string `json:"git_email"`
 	// ClaudeBin overrides the claude binary (env AGENT_JOBS_CLAUDE_BIN wins).
 	ClaudeBin string `json:"claude_bin"`
+	// CodexBin overrides the codex binary of codex jobs (env AGENT_JOBS_CODEX_BIN wins).
+	CodexBin string `json:"codex_bin"`
+	// CodexWriteAllowed lets codex jobs of kind fix/general run with the workspace-write sandbox. Off by
+	// default: the guard hook does not run inside codex, so only read-only codex jobs (review, research)
+	// are allowed unless the owner turns this on (DEVIATIONS #5).
+	CodexWriteAllowed bool `json:"codex_write_allowed"`
+	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
+	CodexReasoningEffort string `json:"codex_reasoning_effort"`
+	// Models overrides cells of the kind × complexity model table (DEVIATIONS #6), e.g.
+	// {"review": {"hard": "gpt-6.1-sol"}}. A gpt-* model runs the job on codex. Unset cells keep the defaults.
+	Models map[string]map[string]string `json:"models"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
+	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
+	// and the memory notes of a brief. Empty = not configured: those tools say so, briefs carry no notes.
+	Brain brain.Config `json:"brain"`
+	// CgroupScope is the containment of a job's processes (env AGENT_JOBS_CGROUP_SCOPE wins):
+	// "auto" (default) = its own transient systemd user scope when `systemd-run --user` works, else the
+	// weaker session containment; "required" = a job that cannot get a scope is refused; "off" = never.
+	CgroupScope string `json:"cgroup_scope"`
+	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
+	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
+	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
+	TrashRoots []string `json:"trash_roots"`
+	// LogArchiveDir is where prune moves the records of a cleaned job for later analysis
+	// (<dir>/<YYYY-MM>/<id>/). Default: <state>/archive. Absolute; may be another disk or a synced folder.
+	LogArchiveDir string `json:"log_archive_dir"`
+	// LogArchiveDays is how long archived months are kept (prune deletes older ones). Nil = 365, 0 = forever.
+	LogArchiveDays *int `json:"log_archive_days"`
+	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
+	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
+	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
+	// the rule off (claude's own exit or the timeout ends the job).
+	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
+	// DailyHour is the local hour (0..23) after which the daemon runs the daily automation (prune and
+	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
+	DailyHour *int `json:"daily_hour"`
+	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
+	DailyOff bool `json:"daily_off"`
+}
+
+// DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
+const DefaultDailyHour = 4
+
+// DailyAt returns the local hour after which the daily automation runs.
+func (c Config) DailyAt() int {
+	if c.DailyHour == nil {
+		return DefaultDailyHour
+	}
+	return *c.DailyHour
+}
+
+// DefaultLogArchiveDays is the archive retention when log_archive_days is not set.
+const DefaultLogArchiveDays = 365
+
+// ArchiveDays returns the archive retention in days (0 = forever).
+func (c Config) ArchiveDays() int {
+	if c.LogArchiveDays == nil {
+		return DefaultLogArchiveDays
+	}
+	return *c.LogArchiveDays
+}
+
+// IdleAfterResultOff is the idle_after_result_seconds value that turns the rule off.
+const IdleAfterResultOff = -1
+
+// IdleAfterResult returns the idle-after-result grace; 0 means the rule is off.
+func (c Config) IdleAfterResult() time.Duration {
+	if c.IdleAfterResultSeconds == IdleAfterResultOff {
+		return 0
+	}
+	if c.IdleAfterResultSeconds > 0 {
+		return time.Duration(c.IdleAfterResultSeconds) * time.Second
+	}
+	return DefaultIdleAfterResult
 }
 
 // removedConfigKeys were configurable once and now are fixed by the reference; a config that still
@@ -115,6 +191,35 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
 	}
+	if err := c.Brain.Validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
+		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
+	}
+	if c.IdleAfterResultSeconds < IdleAfterResultOff {
+		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
+	}
+	for _, r := range c.TrashRoots {
+		if !filepath.IsAbs(r) {
+			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
+		}
+	}
+	if c.LogArchiveDir != "" && !filepath.IsAbs(c.LogArchiveDir) {
+		return c, fmt.Errorf("config.json: log_archive_dir %q must be an absolute path", c.LogArchiveDir)
+	}
+	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
+		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
+		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
+	}
+	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if c.LogArchiveDir == "" {
+		c.LogArchiveDir = filepath.Join(stateDir, "archive")
+	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
 	}
@@ -122,6 +227,15 @@ func LoadConfig(stateDir string) (Config, error) {
 		c.CardsDir = filepath.Join(stateDir, "cards")
 	}
 	return c, nil
+}
+
+// TrashRootsOrDefault returns the configured trash roots; nil when none are configured (fail
+// closed: there is no default root).
+func (c Config) TrashRootsOrDefault() []string {
+	if len(c.TrashRoots) > 0 {
+		return c.TrashRoots
+	}
+	return nil
 }
 
 func (c Config) claudeBin() string {
@@ -169,13 +283,19 @@ var defaultModels = map[string]map[string]string{
 
 // ModelFor returns the model for kind × complexity. The complexity must be stated: there is no
 // default complexity and no classifier (owner 2026-10-17, docs/DECISIONS.md).
-func ModelFor(kind, complexity string) (string, error) {
+func ModelFor(kind, complexity string) (string, error) { return modelFor(nil, kind, complexity) }
+
+// modelFor is ModelFor with the config's overrides (config models) applied first.
+func modelFor(overrides map[string]map[string]string, kind, complexity string) (string, error) {
 	if complexity == "" {
 		return "", errors.New("complexity is required to pick a model (light|normal|hard)")
 	}
 	m, ok := defaultModels[kind][complexity]
 	if !ok {
 		return "", fmt.Errorf("unknown kind/complexity %q/%q (complexity: light|normal|hard)", kind, complexity)
+	}
+	if o := overrides[kind][complexity]; o != "" {
+		return o, nil
 	}
 	return m, nil
 }
@@ -195,12 +315,16 @@ func ValidateModel(model string) error {
 // ResolveModel returns the model for a request: the explicit model if given (a stated complexity
 // must still be valid), else the kind × complexity table. Neither given = rejected, never guessed.
 func ResolveModel(kind, model, complexity string) (string, error) {
+	return resolveModel(nil, kind, model, complexity)
+}
+
+func resolveModel(overrides map[string]map[string]string, kind, model, complexity string) (string, error) {
 	if model == "" && complexity == "" {
 		return "", errors.New("model or complexity is required: state an explicit model or a complexity " +
 			"(light|normal|hard); there is no default and no classifier")
 	}
 	if complexity != "" {
-		m, err := ModelFor(kind, complexity)
+		m, err := modelFor(overrides, kind, complexity)
 		if err != nil {
 			return "", err
 		}
@@ -212,4 +336,45 @@ func ResolveModel(kind, model, complexity string) (string, error) {
 		return "", err
 	}
 	return model, nil
+}
+
+// PinScopeRequired sets cgroup_scope to "required" in <state>/config.json when the file does not set it
+// yet and a transient user scope can be created right now (the installer runs it: on a host where scopes
+// work, a job never silently falls back to the weaker session containment). Other keys are kept. It
+// returns what it did, for the installer's output.
+func PinScopeRequired(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, "config.json")
+	raw := map[string]json.RawMessage{}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return "", fmt.Errorf("read config: %w", err)
+	default:
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return "", fmt.Errorf("parse config.json: %w", err)
+		}
+	}
+	if v, ok := raw["cgroup_scope"]; ok {
+		return "cgroup_scope already set (" + string(v) + "), left as is", nil
+	}
+	if err := probeScope(); err != nil {
+		return "cgroup_scope left at auto (no user scope on this host: " + err.Error() + ")", nil
+	}
+	raw["cgroup_scope"] = json.RawMessage(`"required"`)
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return "cgroup_scope set to required (user scopes work on this host): " + path, nil
 }

@@ -5,16 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// StreamResult is the final `result` event of claude's stream-json output.
+// StreamResult is the final `result` event of claude's stream-json output (or, for a codex job, what
+// ParseCodexStream reads from codex's JSON events).
 type StreamResult struct {
 	Found   bool
 	Subtype string
@@ -22,6 +25,30 @@ type StreamResult struct {
 	Turns   int
 	CostUSD float64
 	Text    string
+	// Runner is the program that wrote the stream; empty = claude.
+	Runner string
+	// Token usage (codex streams only).
+	InputTokens, CachedInputTokens, OutputTokens int64
+	// Skipped counts lines over the line limit that were skipped unread (codex streams only).
+	Skipped int
+	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
+	Err string
+}
+
+// program names the runner of a stream result in messages.
+func (r StreamResult) program() string {
+	if r.Runner == "" {
+		return store.RunnerClaude
+	}
+	return r.Runner
+}
+
+// parseRunnerStream parses a job's stream.jsonl with the parser of its runner.
+func parseRunnerStream(runner, path string) StreamResult {
+	if runner == store.RunnerCodex {
+		return ParseCodexStream(path)
+	}
+	return parseStream(path)
 }
 
 type resultEvent struct {
@@ -156,9 +183,19 @@ func admitted(jobDir, token string) error {
 // for the same job refuses to run, so a job is never executed twice. Before registering it checks
 // (under admit.lock) that the row is still running under its token; a late wrapper whose job was
 // cancelled or failed meanwhile exits 4 without running claude and without writing exit_code.
-func RunWrapper(jobDir, token string, argv []string) int {
+//
+// opts.Prompt names the stdin file in the job dir (default prompt.md). With opts.FallbackPrompt and
+// opts.FallbackSession (a resume launch: argv holds --resume <id>), a claude that fails before any
+// progress (no assistant or result event: the session could not be resumed) is run once more in a
+// fresh session: --resume <id> becomes --session-id <FallbackSession>, stdin is FallbackPrompt, the
+// failed stream is kept as stream-resume-failed.jsonl and FallbackMarker records the new session id.
+func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if len(argv) == 0 || token == "" {
 		fmt.Fprintln(os.Stderr, "run-wrapper: missing launch token or claude command")
+		return 2
+	}
+	if err := opts.validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "run-wrapper:", err)
 		return 2
 	}
 	lock, err := os.OpenFile(filepath.Join(jobDir, "wrapper.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -202,11 +239,19 @@ func RunWrapper(jobDir, token string, argv []string) int {
 		return 2
 	}
 	defer stderrLog.Close()
-	code := runClaude(jobDir, argv, stderrLog)
+	// The idle-after-result rule reads claude's result events; a codex job ends by itself or by the timeout.
+	idle := time.Duration(0)
+	if opts.Runner != store.RunnerCodex {
+		idle = idleGrace(jobDir, stderrLog)
+	}
+	code, idleClosed := runClaude(jobDir, opts.prompt(), argv, idle, stderrLog)
+	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !streamProgressed(filepath.Join(jobDir, "stream.jsonl")) {
+		code, idleClosed = runFallback(jobDir, argv, opts, idle, stderrLog, code)
+	}
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
-	sw := sweepSession(stderrLog)
+	sw := sweepJob(jobDir, stderrLog)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
 	}
@@ -219,10 +264,20 @@ func RunWrapper(jobDir, token string, argv []string) int {
 			return 2 // no exit_code: the daemon fails the job as a dead wrapper
 		}
 	}
-	res := ParseStream(filepath.Join(jobDir, "stream.jsonl"))
-	if res.Text != "" {
-		if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(res.Text+"\n")); err != nil {
-			fmt.Fprintln(stderrLog, "run-wrapper: write report.md:", err)
+	if opts.Runner == store.RunnerCodex {
+		writeCodexReport(jobDir, stderrLog)
+	} else if res := ParseStream(filepath.Join(jobDir, "stream.jsonl")); idleClosed {
+		code = finishIdleClosed(jobDir, res, stderrLog)
+	} else if text := res.Text; text != "" || !hasReport(jobDir) {
+		if text == "" && res.Found && !res.IsError && res.Subtype == "success" {
+			// A successful result without text and no report.md of the job's own: the last top-level
+			// assistant text that is a report is the report.
+			text = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
+		}
+		if text != "" {
+			if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(text+"\n")); err != nil {
+				fmt.Fprintln(stderrLog, "run-wrapper: write report.md:", err)
+			}
 		}
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
@@ -232,45 +287,153 @@ func RunWrapper(jobDir, token string, argv []string) int {
 	return 0
 }
 
-func runClaude(jobDir string, argv []string, stderrLog *os.File) int {
-	stdin, err := os.Open(filepath.Join(jobDir, "prompt.md"))
+// WrapperOptions are the run-wrapper options of a resume launch (see RunWrapper).
+type WrapperOptions struct {
+	Prompt          string // stdin file name in the job dir; empty = prompt.md
+	FallbackPrompt  string // stdin file name for the fresh-session fallback; empty = no fallback
+	FallbackSession string // the fallback's session id
+	Runner          string // the program argv runs: claude (default) or codex
+}
+
+func (o WrapperOptions) prompt() string {
+	if o.Prompt == "" {
+		return "prompt.md"
+	}
+	return o.Prompt
+}
+
+func (o WrapperOptions) validate() error {
+	for _, f := range []string{o.Prompt, o.FallbackPrompt} {
+		if f != "" && (f != filepath.Base(f) || f == "." || f == "..") {
+			return fmt.Errorf("prompt file %q must be a file name in the job dir", f)
+		}
+	}
+	if (o.FallbackPrompt == "") != (o.FallbackSession == "") {
+		return errors.New("--fallback-prompt and --fallback-session go together")
+	}
+	switch o.Runner {
+	case "", store.RunnerClaude:
+	case store.RunnerCodex:
+		if o.FallbackPrompt != "" {
+			return errors.New("a codex job has no resume fallback")
+		}
+	default:
+		return fmt.Errorf("runner %q must be claude or codex", o.Runner)
+	}
+	if o.FallbackSession != "" && !ValidSessionID(o.FallbackSession) {
+		return fmt.Errorf("fallback session %q is not a session id", o.FallbackSession)
+	}
+	return nil
+}
+
+// FallbackMarker is the job-dir file the wrapper writes when a resume fell back to a fresh session;
+// it holds the new session id.
+const FallbackMarker = "fallback_session"
+
+// runFallback reruns claude in a fresh session after a failed resume (see RunWrapper).
+func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Duration, stderrLog *os.File, code int) (int, bool) {
+	fresh := make([]string, 0, len(argv))
+	replaced := false
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--resume" && i+1 < len(argv) && !replaced {
+			fresh = append(fresh, "--session-id", opts.FallbackSession)
+			i++
+			replaced = true
+			continue
+		}
+		fresh = append(fresh, argv[i])
+	}
+	if !replaced {
+		return code, false
+	}
+	fmt.Fprintf(stderrLog, "run-wrapper: resume failed (exit %d, no progress); falling back to a fresh session %s\n",
+		code, opts.FallbackSession)
+	if err := os.Rename(filepath.Join(jobDir, "stream.jsonl"), filepath.Join(jobDir, "stream-resume-failed.jsonl")); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: keep failed resume stream:", err)
+	}
+	if err := writeAtomic(filepath.Join(jobDir, FallbackMarker), []byte(opts.FallbackSession+"\n")); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: write fallback marker:", err)
+		return code, false
+	}
+	return runClaude(jobDir, opts.FallbackPrompt, fresh, idle, stderrLog)
+}
+
+// streamProgressed reports whether stream.jsonl holds an assistant or result event: claude got as
+// far as the model. A resume that fails before that never ran a turn.
+func streamProgressed(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	for sc.Scan() {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(sc.Bytes(), &ev) == nil && (ev.Type == "assistant" || ev.Type == "result") {
+			return true
+		}
+	}
+	return false
+}
+
+// idleGrace is the idle-after-result grace from the agent's config.json (<state>/jobs/<id> = jobDir);
+// an unreadable config falls back to the default.
+func idleGrace(jobDir string, log io.Writer) time.Duration {
+	abs, err := filepath.Abs(jobDir)
+	if err == nil {
+		var c Config
+		if c, err = LoadConfig(filepath.Dir(filepath.Dir(abs))); err == nil {
+			return c.IdleAfterResult()
+		}
+	}
+	fmt.Fprintln(log, "run-wrapper: config (idle-after-result grace falls back to the default):", err)
+	return DefaultIdleAfterResult
+}
+
+// runClaude runs claude and returns its exit code, and whether the idle-after-result rule ended it.
+func runClaude(jobDir, promptFile string, argv []string, idle time.Duration, stderrLog *os.File) (int, bool) {
+	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127
+		return 127, false
 	}
 	defer stdin.Close()
 	stdout, err := os.Create(filepath.Join(jobDir, "stream.jsonl"))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127
+		return 127, false
 	}
 	defer stdout.Close()
 	env, err := GitEnv(jobDir, os.Environ())
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
-		return 127
+		return 127, false
 	}
 	env, err = JobEnv(jobDir, env)
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
-		return 127
+		return 127, false
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderrLog
-	if err := cmd.Run(); err != nil {
+	closed, err := runIdleWatched(cmd, filepath.Join(jobDir, "stream.jsonl"), idle, stderrLog)
+	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				return 128 + int(ws.Signal())
+				return 128 + int(ws.Signal()), closed
 			}
-			return ee.ExitCode()
+			return ee.ExitCode(), closed
 		}
 		fmt.Fprintln(stderrLog, "run-wrapper: start claude:", err)
-		return 127
+		return 127, false
 	}
-	return 0
+	return 0, closed
 }
 
 // JobEnvVar marks every process of a job: the wrapper sets AGENT_JOBS_JOB=<job id> on claude, and
@@ -281,7 +444,14 @@ const JobEnvVar = "AGENT_JOBS_JOB"
 // InsideJob returns the job id when this process runs inside a job (the marker is set, even empty).
 func InsideJob() (string, bool) { return os.LookupEnv(JobEnvVar) }
 
-// JobEnv returns env without any inherited marker, plus AGENT_JOBS_JOB=<id of jobDir>.
+// userBusVars point at the user's D-Bus session (systemd user manager). They are removed from the job's
+// environment: with them, `systemd-run --user` or a D-Bus call would start a process in a new unit,
+// outside the job's scope (not a sandbox: a script can rebuild the address; the guard rejects the
+// direct spellings).
+var userBusVars = map[string]bool{"DBUS_SESSION_BUS_ADDRESS": true, "XDG_RUNTIME_DIR": true}
+
+// JobEnv returns env without any inherited marker and without the user bus variables, plus
+// AGENT_JOBS_JOB=<id of jobDir>.
 func JobEnv(jobDir string, env []string) ([]string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
@@ -289,7 +459,7 @@ func JobEnv(jobDir string, env []string) ([]string, error) {
 	}
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {
-		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar {
+		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar && !userBusVars[k] {
 			out = append(out, kv)
 		}
 	}

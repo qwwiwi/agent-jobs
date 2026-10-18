@@ -182,7 +182,7 @@ func TestInstallLinuxIdempotentAndUninstall(t *testing.T) {
 	if fi, err := os.Stat(envFile); err != nil || fi.Mode().Perm() != 0o600 {
 		t.Errorf("env file not created 0600: %v %v", fi, err)
 	}
-	if got := e.read(filepath.Join(e.fake, "bin.log")); got != "init --agent t1\n" {
+	if got := e.read(filepath.Join(e.fake, "bin.log")); got != "init --agent t1 --pin-scope\n" {
 		t.Errorf("init call = %q", got)
 	}
 	calls := e.calls()
@@ -360,7 +360,7 @@ func TestInstallLinuxEnvFileParsedNotSourced(t *testing.T) {
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("env file was executed as shell")
 	}
-	want := "init --agent t1 home=" + filepath.Join(e.home, "state") + "\n"
+	want := "init --agent t1 --pin-scope home=" + filepath.Join(e.home, "state") + "\n"
 	if got := e.read(filepath.Join(e.fake, "bin.log")); got != want {
 		t.Errorf("init saw %q, want %q", got, want)
 	}

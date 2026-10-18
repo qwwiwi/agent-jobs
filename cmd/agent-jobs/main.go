@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
@@ -30,10 +33,21 @@ const usage = `usage: agent-jobs <command> [flags]
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
-  status     --agent A <id>
+             [--runner claude|codex] [--reasoning-effort low|medium|high]
+                                           a gpt-* model runs on codex exec (read-only kinds
+                                           review/research unless codex_write_allowed)
+  status     --agent A [<id>]              a job; without an id: the daily automation
+                                           (prune + doctor procs) and its last run
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
-  cancel     --agent A <id>
+  cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
+  stop       --agent A <id> [--reason R]   stop a queued/running job, keep work dir and session (resumable)
+  resume     --agent A <id> (--context TEXT | --context-file F | stdin)
+             [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
+                                           continue a stopped/timeout/failed job in the same session
+                                           with an «Orchestrator update»; limits default to what is left
+  amend      --agent A <id> (--context TEXT | --context-file F | stdin)
+                                           append context to a queued job's brief (keeps its place)
   profile    --agent A --from FILE [--from FILE]... [--force] [--dry-run]
                                            generate the job profile (owner rules, <= 8 KB) from the
                                            sections of the agent's own rules marked
@@ -42,8 +56,26 @@ const usage = `usage: agent-jobs <command> [flags]
   card list  --agent A [--repo PATH]       list project cards (with --repo: the ones a job there gets)
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
+  prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
+                                           small top-level text files stay; stream.jsonl, stderr.log
+                                           move gzipped into the log archive, see archive)
+  archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
+                                           archive (<archive>/<YYYY-MM>/<id>/) and drop months past
+                                           log_archive_days; --dry-run shows what would move
+  stats      --agent A [--since D] [--by kind|model|skill] [--json] [--backfill [--all]]
+                                           per-job summary: counts, success rate, cost and duration
+                                           (median, p90), guard refusal rules, skills; --backfill
+                                           first writes missing rows from job dirs and the archive
+  intentions --agent A [--status open|done|dropped] [--json]
+                                           the agent's own goals (intention_* MCP tools), oldest first
+  notify-owner --agent A --text T [--urgency normal|high]
+                                           one "[jobs:notify-owner] T" line into the notify target
+                                           for the session to relay (rate limited, stored)
+  doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
+                                           rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T -- <claude> <args...>   (internal, started by the daemon)
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
+                                           (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
@@ -82,6 +114,12 @@ func main() {
 		err = cmdResult(args)
 	case "cancel":
 		err = cmdCancel(args)
+	case "stop":
+		err = cmdStop(args)
+	case "resume":
+		err = cmdResume(args)
+	case "amend":
+		err = cmdAmend(args)
 	case "profile":
 		err = cmdProfile(args)
 	case "card":
@@ -90,6 +128,18 @@ func main() {
 		err = cmdTick(args)
 	case "daemon":
 		err = cmdDaemon(args)
+	case "prune":
+		err = cmdPrune(args)
+	case "archive":
+		err = cmdArchive(args)
+	case "stats":
+		err = cmdStats(args)
+	case "intentions":
+		err = cmdIntentions(args)
+	case "notify-owner":
+		err = cmdNotifyOwner(args)
+	case "doctor":
+		err = cmdDoctor(args)
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -140,11 +190,35 @@ func mcpRole(args []string) string {
 }
 
 func runWrapper(args []string) int {
-	if len(args) < 5 || args[1] != "--token" || args[3] != "--" {
-		fmt.Fprintln(os.Stderr, "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> -- <claude> <args...>")
+	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
+	if len(args) < 5 || args[1] != "--token" {
+		fmt.Fprintln(os.Stderr, u)
 		return 2
 	}
-	return jobs.RunWrapper(args[0], args[2], args[4:])
+	var opts jobs.WrapperOptions
+	rest := args[3:]
+	for len(rest) >= 2 && rest[0] != "--" {
+		switch rest[0] {
+		case "--prompt":
+			opts.Prompt = rest[1]
+		case "--fallback-prompt":
+			opts.FallbackPrompt = rest[1]
+		case "--fallback-session":
+			opts.FallbackSession = rest[1]
+		case "--runner":
+			opts.Runner = rest[1]
+		default:
+			fmt.Fprintln(os.Stderr, u)
+			return 2
+		}
+		rest = rest[2:]
+	}
+	if len(rest) < 2 || rest[0] != "--" {
+		fmt.Fprintln(os.Stderr, u)
+		return 2
+	}
+	return jobs.RunWrapper(args[0], args[2], rest[1:], opts)
 }
 
 type multi []string
@@ -237,6 +311,7 @@ func open(agent string) (*jobs.Manager, error) {
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	agent := agentFlag(fs)
+	pin := fs.Bool("pin-scope", false, "set cgroup_scope=required in config.json when unset and user scopes work here (installer)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -245,6 +320,13 @@ func cmdInit(args []string) error {
 		return err
 	}
 	defer m.Close()
+	if *pin {
+		msg, err := jobs.PinScopeRequired(m.StateDir)
+		if err != nil {
+			return err
+		}
+		fmt.Println(msg)
+	}
 	// The main session's duties ship with the tool and are rewritten on every init (not user-edited).
 	ob, err := agentjobs.Templates.ReadFile("prompts/orchestrator.md")
 	if err != nil {
@@ -292,6 +374,8 @@ func cmdStart(args []string) error {
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
+	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
+	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -345,28 +429,98 @@ func fmtTime(t *time.Time) string {
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	agent := agentFlag(fs)
-	id, err := oneID(fs, args)
+	pos, err := parse(fs, args)
 	if err != nil {
 		return err
+	}
+	if len(pos) > 1 {
+		return errors.New("at most one job id expected")
 	}
 	m, err := open(*agent)
 	if err != nil {
 		return err
 	}
 	defer m.Close()
-	j, err := m.Store.Get(id)
+	if len(pos) == 0 {
+		if err := printDaily(m); err != nil {
+			return err
+		}
+		return printUndelivered(m)
+	}
+	j, err := m.Store.Get(pos[0])
 	if err != nil {
 		return err
 	}
 	fmt.Printf("id:        %s\ntitle:     %s\nkind:      %s\nstatus:    %s\nmodel:     %s\n", j.ID, j.Title, j.Kind, j.Status, j.Model)
-	fmt.Printf("limits:    %d turns · $%g · %dm\n", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
-	fmt.Printf("usage:     %d turns · $%.2f · %ds\n", j.Turns, j.CostUSD, j.DurationSec)
+	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
+	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
+	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
+	if c := jobs.Containment(j); c != "" {
+		fmt.Printf("contain:   %s\n", c)
+	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
+	}
+	return nil
+}
+
+// printDaily is `status` without a job id: the daily automation (prune and doctor procs) and its
+// last run.
+func printDaily(m *jobs.Manager) error {
+	d, err := m.Daily()
+	if err != nil {
+		return err
+	}
+	if !d.Enabled {
+		fmt.Println("daily:     off (daily_off)")
+	} else {
+		fmt.Printf("daily:     prune + doctor procs (report only) once a day after %02d:00 local time\n", d.Hour)
+	}
+	if d.LastDay == "" {
+		fmt.Println("last run:  never")
+		return nil
+	}
+	state := "finished " + fmtTime(d.FinishedAt)
+	if d.Running {
+		state = "not finished (running, or the daemon stopped during it)"
+	}
+	fmt.Printf("last run:  %s, started %s, %s\n", d.LastDay, fmtTime(d.StartedAt), state)
+	if r := d.Result; r != nil {
+		fmt.Printf("prune:     %d jobs, %d bytes freed, %d jobs archived (%d bytes), %d archived months expired\n",
+			r.JobsPruned, r.BytesFreed, r.JobsArchived, r.ArchivedBytes, r.ArchiveExpired)
+		fmt.Printf("procs:     %d ghosts (%d job, %d leaders, %d suspects), %d dead rows\n",
+			r.Ghosts, r.JobGhosts, r.Leaders, r.Suspects, r.DeadRows)
+		for _, e := range []struct{ name, text string }{{"prune", r.PruneError}, {"procs", r.ProcsError}, {"run", r.Error}} {
+			if e.text != "" {
+				fmt.Printf("error:     %s: %s\n", e.name, e.text)
+			}
+		}
+	}
+	return nil
+}
+
+// printUndelivered is the end of `status` without a job id: notify_owner notifications of the last
+// 24 h that did not reach the session.
+func printUndelivered(m *jobs.Manager) error {
+	list, err := m.UndeliveredNotifications()
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("notify:    no undelivered owner notifications in the last 24 h")
+		return nil
+	}
+	fmt.Printf("notify:    %d owner notifications not delivered in the last 24 h\n", len(list))
+	for _, n := range list {
+		from := "orchestrator"
+		if n.JobID != "" {
+			from = "job " + n.JobID
+		}
+		fmt.Printf("  #%d %s %s (%s): %s · error: %s\n", n.ID, fmtTime(&n.CreatedAt), from, n.Urgency, n.Text, n.Error)
 	}
 	return nil
 }
@@ -388,11 +542,34 @@ func cmdList(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tTITLE")
+	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD, fmtTime(&j.CreatedAt), j.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
+			jobs.CostText(j.CostUSD, j.CostIsUnknown()),
+			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// costWord is a cost in a sentence: "$1.23", or "cost unknown".
+func costWord(cost float64, unknown bool) string {
+	if unknown {
+		return "cost unknown"
+	}
+	return jobs.CostText(cost, false)
+}
+
+// containShort is the containment column of `list`: scope, scope! (stop pending), session, or - (never launched).
+func containShort(j *store.Job) string {
+	switch {
+	case j.ScopeUnit != "" && j.ScopePending:
+		return "scope!"
+	case j.ScopeUnit != "":
+		return "scope"
+	case jobs.Containment(j) == "":
+		return "-"
+	}
+	return "session"
 }
 
 func cmdResult(args []string) error {
@@ -414,6 +591,18 @@ func cmdResult(args []string) error {
 	fmt.Println(jobs.DoneLine(j))
 	if j.Error != "" {
 		fmt.Println("error:", j.Error)
+	}
+	atts, err := m.Store.Attempts(id)
+	if err != nil {
+		return err
+	}
+	for _, a := range atts {
+		cost := costWord(a.CostUSD, a.CostUnknown)
+		fmt.Printf("attempt %d: %s %s · %d turns · %s · %ds · %s\n", a.N, a.Mode, a.Status, a.Turns, cost,
+			a.DurationSec, filepath.Join(m.JobDir(id), jobs.AttemptReportName(a.N)))
+	}
+	if len(atts) > 0 {
+		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
 	}
 	b, err := os.ReadFile(filepath.Join(m.JobDir(id), "report.md"))
 	if err != nil {
@@ -442,6 +631,98 @@ func cmdCancel(args []string) error {
 		return err
 	}
 	fmt.Println("cancelled", id)
+	return nil
+}
+
+func cmdStop(args []string) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	reason := fs.String("reason", "", "why the job is stopped (recorded on the job)")
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	j, err := m.Stop(id, *reason)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("stopped %s (%d turns, %s); resume with: agent-jobs resume --agent %s %s --context ...\n",
+		j.ID, j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), *agent, j.ID)
+	return nil
+}
+
+// contextFlags adds --context / --context-file; readContext falls back to stdin.
+func contextFlags(fs *flag.FlagSet) (*string, *string) {
+	return fs.String("context", "", "the update text"), fs.String("context-file", "", "read the update from a file")
+}
+
+func readContext(text, file string) (string, error) {
+	switch {
+	case text != "":
+		return text, nil
+	case file != "":
+		b, err := os.ReadFile(file)
+		return string(b), err
+	}
+	b, err := io.ReadAll(os.Stdin)
+	return string(b), err
+}
+
+func cmdResume(args []string) error {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text, file := contextFlags(fs)
+	var l jobs.Limits
+	fs.IntVar(&l.MaxTurns, "max-turns", 0, fmt.Sprintf("default: what is left; ceiling %d", jobs.CeilingMaxTurns))
+	fs.Float64Var(&l.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default: what is left; ceiling %g", jobs.CeilingMaxBudgetUSD))
+	fs.IntVar(&l.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default: what is left; ceiling %d", jobs.CeilingTimeoutMinutes))
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := readContext(*text, *file)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	j, err := m.Resume(id, ctx, l)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("resume queued %s (limits %d turns · $%g · %dm)\n", j.ID, j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
+	return nil
+}
+
+func cmdAmend(args []string) error {
+	fs := flag.NewFlagSet("amend", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text, file := contextFlags(fs)
+	id, err := oneID(fs, args)
+	if err != nil {
+		return err
+	}
+	ctx, err := readContext(*text, *file)
+	if err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if _, err := m.Amend(id, ctx); err != nil {
+		return err
+	}
+	fmt.Println("amended", id)
 	return nil
 }
 
@@ -561,16 +842,27 @@ func cmdDaemon(args []string) error {
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
 	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
+	go func() {
+		if err := m.ServeBrain(ctx); err != nil {
+			m.Log.Printf("%v (jobs get no memory tools and no notify_owner until the daemon restarts)", err)
+		}
+	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
 	for {
 		if err := m.Tick(); err != nil {
 			m.Log.Printf("tick: %v", err)
 		}
+		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
+		// the next ticks keep launching jobs while it runs.
+		m.StartDaily(ctx)
 		select {
 		case <-ctx.Done():
-			// Jobs run in their own sessions: stopping the daemon does not touch them.
+			// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
+			// in progress stops between jobs (ctx) and is waited for before the store closes.
 			m.Log.Printf("daemon stopping; running jobs keep running")
+			m.WaitDaily()
 			return nil
 		case <-t.C:
 		}
@@ -595,4 +887,295 @@ func cmdMCP(args []string) error {
 	defer stop()
 	// stdout carries the protocol: nothing else may print there.
 	return mcp.Serve(ctx, role, *agent)
+}
+
+func cmdPrune(args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "only list what would be removed")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, perr := m.Prune(*dry)
+	if *asJSON {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+		return perr
+	}
+	verb := "removed"
+	if *dry {
+		verb = "would remove"
+	}
+	for _, j := range rep.Jobs {
+		var n int64
+		for _, e := range j.Removed {
+			n += e.Bytes
+		}
+		fmt.Printf("%s  %s  %s %d entries (%d bytes)", j.ID, j.Status, verb, len(j.Removed), n)
+		if j.Skipped != "" {
+			fmt.Printf("  [%s]", j.Skipped)
+		}
+		if j.Error != "" {
+			fmt.Printf("  error: %s", j.Error)
+		}
+		fmt.Println()
+		for _, e := range j.Removed {
+			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
+		}
+	}
+	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
+	return perr
+}
+
+func printArchived(bytes int64, expired []jobs.PruneEntry, retentionOff string, dry bool) {
+	verb, gone := "moved", "removed"
+	if dry {
+		verb, gone = "would move", "would remove"
+	}
+	fmt.Printf("archive: %s %d bytes into the log archive\n", verb, bytes)
+	for _, e := range expired {
+		fmt.Printf("archive: %s %s  %d  %s\n", gone, e.Path, e.Bytes, e.Reason)
+	}
+	if retentionOff != "" {
+		fmt.Printf("archive: %s\n", retentionOff)
+	}
+}
+
+func cmdArchive(args []string) error {
+	fs := flag.NewFlagSet("archive", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "only list what would move")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, aerr := m.Archive(*dry)
+	if *asJSON {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+		return aerr
+	}
+	keep := "forever"
+	if rep.Days > 0 {
+		keep = fmt.Sprintf("%d days", rep.Days)
+	}
+	fmt.Printf("archive: %s (kept %s)\n", rep.Dir, keep)
+	var n int64
+	for _, j := range rep.Jobs {
+		fmt.Printf("%s  -> %s", j.ID, j.Dest)
+		if j.Already {
+			fmt.Print("  [already archived]")
+		}
+		if j.Error != "" {
+			fmt.Printf("  error: %s", j.Error)
+		}
+		fmt.Println()
+		for _, e := range j.Moved {
+			n += e.Bytes
+			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
+		}
+	}
+	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
+	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
+	return aerr
+}
+
+func cmdIntentions(args []string) error {
+	fs := flag.NewFlagSet("intentions", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	status := fs.String("status", "", "only open|done|dropped (default all)")
+	asJSON := fs.Bool("json", false, "print the list as JSON (same as intention_list)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	list, err := m.ListIntentions(*status)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(mcp.IntentionsOutput{Intentions: list})
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tSTATUS\tPRIORITY\tDUE\tUPDATED\tTEXT")
+	for _, it := range list {
+		due := it.Due
+		if due == "" {
+			due = "-"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Status, it.Priority, due, fmtTime(&it.UpdatedAt), it.Text)
+	}
+	return w.Flush()
+}
+
+func cmdNotifyOwner(args []string) error {
+	fs := flag.NewFlagSet("notify-owner", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text := fs.String("text", "", "the message for the owner, one line (at most 300 characters)")
+	urgency := fs.String("urgency", "", "normal|high (default normal)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return errors.New("no positional arguments: give the message with --text")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	n, err := m.NotifyOwner("", *text, *urgency)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("notification %d delivered: %s\n", n.ID, jobs.NotifyLine(n))
+	return nil
+}
+
+func cmdStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
+	by := fs.String("by", "kind", "group by kind|model|skill")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	backfill := fs.Bool("backfill", false, "first write the missing summary rows from job dirs and the archive")
+	all := fs.Bool("all", false, "with --backfill: rewrite every row, not only the missing ones")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	t, err := jobs.ParseSince(*since, m.Now())
+	if err != nil {
+		return err
+	}
+	if *backfill {
+		b, err := m.BackfillStats(*all)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "backfill: %d rows written, %d present, %d errors\n", b.Recorded, b.Present, len(b.Errors))
+		for _, e := range b.Errors {
+			fmt.Fprintln(os.Stderr, "backfill:", e)
+		}
+	}
+	rep, err := m.Stats(t, *by)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(rep)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	row := func(key string, s jobs.StatsSummary) {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\n", key, s.Jobs,
+			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
+			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+	}
+	// COST, MEDIAN and P90 are over the jobs with a known cost; COST? counts the others (codex, killed).
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	for _, g := range rep.Groups {
+		row(shown(g.Key), g.StatsSummary)
+	}
+	row("total", rep.Totals)
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if len(rep.GuardRules) > 0 {
+		fmt.Println("\nguard refusals by rule:")
+		for _, r := range rep.GuardRules {
+			fmt.Printf("  %-22s %d\n", shown(r.Name), r.Count)
+		}
+	}
+	if len(rep.Skills) > 0 {
+		fmt.Println("\nskills (uses, jobs, success rate):")
+		for _, s := range rep.Skills {
+			fmt.Printf("  %-22s %d  %d  %.0f%%\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100)
+		}
+	}
+	return nil
+}
+
+// shown prints a name taken from a job's stream (a skill, a guard rule, a group key): as it is when
+// every rune is printable, quoted otherwise, so a job cannot plant terminal escape sequences.
+func shown(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0 {
+		return s
+	}
+	return strconv.Quote(s)
+}
+
+func cmdDoctor(args []string) error {
+	if len(args) == 0 || args[0] != "procs" {
+		return errors.New("usage: agent-jobs doctor procs --agent A [--kill] [--json]")
+	}
+	fs := flag.NewFlagSet("doctor procs", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	kill := fs.Bool("kill", false, "end the processes proven to belong to a finished job (leaders and suspects are never killed)")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, err := m.DoctorProcs(*kill)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(rep)
+	}
+	if rep.Note != "" {
+		fmt.Println("note:", rep.Note)
+	}
+	for _, r := range rep.DeadRows {
+		fmt.Printf("row   %s  pid %d  %s  (%s)\n", r.ID, r.PID, r.Reason, r.Title)
+	}
+	for _, g := range rep.Ghosts {
+		state := ""
+		switch {
+		case g.Killed:
+			state = "  KILLED"
+		case g.KillError != "":
+			state = "  kill failed: " + g.KillError
+		}
+		fmt.Printf("%-7s pid %d  sid %d  %s  %s%s\n", g.Kind, g.PID, g.SID, g.Reason, g.Cmdline, state)
+	}
+	fmt.Printf("doctor procs: %d processes, %d dead rows, %d killed", len(rep.Ghosts), len(rep.DeadRows), rep.Killed)
+	if !*kill && len(rep.Ghosts) > 0 {
+		fmt.Print(" (report only; --kill ends the job ghosts)")
+	}
+	fmt.Println()
+	return nil
+}
+
+func printJSON(v any) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }

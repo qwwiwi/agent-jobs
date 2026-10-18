@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,55 @@ printf '%s\n' "$@" > ../argv.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
+printf '%s' "$prompt" > ../stdin.txt
+{ printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt
+# Sessions (FAKE_SESSIONS = the test's CLAUDE_CONFIG_DIR): --session-id creates the transcript,
+# --resume needs it (and fails like claude when it is missing or the update says FAKE_RESUME_FAIL).
+sid=""; resume=""; args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in --session-id) sid="${args[i+1]}" ;; --resume) resume="${args[i+1]}" ;; esac
+done
+# As claude: the project dir is the physical cwd with every non-alphanumeric character as '-'.
+proj="${FAKE_SESSIONS-}/projects/$(pwd -P | sed 's/[^A-Za-z0-9]/-/g')"
+if [[ -n "${FAKE_SESSIONS-}" ]]; then
+  if [[ -n $resume && ( ! -f "$proj/$resume.jsonl" || $prompt == *FAKE_RESUME_FAIL* ) ]]; then
+    echo "No conversation found with session ID: $resume" >&2
+    exit 1
+  fi
+  if [[ -n $sid ]]; then mkdir -p "$proj" && echo '{}' > "$proj/$sid.jsonl"; fi
+  if [[ -n $resume ]]; then echo '{"resumed":true}' >> "$proj/$resume.jsonl"; fi
+fi
+if [[ $prompt == *FAKE_ESCAPE* ]]; then
+  # A process that leaves the job's process group but stays in its session (setpgid).
+  python3 -c 'import os,sys,time; os.setpgid(0,0); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(120)' \
+    ../escaped.pid </dev/null >/dev/null 2>&1 &
+fi
+if [[ $prompt == *FAKE_DAEMON* ]]; then
+  # A process that leads its own session (setsid): reported, never killed.
+  setsid python3 -c 'import os,sys,time; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(120)' \
+    ../daemon.pid </dev/null >/dev/null 2>&1 &
+fi
+if [[ $prompt == *FAKE_WIP* ]]; then
+  echo wip > wip.txt
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"WIP_PROGRESS_NOTE"}]}}'
+fi
+if [[ $prompt == *FAKE_FORGE* ]]; then
+  # The job appends a result line of its own to the stream (it lies in the job dir).
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
+fi
+if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
+if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
+  # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a
+  # subreaper), marker dropped. Then it tries a control command for another agent and stays alive.
+  JOBDIR=$(cd .. && pwd) setsid bash -c '( sleep 0.5
+      read -r _ _ _ ppid _ sid _ < /proc/$BASHPID/stat
+      echo "$BASHPID $ppid $sid" > "$JOBDIR/orphan.info"
+      env -u AGENT_JOBS_JOB "$AGENT_JOBS_SELF" list --agent agentb > "$JOBDIR/orphan.out" 2>&1
+      echo "exit=$?" >> "$JOBDIR/orphan.out"
+      : > "$JOBDIR/orphan.ready"
+      exec sleep 300 ) & exit 0' < /dev/null > /dev/null 2>&1
+  for _ in $(seq 200); do [[ -e ../orphan.ready ]] && break; sleep 0.05; done
+fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -81,7 +131,84 @@ if [[ $prompt == *FAKE_SURVIVOR* ]]; then
   # A leftover in the wrapper's session (re-parented sleep); the test makes it unkillable.
   ( sleep 60 & echo $! > ../survivor.pid )
 fi
+if [[ $prompt == *FAKE_TOOLS* ]]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Skill","input":{"skill":"deploy"}},{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git push"}}]}}'
+  echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"PreToolUse:Bash hook error: [guard]: blocked by guard: ` + "`git push`" + ` reaches outside the job. A job commits locally only"}]}}'
+fi
+if [[ $prompt == *FAKE_IDLE* ]]; then
+  # Idle-after-result modes: pause blocks on a FIFO held open read-write (bash builtin, no child).
+  mkfifo ../pause.fifo; exec 9<>../pause.fifo
+  pause() { read -r -t "$1" -u 9 || true; }
+  report='## Summary\nidle ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing'
+  if [[ $prompt == *FAKE_IDLE_MCP* ]]; then
+    # The job MCP server stand-in: this binary in the job role, kept alive by a FIFO writer.
+    mkfifo ../mcp.fifo
+    "$AGENT_JOBS_SELF" mcp --role job --agent test < ../mcp.fifo > /dev/null 2>&1 &
+    echo $! > ../mcp.pid
+    exec 8> ../mcp.fifo
+  fi
+  if [[ $prompt == *FAKE_IDLE_OK* ]]; then
+    echo '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$report"'"}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"Background agents are still running."}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":6,"total_cost_usd":0.75,"result":"All done."}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_OWNREPORT* ]]; then
+    # The job wrote report.md itself and ends with a short final message.
+    printf '## Summary\nown report\n' > ../report.md
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"Report written to report.md"}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_SHORT* ]]; then
+    # A report result, then 3 s of silence before claude exits by itself.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.1,"result":"'"$report"'"}'
+    pause 3
+  fi
+  if [[ $prompt == *FAKE_IDLE_NOREPORT* ]]; then
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"done, no report"}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_FAIL* ]]; then
+    echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9,"total_cost_usd":0.9,"result":""}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_CHILD* ]]; then
+    # A live background child after the result, silent stream: not closed until it is gone.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    sleep 3 & wait
+  fi
+  if [[ $prompt == *FAKE_IDLE_CHATTY* ]]; then
+    # No children, but the stream keeps growing after the result: not closed.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    for _ in $(seq 15); do pause 0.2; echo '{"type":"system","subtype":"task_progress"}'; done
+  fi
+  if [[ $prompt == *FAKE_IDLE_BGTASK* ]]; then
+    # An in-process background task is still listed after the result: not closed.
+    echo '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1"}]}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"waiting"}'
+    pause 3
+    echo '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+  fi
+fi
 if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
+if [[ $prompt == *FAKE_ASSISTANT_REPORT* ]]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_SUBAGENT_REPORT* ]]; then
+  # Only a subagent's text and a quoted heading carry the report sections; the result text is empty.
+  echo '{"type":"assistant","parent_tool_use_id":"toolu_1","message":{"content":[{"type":"text","text":"## Summary\nfrom subagent"}]}}'
+  echo '{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Template: ## Summary"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_NONSUCCESS_REPORT* ]]; then
+  # A report text, then a non-success result that is not flagged as an error.
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+  echo '{"type":"result","subtype":"error_max_budget_usd","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+  exit 0
+fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
@@ -95,6 +222,9 @@ printf '\n' >> "$FAKE_TMUX_LOG"
 `
 
 func TestMain(m *testing.M) {
+	if os.Getenv(proxyClientEnv) != "" {
+		os.Exit(runProxyClient())
+	}
 	// Under a git hook (pre-push runs scripts/check.sh) git exports GIT_DIR, GIT_INDEX_FILE, …: every
 	// `git -C <tempdir>` in these tests would then act on the real repository (re-init, config, commit).
 	for _, kv := range os.Environ() {
@@ -105,17 +235,20 @@ func TestMain(m *testing.M) {
 	// Run inside a job (a job working on this repository), the binary under test would refuse its
 	// control commands; the tests set the marker themselves where they need it.
 	_ = os.Unsetenv(JobEnvVar)
+	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
+	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
+	ignoreOuterJob()
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
+	out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
 	if err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	fakeHelpr = dir
-	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux} {
+	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux, "codex": fakeCodex} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			log.Fatal(err)
 		}
@@ -125,12 +258,31 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// ignoreOuterJob records the wrapper of a job this test process runs in (ancestor or session leader)
+// as outer: not counted by the in-job checks of this process and of the hooked binary under test.
+func ignoreOuterJob() {
+	var pids []string
+	for _, find := range []func() (int, bool){WrapperAncestor, WrapperSession} {
+		if pid, _ := find(); pid > 1 && !isOuterWrapper(pid) {
+			outerWrappers = append(outerWrappers, pid)
+			pids = append(pids, fmt.Sprint(pid))
+		}
+	}
+	if len(pids) > 0 {
+		_ = os.Setenv(outerWrapperEnv, strings.Join(pids, ","))
+	}
+}
+
+const outerWrapperEnv = "AGENT_JOBS_TEST_OUTER_WRAPPER"
+
 func newManager(t *testing.T) *Manager {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("AGENT_JOBS_CLAUDE_BIN", filepath.Join(fakeHelpr, "claude"))
 	t.Setenv("AGENT_JOBS_TMUX_BIN", filepath.Join(fakeHelpr, "tmux"))
+	// Session containment unless a test asks for a scope (scope_test.go): the same on every host.
+	t.Setenv("AGENT_JOBS_CGROUP_SCOPE", ScopeOff)
 	m, err := Open("test")
 	if err != nil {
 		t.Fatal(err)
@@ -282,7 +434,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch",
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "Bash(systemd-run:*)", "Bash(systemctl --user:*)", "Bash(busctl:*)", "Bash(dbus-send:*)", "Bash(gdbus:*)", "Bash(qdbus:*)", "Bash(dbus-run-session:*)", "Bash(crontab:*)", "Bash(at:*)", "Bash(batch:*)", "Bash(tmux:*)", "Bash(screen:*)", "Bash(pm2:*)", "Bash(docker:*)", "Bash(podman:*)", "Bash(ssh:*)", "Bash(machinectl:*)", "Bash(loginctl:*)", "Bash(unshare:*)", "Bash(nsenter:*)", "WebFetch", "WebSearch",
 		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
@@ -529,7 +681,7 @@ func TestNotifyOneLineViaTmux(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m", j.ID)
+	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · session only", j.ID)
 	if len(lines) != 2 || lines[0] != "send-keys|-t|fake-session|-l|"+wantLine+"|" || lines[1] != "send-keys|-t|fake-session|Enter|" {
 		t.Fatalf("tmux calls:\n%s", b)
 	}
@@ -788,7 +940,7 @@ func TestDoneLineSanitized(t *testing.T) {
 	}
 	m := newManager(t)
 	logf := notifyTo(t, m)
-	if err := m.sendTmux("fake-session", "a\x15b\x1bc\rd"); err != nil {
+	if err := m.sendTmux(context.Background(), "fake-session", "a\x15b\x1bc\rd"); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(logf)
@@ -919,7 +1071,7 @@ func TestOrphanWrapperAdopted(t *testing.T) {
 	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.spawn(j, tok); err != nil { // "crash": PID never written
+	if _, err := m.spawn(j, tok, "", launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}); err != nil { // "crash": PID never written
 		t.Fatal(err)
 	}
 	if get(t, m, j.ID).PID != 0 {
