@@ -244,7 +244,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if opts.Runner != store.RunnerCodex {
 		idle = idleGrace(jobDir, stderrLog)
 	}
-	code, idleClosed := runClaude(jobDir, opts.prompt(), argv, idle, stderrLog)
+	code, idleClosed := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !streamProgressed(filepath.Join(jobDir, "stream.jsonl")) {
 		code, idleClosed = runFallback(jobDir, argv, opts, idle, stderrLog, code)
 	}
@@ -355,7 +355,7 @@ func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Du
 		fmt.Fprintln(stderrLog, "run-wrapper: write fallback marker:", err)
 		return code, false
 	}
-	return runClaude(jobDir, opts.FallbackPrompt, fresh, idle, stderrLog)
+	return runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog)
 }
 
 // streamProgressed reports whether stream.jsonl holds an assistant or result event: claude got as
@@ -393,8 +393,9 @@ func idleGrace(jobDir string, log io.Writer) time.Duration {
 	return DefaultIdleAfterResult
 }
 
-// runClaude runs claude and returns its exit code, and whether the idle-after-result rule ended it.
-func runClaude(jobDir, promptFile string, argv []string, idle time.Duration, stderrLog *os.File) (int, bool) {
+// runClaude runs the job's runner (claude, or codex when runner is codex) and returns its exit code,
+// and whether the idle-after-result rule ended it.
+func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File) (int, bool) {
 	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
@@ -417,6 +418,9 @@ func runClaude(jobDir, promptFile string, argv []string, idle time.Duration, std
 		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
 		return 127, false
 	}
+	if runner != store.RunnerCodex {
+		env = ForkSubagentEnv(env)
+	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
@@ -434,6 +438,22 @@ func runClaude(jobDir, promptFile string, argv []string, idle time.Duration, std
 		return 127, false
 	}
 	return 0, closed
+}
+
+// ForkSubagentEnvVar switches Claude Code's fork subagents (on by default in `claude -p` since the
+// 2026-10-16 release); a claude job always runs with it set to 0 (owner decision 2026-10-18).
+const ForkSubagentEnvVar = "CLAUDE_CODE_FORK_SUBAGENT"
+
+// ForkSubagentEnv returns env with every inherited ForkSubagentEnvVar dropped and
+// ForkSubagentEnvVar=0 appended, so claude starts no fork subagents. Ordinary subagents are unaffected.
+func ForkSubagentEnv(env []string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k != ForkSubagentEnvVar {
+			out = append(out, kv)
+		}
+	}
+	return append(out, ForkSubagentEnvVar+"=0")
 }
 
 // JobEnvVar marks every process of a job: the wrapper sets AGENT_JOBS_JOB=<job id> on claude, and

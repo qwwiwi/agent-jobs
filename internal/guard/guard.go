@@ -150,8 +150,30 @@ func resolveDepth(path, dir string, depth int) string {
 		path = filepath.Join(dir, path)
 	}
 	path = filepath.Clean(path)
-	rest := ""
-	for p := path; ; p = filepath.Dir(p) {
+	// Past a component that does not exist no longer prefix exists either: start from the longest
+	// existing one, so a deep path costs one pass, not one per level.
+	end := len(path)
+	for i := 1; i <= len(path); i++ {
+		if i < len(path) && path[i] != filepath.Separator {
+			continue
+		}
+		if _, err := os.Lstat(path[:i]); err != nil {
+			end = strings.LastIndexByte(path[:i], filepath.Separator)
+			break
+		}
+	}
+	for {
+		if end <= 0 {
+			if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
+				return path
+			}
+			end = 0
+		}
+		p := path[:end]
+		if end == 0 {
+			p = string(filepath.Separator)
+		}
+		rest := strings.TrimLeft(path[end:], string(filepath.Separator))
 		if r, err := filepath.EvalSymlinks(p); err == nil {
 			return filepath.Join(r, rest)
 		}
@@ -160,10 +182,10 @@ func resolveDepth(path, dir string, depth int) string {
 				return resolveDepth(filepath.Join(target, rest), filepath.Dir(p), depth+1)
 			}
 		}
-		if p == filepath.Dir(p) {
+		if end == 0 {
 			return path
 		}
-		rest = filepath.Join(filepath.Base(p), rest)
+		end = strings.LastIndexByte(path[:end], filepath.Separator)
 	}
 }
 
@@ -237,27 +259,155 @@ func protectedBlocked(p string) string {
 	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database); a job does not write there."
 }
 
+func ancestorBlocked(w, p string) string {
+	return "blocked by guard: argument `" + w + "` is an ancestor of agent-jobs state (`" + p + "`, the subagent log or " +
+		"the job database); a job does not remove, move or write into it."
+}
+
 // checkProtected rejects Bash writes into cfg.Protected. Paths are resolved by pathScope (pathres.go):
 // `~/` and $HOME expanded, relative words against the call's directory and every literal cd/pushd
 // target in the call, symlinks resolved on the longest existing prefix. Refused:
 //   - an output redirection to a protected path;
 //   - a protected path (or one inside it) as an argument of any program that is not a plain reader
-//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value or
-//     inline code (`dd of=…`, `python3 -c "open('…')"`), and the directory holding one (`cp f <dir>`);
+//     (rm, mv, cp, ln, tee, truncate, sed -i, dd, sqlite3, cd, …), also inside an option value, inline
+//     code, a here-doc or a here-string (`dd of=…`, `python3 -c "open('…')"`, `python3 <<< "…"`),
+//     and the directory holding one (`cp f <dir>`);
 //   - for rm/mv/cp/ln/rsync/chmod/chown/tar/… and find with an action, an ancestor of a protected
-//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`);
-//   - `xargs <non-reader>` fed by an earlier stage of its pipeline that names a protected path or an
-//     ancestor of one;
+//     path (`rm -r <state>`, `find <state> -delete`, `ln -s <state> S`); for cp/install/ln/mv a
+//     destination D is refused when it is or holds a protected path, when D/<source name> reaches
+//     one, or when it is an ancestor of one, except D written as $HOME itself without -T or --parents
+//     and with every source a plain name (`cp f ~` stays allowed, `cp -r m/. ~` does not);
+//   - inside option values and inline code, every path-like token (split on `=`, `:`, quotes,
+//     brackets, …; tokens that clean to `/` or `.` skipped) resolved like an argument; in inline code
+//     (-c/-e values, here-docs, here-strings) and `--opt=`/`key=` values also as an ancestor when
+//     spelled with `//`, `/./`, `..` or lying strictly below $HOME; a `file:` URI also percent-decoded
+//     and with an empty or `localhost` authority dropped; `..` walked like the kernel (after the
+//     symlinks of its prefix) as well as lexically, and refused outright when the call may create a
+//     symlink (ln, cp -s, a word naming symlink) and the part before the first `..` does not exist;
+//   - `xargs <non-reader>`, and an interpreter that may read its program from the pipe (python,
+//     perl, node, ruby, php, sqlite3, whatever its arguments), fed by an earlier stage of its pipeline
+//     that names a protected path or an ancestor of one;
 //   - after a cd the guard cannot resolve (`cd $X`, `cd -`, CDPATH), a relative word that could lead
-//     to a protected path; likewise `~user/…`.
+//     to a protected path; likewise `~user/…`;
+//   - a call whose check takes longer than protectedBudget (fail closed: «too complex to verify»).
 //
-// A path built at run time otherwise (a variable other than $HOME, a substitution, a file read by
-// xargs) is not resolved: that and a script the job writes are the documented residual gap.
+// Residual gap (DEVIATIONS #12), not resolved: a path built at run time (a variable other than
+// $HOME, a substitution, a file list read by xargs or a program read by an interpreter from a file
+// or from a pipe stage the guard does not see the text of, a path assembled or escaped in inline
+// code), a plain ancestor of a protected path in free text or outside $HOME (`os.chdir('/home')`,
+// then a relative path), a relative path inside inline code after an unresolved cd, a symlink made
+// in an earlier Bash call that is not on disk yet when the hook runs, a cd made in an earlier Bash
+// call (only the hook's cwd and the cds of this call are known), and a script the job writes and runs.
 func checkProtected(scripts []*script, _ string, cfg Config) string {
 	if len(cfg.Protected) == 0 {
 		return ""
 	}
 	s := newPathScope(scripts, cfg)
+	r := s.checkScripts(scripts)
+	if s.expired {
+		return "blocked by guard: the command is too complex to verify against agent-jobs state (the subagent log " +
+			"or the job database) within the guard's time budget; split it or write the code to a file and run that."
+	}
+	return r
+}
+
+// stdinInterpreters may run a program they read from stdin. Options taking a value (`python3 -W
+// ignore`, `sqlite3 -separator , x.db`, `node -r fs`) make their arguments ambiguous, so as a later
+// pipe stage one is treated as reading its program from the pipe whatever its arguments.
+var stdinInterpreters = map[string]bool{"python": true, "sqlite3": true, "perl": true, "node": true, "ruby": true, "php": true}
+
+// stdinInterpreter reports a program that may read its program from stdin.
+func stdinInterpreter(name string) bool {
+	return strings.HasPrefix(name, "python") || stdinInterpreters[name]
+}
+
+// interpSpec describes how an interpreter takes its program on the command line: short options
+// that give it (code, a module or a file) and the subset giving inline code as the next word, short
+// options with a value attached or next, short options with an attached value only (`perl -i.bak`,
+// `-0777`), short options taking no value, and the same for long options. Any other option may take
+// the next word as its value, so the guard does not know what follows it.
+type interpSpec struct {
+	codeShort, inlineShort, valueShort, attachShort, flagShort string
+	codeLong, valueLong                                        []string
+}
+
+// interpSpecs are the interpreters whose inline code inlineCode finds by their options.
+var interpSpecs = map[string]interpSpec{
+	"python": {codeShort: "cm", inlineShort: "c", valueShort: "WX", flagShort: "bBdEIOPqsSu",
+		valueLong: []string{"--check-hash-based-pycs"}},
+	"perl": {codeShort: "eE", inlineShort: "eE", valueShort: "IMm", attachShort: "xiFCdD0", flagShort: "acnpslwtTUWX"},
+	"node": {codeShort: "ep", inlineShort: "ep", valueShort: "rC", codeLong: []string{"--eval", "--print"},
+		valueLong: []string{"--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"}},
+	"ruby": {codeShort: "e", inlineShort: "e", valueShort: "IrCE", attachShort: "FKTWx0i", flagShort: "acdlnpswU"},
+	"php":  {codeShort: "rfBRFE", inlineShort: "rBRE", valueShort: "cdz", flagShort: "eHlnqsw"},
+}
+
+// interpCode parses an interpreter call by its interpSpec and returns the args index of its inline
+// program word (`-c <code>`, `--eval <code>`), -1 if none or after any option not in the spec (it
+// may take the next word). It does not tell whether the interpreter also runs stdin (`node -e 0
+// -i`, `node -p`): a pipe feeder into an interpreter is always scanned strictly.
+func interpCode(name string, args []string) int {
+	if strings.HasPrefix(name, "python") {
+		name = "python"
+	}
+	spec, ok := interpSpecs[name]
+	if !ok {
+		return -1
+	}
+	inline := func(i int) int {
+		if i < len(args) {
+			return i
+		}
+		return -1
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--" || a == "-":
+			return -1
+		case strings.HasPrefix(a, "--"):
+			opt, _, eq := strings.Cut(a, "=")
+			switch {
+			case slices.Contains(spec.codeLong, opt):
+				if eq {
+					return -1
+				}
+				return inline(i + 1)
+			case slices.Contains(spec.valueLong, opt):
+				if !eq {
+					i++
+				}
+			default:
+				return -1
+			}
+		case strings.HasPrefix(a, "-"):
+		cluster:
+			for j := 1; j < len(a); j++ {
+				switch c := a[j]; {
+				case strings.IndexByte(spec.codeShort, c) >= 0:
+					if j == len(a)-1 && strings.IndexByte(spec.inlineShort, c) >= 0 {
+						return inline(i + 1)
+					}
+					return -1
+				case strings.IndexByte(spec.valueShort, c) >= 0:
+					if j == len(a)-1 {
+						i++
+					}
+					break cluster
+				case strings.IndexByte(spec.attachShort, c) >= 0:
+					break cluster
+				case strings.IndexByte(spec.flagShort, c) < 0:
+					return -1
+				}
+			}
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
@@ -276,12 +426,31 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 					continue
 				}
 				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
-				for _, a := range argv[1:] {
-					if p, ok := s.hit(a, tree); ok {
+				var ca copyArgs
+				if destCopiers[name] {
+					ca = parseCopyArgs(name, argv[1:])
+				}
+				for _, d := range ca.dests {
+					if r := s.checkDest(d, ca); r != "" {
+						return r
+					}
+				}
+				for k, a := range argv[1:] {
+					code := codeArg(argv, k+1)
+					if bigText(a) && inlineCode(name, argv, k+1) {
+						if h, ok := s.contains(a, true); ok {
+							return h.reason()
+						}
+						continue
+					}
+					if p, ok := s.hit(a, tree && !ca.destIdx[k]); ok {
+						if _, in := s.hit(a, false); tree && !in {
+							return ancestorBlocked(a, p)
+						}
 						return protectedBlocked(p)
 					}
-					if p, ok := s.contains(a); ok {
-						return protectedBlocked(p)
+					if h, ok := s.contains(a, code); ok {
+						return h.reason()
 					}
 					if name != "cd" && name != "pushd" {
 						if p, ok := s.parentHit(a); ok {
@@ -289,18 +458,32 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 						}
 					}
 				}
-				if p, ok := s.contains(c.heredoc); ok && c.heredoc != "" {
-					return protectedBlocked(p)
+				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
+					return h.reason()
 				}
-				if slices.Contains(v.wrappers, "xargs") {
-					for _, prev := range pl.cmds[:i] {
-						for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
-							_, h := s.hit(w, true)
-							_, m := s.contains(w)
-							if w != "" && (h || m) {
-								return "blocked by guard: `xargs " + name + "` reads `" + w + "`, which names agent-jobs " +
-									"state (the subagent log or the job database); the guard cannot verify what xargs passes on."
-							}
+				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
+				// -i`): its feeder gets the strict scan, ancestors included (`ls ~ | python3 x.py` is
+				// refused, a known false refusal).
+				feeder := ""
+				switch {
+				case slices.Contains(v.wrappers, "xargs"):
+					feeder = "`xargs " + name + "`"
+				case i > 0 && stdinInterpreter(name):
+					feeder = "`" + name + "` (its program may come from the pipe)"
+				}
+				if feeder == "" {
+					continue
+				}
+				for _, prev := range pl.cmds[:i] {
+					for j, w := range append(slices.Clone(prev.words), prev.heredoc) {
+						h := false
+						if j < len(prev.words) || !bigText(w) {
+							_, h = s.hit(w, true)
+						}
+						_, m := s.contains(w, true)
+						if w != "" && (h || m) {
+							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
+								"state (the subagent log or the job database); the guard cannot verify what it is fed."
 						}
 					}
 				}
@@ -1683,14 +1866,16 @@ var gitDirTargets = map[string]bool{
 	"cd": true, "pushd": true, "ln": true, "cp": true, "mv": true, "tee": true, "install": true, "rsync": true,
 }
 
-// pathOf returns the cleaned path of a word; for an option `--opt=value` that of its value.
-func pathOf(w string) string {
-	if strings.HasPrefix(w, "-") {
-		if _, v, ok := strings.Cut(w, "="); ok {
-			w = v
-		}
+// pathOf returns the cleaned path of a word; for an option `--opt=value` or a `key=value` word
+// (`dd of=…`) that of its value.
+func pathOf(w string) string { return filepath.Clean(wordValue(w)) }
+
+// wordValue returns a word as written, or for `--opt=value` / `key=value` the part after the first `=`.
+func wordValue(w string) string {
+	if _, v, ok := strings.Cut(w, "="); ok {
+		return v
 	}
-	return filepath.Clean(w)
+	return w
 }
 
 // gitFile reports a word naming git's config, hooks or $GIT_DIR, also respelled (`.git//config`,
