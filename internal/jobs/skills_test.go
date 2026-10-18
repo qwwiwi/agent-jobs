@@ -496,3 +496,85 @@ func TestSkillGuardAndForcedAdd(t *testing.T) {
 		}
 	}
 }
+
+// A link that cannot be removed (non-writable .claude/skills) stays tracked: its info/exclude line
+// stays, the resumed attempt adopts it as delivered instead of taking it for the repository's own,
+// and only once a later cleanup really removes it does the exclude block go.
+func TestSkillLinkUnlinkFailureTrackedAcrossResume(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	m, _ := skillsManager(t)
+	t.Setenv("FAKE_SESSIONS", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", os.Getenv("FAKE_SESSIONS"))
+	repo := newRepo(t)
+	j := enqueue(t, m, "FAKE_WIP FAKE_SLEEP_ONCE=30", func(r *StartRequest) { r.Kind, r.RepoPath = "fix", repo })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	waitFor(t, "work in progress", 15*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(work, "wip.txt"))
+		return err == nil
+	})
+	skillsDir := filepath.Join(work, ".claude", "skills")
+	if err := os.Chmod(skillsDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(skillsDir, 0o755) })
+	if _, err := m.Stop(j.ID, "plan changed"); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(skillsDir, "golang")
+	exclude := filepath.Join(repo, ".git", "info", "exclude")
+	tracked := func(when string) {
+		t.Helper()
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s: link gone (%v)", when, err)
+		}
+		if b, _ := os.ReadFile(exclude); !strings.Contains(string(b), skillExcludeBegin(j.ID)+"\n") ||
+			!strings.Contains(string(b), "\n/.claude/skills/golang\n") {
+			t.Fatalf("%s: exclude block dropped while the link is there:\n%s", when, b)
+		}
+		if out := gitT(t, work, "status", "--porcelain", "--untracked-files=all"); strings.Contains(out, ".claude") {
+			t.Fatalf("%s: git sees the link: %q", when, out)
+		}
+	}
+	tracked("after the stop")
+	if _, err := m.Resume(j.ID, "go on FAKE_SLEEP=1", Limits{MaxBudgetUSD: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := get(t, m, j.ID); r.Status != store.StatusRunning || !slices.Contains(r.SkillsDelivered, "golang") ||
+		strings.Contains(r.SkillsNote, "golang") {
+		t.Fatalf("resumed: %s %q delivered %v note %q", r.Status, r.Error, r.SkillsDelivered, r.SkillsNote)
+	}
+	tracked("while resumed")
+	waitFor(t, "exit_code", 15*time.Second, func() bool {
+		_, ok := readExitCode(m.JobDir(j.ID))
+		return ok
+	})
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	r := get(t, m, j.ID)
+	if r.Status != store.StatusSucceeded {
+		t.Fatalf("after resume %s %q", r.Status, r.Error)
+	}
+	tracked("after the resumed attempt")
+	// Writable again: the next cleanup removes the link, then the block.
+	if err := os.Chmod(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.removeSkills(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatal("link left after a cleanup that could remove it")
+	}
+	if b, _ := os.ReadFile(exclude); strings.Contains(string(b), j.ID) {
+		t.Fatalf("exclude block kept after the link went:\n%s", b)
+	}
+}

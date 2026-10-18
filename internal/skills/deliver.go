@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // LinkDir is where a job's skills are linked, relative to its work dir: claude loads project skills
@@ -44,8 +45,10 @@ type Delivery struct {
 // Link links every entry into work/.claude/skills/<name> -> <entry dir> (absolute). Each entry is
 // checked again first: its directory still resolves to itself inside its root, holds SKILL.md, and
 // the selection still fits the size budget (measured on the target). A name the repository already
-// has is left alone (RepoOwned). On an error nothing stays linked.
-func Link(work string, entries []Entry, maxKB float64) (Delivery, error) {
+// has is left alone (RepoOwned), except a name in adopt (a link of an earlier attempt that could not
+// be removed): a symlink there to the entry's directory is taken over as linked, one elsewhere is
+// replaced. On an error nothing linked by this call stays linked (adopted links stay).
+func Link(work string, entries []Entry, maxKB float64, adopt []string) (Delivery, error) {
 	var d Delivery
 	if len(entries) == 0 {
 		return d, nil
@@ -81,38 +84,59 @@ func Link(work string, entries []Entry, maxKB float64) (Delivery, error) {
 			}
 		}
 	}
+	var created []string
+	rollback := func() {
+		_, _ = Unlink(work, created)
+	}
 	for _, e := range entries {
 		link := LinkPath(work, e.Name)
-		if _, err := os.Lstat(link); err == nil {
+		fi, err := os.Lstat(link)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			rollback()
+			return Delivery{}, err
+		case fi.Mode()&fs.ModeSymlink != 0 && slices.Contains(adopt, e.Name):
+			if target, err := os.Readlink(link); err == nil && target == e.Dir {
+				d.Linked = append(d.Linked, e.Name)
+				continue
+			}
+			if err := os.Remove(link); err != nil {
+				rollback()
+				return Delivery{}, fmt.Errorf("skill %q: stale link of an earlier attempt: %w", e.Name, err)
+			}
+		default:
 			d.RepoOwned = append(d.RepoOwned, e.Name)
 			continue
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			Unlink(work, d.Linked)
-			return Delivery{}, err
 		}
 		if err := os.Symlink(e.Dir, link); err != nil {
-			Unlink(work, d.Linked)
+			rollback()
 			return Delivery{}, fmt.Errorf("link skill %q: %w", e.Name, err)
 		}
+		created = append(created, e.Name)
 		d.Linked = append(d.Linked, e.Name)
 	}
 	return d, nil
 }
 
 // Unlink removes the links of names from work/.claude/skills (only symlinks: anything else at that
-// path is the job's or the repository's and stays), then .claude/skills and .claude when they are
-// left empty. It never follows a link: .claude or .claude/skills that is not a real directory is not
-// entered. It returns what it could not remove.
-func Unlink(work string, names []string) []string {
+// path is the job's or the repository's and stays, and is no longer tracked), then .claude/skills
+// and .claude when they are left empty. It never follows a link: .claude or .claude/skills that is
+// not a real directory is not entered. It returns the names whose link is still there (removal
+// failed) and what went wrong.
+func Unlink(work string, names []string) ([]string, error) {
 	var left []string
+	var errs []error
 	claudeDir := filepath.Join(work, ".claude")
 	skillsDir := filepath.Join(work, filepath.FromSlash(LinkDir))
 	for _, p := range []string{claudeDir, skillsDir} {
 		if ok, err := realDir(p); !ok || err != nil {
+			// Missing: no link can be there. Not a real directory: the links are not at their path any
+			// more (the job replaced the directory).
 			if len(names) > 0 && err != nil {
-				left = append(left, fmt.Sprintf("links not removed: %v", err))
+				errs = append(errs, fmt.Errorf("links not removed: %w", err))
 			}
-			return left
+			return nil, errors.Join(errs...)
 		}
 	}
 	for _, n := range names {
@@ -124,17 +148,19 @@ func Unlink(work string, names []string) []string {
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 		case err != nil:
-			left = append(left, fmt.Sprintf("%s: %v", n, err))
+			left = append(left, n)
+			errs = append(errs, fmt.Errorf("%s: %w", n, err))
 		case fi.Mode()&fs.ModeSymlink == 0:
-			left = append(left, n+": no longer a link, left in place")
+			errs = append(errs, fmt.Errorf("%s: no longer a link, left in place", n))
 		default:
 			if err := os.Remove(link); err != nil {
-				left = append(left, fmt.Sprintf("%s: %v", n, err))
+				left = append(left, n)
+				errs = append(errs, fmt.Errorf("%s: %w", n, err))
 			}
 		}
 	}
 	// Remove only when empty (os.Remove fails on a non-empty directory).
 	_ = os.Remove(skillsDir)
 	_ = os.Remove(claudeDir)
-	return left
+	return left, errors.Join(errs...)
 }
