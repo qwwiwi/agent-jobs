@@ -287,7 +287,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 **Сборка и проверка**
 
 ```bash
-go build -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.3.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # один раз на клон: pre-push запускает scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```

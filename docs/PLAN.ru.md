@@ -33,7 +33,7 @@ Agent Jobs реализует [эталонный дизайн](REFERENCE.ru.md)
 - `agent-jobs doctor procs [--kill]`: процессы, пережившие свою джобу или сессию, и строки running с мёртвым pid; только отчёт, `--kill` завершает лишь процессы, доказанно принадлежащие закончившейся джобе (DEVIATIONS #13).
 - Тулы оркестратора `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (джобе — ни одного).
 
-**Волна E2: остановка, продолжение в той же сессии, дополнение** (одобрено владельцем как приоритет, см. [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Сделано в ветке, на ревью.
+**Волна E2: остановка, продолжение в той же сессии, дополнение** (одобрено владельцем как приоритет, см. [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Построено в v0.3.0.
 
 - Каждая джоба получает id сессии до запуска (`--session-id`); `--no-session-persistence` убран.
 - `job_stop` / `agent-jobs stop`: идущая или ожидающая джоба становится `stopped`, worktree, незакоммиченная работа и сессия сохраняются.
@@ -43,8 +43,8 @@ Agent Jobs реализует [эталонный дизайн](REFERENCE.ru.md)
 
 ## Волна A
 
-- **Тулы памяти, задач и команды через общий мозг.** *Статус: построено в ветке ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), на ревью; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Имена как в эталоне, работают поверх общей памяти и задач команды (DEVIATIONS #2, #3). Джобе доступны только `memory_search` и `memory_write`.
-- **Заметки памяти в брифе.** *Статус: построено в ветке ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), на ревью; `internal/jobs/memory.go`.* Демон добавляет в каждый бриф до шести самых близких заметок из общей памяти, чтобы джоба не переоткрывала уже записанное. Если память недоступна, джоба всё равно стартует, и бриф об этом говорит.
+- **Тулы памяти, задач и команды через общий мозг.** *Статус: построено в v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Имена как в эталоне, работают поверх общей памяти и задач команды (DEVIATIONS #2, #3). Джобе доступны только `memory_search` и `memory_write`.
+- **Заметки памяти в брифе.** *Статус: построено в v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/jobs/memory.go`.* Демон добавляет в каждый бриф до шести самых близких заметок из общей памяти, чтобы джоба не переоткрывала уже записанное. Если память недоступна, джоба всё равно стартует, и бриф об этом говорит.
 
 ## Волна B
 

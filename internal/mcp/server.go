@@ -19,7 +19,7 @@ import (
 const ServerName = "agent-jobs"
 
 // Version is reported in the MCP handshake.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // Deps is what tool handlers work on. In the job role Manager is nil: no job-role tool needs the
 // job database, and a job's server does not open it.

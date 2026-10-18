@@ -33,7 +33,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 - `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #13).
 - Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
 
-**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Built on a branch, on review.
+**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Built in v0.3.0.
 
 - Every job gets a session id before launch (`--session-id`); `--no-session-persistence` is gone.
 - `job_stop` / `agent-jobs stop`: a running or queued job ends `stopped`, keeping its worktree, uncommitted work and session.
@@ -43,8 +43,8 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 
 ## Wave A
 
-- **Memory, tasks and team tools via the shared brain.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
-- **Memory notes in the brief.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
+- **Memory, tasks and team tools via the shared brain.** *Status: built in v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
+- **Memory notes in the brief.** *Status: built in v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
 ## Wave B
 

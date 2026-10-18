@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-18
+
+No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released here in 0.3.0.
+
 ### Added
 - `scripts/check-commit-messages.sh`, run by `scripts/check.sh` and the pre-push hook: refuses commits not yet on `origin/main` (or the last 20 when it is unknown) whose message contains Cyrillic, naming each one; bash 3.2 and POSIX grep.
 - MCP server `agent-jobs mcp --role orchestrator|job --agent A` (stdio, `github.com/modelcontextprotocol/go-sdk` v1.8.0) with a tool registry of two audiences; the job role is an allowlist, and the server itself refuses hidden tools and filters the tool list.
@@ -58,23 +62,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A job no longer hangs after its final result: when `claude -p` stays alive after a `result` event (seen with background subagents), the wrapper ends it once, for the whole grace period (config `idle_after_result_seconds`, default 180), the stream has been silent and claude has had no live descendant other than the job MCP server; the job is judged by the last result (turns and cost from it), the row records «closed by the idle-after-result rule», and report.md is the last result's text if it starts with `## Summary`, else the job's own report.md, else the last top-level assistant text starting with `## Summary` (subagent output never counts), else a short note that the job ended without a report. `idle_after_result_seconds: -1` turns the rule off. Linux only.
 - `agent-jobs card new` works for an origin whose host has no dot (`git@myserver:org/repo.git`, `ssh://localhost/…`) or is an IPv6 address: such remotes are written as `ssh://host/path`.
 - Subagent log and counter: the log line is appended (under the flock) before the counter is reserved, and taken back when the counter refuses; a failed write is reported as a write error and no longer leaves the counter ahead of the log (which refused every later subagent as «shortened»).
+- Guard false refusals from the containment fix: the out-of-scope tool names (`ssh`, `docker`, `tmux`, `pm2`, `podman`, `crontab`, `systemctl`, …) count only where they run (the command word, also behind wrappers and `xargs`; the value of an exec option such as `find -exec`, `rsync -e`, `go test -exec`; a positional of a runner such as `setsid`/`watch`/`flock`; a word inside code such as `python -c`, `node -e`, `awk`, `trap`; an absolute path or a substitution given to `cp`/`mv`/`install`/`ln`), so `go test ./internal/ssh/...`, `make -C docker`, `npm run docker`, `sed -i s/ssh:/https:/ f` and `cp -r docker dest` are allowed again. A `cd` to a resolved directory no longer makes a variable write target unverifiable, and a trailing `popd` (the last command of the call, no `trap`) no longer counts as an unresolvable cd.
+- `scripts/install-linux.sh` builds with `GOENV=off GOFLAGS=` and refuses to install a binary whose `go version -m` shows build tags (a go env file could otherwise turn on the test hooks).
 
 ### Security
 - Guard: a job's subagent must stay inside the job. Its input may carry only the string keys `description`, `prompt`, `subagent_type` and `model`, matched exactly and case-sensitively by a token walk (encoding/json would match `Isolation` to `isolation` and let a later duplicate win); duplicate keys and every other key (`isolation`, `run_in_background`, `team_name`, …) are refused. Without a subagent log every subagent is refused. The hook input must be a single JSON object.
 - Guard: protected paths (`--protect`: the subagent logs and `jobs.db*`) cannot be written by file tools or literal Bash targets (redirections; arguments of any program that is not a plain reader), symlinks resolved.
 - Guard: protected-path resolution (`internal/guard/pathres.go`) expands `~/` and `$HOME`, follows literal `cd`/`pushd` through the call, and refuses protected paths inside option values and inline code (`dd of=`, `python3 -c`, `perl -e`, `node -e`), ancestors as targets of `rm`/`mv`/`cp`/`ln`/`rsync`/`chmod`/`chown`/`tar`/`find -delete`, the directory holding one as a destination, `xargs <non-reader>` fed a protected path, and relative words that could reach one after an unresolvable `cd` (`$X`, `-`, `CDPATH`) or under `~user/`.
 - Project cards are opened with `openat(O_NOFOLLOW)` relative to the cards directory and read bounded from the same descriptor (no symlink escape, no growth after the size check); front matter selectors and a new card's origin with control characters (CR/LF, …) are refused.
-
-### Security
 - A job's environment no longer carries `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR`; the guard and the deny rules reject `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus`, `qdbus`, `dbus-run-session` (guard also behind wrappers, `xargs`, and as words inside other programs' arguments) and writes into the cgroup file system in any spelling (cleaned, relative, symlinked, through `/proc/<pid>/root`, control-file base names; `cd` into `/sys` or `/sys/fs`), the direct ways out of a job's scope.
 - Owner decision 2026-10-17: the guard and the deny rules also reject `crontab`, `at`, `batch`, `tmux`, `screen`, `pm2`, `docker`, `docker-compose`, `podman`, `podman-compose`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`, `qdbus-qt5`, `qdbus6` (daemons, schedulers and namespaces that run processes outside the job's scope).
 - Guard: cgroup-file-system write targets are resolved through variables/backticks (fail closed), `~`, cd/pushd/popd chains in one call (CDPATH, `cd -`), and symlinks to `/`, `/sys`, `/sys/fs`; `cgroup.kill`, `cgroup.freeze` and the other cgroup core files count as control files.
 - Guard: a write target (redirection, or an argument of a program that writes: tee, dd, cp, mv, install, ln, rsync, sed, mkdir, touch, rm, …) computed inside the same call is refused as unverifiable in any call, not only when it mentions cgroupfs: a command or process substitution, a variable the call sets (assignment, `read`, `mapfile`/`readarray`, `for`/`select`, `declare`/`export`/`local`/`typeset`/`readonly`, `printf -v`, `${X:=…}`), a positional, indirect or `$_` expansion, any variable after `.`/`source` or `declare -n`, and any write after an `ln` with a variable argument. A plain environment variable (`> "$OUT"`, `tee "$LOG"`, `"${OUT}"`) stays allowed. Note: calls such as `mkdir -p "$(dirname f)"`, `OUT=x.log; make > "$OUT"` or `for f in a b; do echo > "$f"; done` are now refused; write the paths out.
 - Guard: `trap` code is parsed like `sh -c` code (it runs later, also after the last command).
-
-### Fixed
-- Guard false refusals from the containment fix: the out-of-scope tool names (`ssh`, `docker`, `tmux`, `pm2`, `podman`, `crontab`, `systemctl`, …) count only where they run (the command word, also behind wrappers and `xargs`; the value of an exec option such as `find -exec`, `rsync -e`, `go test -exec`; a positional of a runner such as `setsid`/`watch`/`flock`; a word inside code such as `python -c`, `node -e`, `awk`, `trap`; an absolute path or a substitution given to `cp`/`mv`/`install`/`ln`), so `go test ./internal/ssh/...`, `make -C docker`, `npm run docker`, `sed -i s/ssh:/https:/ f` and `cp -r docker dest` are allowed again. A `cd` to a resolved directory no longer makes a variable write target unverifiable, and a trailing `popd` (the last command of the call, no `trap`) no longer counts as an unresolvable cd.
-- `scripts/install-linux.sh` builds with `GOENV=off GOFLAGS=` and refuses to install a binary whose `go version -m` shows build tags (a go env file could otherwise turn on the test hooks).
 
 ## [0.1.0] – 2026-10-17 – Stage 1 core, Linux port, guard hardening, public release
 
@@ -118,5 +118,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - File tools (Write/Edit/MultiEdit/NotebookEdit) cannot write inside `.git` or the job's own git dirs (symlinks resolved, `..` rejected).
 - Wrapper starts claude with a scrubbed git environment (job-only global config with the job identity, no system config, hooks/fsmonitor/ssh/credential helper/pager/editor overridden); the daemon's own git calls use the same overrides, and cleanup makes no patch when the repository config names a filter, diff command or textconv.
 
-[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/qwwiwi/agent-jobs/releases/tag/v0.1.0
