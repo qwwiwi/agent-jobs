@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -632,33 +634,168 @@ func TestValidManagerCgroup(t *testing.T) {
 	}
 }
 
-// With the user bus broken and no trusted path for the manager's cgroup, the stop refuses: nothing is
-// swept (not even a uid-owned user@<uid>.service decoy holding the scope's name) and the stop fails, so
-// the scope stays pending.
+// With the user bus broken and no trusted systemctl for the system manager (so no answer) and no default
+// cgroup, the stop refuses: nothing is swept (not even a uid-owned user@<uid>.service decoy holding the
+// scope's name), the stop fails, and a cancelled job stays scope-pending.
 func TestStopScopeRefusesWithoutTrustedManagerCgroup(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("cgroups are Linux")
 	}
 	m := newManager(t)
-	id := "261018-000000-0000"
-	unit := ScopeUnit(m.Agent, id)
+	untrusted := stubSystemManager(t, "echo /agents.slice/user@0.service\n")
+	oldBin := systemManagerBin
+	systemManagerBin = func() (string, error) { return trustedBinary([]string{untrusted}) }
+	t.Cleanup(func() { systemManagerBin = oldBin })
+	if _, err := userManagerUnitCgroup(os.Getuid()); err == nil || !strings.Contains(err.Error(), "no trusted systemctl") {
+		t.Fatalf("lookup with only a user-owned systemctl = %v, want a refusal", err)
+	}
+	fakeSystemctl(t) // user bus broken, cgroupRoot an empty dir (no default cgroup)
+	root := cgroupRoot
 	mgr := fmt.Sprintf("user@%d.service", os.Getuid())
+	j := scopedRow(t, m)
+	unit := ScopeUnit(m.Agent, j.ID)
 	decoy := "deleg.slice/x.service/" + mgr + "/app.slice/" + unit
-	root := fakeManagerCgroup(t, "", errors.New("exit status 1"), decoy)
+	if err := os.MkdirAll(filepath.Join(root, decoy), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	// An empty decoy would count as swept; refusing must not depend on looking at it at all.
 	if err := os.WriteFile(filepath.Join(root, decoy, "cgroup.procs"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(t.TempDir(), "systemctl")
-	if err := os.WriteFile(bin, []byte("#!/bin/bash\nexit 1\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	old := systemctlBin
-	systemctlBin = bin
-	t.Cleanup(func() { systemctlBin = old })
-	err := m.stopScope(id)
+	err := m.stopScope(j.ID)
 	if err == nil || !strings.Contains(err.Error(), "no trusted cgroup path") {
 		t.Fatalf("stopScope = %v, want a refusal", err)
+	}
+	if err := m.Cancel(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, m, j.ID); got.Status != store.StatusCancelled || !got.ScopePending {
+		t.Fatalf("cancel without a trusted path: %s pending=%v %q, want cancelled and scope-pending", got.Status, got.ScopePending, got.Error)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if !get(t, m, j.ID).ScopePending {
+		t.Fatal("a tick without a trusted path cleared the pending mark")
+	}
+}
+
+// stubSystemManager writes a bash stub with body and points systemManagerBin at it for one test.
+func stubSystemManager(t *testing.T, body string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := systemManagerBin
+	systemManagerBin = func() (string, error) { return bin, nil }
+	t.Cleanup(func() { systemManagerBin = old })
+	return bin
+}
+
+// killPidFile kills the pid a stub wrote to f (a sleeper it left behind).
+func killPidFile(t *testing.T, f string) {
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(f); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+}
+
+// At the command boundary the lookup passes exactly the documented arguments and an environment without
+// the daemon's DBUS_* or LD_* variables.
+func TestSystemManagerLookupBoundary(t *testing.T) {
+	dir := t.TempDir()
+	args, env := filepath.Join(dir, "args"), filepath.Join(dir, "env")
+	stubSystemManager(t, "printf '%s\\n' \"$@\" > "+args+"\nenv > "+env+"\necho ' /agents.slice/user@7.service '\n")
+	t.Setenv("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent/bus")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
+	t.Setenv("LD_LIBRARY_PATH", "/nonexistent")
+	got, err := systemManagerUnitCgroup(7)
+	if err != nil || got != "/agents.slice/user@7.service" {
+		t.Fatalf("lookup = %q, %v", got, err)
+	}
+	b, err := os.ReadFile(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "--system\nshow\nuser@7.service\n--property=ControlGroup\n--value\n"; string(b) != want {
+		t.Fatalf("args = %q, want %q", b, want)
+	}
+	b, err = os.ReadFile(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "DBUS_") || strings.HasPrefix(l, "LD_") {
+			t.Fatalf("lookup inherited %q; env:\n%s", l, b)
+		}
+	}
+	for _, want := range systemManagerEnv {
+		if !slices.Contains(lines, want) {
+			t.Fatalf("env lacks %q:\n%s", want, b)
+		}
+	}
+}
+
+// The lookup is bounded even when a descendant holds its stdout: after the process exits (WaitDelay) and
+// when it hangs (timeout, then WaitDelay).
+func TestSystemManagerLookupBounded(t *testing.T) {
+	for _, tc := range []struct{ name, tail string }{
+		{"exits, sleeper holds stdout", "echo /agents.slice/user@7.service\nexit 0\n"},
+		{"hangs, sleeper holds stdout", "exec sleep 30\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pid := filepath.Join(t.TempDir(), "pid")
+			killPidFile(t, pid)
+			stubSystemManager(t, "sleep 30 &\necho $! > "+pid+"\n"+tc.tail)
+			oldT, oldW := systemManagerTimeout, systemManagerWaitDelay
+			systemManagerTimeout, systemManagerWaitDelay = 500*time.Millisecond, 500*time.Millisecond
+			t.Cleanup(func() { systemManagerTimeout, systemManagerWaitDelay = oldT, oldW })
+			start := time.Now()
+			_, err := systemManagerUnitCgroup(7)
+			if d := time.Since(start); d > 5*time.Second {
+				t.Fatalf("lookup took %s (err %v), want it bounded", d, err)
+			}
+			if err == nil {
+				t.Fatal("lookup whose pipes stayed held succeeded")
+			}
+		})
+	}
+	if systemManagerWaitDelay <= 0 {
+		t.Fatal("systemManagerWaitDelay must be set")
+	}
+}
+
+// Only a root-owned, not group/world-writable regular file in such a directory is taken; the daemon's
+// PATH plays no part.
+func TestTrustedBinary(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux paths")
+	}
+	own := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(own, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.Symlink(own, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(own))
+	for _, c := range [][]string{{own}, {link}, {"/nonexistent/systemctl"}, {"/usr/bin"}, nil} {
+		if p, err := trustedBinary(c); err == nil {
+			t.Errorf("trustedBinary(%q) = %q, want an error", c, p)
+		}
+	}
+	real, err := trustedBinary(systemctlCandidates)
+	if err != nil {
+		t.Skipf("no trusted systemctl on this host: %v", err)
+	}
+	if p, err := trustedBinary(append([]string{own, link, "/nonexistent/systemctl"}, systemctlCandidates...)); err != nil || p != real {
+		t.Fatalf("trustedBinary skipped the untrusted ones = %q, %v, want %q", p, err, real)
 	}
 }
 

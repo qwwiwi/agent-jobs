@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -346,18 +347,84 @@ var cgroupDirOwner = func(fi fs.FileInfo) (int, bool) {
 	return int(st.Uid), true
 }
 
-// systemManagerBin is the systemctl that asks the system manager for the user manager's cgroup; apart
-// from systemctlBin (the user-bus calls a test makes fail) so the lookup stays real in such a test.
-var systemManagerBin = "systemctl"
+// systemctlCandidates are the only places the system-manager lookup takes systemctl from: never the
+// daemon's PATH.
+var systemctlCandidates = []string{"/usr/bin/systemctl", "/bin/systemctl"}
+
+// systemManagerBin returns the systemctl that asks the system manager for the user manager's cgroup,
+// resolved once from systemctlCandidates; apart from systemctlBin (the user-bus calls a test makes fail)
+// so the lookup stays real in such a test. A variable so tests can stand in a stub.
+var systemManagerBin = sync.OnceValues(func() (string, error) { return trustedBinary(systemctlCandidates) })
+
+// systemManagerEnv is the whole environment of the lookup: nothing of the daemon's (no DBUS_* that could
+// point it at another bus, no LD_*).
+var systemManagerEnv = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+
+// systemManagerTimeout bounds the lookup; systemManagerWaitDelay bounds the wait for its pipes after the
+// process exits or is killed (a descendant holding stdout would otherwise block Output). Variables for tests.
+var (
+	systemManagerTimeout   = 10 * time.Second
+	systemManagerWaitDelay = 2 * time.Second
+)
+
+// trustedBinary returns the first candidate that resolves to a regular root-owned file, not group- or
+// world-writable, in a root-owned directory that is not group- or world-writable.
+func trustedBinary(candidates []string) (string, error) {
+	var errs []error
+	for _, c := range candidates {
+		p, err := filepath.EvalSymlinks(c)
+		if err == nil {
+			err = rootOwnedUnwritable(p, false)
+		}
+		if err == nil {
+			err = rootOwnedUnwritable(filepath.Dir(p), true)
+		}
+		if err == nil {
+			return p, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", c, err))
+	}
+	return "", fmt.Errorf("no trusted systemctl: %w", errors.Join(errs...))
+}
+
+// rootOwnedUnwritable checks that p (not followed) is a directory (dir) or a regular file, owned by root
+// and not writable by group or others.
+func rootOwnedUnwritable(p string, dir bool) error {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if dir && !fi.IsDir() || !dir && !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s: wrong file type %s", p, fi.Mode().Type())
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s: group or world writable", p)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 {
+		return fmt.Errorf("%s: not owned by root", p)
+	}
+	return nil
+}
 
 // userManagerUnitCgroup returns the ControlGroup of user@<uid>.service as the system manager reports it;
 // a variable so tests can stand in. The system manager is asked (not the user bus, which may be the broken
 // one): it placed the unit, and no process of the user can change its answer.
-var userManagerUnitCgroup = func(uid int) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+var userManagerUnitCgroup = systemManagerUnitCgroup
+
+// systemManagerUnitCgroup asks the system manager through the trusted systemctl, with a fixed minimal
+// environment, bounded by systemManagerTimeout plus systemManagerWaitDelay.
+func systemManagerUnitCgroup(uid int) (string, error) {
+	bin, err := systemManagerBin()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), systemManagerTimeout)
 	defer cancel()
 	unit := fmt.Sprintf("user@%d.service", uid)
-	out, err := exec.CommandContext(ctx, systemManagerBin, "--system", "show", unit, "--property=ControlGroup", "--value").Output()
+	cmd := exec.CommandContext(ctx, bin, "--system", "show", unit, "--property=ControlGroup", "--value")
+	cmd.Env = systemManagerEnv
+	cmd.WaitDelay = systemManagerWaitDelay
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("systemctl --system show %s: %w", unit, err)
 	}
