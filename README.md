@@ -120,7 +120,7 @@ Use amend while a job waits, stop and resume when a running job needs new facts 
 | Time (`--timeout-minutes`) | 45 min | 180 min |
 | Running per agent (`max_running`) | 2 | 8 |
 
-A request above a ceiling is **rejected, never clamped**, so a job never stops for a reason its author could not see. Zero or omitted means the default; negative values are rejected.
+A request above a ceiling is **rejected, never clamped**, so a job never stops for a reason its author could not see. Zero or omitted means the default; negative values are rejected. Exception: `max_running` (a config.json key) takes the default only when the key is absent; an explicit 0, `null` or any value outside 1..8 is a config error.
 
 **Model.** Pass `--model`, or a `--complexity` (`light` / `normal` / `hard`) that maps to a model by kind:
 
