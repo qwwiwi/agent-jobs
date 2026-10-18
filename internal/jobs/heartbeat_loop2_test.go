@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -79,10 +80,22 @@ func TestHeartbeatRecheckUnderTmuxLock(t *testing.T) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		t.Fatal(err)
 	}
+	// The sync point: the delivery found tmux.lock held and waits for it, so the decision is in and
+	// the re-check can only come after the lock is released.
+	waiting := make(chan struct{})
+	var once sync.Once
+	tmuxLockWaiting = func() { once.Do(func() { close(waiting) }) }
+	t.Cleanup(func() { tmuxLockWaiting = func() {} })
 	done := runAsync(m, HeartbeatTriggerDaemon)
-	waitFor(t, "decision call", 10*time.Second, func() bool { return e.calls() == 1 })
-	time.Sleep(500 * time.Millisecond) // the answer is in; the delivery waits for tmux.lock
-	clock.Set(start.Add(time.Minute))  // 22:00:30, inside the night window
+	select {
+	case <-waiting:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delivery never waited for tmux.lock")
+	}
+	if c := e.calls(); c != 1 {
+		t.Fatalf("model calls %d before the lock wait, want 1", c)
+	}
+	clock.Set(start.Add(time.Minute)) // 22:00:30, inside the night window
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -879,7 +880,7 @@ func (m *Manager) collect() error {
 		}
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
-			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+			res := m.endedResult(j)
 			status, msg := m.verdict(j, code, res, dir)
 			m.finish(j, status, res, false, dur, msg, now)
 			continue
@@ -898,19 +899,19 @@ func (m *Manager) collect() error {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
 			m.killJob(j, j.PID, j.PGID)
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
 			if code, ok := readExitCode(dir); ok {
-				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+				res := m.endedResult(j)
 				status, msg := m.verdict(j, code, res, dir)
 				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			m.finish(j, store.StatusFailed, res, killed, dur, "wrapper died without writing exit_code (see stderr.log)", now)
 		}
 	}
@@ -921,15 +922,40 @@ func (m *Manager) collect() error {
 // Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
 // stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
 // the assistant turns are counted and the cost is unknown (killed is true).
-func killedResult(runner, dir string) (res StreamResult, killed bool) {
+func (m *Manager) killedResult(j *store.Job) (res StreamResult, killed bool) {
+	dir := m.JobDir(j.ID)
 	p := filepath.Join(dir, "stream.jsonl")
 	if _, ok := readExitCode(dir); ok {
-		return parseRunnerStream(runner, p), false
+		return m.endedResult(j), false
 	}
-	if runner == store.RunnerCodex {
-		return StreamResult{Runner: runner, Turns: ParseCodexStream(p).Turns}, true
+	if j.Runner == store.RunnerCodex {
+		return StreamResult{Runner: j.Runner, Turns: ParseCodexStream(p).Turns}, true
 	}
 	return StreamResult{Turns: streamTurns(p)}, true
+}
+
+// endedResult is the result of an attempt whose wrapper wrote exit_code. For claude it is what the
+// wrapper read from claude's stdout and recorded in the row for this launch (store.SetWrapperResult),
+// never a result line in stream.jsonl: the job can append one there. No record (the wrapper could not
+// write it, or exited before claude ended) is no result: the cost is then unknown. A codex stream is
+// parsed from stream.jsonl as before.
+func (m *Manager) endedResult(j *store.Job) StreamResult {
+	if j.Runner == store.RunnerCodex {
+		return ParseCodexStream(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
+	}
+	raw, ok, err := m.Store.WrapperResult(j.ID, j.LaunchToken)
+	if err != nil {
+		m.Log.Printf("job %s: read the wrapper's result: %v", j.ID, err)
+	}
+	if !ok {
+		return StreamResult{}
+	}
+	var w wrapperResult
+	if err := json.Unmarshal([]byte(raw), &w); err != nil {
+		m.Log.Printf("job %s: the wrapper's result is unreadable: %v", j.ID, err)
+		return StreamResult{}
+	}
+	return StreamResult{Found: w.Found, Subtype: w.Subtype, IsError: w.IsError, Turns: w.Turns, CostUSD: w.CostUSD}
 }
 
 // finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
@@ -1140,7 +1166,7 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
-	res, killed := killedResult(j.Runner, m.JobDir(id))
+	res, killed := m.killedResult(j)
 	msg := "cancelled"
 	if err := m.endScope(j); err != nil {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))

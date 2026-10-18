@@ -61,7 +61,8 @@ type Config struct {
 	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
 	SubagentReserve func(max int) (prev int, allowed bool, err error)
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
-	// database that holds the counter, the skill catalog roots and the job's skill links.
+	// database that holds the counter, the skill catalog roots, the job's skill links and the claude
+	// project dirs that hold the job's session transcripts.
 	// File tools and literal Bash targets into them are refused.
 	Protected []string
 	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
@@ -263,8 +264,8 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 }
 
 func protectedBlocked(p string) string {
-	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database) or a skill catalog " +
-		"(a skill root or a skill link); a job does not write there."
+	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), a skill catalog " +
+		"(a skill root or a skill link) or claude's session transcripts of the job; a job does not write there."
 }
 
 func ancestorBlocked(w, p string) string {
