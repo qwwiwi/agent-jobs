@@ -13,7 +13,8 @@ import (
 // A job never holds the brain credential. Its MCP server (job role) is a SocketClient: it sends
 // memory_search and memory_write to the agent's daemon over a unix socket in the state directory
 // (<state>/brain.sock, mode 600), and the daemon, which holds the token, checks that the job is
-// running, gives a write the job's provenance (ForJob) and calls the brain.
+// running and that the calling process belongs to it (socket peer credentials: its session and
+// scope), gives a write the job's provenance (ForJob) and calls the brain.
 
 // Socket operations.
 const (
@@ -52,7 +53,7 @@ var ErrJobRole = errors.New("not available to a job: only memory_search and memo
 // SocketClient is the brain of a job: memory_search and memory_write through the daemon.
 type SocketClient struct {
 	Path    string        // <state>/brain.sock
-	JobID   string        // the job's id (AGENT_JOBS_JOB); the daemon checks it is running
+	JobID   string        // the job's id (AGENT_JOBS_JOB); the daemon checks it is running and is the caller's
 	Timeout time.Duration // bounds one call; 0 = DefaultTimeout + 5 s
 }
 

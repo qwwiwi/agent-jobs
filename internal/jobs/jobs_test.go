@@ -221,6 +221,9 @@ printf '\n' >> "$FAKE_TMUX_LOG"
 `
 
 func TestMain(m *testing.M) {
+	if os.Getenv(proxyClientEnv) != "" {
+		os.Exit(runProxyClient())
+	}
 	// Under a git hook (pre-push runs scripts/check.sh) git exports GIT_DIR, GIT_INDEX_FILE, …: every
 	// `git -C <tempdir>` in these tests would then act on the real repository (re-init, config, commit).
 	for _, kv := range os.Environ() {

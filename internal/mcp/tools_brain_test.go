@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -310,12 +311,17 @@ func TestStdioJobRoleThroughDaemonProxy(t *testing.T) {
 
 	cmd := exec.Command(selfBin, "mcp", "--role", "job", "--agent", "test")
 	cmd.Env = append(os.Environ(), jobs.JobEnvVar+"="+j.ID)
+	// The proxy binds a call to the caller's session: the server leads one, recorded as the job's.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cs, err := sdk.NewClient(&sdk.Implementation{Name: "test", Version: "0"}, nil).
 		Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cs.Close() })
+	if err := m.Store.SetPID(j.ID, "tok", cmd.Process.Pid, cmd.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
 	var found NotesOutput
 	call(t, cs, "memory_search", map[string]any{"query": "q"}, &found)
 	if len(found.Notes) != 1 || found.Notes[0].Path != "70-runbooks/a.md" {

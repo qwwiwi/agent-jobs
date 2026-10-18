@@ -161,7 +161,7 @@ func TestProxyNotifyOwnerWithoutBrain(t *testing.T) {
 	sock := serveProxy(t, m)
 	j := running(t, m)
 	ctx := context.Background()
-	c := brain.SocketClient{Path: sock, JobID: j.ID}
+	c := jobPeer(t, m, sock, j)
 	o, err := c.NotifyOwner(ctx, "blocked on a decision", "high")
 	if err != nil || o["delivered"] != true || o["job_id"] != j.ID {
 		t.Fatalf("notify via proxy: %v %v", o, err)
@@ -176,7 +176,7 @@ func TestProxyNotifyOwnerWithoutBrain(t *testing.T) {
 		t.Fatalf("search without a brain: %v", err)
 	}
 	queued := enqueue(t, m, "x", nil)
-	if _, err := (brain.SocketClient{Path: sock, JobID: queued.ID}).NotifyOwner(ctx, "hi", ""); err == nil ||
+	if _, err := c.as(queued.ID).NotifyOwner(ctx, "hi", ""); err == nil ||
 		!strings.Contains(err.Error(), "not a running job") {
 		t.Fatalf("queued job: %v", err)
 	}
