@@ -75,6 +75,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 - **Job** is `agent-jobs run-wrapper` running `claude -p` in its own process group, with a scrubbed git environment, in a git worktree detached at the base commit (or an empty directory).
 - **Job folder** keeps the brief, settings, event stream, report and, after cleanup, the patches.
 - **Schedules (cron)** are built, unreleased (Wave B): the daemon checks them every minute and types a due prompt into the main session or starts a job.
+- **Checks (dead-man's switch)** are built, unreleased (Wave B): work that stays silent while healthy leaves a mark; the daemon alerts the main session once when an expected time passes without one.
 
 ### Lifecycle
 
@@ -292,6 +293,18 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 
 A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts included: a firing must be later than the last one on the local wall clock too, so in the hour repeated when DST ends `*/30 2 * * *` fires at 02:00 and 02:30 once each. If the system clock is set back, schedules pause until the clock passes both persisted watermarks (the instant and the local wall-clock minute of the last firing); a restart does not reset them, and `next_fire_at` shows the firing that resumes them. `agent-jobs schedules --agent A [--json]` lists them.
 
+**Checks** (dead-man's switch; orchestrator only, except `check_mark`), a cron expression in local time saying when something that stays silent while healthy must have reported, plus a grace:
+
+| tool | what it does |
+|---|---|
+| `check_add` | `name` (slug: a-z, 0-9, `-`, `_`; ≤ 64), `cron` (same syntax as schedules), optional `grace_minutes` (default 60, 1..10080) |
+| `check_list` | the checks, oldest first: `state` (ok, missed, waiting, disabled) for the latest expected time whose grace has passed (a mark after the grace keeps it missed, with `late_mark_at`), the next expected time, the last mark, the newest missed alert with its delivery (`alert_state`: pending, delivered, failed; `alert_attempts`, `last_alert_error`, `alert_merged`) and `alerts_pending` / `alerts_failed` over all alerts |
+| `check_set` | edit in place by `name`: `cron`, `grace_minutes`, `enabled` (false pauses); a new cron or grace, or enabling, re-arms the check |
+| `check_remove` | delete by `name` with its marks, only on the owner's instruction |
+| `check_mark` | orchestrator **and job**: leave a completion mark, optional `note` (one line, ≤ 300 characters); a job's mark goes through the daemon and carries its id. CLI: `agent-jobs check mark --agent A NAME [--note T]` (for scripts and timers outside a job) |
+
+In every tick the daemon judges each enabled check's expected times whose grace has passed, every one since the last judged, oldest first (at most 1000 per check and tick). Expected times are the cron's instants after the arm time (creation, or the last `check_set` of the cron or grace, or enabling); a mark belongs to exactly one of them, a pure function of its time: the earliest expected time E with E+grace ≥ the mark (E's window is (P+grace, E+grace], P the previous expected time; the first window starts at the arm time). E is ok when a mark belongs to it, missed otherwise, whatever the order the marks arrived in or how long the daemon was down; marks before the arm time never count. A window stores at most 20 marks (more answer `ok, already marked`), a mark is pruned only once its expected time is judged. The outcome is stored and never re-judged; a `check_set` between the daemon's read and its claim voids the claim. Each missed E is its own alert with its own attempts; the session gets one line per tick, after the tick has released its lifecycle lock: `[jobs:check-missed] <name> expected <E> (no mark within <grace>m)`, or `<name>: 3 missed, latest <E> (…)` for several, checks joined by `; ` (beyond 50 pending alerts of a check the older ones are merged into a counter). A failed delivery is retried with backoff (1, 2, 4, 8 minutes), at most 5 attempts (no `notify_tmux_target` counts as a failed attempt), then the alert is failed; each attempt is fenced (re-checked under `tmux.lock` right before typing), delivery is at-least-once (a daemon that dies after typing and before storing it types it again). Failed alerts stay in `agent-jobs status` and `system_doctor` until a `check_set` acknowledges them (a later healthy expected time does not); disabling a check pauses its judging, alerts already pending are still delivered. DST follows the schedules' rule. Missed checks (also after a late mark: `missed (late mark at …)`) and pending or failed alerts show in `agent-jobs status` and `system_doctor`; `agent-jobs checks --agent A [--json]` lists them.
+
 **Owner** (orchestrator and job):
 
 | tool | what it does |
@@ -337,6 +350,7 @@ Register both hooks in the orchestrator's Claude Code settings (the `settings.js
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
+| Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, unreleased (Wave B) |
 | Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
 | Skills | `skill_list` (catalog, content search) | the selected skills, linked into the worktree | built, unreleased (Wave E7, job-side part) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
