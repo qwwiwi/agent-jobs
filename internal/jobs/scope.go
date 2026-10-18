@@ -337,10 +337,40 @@ var errScopeActive = errors.New("scope still active after stop")
 var systemctlBin = "systemctl"
 
 // scopeCgroupPath is the cgroup v2 path a job scope gets from `systemd-run --user --scope` (the user
-// manager's app.slice): the daemon can reach it without the bus.
+// manager's app.slice): the daemon can reach it without the bus. The user manager's cgroup is read from
+// the daemon's own cgroup (the manager need not sit under user.slice, e.g. in a custom system slice);
+// when the daemon is not under one, it is the default /user.slice/user-<uid>.slice/user@<uid>.service.
 func scopeCgroupPath(unit string) string {
 	uid := os.Getuid()
-	return fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service/app.slice/%s", uid, uid, unit)
+	mgr := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service", uid, uid)
+	if b, err := os.ReadFile(cgroupFile); err == nil {
+		if p, ok := userManagerCgroup(string(b), uid); ok {
+			mgr = p
+		}
+	}
+	return mgr + "/app.slice/" + unit
+}
+
+// userManagerCgroup returns the cgroup v2 path of the user manager (user@<uid>.service) a
+// /proc/<pid>/cgroup content lies under: the prefix through the outermost such component. The outermost
+// one is the real manager: every cgroup the user can create (and move its processes into) is below it.
+// A path that is not absolute or has an empty, "." or ".." component is not used.
+func userManagerCgroup(content string, uid int) (string, bool) {
+	p, ok := unifiedPath(content)
+	if !ok || !strings.HasPrefix(p, "/") {
+		return "", false
+	}
+	want := fmt.Sprintf("user@%d.service", uid)
+	parts := strings.Split(p, "/")[1:]
+	for i, c := range parts {
+		if c == "" || c == "." || c == ".." {
+			return "", false
+		}
+		if c == want {
+			return "/" + strings.Join(parts[:i+1], "/"), true
+		}
+	}
+	return "", false
 }
 
 // stopScope stops a job's scope: systemd sends SIGTERM to every process in the unit's cgroup, waits

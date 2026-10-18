@@ -500,6 +500,47 @@ func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
 	}
 }
 
+// The scope's cgroup path follows the user manager's cgroup as the daemon sees it, whether the manager
+// is under user.slice or a custom slice; without a manager (or with an unusable path) it falls back to
+// the default user.slice layout.
+func TestScopeCgroupPathFollowsUserManager(t *testing.T) {
+	uid := os.Getuid()
+	mgr := fmt.Sprintf("user@%d.service", uid)
+	def := fmt.Sprintf("/user.slice/user-%d.slice/%s", uid, mgr)
+	unit := ScopeUnit("t", "261018-000000-0000")
+	for _, tc := range []struct{ name, content, want string }{
+		{"user.slice", "0::" + def + "/app.slice/x.service\n", def},
+		{"agents.slice", "0::/agents.slice/" + mgr + "/app.slice/agent-jobs-a-1.scope\n", "/agents.slice/" + mgr},
+		{"v1 lines first", "1:name=systemd:/foo\n0::/agents.slice/" + mgr + "/init.scope\n", "/agents.slice/" + mgr},
+		{"outermost wins", "0::/agents.slice/" + mgr + "/app.slice/a.scope/" + mgr + "/x\n", "/agents.slice/" + mgr},
+		{"no user manager", "0::/system.slice/agent-jobs.service\n", def},
+		{"other uid", fmt.Sprintf("0::/user.slice/user@%d.service/app.slice/x\n", uid+1), def},
+		{"dot-dot", "0::/a/../" + mgr + "/app.slice\n", def},
+		{"no v2 line", "1:name=systemd:/" + mgr + "\n", def},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := filepath.Join(t.TempDir(), "cgroup")
+			if err := os.WriteFile(f, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			old := cgroupFile
+			cgroupFile = f
+			t.Cleanup(func() { cgroupFile = old })
+			if got, want := scopeCgroupPath(unit), tc.want+"/app.slice/"+unit; got != want {
+				t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
+			}
+		})
+	}
+	t.Run("unreadable", func(t *testing.T) {
+		old := cgroupFile
+		cgroupFile = filepath.Join(t.TempDir(), "missing")
+		t.Cleanup(func() { cgroupFile = old })
+		if got, want := scopeCgroupPath(unit), def+"/app.slice/"+unit; got != want {
+			t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
+		}
+	})
+}
+
 // fakeProbe makes probeScope fail (or succeed) for one test.
 func fakeProbe(t *testing.T, err error) {
 	t.Helper()
