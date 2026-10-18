@@ -131,13 +131,15 @@ type QueueStatus struct {
 	Running        int `json:"running"`
 	PendingNotify  int `json:"pending_notify"`
 	PendingCleanup int `json:"pending_cleanup"`
-	// MaxRunning is the effective cap on running jobs (config max_running, default 2).
-	MaxRunning int `json:"max_running"`
+	// ConfiguredMaxRunning is max_running (default 2) as this process loaded config.json when it
+	// opened the manager. The daemon enforces its own copy, read at its start; after a config change
+	// the two can differ until both restart. /v1/health shows the daemon's value.
+	ConfiguredMaxRunning int `json:"configured_max_running"`
 }
 
 // Queue reports the queue.
 func (m *Manager) Queue() (QueueStatus, error) {
-	q := QueueStatus{MaxRunning: m.Cfg.MaxRunningJobs()}
+	q := QueueStatus{ConfiguredMaxRunning: m.Cfg.MaxRunningJobs()}
 	for _, c := range []struct {
 		n *int
 		f func() ([]*store.Job, error)

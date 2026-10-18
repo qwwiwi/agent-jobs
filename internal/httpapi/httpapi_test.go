@@ -260,6 +260,16 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+// /v1/health shows the max_running of the manager that serves it (the daemon's).
+func TestHealthMaxRunningConfigured(t *testing.T) {
+	f := newFixture(t)
+	five := 5
+	f.m.Cfg.MaxRunning = &five
+	if out := f.get(t, "/v1/health", http.StatusOK); out["max_running"] != 5.0 {
+		t.Fatalf("health %v", out)
+	}
+}
+
 func TestJobsList(t *testing.T) {
 	f := newFixture(t)
 	f.insert(t, "261018-100000-aaaa", store.StatusQueued)

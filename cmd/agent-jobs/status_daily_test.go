@@ -65,7 +65,7 @@ func TestStatusShowsDaily(t *testing.T) {
 	}
 }
 
-// `status` without a job id shows the queue and the effective max_running (config, default 2).
+// `status` without a job id shows the queue and the configured max_running (config, default 2).
 func TestStatusShowsQueue(t *testing.T) {
 	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
 	m, err := jobs.Open("test")
@@ -73,12 +73,12 @@ func TestStatusShowsQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if out := captureStdout(t, func() error { return printQueue(m) }); !strings.Contains(out, "queue:     0 running, 0 queued (max_running 2)") {
+	if out := captureStdout(t, func() error { return printQueue(m) }); !strings.Contains(out, "queue:     0 running, 0 queued (configured max_running 2)") {
 		t.Fatalf("default:\n%s", out)
 	}
 	five := 5
 	m.Cfg.MaxRunning = &five
-	if out := captureStdout(t, func() error { return printQueue(m) }); !strings.Contains(out, "(max_running 5)") {
+	if out := captureStdout(t, func() error { return printQueue(m) }); !strings.Contains(out, "(configured max_running 5)") {
 		t.Fatalf("configured:\n%s", out)
 	}
 }

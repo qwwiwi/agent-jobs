@@ -105,7 +105,7 @@ type Config struct {
 	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
 	DailyHour *int `json:"daily_hour"`
 	// MaxRunning is how many jobs of this agent run at once; the rest wait in the queue.
-	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8).
+	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8); explicit null is refused.
 	MaxRunning *int `json:"max_running"`
 	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
 	DailyOff bool `json:"daily_off"`
@@ -304,6 +304,11 @@ func LoadConfig(stateDir string) (Config, error) {
 			if _, ok := raw[k]; ok {
 				return c, fmt.Errorf("config.json: %q is no longer supported: %s", k, why)
 			}
+		}
+		// null decodes to a nil pointer, which reads as absent; an explicit null is a mistake.
+		if v, ok := raw["max_running"]; ok && strings.TrimSpace(string(v)) == "null" {
+			return c, fmt.Errorf("config.json: max_running must be an integer 1..%d, not null (omit the key for default %d)",
+				CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
 		}
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {

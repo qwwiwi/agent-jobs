@@ -552,13 +552,14 @@ func cmdStatus(args []string) error {
 	return nil
 }
 
-// printQueue is `status` without a job id: running and queued jobs and the effective max_running.
+// printQueue is `status` without a job id: running and queued jobs and max_running as config.json
+// says now (the daemon uses the value it read at its start).
 func printQueue(m *jobs.Manager) error {
 	q, err := m.Queue()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("queue:     %d running, %d queued (max_running %d)\n", q.Running, q.Queued, q.MaxRunning)
+	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
 	return nil
 }
 
