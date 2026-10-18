@@ -324,8 +324,13 @@ func idleClosedReason(dir string) string {
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
 		return ""
 	}
-	b, _ := io.ReadAll(io.LimitReader(f, 512))
-	if s := Printable(string(b), 200); strings.HasPrefix(s, ReasonIdleClosed) {
+	const max = 512
+	b, _ := io.ReadAll(io.LimitReader(f, max+1))
+	truncated := len(b) > max
+	if truncated {
+		b = b[:max]
+	}
+	if s := RedactPrintable(RedactRead(string(b), truncated), 200); strings.HasPrefix(s, ReasonIdleClosed) {
 		return s
 	}
 	return ""

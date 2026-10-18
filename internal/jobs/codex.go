@@ -311,7 +311,7 @@ func ParseCodexStream(path string) StreamResult {
 			}
 		case "turn.failed":
 			out.Found, out.IsError, out.Subtype = true, true, "turn_failed"
-			if msg := Printable(ev.Error.Message, 200); msg != "" {
+			if msg := RedactPrintable(ev.Error.Message, 200); msg != "" {
 				out.Subtype += ": " + msg
 			}
 		}
@@ -328,7 +328,7 @@ func ParseCodexStream(path string) StreamResult {
 func codexStreamFailure(res StreamResult) string {
 	switch {
 	case res.Err != "":
-		return "codex stream not read to its end: " + Printable(res.Err, 200)
+		return "codex stream not read to its end: " + RedactPrintable(res.Err, 200)
 	case !res.Found:
 		return "codex stream has no terminal turn.completed event (codex stopped early or the stream is truncated)"
 	}

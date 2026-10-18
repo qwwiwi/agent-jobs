@@ -75,7 +75,7 @@ func DoneLine(j *store.Job) string {
 		cost = "cost " + cost
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
-		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
+		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
 	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
 		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
 	}

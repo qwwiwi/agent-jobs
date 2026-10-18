@@ -353,13 +353,22 @@ func TestJobReportCap(t *testing.T) {
 	if out["report"] != "## Summary\nshort\n" || out["report_truncated"] != nil {
 		t.Fatalf("short report: %v", out)
 	}
-	big := strings.Repeat("x", MaxReportBytes+1000)
+	// Cut at the cap, the report loses its whole incomplete last line (all of it without a line break).
+	line := strings.Repeat("x", 99) + "\n"
+	big := strings.Repeat(line, MaxReportBytes/len(line)+10)
 	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(big), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out = f.get(t, "/v1/jobs/"+j.ID+"?report=1", http.StatusOK)
-	if r, _ := out["report"].(string); len(r) != MaxReportBytes || out["report_truncated"] != true {
+	if r, _ := out["report"].(string); len(r) != MaxReportBytes/len(line)*len(line) || out["report_truncated"] != true {
 		t.Fatalf("big report: %d bytes, truncated %v", len(r), out["report_truncated"])
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(strings.Repeat("x", MaxReportBytes+1000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out = f.get(t, "/v1/jobs/"+j.ID+"?report=1", http.StatusOK)
+	if r, _ := out["report"].(string); r != "" || out["report_truncated"] != true {
+		t.Fatalf("one-line big report: %d bytes, truncated %v", len(r), out["report_truncated"])
 	}
 	// A symlinked report (the job dir is the job's to write) is not followed.
 	if err := os.Remove(filepath.Join(dir, "report.md")); err != nil {

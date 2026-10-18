@@ -328,6 +328,11 @@ var migrationBackfills = map[string]string{
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`: `UPDATE job_stats SET cost_unknown=1
 		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
 			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
+	// Every job that existed before the column may hold an unredacted report: a queued or running
+	// attempt writes one later, a finished one was settled by a build that did not redact (or did
+	// and died before the rewrite). All are marked; redaction is idempotent, and a job without a
+	// regular report.md is just cleared on the next tick.
+	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`: `UPDATE jobs SET redaction_pending=1`,
 }
 
 // migrate runs one migration and its backfill, if any, in one transaction; a column that is already
@@ -780,7 +785,10 @@ func (s *Store) Finish(id, token, status string, turns int, cost float64, durati
 	if status == StatusQueued || status == StatusRunning {
 		return fmt.Errorf("finish: %q is not a terminal status", status)
 	}
-	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=? WHERE id=? AND `
+	// redaction_pending is set in the same update: the report of the ended attempt counts as
+	// unredacted until it was redacted (ClearRedactionPending), whatever set or cleared it before.
+	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=?, redaction_pending=1
+		WHERE id=? AND `
 	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), id}
 	if token == "" {
 		q += `status IN ('queued','running','stopped')`
