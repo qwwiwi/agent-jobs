@@ -44,3 +44,38 @@ func TestCodexJobViewCostUnknownAndLimits(t *testing.T) {
 		t.Fatalf("job_list: %+v", list)
 	}
 }
+
+// A queued or running codex job reports its cost unknown before any attempt ended: never a known $0.00.
+func TestCodexJobViewCostUnknownWhileActive(t *testing.T) {
+	m := newManager(t)
+	now := time.Now()
+	ids := []string{"261018-120000-c0d1", "261018-120000-c0d2"}
+	for i, status := range []string{store.StatusQueued, store.StatusRunning} {
+		j := &store.Job{ID: ids[i], Agent: "test", Title: "codex review", Kind: "review", Brief: "b", Status: status,
+			Model: "gpt-6.1-sol", Runner: store.RunnerCodex, TimeoutMinutes: 45, CreatedAt: now.Add(-time.Hour)}
+		if status == store.StatusRunning {
+			j.StartedAt = &now
+		}
+		if err := m.Store.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs := connect(t, mustServer(t, m))
+	for _, id := range ids {
+		var st JobView
+		call(t, cs, "job_status", map[string]any{"id": id}, &st)
+		if !st.CostUnknown {
+			t.Fatalf("job_status %s: %+v", id, st)
+		}
+		var res JobResultOutput
+		call(t, cs, "job_result", map[string]any{"id": id}, &res)
+		if !res.CostUnknown {
+			t.Fatalf("job_result %s: %+v", id, res)
+		}
+	}
+	var list JobListOutput
+	call(t, cs, "job_list", map[string]any{}, &list)
+	if len(list.Jobs) != 2 || !list.Jobs[0].CostUnknown || !list.Jobs[1].CostUnknown {
+		t.Fatalf("job_list: %+v", list)
+	}
+}

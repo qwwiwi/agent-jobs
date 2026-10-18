@@ -308,7 +308,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	}
 	st := &store.JobStats{
 		ID: j.ID, Kind: j.Kind, Model: j.Model, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
-		CostUnknown: j.CostUnknown, DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
+		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
 		RecordedAt: m.Now(),

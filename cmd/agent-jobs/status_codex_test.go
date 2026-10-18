@@ -36,3 +36,28 @@ func TestStatusListCodexCostUnknown(t *testing.T) {
 		t.Fatalf("list:\n%s", out)
 	}
 }
+
+// A running codex job shows its cost unknown in `status` and `list` before the attempt ends.
+func TestStatusListRunningCodexCostUnknown(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	j := &store.Job{ID: "261018-120000-c0d2", Agent: "test", Title: "codex review", Kind: "review", Brief: "b",
+		Status: store.StatusRunning, Model: "gpt-6.1-sol", Runner: store.RunnerCodex, TimeoutMinutes: 45,
+		CreatedAt: now, StartedAt: &now}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Close()
+	out := captureStdout(t, func() error { return cmdStatus([]string{"--agent", "test", j.ID}) })
+	if !strings.Contains(out, "cost unknown") || strings.Contains(out, "$0.00") {
+		t.Fatalf("status:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return cmdList([]string{"--agent", "test"}) })
+	if !strings.Contains(out, " unknown ") || strings.Contains(out, "$0.00") {
+		t.Fatalf("list:\n%s", out)
+	}
+}

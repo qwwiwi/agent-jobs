@@ -64,8 +64,8 @@ func LimitsText(j *store.Job) string {
 // A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 func DoneLine(j *store.Job) string {
-	cost := CostText(j.CostUSD, j.CostUnknown)
-	if j.CostUnknown {
+	cost := CostText(j.CostUSD, j.CostIsUnknown())
+	if j.CostIsUnknown() {
 		cost = "cost " + cost
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",

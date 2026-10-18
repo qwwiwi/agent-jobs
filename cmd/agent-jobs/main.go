@@ -445,7 +445,7 @@ func cmdStatus(args []string) error {
 	}
 	fmt.Printf("id:        %s\ntitle:     %s\nkind:      %s\nstatus:    %s\nmodel:     %s\n", j.ID, j.Title, j.Kind, j.Status, j.Model)
 	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
-	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostUnknown), j.DurationSec)
+	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
@@ -515,7 +515,7 @@ func cmdList(args []string) error {
 	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
 	for _, j := range list {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
-			jobs.CostText(j.CostUSD, j.CostUnknown),
+			jobs.CostText(j.CostUSD, j.CostIsUnknown()),
 			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
@@ -622,7 +622,7 @@ func cmdStop(args []string) error {
 		return err
 	}
 	fmt.Printf("stopped %s (%d turns, %s); resume with: agent-jobs resume --agent %s %s --context ...\n",
-		j.ID, j.Turns, costWord(j.CostUSD, j.CostUnknown), *agent, j.ID)
+		j.ID, j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), *agent, j.ID)
 	return nil
 }
 

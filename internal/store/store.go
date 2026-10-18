@@ -103,6 +103,10 @@ type Job struct {
 	ScopePending bool
 }
 
+// CostIsUnknown reports whether the job's cost is not known: a codex job always (codex reports no
+// price, so even a queued or running one has no cost to show), a claude job when CostUnknown is set.
+func (j *Job) CostIsUnknown() bool { return j.CostUnknown || j.Runner == RunnerCodex }
+
 // Attempt is one earlier attempt of a resumed job (the current attempt is the job row itself).
 type Attempt struct {
 	JobID          string

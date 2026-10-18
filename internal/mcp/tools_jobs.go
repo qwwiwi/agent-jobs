@@ -86,7 +86,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 	return JobView{
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
-		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostUnknown,
+		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
 		Limits: limitsNote(j), DurationSec: j.DurationSec,
 		RepoPath: j.RepoPath, BaseCommit: j.BaseCommit, CreatedAt: fmtTS(&j.CreatedAt),
 		StartedAt: fmtTS(j.StartedAt), FinishedAt: fmtTS(j.FinishedAt), NotifiedAt: fmtTS(j.NotifiedAt),
@@ -243,7 +243,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 			return nil, JobResultOutput{}, err
 		}
 		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: j.Error,
-			CostUnknown: j.CostUnknown, Artifacts: []string{}}
+			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
 		}
