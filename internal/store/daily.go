@@ -30,14 +30,15 @@ CREATE TABLE IF NOT EXISTS daily (
 // dailyName is the key of the only row (one daily automation per agent store).
 const dailyName = "daily"
 
-// ClaimDaily records day as the day of the daily run, unless a run was already claimed for it. It
-// is atomic (one statement), so two daemons, or a restarted one, never run the same day twice; a
-// claim made before a crash still counts (the day is not repeated).
+// ClaimDaily records day as the day of the daily run, unless a run was already claimed for it or for
+// a later day (days are YYYY-MM-DD, so they compare as strings; a clock or TZ step backwards never
+// re-runs an earlier day). It is atomic (one statement), so two daemons, or a restarted one, never
+// run the same day twice; a claim made before a crash still counts (the day is not repeated).
 func (s *Store) ClaimDaily(day string, now time.Time) (bool, error) {
 	res, err := s.db.Exec(`INSERT INTO daily (name, day, started_at) VALUES (?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET day = excluded.day, started_at = excluded.started_at,
 			finished_at = NULL, result = ''
-		WHERE daily.day <> excluded.day`, dailyName, day, now.Unix())
+		WHERE daily.day < excluded.day`, dailyName, day, now.Unix())
 	if err != nil {
 		return false, fmt.Errorf("claim daily: %w", err)
 	}

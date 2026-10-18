@@ -234,7 +234,6 @@ func TestDailyTimeboxAndShutdown(t *testing.T) {
 		return PruneReport{}, ctx.Err()
 	}
 	hang := make(chan struct{})
-	defer close(hang)
 	m.dailyProcsFn = func(context.Context) (ProcsReport, error) { <-hang; return ProcsReport{}, nil }
 	if !startAt(t, m, at(10, 5, 0)) {
 		t.Fatal("not started")
@@ -244,6 +243,12 @@ func TestDailyTimeboxAndShutdown(t *testing.T) {
 		!strings.Contains(d.Result.ProcsError, "deadline") || d.Running {
 		t.Fatalf("time-boxed: %+v %v", d.Result, err)
 	}
+	// The abandoned scan holds the daily lock until it ends (TestDailyAbandonedScanHoldsLock).
+	close(hang)
+	for !m.dailyMu.TryLock() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	m.dailyMu.Unlock()
 	// Shutdown: the daemon's ctx ends during prune; doctor procs is skipped and WaitDaily returns.
 	DailyStepTimeout = time.Minute
 	var procs atomic.Int32
@@ -297,5 +302,63 @@ func TestDailyRealRun(t *testing.T) {
 	if err != nil || d.Result == nil || d.Result.JobsPruned != 1 || d.Result.BytesFreed < 4096 || d.Result.PruneError != "" ||
 		d.LastDay != now.Format(time.DateOnly) {
 		t.Fatalf("real run: %+v %+v %v", d, d.Result, err)
+	}
+}
+
+// A panic in the doctor procs scan (its own goroutine) is recovered: the daemon survives, the
+// summary records the error, the prune result is kept, and the next tick still launches jobs.
+func TestDailyProcsPanicRecovered(t *testing.T) {
+	m := newManager(t)
+	prunes, _ := dailyCounters(m, nil)
+	m.dailyProcsFn = func(context.Context) (ProcsReport, error) { panic("scan bug") }
+	if !startAt(t, m, at(10, 5, 0)) {
+		t.Fatal("not started")
+	}
+	d, err := m.Daily()
+	if err != nil || d.Result == nil || d.Running || !strings.Contains(d.Result.ProcsError, "doctor procs panicked: scan bug") ||
+		prunes.Load() != 1 || d.Result.JobsPruned != 1 || d.Result.BytesFreed != 100 {
+		t.Fatalf("after a procs panic: %+v %+v %v", d, d.Result, err)
+	}
+	j := enqueue(t, m, "FAKE_SLEEP=0", nil)
+	m.Now = time.Now
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.Store.Get(j.ID); got.Status == store.StatusQueued {
+		t.Fatal("tick did not launch after a procs panic")
+	}
+}
+
+// A doctor procs scan abandoned at its time-box keeps the daily lock until it really ends, so the
+// next day's run never overlaps it; WaitDaily (shutdown) does not wait for it.
+func TestDailyAbandonedScanHoldsLock(t *testing.T) {
+	m := newManager(t)
+	old := DailyStepTimeout
+	DailyStepTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { DailyStepTimeout = old })
+	dailyCounters(m, nil)
+	hang, scanned := make(chan struct{}), make(chan struct{})
+	m.dailyProcsFn = func(context.Context) (ProcsReport, error) {
+		defer close(scanned)
+		<-hang
+		return ProcsReport{}, nil
+	}
+	if !startAt(t, m, at(10, 5, 0)) { // startAt returns after WaitDaily: shutdown is not held up
+		t.Fatal("not started")
+	}
+	if d, _ := m.Daily(); d.Result == nil || !strings.Contains(d.Result.ProcsError, "deadline") {
+		t.Fatalf("abandoned scan: %+v", d.Result)
+	}
+	if startAt(t, m, at(11, 5, 0)) {
+		t.Fatal("the next day's run started while the abandoned scan still ran")
+	}
+	close(hang)
+	<-scanned
+	deadline := time.Now().Add(5 * time.Second)
+	for !startAt(t, m, at(11, 5, 0)) {
+		if time.Now().After(deadline) {
+			t.Fatal("the lock was not released after the abandoned scan ended")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

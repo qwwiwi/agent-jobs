@@ -52,3 +52,22 @@ func TestDailyClaimOncePerDay(t *testing.T) {
 		t.Fatalf("after the next claim: %+v, %v", d, err)
 	}
 }
+
+// A clock or TZ step backwards never claims (re-runs) a day earlier than the stored one.
+func TestDailyClaimNeverGoesBack(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Unix(1_800_000_000, 0)
+	if ok, err := st.ClaimDaily("2027-01-16", now); err != nil || !ok {
+		t.Fatalf("claim: %v, %v", ok, err)
+	}
+	if ok, err := st.ClaimDaily("2027-01-15", now.Add(time.Minute)); err != nil || ok {
+		t.Fatalf("claim of an earlier day: %v, %v", ok, err)
+	}
+	if d, err := st.GetDaily(); err != nil || d.Day != "2027-01-16" {
+		t.Fatalf("daily row: %+v, %v", d, err)
+	}
+}

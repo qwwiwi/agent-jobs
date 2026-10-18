@@ -73,7 +73,7 @@ type PruneReport struct {
 // drivers) is not touched. Symlinks are removed as links, never followed. With dryRun nothing is
 // removed. Before anything is removed, the job's records for analysis move into the log archive
 // (archiveJob); a failed archive keeps the files it would have moved or copied (the rest is pruned
-// and the job reports the error). Archived months older than the retention are removed (archive roots with the
+// and the job reports the error). Archived months older than the retention are removed first (archive roots with the
 // marker only). Each job is pruned under the lifecycle lock, taken per job and its row re-read
 // under it, so prune never races a tick's cleanup or a resume, and a long prune (the daily run)
 // never holds up the ticks between jobs.
@@ -81,8 +81,9 @@ func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 	return m.PruneContext(context.Background(), dryRun)
 }
 
-// PruneContext is Prune bounded by ctx: once ctx is done no further job is started (the one in
-// progress finishes) and the error says so; the report covers what was done.
+// PruneContext is Prune bounded by ctx: the archive retention runs first, then once ctx is done no
+// further job is started (the one in progress finishes) and the error says so; the report covers
+// what was done.
 func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, error) {
 	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
 	cutoff := m.Now().Add(-PruneAge)
@@ -98,7 +99,17 @@ func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, e
 			}
 		}
 	}
+	// Archive retention runs first, so a per-job pass cut short by ctx never starves it.
 	var errs []error
+	unlock, err := m.lock()
+	if err != nil {
+		return rep, err
+	}
+	rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
+	unlock()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("archive retention: %w", err))
+	}
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("prune stopped before job %s: %w", id, err))
@@ -124,17 +135,6 @@ func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, e
 			rep.ArchivedBytes += e.Bytes
 		}
 		rep.Jobs = append(rep.Jobs, pj)
-	}
-	if ctx.Err() == nil {
-		unlock, err := m.lock()
-		if err != nil {
-			return rep, errors.Join(append(errs, err)...)
-		}
-		rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
-		unlock()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("archive retention: %w", err))
-		}
 	}
 	if !dryRun {
 		m.Log.Printf("prune: %d job folders, %d bytes removed, %d bytes moved to the archive, %d archived months expired",

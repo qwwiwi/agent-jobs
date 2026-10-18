@@ -103,18 +103,29 @@ func (m *Manager) StartDaily(ctx context.Context) bool {
 	m.dailyWG.Add(1)
 	go func() {
 		defer m.dailyWG.Done()
-		defer m.dailyMu.Unlock()
-		m.runDaily(ctx, day)
+		if scan := m.runDaily(ctx, day); scan != nil {
+			// An abandoned doctor procs scan keeps the lock until it really ends (the next day's run
+			// never overlaps it), but the run is over for WaitDaily, so shutdown is not held up.
+			go func() {
+				<-scan
+				m.dailyMu.Unlock()
+			}()
+			return
+		}
+		m.dailyMu.Unlock()
 	}()
 	return true
 }
 
-// WaitDaily waits until a daily run started by StartDaily has ended.
+// WaitDaily waits until a daily run started by StartDaily has ended. A doctor procs scan abandoned
+// at its time-box is not waited for (it has no cancellation points); it may still be running.
 func (m *Manager) WaitDaily() { m.dailyWG.Wait() }
 
 // runDaily runs prune and doctor procs (report mode), each bounded by DailyStepTimeout and by ctx;
 // a failing step never stops the other. A panic is recovered and logged: the daemon never crashes.
-func (m *Manager) runDaily(ctx context.Context, day string) {
+// scan is non-nil when the doctor procs scan was abandoned at the time-box; it is closed when the
+// scan ends.
+func (m *Manager) runDaily(ctx context.Context, day string) (scan <-chan struct{}) {
 	var r DailyResult
 	defer func() {
 		if p := recover(); p != nil {
@@ -139,10 +150,10 @@ func (m *Manager) runDaily(ctx context.Context, day string) {
 	}
 	if ctx.Err() != nil {
 		r.ProcsError = "skipped: the daemon is shutting down"
-		return
+		return nil
 	}
 	dctx, cancel := context.WithTimeout(ctx, DailyStepTimeout)
-	procs, err := m.dailyProcs(dctx)
+	procs, scan, err := m.dailyProcs(dctx)
 	cancel()
 	r.Ghosts, r.DeadRows, r.ProcsNote = len(procs.Ghosts), len(procs.DeadRows), procs.Note
 	for _, g := range procs.Ghosts {
@@ -159,6 +170,7 @@ func (m *Manager) runDaily(ctx context.Context, day string) {
 		r.ProcsError = err.Error()
 		m.Log.Printf("daily %s: doctor procs: %v", day, err)
 	}
+	return scan
 }
 
 func (m *Manager) finishDaily(day string, r DailyResult) {
@@ -184,8 +196,10 @@ func (m *Manager) dailyPrune(ctx context.Context) (PruneReport, error) {
 }
 
 // dailyProcs is the doctor procs step, never killing (overridable in tests). The scan has no
-// cancellation points of its own: it is waited for until ctx ends, then left to finish alone.
-func (m *Manager) dailyProcs(ctx context.Context) (ProcsReport, error) {
+// cancellation points of its own: it is waited for until ctx ends, then left to finish alone, and
+// the returned channel (nil when the scan finished in time) is closed when it ends. A panic in the
+// scan is recovered and returned as an error.
+func (m *Manager) dailyProcs(ctx context.Context) (ProcsReport, <-chan struct{}, error) {
 	f := m.dailyProcsFn
 	if f == nil {
 		f = func(context.Context) (ProcsReport, error) { return m.DoctorProcs(false) }
@@ -194,15 +208,21 @@ func (m *Manager) dailyProcs(ctx context.Context) (ProcsReport, error) {
 		rep ProcsReport
 		err error
 	}
-	ch := make(chan res, 1)
+	ch, done := make(chan res, 1), make(chan struct{})
 	go func() {
+		defer close(done)
+		defer func() {
+			if p := recover(); p != nil {
+				ch <- res{err: fmt.Errorf("doctor procs panicked: %v", p)}
+			}
+		}()
 		rep, err := f(ctx)
 		ch <- res{rep, err}
 	}()
 	select {
 	case r := <-ch:
-		return r.rep, r.err
+		return r.rep, nil, r.err
 	case <-ctx.Done():
-		return ProcsReport{}, fmt.Errorf("doctor procs: %w", ctx.Err())
+		return ProcsReport{}, done, fmt.Errorf("doctor procs: %w", ctx.Err())
 	}
 }

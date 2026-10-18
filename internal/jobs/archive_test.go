@@ -3,12 +3,14 @@ package jobs
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -519,5 +521,46 @@ func TestArchiveSyncsMeta(t *testing.T) {
 	}
 	if !slices.Contains(synced, "meta.json") || !slices.Contains(synced, "stream.jsonl.gz") {
 		t.Fatalf("synced files: %v", synced)
+	}
+}
+
+// countdownCtx is a context whose Err turns to Canceled after n calls (a time-box that ends mid-pass).
+type countdownCtx struct {
+	context.Context
+	n atomic.Int32
+}
+
+func (c *countdownCtx) Err() error {
+	if c.n.Add(-1) < 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+// Archive retention is not starved by the time-box: when the context ends in the middle of the
+// per-job pass, the expired months are still removed.
+func TestArchiveRetentionRunsWhenPruneTimesOut(t *testing.T) {
+	m := newManager(t)
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	m.Now = func() time.Time { return now }
+	root := m.ArchiveDir()
+	writeFile(t, filepath.Join(root, archiveMarker), nil, 0o600)
+	writeFile(t, filepath.Join(root, "2024-01", "j0", "meta.json"), []byte("{}"), 0o600)
+	old := now.Add(-72 * time.Hour)
+	for _, id := range []string{"261001-000000-aaaa", "261001-000000-bbbb"} {
+		insertJob(t, m, id, store.StatusSucceeded, &old, func(j *store.Job) { j.CleanedAt = &old })
+		writeFile(t, filepath.Join(m.JobDir(id), "work", "x.bin"), []byte("\x00x"), 0o600)
+	}
+	ctx := &countdownCtx{Context: context.Background()}
+	ctx.n.Store(1) // the first job is pruned, the pass stops before the second
+	rep, err := m.PruneContext(ctx, false)
+	if err == nil || !strings.Contains(err.Error(), "prune stopped before job") || len(rep.Jobs) != 1 {
+		t.Fatalf("time-boxed pass: %+v %v", rep.Jobs, err)
+	}
+	if len(rep.ArchiveExpired) != 1 {
+		t.Fatalf("retention starved: %+v", rep.ArchiveExpired)
+	}
+	if _, err := os.Stat(filepath.Join(root, "2024-01")); !os.IsNotExist(err) {
+		t.Fatalf("expired month still there: %v", err)
 	}
 }
