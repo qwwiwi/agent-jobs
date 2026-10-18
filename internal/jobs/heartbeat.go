@@ -198,20 +198,16 @@ type HeartbeatGateResult struct {
 
 // heartbeatFacts are what the gate reads from the store.
 type heartbeatFacts struct {
-	// lastDecision is the last decision that counts for the interval (not suppressed); last is the
-	// last of any outcome.
-	lastWake, lastDecision, last *store.Heartbeat
-	pending                      *store.Heartbeat
-	wakesToday                   int
+	// last is the last decision of any outcome; it holds the interval (a suppressed one too: the
+	// model was called).
+	lastWake, last, pending *store.Heartbeat
+	wakesToday              int
 }
 
 func (m *Manager) heartbeatFacts(now time.Time) (heartbeatFacts, error) {
 	var f heartbeatFacts
 	var err error
 	if f.lastWake, err = m.Store.LastHeartbeatWake(); err != nil {
-		return f, err
-	}
-	if f.lastDecision, err = m.Store.LastCountedHeartbeat(); err != nil {
 		return f, err
 	}
 	if f.last, err = m.Store.LastHeartbeat(); err != nil {
@@ -290,8 +286,8 @@ func (m *Manager) heartbeatGate(now time.Time, ignoreInterval, markStale bool) (
 		res.Reason = fmt.Sprintf("night window %02d:00-%02d:00", start, end)
 	case !ignoreInterval && f.lastWake != nil && now.Sub(f.lastWake.ClaimedAt) < hc.Interval():
 		res.Reason = "interval: last wake " + f.lastWake.ClaimedAt.In(loc).Format(time.DateTime)
-	case !ignoreInterval && f.lastDecision != nil && now.Sub(f.lastDecision.ClaimedAt) < hc.Interval():
-		res.Reason = "interval: last decision " + f.lastDecision.ClaimedAt.In(loc).Format(time.DateTime)
+	case !ignoreInterval && f.last != nil && now.Sub(f.last.ClaimedAt) < hc.Interval():
+		res.Reason = "interval: last decision " + f.last.ClaimedAt.In(loc).Format(time.DateTime)
 	case f.wakesToday >= hc.MaxWakes():
 		res.Reason = fmt.Sprintf("daily cap: %d of %d wakes used today", f.wakesToday, hc.MaxWakes())
 	default:
@@ -339,7 +335,7 @@ func (m *Manager) nextHeartbeatEligible(now time.Time, f heartbeatFacts, ignoreI
 	hc, loc := m.Cfg.Heartbeat, m.loc()
 	t := now
 	if !ignoreInterval {
-		for _, h := range []*store.Heartbeat{f.lastWake, f.lastDecision} {
+		for _, h := range []*store.Heartbeat{f.lastWake, f.last} {
 			if h != nil && h.ClaimedAt.Add(hc.Interval()).After(t) {
 				t = h.ClaimedAt.Add(hc.Interval())
 			}
@@ -668,9 +664,9 @@ func (m *Manager) heartbeatLock() (func(), error) {
 	}, nil
 }
 
-// heartbeatDeliveryClosed re-checks, after the model answered, what may have changed during the
-// call: the heartbeat still on, outside the night window, nothing queued for the session. It
-// returns why a wake may no longer be delivered, or "".
+// heartbeatDeliveryClosed re-checks, right before typing (under tmux.lock), what may have changed
+// since the gate: the heartbeat still on, outside the night window, nothing queued for the session.
+// It returns why a wake may no longer be delivered, or "".
 func (m *Manager) heartbeatDeliveryClosed(now time.Time) (string, error) {
 	hc := m.Cfg.Heartbeat
 	if !hc.Enabled {
@@ -682,12 +678,12 @@ func (m *Manager) heartbeatDeliveryClosed(now time.Time) (string, error) {
 	return m.sessionBusy(now)
 }
 
-// decideHeartbeat asks the model for the claimed row h, stores the decision and, only after the
-// row's pending->wake transition succeeded, delivers the fixed wake line. A wake answer that comes
-// when delivery is no longer allowed is stored as suppressed. Every failure of the call or the
-// answer is stored on the row and logged; none wakes the session. It returns an error when the
-// decision could not be stored (the row was abandoned meanwhile, or the write failed): then nothing
-// is delivered.
+// decideHeartbeat asks the model for the claimed row h, stores the decision and, for a wake answer,
+// takes tmux.lock, re-checks delivery there and, only after the row's pending->wake transition
+// succeeded, types the fixed wake line (all under the lock). A wake answer that comes when delivery
+// is no longer allowed is stored as suppressed. Every failure of the call or the answer is stored on
+// the row and logged; none wakes the session. It returns an error when the decision could not be
+// stored (the row was abandoned meanwhile, or the write failed): then nothing is delivered.
 func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error {
 	finish := func(decision, reason string, cost float64, errText string) error {
 		if err := m.Store.FinishHeartbeat(h.ID, decision, reason, cost, errText, m.Now()); err != nil {
@@ -719,22 +715,43 @@ func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error
 		m.Log.Printf("heartbeat %d: no wake: %s", h.ID, reason)
 		return finish(store.HeartbeatSleep, reason, cost, "")
 	}
-	closed, err := m.heartbeatDeliveryClosed(m.Now())
-	if err != nil {
-		closed = "eligibility not re-checked: " + err.Error()
-	}
-	if closed != "" {
-		m.Log.Printf("heartbeat %d: wake suppressed: %s", h.ID, closed)
-		return finish(store.HeartbeatSuppressed, reason, cost, "suppressed: "+RedactPrintable(closed, 280))
-	}
-	if err := finish(store.HeartbeatWake, reason, cost, ""); err != nil {
-		return err
+	// deliver runs under tmux.lock (when a target is set), right before typing: the re-check, the
+	// stored outcome and the line. stored is the outcome, "" when deliver never ran.
+	target := m.Cfg.NotifyTmuxTarget
+	var stored string
+	var storeErr error
+	deliver := func(ctx context.Context) error {
+		closed, err := m.heartbeatDeliveryClosed(m.Now())
+		if err != nil {
+			closed = "eligibility not re-checked: " + err.Error()
+		}
+		if closed != "" {
+			m.Log.Printf("heartbeat %d: wake suppressed: %s", h.ID, closed)
+			stored, storeErr = store.HeartbeatSuppressed, finish(store.HeartbeatSuppressed, reason, cost, "suppressed: "+RedactPrintable(closed, 280))
+			return nil
+		}
+		stored, storeErr = store.HeartbeatWake, finish(store.HeartbeatWake, reason, cost, "")
+		switch {
+		case storeErr != nil:
+			return nil
+		case target == "":
+			return errors.New("notify off: notify_tmux_target is not configured")
+		}
+		return m.sendTmux(ctx, target, HeartbeatLine(h.ID))
 	}
 	var derr error
-	if target := m.Cfg.NotifyTmuxTarget; target == "" {
-		derr = errors.New("notify off: notify_tmux_target is not configured")
+	if target == "" {
+		derr = deliver(context.Background())
 	} else {
-		derr = m.sendTmuxLocked(target, HeartbeatLine(h.ID))
+		derr = m.withTmuxLock(deliver)
+	}
+	if stored == "" {
+		// tmux.lock was not taken: nothing was re-checked or typed; the wake stays, not delivered.
+		if err := finish(store.HeartbeatWake, reason, cost, ""); err != nil {
+			return err
+		}
+	} else if storeErr != nil || stored == store.HeartbeatSuppressed {
+		return storeErr
 	}
 	errText := ""
 	if derr != nil {

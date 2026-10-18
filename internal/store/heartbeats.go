@@ -17,8 +17,8 @@ const (
 	HeartbeatError     = "error"     // the call failed or the answer was invalid (no wake)
 	HeartbeatAbandoned = "abandoned" // claimed, but the process died before it finished (no wake)
 	// HeartbeatSuppressed is a wake answer that came when delivery was no longer allowed (night
-	// window, a delivery pending, heartbeat off): stored with its reason, not delivered, and counted
-	// toward nothing.
+	// window, a delivery pending, heartbeat off): stored with its reason and not delivered. It counts
+	// toward the decision interval (the model was called) but not toward the daily wake cap.
 	HeartbeatSuppressed = "suppressed"
 )
 
@@ -79,8 +79,7 @@ var ErrHeartbeatBusy = errors.New("heartbeat decision not claimed")
 
 // HeartbeatClaimLimits are what ClaimHeartbeat re-checks inside its transaction.
 type HeartbeatClaimLimits struct {
-	// MinGap > 0 refuses a claim less than MinGap after the last counted decision (suppressed ones
-	// count toward nothing).
+	// MinGap > 0 refuses a claim less than MinGap after the last decision of any outcome.
 	MinGap time.Duration
 	// MaxWakes > 0 refuses a claim when MaxWakes wake decisions were claimed at or after DayStart.
 	MaxWakes int
@@ -88,7 +87,7 @@ type HeartbeatClaimLimits struct {
 }
 
 // ClaimHeartbeat records a pending decision at now. In one IMMEDIATE transaction it refuses (with
-// ErrHeartbeatBusy) while another decision is pending, when the last counted decision is closer
+// ErrHeartbeatBusy) while another decision is pending, when the last decision is closer
 // than lim.MinGap, or when the daily wake cap is used up: two daemons, or a daemon and run-now,
 // never claim the same slot nor the same last wake of the day.
 func (s *Store) ClaimHeartbeat(trigger string, now time.Time, lim HeartbeatClaimLimits) (*Heartbeat, error) {
@@ -110,8 +109,8 @@ func (s *Store) ClaimHeartbeat(trigger string, now time.Time, lim HeartbeatClaim
 	var pending, wakes int
 	var last sql.NullInt64
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FILTER (WHERE decision = ?),
-		MAX(claimed_at) FILTER (WHERE decision != ?), COUNT(*) FILTER (WHERE decision = ? AND claimed_at >= ?) FROM heartbeats`,
-		HeartbeatPending, HeartbeatSuppressed, HeartbeatWake, lim.DayStart.Unix()).Scan(&pending, &last, &wakes); err != nil {
+		MAX(claimed_at), COUNT(*) FILTER (WHERE decision = ? AND claimed_at >= ?) FROM heartbeats`,
+		HeartbeatPending, HeartbeatWake, lim.DayStart.Unix()).Scan(&pending, &last, &wakes); err != nil {
 		return nil, fmt.Errorf("claim heartbeat: %w", err)
 	}
 	if pending > 0 {
@@ -168,12 +167,6 @@ func (s *Store) AbandonHeartbeats(before, now time.Time) (int, error) {
 // LastHeartbeat returns the most recent decision (any outcome), or nil when none was claimed.
 func (s *Store) LastHeartbeat() (*Heartbeat, error) {
 	return s.oneHeartbeat(`ORDER BY id DESC LIMIT 1`)
-}
-
-// LastCountedHeartbeat returns the most recent decision that counts for the interval (any outcome
-// but suppressed), or nil.
-func (s *Store) LastCountedHeartbeat() (*Heartbeat, error) {
-	return s.oneHeartbeat(`WHERE decision != ? ORDER BY id DESC LIMIT 1`, HeartbeatSuppressed)
 }
 
 // LastHeartbeatWake returns the most recent wake decision, or nil.

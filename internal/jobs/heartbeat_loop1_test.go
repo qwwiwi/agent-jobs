@@ -236,8 +236,8 @@ func TestHeartbeatLastDailyWakeOneWinner(t *testing.T) {
 }
 
 // A decision call that crosses the start of the night window answers wake: the wake is stored as
-// suppressed with the reason, nothing is delivered, and it counts toward neither the daily cap
-// nor the interval.
+// suppressed with the reason, nothing is delivered, and it is no wake for the daily cap (it holds
+// the interval, which has passed by the end of the night).
 func TestHeartbeatSuppressedAcrossNightStart(t *testing.T) {
 	e := newHeartbeat(t)
 	m := e.m
