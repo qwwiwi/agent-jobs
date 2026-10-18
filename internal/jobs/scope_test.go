@@ -470,9 +470,29 @@ func TestFailedUnitWithMembersIsNotStopped(t *testing.T) {
 }
 
 // Cancel with a broken user bus does not rely on the wrapper's process group: the daemon sweeps the
-// scope's cgroup itself, so a setsid orphan (outside that group) dies too.
+// scope's cgroup itself, so a setsid orphan (outside that group) dies too. Only the user-bus systemctl
+// (systemctlBin) is broken: the manager's cgroup still comes from the real system manager
+// (systemManagerBin), so the swept path is the real one. The caller's own cgroup plays no part: the
+// cancel also works from a caller outside the user manager (the orchestrator's MCP server).
 func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
 	requireSetsid(t)
+	for _, caller := range []string{"own", "outside the user manager"} {
+		t.Run(caller, func(t *testing.T) {
+			if caller != "own" {
+				f := filepath.Join(t.TempDir(), "cgroup")
+				if err := os.WriteFile(f, []byte("0::/agents.slice/channel-thrall.service\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				old := cgroupFile
+				cgroupFile = f
+				t.Cleanup(func() { cgroupFile = old })
+			}
+			cancelWithoutBus(t)
+		})
+	}
+}
+
+func cancelWithoutBus(t *testing.T) {
 	m := scopedManager(t)
 	t.Setenv("AGENT_JOBS_SELF", selfBin)
 	j := enqueue(t, m, "FAKE_SETSID_ORPHAN FAKE_SLEEP=60", nil)
@@ -500,38 +520,146 @@ func TestCancelWithoutBusSweepsScopeCgroup(t *testing.T) {
 	}
 }
 
-// The scope's cgroup path follows the user manager's cgroup as the daemon sees it, whether the manager
-// is under user.slice or a custom slice; without a manager (or with an unusable path), and none in the
-// cgroup tree, it falls back to the default user.slice layout.
-func TestScopeCgroupPathFollowsUserManager(t *testing.T) {
+// fakeManagerCgroup makes the system manager answer cgroup (or fail with err) for user@<uid>.service,
+// and points cgroupRoot at a temp dir holding dirs (relative paths), for one test.
+func fakeManagerCgroup(t *testing.T, cgroup string, err error, dirs ...string) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, d := range dirs {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldLookup, oldRoot := userManagerUnitCgroup, cgroupRoot
+	userManagerUnitCgroup = func(int) (string, error) { return cgroup, err }
+	cgroupRoot = root
+	t.Cleanup(func() { userManagerUnitCgroup, cgroupRoot = oldLookup, oldRoot })
+	return root
+}
+
+// The scope's cgroup path follows the user manager's cgroup as the system manager reports it, wherever
+// the manager runs (user.slice or a custom slice) and wherever the caller runs. A missing or malformed
+// answer falls back to the default user.slice layout only when that cgroup exists and is owned by the
+// uid; otherwise there is no path and nothing is swept.
+func TestScopeCgroupPathFromSystemManager(t *testing.T) {
 	uid := os.Getuid()
 	mgr := fmt.Sprintf("user@%d.service", uid)
 	def := fmt.Sprintf("/user.slice/user-%d.slice/%s", uid, mgr)
 	unit := ScopeUnit("t", "261018-000000-0000")
-	for _, tc := range []struct{ name, content, want string }{
-		{"user.slice", "0::" + def + "/app.slice/x.service\n", def},
-		{"agents.slice", "0::/agents.slice/" + mgr + "/app.slice/agent-jobs-a-1.scope\n", "/agents.slice/" + mgr},
-		{"v1 lines first", "1:name=systemd:/foo\n0::/agents.slice/" + mgr + "/init.scope\n", "/agents.slice/" + mgr},
-		{"outermost wins", "0::/agents.slice/" + mgr + "/app.slice/a.scope/" + mgr + "/x\n", "/agents.slice/" + mgr},
-		{"no user manager", "0::/system.slice/agent-jobs.service\n", def},
-		{"other uid", fmt.Sprintf("0::/user.slice/user@%d.service/app.slice/x\n", uid+1), def},
-		{"dot-dot", "0::/a/../" + mgr + "/app.slice\n", def},
-		{"no v2 line", "1:name=systemd:/" + mgr + "\n", def},
+	failed := errors.New("exit status 1")
+	for _, tc := range []struct {
+		name, answer string
+		err          error
+		dirs         []string
+		want         string // "" = no path
+	}{
+		{"user.slice", def, nil, nil, def},
+		{"agents.slice", "/agents.slice/" + mgr, nil, nil, "/agents.slice/" + mgr},
+		// The answer wins over a planted decoy, and over the default layout.
+		{"decoy ignored", "/agents.slice/" + mgr, nil, []string{"deleg.slice/x.service/" + mgr, def[1:]}, "/agents.slice/" + mgr},
+		{"garbage, default exists", "not a cgroup", nil, []string{def[1:]}, def},
+		{"garbage, no default", "not a cgroup", nil, nil, ""},
+		{"empty answer (unit not loaded)", "", nil, nil, ""},
+		{"dot-dot", "/agents.slice/../" + mgr, nil, nil, ""},
+		{"wrong last component", "/agents.slice/" + mgr + "/app.slice", nil, nil, ""},
+		{"other uid", fmt.Sprintf("/agents.slice/user@%d.service", uid+1), nil, nil, ""},
+		{"command failure, default exists", "", failed, []string{def[1:]}, def},
+		// A decoy elsewhere is never guessed: no answer and no default means no sweep.
+		{"command failure, decoy only", "", failed, []string{"deleg.slice/x.service/" + mgr}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fakeCgroupfs(t, tc.content) // an empty tree: the scan finds nothing
-			if got, want := scopeCgroupPath(unit), tc.want+"/app.slice/"+unit; got != want {
-				t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
+			fakeManagerCgroup(t, tc.answer, tc.err, tc.dirs...)
+			got, ok := scopeCgroupPath(unit)
+			if tc.want == "" {
+				if ok || got != "" {
+					t.Fatalf("scopeCgroupPath = %q, %v, want no path", got, ok)
+				}
+				return
+			}
+			if want := tc.want + "/app.slice/" + unit; !ok || got != want {
+				t.Fatalf("scopeCgroupPath = %q, %v, want %q", got, ok, want)
 			}
 		})
 	}
-	t.Run("unreadable", func(t *testing.T) {
-		fakeCgroupfs(t, "")
-		cgroupFile = filepath.Join(t.TempDir(), "missing")
-		if got, want := scopeCgroupPath(unit), def+"/app.slice/"+unit; got != want {
-			t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
+	t.Run("default owned by another uid", func(t *testing.T) {
+		fakeManagerCgroup(t, "", failed, def[1:])
+		old := cgroupDirOwner
+		cgroupDirOwner = func(fs.FileInfo) (int, bool) { return uid + 1, true }
+		t.Cleanup(func() { cgroupDirOwner = old })
+		if got, ok := scopeCgroupPath(unit); ok {
+			t.Fatalf("scopeCgroupPath = %q: a default cgroup of another uid was used", got)
 		}
 	})
+	t.Run("default is a symlink", func(t *testing.T) {
+		root := fakeManagerCgroup(t, "", failed, "elsewhere/"+mgr, fmt.Sprintf("user.slice/user-%d.slice", uid))
+		if err := os.Symlink(filepath.Join(root, "elsewhere", mgr), filepath.Join(root, def)); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := scopeCgroupPath(unit); ok {
+			t.Fatalf("scopeCgroupPath = %q: a symlinked default was followed", got)
+		}
+	})
+}
+
+// Every component of the manager's path is checked, not only those before user@<uid>.service.
+func TestValidManagerCgroup(t *testing.T) {
+	uid := os.Getuid()
+	mgr := fmt.Sprintf("user@%d.service", uid)
+	for _, tc := range []struct {
+		p  string
+		ok bool
+	}{
+		{"/user.slice/user-1.slice/" + mgr, true},
+		{"/agents.slice/" + mgr, true},
+		{"/" + mgr, true},
+		{"", false},
+		{"/", false},
+		{"agents.slice/" + mgr, false},
+		{"/agents.slice/" + mgr + "/", false},
+		{"/agents.slice/" + mgr + "/..", false},
+		{"/agents.slice/" + mgr + "/.", false},
+		{"/agents.slice/" + mgr + "//", false},
+		{"/agents.slice//" + mgr, false},
+		{"/agents.slice/./" + mgr, false},
+		{"/a/../" + mgr, false},
+		{"/agents.slice/" + mgr + "/app.slice", false},
+		{"/agents.slice/" + mgr + "x", false},
+		{fmt.Sprintf("/agents.slice/user@%d.service", uid+1), false},
+	} {
+		if got := validManagerCgroup(tc.p, uid); got != tc.ok {
+			t.Errorf("validManagerCgroup(%q) = %v, want %v", tc.p, got, tc.ok)
+		}
+	}
+}
+
+// With the user bus broken and no trusted path for the manager's cgroup, the stop refuses: nothing is
+// swept (not even a uid-owned user@<uid>.service decoy holding the scope's name) and the stop fails, so
+// the scope stays pending.
+func TestStopScopeRefusesWithoutTrustedManagerCgroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("cgroups are Linux")
+	}
+	m := newManager(t)
+	id := "261018-000000-0000"
+	unit := ScopeUnit(m.Agent, id)
+	mgr := fmt.Sprintf("user@%d.service", os.Getuid())
+	decoy := "deleg.slice/x.service/" + mgr + "/app.slice/" + unit
+	root := fakeManagerCgroup(t, "", errors.New("exit status 1"), decoy)
+	// An empty decoy would count as swept; refusing must not depend on looking at it at all.
+	if err := os.WriteFile(filepath.Join(root, decoy, "cgroup.procs"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := systemctlBin
+	systemctlBin = bin
+	t.Cleanup(func() { systemctlBin = old })
+	err := m.stopScope(id)
+	if err == nil || !strings.Contains(err.Error(), "no trusted cgroup path") {
+		t.Fatalf("stopScope = %v, want a refusal", err)
+	}
 }
 
 // fakeProbe makes probeScope fail (or succeed) for one test.
@@ -645,76 +773,4 @@ func TestOwnJobScopeFromSubCgroup(t *testing.T) {
 			t.Errorf("ownJobScope for %q = %q, want %q", c.content, got, c.want)
 		}
 	}
-}
-
-// fakeCgroupfs points cgroupFile at content and cgroupRoot at a temp dir holding dirs (relative paths)
-// for one test.
-func fakeCgroupfs(t *testing.T, content string, dirs ...string) string {
-	t.Helper()
-	root := t.TempDir()
-	for _, d := range dirs {
-		if err := os.MkdirAll(filepath.Join(root, d), 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	f := filepath.Join(t.TempDir(), "cgroup")
-	if err := os.WriteFile(f, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	oldFile, oldRoot := cgroupFile, cgroupRoot
-	cgroupFile, cgroupRoot = f, root
-	t.Cleanup(func() { cgroupFile, cgroupRoot = oldFile, oldRoot })
-	return root
-}
-
-// A caller outside the user manager (the orchestrator's session and its MCP server under a system
-// service of a custom slice) still finds the manager's cgroup: it scans the cgroup tree for the one
-// user@<uid>.service owned by this uid. Two matches or none fall back to the default layout.
-func TestScopeCgroupPathCallerOutsideUserManager(t *testing.T) {
-	uid := os.Getuid()
-	mgr := fmt.Sprintf("user@%d.service", uid)
-	def := fmt.Sprintf("/user.slice/user-%d.slice/%s", uid, mgr)
-	unit := ScopeUnit("t", "261018-000000-0000")
-	outside := "0::/agents.slice/channel-thrall.service\n"
-	for _, tc := range []struct {
-		name, content string
-		dirs          []string
-		want          string
-	}{
-		{"under manager", "0::/agents.slice/" + mgr + "/app.slice/x.scope\n", nil, "/agents.slice/" + mgr},
-		{"agents.slice", outside, []string{"agents.slice/channel-thrall.service", "agents.slice/" + mgr + "/app.slice"}, "/agents.slice/" + mgr},
-		{"user.slice", outside, []string{"user.slice/user-1.slice/" + mgr + "/app.slice", "agents.slice/channel-thrall.service"}, "/user.slice/user-1.slice/" + mgr},
-		// A user@ dir below the manager is the user's own (it could create it): not a second match.
-		{"nested below manager", outside, []string{"agents.slice/" + mgr + "/app.slice/a.scope/" + mgr}, "/agents.slice/" + mgr},
-		{"two matches", outside, []string{"agents.slice/" + mgr, "other.slice/" + mgr}, def},
-		{"none", outside, []string{"agents.slice/channel-thrall.service"}, def},
-		{"other uid only", outside, []string{fmt.Sprintf("agents.slice/user@%d.service", uid+1)}, def},
-		{"too deep", outside, []string{"a/b/c/d/" + mgr}, def},
-		{"no v2 line", "1:name=systemd:/x\n", []string{"agents.slice/" + mgr}, "/agents.slice/" + mgr},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fakeCgroupfs(t, tc.content, tc.dirs...)
-			if got, want := scopeCgroupPath(unit), tc.want+"/app.slice/"+unit; got != want {
-				t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
-			}
-		})
-	}
-	t.Run("symlink not followed", func(t *testing.T) {
-		root := fakeCgroupfs(t, outside, "elsewhere/"+mgr)
-		if err := os.Symlink(filepath.Join(root, "elsewhere"), filepath.Join(root, "link.slice")); err != nil {
-			t.Fatal(err)
-		}
-		if got, want := scopeCgroupPath(unit), "/elsewhere/"+mgr+"/app.slice/"+unit; got != want {
-			t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
-		}
-	})
-	t.Run("owned by another uid", func(t *testing.T) {
-		fakeCgroupfs(t, outside, "agents.slice/"+mgr)
-		old := cgroupDirOwner
-		cgroupDirOwner = func(fs.FileInfo) (int, bool) { return uid + 1, true }
-		t.Cleanup(func() { cgroupDirOwner = old })
-		if got, want := scopeCgroupPath(unit), def+"/app.slice/"+unit; got != want {
-			t.Fatalf("scopeCgroupPath = %q, want %q", got, want)
-		}
-	})
 }
