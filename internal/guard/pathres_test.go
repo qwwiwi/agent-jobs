@@ -509,3 +509,62 @@ func TestProtectedPipeSourceAllowed(t *testing.T) {
 		}
 	}
 }
+
+// Final review 2 of PR #12: an option ending in `e` (`sqlite3 -table`, `-line`) does not make the
+// next word code; a database operand over 4 KB is resolved whole, not by its tokens.
+func TestProtectedLongOperandAfterOptionRefused(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	if err := os.Symlink(filepath.Join(state, "subagents"), filepath.Join(cfg.Dir, "S")); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{4097, 4098} {
+		for form, w := range []string{padTo(n, "../../../x y/../jobs.db"), padTo(n, "S/x y/../../jobs.db")} {
+			for _, opts := range []string{"-table", "-line", "-header", "-separator ,", "-header -line", "-separator , -line"} {
+				c := "sqlite3 " + opts + " \"" + w + "\" \"UPDATE jobs SET subagents=0\""
+				if Check(c, cfg) == "" {
+					t.Errorf("%d bytes, form %d, %s: %q allowed", n, form, opts, c[len(c)-40:])
+				}
+			}
+		}
+	}
+	// Inline code over 4 KB given by real code options is still resolved by its tokens only.
+	code := strings.Repeat("print('a b') ", 4200/13)
+	for _, c := range []string{
+		"python3 -c \"" + code + "\"",
+		"python3 -Ic \"" + code + "\"",
+		"perl -e \"" + code + "\"",
+		"perl -lne \"" + code + "\"",
+		"node -e \"" + code + "\"",
+		"node --eval \"" + code + "\"",
+		"ruby -e \"" + code + "\"",
+		"php -r \"" + code + "\"",
+		"bash -c \"" + code + "\"",
+		"sh -ec \"" + code + "\"",
+		"awk \"" + code + "\" in.txt",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("long inline code refused: %.30q: %s", c, r)
+		}
+	}
+}
+
+// Final review 2 of PR #12: an option the guard does not know may take the next word (`node
+// --title x.js` runs stdin), so after one the interpreter counts as reading the pipe.
+func TestProtectedPipeUnknownOptionRefused(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	feed := "printf '%s\\n' \"process.chdir('$HOME/.agent-jobs');require('fs').writeFileSync('thrall/jobs.db','x')\""
+	for _, c := range []string{
+		feed + " | node --title x.js",
+		feed + " | node --title=t x.js",
+		"ls ~/.agent-jobs | python3 --unknown x.py",
+		"ls ~/.agent-jobs | python3 --unknown=1 x.py",
+		"ls ~/.agent-jobs | python3 -Z x.py",
+		"ls ~/.agent-jobs | node --title x.js",
+		"ls ~/.agent-jobs | ruby --foo x.rb",
+		"ls ~/.agent-jobs | perl -Q x.pl",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+}

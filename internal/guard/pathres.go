@@ -259,8 +259,8 @@ func (s *pathScope) hit(w string, tree bool) (string, bool) {
 }
 
 // bigText reports a word longer than any path the kernel opens that holds several path tokens. Only
-// code (inline code, here-docs, here-strings, `--opt=` values) is skipped as one path for it: a
-// plain operand or redirect target is always resolved whole (sqlite3 normalises a long name in
+// code (inline code by inlineCode, here-docs, here-strings) is skipped as one path for it: any
+// other operand, option value or redirect target is always resolved whole (sqlite3 normalises a long name in
 // userspace and opens it), and a heavy word is bounded by protectedBudget.
 func bigText(w string) bool {
 	return len(w) > maxWordBytes && len(pathTokens(w)) > 1
@@ -558,6 +558,49 @@ func codeArg(argv []string, k int) bool {
 		return strings.IndexByte("ceE", p[len(p)-1]) >= 0
 	}
 	return false
+}
+
+// shellFlags are shell options that take no value (not -o/-O): `bash -ec <code>`.
+const shellFlags = "abefhklmnprstuvxBCEHPT"
+
+// awks take their program as the first operand unless given -f.
+var awks = map[string]bool{"awk": true, "gawk": true, "mawk": true, "nawk": true, "busybox-awk": true}
+
+// inlineCode reports argv[k] as inline code by the option semantics of the command named
+// (`python3 -c`, `perl -e`, `node --eval`, `php -r`, `bash -c`, the awk program): only such a word
+// over maxWordBytes is resolved by its tokens; any other word, an option value or key=value word
+// too, is resolved whole (fail closed).
+func inlineCode(name string, argv []string, k int) bool {
+	switch {
+	case shells[name]:
+		for i := 1; i < k; i++ {
+			a := argv[i]
+			if len(a) < 2 || a[0] != '-' || strings.Trim(a[1:], shellFlags) != "" {
+				return false
+			}
+			if i == k-1 {
+				return strings.HasSuffix(a, "c")
+			}
+		}
+		return false
+	case awks[name]:
+		for i := 1; i < len(argv); i++ {
+			switch a := argv[i]; {
+			case a == "--":
+				return i+1 == k
+			case a == "-F" || a == "-v":
+				i++
+			case strings.HasPrefix(a, "-F") || strings.HasPrefix(a, "-v"):
+			case strings.HasPrefix(a, "-") && a != "-":
+				return false
+			default:
+				return i == k
+			}
+		}
+		return false
+	}
+	_, code := interpProgram(name, argv[1:])
+	return code >= 0 && code+1 == k
 }
 
 // onlyDotDot reports a relative path made of `.` and `..` segments only: from a directory inside a

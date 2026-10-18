@@ -322,73 +322,103 @@ func stdinInterpreter(name string) bool {
 }
 
 // interpSpec describes how an interpreter takes its program on the command line: short options
-// that give it (code, a module or a file), short options with a value attached or next, short
-// options with an attached value only (`perl -i.bak`, `-0777`), and the same for long options.
+// that give it (code, a module or a file) and the subset giving inline code as the next word, short
+// options with a value attached or next, short options with an attached value only (`perl -i.bak`,
+// `-0777`), short options taking no value, and the same for long options. Any other option may take
+// the next word as its value, so the guard does not know what follows it.
 type interpSpec struct {
-	codeShort, valueShort, attachShort string
-	codeLong, valueLong                []string
+	codeShort, inlineShort, valueShort, attachShort, flagShort string
+	codeLong, valueLong                                        []string
 }
 
 // interpSpecs are the stdin interpreters that may run a program named on the command line (sqlite3
 // reads SQL from stdin unless given after the database, so it always counts as pipe-fed).
 var interpSpecs = map[string]interpSpec{
-	"python": {codeShort: "cm", valueShort: "WX", valueLong: []string{"--check-hash-based-pycs"}},
-	"perl":   {codeShort: "eE", valueShort: "IMm", attachShort: "xiFCdD0"},
-	"node": {codeShort: "ep", valueShort: "rC", codeLong: []string{"--eval", "--print"},
+	"python": {codeShort: "cm", inlineShort: "c", valueShort: "WX", flagShort: "bBdEIOPqsSu",
+		valueLong: []string{"--check-hash-based-pycs"}},
+	"perl": {codeShort: "eE", inlineShort: "eE", valueShort: "IMm", attachShort: "xiFCdD0", flagShort: "acnpslwtTUWX"},
+	"node": {codeShort: "ep", inlineShort: "ep", valueShort: "rC", codeLong: []string{"--eval", "--print"},
 		valueLong: []string{"--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"}},
-	"ruby": {codeShort: "e", valueShort: "IrCE", attachShort: "FKTWx0i"},
-	"php":  {codeShort: "rfBRFE", valueShort: "cdz"},
+	"ruby": {codeShort: "e", inlineShort: "e", valueShort: "IrCE", attachShort: "FKTWx0i", flagShort: "acdlnpswU"},
+	"php":  {codeShort: "rfBRFE", inlineShort: "rBRE", valueShort: "cdz", flagShort: "eHlnqsw"},
 }
 
 // scriptExts are the file extensions taken as a script operand: a bare word (`python3 -W ignore`)
 // may be the value of an option the guard does not know, a script name is not.
 var scriptExts = []string{".py", ".pyw", ".pyc", ".pyz", ".pl", ".pm", ".t", ".js", ".mjs", ".cjs", ".ts", ".rb", ".php"}
 
-// programGiven reports an interpreter call whose program comes from its arguments (a script file,
-// -m, -c, -e, …) rather than from stdin.
-func programGiven(name string, args []string) bool {
+// interpProgram parses an interpreter call by its interpSpec: given reports a program from its
+// arguments (a script file, -m, -c, -e, …) rather than from stdin, code is the args index of an
+// inline program word (`-c <code>`, `--eval <code>`), -1 if none. Any option not in the spec ends
+// the parse as not given: it may take the next word (`node --title x.js` runs stdin).
+func interpProgram(name string, args []string) (given bool, code int) {
 	if strings.HasPrefix(name, "python") {
 		name = "python"
 	}
 	spec, ok := interpSpecs[name]
 	if !ok {
-		return false
+		return false, -1
+	}
+	inline := func(i int) int {
+		if i < len(args) {
+			return i
+		}
+		return -1
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--":
-			return i+1 < len(args) && isScript(args[i+1])
+			return i+1 < len(args) && isScript(args[i+1]), -1
 		case a == "-":
-			return false
+			return false, -1
 		case strings.HasPrefix(a, "--"):
 			opt, _, eq := strings.Cut(a, "=")
-			if slices.Contains(spec.codeLong, opt) {
-				return true
-			}
-			if slices.Contains(spec.valueLong, opt) && !eq {
-				i++
+			switch {
+			case slices.Contains(spec.codeLong, opt):
+				if eq {
+					return true, -1
+				}
+				return true, inline(i + 1)
+			case slices.Contains(spec.valueLong, opt):
+				if !eq {
+					i++
+				}
+			default:
+				return false, -1
 			}
 		case strings.HasPrefix(a, "-"):
+		cluster:
 			for j := 1; j < len(a); j++ {
-				if strings.IndexByte(spec.codeShort, a[j]) >= 0 {
-					return true
-				}
-				if strings.IndexByte(spec.valueShort, a[j]) >= 0 {
+				switch c := a[j]; {
+				case strings.IndexByte(spec.codeShort, c) >= 0:
+					if j == len(a)-1 && strings.IndexByte(spec.inlineShort, c) >= 0 {
+						return true, inline(i + 1)
+					}
+					return true, -1
+				case strings.IndexByte(spec.valueShort, c) >= 0:
 					if j == len(a)-1 {
 						i++
 					}
-					break
-				}
-				if strings.IndexByte(spec.attachShort, a[j]) >= 0 {
-					break
+					break cluster
+				case strings.IndexByte(spec.attachShort, c) >= 0:
+					break cluster
+				case strings.IndexByte(spec.flagShort, c) < 0:
+					return false, -1
 				}
 			}
 		default:
-			return isScript(a)
+			return isScript(a), -1
 		}
 	}
-	return false
+	return false, -1
+}
+
+// programGiven reports an interpreter call whose program comes from its arguments (a script file,
+// -m, -c, -e, …) rather than from stdin.
+func programGiven(name string, args []string) bool {
+	given, _ := interpProgram(name, args)
+	return given
 }
 
 // isScript reports a word naming a script file by its extension.
@@ -427,7 +457,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				}
 				for k, a := range argv[1:] {
 					code := codeArg(argv, k+1)
-					if code && bigText(a) {
+					if bigText(a) && inlineCode(name, argv, k+1) {
 						if h, ok := s.contains(a, true); ok {
 							return h.reason()
 						}
