@@ -205,7 +205,7 @@ func Open(path string) (*Store, error) {
 	// Tolerant migrations: databases created before a column existed get it with its default;
 	// "duplicate column" means the column is already there.
 	for _, alter := range migrations {
-		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		if err := migrate(db, alter); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate db: %w", err)
 		}
@@ -294,6 +294,39 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+}
+
+// migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
+// they run in the same transaction as the ALTER, so only once, by the process that added the column.
+var migrationBackfills = map[string]string{
+	// The stats of a finished job whose cost is unknown (a codex job, or a job whose attempts all ended
+	// without a cost, as RecordStats computes it) must not count as a known $0.00. A stats row whose
+	// job was pruned keeps the default.
+	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`: `UPDATE job_stats SET cost_unknown=1
+		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
+			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
+}
+
+// migrate runs one migration and its backfill, if any, in one transaction; a column that is already
+// there ("duplicate column") is no error and is not backfilled again.
+func migrate(db *sql.DB, alter string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(alter); err != nil {
+		if strings.Contains(err.Error(), "duplicate column") {
+			return nil
+		}
+		return err
+	}
+	if fill, ok := migrationBackfills[alter]; ok {
+		if _, err := tx.Exec(fill); err != nil {
+			return fmt.Errorf("backfill: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // ReserveSubagent counts one more subagent for running job id unless max are already used. It
