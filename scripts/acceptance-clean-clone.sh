@@ -162,15 +162,15 @@ mkdir -p "$ROOT/bin" "$SANDBOX_HOME" "$STUB" "$LOGS"
 STEP_NAMES=()
 STEP_CODES=()
 DAEMON_PID=""
-JOB_ID=""
 FAILED=0
 FINISHED=0
 
 record() { STEP_NAMES+=("$1"); STEP_CODES+=("$2"); }
 
 stop_daemon() {
-  if [ -n "$JOB_ID" ] && [ -n "$DAEMON_PID" ] && [ "$FAILED" = 1 ]; then
-    "$BIN" cancel --agent "$AGENT" "$JOB_ID" >>"$LOGS/cancel.log" 2>&1 || true
+  # A job left running after a failure runs in its own session and would outlive the daemon.
+  if [ "$FAILED" = 1 ] && [ -s "$ROOT/job.id" ]; then
+    "$BIN" cancel --agent "$AGENT" "$(cat "$ROOT/job.id")" >>"$LOGS/cancel.log" 2>&1 || true
   fi
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
@@ -222,6 +222,7 @@ finish() {
 on_exit() {
   local rc=$?
   if [ "$FINISHED" = 0 ]; then
+    FAILED=1
     stop_daemon
     echo "acceptance: interrupted (exit $rc); temp dir kept: $ROOT" >&2
   fi
