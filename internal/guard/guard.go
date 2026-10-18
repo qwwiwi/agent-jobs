@@ -19,7 +19,8 @@
 //   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
 //     (isolation worktree/remote, background run, agent team);
 //   - any tool outside the job allowlist (toolallow.go): schedules, wakeups, messages to other
-//     sessions, notifications, monitors, worktrees, questions and every unknown tool.
+//     sessions, notifications, monitors (their command bypasses the Bash checks), worktrees,
+//     questions, MCP tools other than the exact job-role agent-jobs tools, and every unknown tool.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
