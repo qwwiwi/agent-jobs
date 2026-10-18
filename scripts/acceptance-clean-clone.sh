@@ -8,14 +8,29 @@
 #   scripts/acceptance-clean-clone.sh --real-model sonnet
 #
 # Isolation: everything lives under one mktemp dir (clone, binary, HOME, state, sockets, logs). The
-# caller's checkout, ~/.agent-jobs, daemon, systemd units, tmux and config are never touched:
-# AGENT_JOBS_HOME, HOME and the systemctl/tmux/claude binaries point into the temp dir, the agent name
-# is a throwaway accept-<random>, the daemon is a foreground child killed on exit, and config.json
-# pins cgroup_scope=off (no systemd scope, no scope probe). The Go build cache is shared.
+# caller's checkout, ~/.agent-jobs, daemon, systemd units, tmux, skills and config are never touched:
+# - before the first git command every GIT_* variable but the transport ones (ssh, askpass, TLS
+#   CA, proxy) is dropped, so GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE never redirect a git command;
+# - after the clone and before any of its code is built or run, HOME is the temp dir's, the
+#   caller's AGENT_JOBS_*, GIT_*, XDG_{CONFIG,DATA,CACHE,STATE}_HOME and CLAUDE_CONFIG_DIR are gone,
+#   AGENT_JOBS_HOME and the systemctl/tmux/claude binaries point into the temp dir, and the installer
+#   gets an explicit --skills-dir in the temp dir; the Go caches stay the caller's (pinned first);
+# - the agent name is a throwaway accept-<random>, config.json pins cgroup_scope=off (no systemd
+#   scope, no scope probe);
+# - every step and the daemon run in a process group of their own next to a holder process that keeps
+#   the group id (= the leader's PID) from being reused; on exit, failure or INT/TERM the active step
+#   is stopped first, then the sandbox's queued/running jobs are cancelled and the daemon is stopped.
+#   The teardown ignores INT/TERM (also a terminal's Ctrl-C to its commands), so repeated signals do
+#   not cut it short.
 #
 # Test job: by default a stub stands in for claude (AGENT_JOBS_CLAUDE_BIN), so no model is called;
-# --real-model M runs one real job instead (1 turn, budget 0.2 USD) and keeps the real HOME so claude
-# finds its login (its session file goes to the real ~/.claude/projects).
+# --real-model M runs one real job instead (1 turn, budget 0.2 USD): the daemon alone runs with the
+# caller's HOME and CLAUDE_CONFIG_DIR so claude finds its login, and that claude writes its session
+# data there (~/.claude/projects, or $CLAUDE_CONFIG_DIR) as any claude run does; this is expected.
+#
+# Required checks: curl must exist (GET /v1/health is part of the acceptance), the installed binary
+# must be byte-identical to the one built and is the one the later steps run, and a --real-model
+# job's report must carry its marker.
 #
 # Inside a job the binary refuses every control command (no nested jobs). --inside-job builds the
 # binary with the test hooks (-tags agentjobs_testhooks) and names the outer job's wrapper as outer,
@@ -29,10 +44,13 @@ usage: acceptance-clean-clone.sh [REF] [--from PATH|URL] [--no-tests] [--real-mo
   REF                git ref of this checkout to test (default HEAD); resolved here, checked out in the clone
   --from PATH|URL    clone from this repository (default: this checkout's origin URL)
   --no-tests         skip scripts/check.sh (gofmt, go vet, go test -count=1) in the clone
-  --real-model MODEL the test job runs on the real claude with MODEL (1 turn, budget 0.2) instead of a stub
+  --real-model MODEL the test job runs on the real claude with MODEL (1 turn, budget 0.2) instead of a stub;
+                     that claude runs with your HOME/CLAUDE_CONFIG_DIR and writes its session data there
   --wait-minutes N   how long to wait for the test job (default 5, 10 with --real-model)
   --keep             keep the temp dir on success too (it is always kept on failure)
   --inside-job       run from inside an agent-jobs job: test-hooks build, outer wrapper ignored
+Needs git, go and curl. The clone never prompts (git and ssh in batch mode): use an ssh agent or a
+credential helper. Nothing outside the temp dir is written, except that real-model session data.
 USAGE
 }
 
@@ -74,13 +92,23 @@ if [ -n "$REAL_MODEL" ] && ! [[ "$REAL_MODEL" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
   exit 2
 fi
 
+# Before the first git command: no inherited repository, work tree, index, object store or config
+# override may redirect git (git -C does not override GIT_DIR, GIT_WORK_TREE or GIT_INDEX_FILE). Only
+# what reaching the remote may need stays.
+while IFS= read -r v; do
+  case "$v" in
+    GIT_SSH|GIT_SSH_COMMAND|GIT_SSH_VARIANT|GIT_ASKPASS|GIT_TERMINAL_PROMPT|GIT_SSL_CAINFO|GIT_SSL_CAPATH|GIT_PROXY_COMMAND) ;;
+    *) unset "$v" ;;
+  esac
+done < <(compgen -e | grep -E '^GIT_' || true)
+
 SRC_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if ! command -v go >/dev/null 2>&1 && [ -x "$HOME/.local/go/bin/go" ]; then
   export PATH="$HOME/.local/go/bin:$PATH"
 fi
-for tool in git go; do
+for tool in git go curl; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "acceptance: $tool not found" >&2
+    echo "acceptance: $tool not found (required)" >&2
     exit 1
   fi
 done
@@ -166,35 +194,111 @@ if [ "${#STATE}" -gt 88 ]; then
 fi
 mkdir -p "$ROOT/bin" "$SANDBOX_HOME" "$STUB" "$LOGS"
 
+INSTALLED="$SANDBOX_HOME/.local/bin/agent-jobs"
+# AJ is the binary the steps run: the one built until the install step put it in place, then the
+# installed one.
+AJ="$BIN"
+REAL_HOME="$HOME"
+REAL_CLAUDE_CONFIG_DIR_SET=0
+REAL_CLAUDE_CONFIG_DIR=""
+if [ -n "${CLAUDE_CONFIG_DIR+x}" ]; then
+  REAL_CLAUDE_CONFIG_DIR_SET=1
+  REAL_CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR"
+fi
+
 STEP_NAMES=()
 STEP_CODES=()
+STEP_PID=""
 DAEMON_PID=""
 FAILED=0
-FINISHED=0
+CLEANED=0
+SUMMARY_DONE=0
+# While CRITICAL=1 (a fork whose PID is not recorded yet, a group being ended) INT/TERM are held in
+# PENDING_SIGNAL and acted on right after, so the teardown never misses a group or signals a stale one.
+CRITICAL=0
+PENDING_SIGNAL=""
 
 record() { STEP_NAMES+=("$1"); STEP_CODES+=("$2"); }
 
-stop_daemon() {
-  # A job left running after a failure runs in its own session and would outlive the daemon.
-  if [ "$FAILED" = 1 ] && [ -s "$ROOT/job.id" ]; then
-    "$BIN" cancel --agent "$AGENT" "$(cat "$ROOT/job.id")" >>"$LOGS/cancel.log" 2>&1 || true
+# spawn_group VAR CMD...: runs CMD in the background in a process group of its own (job control is on
+# for the fork only) and sets VAR to its PID, which is also the group id. A holder (sleep, INT/TERM
+# ignored) sits in the same group: while it lives the group id is in use, so neither the leader's PID
+# nor the group id can be handed to another process, even after the leader exited and was reaped;
+# stop_group ends the holder last. CMD's redirections are the caller's (`spawn_group V cmd >log`).
+spawn_group() {
+  local __var="$1"
+  shift
+  CRITICAL=1
+  set -m
+  (
+    trap '' INT TERM
+    # No inherited fds: a pipe held open by the holder would keep a reader waiting.
+    # shellcheck disable=SC2217
+    sleep 2147483647 </dev/null >/dev/null 2>&1 &
+    trap - INT TERM
+    "$@"
+  ) &
+  printf -v "$__var" '%s' "$!"
+  set +m
+  CRITICAL=0
+  release_signal
+}
+
+# release_signal acts on an INT/TERM held while CRITICAL was set.
+release_signal() {
+  if [ -n "$PENDING_SIGNAL" ]; then exit "$PENDING_SIGNAL"; fi
+}
+
+# stop_group PID SECONDS: TERM to the group (the holder ignores it), up to SECONDS for the leader to
+# exit, then KILL to the group (whatever the leader left behind, and the holder), and reap the leader.
+stop_group() {
+  local g="$1" n=$(($2 * 4))
+  kill -TERM -- "-$g" 2>/dev/null || true
+  while [ "$n" -gt 0 ] && kill -0 "$g" 2>/dev/null; do
+    sleep 0.25
+    n=$((n - 1))
+  done
+  kill -KILL -- "-$g" 2>/dev/null || true
+  wait "$g" 2>/dev/null || true
+}
+
+# cancel_jobs cancels every queued or running job of the sandbox agent (one submitted by an
+# interrupted step included); a cancelled job's processes are ended by the binary.
+cancel_jobs() {
+  [ -x "$AJ" ] && [ -d "$STATE" ] || return 0
+  local st id
+  for st in queued running; do
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      echo "cancel $id ($st)" >>"$LOGS/cancel.log"
+      "$AJ" cancel --agent "$AGENT" "$id" >>"$LOGS/cancel.log" 2>&1 </dev/null || true
+    done < <("$AJ" list --agent "$AGENT" --status "$st" --limit 1000 2>>"$LOGS/cancel.log" </dev/null | awk 'NR > 1 { print $1 }' || true)
+  done
+}
+
+# cleanup: the active step first (it may be submitting a job), then the sandbox's jobs, the daemon,
+# and once more the jobs (one the daemon launched meanwhile). Idempotent; CLEANED is set only once the
+# teardown ran to its end. INT, TERM and PIPE are ignored from here on, by this shell and by the
+# teardown's own commands (a terminal's Ctrl-C reaches the whole foreground group, and a closed
+# `| tee` must not end the shell mid-teardown); it is bounded (about 25 s) and KILL still works.
+cleanup() {
+  [ "$CLEANED" = 0 ] || return 0
+  trap '' INT TERM PIPE
+  if [ -n "$STEP_PID" ]; then
+    stop_group "$STEP_PID" 5
+    STEP_PID=""
   fi
-  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-    kill -TERM "$DAEMON_PID" 2>/dev/null || true
-    local i
-    for i in $(seq 30); do
-      kill -0 "$DAEMON_PID" 2>/dev/null || break
-      sleep 0.5
-    done
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then kill -KILL "$DAEMON_PID" 2>/dev/null || true; fi
-    wait "$DAEMON_PID" 2>/dev/null || true
+  cancel_jobs
+  if [ -n "$DAEMON_PID" ]; then
+    stop_group "$DAEMON_PID" 15
+    DAEMON_PID=""
   fi
-  DAEMON_PID=""
+  cancel_jobs
+  CLEANED=1
 }
 
 finish() {
-  FINISHED=1
-  stop_daemon
+  cleanup
   echo
   echo "== acceptance summary: $REF ($SHA) from $FROM, agent $AGENT"
   local i word
@@ -214,6 +318,7 @@ finish() {
   else
     echo "RESULT: FAIL"
   fi
+  SUMMARY_DONE=1
   if [ "$FAILED" = 0 ] && [ "$KEEP" = 0 ]; then
     # Go marks module files read-only; make the tree writable before removing it.
     chmod -R u+w "$ROOT" 2>/dev/null || true
@@ -228,23 +333,43 @@ finish() {
 
 on_exit() {
   local rc=$?
-  if [ "$FINISHED" = 0 ]; then
+  if [ "$CLEANED" = 0 ]; then
     FAILED=1
-    stop_daemon
+    cleanup
+  fi
+  if [ "$SUMMARY_DONE" = 0 ]; then
     echo "acceptance: interrupted (exit $rc); temp dir kept: $ROOT" >&2
   fi
 }
-trap on_exit EXIT
-trap 'exit 130' INT TERM
 
-# run_step NAME FUNC: runs FUNC in a subshell with errexit (backgrounded and waited for, so errexit is
-# not switched off by a `||` around it), output to logs/NN-NAME.log; a failure ends the run.
+# on_signal CODE: exit CODE (the EXIT trap tears down), or after the critical section when inside one.
+# The teardown itself ignores INT/TERM (cleanup), so a repeated signal never cuts it short.
+on_signal() {
+  FAILED=1
+  if [ "$CRITICAL" = 1 ]; then
+    PENDING_SIGNAL="$1"
+    return 0
+  fi
+  exit "$1"
+}
+trap on_exit EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+# run_step NAME FUNC: runs FUNC with errexit in a process group of its own (spawn_group; waited for,
+# not under a `||`, so errexit stays on), output to logs/NN-NAME.log; a failure ends the run. Whatever
+# the step left in its group is killed when it ends.
 run_step() {
   local name="$1" fn="$2" log rc=0
   log="$LOGS/$(printf '%02d' "${#STEP_NAMES[@]}")-$name.log"
   echo "== $name"
-  (set -e; "$fn") >"$log" 2>&1 </dev/null &
-  if wait "$!"; then rc=0; else rc=$?; fi
+  spawn_group STEP_PID "$fn" >"$log" 2>&1 </dev/null
+  if wait "$STEP_PID"; then rc=0; else rc=$?; fi
+  CRITICAL=1
+  kill -KILL -- "-$STEP_PID" 2>/dev/null || true
+  STEP_PID=""
+  CRITICAL=0
+  release_signal
   record "$name" "$rc"
   if [ "$rc" != 0 ]; then
     FAILED=1
@@ -263,6 +388,12 @@ skip_step() {
 # ---- steps ----
 
 step_clone() {
+  # The step runs in a background process group: a prompt on the terminal would stop it (SIGTTIN)
+  # for good, so git and ssh must fail instead of asking.
+  export GIT_TERMINAL_PROMPT=0
+  if [ -z "${GIT_SSH:-}" ] && [ -z "$(git config --get core.sshCommand || true)" ]; then
+    export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes"
+  fi
   echo "clone $FROM -> $CLONE, checkout $SHA"
   git clone --quiet --no-local --no-checkout -- "$FROM" "$CLONE"
   if ! git -C "$CLONE" cat-file -e "$SHA^{commit}" 2>/dev/null; then
@@ -327,6 +458,7 @@ EOF
 }
 
 step_install() {
+  local aj="$BIN"
   write_stubs
   # cgroup_scope=off before init: no systemd scope per job and no scope probe (init --pin-scope
   # leaves a set value alone). The read-only HTTP API is on, on the state dir's unix socket.
@@ -336,9 +468,18 @@ step_install() {
   chmod 0600 "$STATE/config.json"
   if [ "$(uname -s)" = Linux ]; then
     # README: scripts/install-linux.sh --instance NAME (a prebuilt binary: the one built above).
-    HOME="$SANDBOX_HOME" AGENT_JOBS_SYSTEMCTL="$STUB/systemctl" \
-      "$CLONE/scripts/install-linux.sh" --instance "$AGENT" --binary "$BIN"
-    test -x "$SANDBOX_HOME/.local/bin/agent-jobs"
+    # The skills dir is explicit: the installer's default follows CLAUDE_CONFIG_DIR, which the
+    # sandbox has dropped, but no default may ever reach the caller's skills.
+    AGENT_JOBS_SYSTEMCTL="$STUB/systemctl" \
+      "$CLONE/scripts/install-linux.sh" --instance "$AGENT" --binary "$BIN" --skills-dir "$SANDBOX_HOME/.claude/skills"
+    test -x "$INSTALLED"
+    # The installed bytes are the ones built and tested, and they run; the later steps use them.
+    if ! cmp -s "$BIN" "$INSTALLED"; then
+      echo "installed binary differs: $INSTALLED is not the build $BIN"
+      exit 1
+    fi
+    "$INSTALLED" version
+    aj="$INSTALLED"
     test -f "$SANDBOX_HOME/.config/systemd/user/agent-jobs@.service"
     test -f "$SANDBOX_HOME/.claude/skills/agent-jobs/SKILL.md"
     grep -q "enable agent-jobs@$AGENT.service" "$STUB/systemctl.log"
@@ -349,13 +490,20 @@ step_install() {
   test -f "$STATE/owner-rules.md"
   test -f "$STATE/orchestrator.md"
   grep -q '"cgroup_scope": "off"' "$STATE/config.json"
-  "$BIN" http-api token --agent "$AGENT" --rotate >/dev/null
+  "$aj" http-api token --agent "$AGENT" --rotate >/dev/null
   test -f "$STATE/http-api.token"
 }
 
+# start_daemon: the daemon in a process group of its own (spawn_group), exec'd so its PID is the
+# group id. With --real-model it alone gets the caller's HOME and CLAUDE_CONFIG_DIR: the claude it
+# runs needs the login there.
 start_daemon() {
-  "$BIN" daemon --agent "$AGENT" >"$LOGS/daemon.log" 2>&1 </dev/null &
-  DAEMON_PID=$!
+  local env_cmd=()
+  if [ -n "$REAL_MODEL" ]; then
+    env_cmd=(env "HOME=$REAL_HOME")
+    if [ "$REAL_CLAUDE_CONFIG_DIR_SET" = 1 ]; then env_cmd+=("CLAUDE_CONFIG_DIR=$REAL_CLAUDE_CONFIG_DIR"); fi
+  fi
+  spawn_group DAEMON_PID exec ${env_cmd[@]+"${env_cmd[@]}"} "$AJ" daemon --agent "$AGENT" >"$LOGS/daemon.log" 2>&1 </dev/null
 }
 
 step_daemon() {
@@ -372,20 +520,17 @@ step_daemon() {
 
 step_status() {
   local out
-  out="$("$BIN" status --agent "$AGENT")"
+  out="$("$AJ" status --agent "$AGENT")"
   echo "$out"
   grep -q "^http api:  " <<<"$out"
-  "$BIN" doctor procs --agent "$AGENT"
-  "$BIN" list --agent "$AGENT"
-  if command -v curl >/dev/null 2>&1; then
-    local hdr="$ROOT/http-api.header"
-    (umask 077; printf 'Authorization: Bearer %s\n' "$(cat "$STATE/http-api.token")" >"$hdr")
-    curl -sS --fail --max-time 10 --unix-socket "$STATE/http-api.sock" -H "@$hdr" http://localhost/v1/health
-    echo
-    rm -f "$hdr"
-  else
-    echo "curl not found: /v1/health not checked"
-  fi
+  "$AJ" doctor procs --agent "$AGENT"
+  "$AJ" list --agent "$AGENT"
+  # Required (curl is checked at the start): the read-only HTTP API answers with the token.
+  local hdr="$ROOT/http-api.header"
+  (umask 077; printf 'Authorization: Bearer %s\n' "$(cat "$STATE/http-api.token")" >"$hdr")
+  curl -sS --fail --max-time 10 --unix-socket "$STATE/http-api.sock" -H "@$hdr" http://localhost/v1/health
+  echo
+  rm -f "$hdr"
 }
 
 step_job() {
@@ -414,11 +559,11 @@ nothing
 ## Progress
 - --:-- UTC replied
 EOF
-    id="$("$BIN" start --agent "$AGENT" --title "acceptance real job" --kind general --repo "$SCRATCH" \
+    id="$("$AJ" start --agent "$AGENT" --title "acceptance real job" --kind general --repo "$SCRATCH" \
       --model "$REAL_MODEL" --max-turns 1 --max-budget-usd 0.2 --timeout-minutes "$WAIT_MINUTES" --brief-file "$brief")"
   else
     echo "Acceptance dry job: a stub stands in for claude." >"$brief"
-    id="$("$BIN" start --agent "$AGENT" --title "acceptance dry job" --kind general --repo "$SCRATCH" \
+    id="$("$AJ" start --agent "$AGENT" --title "acceptance dry job" --kind general --repo "$SCRATCH" \
       --model sonnet --brief-file "$brief")"
   fi
   echo "job $id"
@@ -426,23 +571,26 @@ EOF
   # The daemon launches it on its next tick (once a minute) and collects it on the one after.
   st=""
   for i in $(seq $((WAIT_MINUTES * 12))); do
-    st="$("$BIN" status --agent "$AGENT" "$id" | sed -n 's/^status: *//p')"
+    st="$("$AJ" status --agent "$AGENT" "$id" | sed -n 's/^status: *//p')"
     case "$st" in succeeded|failed|timeout|cancelled|stopped) break ;; esac
     sleep 5
   done
-  "$BIN" status --agent "$AGENT" "$id"
+  "$AJ" status --agent "$AGENT" "$id"
   echo "final status: $st"
   test "$st" = succeeded
   test -s "$STATE/jobs/$id/report.md"
-  "$BIN" result --agent "$AGENT" "$id" | tee "$ROOT/result.txt"
+  "$AJ" result --agent "$AGENT" "$id" | tee "$ROOT/result.txt"
   grep -q '^## Summary' "$ROOT/result.txt"
   if [ -n "$REAL_MODEL" ]; then
-    grep -q 'ACCEPT-REAL-JOB-OK' "$ROOT/result.txt" || echo "note: the model did not echo the marker"
+    if ! grep -q 'ACCEPT-REAL-JOB-OK' "$ROOT/result.txt"; then
+      echo "the report lacks the marker ACCEPT-REAL-JOB-OK: the real job is not verified"
+      exit 1
+    fi
   else
     grep -q 'ACCEPT-DRY-JOB-OK' "$ROOT/result.txt"
     grep -qx -- '--max-turns' "$STATE/jobs/$id/stub-argv.txt"
   fi
-  "$BIN" doctor procs --agent "$AGENT"
+  "$AJ" doctor procs --agent "$AGENT"
   kill -0 "$DAEMON_PID"
 }
 
@@ -450,29 +598,40 @@ EOF
 
 echo "acceptance: $REF ($SHA) from $FROM"
 echo "temp dir: $ROOT"
+# The clone runs with the caller's HOME (git credentials, ssh) but no GIT_* override (scrubbed above).
 run_step clone step_clone
-run_step build step_build
-if [ "$NO_TESTS" = 1 ]; then skip_step tests --no-tests; else run_step tests step_tests; fi
 
-# From here on: the isolated environment (the caller's agent-jobs, git, XDG and claude settings are
-# dropped; only the temp dir counts).
+# From here on, before any code of the clone is built or run: the isolated environment. The Go caches
+# stay the caller's (pinned before HOME moves); the caller's agent-jobs, git, XDG and claude settings
+# are dropped; only the temp dir counts.
+# The caller's go env file is read, but go itself already runs with the sandbox's config dir (go
+# creates its telemetry dir there).
+caller_goenv="${GOENV:-${XDG_CONFIG_HOME:-$HOME/.config}/go/env}"
+for v in GOCACHE GOMODCACHE GOPATH GOPROXY GOSUMDB GOPRIVATE GONOPROXY GONOSUMDB; do
+  val="$(XDG_CONFIG_HOME="$SANDBOX_HOME/.config" GOENV="$caller_goenv" go env "$v")"
+  if [ -n "$val" ]; then export "$v=$val"; fi
+done
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep -E '^(AGENT_JOBS_|GIT_)' || true)
-unset XDG_CONFIG_HOME
+unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME CLAUDE_CONFIG_DIR ACCEPTANCE_CLEAN_CLONE
+# Nor may the caller's Go settings change what is built or tested (the build sets its own).
+unset GOENV GOFLAGS GOOS GOARCH GOEXPERIMENT
+export HOME="$SANDBOX_HOME"
 export AGENT_JOBS_HOME="$SANDBOX_HOME/.agent-jobs"
 export AGENT_JOBS_TMUX_BIN="$STUB/tmux"
 export AGENT_JOBS_CGROUP_SCOPE=off
 if [ -z "$REAL_MODEL" ]; then
-  export HOME="$SANDBOX_HOME"
-  unset CLAUDE_CONFIG_DIR
   export AGENT_JOBS_CLAUDE_BIN="$STUB/claude"
 fi
 if [ "$INSIDE_JOB" = 1 ] && [ -n "$OUTER" ]; then
   export AGENT_JOBS_TEST_OUTER_WRAPPER="$OUTER"
 fi
 
+run_step build step_build
+if [ "$NO_TESTS" = 1 ]; then skip_step tests --no-tests; else run_step tests step_tests; fi
 run_step install step_install
+if [ "$(uname -s)" = Linux ]; then AJ="$INSTALLED"; fi
 start_daemon
-# The daemon is a child of this shell (the exit trap stops it); step_daemon only checks it.
+# The daemon is this shell's (the teardown stops it); step_daemon only checks it.
 run_step daemon step_daemon
 run_step status step_status
 if [ -n "$REAL_MODEL" ]; then run_step real-job step_job; else run_step dry-job step_job; fi

@@ -18,13 +18,33 @@ const acceptanceScript = "scripts/acceptance-clean-clone.sh"
 // HOME, no agent-jobs variables) plus extra; argv0 is prepended when given (a fake wrapper).
 func acceptanceRun(t *testing.T, extra []string, argv0 []string, args ...string) (string, int) {
 	t.Helper()
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Skip("go not on PATH")
-	}
 	script, err := filepath.Abs(acceptanceScript)
 	if err != nil {
 		t.Fatal(err)
+	}
+	cmd := acceptanceCmd(t, script, extra, argv0, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), exitCode(t, err)
+}
+
+// exitCode is the exit status of a finished command (a start failure fails the test).
+func exitCode(t *testing.T, err error) int {
+	t.Helper()
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	return 0
+}
+
+// acceptanceCmd is the command acceptanceRun runs, for the given script: a minimal environment plus
+// extra (a later entry of the same key wins, so extra may override HOME, TMPDIR or PATH).
+func acceptanceCmd(t *testing.T, script string, extra []string, argv0 []string, args ...string) *exec.Cmd {
+	t.Helper()
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH")
 	}
 	// The caller's Go caches: a temp HOME would otherwise download every module into the test's dir.
 	goEnv, err := exec.Command(goBin, "env", "GOCACHE", "GOMODCACHE", "GOPATH").Output()
@@ -52,14 +72,20 @@ func acceptanceRun(t *testing.T, extra []string, argv0 []string, args ...string)
 		"PATH=" + filepath.Dir(goBin) + ":/usr/local/bin:/usr/bin:/bin",
 		"GOCACHE=" + g[0], "GOMODCACHE=" + g[1], "GOPATH=" + g[2],
 	}, extra...)
-	out, err := cmd.CombinedOutput()
-	code := 0
-	if ee, ok := err.(*exec.ExitError); ok {
-		code = ee.ExitCode()
-	} else if err != nil {
-		t.Fatal(err)
+	return cmd
+}
+
+// jobArgs are the extra arguments and environment a full run needs when this test runs inside an
+// agent-jobs job (--inside-job and the job marker).
+func jobArgs() ([]string, []string) {
+	if !insideJob() {
+		return nil, nil
 	}
-	return string(out), code
+	var extra []string
+	if v := os.Getenv("AGENT_JOBS_JOB"); v != "" {
+		extra = append(extra, "AGENT_JOBS_JOB="+v)
+	}
+	return []string{"--inside-job"}, extra
 }
 
 // insideJob reports whether this test process runs inside an agent-jobs job (marker or wrapper).
@@ -163,7 +189,9 @@ func TestAcceptanceScriptLongTmpdir(t *testing.T) {
 }
 
 // TestAcceptanceScriptRun is the whole acceptance (clone of this checkout, build, install, daemon,
-// dry job) without the test suite; it waits for two daemon ticks, so it runs only on request:
+// test job) without the test suite, with the caller's Git, XDG, Claude and agent-jobs settings set to
+// sentinels that must stay untouched; the real-model runs use a fake claude on PATH (with and without
+// the marker). They wait for two daemon ticks, so they run only on request (in parallel):
 // ACCEPTANCE_CLEAN_CLONE=1 go test -run TestAcceptanceScriptRun .
 func TestAcceptanceScriptRun(t *testing.T) {
 	if os.Getenv("ACCEPTANCE_CLEAN_CLONE") != "1" {
@@ -176,16 +204,59 @@ func TestAcceptanceScriptRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"--no-tests", "--from", root}
-	var extra []string
-	if insideJob() {
-		args = append(args, "--inside-job")
-		if v := os.Getenv("AGENT_JOBS_JOB"); v != "" {
-			extra = append(extra, "AGENT_JOBS_JOB="+v)
-		}
+	script := filepath.Join(root, acceptanceScript)
+	for _, c := range []struct {
+		name   string
+		claude string // the fake claude's report summary on PATH ("" = the dry run, no fake claude)
+		pass   bool
+		step   string
+	}{
+		{"dry", "", true, "dry-job"},
+		{"real-model", "ACCEPT-REAL-JOB-OK", true, "real-job"},
+		{"real-model-no-marker", "SOMETHING-ELSE", false, "real-job"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			sent := newSentinels(t)
+			jargs, extra := jobArgs()
+			args := append([]string{"--no-tests", "--from", root}, jargs...)
+			extra = append(extra, sent.env...)
+			if c.claude != "" {
+				bin := filepath.Join(t.TempDir(), "bin")
+				writeFakeClaude(t, bin, c.claude)
+				goBin, err := exec.LookPath("go")
+				if err != nil {
+					t.Fatal(err)
+				}
+				extra = append(extra, "PATH="+bin+":"+filepath.Dir(goBin)+":/usr/local/bin:/usr/bin:/bin")
+				args = append(args, "--real-model", "sonnet", "--wait-minutes", "5")
+			}
+			cmd := acceptanceCmd(t, script, extra, nil, args...)
+			b, err := cmd.CombinedOutput()
+			out, code := string(b), exitCode(t, err)
+			ok := code == 0 && strings.Contains(out, "RESULT: PASS") && strings.Contains(out, "PASS  "+c.step)
+			if c.pass != ok {
+				t.Fatalf("acceptance (want pass=%v): exit %d\n%s", c.pass, code, out)
+			}
+			if !c.pass && (!strings.Contains(out, "FAIL  "+c.step) || !strings.Contains(out, "lacks the marker")) {
+				t.Fatalf("want %s to fail on the marker:\n%s", c.step, out)
+			}
+			sent.check(t)
+		})
 	}
-	out, code := acceptanceRun(t, extra, nil, args...)
-	if code != 0 || !strings.Contains(out, "RESULT: PASS") || !strings.Contains(out, "PASS  dry-job") {
-		t.Fatalf("acceptance: exit %d\n%s", code, out)
+}
+
+// writeFakeClaude writes dir/claude: a runner for a --real-model job that answers with a report whose
+// summary is summary.
+func writeFakeClaude(t *testing.T, dir, summary string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n" +
+		`printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0,"result":"## Summary\n` +
+		summary + `\n\n## Findings / Changes\nnothing\n\n## Evidence\nnothing\n\n## Not done / uncertain\nnothing\n\n## Progress\n- --:-- UTC replied"}'` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
 	}
 }
