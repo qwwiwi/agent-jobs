@@ -19,7 +19,7 @@ import (
 const ServerName = "agent-jobs"
 
 // Version is reported in the MCP handshake.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // Deps is what tool handlers work on. In the job role Manager is nil: no job-role tool needs the
 // job database, and a job's server does not open it.
@@ -66,6 +66,9 @@ var toolDefs = []toolDef{
 	{"activity_report", addActivityReport},
 	{"trash_move", addTrashMove},
 	{"trash_restore", addTrashRestore},
+	{"intention_add", addIntentionAdd},
+	{"intention_list", addIntentionList},
+	{"intention_set", addIntentionSet},
 }
 
 func definitions() []toolDef { return toolDefs }
@@ -92,6 +95,7 @@ Route: minutes of work, do it yourself; the session needs the result now, a suba
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.
 system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
 To change a job's course: job_amend adds context to a queued job; job_stop + job_resume stops a running one and continues it in the same session with your update; job_cancel gives it up.
+intention_add, intention_list and intention_set keep the agent's own goals (open, done, dropped; never deleted).
 memory_*, task_*, send_message and inbox go to the team's shared brain; without a brain block in config.json they answer "brain not configured".
 The agent-jobs skill has the details.`
 

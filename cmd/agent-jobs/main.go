@@ -63,6 +63,8 @@ const usage = `usage: agent-jobs <command> [flags]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills; --backfill
                                            first writes missing rows from job dirs and the archive
+  intentions --agent A [--status open|done|dropped] [--json]
+                                           the agent's own goals (intention_* MCP tools), oldest first
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
@@ -126,6 +128,8 @@ func main() {
 		err = cmdArchive(args)
 	case "stats":
 		err = cmdStats(args)
+	case "intentions":
+		err = cmdIntentions(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "version", "--version":
@@ -945,6 +949,38 @@ func cmdArchive(args []string) error {
 	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
 	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
 	return aerr
+}
+
+func cmdIntentions(args []string) error {
+	fs := flag.NewFlagSet("intentions", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	status := fs.String("status", "", "only open|done|dropped (default all)")
+	asJSON := fs.Bool("json", false, "print the list as JSON (same as intention_list)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	list, err := m.ListIntentions(*status)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(mcp.IntentionsOutput{Intentions: list})
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tSTATUS\tPRIORITY\tDUE\tUPDATED\tTEXT")
+	for _, it := range list {
+		due := it.Due
+		if due == "" {
+			due = "-"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Status, it.Priority, due, fmtTime(&it.UpdatedAt), it.Text)
+	}
+	return w.Flush()
 }
 
 func cmdStats(args []string) error {

@@ -261,6 +261,14 @@ A job gets `memory_search` and `memory_write` only; everything that reaches anot
 | `trash_move` | reversible deletion instead of `rm`: one rename into `~/.agent-jobs/<agent>/trash/<id>/`; only absolute paths inside `trash_roots` (config; **no default**: without it nothing can be moved), never the agent-jobs home (any agent's state), the owner rules, the agent-jobs binary, `~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude.json` or a path with a `.git` component; symlinks never followed out, never across filesystems |
 | `trash_restore` | put an entry back at its original path; refused when the path is occupied (nothing is overwritten) or no longer inside a root |
 
+**Own goals** (orchestrator only), kept in the agent's own job database:
+
+| tool | what it does |
+|---|---|
+| `intention_add` | add a goal: `text` (one line, ≤ 500 characters, control characters refused), optional `due` (`YYYY-MM-DD`) and `priority` (low \| normal \| high, default normal); returns it with its id, status `open` |
+| `intention_list` | the goals, oldest first; optional `status` filter (open \| done \| dropped) |
+| `intention_set` | edit a goal in place by `id`: `status` (open \| done \| dropped) and/or `text`; there is no delete, a goal given up is `dropped` |
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -273,7 +281,7 @@ A job gets `memory_search` and `memory_write` only; everything that reaches anot
 | System | `system_doctor`, `system_logs`, `activity_report` | none | built |
 | Files | `trash_move`, `trash_restore` | none | built |
 | Schedules | `schedule_add`, `schedule_list`, `schedule_remove` | none | planned, Wave B |
-| Own goals | `intention_add`, `intention_list`, `intention_set` | none | planned, Wave B |
+| Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | none | planned, Wave B |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
@@ -286,7 +294,7 @@ Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.30
 **Build and check**
 
 ```bash
-go build -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.3.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```
@@ -397,6 +405,7 @@ agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs fin
 agent-jobs archive --agent my-agent --dry-run        # what prune would move into the log archive
 agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
+agent-jobs intentions --agent my-agent --status open  # the agent's own goals (--json)
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```

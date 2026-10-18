@@ -262,6 +262,14 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 | `trash_move` | обратимое удаление вместо `rm`: один rename в `~/.agent-jobs/<agent>/trash/<id>/`; только абсолютные пути внутри `trash_roots` (конфиг; **по умолчанию нет**: без него ничего не переносится), никогда папка agent-jobs (состояние любого агента), правила владельца, бинарник agent-jobs, `~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude.json` и пути с компонентом `.git`; по симлинкам наружу не ходим, между файловыми системами не переносим |
 | `trash_restore` | вернуть запись на исходный путь; отказ, если путь занят (ничего не перезаписывается) или больше не внутри корня |
 
+**Собственные цели** (только оркестратор), хранятся в базе джоб самого агента:
+
+| тул | что делает |
+|---|---|
+| `intention_add` | добавить цель: `text` (одна строка, не длиннее 500 символов, управляющие символы отклоняются), необязательные `due` (`YYYY-MM-DD`) и `priority` (low \| normal \| high, по умолчанию normal); возвращает её с id, статус `open` |
+| `intention_list` | цели, старые первыми; необязательный фильтр `status` (open \| done \| dropped) |
+| `intention_set` | править цель на месте по `id`: `status` (open \| done \| dropped) и/или `text`; удаления нет, от цели отказываются статусом `dropped` |
+
 **Полный запланированный набор** (из эталонного дизайна; см. [docs/PLAN.ru.md](docs/PLAN.ru.md)):
 
 | группа | тулы оркестратора | доступно джобе | статус |
@@ -274,7 +282,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 | Система | `system_doctor`, `system_logs`, `activity_report` | нет | построено |
 | Файлы | `trash_move`, `trash_restore` | нет | построено |
 | Расписания | `schedule_add`, `schedule_list`, `schedule_remove` | нет | запланировано, волна B |
-| Собственные цели | `intention_add`, `intention_list`, `intention_set` | нет | запланировано, волна B |
+| Собственные цели | `intention_add`, `intention_list`, `intention_set` | нет | построено, не выпущено (волна B) |
 | Владелец | `notify_owner` | нет | запланировано, волна B |
 | Код | индекс кода в виде графа (отдельный сервер) | чтение и индексация | исследование, волна C |
 
@@ -287,7 +295,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 **Сборка и проверка**
 
 ```bash
-go build -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.3.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # один раз на клон: pre-push запускает scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```
@@ -397,6 +405,7 @@ agent-jobs prune  --agent my-agent [--dry-run]       # чистка папок �
 agent-jobs archive --agent my-agent --dry-run        # что prune перенесёт в архив логов
 agent-jobs stats  --agent my-agent --since 30d --by skill   # сводка статистики джоб (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # призрачные процессы; без --kill только отчёт
+agent-jobs intentions --agent my-agent --status open  # собственные цели агента (--json)
 agent-jobs version                      # или --version
 ```
 

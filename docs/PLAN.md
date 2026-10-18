@@ -33,7 +33,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 - `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #13).
 - Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
 
-**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Built on a branch, on review.
+**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Built in v0.3.0.
 
 - Every job gets a session id before launch (`--session-id`); `--no-session-persistence` is gone.
 - `job_stop` / `agent-jobs stop`: a running or queued job ends `stopped`, keeping its worktree, uncommitted work and session.
@@ -43,8 +43,8 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 
 ## Wave A
 
-- **Memory, tasks and team tools via the shared brain.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
-- **Memory notes in the brief.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
+- **Memory, tasks and team tools via the shared brain.** *Status: built in v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
+- **Memory notes in the brief.** *Status: built in v0.3.0 ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)); `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
 ## Wave B
 
@@ -54,9 +54,9 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
   - as a job, when the schedule has a kind; the session then only sees the job-done line.
   Schedules store their model and limits at creation. A missed firing is lost, not queued, so check windows overlap. Schedule rows never expire; they are edited in place and deleted only by the owner.
 - **Dead-man's switch.** Checks that stay silent when all is well leave a completion mark; a watchdog compares the marks with the schedule.
-- **Intentions.** `intention_add`, `intention_list`, `intention_set`: the agent's own goals.
+- **Intentions.** *Status: built, unreleased; `internal/store/intentions.go`, `internal/jobs/intentions.go`, `internal/mcp/tools_intentions.go`.* `intention_add`, `intention_list`, `intention_set`: the agent's own goals, a table `intentions` in the agent's store (text one line, ≤ 500 characters; optional due date and priority; status `open` / `done` / `dropped`, edited in place, never deleted). Orchestrator only; `agent-jobs intentions [--status] [--json]` lists them.
 - **`notify_owner`.** A message to the owner through the agent's existing channel (DEVIATIONS #4).
-- **Daily automation.** `prune` and `doctor procs` run once a day on their own. **Built on branch `feature/daily-automation`, on review:** inside the daemon loop, once per local day at the first tick after `daily_hour` (default 4; `daily_off` disables); prune for real with the log archive, doctor procs report only (killing stays manual, `--kill`); the claimed day is stored (`daily` table), so a restart never repeats it and a missed day runs once, never caught up; each step time-boxed (10 min), in a goroutine that never overlaps itself or delays the ticks; the last run shows in `agent-jobs status` (no id) and `system_doctor`.
+- **Daily automation.** `prune` and `doctor procs` run once a day on their own. **Built, unreleased:** inside the daemon loop, once per local day at the first tick after `daily_hour` (default 4; `daily_off` disables); prune for real with the log archive, doctor procs report only (killing stays manual, `--kill`); the claimed day is stored (`daily` table), so a restart never repeats it and a missed day runs once, never caught up; each step time-boxed (10 min), in a goroutine that never overlaps itself or delays the ticks; the last run shows in `agent-jobs status` (no id) and `system_doctor`.
 - **Codex runner.** A job can run on `codex exec` instead of `claude -p` (DEVIATIONS #5); without turn or budget caps there, so the timeout is the limit.
 
 ## Wave C
