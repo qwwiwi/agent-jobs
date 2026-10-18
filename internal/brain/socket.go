@@ -23,6 +23,9 @@ const (
 	// SocketOpNotify is notify_owner: not a brain call, the daemon types the line into the
 	// orchestrator session (jobs.Manager.NotifyOwner). It works with or without a brain.
 	SocketOpNotify = "notify_owner"
+	// SocketOpCheckMark is check_mark: the daemon records a completion mark for a check
+	// (jobs.Manager.MarkCheck). It works with or without a brain.
+	SocketOpCheckMark = "check_mark"
 )
 
 // MaxSocketMessage bounds one request or response on the socket.
@@ -38,6 +41,8 @@ type SocketRequest struct {
 	// Text and Urgency are notify_owner's input.
 	Text    string `json:"text,omitempty"`
 	Urgency string `json:"urgency,omitempty"`
+	// Check is check_mark's check name; its note goes in Text.
+	Check string `json:"check,omitempty"`
 }
 
 // SocketResponse is the daemon's answer; Error is set when the call failed.
@@ -113,6 +118,12 @@ func (c SocketClient) Write(ctx context.Context, n NoteInput) (Object, error) {
 // notification (also with an error when it was stored but not delivered).
 func (c SocketClient) NotifyOwner(ctx context.Context, text, urgency string) (Object, error) {
 	resp, err := c.do(ctx, SocketRequest{Op: SocketOpNotify, Text: text, Urgency: urgency})
+	return resp.Result, err
+}
+
+// CheckMark asks the daemon to record a completion mark for the check; the answer is the check.
+func (c SocketClient) CheckMark(ctx context.Context, name, note string) (Object, error) {
+	resp, err := c.do(ctx, SocketRequest{Op: SocketOpCheckMark, Check: name, Text: note})
 	return resp.Result, err
 }
 

@@ -33,6 +33,10 @@ type SystemDoctorOutput struct {
 	Daily jobs.DailyStatus `json:"daily"`
 	// Undelivered are notify_owner notifications of the last 24 h that did not reach the session.
 	Undelivered []*store.Notification `json:"undelivered_notifications"`
+	// MissedChecks are the checks (dead-man's switch) whose latest expected time passed its grace
+	// without a mark (a late mark keeps them here), and those whose missed alert is still pending,
+	// with the alert's delivery state (pending, delivered, failed).
+	MissedChecks []jobs.CheckView `json:"missed_checks"`
 	// OwnerPending are owner-waits jobs whose result the owner has not been told yet (owner_replied
 	// clears them; they expire after owner_waits_max_hours). They hold the session's Stop hook.
 	OwnerPending []*store.OwnerPending `json:"owner_reply_pending"`
@@ -52,7 +56,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
 			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
-			"not delivered to the session, and the owner-waits jobs whose result the owner has not been told yet " +
+			"not delivered to the session, and dead-man's switch checks whose latest expected time passed without a mark " +
+			"(also when a late mark came) or whose missed alert is pending or failed, and the owner-waits jobs whose result the owner has not been told yet " +
 			"(owner_reply_pending; not a problem, owner_replied clears them) with the session their Stop hook holds " +
 			"(owner_hook_session; empty: none bound), and skill_warnings for skill catalog roots or entries that did not load. " +
 			"ok=false lists the problems.",
@@ -72,6 +77,12 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			last := out.Undelivered[n-1]
 			out.Problems = append(out.Problems, fmt.Sprintf("%d owner notifications not delivered in the last 24 h (latest #%d: %s)",
 				n, last.ID, last.Error))
+		}
+		if out.MissedChecks, err = m.MissedChecks(); err != nil {
+			out.Problems = append(out.Problems, "checks: "+err.Error())
+		}
+		for _, v := range out.MissedChecks {
+			out.Problems = append(out.Problems, "check "+jobs.CheckViewText(v))
 		}
 		if out.OwnerPending, _, err = m.OwnerPending(); err != nil {
 			out.Problems = append(out.Problems, "owner reply pending: "+err.Error())
