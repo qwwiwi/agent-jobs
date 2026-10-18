@@ -40,6 +40,7 @@ const usage = `usage: agent-jobs <command> [flags]
                                            --owner-waits: the owner asked for it (Stop hook)
              [--acceptance-cmd CMD]       fix/general: one-line shell command the job must
                                            pass in its worktree after claude exits 0
+                                           (needs config acceptance_allowed)
   status     --agent A [<id>]              a job; without an id: the daily automation
                                            (prune + doctor procs) and its last run, undelivered
                                            owner notifications, owner replies pending
@@ -398,7 +399,7 @@ func cmdStart(args []string) error {
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
 	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
 	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
-	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job")
+	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job (needs config acceptance_allowed)")
 	fs.BoolVar(&r.OwnerWaits, "owner-waits", false, "the owner asked for this job: its done line says «owner waits» and the Stop hook holds the session until owner_replied")
 	if _, err := parse(fs, args); err != nil {
 		return err

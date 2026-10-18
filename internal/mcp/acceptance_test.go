@@ -15,6 +15,7 @@ import (
 // command, its exit code, duration and log tail; the done line says the acceptance failed.
 func TestAcceptanceTools(t *testing.T) {
 	m := newManager(t)
+	m.Cfg.AcceptanceAllowed = true
 	cs := connect(t, mustServer(t, m))
 	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {
 		a["kind"], a["acceptance_cmd"] = "review", "make test"
@@ -71,11 +72,27 @@ func TestAcceptanceTools(t *testing.T) {
 // schedule_add carries acceptance_cmd to the schedule.
 func TestScheduleAddAcceptance(t *testing.T) {
 	m := newManager(t)
+	m.Cfg.AcceptanceAllowed = true
 	cs := connect(t, mustServer(t, m))
 	var out ScheduleOutput
 	call(t, cs, "schedule_add", map[string]any{"cron": "@daily", "prompt": "p", "kind": "fix", "model": "sonnet",
 		"acceptance_cmd": "make test"}, &out)
 	if out.Schedule.AcceptanceCmd != "make test" {
 		t.Fatalf("schedule_add: %+v", out.Schedule.Schedule)
+	}
+}
+
+// Without config acceptance_allowed, job_start and schedule_add refuse acceptance_cmd.
+func TestAcceptanceNeedsOptIn(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {
+		a["kind"], a["acceptance_cmd"] = "fix", "make test"
+	})); !strings.Contains(msg, "acceptance_allowed") {
+		t.Fatalf("job_start without opt-in: %q", msg)
+	}
+	if msg := callErr(t, cs, "schedule_add", map[string]any{"cron": "@daily", "prompt": "p", "kind": "fix", "model": "sonnet",
+		"acceptance_cmd": "make test"}); !strings.Contains(msg, "acceptance_allowed") {
+		t.Fatalf("schedule_add without opt-in: %q", msg)
 	}
 }

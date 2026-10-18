@@ -113,6 +113,15 @@ type Job struct {
 	AcceptanceExit *int
 	// AcceptanceDurationSec is how long the acceptance command ran.
 	AcceptanceDurationSec int
+	// AcceptanceDeadline is the daemon's deadline for the job once its acceptance command started: the
+	// wrapper records it with the start, from the acceptance timeout it applies (nil before).
+	AcceptanceDeadline *time.Time
+	// AcceptancePGID is the process group of the running acceptance command (0 when none runs); cancel,
+	// stop and timeout kill it along with the wrapper.
+	AcceptancePGID int
+	// TimedOutAt is when the daemon decided to time the running attempt out (nil before). Set by
+	// ClaimTimeout; once set, the acceptance command can no longer start.
+	TimedOutAt *time.Time
 }
 
 // AcceptanceTimedOut is the AcceptanceExit of an acceptance command ended by its timeout.
@@ -339,6 +348,9 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_started_at INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_exit INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_duration_sec INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_deadline INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -454,7 +466,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
-	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec`
+	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
+	acceptance_pgid, timed_out_at`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -471,14 +484,15 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
-		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec)
+		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
+		j.AcceptancePGID, ts(j.TimedOutAt))
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -490,17 +504,17 @@ type scanner interface{ Scan(dest ...any) error }
 func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
-	var started, finished, notified, cleaned, accStarted, accExit sql.NullInt64
+	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
-		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec)
+		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut)
 	if err != nil {
 		return nil, err
 	}
-	j.AcceptanceStartedAt = convTS(accStarted)
+	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
 		e := int(accExit.Int64)
 		j.AcceptanceExit = &e
@@ -706,7 +720,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
 		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', acceptance_started_at=NULL,
-		acceptance_exit=NULL, acceptance_duration_sec=0, max_turns=?, max_budget_usd=?,
+		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
@@ -752,17 +766,41 @@ func (s *Store) Unclaim(id, token string) error {
 }
 
 // SetAcceptanceStarted records, for the running launch that owns the job, that its acceptance command
-// started now.
-func (s *Store) SetAcceptanceStarted(id, token string, now time.Time) error {
-	return affected(s.db.Exec(`UPDATE jobs SET acceptance_started_at=? WHERE id=? AND status='running' AND launch_token=?`,
-		now.Unix(), id, token))
+// starts now and the deadline the daemon must then allow the job. It is the acceptance side of the
+// timeout race: it fails (ErrImmutable) once ClaimTimeout has decided to time the attempt out, and a
+// claim after it sees the recorded deadline. SQLite serializes the two updates, so exactly one wins.
+func (s *Store) SetAcceptanceStarted(id, token string, now, deadline time.Time) error {
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_started_at=?, acceptance_deadline=? WHERE id=? AND
+		status='running' AND launch_token=? AND timed_out_at IS NULL`, now.Unix(), deadline.Unix(), id, token))
+}
+
+// SetAcceptancePGID records the process group of the running acceptance command (0 = it ended).
+func (s *Store) SetAcceptancePGID(id, token string, pgid int) error {
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_pgid=? WHERE id=? AND status='running' AND launch_token=?`,
+		pgid, id, token))
 }
 
 // SetAcceptanceResult records the acceptance command's exit code (AcceptanceTimedOut for a timeout)
-// and duration for the running launch that owns the job.
+// and duration for the running launch that owns the job; the command's process group is gone by then.
 func (s *Store) SetAcceptanceResult(id, token string, exit, durationSec int) error {
-	return affected(s.db.Exec(`UPDATE jobs SET acceptance_exit=?, acceptance_duration_sec=? WHERE id=? AND status='running'
-		AND launch_token=?`, exit, durationSec, id, token))
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_exit=?, acceptance_duration_sec=?, acceptance_pgid=0 WHERE id=?
+		AND status='running' AND launch_token=?`, exit, durationSec, id, token))
+}
+
+// ClaimTimeout decides, in one conditional update, that the running attempt under token has timed out
+// at now: past started_at + timeout_minutes and, when its acceptance command started, past the
+// recorded acceptance deadline. It returns false when the attempt has not timed out by the row as it
+// is now (the acceptance command started after the caller read the row) or is no longer running under
+// token. A claim already made stays (true again): the daemon may have died before finishing the row.
+func (s *Store) ClaimTimeout(id, token string, now time.Time) (bool, error) {
+	res, err := s.db.Exec(`UPDATE jobs SET timed_out_at=COALESCE(timed_out_at, ?) WHERE id=? AND status='running'
+		AND launch_token=? AND (timed_out_at IS NOT NULL OR (started_at IS NOT NULL AND ? > started_at + timeout_minutes*60
+		AND (acceptance_deadline IS NULL OR ? > acceptance_deadline)))`, now.Unix(), id, token, now.Unix(), now.Unix())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // SetPID records the wrapper's pid/pgid for the launch that owns the job.
