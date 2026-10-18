@@ -295,9 +295,11 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
 		if cut == 0 {
 			cut = len(body)
 		}
+		// The dropped line completes the evicted text's last line: was a key block open at the cut
+		// (its BEGIN line evicted, its END line not), what is kept of it goes until its END line.
+		out.evicted.feed(body[:cut])
 		body, dropped = body[cut:], dropped+int64(cut)
-		// A key block whose BEGIN line was cut off: its body and END line go too.
-		if kept, n := redactHeadCutPEM(string(body)); n > 0 {
+		if kept, n := redactPEM(string(body), out.evicted.open); n > 0 {
 			body = []byte(kept)
 		}
 		body = append([]byte(fmt.Sprintf("[... %d earlier bytes cut, last %d kept ...]\n", dropped, len(body))), body...)
@@ -394,21 +396,26 @@ func acceptanceEnv(jobDir string, env []string) ([]string, error) {
 	return JobEnv(jobDir, keep)
 }
 
-// tailBuffer keeps the last max bytes written to it.
+// tailBuffer keeps the last max bytes written to it; evicted follows the PEM key block markers of
+// what it dropped.
 type tailBuffer struct {
 	max     int
 	buf     []byte
 	dropped int64
+	evicted pemTracker
 }
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
 	n := len(p)
 	if len(p) >= t.max {
+		t.evicted.feed(t.buf)
+		t.evicted.feed(p[:len(p)-t.max])
 		t.dropped += int64(len(t.buf) + len(p) - t.max)
 		t.buf = append(t.buf[:0], p[len(p)-t.max:]...)
 		return n, nil
 	}
 	if over := len(t.buf) + len(p) - t.max; over > 0 {
+		t.evicted.feed(t.buf[:over])
 		t.dropped += int64(over)
 		t.buf = append(t.buf[:0], t.buf[over:]...)
 	}
@@ -422,8 +429,8 @@ func (t *tailBuffer) Bytes() []byte { return append([]byte(nil), t.buf...) }
 // ReadAcceptanceLogTail returns the end of <stateDir>/jobs/<id>/acceptance.log, at most max bytes, as
 // valid UTF-8 with secret-looking values redacted (like report.md: at most acceptanceReadCap bytes
 // are read, and the text is redacted before it is cut to max; a line cut at the start of the read or
-// of the tail is dropped whole, so no part of a value split by a cut is shown, and what such a cut
-// left of a PEM key block, its body and END line, is redacted). The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
+// of the tail is dropped whole, so no part of a value split by a cut is shown; what a cut, this one
+// or an earlier build's, left of a PEM key block is redacted on every read, see redactPEM). The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
 // following a symlinked jobs or job dir or log, and only a regular file of this user with one link).
 func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 	f, size, err := OpenJobFile(stateDir, id, AcceptanceLog, os.Getuid())
@@ -443,7 +450,7 @@ func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 	}
 	s := strings.ToValidUTF8(string(b), "�")
 	if off > 0 {
-		s, _ = redactHeadCutPEM(dropFirstLine(s))
+		s = dropFirstLine(s)
 	}
 	s = RedactText(s)
 	if cut := int64(len(s)) - max; cut > 0 {
@@ -452,7 +459,7 @@ func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 		if head != '\n' {
 			s = dropFirstLine(s)
 		}
-		s, _ = redactHeadCutPEM(s)
+		s, _ = redactPEM(s, false)
 	}
 	return s, nil
 }
