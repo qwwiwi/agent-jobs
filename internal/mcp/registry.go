@@ -75,6 +75,8 @@ var OrchestratorOnly = []string{
 	"check_remove",
 	// «Owner waits»: only the session that writes to the owner clears the pending record.
 	"owner_replied",
+	// The heartbeat's stored decisions (their reason is untrusted model text): the session reads them.
+	"heartbeat_get",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

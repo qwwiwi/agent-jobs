@@ -589,3 +589,37 @@ func TestAcceptanceNotLeaked(t *testing.T) {
 		}
 	}
 }
+
+// /v1/health carries the heartbeat state but neither the goals file (path or text) nor the model's
+// reason.
+func TestHealthHeartbeat(t *testing.T) {
+	f := newFixture(t)
+	goals := filepath.Join(t.TempDir(), "goals.md")
+	if err := os.WriteFile(goals, []byte("GOAL_SECRET_MARKER\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.m.Cfg.Heartbeat = jobs.HeartbeatConfig{Enabled: true, GoalsFile: goals}
+	h, err := f.m.Store.ClaimHeartbeat(jobs.HeartbeatTriggerDaemon, f.now, store.HeartbeatClaimLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.m.Store.FinishHeartbeat(h.ID, store.HeartbeatWake, "REASON_MARKER", 0, "", f.now); err != nil {
+		t.Fatal(err)
+	}
+	res, b := f.do(t, http.MethodGet, "/v1/health", f.token)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("health: %d %s", res.StatusCode, b)
+	}
+	var out HealthOutput
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if hb := out.Heartbeat; !hb.Enabled || hb.LastDecision != store.HeartbeatWake || hb.DailyMaxWakes != 6 {
+		t.Fatalf("heartbeat: %+v", hb)
+	}
+	for _, s := range []string{"GOAL_SECRET_MARKER", "REASON_MARKER", goals} {
+		if strings.Contains(string(b), s) {
+			t.Fatalf("health leaks %q: %s", s, b)
+		}
+	}
+}

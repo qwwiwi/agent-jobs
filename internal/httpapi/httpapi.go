@@ -516,6 +516,31 @@ type HealthOutput struct {
 	UptimeSec int64  `json:"uptime_sec"`
 	Running   int    `json:"running"`
 	Queued    int    `json:"queued"`
+	// Heartbeat is the heartbeat state without the goals file (neither its path nor its text) and
+	// without the model's reason.
+	Heartbeat HeartbeatView `json:"heartbeat"`
+}
+
+// HeartbeatView is the heartbeat in /v1/health.
+type HeartbeatView struct {
+	Enabled       bool   `json:"enabled"`
+	WakesToday    int    `json:"wakes_today"`
+	DailyMaxWakes int    `json:"daily_max_wakes,omitempty"`
+	NextEligible  string `json:"next_eligible,omitempty"`
+	LastDecision  string `json:"last_decision,omitempty"`
+	LastAt        string `json:"last_at,omitempty"`
+	LastDelivered bool   `json:"last_delivered,omitempty"`
+}
+
+func heartbeatView(st jobs.HeartbeatStatus) HeartbeatView {
+	v := HeartbeatView{Enabled: st.Enabled, WakesToday: st.WakesToday, DailyMaxWakes: st.DailyMaxWakes}
+	if st.NextEligible != nil {
+		v.NextEligible = st.NextEligible.UTC().Format(time.RFC3339)
+	}
+	if h := st.Last; h != nil {
+		v.LastDecision, v.LastAt, v.LastDelivered = h.Decision, h.ClaimedAt.UTC().Format(time.RFC3339), h.Delivered
+	}
+	return v
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -529,8 +554,13 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		a.internalError(w, "health", err)
 		return
 	}
+	hb, err := a.m.Heartbeat()
+	if err != nil {
+		a.internalError(w, "health", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, HealthOutput{Version: capField(a.version), StartedAt: a.started.UTC().Format(time.RFC3339),
-		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued})
+		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued, Heartbeat: heartbeatView(hb)})
 }
 
 // JobView is one job as the API (and `agent-jobs list --json`) shows it: the job row without its brief,
