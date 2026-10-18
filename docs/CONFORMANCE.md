@@ -99,7 +99,7 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | «A missed firing is lost, not queued» | 1:1 | `internal/jobs/schedule.go:18-19, 300-338`, `internal/store/schedules.go:238` |
 | «writes a completion mark, and a separate «dead man's switch» compares the marks with the schedule» | 1:1 in idea; checks carry their own cron and grace, and the `check_*` tools are not in the reference MCP table: deviation (Finding U2 → #17) | `internal/jobs/checks.go:51, 215, 278, 620`, `internal/mcp/tools_checks.go:72-145` |
 | «The schedule row itself never expires … edit it in place … re-read it … delete it only by the owner's decision» | 1:1 | `internal/store/schedules.go:199-218`, `internal/mcp/tools_schedules.go:133-134` |
-| Heartbeat: «a cheap check in Go … then a small model decides» | **missing** (model change is deviation #1; nothing is built) | no code: `grep -rni heartbeat internal cmd` is empty |
+| Heartbeat: «a cheap check in Go … then a small model decides» | deviation #1 (Sonnet decides, not Haiku); built, off by default (`heartbeat.enabled`) | `internal/jobs/heartbeat.go:36, 256, 489-491, 609, 771`, `internal/store/heartbeats.go`, `internal/mcp/tools_heartbeat.go` |
 
 ### MCP tools (REFERENCE.md 108–125)
 
@@ -157,8 +157,9 @@ Each was checked with `grep -n -i` for its key terms in `docs/DEVIATIONS.md`; no
 
 ### Missing (planned, not deviations)
 
-- **Heartbeat** (REFERENCE.md 106): nothing built; `grep -rni heartbeat internal cmd` is empty. PLAN Wave D.
 - **Code-graph MCP server** (REFERENCE.md 123): nothing built. PLAN Wave C.
+
+Heartbeat (REFERENCE.md 106), listed here before, is built since (Wave D, `internal/jobs/heartbeat.go`, `internal/store/heartbeats.go`, off by default); its only difference from the reference is the model, deviation #1. See the Schedules table above.
 
 ### Rows listed but still «owner OK pending»
 
