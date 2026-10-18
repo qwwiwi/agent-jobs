@@ -156,8 +156,8 @@ type codexEvent struct {
 
 // ParseCodexStream reads a `codex exec --json` stream: Found when a turn ended (turn.completed or
 // turn.failed), IsError when the last turn failed, Text = the last agent message, Turns = the completed
-// items other than reasoning (messages, commands, file changes, tool calls), and the token usage summed
-// over the turns. The cost is never known (codex reports no price).
+// items other than reasoning and error warnings (messages, commands, file changes, tool calls), and the
+// token usage summed over the turns. The cost is never known (codex reports no price).
 func ParseCodexStream(path string) StreamResult {
 	out := StreamResult{Runner: store.RunnerCodex}
 	f, err := os.Open(path)
@@ -174,7 +174,8 @@ func ParseCodexStream(path string) StreamResult {
 		}
 		switch ev.Type {
 		case "item.completed":
-			if ev.Item.Type == "reasoning" || ev.Item.Type == "" {
+			// "error" items are warnings (e.g. unrecognized config settings), not work done.
+			if ev.Item.Type == "reasoning" || ev.Item.Type == "error" || ev.Item.Type == "" {
 				continue
 			}
 			out.Turns++

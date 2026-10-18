@@ -295,3 +295,15 @@ func TestParseCodexStreamUsage(t *testing.T) {
 		t.Fatalf("missing stream %+v", r)
 	}
 }
+
+// TestParseCodexStreamRealSample parses a stream recorded from codex-cli 0.162.1 on the host: an
+// "error" item is a warning (unrecognized config settings), not a turn.
+func TestParseCodexStreamRealSample(t *testing.T) {
+	r := ParseCodexStream(filepath.Join("testdata", "codex-0.162.1-stream.jsonl"))
+	if !r.Found || r.IsError || r.Subtype != "success" || r.Text != "OK" || r.Turns != 1 {
+		t.Fatalf("parsed %+v", r)
+	}
+	if r.InputTokens != 18525 || r.CachedInputTokens != 12288 || r.OutputTokens != 5 || r.CostUSD != 0 {
+		t.Fatalf("usage %+v", r)
+	}
+}
