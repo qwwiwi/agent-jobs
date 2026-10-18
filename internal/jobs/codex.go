@@ -1,14 +1,18 @@
 package jobs
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -138,14 +142,67 @@ func (c Config) codexBin() string {
 // CodexDisabledFeatures are the codex features every codex job runs without (`--disable <f>` each):
 // whatever could act outside the shell sandbox (apps, browsers, computer use, plugins, MCP installs,
 // hooks, background daemons and automations, worktrees, sub-agents) or a one-shot job has no use for.
-// With --ignore-user-config, --ignore-rules, --ephemeral and an empty mcp_servers table, a job never
-// inherits the owner's codex config, rules, MCP servers, apps or plugins: the sandbox is the whole
-// containment (this exact command line verified on codex-cli 0.162.1).
+// With --ignore-user-config, --ignore-rules, --ephemeral and an empty mcp_servers table, a job does not
+// inherit the owner's codex config, rules, apps or plugins (this exact command line verified on
+// codex-cli 0.162.1); MCP servers from other config layers are ruled out by checkCodexMCP, so the
+// sandbox is the whole containment.
 var CodexDisabledFeatures = []string{
 	"apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
 	"image_generation", "multi_agent", "plugins", "plugin_sharing", "remote_plugin",
 	"skill_mcp_dependency_install", "daemon_auto_start", "in_app_local_automation", "goals",
 	"realtime_conversation", "worktrees", "hooks",
+}
+
+// codexMCPTimeout bounds the `codex mcp list --json` check before a codex launch.
+var codexMCPTimeout = 15 * time.Second
+
+// checkCodexMCP fails closed on MCP servers a codex job could inherit: --ignore-user-config leaves the
+// system and managed config layers active, and `-c mcp_servers={}` does not clear a table codex merges
+// recursively, so the command line alone proves nothing. Before every launch the same binary runs
+// `mcp list --json` (it starts no model) in the job's work dir with the job's environment; only an
+// empty JSON array lets the job run. It reads every layer, the user one included, so it is stricter
+// than the job's own command line: a codex job needs a codex setup without MCP servers.
+func checkCodexMCP(bin, dir string, env []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), codexMCPTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "mcp", "list", "--json")
+	cmd.Dir, cmd.Env = dir, env
+	cmd.WaitDelay = time.Second // a child holding stdout open does not outlive the timeout
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	fail := func(why string) error {
+		return fmt.Errorf("codex MCP check `%s mcp list --json` %s; codex jobs refuse to run unless it prints []",
+			bin, why)
+	}
+	switch {
+	case ctx.Err() != nil:
+		return fail(fmt.Sprintf("timed out after %s", codexMCPTimeout))
+	case err != nil:
+		return fail(fmt.Sprintf("failed: %v: %s", err, Printable(stderr.String(), 200)))
+	}
+	dec := json.NewDecoder(bytes.NewReader(out))
+	var servers []struct {
+		Name string `json:"name"`
+	}
+	if err := dec.Decode(&servers); err != nil || servers == nil || dec.More() {
+		return fail(fmt.Sprintf("printed %q, not a JSON array", Printable(string(out), 200)))
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return fail(fmt.Sprintf("printed %q, not one JSON array", Printable(string(out), 200)))
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	names := make([]string, len(servers))
+	for i, s := range servers {
+		names[i] = Printable(s.Name, 64)
+		if names[i] == "" {
+			names[i] = "(unnamed)"
+		}
+	}
+	return fmt.Errorf("codex has MCP servers configured: %s; codex jobs refuse to run with inherited MCP servers",
+		strings.Join(names, ", "))
 }
 
 // CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,

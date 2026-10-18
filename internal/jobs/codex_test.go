@@ -12,9 +12,17 @@ import (
 )
 
 // fakeCodex stands in for `codex exec --json`: it records argv, stdin and the job marker and prints
-// codex's JSON events. FAKE_CODEX_* words in the prompt pick other endings.
+// codex's JSON events. FAKE_CODEX_* words in the prompt pick other endings. As `codex mcp list --json`
+// it records its argv and working dir in FAKE_CODEX_MCP_LOG (if set) and prints FAKE_CODEX_MCP_OUT
+// (default []) after FAKE_CODEX_MCP_SLEEP seconds, exiting with FAKE_CODEX_MCP_EXIT.
 const fakeCodex = `#!/bin/bash
 set -u
+if [[ ${1-} == mcp ]]; then
+  if [[ -n ${FAKE_CODEX_MCP_LOG-} ]]; then printf '%s\n' "$@" "$PWD" >> "$FAKE_CODEX_MCP_LOG"; fi
+  if [[ -n ${FAKE_CODEX_MCP_SLEEP-} ]]; then sleep "$FAKE_CODEX_MCP_SLEEP"; fi
+  printf '%s\n' "${FAKE_CODEX_MCP_OUT-[]}"
+  exit "${FAKE_CODEX_MCP_EXIT-0}"
+fi
 prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
 printf '%s' "$prompt" > ../stdin.txt
@@ -242,6 +250,55 @@ func TestCodexWriteJobRefusedByDefault(t *testing.T) {
 	argv, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "argv.txt"))
 	if j.Status != store.StatusSucceeded || !strings.Contains(string(argv), "-s\nworkspace-write\n") {
 		t.Fatalf("got %s %q argv %q", j.Status, j.Error, argv)
+	}
+}
+
+// Before every codex launch the daemon runs `<codex bin> mcp list --json` in the job's work dir: only
+// an empty JSON array lets the job run; MCP servers (listed by name), garbage, an exit code or a hang
+// refuse it before codex exec starts (DEVIATIONS #5).
+func TestCodexRefusedWithInheritedMCP(t *testing.T) {
+	m := newCodexManager(t)
+	log := filepath.Join(t.TempDir(), "mcp.log")
+	t.Setenv("FAKE_CODEX_MCP_LOG", log)
+	j := runToEnd(t, m, enqueue(t, m, "review it", codexReview).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("mcp list [] must launch: %s %q", j.Status, j.Error)
+	}
+	calls, _ := os.ReadFile(log)
+	if want := "mcp\nlist\n--json\n" + filepath.Join(m.JobDir(j.ID), "work") + "\n"; string(calls) != want {
+		t.Fatalf("mcp check calls:\n%s\nwant:\n%s", calls, want)
+	}
+	defer func(d time.Duration) { codexMCPTimeout = d }(codexMCPTimeout)
+	codexMCPTimeout = time.Second
+	for _, c := range []struct {
+		name, out, exit, sleep, want string
+	}{
+		{"servers", `[{"name":"github","enabled":true},{"name":"brain","enabled":false}]`, "0", "",
+			"codex has MCP servers configured: github, brain; codex jobs refuse to run with inherited MCP servers"},
+		{"unnamed", `[{}]`, "0", "", "codex has MCP servers configured: (unnamed)"},
+		{"garbage", `no servers`, "0", "", "codex MCP check"},
+		{"trailing", `[] []`, "0", "", "codex MCP check"},
+		{"exit", `[]`, "1", "", "codex MCP check"},
+		{"timeout", `[]`, "0", "5", "timed out"},
+	} {
+		t.Setenv("FAKE_CODEX_MCP_OUT", c.out)
+		t.Setenv("FAKE_CODEX_MCP_EXIT", c.exit)
+		t.Setenv("FAKE_CODEX_MCP_SLEEP", c.sleep)
+		start := time.Now()
+		j := enqueue(t, m, "review it", codexReview)
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		got := get(t, m, j.ID)
+		if got.Status != store.StatusFailed || !strings.Contains(got.Error, c.want) {
+			t.Fatalf("%s: got %s %q, want failed with %q", c.name, got.Status, got.Error, c.want)
+		}
+		if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt")); err == nil {
+			t.Fatalf("%s: refused job must not run codex exec", c.name)
+		}
+		if d := time.Since(start); d > 4*time.Second {
+			t.Fatalf("%s: the check took %s", c.name, d)
+		}
 	}
 }
 
