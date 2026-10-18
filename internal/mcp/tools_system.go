@@ -33,6 +33,12 @@ type SystemDoctorOutput struct {
 	Daily jobs.DailyStatus `json:"daily"`
 	// Undelivered are notify_owner notifications of the last 24 h that did not reach the session.
 	Undelivered []*store.Notification `json:"undelivered_notifications"`
+	// OwnerPending are owner-waits jobs whose result the owner has not been told yet (owner_replied
+	// clears them; they expire after owner_waits_max_hours). They hold the session's Stop hook.
+	OwnerPending []*store.OwnerPending `json:"owner_reply_pending"`
+	// OwnerHookSession is the orchestrator session the Stop hook holds (`agent-jobs hook bind` from
+	// its SessionStart hook); "" when none is bound, and then the hook holds no session.
+	OwnerHookSession string `json:"owner_hook_session"`
 }
 
 func addSystemDoctor(s *sdk.Server, d Deps) {
@@ -43,7 +49,9 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
 			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
-			"not delivered to the session. ok=false lists the problems.",
+			"not delivered to the session, and the owner-waits jobs whose result the owner has not been told yet " +
+			"(owner_reply_pending; not a problem, owner_replied clears them) with the session their Stop hook holds " +
+			"(owner_hook_session; empty: none bound). ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
 		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks()}
@@ -60,6 +68,12 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			last := out.Undelivered[n-1]
 			out.Problems = append(out.Problems, fmt.Sprintf("%d owner notifications not delivered in the last 24 h (latest #%d: %s)",
 				n, last.ID, last.Error))
+		}
+		if out.OwnerPending, _, err = m.OwnerPending(); err != nil {
+			out.Problems = append(out.Problems, "owner reply pending: "+err.Error())
+		}
+		if out.OwnerHookSession, _, err = m.Store.HookSession(); err != nil {
+			out.Problems = append(out.Problems, "owner hook session: "+err.Error())
 		}
 		if out.Daily, err = m.Daily(); err != nil {
 			out.Problems = append(out.Problems, "daily: "+err.Error())
