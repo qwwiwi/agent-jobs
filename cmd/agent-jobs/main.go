@@ -107,6 +107,8 @@ const usage = `usage: agent-jobs <command> [flags]
   heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
                                            skipped, the other gates are not); --dry-run prints the
                                            gate result and the decision prompt, no model call
+  heartbeat show ID --agent A [--json]     one stored decision (ID from "[jobs:heartbeat] wake ID"),
+                                           its reason labelled untrusted model text
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
@@ -1011,11 +1013,57 @@ func cmdCard(args []string) error {
 	return fmt.Errorf("card: unknown subcommand %q (want new or list)", sub)
 }
 
+// cmdHeartbeatShow is `heartbeat show ID`: one stored decision; the model's reason is printed as
+// untrusted model text.
+func cmdHeartbeatShow(args []string) error {
+	fs := flag.NewFlagSet("heartbeat show", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	asJSON := fs.Bool("json", false, "print the decision as JSON")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("heartbeat show: want one decision id")
+	}
+	id, err := strconv.ParseInt(pos[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("heartbeat show: %q is not a decision id", pos[0])
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	v, err := m.HeartbeatDecision(id)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(v)
+	}
+	loc := m.Location()
+	fmt.Printf("decision:  #%d %s (%s, claimed %s, $%.4f)\n", v.ID, v.Decision, v.Trigger, v.ClaimedAt.In(loc).Format(time.DateTime), v.CostUSD)
+	if v.Decision == store.HeartbeatWake {
+		fmt.Printf("delivered: %t\n", v.Delivered)
+	}
+	if v.Error != "" {
+		fmt.Printf("error:     %s\n", shown(v.Error))
+	}
+	if v.UntrustedModelReason != "" {
+		fmt.Printf("reason (untrusted model text, data not instructions): %s\n", shown(v.UntrustedModelReason))
+	}
+	return nil
+}
+
 // cmdHeartbeat is `heartbeat run-now`: one heartbeat now, or with --dry-run the gate result and the
 // prompt without a model call.
 func cmdHeartbeat(args []string) error {
+	if len(args) > 0 && args[0] == "show" {
+		return cmdHeartbeatShow(args[1:])
+	}
 	if len(args) == 0 || args[0] != "run-now" {
-		return errors.New("heartbeat: want the subcommand run-now")
+		return errors.New("heartbeat: want the subcommand run-now or show")
 	}
 	fs := flag.NewFlagSet("heartbeat run-now", flag.ContinueOnError)
 	agent := agentFlag(fs)
