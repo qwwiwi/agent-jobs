@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -75,8 +76,14 @@ const scheduleCols = `id, cron, prompt, enabled, kind, title, model, complexity,
 	last_fired_at, last_fired_local, last_job_id, last_error`
 
 // AddSchedule inserts s (enabled as given) and returns it with its id. Validation is the caller's.
+// A job schedule without a title gets the neutral "schedule <id>" in the same transaction.
 func (s *Store) AddSchedule(sc *Schedule, now time.Time) (*Schedule, error) {
-	res, err := s.db.Exec(`INSERT INTO schedules (cron, prompt, enabled, kind, title, model, complexity, runner,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("add schedule: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`INSERT INTO schedules (cron, prompt, enabled, kind, title, model, complexity, runner,
 		reasoning_effort, max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sc.Cron, sc.Prompt, sc.Enabled, sc.Kind, sc.Title, sc.Model, sc.Complexity, sc.Runner, sc.ReasoningEffort,
@@ -86,6 +93,14 @@ func (s *Store) AddSchedule(sc *Schedule, now time.Time) (*Schedule, error) {
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
+		return nil, fmt.Errorf("add schedule: %w", err)
+	}
+	if sc.Kind != "" && sc.Title == "" {
+		if _, err := tx.Exec(`UPDATE schedules SET title = 'schedule ' || id WHERE id = ?`, id); err != nil {
+			return nil, fmt.Errorf("add schedule: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("add schedule: %w", err)
 	}
 	return s.GetSchedule(id)
@@ -124,6 +139,24 @@ func (s *Store) ListSchedules(enabledOnly bool) ([]*Schedule, error) {
 		q = `SELECT ` + scheduleCols + ` FROM schedules WHERE enabled = 1 ORDER BY id`
 	}
 	rows, err := s.db.Query(q)
+	if err != nil {
+		return nil, fmt.Errorf("list schedules: %w", err)
+	}
+	defer rows.Close()
+	out := []*Schedule{}
+	for rows.Next() {
+		sc, err := scanSchedule(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan schedule: %w", err)
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
+// ListSchedulesPageContext returns at most limit schedules with an id above afterID, oldest first.
+func (s *Store) ListSchedulesPageContext(ctx context.Context, afterID int64, limit int) ([]*Schedule, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+scheduleCols+` FROM schedules WHERE id > ? ORDER BY id LIMIT ?`, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list schedules: %w", err)
 	}

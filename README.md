@@ -233,7 +233,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits; returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `owner_waits` (the owner asked for it, see *Owner waits*); returns the queued row |
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
 | `job_list` | recent jobs, filterable by status |
@@ -294,6 +294,31 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 |---|---|
 | `notify_owner` | ask for the owner's attention: `text` (one line, ≤ 300 characters, control characters refused, `[jobs:` inside it defanged), optional `urgency` (normal \| high). agent-jobs sends nothing to a messenger itself: one line `[jobs:notify-owner] …` (with `job <id>:` from a job) is typed into the notify target like the job-done line, and the agent's session relays it over its own channel. A job: at most 3, at most one a minute (through the daemon); the agent: at most 20 an hour. Every admitted call is stored; a refused one (invalid text or urgency, over a limit) is an error and stores nothing. An undelivered one (no target, tmux refused or not done within 10 s) is an error and shows in `agent-jobs status` and `system_doctor`. CLI: `agent-jobs notify-owner --agent A --text T [--urgency high]` |
 
+**Owner waits** (built, unreleased): a job started at the owner's request is marked (`job_start` with `owner_waits: true`, `agent-jobs start --owner-waits`). Its job-done line ends with `· owner waits`. When the job has finished, it is recorded as «owner reply pending» for the agent *before* its line is typed into the session, so the session never sees the line without the record. A Stop hook in the orchestrator session, `agent-jobs hook stop --agent A`, then blocks the end of a turn (`{"decision":"block","reason":"…"}`) until the session has written to the owner and called `owner_replied`; it blocks at most once per turn (with `stop_hook_active` it always allows, so it never loops) and fails open (any error, and any incomplete hook input, allows the stop).
+
+The hook holds **only the orchestrator session**: `agent-jobs hook bind --agent A`, run from that session's SessionStart hook, records its `session_id`. A bind is accepted only when all hold: (a) it runs in the tmux pane of `notify_tmux_target` (`$TMUX_PANE` equals the pane tmux resolves the target to); (b) the hook input's `cwd` is inside `orchestrator_dir` (config); (c) it is not inside a job. With no `notify_tmux_target` or no `orchestrator_dir` configured every bind is refused, and the Stop hook then never blocks. Replacing a binding obeys the same checks: a new session, `/clear` or a resume in the same pane and directory rebinds, while another project's session with the same hooks, or a process elsewhere, cannot take it over; a refused bind keeps the old binding. A process the orchestrator itself starts in that pane and directory (its own subagent) is inside the orchestrator's trust domain and is not defended against. The Stop hook blocks only when its input's `session_id` equals the bound one; with no session bound, or in any other session that has the hook configured, it allows.
+
+Records are kept per job attempt (a resumed job's new line holds again). `owner_replied` clears a record whether its line was already delivered or is still being delivered; with a `job_id` it acknowledges every attempt of that job, including a finished attempt whose line has not gone out yet (that line then holds nothing). A record expires on its own after `owner_waits_max_hours` (config, default 6); an expired or acknowledged attempt is never reopened, also when its delivery is retried. With notify off (no `notify_tmux_target`) the record is still created when the job finishes, but no job-done line arrives: the hook's reason says so and asks the session to check the job with `job_status`. Pending records (with how far their line got: `delivering`, `delivered`, `notify_off`) and the bound session show in `agent-jobs status` (no id) and `system_doctor` (`owner_reply_pending`, `owner_hook_session`).
+
+| tool | what it does |
+|---|---|
+| `owner_replied` | orchestrator only: after writing to the owner, clear the «owner reply pending» record of `job_id`, or of every job without it; returns the cleared ids and what is still pending |
+
+Register both hooks in the orchestrator's Claude Code settings (the `settings.json` the agent's session loads, never a job's; agent-jobs does not edit it), and set `notify_tmux_target` and `orchestrator_dir` in the agent's `config.json` (below). Without a successful SessionStart bind the Stop hook holds nothing:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "agent-jobs hook bind --agent A" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "agent-jobs hook stop --agent A" } ] }
+    ]
+  }
+}
+```
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -308,6 +333,7 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
+| Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---
@@ -348,6 +374,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 ```json
 {
   "notify_tmux_target": "my-agent-session",
+  "orchestrator_dir": "/home/me/my-agent",
   "owner_names": ["Owner"],
   "git_name": "Agent Bot",
   "git_email": "agent@example.com"
@@ -356,6 +383,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 
 - `notify_tmux_target`: tmux target for the job-done line. Empty (default) = notify off; the line goes to the daemon log and cleanup still runs.
 - `tmux_socket`: tmux socket name of that session (`tmux -L <name>`); empty = tmux's default socket. A name, not a path.
+- `orchestrator_dir`: absolute directory the orchestrator session works in. `hook bind` (owner waits) binds only a session whose `cwd` is inside it and that runs in the pane of `notify_tmux_target`; empty (default) = binding refused, the owner-waits Stop hook never blocks. `owner_waits_max_hours`: how long an «owner reply pending» record holds (default 6).
 - `idle_after_result_seconds`: grace of the idle-after-result rule (default 180). A job whose claude printed its final `result`, then stays silent this long with no live child but the job MCP server, is ended and judged by that result instead of waiting for the timeout (Linux). `-1` turns the rule off.
 - `owner_names`: names that must never appear in a job's commit.
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
@@ -365,6 +393,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `max_brief_bytes`: largest brief `job_start` accepts (default 32768); `brief_warn_files` (default 40) and `brief_warn_headings` (default 8): above these a queued job gets a `size_warning`.
 - `brain`: the shared brain behind the memory, task and team tools and the memory notes of a brief (see «Shared brain» below). Absent = not configured.
 - `cgroup_scope`: `auto` (default: a transient systemd user scope per job when `systemd-run --user` works, else the weaker session containment), `required` (refuse jobs that cannot get a scope), `off`.
+- `http_api`: the read-only HTTP API, `{"enabled": false}` by default, listening on the unix socket `<state>/http-api.sock` (see «Read-only HTTP API» below).
 - Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
 
 **Shared brain**
@@ -394,6 +423,28 @@ The memory, task and team tools and the memory notes of a brief talk to the team
 
 **Memory notes in the brief.** When a job is prepared, the daemon asks `recall` for up to six notes closest to the job's title and brief (the first 4000 bytes) and adds a «Memory notes» section after the project cards: path, scope, score and the snippet quoted line by line (a note cannot open a section of its own), marked as data written by others. The lookup has 5 seconds; on an error or a timeout the job starts anyway and the section says «Shared memory was unreachable when this job was prepared (reason)». No brain configured = no section. Notes written by jobs are left out and only counted («N close notes written by jobs were left out: they are unreviewed»): the daemon knows them by the paths it recorded when it wrote them for a job, or by the job's first line in the snippet. A job's note reaches a brief only after someone writes it again as the agent's own. After one lookup goes unanswered, lookups are skipped for a minute, so a hanging brain delays one launch, not every launch of a tick.
 
+**Read-only HTTP API (off by default)**
+
+For a jobs dashboard (DEVIATIONS #8) the daemon can serve a small JSON API. It is off unless the config turns it on and every request needs the agent's bearer token. By default it listens on the unix socket `<state>/http-api.sock` (mode 600, created under umask 077; the state dir must be mode 700 and owned by the agent user, else the API does not start); `listen` may name another unix socket path or a loopback `ip:port` (`127.0.0.0/8`, `[::1]`; any other address is refused at config load):
+
+```json
+{ "http_api": { "enabled": true } }
+{ "http_api": { "enabled": true, "listen": "127.0.0.1:7781" } }
+```
+
+```bash
+agent-jobs http-api token --agent my-agent --rotate   # writes <state>/http-api.token (mode 600), prints it once
+systemctl --user restart agent-jobs@my-agent           # the daemon starts the API
+curl -s --unix-socket ~/.agent-jobs/my-agent/http-api.sock -H "Authorization: Bearer $(cat ~/.agent-jobs/my-agent/http-api.token)" http://localhost/v1/health
+```
+
+- `GET /v1/health`: version, start time, uptime, running and queued counts. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill`: the `job_stats` summary. `GET /v1/stats` covers the last 30 days without `since`; a `since` older than 365 days is 400; at most 200 groups and skills (`groups_truncated`, `skills_truncated`). `GET /v1/schedules?limit=N&cursor=C`: schedules with their next firing, oldest first, pages of 100 by default (max 500); `next_cursor` is the `cursor` of the next page.
+- On a TCP listener the `Host` header must be `localhost` or a loopback IP literal (`127.x.x.x`, `[::1]`), without a port or with the listener's, else 421 (no name is resolved: a DNS-rebound page cannot reach the API); a unix socket is exempt.
+- Every endpoint needs the token, health included (401 without it or with a wrong one; the scheme `Bearer` is case-insensitive; constant-time compare; the file is read per request, so a rotation takes effect at once, and a token file readable by group or others fails closed). Any method but GET is 405; no endpoint changes state. No CORS headers.
+- Never returned: briefs, schedule prompts or titles derived from them (a job schedule without a title is called `schedule <id>`, and so are the jobs it fires; an older schedule or job whose title starts with `schedule: ` is shown that way too), session ids, env, config, the job dir or the repository path (only the repository's folder name), error texts. A job's error is `error_code` + `error_message`, a schedule's last error `last_error_code` + `last_error_message`, the code one of `launch_failed`, `timeout`, `cancelled`, `guard_refused`, `codex_config_refused`, `delivery_failed`, `processes_survived`, `run_failed`, `unknown` with a fixed message; the text itself is in `agent-jobs status <id>` and the daemon log. Every string field is cut at 200 bytes. `report.md` is read only through the state dir: `jobs`, the job dir and the report are opened without following a symlink, and a report that is not a regular file of the agent user with one link is not read (`report_error`). Only this agent's jobs.
+- Server limits: header read 5 s, read 10 s, write 30 s, idle 60 s, headers at most 8 KB; 10 requests per second per client for authenticated requests and, in a separate bucket, for refused ones (401s), 429 above; at most 1024 clients tracked, the one seen longest ago is dropped.
+- `agent-jobs status --agent A` (no id) and `system_doctor` show where the API listens (the real port for port 0) or `http api not serving: <reason>` (a failed bind, an unsafe state dir, a missing token, the daemon stopped).
+
 **Run the daemon on Linux (systemd user service)**
 
 ```bash
@@ -421,7 +472,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agent-jobs.$AGENT.pl
 agent-jobs start --agent my-agent --title "review auth" --kind review \
   --repo ~/src/project --base main --complexity normal \
   --brief-file brief.md                 # prints the job id at once
-agent-jobs list   --agent my-agent
+agent-jobs list   --agent my-agent [--status running] [--json]
 agent-jobs status --agent my-agent <id>
 agent-jobs result --agent my-agent <id> # job-done line + report.md
 agent-jobs cancel --agent my-agent <id>
@@ -433,6 +484,7 @@ agent-jobs archive --agent my-agent --dry-run        # what prune would move int
 agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs intentions --agent my-agent --status open  # the agent's own goals (--json)
+agent-jobs http-api token --agent my-agent --rotate   # token of the read-only HTTP API, printed once
 agent-jobs mcp --agent my-agent --role orchestrator   # MCP server on stdio for the agent's session
 agent-jobs version                      # also --version
 ```
