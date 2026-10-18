@@ -293,9 +293,21 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 }
 
 // Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, fire the
-// schedules due this minute, run the checks' watchdog (dead-man's switch), start queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
-// cleanup delay.
+// schedules due this minute, judge the checks (dead-man's switch), start queued ones (≤2 running),
+// send job-done lines, and clean up worktrees whose notify is older than the cleanup delay; then,
+// with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
+	err := m.tickLocked()
+	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
+	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
+	if derr := m.deliverCheckAlerts(); derr != nil {
+		err = errors.Join(err, fmt.Errorf("check alerts: %w", derr))
+	}
+	return err
+}
+
+// tickLocked is the part of Tick that runs under the lifecycle lock.
+func (m *Manager) tickLocked() error {
 	unlock, err := m.lock()
 	if err != nil {
 		return err

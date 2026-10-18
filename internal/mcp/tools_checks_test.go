@@ -89,7 +89,8 @@ func TestCheckToolsOrchestrator(t *testing.T) {
 	var doc SystemDoctorOutput
 	call(t, cs, "system_doctor", map[string]any{}, &doc)
 	if len(doc.MissedChecks) != 1 || doc.OK || !slices.ContainsFunc(doc.Problems, func(p string) bool {
-		return strings.HasPrefix(p, "check backup missed: expected 2026-10-19T10:00:00Z") && strings.Contains(p, "notify off")
+		return strings.HasPrefix(p, "check backup missed: expected 2026-10-19 10:00 UTC, no mark within 30m; alert pending (1 of 5") &&
+			strings.Contains(p, "notify off")
 	}) {
 		t.Fatalf("doctor: %+v %v", doc.MissedChecks, doc.Problems)
 	}
@@ -100,7 +101,8 @@ func TestCheckToolsOrchestrator(t *testing.T) {
 	}
 	var list ChecksOutput
 	call(t, cs, "check_list", map[string]any{}, &list)
-	if len(list.Checks) != 1 || list.Checks[0].State != "late" || list.Checks[0].LastMissedAt == nil {
+	if len(list.Checks) != 1 || list.Checks[0].State != "missed" || list.Checks[0].LateMarkAt == nil ||
+		list.Checks[0].LastMissedAt == nil || list.Checks[0].AlertState != "pending" {
 		t.Fatalf("check_list: %+v", list.Checks)
 	}
 	var rm CheckRemoveOutput

@@ -97,7 +97,7 @@ A job (or you, with `notify_owner`) can ask for the owner's attention. agent-job
 
 ## A check missed: `[jobs:check-missed]`
 
-Checks are a dead-man's switch (`check_add`, `check_list`, `check_set`; `check_remove` only on the owner's instruction): work that stays silent while healthy calls `check_mark` (a job can, when its brief asks) or `agent-jobs check mark NAME`. When an expected time plus its grace passes without a mark you receive one line `[jobs:check-missed] <name> expected <time> (no mark within <grace>m)`, once per expected time. Find out why the work did not report (a job that failed, a timer that did not run) and tell the owner when it matters. Missed checks also show in `system_doctor` (`missed_checks`).
+Checks are a dead-man's switch (`check_add`, `check_list`, `check_set`; `check_remove` only on the owner's instruction): work that stays silent while healthy calls `check_mark` (a job can, when its brief asks) or `agent-jobs check mark NAME`. When an expected time plus its grace passes without a mark you receive one line `[jobs:check-missed] <name> expected <time> (no mark within <grace>m)`, once per expected time (rarely twice, when the daemon died while typing it). Each mark counts for one expected time. Find out why the work did not report (a job that failed, a timer that did not run) and tell the owner when it matters. Missed checks also show in `system_doctor` (`missed_checks`), a late mark included, and so do alerts that could not be typed (pending, or failed after 5 attempts).
 
 ## Job context
 

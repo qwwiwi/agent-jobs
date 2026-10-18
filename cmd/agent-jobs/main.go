@@ -541,7 +541,8 @@ func printUndelivered(m *jobs.Manager) error {
 }
 
 // printMissedChecks is part of `status` without a job id: the checks whose latest expected time
-// passed its grace without a mark.
+// passed its grace without a mark (a late mark shown, the time stays missed) and the missed
+// alerts still pending, with their delivery state.
 func printMissedChecks(m *jobs.Manager) error {
 	list, err := m.MissedChecks()
 	if err != nil {
@@ -551,13 +552,9 @@ func printMissedChecks(m *jobs.Manager) error {
 		fmt.Println("checks:    no missed checks")
 		return nil
 	}
-	fmt.Printf("checks:    %d missed\n", len(list))
+	fmt.Printf("checks:    %d missed or alert pending\n", len(list))
 	for _, v := range list {
-		fmt.Printf("  %s expected %s (no mark within %dm), last mark %s", v.Name, v.LastExpectedAt, v.GraceMinutes, fmtTime(v.LastMarkAt))
-		if v.LastAlertError != "" {
-			fmt.Printf(" · alert not delivered: %s", jobs.Printable(v.LastAlertError, 80))
-		}
-		fmt.Println()
+		fmt.Printf("  %s · last mark %s\n", jobs.CheckViewText(v), fmtTime(v.LastMarkAt))
 	}
 	return nil
 }
@@ -1137,7 +1134,7 @@ func cmdChecks(args []string) error {
 		if next == "" {
 			next = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\n", v.Name, v.State, v.Cron, v.GraceMinutes, exp, next,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\n", v.Name, jobs.CheckStateText(v), v.Cron, v.GraceMinutes, exp, next,
 			fmtTime(v.LastMarkAt), jobs.Printable(v.LastMarkNote, 60))
 	}
 	return w.Flush()

@@ -23,6 +23,9 @@ func watch(t *testing.T, m *Manager) {
 	if err := m.watchChecks(); err != nil {
 		t.Fatal(err)
 	}
+	if err := m.deliverCheckAlerts(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func markAt(t *testing.T, m *Manager, now *time.Time, at time.Time, name string) {
@@ -46,9 +49,9 @@ func missedLines(t *testing.T, logf string) []string {
 	return out
 }
 
-// A mark in (P+grace, E+grace] (P the previous expected time) satisfies E; the boundary E+grace
-// is inclusive and the watchdog looks at E only once E+grace has passed. A mark late in E's grace
-// does not also cover the next expected time (windows never overlap).
+// A mark in (P, E+grace] (P the previous expected time) satisfies E; the boundary E+grace is
+// inclusive and the watchdog looks at E only once E+grace has passed. A mark late in E's grace
+// does not also cover the next expected time (each mark satisfies one expected time).
 func TestCheckMarkMatchesExpectedWithGrace(t *testing.T) {
 	m, now, logf := scheduleManager(t, time.UTC) // 2026-10-19 09:00 UTC
 	addCheck(t, m, "backup", "0 10 * * *", 30)
@@ -133,21 +136,19 @@ func TestCheckAlertsOnceAcrossRestartAndManagers(t *testing.T) {
 		t.Fatalf("alerted %d times: %q", len(got), got)
 	}
 	ck, err := m2.Store.GetCheck("nightly")
-	if err != nil || ck.LastMissedAt == nil || !ck.LastMissedAt.Equal(e) || ck.LastAlertError != "" {
+	if err != nil || ck.LastMissedAt == nil || !ck.LastMissedAt.Equal(e) || ck.LastAlertError != "" ||
+		ck.AlertState != store.AlertDelivered || ck.AlertAttempts != 1 {
 		t.Fatalf("row: %+v %v", ck, err)
 	}
 	missed, err := m2.MissedChecks()
 	if err != nil || len(missed) != 1 || missed[0].Name != "nightly" {
 		t.Fatalf("missed: %+v %v", missed, err)
 	}
-	// A late mark turns the state to late: no longer missed (the alert stays recorded).
+	// A late mark keeps the time missed, with the late mark shown.
 	if _, err := m2.MarkCheck("nightly", "done late", ""); err != nil {
 		t.Fatal(err)
 	}
-	if missed, _ := m2.MissedChecks(); len(missed) != 0 {
-		t.Fatalf("still missed after a mark: %+v", missed)
-	}
-	if v, _ := m2.CheckViews(); len(v) != 1 || v[0].State != CheckLate {
+	if v, _ := m2.CheckViews(); len(v) != 1 || v[0].State != CheckMissed || v[0].LateMarkAt == nil {
 		t.Fatalf("views: %+v", v)
 	}
 }
@@ -225,7 +226,8 @@ func TestCheckBatchesMissedIntoOneLine(t *testing.T) {
 	}
 }
 
-// A failed delivery is recorded on the check, shown as missed, and not retried.
+// A failed delivery is recorded on the check and stays pending (shown as missed); without a
+// notify target the attempt fails the same way.
 func TestCheckFailedAlertRecorded(t *testing.T) {
 	m, now, _ := scheduleManager(t, time.UTC)
 	addCheck(t, m, "x", "0 10 * * *", 30)
@@ -233,14 +235,14 @@ func TestCheckFailedAlertRecorded(t *testing.T) {
 	*now = time.Date(2026, 10, 19, 10, 30, 1, 0, time.UTC)
 	watch(t, m)
 	ck, _ := m.Store.GetCheck("x")
-	if ck.LastMissedAt == nil || !strings.Contains(ck.LastAlertError, "tmux") {
+	if ck.LastMissedAt == nil || !strings.Contains(ck.LastAlertError, "tmux") || ck.AlertState != store.AlertPending {
 		t.Fatalf("row: %+v", ck)
 	}
 	m.Cfg.NotifyTmuxTarget = ""
 	*now = time.Date(2026, 10, 20, 10, 30, 1, 0, time.UTC)
 	watch(t, m)
 	ck, _ = m.Store.GetCheck("x")
-	if !strings.Contains(ck.LastAlertError, "notify off") {
+	if !strings.Contains(ck.LastAlertError, "notify off") || ck.AlertAttempts != 1 {
 		t.Fatalf("row: %+v", ck)
 	}
 }

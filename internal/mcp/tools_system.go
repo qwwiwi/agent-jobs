@@ -34,7 +34,8 @@ type SystemDoctorOutput struct {
 	// Undelivered are notify_owner notifications of the last 24 h that did not reach the session.
 	Undelivered []*store.Notification `json:"undelivered_notifications"`
 	// MissedChecks are the checks (dead-man's switch) whose latest expected time passed its grace
-	// without a mark.
+	// without a mark (a late mark keeps them here), and those whose missed alert is still pending,
+	// with the alert's delivery state (pending, delivered, failed).
 	MissedChecks []jobs.CheckView `json:"missed_checks"`
 }
 
@@ -46,7 +47,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
 			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
-			"not delivered to the session, and dead-man's switch checks whose latest expected time passed without a mark. " +
+			"not delivered to the session, and dead-man's switch checks whose latest expected time passed without a mark " +
+			"(also when a late mark came) or whose missed alert is pending or failed. " +
 			"ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
@@ -69,11 +71,7 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			out.Problems = append(out.Problems, "checks: "+err.Error())
 		}
 		for _, v := range out.MissedChecks {
-			p := fmt.Sprintf("check %s missed: expected %s, no mark within %dm", v.Name, v.LastExpectedAt, v.GraceMinutes)
-			if v.LastAlertError != "" {
-				p += " (alert not delivered: " + v.LastAlertError + ")"
-			}
-			out.Problems = append(out.Problems, p)
+			out.Problems = append(out.Problems, "check "+jobs.CheckViewText(v))
 		}
 		if out.Daily, err = m.Daily(); err != nil {
 			out.Problems = append(out.Problems, "daily: "+err.Error())

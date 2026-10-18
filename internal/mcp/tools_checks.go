@@ -73,7 +73,8 @@ func addCheckAdd(s *sdk.Server, d Deps) {
 		Description: "Add a dead-man's switch check: a name, a cron in local time saying when something that stays silent " +
 			"while healthy must have reported, and a grace (default 60 minutes). That something calls check_mark (a job can) " +
 			"or `agent-jobs check mark NAME`. When an expected time plus its grace passes with no mark since the previous " +
-			"expected time, this session gets one line \"[jobs:check-missed] ...\" (once per expected time). " +
+			"expected time (each mark counts for one expected time only), this session gets one line " +
+			"\"[jobs:check-missed] ...\" (once per expected time; a failed delivery is retried up to 5 times). " +
 			"Expected times before the check was added never alert. Checks never expire.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in CheckAddInput) (*sdk.CallToolResult, CheckOutput, error) {
 		c, err := d.Manager.AddCheck(in.Name, in.Cron, in.GraceMinutes)
@@ -104,7 +105,8 @@ func addCheckList(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "check_list",
 		Description: "List this agent's checks, oldest first: state (ok, missed, waiting, disabled) for the latest expected " +
-			"time whose grace has passed, the next expected time, the last mark and the last missed alert.",
+			"time whose grace has passed (missed stays missed after a late mark: late_mark_at), the next expected time, " +
+			"the last mark and the last missed alert with its delivery (alert_state pending, delivered or failed).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ CheckListInput) (*sdk.CallToolResult, ChecksOutput, error) {
 		list, err := d.Manager.CheckViews()
 		if err != nil {
