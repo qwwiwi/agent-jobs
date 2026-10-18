@@ -29,7 +29,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
 | `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list` |
 
-job_start returns the id at once; the daemon starts the job within a minute, at most two at a time per agent. Do not poll it in a loop: wait for the job-done line.
+job_start returns the id at once; the daemon starts the job within a minute, at most `max_running` at a time per agent (config.json, default two). Do not poll it in a loop: wait for the job-done line.
 
 What the job gets on its own, so the brief need not repeat it: the hard rules, the owner's rules (the job profile), the project card of the repository if one exists, the kind checklist and the report contract.
 
