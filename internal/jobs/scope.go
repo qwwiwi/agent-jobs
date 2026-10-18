@@ -346,99 +346,62 @@ var cgroupDirOwner = func(fi fs.FileInfo) (int, bool) {
 	return int(st.Uid), true
 }
 
+// systemManagerBin is the systemctl that asks the system manager for the user manager's cgroup; apart
+// from systemctlBin (the user-bus calls a test makes fail) so the lookup stays real in such a test.
+var systemManagerBin = "systemctl"
+
+// userManagerUnitCgroup returns the ControlGroup of user@<uid>.service as the system manager reports it;
+// a variable so tests can stand in. The system manager is asked (not the user bus, which may be the broken
+// one): it placed the unit, and no process of the user can change its answer.
+var userManagerUnitCgroup = func(uid int) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	unit := fmt.Sprintf("user@%d.service", uid)
+	out, err := exec.CommandContext(ctx, systemManagerBin, "--system", "show", unit, "--property=ControlGroup", "--value").Output()
+	if err != nil {
+		return "", fmt.Errorf("systemctl --system show %s: %w", unit, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // scopeCgroupPath is the cgroup v2 path a job scope gets from `systemd-run --user --scope` (the user
 // manager's app.slice): the daemon can reach it without the bus. The manager need not sit under user.slice
-// (e.g. a custom system slice), and the caller need not run under it (the orchestrator's MCP server runs
-// in a system service), so the manager's cgroup is taken from the caller's own cgroup when it is under
-// it, else found by a scan of the cgroup tree; failing both, it is /user.slice/user-<uid>.slice/user@<uid>.service.
-func scopeCgroupPath(unit string) string {
+// (e.g. a custom system slice) and the caller need not run under it (the orchestrator's MCP server runs in
+// a system service), so the manager's cgroup comes from the system manager. When that answer is missing
+// or malformed, the default /user.slice/user-<uid>.slice/user@<uid>.service is used only if that cgroup
+// exists and is owned by the uid; otherwise ok is false and the caller must not sweep anything: a cgroup
+// path the user could have planted (e.g. a user@<uid>.service decoy inside a delegated subtree) is never
+// guessed.
+func scopeCgroupPath(unit string) (path string, ok bool) {
 	uid := os.Getuid()
-	mgr := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service", uid, uid)
-	if p, ok := ownUserManagerCgroup(uid); ok {
-		mgr = p
-	} else if p, ok := findUserManagerCgroup(cgroupRoot, uid); ok {
-		mgr = p
+	if p, err := userManagerUnitCgroup(uid); err == nil && validManagerCgroup(p, uid) {
+		return p + "/app.slice/" + unit, true
 	}
-	return mgr + "/app.slice/" + unit
-}
-
-// ownUserManagerCgroup returns the user manager's cgroup when this process runs under it.
-func ownUserManagerCgroup(uid int) (string, bool) {
-	b, err := os.ReadFile(cgroupFile)
-	if err != nil {
+	def := fmt.Sprintf("/user.slice/user-%d.slice/user@%d.service", uid, uid)
+	fi, err := os.Lstat(filepath.Join(cgroupRoot, def))
+	if err != nil || !fi.IsDir() {
 		return "", false
 	}
-	return userManagerCgroup(string(b), uid)
-}
-
-// userManagerScanDepth bounds the scan for the user manager's cgroup: user.slice/user-<uid>.slice/
-// user@<uid>.service is depth 3, a manager in a custom slice depth 2.
-const userManagerScanDepth = 4
-
-// findUserManagerCgroup scans the cgroup tree at root (depth <= userManagerScanDepth, symlinks not
-// followed) for a directory named user@<uid>.service owned by uid, and returns its path relative to root
-// only when there is exactly one. The scan does not descend into a match: below the manager the user can
-// create cgroups of any name. Zero matches (no manager, or deeper than the bound) or several (the user may
-// also create such a directory in another subtree delegated to it, so which one is real is unknown) give
-// false, and the caller falls back to the default path: a wrong guess would only make the sweep fail, but
-// a decoy must not be swept as the scope.
-func findUserManagerCgroup(root string, uid int) (string, bool) {
-	want := fmt.Sprintf("user@%d.service", uid)
-	var found []string
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if p == root {
-				return err
-			}
-			return nil // an unreadable or vanished cgroup: skip it
-		}
-		if !d.IsDir() || p == root {
-			return nil // WalkDir reports a symlink as a non-dir and does not follow it
-		}
-		rel, rerr := filepath.Rel(root, p)
-		if rerr != nil {
-			return fs.SkipDir
-		}
-		depth := strings.Count(rel, string(filepath.Separator)) + 1
-		if d.Name() == want {
-			if fi, ierr := d.Info(); ierr == nil {
-				if owner, ok := cgroupDirOwner(fi); ok && owner == uid {
-					found = append(found, "/"+filepath.ToSlash(rel))
-				}
-			}
-			return fs.SkipDir
-		}
-		if depth >= userManagerScanDepth {
-			return fs.SkipDir
-		}
-		return nil
-	})
-	if len(found) != 1 {
+	if owner, ok := cgroupDirOwner(fi); !ok || owner != uid {
 		return "", false
 	}
-	return found[0], true
+	return def + "/app.slice/" + unit, true
 }
 
-// userManagerCgroup returns the cgroup v2 path of the user manager (user@<uid>.service) a
-// /proc/<pid>/cgroup content lies under: the prefix through the outermost such component. The outermost
-// one is the real manager: every cgroup the user can create (and move its processes into) is below it.
-// A path that is not absolute or has an empty, "." or ".." component is not used.
-func userManagerCgroup(content string, uid int) (string, bool) {
-	p, ok := unifiedPath(content)
-	if !ok || !strings.HasPrefix(p, "/") {
-		return "", false
+// validManagerCgroup reports whether p is a usable cgroup v2 path of the user manager: absolute, no
+// empty, "." or ".." component anywhere (so no trailing "/" either), the last component exactly
+// user@<uid>.service.
+func validManagerCgroup(p string, uid int) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
 	}
-	want := fmt.Sprintf("user@%d.service", uid)
-	parts := strings.Split(p, "/")[1:]
-	for i, c := range parts {
+	parts := strings.Split(p[1:], "/")
+	for _, c := range parts {
 		if c == "" || c == "." || c == ".." {
-			return "", false
-		}
-		if c == want {
-			return "/" + strings.Join(parts[:i+1], "/"), true
+			return false
 		}
 	}
-	return "", false
+	return parts[len(parts)-1] == fmt.Sprintf("user@%d.service", uid)
 }
 
 // stopScope stops a job's scope: systemd sends SIGTERM to every process in the unit's cgroup, waits
@@ -446,7 +409,8 @@ func userManagerCgroup(content string, uid int) (string, bool) {
 // (the wrapper exited and the scope was collected) is fine; a failed unit only when its cgroup is empty
 // (a stop that timed out on unkillable processes leaves it failed with members). When systemctl cannot
 // stop it (no user bus, the manager busy), the daemon sweeps the scope's cgroup itself (pidfd, membership
-// re-checked) and accepts the stop only when the cgroup is then provably empty. The unit is always
+// re-checked) and accepts the stop only when the cgroup is then provably empty; without a trusted path to
+// that cgroup it sweeps nothing and the stop fails (stays pending). The unit is always
 // recomputed from the agent and the job id, never read from a file the job could write.
 func (m *Manager) stopScope(id string) error {
 	unit := ScopeUnit(m.Agent, id)
@@ -464,9 +428,15 @@ func (m *Manager) stopScope(id string) error {
 		return nil // a failed unit whose cgroup is gone
 	}
 	if cg == "" {
-		cg = scopeCgroupPath(unit)
+		cg, _ = scopeCgroupPath(unit)
 	}
-	if ferr := m.sweepScopeCgroup(id, cg); ferr == nil {
+	var ferr error
+	if cg == "" {
+		ferr = errors.New("no trusted cgroup path for the user manager: not swept")
+	} else {
+		ferr = m.sweepScopeCgroup(id, cg)
+	}
+	if ferr == nil {
 		return nil
 	} else if serr == nil && state == "failed" {
 		return fmt.Errorf("%s: failed with processes left: %w", unit, ferr)
