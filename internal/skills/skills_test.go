@@ -426,3 +426,35 @@ func TestUnlinkReportsLeftAndLinkAdopts(t *testing.T) {
 		t.Fatalf("left %v err %v", left, err)
 	}
 }
+
+// An uninspectable parent (.claude unreadable) hides whether the links are still there: every name
+// stays reported as left, so its caller keeps tracking it.
+func TestUnlinkUnreadableParentKeepsNames(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	c := testCatalog(t)
+	e, _ := c.Lookup("golang")
+	work := t.TempDir()
+	if _, err := Link(work, []Entry{e}, 400, nil); err != nil {
+		t.Fatal(err)
+	}
+	claudeDir := filepath.Join(work, ".claude")
+	if err := os.Chmod(claudeDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(claudeDir, 0o755) })
+	left, err := Unlink(work, []string{"golang", "../bad"})
+	if !slices.Equal(left, []string{"golang"}) || err == nil {
+		t.Fatalf("left %v err %v, want golang reported", left, err)
+	}
+	if err := os.Chmod(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Lstat(LinkPath(work, "golang")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link gone: %v", err)
+	}
+	if left, err := Unlink(work, left); len(left) > 0 || err != nil {
+		t.Fatalf("left %v err %v", left, err)
+	}
+}

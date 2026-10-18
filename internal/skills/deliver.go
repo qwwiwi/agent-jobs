@@ -18,6 +18,9 @@ func LinkPath(work, name string) string {
 	return filepath.Join(work, filepath.FromSlash(LinkDir), name)
 }
 
+// errNotRealDir is realDir's error for a path that exists but is not a real directory.
+var errNotRealDir = errors.New("not a real directory")
+
 // realDir reports whether p is a real directory (not a symlink); missing is (false, nil).
 func realDir(p string) (bool, error) {
 	fi, err := os.Lstat(p)
@@ -28,7 +31,7 @@ func realDir(p string) (bool, error) {
 		return false, err
 	}
 	if !fi.IsDir() {
-		return false, fmt.Errorf("%s is not a real directory (%s)", filepath.Base(p), fi.Mode().Type())
+		return false, fmt.Errorf("%s is %w (%s)", filepath.Base(p), errNotRealDir, fi.Mode().Type())
 	}
 	return true, nil
 }
@@ -122,15 +125,28 @@ func Link(work string, entries []Entry, maxKB float64, adopt []string) (Delivery
 // Unlink removes the links of names from work/.claude/skills (only symlinks: anything else at that
 // path is the job's or the repository's and stays, and is no longer tracked), then .claude/skills
 // and .claude when they are left empty. It never follows a link: .claude or .claude/skills that is
-// not a real directory is not entered. It returns the names whose link is still there (removal
-// failed) and what went wrong.
+// not a real directory is not entered. It returns the names whose link may still be there (removal
+// failed, or a parent directory could not be inspected: every valid name then) and what went wrong.
 func Unlink(work string, names []string) ([]string, error) {
 	var left []string
 	var errs []error
 	claudeDir := filepath.Join(work, ".claude")
 	skillsDir := filepath.Join(work, filepath.FromSlash(LinkDir))
 	for _, p := range []string{claudeDir, skillsDir} {
-		if ok, err := realDir(p); !ok || err != nil {
+		ok, err := realDir(p)
+		if err != nil && !errors.Is(err, errNotRealDir) {
+			// Not inspectable (e.g. .claude unreadable): the links may well be there, so all stay tracked.
+			for _, n := range names {
+				if ValidName(n) {
+					left = append(left, n)
+				}
+			}
+			if len(left) == 0 {
+				return nil, nil
+			}
+			return left, fmt.Errorf("links not removed: %w", err)
+		}
+		if !ok {
 			// Missing: no link can be there. Not a real directory: the links are not at their path any
 			// more (the job replaced the directory).
 			if len(names) > 0 && err != nil {
