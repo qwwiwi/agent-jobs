@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -626,26 +627,115 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) {
 }
 
 // killAcceptance ends the acceptance command's process group recorded in the job row (read now: it is
-// recorded after the caller's row was read). The row is written by the wrapper, not the job, but a
-// group is only signalled while its leader is alive, leads it and carries this job's marker, so a
-// recycled pid is never hit.
+// recorded after the caller's row was read). The row is written by the wrapper, not the job. While the
+// group's leader is alive and leads it, the whole group is signalled only if the leader carries this
+// job's marker. Once the leader is gone (the shell died on SIGTERM while a child that ignores it keeps
+// running, and the wrapper was killed before its own grace ended the group), the surviving members are
+// ended one by one (killLeaderlessGroup). Either way a recycled pid or pgid is never hit.
 func (m *Manager) killAcceptance(id string) {
 	j, err := m.Store.Get(id)
 	if err != nil || j.AcceptancePGID == 0 {
 		return
 	}
 	g := j.AcceptancePGID
-	if err := verifyGroup(g, g); err != nil {
-		if alive(g) {
-			m.Log.Printf("job %s: refusing to kill acceptance process group %d: %v", id, g, err)
+	if err := plausibleGroup(g); err != nil {
+		m.Log.Printf("job %s: refusing to kill acceptance process group %d: %v", id, g, err)
+		return
+	}
+	if p, err := procStatFull(g); err == nil && p.state != "Z" && p.pgid == g {
+		if procMarker(g) != id {
+			m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
+			return
 		}
+		m.signalGroup(g)
 		return
 	}
-	if procMarker(g) != id {
-		m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
+	m.killLeaderlessGroup(id, g)
+}
+
+// acceptanceMember reports whether pid is a live (non-zombie) member of process group g carrying the
+// marker of job id.
+func acceptanceMember(id string, g int) func(int) bool {
+	return func(pid int) bool {
+		p, err := procStatFull(pid)
+		return err == nil && p.state != "Z" && p.pgid == g && procMarker(pid) == id
+	}
+}
+
+// groupMembers lists the live (non-zombie) processes of process group g, except this process and its
+// ancestors.
+func groupMembers(g int) ([]int, error) {
+	ents, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, err
+	}
+	skip := selfAndAncestors()
+	var out []int
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || skip[pid] {
+			continue
+		}
+		if p, err := procStatFull(pid); err == nil && p.state != "Z" && p.pgid == g {
+			out = append(out, pid)
+		}
+	}
+	return out, nil
+}
+
+// killLeaderlessGroup ends the surviving members of acceptance process group g whose leader is gone:
+// only when every member carries the marker of job id (a member without it means the pgid is not, or
+// no longer, this job's group, and nothing is signalled), each through a pidfd opened before its
+// membership and marker are re-checked (signalMember), SIGTERM, KillGrace, then SIGKILL to whatever
+// marked member is still there. Without pidfd support nothing is signalled.
+func (m *Manager) killLeaderlessGroup(id string, g int) {
+	members, err := groupMembers(g)
+	if err != nil {
+		m.Log.Printf("job %s: acceptance process group %d not checked: %v", id, g, err)
 		return
 	}
-	m.signalGroup(g)
+	if len(members) == 0 {
+		return
+	}
+	for _, pid := range members {
+		if procMarker(pid) != id {
+			m.Log.Printf("job %s: refusing to kill acceptance process group %d: member %d carries no marker of the job", id, g, pid)
+			return
+		}
+	}
+	isMember := acceptanceMember(id, g)
+	marked := func() []int {
+		pids, err := groupMembers(g)
+		if err != nil {
+			m.Log.Printf("job %s: acceptance process group %d: %v", id, g, err)
+			return nil
+		}
+		return slices.DeleteFunc(pids, func(pid int) bool { return !isMember(pid) })
+	}
+	signal := func(sig syscall.Signal) {
+		for _, pid := range marked() {
+			if _, err := signalMember(pid, isMember, sig); err != nil {
+				m.Log.Printf("job %s: acceptance process group %d: %v", id, g, err)
+			}
+		}
+	}
+	m.Log.Printf("job %s: acceptance process group %d has no leader; ending %d marked member(s)", id, g, len(members))
+	signal(syscall.SIGTERM)
+	deadline := time.Now().Add(m.KillGrace)
+	for time.Now().Before(deadline) {
+		if len(marked()) == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	signal(syscall.SIGKILL)
+	for i := 0; i < 20; i++ {
+		if len(marked()) == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	m.Log.Printf("job %s: acceptance process group %d: marked members survived SIGKILL", id, g)
 }
 
 // endScope stops a scoped job's unit before its row turns terminal (a no-op for an already collected
