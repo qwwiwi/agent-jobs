@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -241,11 +242,17 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	if _, err := os.Lstat(work); errors.Is(err, os.ErrNotExist) {
 		return nil // restored from the saved ref before the launch, then checked again
 	}
+	// Skill links an earlier removal left behind are the daemon's, not the project's: the next
+	// attempt adopts them (deliverSkills), and they do not count as a change.
+	left := m.leftSkillLinks(j, work)
 	if j.RepoPath == "" {
 		found := ""
 		err := filepath.WalkDir(work, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
+			}
+			if path == filepath.Join(work, ".claude") && onlySkillLinks(work, left) {
+				return fs.SkipDir
 			}
 			if slices.Contains(projectClaudeNames, d.Name()) {
 				found, _ = filepath.Rel(work, path)
@@ -266,15 +273,43 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	if err != nil {
 		return err
 	}
+	var changed []string
+	for _, l := range strings.Split(st, "\n") {
+		if l != "" && !slices.ContainsFunc(left, func(n string) bool { return l == "!! "+skills.LinkDir+"/"+n }) {
+			changed = append(changed, l)
+		}
+	}
 	diff, err := git(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
 		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
 	}
-	if st != "" || diff != "" {
+	if len(changed) > 0 || diff != "" {
 		return refuse("work/.claude, a CLAUDE.md or a CLAUDE.local.md differs from the job's base commit")
 	}
 	return nil
+}
+
+// onlySkillLinks reports whether work/.claude holds nothing but the directory skills with links of
+// names in it (all of them symlinks).
+func onlySkillLinks(work string, names []string) bool {
+	if len(names) == 0 {
+		return false
+	}
+	top, err := os.ReadDir(filepath.Join(work, ".claude"))
+	if err != nil || len(top) != 1 || top[0].Name() != "skills" || !top[0].IsDir() {
+		return false
+	}
+	links, err := os.ReadDir(filepath.Join(work, filepath.FromSlash(skills.LinkDir)))
+	if err != nil {
+		return false
+	}
+	for _, e := range links {
+		if e.Type()&fs.ModeSymlink == 0 || !slices.Contains(names, e.Name()) {
+			return false
+		}
+	}
+	return true
 }
 
 // checkEscaped refuses the next attempt while a process of the job is alive outside a running

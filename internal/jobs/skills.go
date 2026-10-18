@@ -223,15 +223,19 @@ func (m *Manager) checkSkillLinks(j *store.Job, delivered []string) error {
 
 // deliverSkills links the job's selected skills into its work dir for this attempt (E7): each as
 // <work>/.claude/skills/<name> -> its catalog directory, hidden from git by the repository's
-// info/exclude. A skill the repository already has stays the repository's; a codex job gets none.
-// What was linked is recorded on the row (removeSkills undoes it when the attempt ends).
+// info/exclude. A skill the repository already has stays the repository's; a link an earlier attempt
+// left behind (leftSkillLinks) is adopted, not taken for the repository's; a codex job gets none.
+// What was linked is recorded on the row (removeSkills undoes it when the attempt ends). Until that
+// is recorded, j.SkillsDelivered keeps the earlier attempt's list, so a failed delivery still lets
+// removeSkills retry the links left behind.
 func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
-	j.SkillsDelivered, j.SkillsNote = nil, ""
+	j.SkillsNote = ""
 	if len(j.Skills) == 0 {
+		j.SkillsDelivered = nil
 		return nil
 	}
 	if j.Runner == store.RunnerCodex {
-		j.SkillsNote = SkillsCodexNote
+		j.SkillsDelivered, j.SkillsNote = nil, SkillsCodexNote
 		m.Log.Printf("job %s: %s (%s)", j.ID, SkillsCodexNote, strings.Join(j.Skills, ", "))
 		return m.Store.SetSkillsDelivered(j.ID, token, nil, j.SkillsNote)
 	}
@@ -244,7 +248,8 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 		}
 		entries = append(entries, e)
 	}
-	d, err := skills.Link(work, entries, m.Cfg.SkillBudget().MaxKB)
+	adopt := m.leftSkillLinks(j, work)
+	d, err := skills.Link(work, entries, m.Cfg.SkillBudget().MaxKB, adopt)
 	if err != nil {
 		return fmt.Errorf("skills: %w", err)
 	}
@@ -254,19 +259,17 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 		m.Log.Printf("job %s: %s", j.ID, j.SkillsNote)
 	}
 	if j.RepoPath != "" && len(d.Linked) > 0 {
-		var pats []string
-		for _, n := range d.Linked {
-			// No trailing slash: git sees a symlink as a file, not a directory.
-			pats = append(pats, "/"+skills.LinkDir+"/"+n)
-		}
-		if err := updateExclude(j.RepoPath, j.ID, pats); err != nil {
-			skills.Unlink(work, d.Linked)
-			j.SkillsDelivered = nil
+		if err := updateExclude(j.RepoPath, j.ID, excludePatterns(d.Linked)); err != nil {
+			left, uerr := skills.Unlink(work, d.Linked)
+			if uerr != nil {
+				m.Log.Printf("job %s: skill links: %v", j.ID, uerr)
+			}
+			j.SkillsDelivered = left
 			return fmt.Errorf("skills: info/exclude: %w", err)
 		}
 	}
 	if err := m.Store.SetSkillsDelivered(j.ID, token, j.SkillsDelivered, j.SkillsNote); err != nil {
-		m.removeSkills(j)
+		_ = m.removeSkills(j)
 		return fmt.Errorf("record skills: %w", err)
 	}
 	if len(d.Linked) > 0 {
@@ -275,21 +278,65 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 	return nil
 }
 
-// removeSkills removes the skill links of the job's attempt and its info/exclude lines (idempotent).
-// It runs when an attempt ends, before anything diffs the work dir: the links never reach a patch.
-func (m *Manager) removeSkills(j *store.Job) {
-	if len(j.SkillsDelivered) == 0 {
-		return
+// excludePatterns are the info/exclude lines of the links of names.
+func excludePatterns(names []string) []string {
+	var pats []string
+	for _, n := range names {
+		// No trailing slash: git sees a symlink as a file, not a directory.
+		pats = append(pats, "/"+skills.LinkDir+"/"+n)
 	}
-	work := filepath.Join(m.JobDir(j.ID), "work")
-	if left := skills.Unlink(work, j.SkillsDelivered); len(left) > 0 {
-		m.Log.Printf("job %s: skill links: %s", j.ID, strings.Join(left, "; "))
-	}
-	if j.RepoPath != "" {
-		if err := updateExclude(j.RepoPath, j.ID, nil); err != nil {
-			m.Log.Printf("job %s: remove skill lines from info/exclude: %v", j.ID, err)
+	return pats
+}
+
+// leftSkillLinks are the links of the job's recorded skills (j.SkillsDelivered) still in work: a
+// symlink at .claude/skills/<name> that resolves into a usable catalog root. Such a link is the
+// daemon's (an earlier removal failed), not the repository's.
+func (m *Manager) leftSkillLinks(j *store.Job, work string) []string {
+	roots, _ := m.skillRoots()
+	var out []string
+	for _, n := range j.SkillsDelivered {
+		if !skills.ValidName(n) {
+			continue
+		}
+		link := skills.LinkPath(work, n)
+		if fi, err := os.Lstat(link); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		for _, r := range roots {
+			if under(link, r) {
+				out = append(out, n)
+				break
+			}
 		}
 	}
+	return out
+}
+
+// removeSkills removes the skill links of the job's attempt and its info/exclude lines (idempotent).
+// It runs when an attempt ends, before anything diffs the work dir: the links never reach a patch.
+// A link that cannot be removed keeps its exclude line and stays on the row's delivered list, so a
+// later call (the next attempt adopts it, cleanup retries) removes it; the error says what is left.
+func (m *Manager) removeSkills(j *store.Job) error {
+	if len(j.SkillsDelivered) == 0 {
+		return nil
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	left, err := skills.Unlink(work, j.SkillsDelivered)
+	if err != nil {
+		err = fmt.Errorf("skill links: %w", err)
+		m.Log.Printf("job %s: %v", j.ID, err)
+	}
+	if j.RepoPath != "" {
+		if xerr := updateExclude(j.RepoPath, j.ID, excludePatterns(left)); xerr != nil {
+			xerr = fmt.Errorf("skill lines in info/exclude: %w", xerr)
+			m.Log.Printf("job %s: %v", j.ID, xerr)
+			err = errors.Join(err, xerr)
+		}
+	}
+	if len(left) > 0 {
+		err = errors.Join(err, fmt.Errorf("skill links still in the work dir: %s", strings.Join(left, ", ")))
+	}
+	return err
 }
 
 // skillProtected are the paths a job never writes because of skills: every usable catalog root (as

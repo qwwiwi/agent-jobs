@@ -263,7 +263,7 @@ func TestLinkAndUnlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := Link(work, sel, 400)
+	d, err := Link(work, sel, 400, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,8 +274,8 @@ func TestLinkAndUnlink(t *testing.T) {
 	if target, err := os.Readlink(LinkPath(work, "golang")); err != nil || target != e.Dir {
 		t.Fatalf("link -> %q (%v), want %s", target, err, e.Dir)
 	}
-	if left := Unlink(work, d.Linked); len(left) > 0 {
-		t.Fatalf("left %v", left)
+	if left, err := Unlink(work, d.Linked); len(left) > 0 || err != nil {
+		t.Fatalf("left %v (%v)", left, err)
 	}
 	if _, err := os.Lstat(LinkPath(work, "golang")); !os.IsNotExist(err) {
 		t.Fatal("link not removed")
@@ -288,11 +288,11 @@ func TestLinkAndUnlink(t *testing.T) {
 	}
 	// Empty dirs created for the links go; a fresh work dir is left as it was.
 	fresh := t.TempDir()
-	d, err = Link(fresh, sel[:1], 400)
+	d, err = Link(fresh, sel[:1], 400, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	Unlink(fresh, d.Linked)
+	_, _ = Unlink(fresh, d.Linked)
 	if _, err := os.Lstat(filepath.Join(fresh, ".claude")); !os.IsNotExist(err) {
 		t.Fatal(".claude left behind")
 	}
@@ -305,7 +305,7 @@ func TestLinkRechecksBudgetAndRefusesSymlinkedDirs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.Dir, "grown.bin"), make([]byte, 20<<10), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Link(work, []Entry{e}, 10); err == nil || !strings.Contains(err.Error(), "skills_max_kb") {
+	if _, err := Link(work, []Entry{e}, 10, nil); err == nil || !strings.Contains(err.Error(), "skills_max_kb") {
 		t.Fatalf("grown skill linked: %v", err)
 	}
 	// .claude as a symlink is never entered.
@@ -313,7 +313,7 @@ func TestLinkRechecksBudgetAndRefusesSymlinkedDirs(t *testing.T) {
 	if err := os.Symlink(t.TempDir(), filepath.Join(work2, ".claude")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Link(work2, []Entry{e}, 400); err == nil {
+	if _, err := Link(work2, []Entry{e}, 400, nil); err == nil {
 		t.Fatal("linked through a symlinked .claude")
 	}
 }
@@ -389,5 +389,40 @@ func TestLoadRejectsSymlinkCycle(t *testing.T) {
 	}
 	if got, warns := loadOne(root); len(got) != 0 || !strings.Contains(warns, "symlink loop") {
 		t.Fatalf("entries %v warnings %s", got, warns)
+	}
+}
+
+func TestUnlinkReportsLeftAndLinkAdopts(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	c := testCatalog(t)
+	e, _ := c.Lookup("golang")
+	work := t.TempDir()
+	d, err := Link(work, []Entry{e}, 400, nil)
+	if err != nil || !slices.Equal(d.Linked, []string{"golang"}) {
+		t.Fatalf("link %+v %v", d, err)
+	}
+	dir := filepath.Join(work, filepath.FromSlash(LinkDir))
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	left, err := Unlink(work, d.Linked)
+	if !slices.Equal(left, []string{"golang"}) || err == nil {
+		t.Fatalf("left %v err %v, want golang reported", left, err)
+	}
+	// Without adopt the left link looks like the repository's; with it, it is linked again.
+	if d, err := Link(work, []Entry{e}, 400, nil); err != nil || !slices.Equal(d.RepoOwned, []string{"golang"}) {
+		t.Fatalf("no adopt: %+v %v", d, err)
+	}
+	if d, err := Link(work, []Entry{e}, 400, left); err != nil || !slices.Equal(d.Linked, []string{"golang"}) || len(d.RepoOwned) > 0 {
+		t.Fatalf("adopt: %+v %v", d, err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if left, err := Unlink(work, []string{"golang"}); len(left) > 0 || err != nil {
+		t.Fatalf("left %v err %v", left, err)
 	}
 }
