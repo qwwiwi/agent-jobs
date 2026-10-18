@@ -102,6 +102,10 @@ type Config struct {
 	// OwnerWaitsMaxHours is how long an «owner reply pending» record of an owner-waits job may hold
 	// the orchestrator's Stop hook before it expires on its own. 0 = DefaultOwnerWaitsMaxHours (6).
 	OwnerWaitsMaxHours int `json:"owner_waits_max_hours"`
+	// OrchestratorDir is the absolute directory the orchestrator session works in. `hook bind`
+	// accepts a session only when its cwd lies inside it (and it runs in the pane of
+	// NotifyTmuxTarget). Empty = binding refused: the owner-waits Stop hook then never blocks.
+	OrchestratorDir string `json:"orchestrator_dir"`
 	// HTTPAPI is the read-only HTTP API for a jobs dashboard (DEVIATIONS #8), served by the daemon.
 	// Off by default; the listen address must be loopback or a unix socket path.
 	HTTPAPI HTTPAPIConfig `json:"http_api"`
@@ -280,6 +284,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.OwnerWaitsMaxHours < 0 {
 		return c, fmt.Errorf("config.json: owner_waits_max_hours %d must be 0 (default %d) or positive", c.OwnerWaitsMaxHours, DefaultOwnerWaitsMaxHours)
+	}
+	if c.OrchestratorDir != "" && (!filepath.IsAbs(c.OrchestratorDir) || filepath.Clean(c.OrchestratorDir) == "/") {
+		return c, fmt.Errorf("config.json: orchestrator_dir %q must be an absolute path other than /", c.OrchestratorDir)
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)

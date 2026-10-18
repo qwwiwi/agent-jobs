@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -194,18 +195,26 @@ func tmuxArgEscape(s string) string {
 // runTmux runs one tmux command within ctx, in a process group of its own that is killed when ctx
 // ends (WaitDelay bounds the wait for pipes a straggler may hold open).
 func (m *Manager) runTmux(ctx context.Context, args ...string) error {
+	_, err := m.runTmuxOutput(ctx, args...)
+	return err
+}
+
+// runTmuxOutput is runTmux that returns the command's stdout.
+func (m *Manager) runTmuxOutput(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, m.Cfg.tmuxBin(), m.Cfg.tmuxArgs(args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
 	if err == nil {
-		return nil
+		return stdout.String(), nil
 	}
 	if ctx.Err() != nil {
-		return fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
+		return "", fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
 	}
-	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()+stdout.String()))
 }
 
 func (m *Manager) cleanupDue() error {

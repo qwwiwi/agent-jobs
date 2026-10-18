@@ -265,3 +265,47 @@ func TestOwnerWaitsNotifyOffReason(t *testing.T) {
 		t.Fatalf("notify-off reason: %+v", out)
 	}
 }
+
+// A job-done line whose delivery keeps failing holds the session at most owner_waits_max_hours:
+// once expired, the retries of every later tick never block again.
+func TestOwnerWaitsFailingDeliveryExpiresOnce(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.NotifyTmuxTarget = "nowhere"
+	t.Setenv("AGENT_JOBS_TMUX_BIN", "/usr/bin/false")
+	w := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	if err := m.Cancel(w.ID); err != nil {
+		t.Fatal(err)
+	}
+	m.Cfg.OwnerWaitsMaxHours = 1
+	base := time.Now()
+	for i := range 5 {
+		at := base.Add(time.Duration(i) * 50 * time.Minute)
+		m.Now = func() time.Time { return at }
+		if err := m.notifyPending(); err != nil {
+			t.Fatal(err)
+		}
+		list, _, err := m.OwnerPending()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if blocks := len(list) == 1; blocks != (i < 2) {
+			t.Fatalf("tick %d (+%d min): pending %v", i, i*50, list)
+		}
+	}
+	if j, _ := m.Store.Get(w.ID); j.NotifiedAt != nil {
+		t.Fatal("the line was never delivered")
+	}
+}
+
+// orchestrator_dir must be absolute and not /.
+func TestOrchestratorDirConfig(t *testing.T) {
+	for _, bad := range []string{`"rel/dir"`, `"/"`} {
+		dir := t.TempDir()
+		if err := os.WriteFile(dir+"/config.json", []byte(`{"orchestrator_dir": `+bad+`}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(dir); err == nil || !strings.Contains(err.Error(), "orchestrator_dir") {
+			t.Fatalf("%s: %v", bad, err)
+		}
+	}
+}

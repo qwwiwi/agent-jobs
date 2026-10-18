@@ -1314,7 +1314,8 @@ func cmdDoctor(args []string) error {
 
 // runHook serves the hooks of the orchestrator session (Claude Code hook JSON on stdin):
 //
-//	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds
+//	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds, only
+//	                      from the notify tmux pane ($TMUX_PANE) with its cwd inside orchestrator_dir
 //	hook stop --agent A   Stop hook: prints the block decision while an owner reply is pending, for
 //	                      the bound session only
 //
@@ -1347,7 +1348,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return fail(errors.New("no positional arguments"))
 	}
 	if sub == "bind" {
-		session, err := jobs.ParseSessionStartInput(stdin)
+		in, err := jobs.ParseSessionStartInput(stdin)
 		if err != nil {
 			return fail(err)
 		}
@@ -1357,7 +1358,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		}
 		defer m.Close()
 		// Nothing on stdout: a SessionStart hook's stdout becomes session context.
-		if err := m.BindHookSession(session); err != nil {
+		if err := m.BindHookSession(in, os.Getenv("TMUX_PANE")); err != nil {
 			return fail(err)
 		}
 		return 0

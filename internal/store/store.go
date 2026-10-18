@@ -232,15 +232,13 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
 	}
-	if _, err := db.Exec(ownerPendingSchema); err != nil {
+	if err := migrateOwnerPending(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner pending: %w", err)
 	}
-	for _, alter := range ownerPendingMigrations {
-		if err := migrate(db, alter); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("migrate db: owner pending: %w", err)
-		}
+	if _, err := db.Exec(ownerPendingSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: owner pending: %w", err)
 	}
 	return &Store{db: db}, nil
 }

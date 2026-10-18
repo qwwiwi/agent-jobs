@@ -53,7 +53,7 @@ func TestOwnerRepliedTool(t *testing.T) {
 	if doc.OwnerHookSession != "" {
 		t.Fatalf("no session bound yet: %q", doc.OwnerHookSession)
 	}
-	if err := m.BindHookSession("orch-1"); err != nil {
+	if err := m.Store.BindHookSession("orch-1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	call(t, cs, "system_doctor", map[string]any{}, &doc)

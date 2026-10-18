@@ -271,3 +271,193 @@ func TestOpenMigratesOldOwnerPendingTable(t *testing.T) {
 		t.Fatalf("migrated: %+v %v", list, err)
 	}
 }
+
+func ownerRows(t *testing.T, st *Store, id string) map[int]string {
+	t.Helper()
+	rows, err := st.db.Query(`SELECT attempt, state FROM owner_pending WHERE job_id = ?`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[int]string{}
+	for rows.Next() {
+		var a int
+		var s string
+		if err := rows.Scan(&a, &s); err != nil {
+			t.Fatal(err)
+		}
+		out[a] = s
+	}
+	return out
+}
+
+// A line whose delivery keeps failing expires once and stays expired: later retries of the same
+// attempt reuse the row and never block again. An acknowledged attempt stays acknowledged across
+// expiry and retries.
+func TestOwnerPendingExpiryIsFinal(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	t0 := time.Unix(1760000000, 0)
+	const maxAge = 6 * time.Hour
+	insertJob(t, st, "w", true, t0)
+	if err := st.BeginOwnerPending("w", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := pendingIDs(t, st, t0.Add(time.Hour), maxAge); !slices.Equal(ids, []string{"w"}) {
+		t.Fatalf("delivering: %v", ids)
+	}
+	if ids, expired := pendingIDs(t, st, t0.Add(7*time.Hour), maxAge); len(ids) != 0 || expired != 1 {
+		t.Fatalf("after max age: %v, expired %d", ids, expired)
+	}
+	for i := 1; i <= 3; i++ {
+		at := t0.Add(time.Duration(7*i) * time.Hour)
+		if err := st.BeginOwnerPending("w", OwnerDelivering, at); err != nil {
+			t.Fatal(err)
+		}
+		if ids, expired := pendingIDs(t, st, at, maxAge); len(ids) != 0 || expired != 0 {
+			t.Fatalf("retry %d after expiry blocks again: %v, expired %d", i, ids, expired)
+		}
+	}
+	if rows := ownerRows(t, st, "w"); len(rows) != 1 || rows[0] != "expired" {
+		t.Fatalf("one expired row expected: %v", rows)
+	}
+	// A late successful delivery does not reopen it either.
+	if err := st.MarkNotified("w", t0.Add(30*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := pendingIDs(t, st, t0.Add(30*time.Hour), maxAge); len(ids) != 0 {
+		t.Fatalf("delivered after expiry: %v", ids)
+	}
+
+	insertJob(t, st, "a", true, t0)
+	if err := st.BeginOwnerPending("a", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, err := st.ClearOwnerPending("a", t0); err != nil || !slices.Equal(cleared, []string{"a"}) {
+		t.Fatalf("ack: %v %v", cleared, err)
+	}
+	_, _ = pendingIDs(t, st, t0.Add(7*time.Hour), maxAge)
+	if err := st.BeginOwnerPending("a", OwnerDelivering, t0.Add(7*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := pendingIDs(t, st, t0.Add(7*time.Hour), maxAge); len(ids) != 0 {
+		t.Fatalf("acknowledged then retried past max age blocks: %v", ids)
+	}
+	if rows := ownerRows(t, st, "a"); rows[0] != "acknowledged" {
+		t.Fatalf("ack row lost: %v", rows)
+	}
+}
+
+// Rows are pruned only once the job can no longer be retried (finished and notified) and they are
+// older than the max age; a row whose line is still pending survives, so nothing recreates it.
+func TestOwnerPendingPrune(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	t0 := time.Unix(1760000000, 0)
+	const maxAge = 6 * time.Hour
+	insertJob(t, st, "done", true, t0)
+	insertJob(t, st, "retrying", true, t0)
+	if err := st.BeginOwnerPending("done", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkNotified("done", t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BeginOwnerPending("retrying", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _ = pendingIDs(t, st, t0.Add(time.Hour), maxAge); len(ownerRows(t, st, "done")) != 1 {
+		t.Fatal("pruned within max age")
+	}
+	_, _ = pendingIDs(t, st, t0.Add(7*time.Hour), maxAge)
+	if rows := ownerRows(t, st, "done"); len(rows) != 0 {
+		t.Fatalf("finished and notified, past max age: kept %v", rows)
+	}
+	if rows := ownerRows(t, st, "retrying"); len(rows) != 1 || rows[0] != "expired" {
+		t.Fatalf("a retried line's row must stay (expired): %v", rows)
+	}
+}
+
+// owner_replied(job) acknowledges every attempt of the job and pre-acknowledges its latest finished
+// attempt in one go. Exact sequence: attempt 1 pending, resume, attempt 2 finishes, owner_replied
+// before attempt 2's line begins -> attempt 2's line does not block.
+func TestOwnerRepliedAcksAllAttempts(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	t0 := time.Unix(1760000000, 0)
+	insertJob(t, st, "w", true, t0)
+	if _, err := st.db.Exec(`UPDATE jobs SET attempt = 1 WHERE id = 'w'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.BeginOwnerPending("w", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkNotified("w", t0); err != nil {
+		t.Fatal(err)
+	}
+	// Resume: attempt 2 runs, then finishes.
+	if _, err := st.db.Exec(`UPDATE jobs SET attempt = 2, notified_at = NULL, status = 'running' WHERE id = 'w'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE jobs SET status = 'succeeded' WHERE id = 'w'`); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, err := st.ClearOwnerPending("w", t0); err != nil || !slices.Equal(cleared, []string{"w"}) {
+		t.Fatalf("owner_replied: %v %v", cleared, err)
+	}
+	if err := st.BeginOwnerPending("w", OwnerDelivering, t0); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := pendingIDs(t, st, t0, 6*time.Hour); len(ids) != 0 {
+		t.Fatalf("attempt 2 blocks after owner_replied: %v", ids)
+	}
+	if err := st.MarkNotified("w", t0); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := pendingIDs(t, st, t0, 6*time.Hour); len(ids) != 0 {
+		t.Fatalf("attempt 2 delivered blocks after owner_replied: %v", ids)
+	}
+	if rows := ownerRows(t, st, "w"); rows[1] != "acknowledged" || rows[2] != "acknowledged" {
+		t.Fatalf("rows: %v", rows)
+	}
+}
+
+// An owner_pending table keyed by job_id alone (the earlier owner-waits builds) is rebuilt into the
+// (job, attempt) table on Open: a replied row becomes acknowledged, an open one keeps its state.
+func TestOpenRebuildsOwnerPendingPerAttempt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertJob(t, st, "open", true, time.Unix(1760000000, 0))
+	insertJob(t, st, "replied", true, time.Unix(1760000000, 0))
+	if _, err := st.db.Exec(`DROP TABLE owner_pending;
+		CREATE TABLE owner_pending (job_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
+			attempt INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'delivered', replied INTEGER NOT NULL DEFAULT 0);
+		INSERT INTO owner_pending VALUES ('open', 1760000000, 0, 'delivering', 0), ('replied', 1760000000, 0, 'delivered', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	for range 2 {
+		if st, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		if rows := ownerRows(t, st, "open"); len(rows) != 1 || rows[0] != OwnerDelivering {
+			t.Fatalf("open: %v", rows)
+		}
+		if rows := ownerRows(t, st, "replied"); len(rows) != 1 || rows[0] != OwnerAcknowledged {
+			t.Fatalf("replied: %v", rows)
+		}
+		_ = st.Close()
+	}
+}
