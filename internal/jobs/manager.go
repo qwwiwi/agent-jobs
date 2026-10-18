@@ -251,7 +251,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd)
+	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Cfg.AcceptanceAllowed)
 	if err != nil {
 		return nil, err
 	}
@@ -589,9 +589,15 @@ func verifyGroup(pid, pgid int) error {
 	return nil
 }
 
-// killJob ends a running job (timeout, cancel): its whole scope when it has one, else (or when the
-// stop fails) its wrapper's process group.
+// beforeTimeoutClaim runs between collect's timeout preselection and its ClaimTimeout; a variable so
+// tests can interleave the wrapper's acceptance start.
+var beforeTimeoutClaim = func(string) {}
+
+// killJob ends a running job (timeout, cancel, stop): its whole scope when it has one, else (or when
+// the stop fails) its wrapper's process group, then the process group of a running acceptance command
+// (a group of its own, which neither a session-only job's group kill nor a dead wrapper ends).
 func (m *Manager) killJob(j *store.Job, pid, pgid int) {
+	defer m.killAcceptance(j.ID)
 	if j.ScopeUnit != "" {
 		err := m.stopScope(j.ID)
 		if err == nil {
@@ -602,6 +608,29 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) {
 	if pgid != 0 {
 		m.killGroup(j.ID, pid, pgid)
 	}
+}
+
+// killAcceptance ends the acceptance command's process group recorded in the job row (read now: it is
+// recorded after the caller's row was read). The row is written by the wrapper, not the job, but a
+// group is only signalled while its leader is alive, leads it and carries this job's marker, so a
+// recycled pid is never hit.
+func (m *Manager) killAcceptance(id string) {
+	j, err := m.Store.Get(id)
+	if err != nil || j.AcceptancePGID == 0 {
+		return
+	}
+	g := j.AcceptancePGID
+	if err := verifyGroup(g, g); err != nil {
+		if alive(g) {
+			m.Log.Printf("job %s: refusing to kill acceptance process group %d: %v", id, g, err)
+		}
+		return
+	}
+	if procMarker(g) != id {
+		m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
+		return
+	}
+	m.signalGroup(g)
 }
 
 // endScope stops a scoped job's unit before its row turns terminal (a no-op for an already collected
@@ -647,6 +676,11 @@ func (m *Manager) killGroup(id string, pid, pgid int) {
 		m.Log.Printf("job %s: refusing to kill process group %d: %v", id, pgid, err)
 		return
 	}
+	m.signalGroup(pgid)
+}
+
+// signalGroup sends SIGTERM to the process group, waits up to KillGrace, then SIGKILL.
+func (m *Manager) signalGroup(pgid int) {
 	_ = killFn(-pgid, syscall.SIGTERM)
 	deadline := time.Now().Add(m.KillGrace)
 	for time.Now().Before(deadline) {
@@ -729,7 +763,19 @@ func (m *Manager) collect() error {
 			m.finish(j, status, res, false, dur, msg, now)
 			continue
 		}
-		if j.StartedAt != nil && now.After(m.jobDeadline(j)) {
+		if j.StartedAt != nil && now.After(jobDeadline(j)) {
+			// j was read at the start of the tick: the wrapper may have started the acceptance command
+			// since. The decision is a conditional update against the row as it is now; it also closes
+			// the start of an acceptance command from here on.
+			beforeTimeoutClaim(j.ID)
+			claimed, err := m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+			if err != nil {
+				m.Log.Printf("job %s: claim timeout: %v", j.ID, err)
+				continue
+			}
+			if !claimed {
+				continue // the acceptance command started meanwhile: its deadline counts from the next tick
+			}
 			m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
 			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)

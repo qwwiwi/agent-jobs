@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -16,11 +17,28 @@ func withAcceptance(cmd string) func(*StartRequest) {
 	return func(r *StartRequest) { r.Kind = "fix"; r.AcceptanceCmd = cmd }
 }
 
+// acceptanceManager is newManager with acceptance_allowed on, in m.Cfg and in config.json (the wrapper
+// reloads it); extra is more config JSON members.
+func acceptanceManager(t *testing.T, extra string) *Manager {
+	t.Helper()
+	m := newManager(t)
+	body := `{"acceptance_allowed": true` + extra + `}`
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(m.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Cfg = c
+	return m
+}
+
 // A passing acceptance command keeps the job succeeded; its output tail is in acceptance.log and its
 // exit code and duration in the row. It runs in the work dir, with the job marker and without the
 // wrapper's other variables.
 func TestAcceptancePass(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	t.Setenv("ACCEPTANCE_TEST_SECRET", "must-not-leak")
 	j := enqueue(t, m, "do it", withAcceptance(`echo ACC_OK; pwd > ../acc-cwd.txt; env > ../acc-env.txt`))
 	j = runToEnd(t, m, j.ID)
@@ -44,6 +62,19 @@ func TestAcceptancePass(t *testing.T) {
 	if !strings.Contains(env, JobEnvVar+"="+j.ID) || !strings.Contains(env, "GIT_CONFIG_NOSYSTEM=1") || !strings.Contains(env, "PATH=") {
 		t.Fatalf("acceptance env lacks the job marker, git env or PATH:\n%s", env)
 	}
+	// HOME and TMPDIR are a throwaway dir in the job dir; the wrapper's own HOME is not passed on.
+	home := filepath.Join(dir, acceptanceHome)
+	if !envHas(env, "HOME", home) || !envHas(env, "TMPDIR", filepath.Join(home, "tmp")) {
+		t.Fatalf("acceptance HOME/TMPDIR not the job's throwaway dir %s:\n%s", home, env)
+	}
+	if real := os.Getenv("HOME"); real != "" && envHas(env, "HOME", real) {
+		t.Fatalf("acceptance env has the real HOME %s", real)
+	}
+	// The daemon's deadline is the one the wrapper recorded with the start (default timeout 15 min).
+	if j.AcceptanceDeadline == nil || !j.AcceptanceDeadline.Equal(j.AcceptanceStartedAt.Add(15*time.Minute+acceptanceDeadlineGrace)) ||
+		j.AcceptancePGID != 0 {
+		t.Fatalf("recorded deadline %v (start %v), pgid %d", j.AcceptanceDeadline, j.AcceptanceStartedAt, j.AcceptancePGID)
+	}
 	if line := DoneLine(j); strings.Contains(line, "acceptance") || !strings.Contains(line, " succeeded ") {
 		t.Fatalf("done line: %s", line)
 	}
@@ -51,7 +82,7 @@ func TestAcceptancePass(t *testing.T) {
 
 // A failing acceptance command fails the job: error "acceptance failed (exit N)", the done line says so.
 func TestAcceptanceFail(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	j := enqueue(t, m, "do it", withAcceptance(`echo ACC_BAD >&2; exit 3`))
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusFailed || j.Error != "acceptance failed (exit 3)" {
@@ -73,7 +104,7 @@ func TestAcceptanceFail(t *testing.T) {
 
 // A claude run that fails never runs the acceptance command; the failure is claude's.
 func TestAcceptanceNotRunAfterFailedRun(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	j := enqueue(t, m, "FAKE_EXIT3", withAcceptance(`touch ../acc-ran`))
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "exited with code 3") || j.AcceptanceExit != nil {
@@ -119,7 +150,8 @@ func TestAcceptanceTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	exit, dur := runAcceptance(dir, `echo started; sleep 30 & echo $! > ../child.pid; sleep 30`, 300*time.Millisecond, io.Discard)
+	exit, dur := runAcceptance(context.Background(), dir, `echo started; sleep 30 & echo $! > ../child.pid; sleep 30`,
+		300*time.Millisecond, io.Discard, nil)
 	if exit != store.AcceptanceTimedOut {
 		t.Fatalf("exit %d, want timeout", exit)
 	}
@@ -145,11 +177,13 @@ func TestAcceptanceTimeout(t *testing.T) {
 
 // The acceptance log keeps only the last AcceptanceLogBytes, with a note of what was cut.
 func TestAcceptanceLogCapped(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, "work"), 0o700); err != nil {
+	state := t.TempDir()
+	dir := filepath.Join(state, "jobs", "j1")
+	if err := os.MkdirAll(filepath.Join(dir, "work"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	exit, _ := runAcceptance(dir, `head -c 200000 /dev/zero | tr '\0' a; echo; echo TAIL_END`, time.Minute, io.Discard)
+	exit, _ := runAcceptance(context.Background(), dir, `head -c 200000 /dev/zero | tr '\0' a; echo; echo TAIL_END`,
+		time.Minute, io.Discard, nil)
 	if exit != 0 {
 		t.Fatalf("exit %d", exit)
 	}
@@ -157,7 +191,7 @@ func TestAcceptanceLogCapped(t *testing.T) {
 	if !strings.HasPrefix(log, "[... ") || !strings.HasSuffix(log, "TAIL_END\n") || len(log) > AcceptanceLogBytes+100 {
 		t.Fatalf("log: %d bytes, starts %q", len(log), log[:min(len(log), 60)])
 	}
-	tail, err := ReadAcceptanceLogTail(dir, 9)
+	tail, err := ReadAcceptanceLogTail(state, "j1", 9)
 	if err != nil || tail != "TAIL_END\n" {
 		t.Fatalf("tail %q %v", tail, err)
 	}
@@ -168,7 +202,7 @@ func TestAcceptanceLogCapped(t *testing.T) {
 	if err := os.Symlink("/etc/passwd", filepath.Join(dir, AcceptanceLog)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadAcceptanceLogTail(dir, 100); err == nil {
+	if _, err := ReadAcceptanceLogTail(state, "j1", 100); err == nil {
 		t.Fatal("a symlinked acceptance.log was read")
 	}
 }
@@ -189,7 +223,7 @@ func TestTailBuffer(t *testing.T) {
 
 // acceptance_cmd is refused for review and research jobs and when it is not one line of at most 1 KB.
 func TestAcceptanceRefused(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	for _, kind := range []string{"review", "research"} {
 		_, err := m.Enqueue(StartRequest{Title: "t", Kind: kind, Brief: "b", Model: "sonnet", AcceptanceCmd: "make test"})
 		if err == nil || !strings.Contains(err.Error(), "acceptance_cmd does not apply to a "+kind+" job") {
@@ -204,6 +238,12 @@ func TestAcceptanceRefused(t *testing.T) {
 		"make\ntest": "one line",
 		"make\rtest": "one line",
 		"make\x00":   "one line",
+		// Boundary newlines are refused too, not trimmed away (nor a newline-only input into no command).
+		"make test\n":  "one line",
+		"\rmake test":  "one line",
+		" make test\r": "one line",
+		"\n":           "one line",
+		"\r\n":         "one line",
 		strings.Repeat("x", MaxAcceptanceCmdBytes+1): "at most 1024",
 		"\xff": "UTF-8",
 	} {
@@ -225,7 +265,7 @@ func TestAcceptanceRefused(t *testing.T) {
 // Job schedules carry acceptance_cmd to the jobs they start (validated like job_start); a session
 // schedule refuses it.
 func TestAcceptanceSchedules(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	if _, err := m.AddSchedule(ScheduleRequest{Cron: "@daily", Prompt: "p", AcceptanceCmd: "make test"}); err == nil ||
 		!strings.Contains(err.Error(), "acceptance_cmd") {
 		t.Fatalf("session schedule: %v", err)
@@ -252,7 +292,7 @@ func TestAcceptanceSchedules(t *testing.T) {
 
 // A resumed job runs its acceptance command again after the resumed run.
 func TestAcceptanceRerunsOnResume(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	sessionsHome(t, true)
 	// Fails on attempt 1 (no attempts dir yet), passes once attempt 1 is archived.
 	j := enqueue(t, m, "do it", withAcceptance(`echo run >> ../acc-runs.txt; test -d ../attempts`))
@@ -279,24 +319,22 @@ func TestAcceptanceRerunsOnResume(t *testing.T) {
 	}
 }
 
-// Once the acceptance command started, the daemon allows it its own timeout (plus a grace) even past
-// the job's timeout.
+// Once the acceptance command started, the daemon allows the job the deadline the wrapper recorded
+// with the start, never less than the job's own timeout.
 func TestAcceptanceDeadline(t *testing.T) {
-	m := newManager(t)
 	start := time.Unix(1760000000, 0)
 	j := &store.Job{StartedAt: &start, TimeoutMinutes: 10}
-	if d := m.jobDeadline(j); !d.Equal(start.Add(10 * time.Minute)) {
+	if d := jobDeadline(j); !d.Equal(start.Add(10 * time.Minute)) {
 		t.Fatalf("plain deadline %s", d)
 	}
-	acc := start.Add(9 * time.Minute)
-	j.AcceptanceCmd, j.AcceptanceStartedAt = "make test", &acc
-	if d := m.jobDeadline(j); !d.Equal(acc.Add(DefaultAcceptanceTimeoutMinutes*time.Minute + acceptanceDeadlineGrace)) {
+	acc := acceptanceDeadline(start.Add(9*time.Minute), 60*time.Minute)
+	j.AcceptanceCmd, j.AcceptanceDeadline = "make test", &acc
+	if d := jobDeadline(j); !d.Equal(start.Add(69*time.Minute + acceptanceDeadlineGrace)) {
 		t.Fatalf("acceptance deadline %s", d)
 	}
-	m.Cfg.AcceptanceTimeoutMinutes = 1
-	early := start.Add(time.Minute)
-	j.AcceptanceStartedAt = &early
-	if d := m.jobDeadline(j); !d.Equal(start.Add(10 * time.Minute)) {
+	early := acceptanceDeadline(start.Add(time.Minute), time.Minute)
+	j.AcceptanceDeadline = &early
+	if d := jobDeadline(j); !d.Equal(start.Add(10 * time.Minute)) {
 		t.Fatalf("the job's own deadline is never shortened: %s", d)
 	}
 }

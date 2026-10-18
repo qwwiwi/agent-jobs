@@ -112,6 +112,10 @@ type Config struct {
 	// AcceptanceTimeoutMinutes is the time limit of a job's acceptance command (acceptance_cmd).
 	// 0 = DefaultAcceptanceTimeoutMinutes (15); at most CeilingAcceptanceTimeoutMinutes (60).
 	AcceptanceTimeoutMinutes int `json:"acceptance_timeout_minutes"`
+	// AcceptanceAllowed opts in to acceptance_cmd (default false: job_start and schedule_add refuse it,
+	// and the wrapper, which reloads config.json, does not run it). The command runs the job's code
+	// outside the guard.
+	AcceptanceAllowed bool `json:"acceptance_allowed"`
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when

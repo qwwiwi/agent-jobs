@@ -38,7 +38,8 @@ func TestAcceptanceColumnsMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if j.AcceptanceCmd != "" || j.AcceptanceStartedAt != nil || j.AcceptanceExit != nil || j.AcceptanceDurationSec != 0 {
+		if j.AcceptanceCmd != "" || j.AcceptanceStartedAt != nil || j.AcceptanceExit != nil || j.AcceptanceDurationSec != 0 ||
+			j.AcceptanceDeadline != nil || j.AcceptancePGID != 0 || j.TimedOutAt != nil {
 			t.Fatalf("migrated acceptance fields: %+v", j)
 		}
 		sc, err := st.GetSchedule(1)
@@ -69,11 +70,17 @@ func TestAcceptanceFieldsRoundTrip(t *testing.T) {
 	if err := st.Claim("j1", "tok", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetAcceptanceStarted("j1", "other", now); err == nil {
+	if err := st.SetAcceptanceStarted("j1", "other", now, now.Add(time.Hour)); err == nil {
 		t.Fatal("another launch recorded the acceptance start")
 	}
-	if err := st.SetAcceptanceStarted("j1", "tok", now.Add(time.Minute)); err != nil {
+	if err := st.SetAcceptanceStarted("j1", "tok", now.Add(time.Minute), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
+	}
+	if err := st.SetAcceptancePGID("j1", "tok", 4242); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.Get("j1"); err != nil || got.AcceptancePGID != 4242 || !got.AcceptanceDeadline.Equal(now.Add(time.Hour)) {
+		t.Fatalf("pgid/deadline: %+v %v", got, err)
 	}
 	if err := st.SetAcceptanceResult("j1", "tok", 2, 7); err != nil {
 		t.Fatal(err)
@@ -83,8 +90,11 @@ func TestAcceptanceFieldsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.AcceptanceCmd != "make test" || got.AcceptanceStartedAt == nil || !got.AcceptanceStartedAt.Equal(now.Add(time.Minute)) ||
-		got.AcceptanceExit == nil || *got.AcceptanceExit != 2 || got.AcceptanceDurationSec != 7 {
+		got.AcceptanceExit == nil || *got.AcceptanceExit != 2 || got.AcceptanceDurationSec != 7 || got.AcceptancePGID != 0 {
 		t.Fatalf("acceptance fields: %+v", got)
+	}
+	if ok, err := st.ClaimTimeout("j1", "tok", now.Add(2*time.Hour)); err != nil || !ok {
+		t.Fatalf("claim timeout: %v %v", ok, err)
 	}
 	if err := st.Finish("j1", "tok", StatusFailed, 0, 0, 1, "acceptance failed (exit 2)", now); err != nil {
 		t.Fatal(err)
@@ -96,7 +106,56 @@ func TestAcceptanceFieldsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AcceptanceCmd != "make test" || got.AcceptanceStartedAt != nil || got.AcceptanceExit != nil || got.AcceptanceDurationSec != 0 {
+	if got.AcceptanceCmd != "make test" || got.AcceptanceStartedAt != nil || got.AcceptanceExit != nil || got.AcceptanceDurationSec != 0 ||
+		got.AcceptanceDeadline != nil || got.AcceptancePGID != 0 || got.TimedOutAt != nil {
 		t.Fatalf("after requeue: %+v", got)
+	}
+}
+
+// ClaimTimeout is the daemon's side of the timeout race: it holds only past the job's timeout and past
+// a recorded acceptance deadline, and after it the acceptance command can no longer start.
+func TestClaimTimeout(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Unix(1760000000, 0)
+	j := &Job{ID: "j1", Agent: "a", Title: "t", Kind: "fix", Brief: "b", Status: StatusQueued, Model: "opus",
+		MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 10, CreatedAt: now, AcceptanceCmd: "make test"}
+	if err := st.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Claim("j1", "tok", now); err != nil {
+		t.Fatal(err)
+	}
+	claim := func(at time.Time, token string) bool {
+		t.Helper()
+		ok, err := st.ClaimTimeout("j1", token, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if claim(now.Add(10*time.Minute), "tok") {
+		t.Fatal("claimed at the timeout, not past it")
+	}
+	if err := st.SetAcceptanceStarted("j1", "tok", now.Add(9*time.Minute), now.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if claim(now.Add(20*time.Minute), "tok") {
+		t.Fatal("claimed before the recorded acceptance deadline")
+	}
+	if claim(now.Add(31*time.Minute), "other") {
+		t.Fatal("another launch claimed the timeout")
+	}
+	if !claim(now.Add(31*time.Minute), "tok") || !claim(now.Add(31*time.Minute), "tok") {
+		t.Fatal("no claim past the acceptance deadline (or not idempotent)")
+	}
+	if err := st.SetAcceptanceStarted("j1", "tok", now.Add(32*time.Minute), now.Add(time.Hour)); err == nil {
+		t.Fatal("acceptance start recorded after the timeout claim")
+	}
+	if got, err := st.Get("j1"); err != nil || got.TimedOutAt == nil || !got.TimedOutAt.Equal(now.Add(31*time.Minute)) {
+		t.Fatalf("timed_out_at: %+v %v", got, err)
 	}
 }

@@ -138,7 +138,7 @@ type JobStartInput struct {
 	Base            string  `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
 	Runner          string  `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
 	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
-	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only: one-line shell command (max 1 KB) run in the job worktree after claude exits 0; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
+	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 	OwnerWaits      bool    `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
 }
 
@@ -228,7 +228,7 @@ func acceptanceView(m *jobs.Manager, j *store.Job) *AcceptanceView {
 	if j.AcceptanceExit != nil {
 		v.Ran, v.Exit, v.TimedOut = true, *j.AcceptanceExit, *j.AcceptanceExit == store.AcceptanceTimedOut
 	}
-	if tail, err := jobs.ReadAcceptanceLogTail(m.JobDir(j.ID), MaxAcceptanceTailBytes); err == nil {
+	if tail, err := jobs.ReadAcceptanceLogTail(m.StateDir, j.ID, MaxAcceptanceTailBytes); err == nil {
 		v.LogTail = tail
 	}
 	return v
