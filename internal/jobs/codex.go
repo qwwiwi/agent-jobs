@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,13 +145,39 @@ func (c Config) codexBin() string {
 // hooks, background daemons and automations, worktrees, sub-agents) or a one-shot job has no use for.
 // With --ignore-user-config, --ignore-rules, --ephemeral and an empty mcp_servers table, a job does not
 // inherit the owner's codex config, rules, apps or plugins (this exact command line verified on
-// codex-cli 0.162.1); MCP servers from other config layers are ruled out by checkCodexMCP, so the
-// sandbox is the whole containment.
+// codex-cli 0.162.1); system/managed config layers are ruled out by checkCodexSystemConfig and MCP
+// servers from other config layers by checkCodexMCP, so the sandbox is the whole containment.
 var CodexDisabledFeatures = []string{
 	"apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
 	"image_generation", "multi_agent", "plugins", "plugin_sharing", "remote_plugin",
 	"skill_mcp_dependency_install", "daemon_auto_start", "in_app_local_automation", "goals",
 	"realtime_conversation", "worktrees", "hooks",
+}
+
+// codexSystemConfigDir is where codex reads its system and managed config layers; a test hook, never
+// user config.
+var codexSystemConfigDir = "/etc/codex"
+
+// checkCodexSystemConfig fails closed on codex's system and managed config layers (`config.toml`,
+// `managed_config.toml`, `requirements.toml`, ... in /etc/codex): they are applied after the job's CLI
+// overrides and can turn `apps` back on, whose implicit codex_apps server neither `--disable apps` nor
+// `mcp list` covers. A missing or empty dir passes; anything in it, or a dir that cannot be read, refuses.
+func checkCodexSystemConfig(dir string) error {
+	entries, err := os.ReadDir(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
+		return fmt.Errorf("codex system config check: %w; codex jobs refuse to run unless %s is missing or empty", err, dir)
+	case len(entries) == 0:
+		return nil
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = Printable(e.Name(), 64)
+	}
+	return fmt.Errorf("codex has system or managed configuration in %s (%s); codex jobs refuse to run with it",
+		dir, strings.Join(names, ", "))
 }
 
 // codexMCPTimeout bounds the `codex mcp list --json` check before a codex launch.

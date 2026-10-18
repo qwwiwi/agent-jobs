@@ -448,7 +448,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
 		if j.Runner == store.RunnerCodex {
-			// Fail closed on MCP servers codex would load, read where and how the job would run.
+			// Fail closed on system/managed config layers and on MCP servers codex would load, read where
+			// and how the job would run.
+			if err := checkCodexSystemConfig(codexSystemConfigDir); err != nil {
+				return err
+			}
 			if err := checkCodexMCP(codexCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
 				return err
 			}

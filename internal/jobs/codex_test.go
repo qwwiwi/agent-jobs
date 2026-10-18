@@ -53,6 +53,10 @@ func newCodexManager(t *testing.T) *Manager {
 	m := newManager(t)
 	t.Setenv("PATH", fakeHelpr+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AGENT_JOBS_CODEX_BIN", filepath.Join(fakeHelpr, "codex"))
+	// Tests never read the host's /etc/codex: a missing dir by default.
+	prevDir := codexSystemConfigDir
+	codexSystemConfigDir = filepath.Join(t.TempDir(), "no-etc-codex")
+	t.Cleanup(func() { codexSystemConfigDir = prevDir })
 	return m
 }
 
@@ -298,6 +302,45 @@ func TestCodexRefusedWithInheritedMCP(t *testing.T) {
 		}
 		if d := time.Since(start); d > 4*time.Second {
 			t.Fatalf("%s: the check took %s", c.name, d)
+		}
+	}
+}
+
+// A system or managed codex config layer in /etc/codex is applied after the job's CLI overrides and can
+// turn `apps` back on (its codex_apps server is not in `mcp list`), so a codex launch is refused while
+// that directory holds anything; a missing or empty one launches (DEVIATIONS #5).
+func TestCodexRefusedWithSystemConfig(t *testing.T) {
+	m := newCodexManager(t)
+	etc := filepath.Join(t.TempDir(), "etc-codex")
+	codexSystemConfigDir = etc
+	if j := runToEnd(t, m, enqueue(t, m, "review it", codexReview).ID); j.Status != store.StatusSucceeded {
+		t.Fatalf("missing dir must launch: %s %q", j.Status, j.Error)
+	}
+	if err := os.Mkdir(etc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if j := runToEnd(t, m, enqueue(t, m, "review it", codexReview).ID); j.Status != store.StatusSucceeded {
+		t.Fatalf("empty dir must launch: %s %q", j.Status, j.Error)
+	}
+	for _, c := range []struct{ file, want string }{
+		{"managed_config.toml", "(managed_config.toml)"},
+		{"config.toml", "(config.toml, managed_config.toml)"},
+		{"requirements.toml", "(config.toml, managed_config.toml, requirements.toml)"},
+	} {
+		if err := os.WriteFile(filepath.Join(etc, c.file), []byte("[features]\napps = true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		j := enqueue(t, m, "review it", codexReview)
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		want := "codex has system or managed configuration in " + etc + " " + c.want +
+			"; codex jobs refuse to run with it"
+		if got := get(t, m, j.ID); got.Status != store.StatusFailed || !strings.Contains(got.Error, want) {
+			t.Fatalf("%s: got %s %q, want failed with %q", c.file, got.Status, got.Error, want)
+		}
+		if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt")); err == nil {
+			t.Fatalf("%s: refused job must not run codex exec", c.file)
 		}
 	}
 }
