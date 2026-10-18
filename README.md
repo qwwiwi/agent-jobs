@@ -227,6 +227,14 @@ Full rule list: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#rules-enforcement).
   Only the marked sections are copied; over 8 KB is refused and nothing is written. A hand-written owner-rules file still works and is replaced only with `--force`.
 - **Project cards.** Short notes per repository, attached to the brief of every job in that repository: stack, check runner, what not to touch, known traps. They live in `~/.agent-jobs/<agent>/cards/<name>.md` (≤ 4 KB each) and match by `repo:` (the repository's top-level path) or `remote:` (a remote URL or `host/owner/name`; `https://`, `git@host:` and `ssh://` forms compare equal, the host's case is ignored, the path's case is not; a local or relative remote only matches a local path). A card that cannot be read or parsed refuses the start of repository jobs instead of being skipped. Example: [cards/example-agent-jobs.md](cards/example-agent-jobs.md).
 
+- **Skills for jobs.** A job runs with `--setting-sources project`, so it sees only its repository's `.claude/skills`. To give jobs skills from a catalog of your own, point `skill_roots` at it: any directory with an `index.json` at its root works (a local folder, a checkout of a shared skills repository); agent-jobs ships no catalog.
+
+  ```json
+  { "skill_roots": ["/home/me/skills-catalog"], "skills_max_per_job": 6, "skills_max_kb": 400 }
+  ```
+
+  `index.json` is `{"version": 1, "skills": [{"name": "golang", "path": "skills/golang", "status": "core", "kinds": ["code"], "projects": [], "last_verified": "2026-10-18", "risk": []}]}` (other fields such as `owner`, `origin`, `sha256`, `size_kb`, `has_scripts` and a `plugins` list are allowed); each `path` is a directory named like the skill, inside the root, holding `SKILL.md`; a symlink inside a skill may only point to a regular file in that same skill directory (no directory links, nothing outside it, counted in the size), otherwise the entry is skipped with a warning. Status: `core` (a default for its kinds), `active`, `draft` (only when named), `deprecated` (never). A job gets the `core` skills of its kind (`fix` and `general` match `code` and `general`, `review` matches `review`, `research` matches `research`) plus the skills whose `projects` name the repository's folder; `job_start` `skills: ["+name", "-name"]` (CLI `--skills a,+b,-c`, also on schedules) adds or removes; an unknown or deprecated name, or more than the budget, refuses the start. For the run, each skill is linked into the worktree as `.claude/skills/<name>` -> its catalog directory (hidden from git by the repository's `info/exclude`, write-protected for the job, removed when the attempt ends, before any diff); a skill the repository already has stays the repository's; codex jobs get none. The brief names the skills in one line. `skill_list` / `agent-jobs skills list|search QUERY` browse and search the catalog; `agent-jobs stats --by skill` shows uses next to deliveries, `--by skill --by-repo` the rating per repository.
+
 ---
 
 ## MCP tools
@@ -237,7 +245,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*); returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*), `skills` (edits to the default skills: `+name`, `-name`); returns the queued row |
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome |
 | `job_list` | recent jobs, filterable by status |
@@ -245,6 +253,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_stop` | stop a queued or running job, keep its worktree and session: status `stopped` (resumable) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with an «Orchestrator update»; limits default to what is left |
 | `job_amend` | append context to a queued job's brief; it keeps its place in the queue |
+| `skill_list` | the skill catalog (`skill_roots`): name, status, one-line description, kinds, size, risk, last verified, uses and success rate, a `stale` flag; `query` = local content search (best 10, with a score); `kind`, `repo`, `status` filters. Orchestrator only |
 | `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate; `since`, `by` = kind \| model \| skill (same as `agent-jobs stats --json`) |
 
 **Memory, task and team tools** keep the reference's names and are backed by the team's shared brain (gbrain) instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)). Without a `brain` block in `config.json` each of them answers «brain not configured» and nothing else changes.
@@ -351,6 +360,7 @@ Register both hooks in the orchestrator's Claude Code settings (the `settings.js
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
 | Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, unreleased (Wave B) |
 | Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
+| Skills | `skill_list` (catalog, content search) | the selected skills, linked into the worktree | built, unreleased (Wave E7, job-side part) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---
@@ -410,6 +420,7 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `max_brief_bytes`: largest brief `job_start` accepts (default 32768); `brief_warn_files` (default 40) and `brief_warn_headings` (default 8): above these a queued job gets a `size_warning`.
 - `brain`: the shared brain behind the memory, task and team tools and the memory notes of a brief (see «Shared brain» below). Absent = not configured.
 - `cgroup_scope`: `auto` (default: a transient systemd user scope per job when `systemd-run --user` works, else the weaker session containment), `required` (refuse jobs that cannot get a scope), `off`.
+- `skill_roots`: absolute directories of skill catalogs for jobs, each holding an `index.json` (see «Skills for jobs» below); earlier roots win a duplicate name; a missing or invalid root is a warning in `status` and `system_doctor`, never fatal. `skills_max_per_job` (default 6, at most 8) and `skills_max_kb` (default 400) cap one job's skills.
 - `http_api`: the read-only HTTP API, `{"enabled": false}` by default, listening on the unix socket `<state>/http-api.sock` (see «Read-only HTTP API» below).
 - `acceptance_allowed`: `true` lets jobs carry `acceptance_cmd` (default `false`: refused at `job_start`, `schedule_add` and `--acceptance-cmd`, and not run by a wrapper that finds it off). The command runs the job's code outside the guard; see *Acceptance command*. `acceptance_timeout_minutes`: its time limit (default 15, max 60).
 - Also: `owner_rules_path`, `cards_dir` (default `<state>/cards`), `claude_bin`, `tmux_bin`; env overrides `AGENT_JOBS_HOME`, `AGENT_JOBS_AGENT`, `AGENT_JOBS_CLAUDE_BIN`, `AGENT_JOBS_TMUX_BIN`, `AGENT_JOBS_CGROUP_SCOPE`. `AGENT_JOBS_JOB` is the job marker the wrapper sets on every job (see Safety).
@@ -456,7 +467,7 @@ systemctl --user restart agent-jobs@my-agent           # the daemon starts the A
 curl -s --unix-socket ~/.agent-jobs/my-agent/http-api.sock -H "Authorization: Bearer $(cat ~/.agent-jobs/my-agent/http-api.token)" http://localhost/v1/health
 ```
 
-- `GET /v1/health`: version, start time, uptime, running and queued counts. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill`: the `job_stats` summary. `GET /v1/stats` covers the last 30 days without `since`; a `since` older than 365 days is 400; at most 200 groups and skills (`groups_truncated`, `skills_truncated`). `GET /v1/schedules?limit=N&cursor=C`: schedules with their next firing, oldest first, pages of 100 by default (max 500); `next_cursor` is the `cursor` of the next page.
+- `GET /v1/health`: version, start time, uptime, running and queued counts. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill`: the `job_stats` summary. `GET /v1/stats` covers the last 30 days without `since`; a `since` older than 365 days is 400; at most 200 groups and skills (`groups_truncated`, `skills_truncated`). `GET /v1/schedules?limit=N&cursor=C`: schedules with their next firing, oldest first, pages of 100 by default (max 500); `next_cursor` is the `cursor` of the next page. `GET /v1/skills?since=D&repo=R&limit=N`: the skills rating for a frontend, per skill: status, `stale`, delivered, used, success rate, last used, median cost and `by_repo` (repository folder -> used, success rate), sorted by used count; 30 days by default (max 365), 100 skills by default (max 500); names and numbers only.
 - On a TCP listener the `Host` header must be `localhost` or a loopback IP literal (`127.x.x.x`, `[::1]`), without a port or with the listener's, else 421 (no name is resolved: a DNS-rebound page cannot reach the API); a unix socket is exempt.
 - Every endpoint needs the token, health included (401 without it or with a wrong one; the scheme `Bearer` is case-insensitive; constant-time compare; the file is read per request, so a rotation takes effect at once, and a token file readable by group or others fails closed). Any method but GET is 405; no endpoint changes state. No CORS headers.
 - Never returned: briefs, schedule prompts or titles derived from them (a job schedule without a title is called `schedule <id>`, and so are the jobs it fires; an older schedule or job whose title starts with `schedule: ` is shown that way too), session ids, env, config, the job dir or the repository path (only the repository's folder name), error texts. A job's error is `error_code` + `error_message`, a schedule's last error `last_error_code` + `last_error_message`, the code one of `launch_failed`, `timeout`, `cancelled`, `guard_refused`, `codex_config_refused`, `delivery_failed`, `processes_survived`, `run_failed`, `unknown` with a fixed message; the text itself is in `agent-jobs status <id>` and the daemon log. Every string field is cut at 200 bytes. `report.md` is read only through the state dir: `jobs`, the job dir and the report are opened without following a symlink, and a report that is not a regular file of the agent user with one link is not read (`report_error`). Only this agent's jobs.

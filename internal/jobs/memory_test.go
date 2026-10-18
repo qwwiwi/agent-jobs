@@ -16,7 +16,7 @@ import (
 func prepared(t *testing.T, m *Manager, brief string) string {
 	t.Helper()
 	j := enqueue(t, m, brief, nil)
-	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+	if err := m.prepare(j, "", m.JobDir(j.ID)); err != nil {
 		t.Fatalf("prepare must not fail on memory: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "prompt.md"))

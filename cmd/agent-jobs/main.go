@@ -24,6 +24,7 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/httpapi"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/mcp"
+	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -35,9 +36,11 @@ const usage = `usage: agent-jobs <command> [flags]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
              [--runner claude|codex] [--reasoning-effort low|medium|high] [--owner-waits]
+             [--skills a,+b,-c]
                                            a gpt-* model runs on codex exec (read-only kinds
                                            review/research unless codex_write_allowed);
-                                           --owner-waits: the owner asked for it (Stop hook)
+                                           --owner-waits: the owner asked for it (Stop hook);
+                                           --skills: edits to the default catalog skills
              [--acceptance-cmd CMD]       fix/general: one-line shell command the job must
                                            pass in its worktree after claude exits 0
                                            (needs config acceptance_allowed)
@@ -71,8 +74,18 @@ const usage = `usage: agent-jobs <command> [flags]
                                            log_archive_days; --dry-run shows what would move
   stats      --agent A [--since D] [--by kind|model|skill] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
-                                           (median, p90), guard refusal rules, skills; --backfill
-                                           first writes missing rows from job dirs and the archive
+                                           (median, p90), guard refusal rules, skills (uses and
+                                           delivered); --backfill first writes missing rows from
+                                           job dirs and the archive
+             --by skill --by-repo (or --by skill,repo) [--repo R] [--limit N]
+                                           the skills rating: delivered, used, success rate, last
+                                           used, median cost, stale flag and a per-repository
+                                           breakdown (same as GET /v1/skills)
+  skills list   --agent A [--kind K] [--repo R] [--status S] [--json]
+  skills search --agent A QUERY [--kind K] [--repo R] [--status S] [--json]
+                                           the skill catalog (config skill_roots, same as the
+                                           skill_list MCP tool); search scores names, descriptions
+                                           and SKILL.md text locally, best 10
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
@@ -152,6 +165,8 @@ func main() {
 		err = cmdPrune(args)
 	case "archive":
 		err = cmdArchive(args)
+	case "skills":
+		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
 	case "intentions":
@@ -408,9 +423,11 @@ func cmdStart(args []string) error {
 	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
 	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job (needs config acceptance_allowed)")
 	fs.BoolVar(&r.OwnerWaits, "owner-waits", false, "the owner asked for this job: its done line says «owner waits» and the Stop hook holds the session until owner_replied")
+	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
+	r.Skills = skills.ParseEdits(*skillEdits)
 	switch {
 	case *brief != "":
 		r.Brief = *brief
@@ -484,6 +501,9 @@ func cmdStatus(args []string) error {
 			return err
 		}
 		printHTTPAPI(m)
+		for _, w := range m.SkillWarnings() {
+			fmt.Println("skills warning:", shown(w))
+		}
 		if err := printUndelivered(m); err != nil {
 			return err
 		}
@@ -502,6 +522,12 @@ func cmdStatus(args []string) error {
 	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
 	if c := jobs.Containment(j); c != "" {
 		fmt.Printf("contain:   %s\n", c)
+	}
+	if len(j.Skills) > 0 {
+		fmt.Printf("skills:    %s (linked now: %s)\n", strings.Join(j.Skills, ", "), strings.Join(j.SkillsDelivered, ", "))
+		if j.SkillsNote != "" {
+			fmt.Printf("           %s\n", j.SkillsNote)
+		}
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.AcceptanceCmd != "" {
@@ -1322,7 +1348,10 @@ func cmdStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
-	by := fs.String("by", "kind", "group by kind|model|skill")
+	by := fs.String("by", "kind", "group by kind|model|skill (skill,repo: the skills rating by repository)")
+	byRepo := fs.Bool("by-repo", false, "with --by skill: the skills rating with a per-repository breakdown")
+	repo := fs.String("repo", "", "with --by-repo: only jobs of this repository (folder name)")
+	limit := fs.Int("limit", httpapi.DefaultSkillsLimit, "with --by-repo: at most this many skills")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	backfill := fs.Bool("backfill", false, "first write the missing summary rows from job dirs and the archive")
 	all := fs.Bool("all", false, "with --backfill: rewrite every row, not only the missing ones")
@@ -1347,6 +1376,18 @@ func cmdStats(args []string) error {
 		for _, e := range b.Errors {
 			fmt.Fprintln(os.Stderr, "backfill:", e)
 		}
+	}
+	if *by == "skill,repo" {
+		*by, *byRepo = "skill", true
+	}
+	if *byRepo {
+		if *by != "skill" {
+			return errors.New("--by-repo needs --by skill")
+		}
+		if *since == "" {
+			t = m.Now().Add(-httpapi.DefaultStatsDays * 24 * time.Hour)
+		}
+		return printSkillRatings(m, t, *repo, *limit, *asJSON)
 	}
 	rep, err := m.Stats(t, *by)
 	if err != nil {
@@ -1377,12 +1418,92 @@ func cmdStats(args []string) error {
 		}
 	}
 	if len(rep.Skills) > 0 {
-		fmt.Println("\nskills (uses, jobs, success rate):")
+		fmt.Println("\nskills (uses, jobs, success rate, delivered, delivered unused):")
 		for _, s := range rep.Skills {
-			fmt.Printf("  %-22s %d  %d  %.0f%%\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100)
+			fmt.Printf("  %-22s %d  %d  %.0f%%  %d  %d\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100, s.Delivered, s.DeliveredUnused)
 		}
 	}
 	return nil
+}
+
+// printSkillRatings is `stats --by skill --by-repo`: the skills rating (GET /v1/skills).
+func printSkillRatings(m *jobs.Manager, since time.Time, repo string, limit int, asJSON bool) error {
+	rep, err := m.SkillRatings(context.Background(), since, repo, limit)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		return printJSON(rep)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "SKILL\tSTATUS\tDELIVERED\tUSED\tRATE\tMEDIAN COST\tLAST USED\tSTALE\tBY REPO")
+	for _, s := range rep.Skills {
+		var parts []string
+		for _, r := range s.ByRepo {
+			parts = append(parts, fmt.Sprintf("%s %d (%.0f%%)", shown(r.Repo), r.Used, r.SuccessRate*100))
+		}
+		last := s.LastUsed
+		if last == "" {
+			last = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%.0f%%\t$%.2f\t%s\t%t\t%s\n", shown(s.Name), s.Status, s.Delivered, s.Used,
+			s.SuccessRate*100, s.MedianCostUSD, last, s.Stale, strings.Join(parts, ", "))
+	}
+	return w.Flush()
+}
+
+func cmdSkills(args []string) error {
+	if len(args) == 0 || (args[0] != "list" && args[0] != "search") {
+		return errors.New("usage: agent-jobs skills list|search --agent A [QUERY] [--kind K] [--repo R] [--status S] [--json]")
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("skills "+sub, flag.ContinueOnError)
+	agent := agentFlag(fs)
+	var f skills.Filter
+	fs.StringVar(&f.Kind, "kind", "", "a job kind or a catalog kind")
+	fs.StringVar(&f.Repo, "repo", "", "repository path or folder name (skills whose projects include it)")
+	fs.StringVar(&f.Status, "status", "", "core|active|draft|deprecated (default core and active)")
+	asJSON := fs.Bool("json", false, "print as JSON (same as skill_list)")
+	pos, err := parse(fs, args[1:])
+	if err != nil {
+		return err
+	}
+	query := strings.Join(pos, " ")
+	switch {
+	case sub == "search" && strings.TrimSpace(query) == "":
+		return errors.New("skills search needs a QUERY")
+	case sub == "list" && len(pos) > 0:
+		return errors.New("skills list takes no QUERY (use skills search)")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := m.SkillList(context.Background(), query, f)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(out)
+	}
+	for _, w := range out.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", shown(w))
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	head := "NAME\tSTATUS\tKB\tUSES\tRATE\tSTALE\tDESCRIPTION"
+	if sub == "search" {
+		head = "SCORE\t" + head
+	}
+	fmt.Fprintln(w, head)
+	for _, s := range out.Skills {
+		if sub == "search" {
+			fmt.Fprintf(w, "%.2f\t", s.Score)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%.0f\t%d\t%.0f%%\t%t\t%s\n", shown(s.Name), s.Status, s.SizeKB, s.Uses, s.SuccessRate*100,
+			s.Stale, jobs.Printable(s.Description, 100))
+	}
+	return w.Flush()
 }
 
 // shown prints a name taken from a job's stream (a skill, a guard rule, a group key): as it is when

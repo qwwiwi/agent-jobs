@@ -202,7 +202,7 @@ func TestSummarizeGrouping(t *testing.T) {
 	if got := fmt.Sprint(rep.GuardRules); got != "[{outward 3} {pipe-status 1}]" {
 		t.Fatalf("guard rules: %s", got)
 	}
-	if got := fmt.Sprint(rep.Skills); got != "[{deploy 2 3 1 0.5} {review 2 2 1 0.5}]" {
+	if got := fmt.Sprint(rep.Skills); got != "[{deploy 2 3 1 0.5 0 0} {review 2 2 1 0.5 0 0}]" {
 		t.Fatalf("skills: %s", got)
 	}
 	if _, err := Summarize(rows, "repo"); err == nil {

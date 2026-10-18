@@ -50,6 +50,9 @@ const (
 	MaxStatsGroups   = 200
 	DefaultStatsDays = 30
 	MaxStatsDays     = 365
+	// DefaultSkillsLimit and MaxSkillsLimit bound /v1/skills.
+	DefaultSkillsLimit = 100
+	MaxSkillsLimit     = 500
 	// MaxFieldBytes caps every string field of a response (titles, keys, names).
 	MaxFieldBytes = 200
 	// maxTokenBytes bounds the token file read on every request.
@@ -305,6 +308,8 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.stats(w, r)
 	case p == "/v1/schedules":
 		a.schedules(w, r)
+	case p == "/v1/skills":
+		a.skills(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
@@ -560,6 +565,9 @@ type JobView struct {
 	ScheduleID      string  `json:"schedule_id,omitempty"`
 	Attempt         int     `json:"attempt"`
 	Containment     string  `json:"containment,omitempty"`
+	// Skills are the names of the job's selected skills, SkillsDelivered those linked for the attempt.
+	Skills          []string `json:"skills,omitempty"`
+	SkillsDelivered []string `json:"skills_delivered,omitempty"`
 	// ErrorCode is one of the Err* codes when the job has an error, ErrorMessage its fixed message.
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
@@ -592,6 +600,7 @@ func ViewOf(j *store.Job) JobView {
 		FinishedAt: ts(j.FinishedAt), NotifiedAt: ts(j.NotifiedAt), CleanedAt: ts(j.CleanedAt),
 		OwnerWaits: j.OwnerWaits, ResumedFrom: capField(j.ResumedFrom), ScheduleID: capField(j.ScheduleID),
 		Attempt: j.Attempt, Containment: capField(jobs.Containment(j)),
+		Skills: capNames(j.Skills), SkillsDelivered: capNames(j.SkillsDelivered),
 	}
 	if j.Runner == store.RunnerCodex {
 		v.Limits = jobs.CodexLimitsNA
@@ -600,6 +609,18 @@ func ViewOf(j *store.Job) JobView {
 		v.ErrorCode, v.ErrorMessage = code, errorMessages[code]
 	}
 	return v
+}
+
+// capNames caps every name of a list (nil stays nil).
+func capNames(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = capField(s)
+	}
+	return out
 }
 
 // JobsOutput is /v1/jobs.
@@ -770,6 +791,51 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// skills is /v1/skills: the skills rating (jobs.SkillRatings) for a frontend, names and numbers only
+// (no skill bodies, paths or briefs). since: default 30 days, at most 365; repo: a folder name;
+// limit: default 100, at most 500.
+func (a *API) skills(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	now := a.m.Now()
+	s := q.Get("since")
+	if s == "" {
+		s = strconv.Itoa(DefaultStatsDays) + "d"
+	}
+	since, err := jobs.ParseSince(s, now)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if since.Before(now.Add(-MaxStatsDays * 24 * time.Hour)) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("since must be within the last %d days", MaxStatsDays))
+		return
+	}
+	limit, ok := intParam(q, "limit", DefaultSkillsLimit)
+	if !ok || limit < 1 || limit > MaxSkillsLimit {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be 1..%d", MaxSkillsLimit))
+		return
+	}
+	repo := q.Get("repo")
+	if repo != "" && (len(repo) > MaxFieldBytes || strings.ContainsAny(repo, "/\\\x00") || repo == "." || repo == "..") {
+		writeError(w, http.StatusBadRequest, "repo must be a repository folder name")
+		return
+	}
+	rep, err := a.m.SkillRatings(r.Context(), since, repo, limit)
+	if err != nil {
+		a.internalError(w, "skills", err)
+		return
+	}
+	rep.Repo = capField(rep.Repo)
+	for i := range rep.Skills {
+		sk := &rep.Skills[i]
+		sk.Name, sk.Status = capField(sk.Name), capField(sk.Status)
+		for k := range sk.ByRepo {
+			sk.ByRepo[k].Repo = capField(sk.ByRepo[k].Repo)
+		}
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 // ScheduleView is one schedule without its prompt (a schedule's prompt is a brief) or repository path,

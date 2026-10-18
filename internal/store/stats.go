@@ -31,6 +31,8 @@ type JobStats struct {
 	ToolCalls map[string]int `json:"tool_calls"`
 	// Skills counts uses by skill name: Skill tool calls and reads under a skills/<name>/ dir.
 	Skills map[string]int `json:"skills"`
+	// SkillsDelivered are the catalog skills linked into the job's work dir (E7), used or not.
+	SkillsDelivered []string `json:"skills_delivered,omitempty"`
 	// GuardRefusals is the number of tool calls the guard refused; GuardRules counts them by rule.
 	GuardRefusals int            `json:"guard_refusals"`
 	GuardRules    map[string]int `json:"guard_rules"`
@@ -71,7 +73,7 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
 	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
-	cost_unknown`
+	cost_unknown, skills_delivered`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -91,10 +93,11 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
-		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown)
+		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
+		JoinNames(st.SkillsDelivered))
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -105,12 +108,13 @@ func scanStats(r scanner) (*JobStats, error) {
 	var st JobStats
 	var created, recorded int64
 	var started, finished sql.NullInt64
-	var tools, skills, rules string
+	var tools, skills, rules, delivered string
 	if err := r.Scan(&st.ID, &st.Kind, &st.Model, &st.Status, &st.Turns, &st.CostUSD, &st.DurationSec, &created,
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
-		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown); err != nil {
+		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered); err != nil {
 		return nil, err
 	}
+	st.SkillsDelivered = SplitNames(delivered)
 	st.CreatedAt, st.RecordedAt = time.Unix(created, 0), time.Unix(recorded, 0)
 	if started.Valid {
 		t := time.Unix(started.Int64, 0)
