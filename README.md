@@ -554,7 +554,7 @@ scripts/acceptance-clean-clone.sh --real-model sonnet   # the test job on a real
 5. Runs one job in a scratch git repository and waits for it: by default a stub stands in for `claude` (`AGENT_JOBS_CLAUDE_BIN`, no model, no cost); its status must be `succeeded`, `report.md` must exist and `agent-jobs result` must show the report.
 6. Prints PASS / FAIL with the exit code per step. On success the temp dir is removed (`--keep` keeps it); on failure it is kept and its path printed.
 
-The caller's checkout, state dir, daemon, units, tmux and config are never touched; only the Go build cache is shared. With `--real-model` the job keeps the real HOME so `claude` finds its login. Inside a job the binary refuses control commands, so the script refuses to run there unless `--inside-job`, which builds with the test hooks and is not a release acceptance. `AGENT_JOBS_TEST_ACCEPTANCE=1 go test -run TestAcceptanceScriptRun .` runs it (without the test suite) as a Go test.
+The caller's checkout, state dir, daemon, units, tmux and config are never touched; only the Go build cache is shared. With `--real-model` the job keeps the real HOME so `claude` finds its login. Inside a job the binary refuses control commands, so the script refuses to run there unless `--inside-job`, which builds with the test hooks and is not a release acceptance. `ACCEPTANCE_CLEAN_CLONE=1 go test -run TestAcceptanceScriptRun .` runs it (without the test suite) as a Go test.
 
 ## Versioning
 

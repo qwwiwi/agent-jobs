@@ -157,6 +157,13 @@ STATE="$SANDBOX_HOME/.agent-jobs/$AGENT"
 STUB="$ROOT/stub"
 LOGS="$ROOT/logs"
 SCRATCH="$ROOT/scratch"
+# A unix socket path holds at most 104 bytes on macOS (108 on Linux); the daemon's sockets live in the
+# state dir.
+if [ "${#STATE}" -gt 88 ]; then
+  rmdir "$ROOT"
+  echo "acceptance: state dir $STATE is too long for its unix sockets; use a shorter TMPDIR" >&2
+  exit 2
+fi
 mkdir -p "$ROOT/bin" "$SANDBOX_HOME" "$STUB" "$LOGS"
 
 STEP_NAMES=()
