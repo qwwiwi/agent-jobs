@@ -45,6 +45,8 @@ type ScheduleRequest struct {
 	Base            string
 	Runner          string
 	ReasoningEffort string
+	// Skills are skill edits (as StartRequest.Skills), stored and applied at each firing.
+	Skills []string
 }
 
 // SchedulePrompt validates a schedule's prompt: required, valid UTF-8, one line (no control or
@@ -101,8 +103,8 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	sc := &store.Schedule{Cron: cron, Prompt: prompt, Enabled: true}
 	if r.Kind == "" {
 		if r.Title != "" || r.Model != "" || r.Complexity != "" || r.MaxTurns != 0 || r.MaxBudgetUSD != 0 ||
-			r.TimeoutMinutes != 0 || r.Repo != "" || r.Base != "" || r.Runner != "" || r.ReasoningEffort != "" {
-			return nil, errors.New("job fields (title, model, complexity, limits, repo, base, runner, reasoning_effort) " +
+			r.TimeoutMinutes != 0 || r.Repo != "" || r.Base != "" || r.Runner != "" || r.ReasoningEffort != "" || len(r.Skills) > 0 {
+			return nil, errors.New("job fields (title, model, complexity, limits, repo, base, runner, reasoning_effort, skills) " +
 				"need a kind; without a kind the prompt goes into the session")
 		}
 		if m.Cfg.NotifyTmuxTarget == "" {
@@ -123,10 +125,18 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	j, err := m.newJob(StartRequest{
 		Title: title, Kind: r.Kind, Brief: prompt, RepoPath: r.Repo, Base: r.Base, Model: r.Model,
 		Complexity: r.Complexity, MaxTurns: r.MaxTurns, MaxBudgetUSD: r.MaxBudgetUSD, TimeoutMinutes: r.TimeoutMinutes,
-		Runner: r.Runner, ReasoningEffort: r.ReasoningEffort,
+		Runner: r.Runner, ReasoningEffort: r.ReasoningEffort, Skills: r.Skills,
 	})
 	if err != nil {
 		return nil, err
+	}
+	for _, e := range r.Skills {
+		if e = strings.TrimSpace(e); e != "" {
+			if strings.Contains(e, ",") {
+				return nil, fmt.Errorf("skill edit %q: one name per entry", e)
+			}
+			sc.Skills = append(sc.Skills, e)
+		}
 	}
 	if r.Title == "" {
 		j.Title = ""
@@ -300,7 +310,7 @@ func (m *Manager) fireSchedules() error {
 		j, err := m.Enqueue(StartRequest{
 			Title: ScheduleTitle(sc), Kind: sc.Kind, Brief: sc.Prompt, RepoPath: sc.RepoPath, Base: sc.Base, Model: sc.Model,
 			Complexity: sc.Complexity, MaxTurns: sc.MaxTurns, MaxBudgetUSD: sc.MaxBudgetUSD, TimeoutMinutes: sc.TimeoutMinutes,
-			Runner: sc.Runner, ReasoningEffort: sc.ReasoningEffort, ScheduleID: strconv.FormatInt(sc.ID, 10),
+			Runner: sc.Runner, ReasoningEffort: sc.ReasoningEffort, ScheduleID: strconv.FormatInt(sc.ID, 10), Skills: sc.Skills,
 		})
 		if err != nil {
 			ferr = err.Error()

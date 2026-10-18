@@ -335,6 +335,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if err := m.verifyWorktree(j, work); err != nil {
 		return fmt.Errorf("refusing to touch %s: %w", work, err)
 	}
+	m.removeSkills(j) // removed when the attempt ended; again here, so no link reaches a patch
 	drivers, err := repoDrivers(work)
 	if err != nil {
 		return err

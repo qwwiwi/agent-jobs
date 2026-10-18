@@ -112,12 +112,12 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
 // without a subagent log (every subagent refused). Jobs get JobGuardCommand.
-func (m *Manager) GuardCommand(gitDirs ...string) string { return m.guardCommand("", gitDirs...) }
+func (m *Manager) GuardCommand(gitDirs ...string) string { return m.guardCommand("", nil, gitDirs...) }
 
 // JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
 // guard.MaxSubagentsPerJob subagents per job.
 func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
-	return m.guardCommand(id, gitDirs...)
+	return m.guardCommand(id, m.skillProtected(nil), gitDirs...)
 }
 
 // ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
@@ -133,7 +133,7 @@ func (m *Manager) SubagentLogPath(id string) string {
 	return filepath.Join(m.StateDir, "subagents", id+".log")
 }
 
-func (m *Manager) guardCommand(jobID string, gitDirs ...string) string {
+func (m *Manager) guardCommand(jobID string, extraProtected []string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Cfg.OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -150,7 +150,7 @@ func (m *Manager) guardCommand(jobID string, gitDirs ...string) string {
 	if jobID != "" {
 		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
 			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
-		for _, p := range m.ProtectedPaths() {
+		for _, p := range append(m.ProtectedPaths(), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
 	}
@@ -166,12 +166,15 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // JobSettings is the settings.json of job j: Settings plus the job's subagent log in the guard hook.
 // The subagent tool (Agent, formerly Task) is not denied: a job may use up to three subagents, which
 // run inside the job's process, under these settings and this hook, within the job's limits.
+// The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
+// the guard): a job reads its skills but never changes the catalog through them.
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
-	return m.settings(j.Kind, m.JobGuardCommand(j.ID, gitDirs...))
+	protected := m.skillProtected(j)
+	return m.settings(j.Kind, m.guardCommand(j.ID, protected, gitDirs...), skillDenyRules(protected)...)
 }
 
-func (m *Manager) settings(kind, guardCmd string) map[string]any {
-	deny := append([]string{}, denyRules...)
+func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
+	deny := append(append([]string{}, denyRules...), extraDeny...)
 	if kind != "research" {
 		deny = append(deny, webTools...)
 	}
@@ -244,7 +247,7 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 			"Commit locally; never push. The diff is measured from that base.", j.BaseCommit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n%s\n\n## Owner rules\n\n%s\n\n", pre, sub, ownerRules)
+	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
@@ -276,7 +279,7 @@ func (m *Manager) JobMCPConfig() map[string]any {
 }
 
 // prepare creates the job directory: prompt.md, settings.json, mcp.json, work/, base_commit.
-func (m *Manager) prepare(j *store.Job, dir string) error {
+func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	rules, err := m.readOwnerRules()
 	if err != nil {
 		return err
@@ -314,10 +317,13 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	work := filepath.Join(dir, "work")
 	settings := filepath.Join(dir, "settings.json")
 	if j.RepoPath == "" {
-		if err := writeJSON(settings, m.JobSettings(j)); err != nil {
+		if err := os.MkdirAll(work, 0o700); err != nil {
 			return err
 		}
-		return os.MkdirAll(work, 0o700)
+		if err := m.deliverSkills(j, token, work); err != nil {
+			return err
+		}
+		return writeJSON(settings, m.JobSettings(j))
 	}
 	if _, err := os.Stat(work); err == nil {
 		return fmt.Errorf("work dir %s already exists", work)
@@ -336,6 +342,9 @@ func (m *Manager) prepare(j *store.Job, dir string) error {
 	}
 	common, err := git(work, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
+		return err
+	}
+	if err := m.deliverSkills(j, token, work); err != nil {
 		return err
 	}
 	if err := writeJSON(settings, m.JobSettings(j, gitDir, common)); err != nil {
