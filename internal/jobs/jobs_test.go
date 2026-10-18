@@ -65,6 +65,14 @@ if [[ $prompt == *FAKE_WIP* ]]; then
   echo wip > wip.txt
   echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"WIP_PROGRESS_NOTE"}]}}'
 fi
+if [[ $prompt == *FAKE_LINK_COMMIT* ]]; then
+  # The job forces its skill link into a commit (info/exclude does not stop git add -f).
+  echo work > skillwork.txt
+  git add skillwork.txt
+  git add -f .claude/skills/golang
+  git -c user.name=T -c user.email=t@example.com commit -qm "link committed"
+fi
+if [[ $prompt == *FAKE_LINK_STAGE* ]]; then git add -f .claude/skills/golang; fi
 if [[ $prompt == *FAKE_SKILLS* ]]; then
   # What the job sees of its skills (links, their targets, git status), then a commit of everything.
   { ls .claude/skills 2>&1; echo ---; for l in .claude/skills/*; do readlink "$l"; done; echo ---
