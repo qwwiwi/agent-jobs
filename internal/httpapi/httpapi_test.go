@@ -599,7 +599,7 @@ func TestHealthHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.m.Cfg.Heartbeat = jobs.HeartbeatConfig{Enabled: true, GoalsFile: goals}
-	h, err := f.m.Store.ClaimHeartbeat(jobs.HeartbeatTriggerDaemon, f.now, 0)
+	h, err := f.m.Store.ClaimHeartbeat(jobs.HeartbeatTriggerDaemon, f.now, store.HeartbeatClaimLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}

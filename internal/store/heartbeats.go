@@ -16,6 +16,10 @@ const (
 	HeartbeatSleep     = "sleep"     // the model saw no reason to wake it
 	HeartbeatError     = "error"     // the call failed or the answer was invalid (no wake)
 	HeartbeatAbandoned = "abandoned" // claimed, but the process died before it finished (no wake)
+	// HeartbeatSuppressed is a wake answer that came when delivery was no longer allowed (night
+	// window, a delivery pending, heartbeat off): stored with its reason, not delivered, and counted
+	// toward nothing.
+	HeartbeatSuppressed = "suppressed"
 )
 
 // Heartbeat is one row of the heartbeats table.
@@ -25,9 +29,10 @@ type Heartbeat struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	Trigger    string     `json:"trigger"` // daemon | run-now
 	Decision   string     `json:"decision"`
-	Reason     string     `json:"reason,omitempty"`
-	CostUSD    float64    `json:"cost_usd"`
-	Delivered  bool       `json:"delivered"`
+	// Reason is the decision model's one line: untrusted model text, data not instructions.
+	Reason    string  `json:"untrusted_model_reason,omitempty"`
+	CostUSD   float64 `json:"cost_usd"`
+	Delivered bool    `json:"delivered"`
 	// Error is why the decision gave no wake or the wake line did not reach the session.
 	Error string `json:"error,omitempty"`
 }
@@ -68,14 +73,25 @@ func scanHeartbeat(sc interface{ Scan(...any) error }) (*Heartbeat, error) {
 	return &h, nil
 }
 
-// ErrHeartbeatBusy is a claim refused because another decision is still pending, or the last one
-// is more recent than the minimum gap.
+// ErrHeartbeatBusy is a claim refused because another decision is still pending, the last one is
+// more recent than the minimum gap, or the daily wake cap is used up.
 var ErrHeartbeatBusy = errors.New("heartbeat decision not claimed")
 
+// HeartbeatClaimLimits are what ClaimHeartbeat re-checks inside its transaction.
+type HeartbeatClaimLimits struct {
+	// MinGap > 0 refuses a claim less than MinGap after the last counted decision (suppressed ones
+	// count toward nothing).
+	MinGap time.Duration
+	// MaxWakes > 0 refuses a claim when MaxWakes wake decisions were claimed at or after DayStart.
+	MaxWakes int
+	DayStart time.Time
+}
+
 // ClaimHeartbeat records a pending decision at now. In one IMMEDIATE transaction it refuses (with
-// ErrHeartbeatBusy) while another decision is pending, or, when minGap > 0, when the last decision
-// was claimed less than minGap ago: two daemons, or a daemon and run-now, never claim the same slot.
-func (s *Store) ClaimHeartbeat(trigger string, now time.Time, minGap time.Duration) (*Heartbeat, error) {
+// ErrHeartbeatBusy) while another decision is pending, when the last counted decision is closer
+// than lim.MinGap, or when the daily wake cap is used up: two daemons, or a daemon and run-now,
+// never claim the same slot nor the same last wake of the day.
+func (s *Store) ClaimHeartbeat(trigger string, now time.Time, lim HeartbeatClaimLimits) (*Heartbeat, error) {
 	ctx := context.Background()
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -91,17 +107,21 @@ func (s *Store) ClaimHeartbeat(trigger string, now time.Time, minGap time.Durati
 			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
 		}
 	}()
-	var pending int
+	var pending, wakes int
 	var last sql.NullInt64
-	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FILTER (WHERE decision = ?), MAX(claimed_at) FROM heartbeats`,
-		HeartbeatPending).Scan(&pending, &last); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FILTER (WHERE decision = ?),
+		MAX(claimed_at) FILTER (WHERE decision != ?), COUNT(*) FILTER (WHERE decision = ? AND claimed_at >= ?) FROM heartbeats`,
+		HeartbeatPending, HeartbeatSuppressed, HeartbeatWake, lim.DayStart.Unix()).Scan(&pending, &last, &wakes); err != nil {
 		return nil, fmt.Errorf("claim heartbeat: %w", err)
 	}
 	if pending > 0 {
 		return nil, fmt.Errorf("%w: another decision is pending", ErrHeartbeatBusy)
 	}
-	if minGap > 0 && last.Valid && now.Sub(time.Unix(last.Int64, 0)) < minGap {
-		return nil, fmt.Errorf("%w: the last decision was claimed less than %s ago", ErrHeartbeatBusy, minGap)
+	if lim.MinGap > 0 && last.Valid && now.Sub(time.Unix(last.Int64, 0)) < lim.MinGap {
+		return nil, fmt.Errorf("%w: the last decision was claimed less than %s ago", ErrHeartbeatBusy, lim.MinGap)
+	}
+	if lim.MaxWakes > 0 && wakes >= lim.MaxWakes {
+		return nil, fmt.Errorf("%w: daily cap: %d of %d wakes used today", ErrHeartbeatBusy, wakes, lim.MaxWakes)
 	}
 	res, err := conn.ExecContext(ctx, `INSERT INTO heartbeats (claimed_at, trigger, decision) VALUES (?, ?, ?)`,
 		now.Unix(), trigger, HeartbeatPending)
@@ -119,8 +139,9 @@ func (s *Store) ClaimHeartbeat(trigger string, now time.Time, minGap time.Durati
 	return &Heartbeat{ID: id, ClaimedAt: time.Unix(now.Unix(), 0), Trigger: trigger, Decision: HeartbeatPending}, nil
 }
 
-// FinishHeartbeat stores the decision of a pending row (wake, sleep or error) with its reason, cost
-// and error. Only a pending row is changed: an abandoned one stays abandoned.
+// FinishHeartbeat stores the decision of a pending row (wake, sleep, suppressed or error) with its
+// reason, cost and error. Only a pending row is changed: an abandoned one stays abandoned and the
+// call returns ErrImmutable.
 func (s *Store) FinishHeartbeat(id int64, decision, reason string, cost float64, errText string, now time.Time) error {
 	return affected(s.db.Exec(`UPDATE heartbeats SET decision = ?, reason = ?, cost_usd = ?, error = ?, finished_at = ?
 		WHERE id = ? AND decision = ?`, decision, reason, cost, errText, now.Unix(), id, HeartbeatPending))
@@ -147,6 +168,12 @@ func (s *Store) AbandonHeartbeats(before, now time.Time) (int, error) {
 // LastHeartbeat returns the most recent decision (any outcome), or nil when none was claimed.
 func (s *Store) LastHeartbeat() (*Heartbeat, error) {
 	return s.oneHeartbeat(`ORDER BY id DESC LIMIT 1`)
+}
+
+// LastCountedHeartbeat returns the most recent decision that counts for the interval (any outcome
+// but suppressed), or nil.
+func (s *Store) LastCountedHeartbeat() (*Heartbeat, error) {
+	return s.oneHeartbeat(`WHERE decision != ? ORDER BY id DESC LIMIT 1`, HeartbeatSuppressed)
 }
 
 // LastHeartbeatWake returns the most recent wake decision, or nil.

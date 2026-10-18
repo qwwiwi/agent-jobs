@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +16,8 @@ import (
 )
 
 // fakeHeartbeatClaude stands in for the decision call: it records each call (argv, stdin, env) in
-// $FAKE_HB_DIR, sleeps when $FAKE_HB_DIR/sleep exists, and prints $FAKE_HB_DIR/out.
+// $FAKE_HB_DIR, sleeps when $FAKE_HB_DIR/sleep exists, waits for $FAKE_HB_DIR/go when
+// $FAKE_HB_DIR/hold exists (touching held first), and prints $FAKE_HB_DIR/out.
 const fakeHeartbeatClaude = `#!/bin/bash
 d="$FAKE_HB_DIR"
 echo call >> "$d/calls"
@@ -23,6 +25,7 @@ printf '%s\n' "$@" > "$d/argv"
 cat > "$d/stdin"
 env > "$d/env"
 if [[ -f "$d/sleep" ]]; then sleep 30; fi
+if [[ -f "$d/hold" ]]; then touch "$d/held"; while [[ ! -f "$d/go" ]]; do sleep 0.05; done; fi
 cat "$d/out" 2>/dev/null
 `
 
@@ -87,7 +90,7 @@ func (e *hbEnv) calls() int {
 // decision stores a finished decision claimed at at.
 func (e *hbEnv) decision(t *testing.T, at time.Time, decision string) {
 	t.Helper()
-	h, err := e.m.Store.ClaimHeartbeat(HeartbeatTriggerDaemon, at, 0)
+	h, err := e.m.Store.ClaimHeartbeat(HeartbeatTriggerDaemon, at, store.HeartbeatClaimLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +177,7 @@ func TestHeartbeatGateReasons(t *testing.T) {
 	}
 	*e.now = hbNoon
 
-	h, err := m.Store.ClaimHeartbeat(HeartbeatTriggerDaemon, hbNoon.Add(-time.Minute), 0)
+	h, err := m.Store.ClaimHeartbeat(HeartbeatTriggerDaemon, hbNoon.Add(-time.Minute), store.HeartbeatClaimLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +349,7 @@ func TestParseHeartbeatAnswerStrict(t *testing.T) {
 	}
 }
 
-// A wake: the decision is stored, then one defanged "[jobs:heartbeat] <reason>" line goes through
+// A wake: the decision is stored, then the fixed line "[jobs:heartbeat] wake <id>" goes through
 // the job-done tmux path; the call itself is read-only (no tools, one turn, the configured model,
 // the scrubbed environment) and gets the goals, the time and the state summary.
 func TestHeartbeatWakeDelivered(t *testing.T) {
@@ -368,7 +371,7 @@ func TestHeartbeatWakeDelivered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "-L|agent2|send-keys|-t|orch|-l|[jobs:heartbeat] (jobs:job-done] release notes are stale|\n-L|agent2|send-keys|-t|orch|Enter|\n"
+	want := fmt.Sprintf("-L|agent2|send-keys|-t|orch|-l|[jobs:heartbeat] wake %d|\n-L|agent2|send-keys|-t|orch|Enter|\n", h.ID)
 	if string(b) != want {
 		t.Fatalf("tmux:\n%s", b)
 	}
@@ -488,11 +491,16 @@ func TestHeartbeatClaimedBeforeCall(t *testing.T) {
 		t.Fatalf("no pending claim while the model runs: %+v %v", p, err)
 	}
 	if _, err := m.RunHeartbeat(context.Background(), HeartbeatTriggerRunNow); !IsHeartbeatGateClosed(err) ||
-		!strings.Contains(err.Error(), "running") {
+		!strings.Contains(err.Error(), "heartbeat.lock") {
 		t.Fatalf("second heartbeat: %v", err)
 	}
+	if g := e.gate(t); g.OK || !strings.Contains(g.Reason, "running") {
+		t.Fatalf("gate while the model runs: %+v", g)
+	}
 
-	// "Restart": another manager on the same store, past the stale limit.
+	// "Restart": another manager on the same store, past the stale limit (a dead process holds no
+	// heartbeat.lock, so its gate runs; here the old call still holds it, so the gate is asked
+	// directly).
 	m2, err := Open("test")
 	if err != nil {
 		t.Fatal(err)
@@ -501,9 +509,8 @@ func TestHeartbeatClaimedBeforeCall(t *testing.T) {
 	m2.Cfg.Heartbeat, m2.Cfg.NotifyTmuxTarget, m2.Loc = m.Cfg.Heartbeat, "orch", time.UTC
 	later := hbNoon.Add(10 * time.Minute)
 	m2.Now = func() time.Time { return later }
-	if _, err := m2.RunHeartbeat(context.Background(), HeartbeatTriggerDaemon); !IsHeartbeatGateClosed(err) ||
-		!strings.Contains(err.Error(), "interval: last decision") {
-		t.Fatalf("after restart: %v", err)
+	if g, err := m2.HeartbeatGate(later, false); err != nil || g.OK || !strings.Contains(g.Reason, "interval: last decision") {
+		t.Fatalf("after restart: %+v %v", g, err)
 	}
 	got, err := m2.Store.GetHeartbeat(p.ID)
 	if err != nil || got.Decision != store.HeartbeatAbandoned {

@@ -17,23 +17,23 @@ func TestHeartbeatClaimFinishAbandon(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Unix(1770000000, 0)
-	h, err := s.ClaimHeartbeat("daemon", now, time.Hour)
+	h, err := s.ClaimHeartbeat("daemon", now, HeartbeatClaimLimits{MinGap: time.Hour})
 	if err != nil || h.Decision != HeartbeatPending {
 		t.Fatalf("claim: %+v %v", h, err)
 	}
-	if _, err := s.ClaimHeartbeat("run-now", now, 0); !errors.Is(err, ErrHeartbeatBusy) {
+	if _, err := s.ClaimHeartbeat("run-now", now, HeartbeatClaimLimits{}); !errors.Is(err, ErrHeartbeatBusy) {
 		t.Fatalf("second claim while pending: %v", err)
 	}
 	if err := s.FinishHeartbeat(h.ID, HeartbeatWake, "go", 0.01, "", now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ClaimHeartbeat("daemon", now.Add(30*time.Minute), time.Hour); !errors.Is(err, ErrHeartbeatBusy) {
+	if _, err := s.ClaimHeartbeat("daemon", now.Add(30*time.Minute), HeartbeatClaimLimits{MinGap: time.Hour}); !errors.Is(err, ErrHeartbeatBusy) {
 		t.Fatalf("claim within the gap: %v", err)
 	}
 	if err := s.SetHeartbeatDelivery(h.ID, false, "tmux down"); err != nil {
 		t.Fatal(err)
 	}
-	h2, err := s.ClaimHeartbeat("daemon", now.Add(2*time.Hour), time.Hour)
+	h2, err := s.ClaimHeartbeat("daemon", now.Add(2*time.Hour), HeartbeatClaimLimits{MinGap: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,5 +71,44 @@ func TestHeartbeatClaimFinishAbandon(t *testing.T) {
 	}
 	if r, at, err := s.HeartbeatGate(); err != nil || r != "eligible" || !at.Equal(now.Add(time.Minute)) {
 		t.Fatalf("gate: %q %v %v", r, at, err)
+	}
+}
+
+// The claim re-checks the daily wake cap in its own transaction; a suppressed decision counts
+// toward neither the cap nor the gap.
+func TestHeartbeatClaimDailyCapAndSuppressed(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	day := time.Unix(1770000000, 0)
+	lim := HeartbeatClaimLimits{MaxWakes: 1, DayStart: day}
+	h, err := s.ClaimHeartbeat("run-now", day.Add(time.Hour), lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishHeartbeat(h.ID, HeartbeatWake, "x", 0, "", day.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimHeartbeat("run-now", day.Add(2*time.Hour), lim); !errors.Is(err, ErrHeartbeatBusy) {
+		t.Fatalf("claim over the daily cap: %v", err)
+	}
+	lim = HeartbeatClaimLimits{MinGap: time.Hour, MaxWakes: 2, DayStart: day}
+	h2, err := s.ClaimHeartbeat("daemon", day.Add(3*time.Hour), lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishHeartbeat(h2.ID, HeartbeatSuppressed, "x", 0, "suppressed: night", day.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimHeartbeat("daemon", day.Add(3*time.Hour+time.Minute), lim); err != nil {
+		t.Fatalf("a suppressed decision held the gap: %v", err)
+	}
+	if last, err := s.LastCountedHeartbeat(); err != nil || last == nil || last.Decision != HeartbeatPending {
+		t.Fatalf("last counted: %+v %v", last, err)
+	}
+	if n, _ := s.CountHeartbeatWakes(day); n != 1 {
+		t.Fatalf("wakes: %d", n)
 	}
 }
