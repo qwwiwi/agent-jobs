@@ -2,8 +2,9 @@ package jobs
 
 import (
 	"context"
-	"fmt"
+	"encoding/base64"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,22 +21,29 @@ type testPEM struct {
 }
 
 func newTestPEM(label string, headers ...string) testPEM {
-	var body []string
-	for i := range 8 {
-		// 64 base64 characters, distinct per line.
-		body = append(body, fmt.Sprintf("K%02dPEMbody", i)+rep("Zq8+", 13)+"x/")
+	// A pseudo-random body (fixed seed per label): 8 lines of 64 base64 characters and a short last one.
+	r := rand.New(rand.NewPCG(uint64(len(label)), uint64(len(headers))))
+	raw := make([]byte, 8*48+10)
+	for i := range raw {
+		raw[i] = byte(r.Uint32())
 	}
+	enc := base64.StdEncoding.EncodeToString(raw)
+	var body []string
+	for len(enc) > 64 {
+		body, enc = append(body, enc[:64]), enc[64:]
+	}
+	body = append(body, enc)
 	lines := append([]string{"-----" + "BEGIN " + label + "-----"}, headers...)
 	lines = append(lines, body...)
 	lines = append(lines, "-----"+"END "+label+"-----")
 	return testPEM{text: strings.Join(lines, "\n"), body: body}
 }
 
-// leaks reports whether out holds any 16-byte piece of a body line of the key.
+// leaks reports whether out holds any 8-byte piece of a body line of the key.
 func (p testPEM) leaks(out string) bool {
 	for _, l := range p.body {
-		for i := 0; i+16 <= len(l); i++ {
-			if strings.Contains(out, l[i:i+16]) {
+		for i := 0; i+8 <= len(l); i++ {
+			if strings.Contains(out, l[i:i+8]) {
 				return true
 			}
 		}
@@ -73,17 +81,10 @@ func TestRedactPEMWhole(t *testing.T) {
 		if p.leaks(out) || out != "before\n[redacted:private-key]\nafter\n" {
 			t.Errorf("%s: %q", name, out)
 		}
-		for _, cut := range []func(string) (string, int){redactHeadCutPEM, redactTailCutPEM} {
-			if out, n := cut(in); out != in || n != 0 {
-				t.Errorf("%s: a whole block is changed by a cut rule: %q", name, out)
-			}
-		}
 	}
 	plain := "## Summary\nok -----END of section\nBEGIN here\n"
-	for _, f := range []func(string) (string, int){redactHeadCutPEM, redactTailCutPEM} {
-		if out, n := f(plain); out != plain || n != 0 {
-			t.Errorf("plain text changed: %q", out)
-		}
+	if out := RedactText(plain); out != plain {
+		t.Errorf("plain text changed: %q", out)
 	}
 	if out := RedactRead(plain, true); out != plain {
 		t.Errorf("RedactRead changed plain text: %q", out)
@@ -204,5 +205,206 @@ func TestAcceptanceLogTailPEMCut(t *testing.T) {
 				t.Errorf("%s headerless, cut %s: tail %q, err %v", name, where, tail, err)
 			}
 		}
+	}
+}
+
+// Key blocks as they appear in files and logs: CRLF line ends, indented (YAML, a tab), blank lines,
+// PGP metadata and an encrypted PKCS#1 header with commas; whole and cut off before their END line.
+func TestRedactPEMLayouts(t *testing.T) {
+	p := newTestPEM("RSA PRIVATE KEY", "Proc-Type: 4,ENCRYPTED", "DEK-Info: DES-EDE3-CBC,A1B2C3D4E5F60718", "")
+	g := newTestPEM("PGP PRIVATE KEY BLOCK", "Version: GnuPG v2", "Comment: a key, of mine: test", "", "")
+	layouts := map[string]func(string) string{
+		"lf":       func(s string) string { return s },
+		"crlf":     func(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") },
+		"spaces":   func(s string) string { return "    " + strings.ReplaceAll(s, "\n", "\n    ") },
+		"tab":      func(s string) string { return "\t" + strings.ReplaceAll(s, "\n", "\n\t") },
+		"blank":    func(s string) string { return strings.Replace(s, "\n", "\n\n", 3) },
+		"crlf tab": func(s string) string { return "\t" + strings.ReplaceAll(s, "\n", "\r\n\t") },
+	}
+	for kname, k := range map[string]testPEM{"encrypted rsa": p, "pgp": g} {
+		for lname, f := range layouts {
+			block := f(k.text)
+			whole := "key:\n" + block + "\nafter\n"
+			if out := RedactText(whole); k.leaks(out) || !strings.HasPrefix(out, "key:\n") ||
+				!strings.HasSuffix(out, "after\n") || !strings.Contains(out, "[redacted:private-key]") {
+				t.Errorf("%s %s whole: %q", kname, lname, out)
+			}
+			// No END line: everything from the BEGIN line on goes.
+			open := "key:\n" + block[:strings.LastIndexByte(block, '\n')] + "\n"
+			if out := RedactText(open); k.leaks(out) || !strings.HasPrefix(out, "key:\n") {
+				t.Errorf("%s %s open: %q", kname, lname, out)
+			}
+			// No BEGIN line: the body run above the END line goes, the prose above it stays.
+			orphan := "prose line\n" + block[strings.IndexByte(block, '\n')+1:] + "\nafter\n"
+			if out := RedactText(orphan); k.leaks(out) || !strings.HasPrefix(out, "prose line\n") ||
+				!strings.HasSuffix(out, "after\n") {
+				t.Errorf("%s %s orphan: %q", kname, lname, out)
+			}
+		}
+	}
+}
+
+// A marker quoted inside prose is no marker: a report that talks about key blocks keeps its text.
+func TestRedactPEMInlineMentionKept(t *testing.T) {
+	b, e := "-----"+"BEGIN RSA PRIVATE KEY-----", "-----"+"END OPENSSH PRIVATE KEY-----"
+	for _, s := range []string{
+		"## Summary\nThe redactor drops a block from `" + b + "` on.\nNext line stays.\nAnd this one.\n",
+		"## Findings\nA file ending in " + e + " was seen.\n" + rep("A", 64) + "\nmore prose\n",
+		"## Notes\nkeys start with " + b + "\nand end with " + e + "\n- done\n",
+		"## Summary\nok\n" + rep("a", 64) + "\n" + "b\n",
+	} {
+		if out := RedactText(s); out != s {
+			t.Errorf("changed:\n%q\n%q", s, out)
+		}
+		if out := RedactRead(s, true); out != s {
+			t.Errorf("RedactRead changed:\n%q\n%q", s, out)
+		}
+	}
+}
+
+// A log capped by an earlier build: the cut note, then the body and END line of a block whose BEGIN
+// line was cut off. Read whole (max covers the file, no cut on this read), log_tail shows no body.
+func TestAcceptanceLogPreviouslyCappedOrphan(t *testing.T) {
+	for name, p := range testPEMs() {
+		raw := p.text[strings.IndexByte(p.text, '\n')+1:]
+		raw = raw[strings.IndexByte(raw, '\n')+1:] // a later body line first: the note's neighbour
+		body := "[... 70000 earlier bytes cut, last 900 kept ...]\n" + raw + "\nafter\nEND\n"
+		state := writeAcceptanceLog(t, body)
+		for _, max := range []int64{int64(len(body)), int64(len(body)) + 100, int64(acceptanceReadCap)} {
+			tail, err := ReadAcceptanceLogTail(state, "j1", max)
+			if err != nil || p.leaks(tail) || !strings.HasSuffix(tail, "after\nEND\n") {
+				t.Errorf("%s, max %d: %q, err %v", name, max, tail, err)
+			}
+		}
+	}
+}
+
+// A key larger than the write cap leaves the log on disk holding only its middle: the BEGIN line
+// was evicted, the command was killed before the END line (none in the output at all).
+func TestAcceptanceLogEvictedOpenKey(t *testing.T) {
+	var body []string
+	r := rand.New(rand.NewPCG(7, 7))
+	for range AcceptanceLogBytes/64 + 200 {
+		raw := make([]byte, 48)
+		for i := range raw {
+			raw[i] = byte(r.Uint32())
+		}
+		body = append(body, base64.StdEncoding.EncodeToString(raw))
+	}
+	k := testPEM{body: body}
+	state := t.TempDir()
+	dir := filepath.Join(state, "jobs", "j1")
+	if err := os.MkdirAll(filepath.Join(dir, "work"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	text := "start\n-----" + "BEGIN OPENSSH PRIVATE KEY-----\n" + strings.Join(body, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "key.txt"), []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if exit, _ := runAcceptance(context.Background(), dir, "cat ../key.txt", time.Minute, io.Discard, nil); exit != 0 {
+		t.Fatalf("exit %d", exit)
+	}
+	log := readFile(t, filepath.Join(dir, AcceptanceLog))
+	if k.leaks(log) || !strings.HasPrefix(log, "[... ") {
+		t.Errorf("log on disk: %q", log[:min(len(log), 300)])
+	}
+	tail, err := ReadAcceptanceLogTail(state, "j1", 4096)
+	if err != nil || k.leaks(tail) {
+		t.Errorf("tail %q, err %v", tail, err)
+	}
+	// The same eviction with the key closed in the evicted part: what follows is kept.
+	text = "-----" + "BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----" + "END OPENSSH PRIVATE KEY-----\n" +
+		rep(rep("y", 99)+"\n", AcceptanceLogBytes/100+50) + "tail line\n"
+	if err := os.WriteFile(filepath.Join(dir, "key.txt"), []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if exit, _ := runAcceptance(context.Background(), dir, "cat ../key.txt", time.Minute, io.Discard, nil); exit != 0 {
+		t.Fatalf("exit %d", exit)
+	}
+	if log := readFile(t, filepath.Join(dir, AcceptanceLog)); strings.Contains(log, "private-key") ||
+		!strings.HasSuffix(log, rep("y", 99)+"\ntail line\n") {
+		t.Errorf("closed key: log %q", log[max(0, len(log)-300):])
+	}
+}
+
+// A window with only the middle of a key and no marker, next to a cut note or at a text's end.
+func TestRedactPEMMarkerless(t *testing.T) {
+	p := newTestPEM("RSA PRIVATE KEY")
+	mid := strings.Join(p.body[2:6], "\n")
+	for _, s := range []string{
+		"[... 99 earlier bytes cut, last 9 kept ...]\n" + mid + "\nafter\n",
+		mid + "\nafter\n",
+		"before\n" + mid + "\n",
+	} {
+		out := RedactText(s)
+		if strings.Contains(out, p.body[3][8:24]) || !strings.Contains(out, "[redacted:private-key]") {
+			t.Errorf("%q", out)
+		}
+	}
+	// A big report cut at the scan cap in the middle of a markerless run.
+	big := "## Summary\n" + rep(" ", MaxRedactBytes-len("## Summary\n")-len(mid)-1) + "\n" + mid + "\n" + rep("x", 100)
+	if out, _ := Redact(big); strings.Contains(out, p.body[3][8:24]) {
+		t.Errorf("scan cap: tail %q", out[max(0, len(out)-400):])
+	}
+}
+
+// The archive copy and the in-place rewrite of a report that holds an orphan body and END line (a
+// report cut by an earlier tool) and an open block at its end: neither file keeps any body.
+func TestRedactReportArchiveAndRewritePEM(t *testing.T) {
+	m := newManager(t)
+	a, b := newTestPEM("EC PRIVATE KEY"), newTestPEM("PGP PRIVATE KEY BLOCK", "Version: x", "")
+	report := "## Summary\nok\n" + a.text[strings.IndexByte(a.text, '\n')+1:] + "\nmiddle\n" +
+		b.text[:strings.LastIndexByte(b.text, '\n')] + "\n"
+	dir := m.JobDir("r1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rp := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(rp, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "report.md")
+	if err := archiveReport(rp, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, dst); a.leaks(got) || b.leaks(got) || !strings.Contains(got, "\nmiddle\n") {
+		t.Errorf("archive: %q", got)
+	}
+	if err := m.redactReport("r1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, rp); a.leaks(got) || b.leaks(got) || !strings.HasPrefix(got, "## Summary\nok\n") {
+		t.Errorf("rewrite: %q", got)
+	}
+}
+
+// Markers as files and listings decorate them: a quoted assignment (.env, YAML), a diff, a quote;
+// and a BEGIN marker followed by escaped line breaks on one line, cut off before its END.
+func TestRedactPEMDecoratedMarkers(t *testing.T) {
+	p := newTestPEM("RSA PRIVATE KEY")
+	lines := strings.Split(p.text, "\n")
+	deco := func(first, each, last string) string {
+		out := []string{first + lines[0]}
+		for _, l := range lines[1 : len(lines)-1] {
+			out = append(out, each+l)
+		}
+		return strings.Join(append(out, last+lines[len(lines)-1]), "\n")
+	}
+	for name, block := range map[string]string{
+		"env":       deco(`KEY="`, "", "") + `"`,
+		"yaml":      deco("key: |\n  ", "  ", "  "),
+		"diff add":  deco("+", "+", "+"),
+		"diff del":  deco("-", "-", "-"),
+		"quote":     deco("> ", "> ", "> "),
+		"json list": deco(`"`, `"`, `"`) + `",`,
+	} {
+		in := "loading env\n" + block + "\ndone\n"
+		if out := RedactText(in); p.leaks(out) || !strings.HasPrefix(out, "loading env\n") || !strings.HasSuffix(out, "\ndone\n") {
+			t.Errorf("%s: %q", name, out)
+		}
+	}
+	esc := `got: "` + strings.Join(lines[:4], `\n`) + `...` + "\nnext line\n"
+	if out := RedactText(esc); p.leaks(out) || !strings.HasSuffix(out, "\nnext line\n") {
+		t.Errorf("escaped: %q", out)
 	}
 }

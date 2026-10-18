@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -27,16 +28,22 @@ type redactRule struct {
 	group int
 }
 
-// pemBeginRe and pemEndRe are the header and footer lines of a PEM private key block (PKCS#1/#8,
-// EC, OPENSSH, ENCRYPTED, ...) and of an armored PGP private key block.
-const (
-	pemBeginRe = `-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`
-	pemEndRe   = `-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`
-)
-
+// pemMarkerRe is a header or footer line of a PEM private key block (PKCS#1/#8, EC, OPENSSH,
+// ENCRYPTED, ...) or of an armored PGP private key block: the whole line (indentation and a CR
+// trimmed), so a marker quoted inside prose is none. Allowed around it is only what a file or a
+// listing puts there: a diff or quote prefix ("+", "-", ">", "#", "|"), an assignment ("KEY=",
+// "key: "), quotes, an escaped line break, a trailing comma. pemInlineRe is a whole block on one line
+// (a key with escaped line breaks, as in JSON); pemEscapedRe a BEGIN marker followed by an escaped
+// line break, the rest of the line (such a line cut off before its END).
 var (
-	pemBegin = regexp.MustCompile(pemBeginRe)
-	pemEnd   = regexp.MustCompile(pemEndRe)
+	pemMarkerRe = regexp.MustCompile(`^(?:[-+>#|*]+[ \t]*)?(?:[A-Za-z_][A-Za-z0-9_.-]{0,40}[ \t]*[:=][ \t]*)?["'` + "`" + `]?` +
+		`(-----(BEGIN|END) [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----)(?:\\r)?(?:\\n)?["'` + "`" + `]?[,;]?$`)
+	pemInlineRe  = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[^\n]*?-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`)
+	pemEscapedRe = regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----(?:\\r)?\\n[^\n]*`)
+	// pemHeaderRe is an RFC 1421 / OpenPGP armor header line: Proc-Type, DEK-Info, Version, Comment, ...
+	pemHeaderRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,40}:(?:[ \t].*)?$`)
+	// cutNoteRe is the note a cut leaves at the start or end of a text.
+	cutNoteRe = regexp.MustCompile(`^\[(?:\.\.\. [0-9]+ earlier bytes cut|redacted:unscanned [0-9]+ bytes)`)
 )
 
 // redactRules run in this order: the specific token formats first, the generic key=value last, so a
@@ -47,9 +54,9 @@ var (
 // A boundary before a value is a captured class (RE2 has no lookaround) outside the secret group,
 // and none is matched after it, so two values one separator apart are both found.
 var redactRules = []redactRule{
-	{"private-key", regexp.MustCompile(pemBeginRe + `[\s\S]*?` + pemEndRe), 0},
-	// A key block cut off before its END line: the header and the base64 lines after it.
-	{"private-key", regexp.MustCompile(pemBeginRe + `(?:\r?\n[A-Za-z0-9+/=:\- ]+)*`), 0},
+	// Key blocks on lines of their own are redactPEM's; this is one written on a single line.
+	{"private-key", pemInlineRe, 0},
+	{"private-key", pemEscapedRe, 0},
 	{"anthropic", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}`), 0},
 	{"openai", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`), 0},
 	{"github", regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`), 0},
@@ -78,10 +85,7 @@ func Redact(s string) (string, int) {
 // redactScanned redacts s, a whole text or its scanned prefix; unscanned > 0 is the size of what
 // followed it, replaced by a note (and counted as one redaction).
 func redactScanned(s string, unscanned int64) (string, int) {
-	n := 0
-	if unscanned > 0 {
-		s, n = redactTailCutPEM(s)
-	}
+	s, n := redactPEM(s, false)
 	for _, r := range redactRules {
 		var k int
 		s, k = r.apply(s)
@@ -111,46 +115,6 @@ func lineCut(s string) int {
 	return strings.LastIndexByte(s, '\n') + 1
 }
 
-// A cut can split a PEM private key block, and dropping the partial line at the cut may take its
-// header or footer with it: what is left (base64 lines and the other marker) matches no rule. So a
-// text cut at its end loses everything from a BEGIN line with no END line after it, and a text cut
-// at its start everything up to an END line with no BEGIN line before it; both become
-// [redacted:private-key]. A complete block is left to Redact.
-
-// redactTailCutPEM redacts a text cut at its end (more followed): from the first BEGIN line after
-// the last END line (a block whose END was cut off) to the end of the text.
-func redactTailCutPEM(s string) (string, int) {
-	from := 0
-	if ends := pemEnd.FindAllStringIndex(s, -1); len(ends) > 0 {
-		from = ends[len(ends)-1][1]
-	}
-	b := pemBegin.FindStringIndex(s[from:])
-	if b == nil {
-		return s, 0
-	}
-	return s[:from+b[0]] + "[redacted:private-key]\n", 1
-}
-
-// redactHeadCutPEM redacts a text cut at its start (more preceded it): from the start through the
-// last END line before the first BEGIN line (a block whose BEGIN was cut off), that whole line.
-func redactHeadCutPEM(s string) (string, int) {
-	to := len(s)
-	if b := pemBegin.FindStringIndex(s); b != nil {
-		to = b[0]
-	}
-	ends := pemEnd.FindAllStringIndex(s[:to], -1)
-	if len(ends) == 0 {
-		return s, 0
-	}
-	end := ends[len(ends)-1][1]
-	if i := strings.IndexByte(s[end:], '\n'); i >= 0 {
-		end += i
-	} else {
-		end = len(s)
-	}
-	return "[redacted:private-key]" + s[end:], 1
-}
-
 // RedactText is Redact without the count.
 func RedactText(s string) string {
 	out, _ := Redact(s)
@@ -160,12 +124,259 @@ func RedactText(s string) string {
 // RedactRead redacts a text read up to a byte cap: when truncated (the file went on), the last
 // incomplete line is dropped whole first (all of the text when it has no line break), so a value cut
 // by the read cap is not shown in part; a PEM key block cut off by it is redacted from its BEGIN line
-// on (redactTailCutPEM).
+// on (redactPEM).
 func RedactRead(s string, truncated bool) string {
 	if truncated {
-		s, _ = redactTailCutPEM(s[:lineCut(s)])
+		s = s[:lineCut(s)]
 	}
 	return RedactText(s)
+}
+
+// PEM private key blocks are found line by line (redactPEM), not by a pattern over the whole text,
+// so a block a cut left without its BEGIN or END line (dropping the partial line at a cut may take
+// it, or an earlier build's cut did) is still found, wherever the text came from and whether or not
+// it was cut this time. A marker is a line of its own (indentation, trailing blanks and a CR
+// ignored); a key body line is base64, an armor header ("Proc-Type: 4,ENCRYPTED", "Version: ...")
+// or blank.
+
+// pemLineKind is what one line is to redactPEM.
+type pemLineKind int
+
+const (
+	pemOther pemLineKind = iota
+	pemBegin
+	pemEnd
+	pemBase64 // base64 characters only
+	pemHeader // an armor header line
+	pemBlank
+	pemNote // a cut note
+)
+
+// pemMaxLine bounds a line that can be a marker (pemTracker keeps no more of a line).
+const pemMaxLine = 256
+
+// pemLine classifies a line (without its line break) and returns its trimmed content.
+func pemLine(line string) (pemLineKind, string) {
+	t := strings.Trim(line, " \t\r")
+	if t == "" {
+		return pemBlank, t
+	}
+	if len(t) <= pemMaxLine && strings.Contains(t, "-----") {
+		if m := pemMarkerRe.FindStringSubmatch(t); m != nil {
+			if m[2] == "BEGIN" {
+				return pemBegin, t
+			}
+			return pemEnd, t
+		}
+	}
+	switch {
+	case isBase64Line(pemBodyLine(t)):
+		return pemBase64, t
+	case t[0] == '[' && cutNoteRe.MatchString(t):
+		return pemNote, t
+	case pemHeaderRe.MatchString(t):
+		return pemHeader, t
+	}
+	return pemOther, t
+}
+
+// pemBodyLine is t without one diff or quote prefix character and a trailing quote or comma, as
+// key body lines appear in a diff or a quoted string ("+MIIE...", "\"MIIE...\","); t when it has none.
+func pemBodyLine(t string) string {
+	if isBase64Line(t) {
+		return t
+	}
+	b := strings.TrimRight(t, `"',`)
+	if b != "" && strings.IndexByte(`+->"'`, b[0]) >= 0 {
+		b = b[1:]
+	}
+	if b == "" || !isBase64Line(b) {
+		return t
+	}
+	return b
+}
+
+func isBase64Line(t string) bool {
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '+' || c == '/' || c == '=') {
+			return false
+		}
+	}
+	return true
+}
+
+// A markerless run is base64 lines with no marker around them, the middle of a key whose both
+// markers fell outside a window: it is a key's when it touches the text's start or end or a cut note
+// and holds at least pemMinFullLines lines of a full key line's length.
+const (
+	pemMinFullLines = 2
+	pemFullMin      = 40
+	pemFullMax      = 80
+)
+
+// redactPEM replaces each PEM private key block of s, and what a cut left of one, with
+// [redacted:private-key], in one pass over its lines (linear). open says s starts inside a block (its
+// BEGIN line came before s). Redacted are:
+//   - a block, from its BEGIN line through its END line (a BEGIN inside a block changes nothing);
+//   - a BEGIN line with no END line after it: through the end of s;
+//   - an END line with no BEGIN line before it: with the run of key body lines right above it (from
+//     the start of s when the run reaches it);
+//   - a markerless run of base64 lines (see pemMinFullLines) at the start or end of s or next to a
+//     cut note.
+//
+// It returns the text and the number of spans replaced.
+func redactPEM(s string, open bool) (string, int) {
+	type span struct{ from, to int }
+	var spans []span
+	add := func(from, to int) {
+		for k := len(spans) - 1; k >= 0 && from <= spans[k].to; k-- {
+			from, to = min(from, spans[k].from), max(to, spans[k].to)
+			spans = spans[:k]
+		}
+		spans = append(spans, span{from, to})
+	}
+	openFrom := 0
+	bodyFrom := -1                      // start of the current run of key body lines (first non-blank one), -1: none
+	atStart := true                     // every line so far was a key body line
+	b64From, b64To, b64Full := -1, 0, 0 // the current run of base64 lines
+	b64Edge := false                    // it began at the start of s or right after a cut note
+	markerless := func(atEdge bool) {
+		if b64From >= 0 && (b64Edge || atEdge) && b64Full >= pemMinFullLines {
+			add(b64From, b64To)
+		}
+		b64From, b64Full = -1, 0
+	}
+	prev := pemNote // the start of s counts as a cut: a run there can be a key's middle
+	short := false  // the line before was a base64 line shorter than a full key line
+	for start := 0; start < len(s); {
+		end := strings.IndexByte(s[start:], '\n')
+		if end < 0 {
+			end = len(s)
+		} else {
+			end += start
+		}
+		line := s[start:end]
+		kind, t := pemLine(line)
+		from := start + len(line) - len(strings.TrimLeft(line, " \t\r"))
+		to := from + len(t)
+		if open {
+			if kind == pemEnd {
+				add(openFrom, to)
+				open = false
+			}
+		} else {
+			switch kind {
+			case pemBegin:
+				markerless(false)
+				open, openFrom = true, from
+				bodyFrom = -1
+			case pemEnd:
+				switch {
+				case atStart:
+					add(0, to)
+				case bodyFrom >= 0:
+					add(bodyFrom, to)
+				default:
+					add(from, to)
+				}
+				bodyFrom, b64From, b64Full = -1, -1, 0
+			case pemBase64, pemHeader, pemBlank:
+				if short {
+					// A short base64 line is a key's last body line only right above its END line;
+					// with more lines after it, it is text ("ok"), and the run starts after it.
+					markerless(false)
+					bodyFrom, atStart = -1, false
+				}
+				if kind != pemBlank && bodyFrom < 0 {
+					bodyFrom = from
+				}
+				if kind == pemBase64 {
+					if b64From < 0 {
+						b64From, b64Edge = from, prev == pemNote
+					}
+					b64To = to
+					if n := len(pemBodyLine(t)); pemFullMin <= n && n <= pemFullMax {
+						b64Full++
+					}
+				} else {
+					markerless(false)
+				}
+			case pemNote:
+				markerless(true)
+				bodyFrom = -1
+			default:
+				markerless(false)
+				bodyFrom = -1
+			}
+		}
+		if kind != pemBase64 && kind != pemHeader && kind != pemBlank {
+			atStart = false
+		}
+		// The PGP checksum line ("=Ab12") is short too, and it can follow the body.
+		short = !open && kind == pemBase64 && len(pemBodyLine(t)) < pemFullMin && pemBodyLine(t)[0] != '='
+
+		if kind != pemBlank || prev != pemNote {
+			prev = kind
+		}
+		start = end + 1
+	}
+	if open {
+		add(openFrom, len(strings.TrimRight(s, "\r\n")))
+	} else {
+		markerless(true)
+	}
+	if len(spans) == 0 {
+		return s, 0
+	}
+	var b strings.Builder
+	last := 0
+	for _, sp := range spans {
+		b.WriteString(s[last:sp.from])
+		b.WriteString("[redacted:private-key]")
+		last = sp.to
+	}
+	b.WriteString(s[last:])
+	return b.String(), len(spans)
+}
+
+// pemTracker follows the PEM key block markers of a byte stream, line by line, keeping no more than
+// pemMaxLine bytes of a line: open says the stream is inside a block (a BEGIN line with no END line
+// after it yet).
+type pemTracker struct {
+	open bool
+	line []byte
+	long bool // the current line is longer than pemMaxLine: no marker
+}
+
+func (p *pemTracker) feed(b []byte) {
+	for len(b) > 0 {
+		i := bytes.IndexByte(b, '\n')
+		chunk := b
+		if i >= 0 {
+			chunk = b[:i]
+		}
+		if !p.long {
+			if len(p.line)+len(chunk) > pemMaxLine {
+				p.long, p.line = true, p.line[:0]
+			} else {
+				p.line = append(p.line, chunk...)
+			}
+		}
+		if i < 0 {
+			return
+		}
+		if !p.long {
+			switch kind, _ := pemLine(string(p.line)); kind {
+			case pemBegin:
+				p.open = true
+			case pemEnd:
+				p.open = false
+			}
+		}
+		p.line, p.long = p.line[:0], false
+		b = b[i+1:]
+	}
 }
 
 // RedactPrintable is Printable(s, max) for job-derived text: redacted before it is cut to max runes,
