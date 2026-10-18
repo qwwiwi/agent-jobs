@@ -74,7 +74,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 - **Queue** is one SQLite table per agent. A tick claims a job with a random launch token before spawning anything, and only that tick can finish it, so a job is never launched twice.
 - **Job** is `agent-jobs run-wrapper` running `claude -p` in its own process group, with a scrubbed git environment, in a git worktree detached at the base commit (or an empty directory).
 - **Job folder** keeps the brief, settings, event stream, report and, after cleanup, the patches.
-- **Schedules (cron)** in the diagram are planned (Wave B), not on `main` yet.
+- **Schedules (cron)** are built, unreleased (Wave B): the daemon checks them every minute and types a due prompt into the main session or starts a job.
 
 ### Lifecycle
 
@@ -272,6 +272,17 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 | `intention_list` | the goals, oldest first; optional `status` filter (open \| done \| dropped) |
 | `intention_set` | edit a goal in place by `id`: `status` (open \| done \| dropped) and/or `text`; there is no delete, a goal given up is `dropped` |
 
+**Schedules** (orchestrator only), a cron expression in local time plus a prompt, checked by the daemon every minute:
+
+| tool | what it does |
+|---|---|
+| `schedule_add` | `cron` (5 fields: ranges, steps, lists, names, `@daily` and the like) and `prompt` (one line, ≤ 2000 characters); without `kind` the prompt arrives in the session as `[jobs:schedule] …` (several due in the same minute as one numbered line); with `kind` plus model or complexity (and optional limits, repo, base, runner) it starts a job, validated like `job_start`, model and limits stored now |
+| `schedule_list` | the schedules, oldest first, with the next firing and the last one (job id or why it was not delivered) |
+| `schedule_set` | edit in place by `id`: `cron`, `prompt`, `enabled` (false pauses) |
+| `schedule_remove` | delete by `id`, only on the owner's instruction |
+
+A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts included: a firing must be later than the last one on the local wall clock too, so in the hour repeated when DST ends `*/30 2 * * *` fires at 02:00 and 02:30 once each. If the system clock is set back, schedules pause until the clock passes both persisted watermarks (the instant and the local wall-clock minute of the last firing); a restart does not reset them, and `next_fire_at` shows the firing that resumes them. `agent-jobs schedules --agent A [--json]` lists them.
+
 **Owner** (orchestrator and job):
 
 | tool | what it does |
@@ -289,7 +300,7 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 | Team | `send_message`, `inbox` | none | built (shared brain) |
 | System | `system_doctor`, `system_logs`, `activity_report` | none | built |
 | Files | `trash_move`, `trash_restore` | none | built |
-| Schedules | `schedule_add`, `schedule_list`, `schedule_remove` | none | planned, Wave B |
+| Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |

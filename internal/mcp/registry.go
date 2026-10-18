@@ -59,6 +59,11 @@ var OrchestratorOnly = []string{
 	"intention_add",
 	"intention_list",
 	"intention_set",
+	// Schedules: only the session adds, edits and removes them (removal only on the owner's instruction).
+	"schedule_add",
+	"schedule_list",
+	"schedule_set",
+	"schedule_remove",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

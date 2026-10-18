@@ -68,6 +68,8 @@ const usage = `usage: agent-jobs <command> [flags]
                                            first writes missing rows from job dirs and the archive
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
+  schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
+                                           time, delivery (session or job kind), next and last firing
   notify-owner --agent A --text T [--urgency normal|high]
                                            one "[jobs:notify-owner] T" line into the notify target
                                            for the session to relay (rate limited, stored)
@@ -136,6 +138,8 @@ func main() {
 		err = cmdStats(args)
 	case "intentions":
 		err = cmdIntentions(args)
+	case "schedules":
+		err = cmdSchedules(args)
 	case "notify-owner":
 		err = cmdNotifyOwner(args)
 	case "doctor":
@@ -1022,6 +1026,51 @@ func cmdIntentions(args []string) error {
 			due = "-"
 		}
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Status, it.Priority, due, fmtTime(&it.UpdatedAt), it.Text)
+	}
+	return w.Flush()
+}
+
+func cmdSchedules(args []string) error {
+	fs := flag.NewFlagSet("schedules", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	asJSON := fs.Bool("json", false, "print the list as JSON (same as schedule_list)")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	list, err := m.ListSchedules()
+	if err != nil {
+		return err
+	}
+	out := mcp.SchedulesOutput{Schedules: make([]mcp.ScheduleView, 0, len(list))}
+	for _, sc := range list {
+		out.Schedules = append(out.Schedules, mcp.ScheduleViewOf(m, sc))
+	}
+	if *asJSON {
+		return printJSON(out)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tENABLED\tCRON\tDELIVERY\tNEXT\tLAST\tPROMPT")
+	for _, v := range out.Schedules {
+		delivery := "session"
+		if v.Kind != "" {
+			delivery = "job " + v.Kind + " " + v.Model
+		}
+		next, last := v.NextFireAt, fmtTime(v.LastFiredAt)
+		if next == "" {
+			next = "-"
+		}
+		if v.LastError != "" {
+			last += " (not delivered: " + jobs.Printable(v.LastError, 60) + ")"
+		} else if v.LastJobID != "" {
+			last += " (job " + v.LastJobID + ")"
+		}
+		fmt.Fprintf(w, "%d\t%t\t%s\t%s\t%s\t%s\t%s\n", v.ID, v.Enabled, v.Cron, delivery, next, last,
+			jobs.Printable(v.Prompt, 80))
 	}
 	return w.Flush()
 }

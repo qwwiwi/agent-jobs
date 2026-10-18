@@ -222,6 +222,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: intentions: %w", err)
 	}
+	if _, err := db.Exec(schedulesSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: schedules: %w", err)
+	}
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
