@@ -28,6 +28,8 @@ type SystemDoctorOutput struct {
 	Queue    jobs.QueueStatus `json:"queue"`
 	Procs    jobs.ProcsReport `json:"processes"`
 	Hooks    []jobs.Check     `json:"hooks"`
+	// Daily is the daily automation (prune + doctor procs, report only) and its last run.
+	Daily jobs.DailyStatus `json:"daily"`
 }
 
 func addSystemDoctor(s *sdk.Server, d Deps) {
@@ -36,7 +38,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue, " +
 			"processes that outlived their job or session and running rows with a dead pid (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
-			"owner rules readable, notify target exists). ok=false lists the problems.",
+			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
+			"counts: jobs pruned, bytes freed, archived, ghosts found). ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
 		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks()}
@@ -46,6 +49,16 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.Procs, err = m.DoctorProcs(false); err != nil {
 			return nil, out, fmt.Errorf("doctor procs: %w", err)
+		}
+		if out.Daily, err = m.Daily(); err != nil {
+			out.Problems = append(out.Problems, "daily: "+err.Error())
+		}
+		if r := out.Daily.Result; r != nil {
+			for _, e := range []struct{ name, text string }{{"prune", r.PruneError}, {"doctor procs", r.ProcsError}, {"run", r.Error}} {
+				if e.text != "" {
+					out.Problems = append(out.Problems, fmt.Sprintf("daily %s %s: %s", out.Daily.LastDay, e.name, e.text))
+				}
+			}
 		}
 		switch {
 		case out.Disk.Error != "":

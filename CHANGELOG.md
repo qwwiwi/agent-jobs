@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- Daily automation (Wave B): the daemon runs `prune` (for real, with the log archive) and `doctor procs` (report only, never kills) once per local day, at the first tick after `daily_hour` (default 4; `daily_off: true` disables). The claimed day is stored in the new `daily` table, so a restart does not repeat it and a missed day runs once. Each step is time-boxed (10 min), runs in a goroutine that never overlaps itself or delays launches, and a failing step never stops the other or the tick. The summary is logged and shown by `agent-jobs status` (without an id) and `system_doctor` (`daily`; a failed step is a problem).
 - `scripts/check-commit-messages.sh`, run by `scripts/check.sh` and the pre-push hook: refuses commits not yet on `origin/main` (or the last 20 when it is unknown) whose message contains Cyrillic, naming each one; bash 3.2 and POSIX grep.
 - MCP server `agent-jobs mcp --role orchestrator|job --agent A` (stdio, `github.com/modelcontextprotocol/go-sdk` v1.8.0) with a tool registry of two audiences; the job role is an allowlist, and the server itself refuses hidden tools and filters the tool list.
 - Orchestrator tools `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` over the existing Manager; `job_result` reads `report.md` only as a regular file (no FIFO, symlink or directory), capped at 256 KB.
@@ -43,6 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Test-only build tag `agentjobs_testhooks` honours `AGENT_JOBS_TEST_OUTER_WRAPPER`, so the repository's own test suite runs inside a job; release builds have no such hook (tested).
 
 ### Changed
+- `prune` takes the lifecycle lock per job (re-reading the row under it) instead of once for the whole pass, and stops between jobs when its context ends (`PruneContext`).
 - Jobs launch with a pre-assigned `--session-id` instead of `--no-session-persistence`: claude keeps each job's session on disk (DEVIATIONS #15). `job_cancel` also gives up a `stopped` job. `run-wrapper` takes `--prompt`, `--fallback-prompt` and `--fallback-session` before `--`.
 - In `auto`/`required`, a probe failure on a host where a scope worked before requeues the job every tick for up to 10 minutes instead of silently downgrading or refusing it.
 - A timeout whose scope stop failed keeps the `timeout` status (with the survivors note) instead of turning into `failed`.

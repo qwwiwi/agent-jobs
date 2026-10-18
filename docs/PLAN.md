@@ -56,7 +56,7 @@ Also: the job's environment loses the user bus variables, and the guard rejects 
 - **Dead-man's switch.** Checks that stay silent when all is well leave a completion mark; a watchdog compares the marks with the schedule.
 - **Intentions.** `intention_add`, `intention_list`, `intention_set`: the agent's own goals.
 - **`notify_owner`.** A message to the owner through the agent's existing channel (DEVIATIONS #4).
-- **Daily automation.** `prune` and `doctor procs` run once a day on their own.
+- **Daily automation.** `prune` and `doctor procs` run once a day on their own. **Built on branch `feature/daily-automation`, on review:** inside the daemon loop, once per local day at the first tick after `daily_hour` (default 4; `daily_off` disables); prune for real with the log archive, doctor procs report only (killing stays manual, `--kill`); the claimed day is stored (`daily` table), so a restart never repeats it and a missed day runs once, never caught up; each step time-boxed (10 min), in a goroutine that never overlaps itself or delays the ticks; the last run shows in `agent-jobs status` (no id) and `system_doctor`.
 - **Codex runner.** A job can run on `codex exec` instead of `claude -p` (DEVIATIONS #5); without turn or budget caps there, so the timeout is the limit.
 
 ## Wave C

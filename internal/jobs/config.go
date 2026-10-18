@@ -80,6 +80,22 @@ type Config struct {
 	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
 	// the rule off (claude's own exit or the timeout ends the job).
 	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
+	// DailyHour is the local hour (0..23) after which the daemon runs the daily automation (prune and
+	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
+	DailyHour *int `json:"daily_hour"`
+	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
+	DailyOff bool `json:"daily_off"`
+}
+
+// DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
+const DefaultDailyHour = 4
+
+// DailyAt returns the local hour after which the daily automation runs.
+func (c Config) DailyAt() int {
+	if c.DailyHour == nil {
+		return DefaultDailyHour
+	}
+	return *c.DailyHour
 }
 
 // DefaultLogArchiveDays is the archive retention when log_archive_days is not set.
@@ -183,6 +199,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
 		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
+		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
 	}
 	if c.LogArchiveDir == "" {
 		c.LogArchiveDir = filepath.Join(stateDir, "archive")

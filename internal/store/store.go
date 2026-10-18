@@ -195,7 +195,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema + statsSchema); err != nil {
+	if _, err := db.Exec(schema + statsSchema + dailySchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
