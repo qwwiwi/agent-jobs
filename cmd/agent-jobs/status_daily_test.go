@@ -64,3 +64,26 @@ func TestStatusShowsDaily(t *testing.T) {
 		t.Fatalf("off:\n%s", out)
 	}
 }
+
+// `status` without a job id ends with the undelivered owner notifications of the last 24 h.
+func TestStatusShowsUndeliveredNotifications(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	out := captureStdout(t, func() error { return printUndelivered(m) })
+	if !strings.Contains(out, "no undelivered owner notifications") {
+		t.Fatalf("none:\n%s", out)
+	}
+	if _, err := m.NotifyOwner("job-7", "need a decision", "high"); err == nil { // no notify target configured
+		t.Fatal("delivered without a target")
+	}
+	out = captureStdout(t, func() error { return printUndelivered(m) })
+	for _, want := range []string{"1 owner notifications not delivered", "job job-7 (high): need a decision", "notify_tmux_target"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
+		}
+	}
+}

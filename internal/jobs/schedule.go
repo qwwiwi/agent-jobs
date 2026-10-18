@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -285,7 +286,7 @@ func (m *Manager) fireSchedules() error {
 		if t := m.Cfg.NotifyTmuxTarget; t == "" {
 			ferr = "notify off (notify_tmux_target not configured)"
 			m.Log.Printf("schedule: %s, firing lost: %s", ferr, line)
-		} else if err := m.sendTmux(t, line); err != nil {
+		} else if err := m.sendTmux(context.Background(), t, line); err != nil {
 			ferr = err.Error()
 			m.Log.Printf("schedule: delivery failed, firing lost: %v", err)
 		}

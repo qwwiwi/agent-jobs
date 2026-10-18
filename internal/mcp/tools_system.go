@@ -9,6 +9,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // Thresholds at which system_doctor calls the disk a problem.
@@ -30,6 +31,8 @@ type SystemDoctorOutput struct {
 	Hooks    []jobs.Check     `json:"hooks"`
 	// Daily is the daily automation (prune + doctor procs, report only) and its last run.
 	Daily jobs.DailyStatus `json:"daily"`
+	// Undelivered are notify_owner notifications of the last 24 h that did not reach the session.
+	Undelivered []*store.Notification `json:"undelivered_notifications"`
 }
 
 func addSystemDoctor(s *sdk.Server, d Deps) {
@@ -39,7 +42,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"processes that outlived their job or session and running rows with a dead pid (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
-			"counts: jobs pruned, bytes freed, archived, ghosts found). ok=false lists the problems.",
+			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
+			"not delivered to the session. ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
 		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks()}
@@ -49,6 +53,13 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.Procs, err = m.DoctorProcs(false); err != nil {
 			return nil, out, fmt.Errorf("doctor procs: %w", err)
+		}
+		if out.Undelivered, err = m.UndeliveredNotifications(); err != nil {
+			out.Problems = append(out.Problems, "owner notifications: "+err.Error())
+		} else if n := len(out.Undelivered); n > 0 {
+			last := out.Undelivered[n-1]
+			out.Problems = append(out.Problems, fmt.Sprintf("%d owner notifications not delivered in the last 24 h (latest #%d: %s)",
+				n, last.ID, last.Error))
 		}
 		if out.Daily, err = m.Daily(); err != nil {
 			out.Problems = append(out.Problems, "daily: "+err.Error())

@@ -67,10 +67,12 @@ var OrchestratorOnly = []string{
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
-// team's shared memory, nothing that reaches a person or another agent.
+// team's shared memory, and notify_owner, which reaches the owner only through the agent's own
+// session (rate limited); nothing that reaches another agent.
 var JobAllowed = []string{
 	"memory_search",
 	"memory_write",
+	"notify_owner",
 }
 
 // Allowed reports whether role may see and call the tool.

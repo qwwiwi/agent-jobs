@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,6 +222,9 @@ printf '\n' >> "$FAKE_TMUX_LOG"
 `
 
 func TestMain(m *testing.M) {
+	if os.Getenv(proxyClientEnv) != "" {
+		os.Exit(runProxyClient())
+	}
 	// Under a git hook (pre-push runs scripts/check.sh) git exports GIT_DIR, GIT_INDEX_FILE, …: every
 	// `git -C <tempdir>` in these tests would then act on the real repository (re-init, config, commit).
 	for _, kv := range os.Environ() {
@@ -936,7 +940,7 @@ func TestDoneLineSanitized(t *testing.T) {
 	}
 	m := newManager(t)
 	logf := notifyTo(t, m)
-	if err := m.sendTmux("fake-session", "a\x15b\x1bc\rd"); err != nil {
+	if err := m.sendTmux(context.Background(), "fake-session", "a\x15b\x1bc\rd"); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(logf)
