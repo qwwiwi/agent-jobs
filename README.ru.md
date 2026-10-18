@@ -278,6 +278,8 @@ git config core.hooksPath .githooks   # один раз на клон: pre-push 
 scripts/check.sh                       # gofmt, go vet, go test
 ```
 
+Контрибьюторам: сообщения коммитов только на английском; `scripts/check.sh` (а значит и pre-push хук) отклоняет неотправленные коммиты (`origin/main..HEAD`), в заголовке или теле которых есть кириллица.
+
 **Инициализация агента**
 
 ```bash

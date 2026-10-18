@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- `scripts/check-commit-messages.sh`, run by `scripts/check.sh` and the pre-push hook: refuses commits not yet on `origin/main` (or the last 20 when it is unknown) whose message contains Cyrillic, naming each one; bash 3.2 and POSIX grep.
 - MCP server `agent-jobs mcp --role orchestrator|job --agent A` (stdio, `github.com/modelcontextprotocol/go-sdk` v1.8.0) with a tool registry of two audiences; the job role is an allowlist, and the server itself refuses hidden tools and filters the tool list.
 - Orchestrator tools `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` over the existing Manager; `job_result` reads `report.md` only as a regular file (no FIFO, symlink or directory), capped at 256 KB.
 - Each job's `mcp.json` now names the job-role server instead of an empty stub.
