@@ -46,7 +46,7 @@ func TestBrainToolsPerRole(t *testing.T) {
 		}
 	}
 	job := brainServer(t, RoleJob, &brain.Fake{}, "j1")
-	if got := toolNames(t, job); !slices.Equal(got, []string{"memory_search", "memory_write", "notify_owner"}) {
+	if got := toolNames(t, job); !slices.Equal(got, []string{"check_mark", "memory_search", "memory_write", "notify_owner"}) {
 		t.Fatalf("job role lists %v", got)
 	}
 	for _, n := range brainTools[2:] {

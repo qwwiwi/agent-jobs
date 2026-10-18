@@ -293,7 +293,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 }
 
 // Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops that failed, fire the
-// schedules due this minute, start queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
+// schedules due this minute, run the checks' watchdog (dead-man's switch), start queued ones (≤2 running), send job-done lines, and clean up worktrees whose notify is older than the
 // cleanup delay.
 func (m *Manager) Tick() error {
 	unlock, err := m.lock()
@@ -310,6 +310,9 @@ func (m *Manager) Tick() error {
 	}
 	if err := m.fireSchedules(); err != nil {
 		errs = append(errs, fmt.Errorf("schedules: %w", err))
+	}
+	if err := m.watchChecks(); err != nil {
+		errs = append(errs, fmt.Errorf("checks: %w", err))
 	}
 	if err := m.launchQueued(); err != nil {
 		errs = append(errs, fmt.Errorf("launch: %w", err))

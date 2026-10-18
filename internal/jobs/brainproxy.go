@@ -37,9 +37,9 @@ func (m *Manager) brainAgent() string {
 }
 
 // ServeBrain runs the job proxy for the agent's jobs until ctx ends: a unix socket (mode 600) on
-// which a running job's MCP server asks for memory_search, memory_write and notify_owner. The daemon
-// holds the brain token; the job never does. Without a brain the socket still serves notify_owner
-// (the memory calls answer «brain not configured»). A socket another live daemon answers on is left
+// which a running job's MCP server asks for memory_search, memory_write, notify_owner and
+// check_mark. The daemon holds the brain token; the job never does. Without a brain the socket
+// still serves notify_owner and check_mark (the memory calls answer «brain not configured»). A socket another live daemon answers on is left
 // alone (error); a stale one is replaced.
 func (m *Manager) ServeBrain(ctx context.Context) error {
 	p := BrainSocketPath(m.StateDir)
@@ -99,9 +99,9 @@ func (m *Manager) ServeBrain(ctx context.Context) error {
 
 // HandleBrainRequest answers one proxy call from the process peer (its pid from the socket's peer
 // credentials): only for a running job of this agent that peer belongs to (peerJob; the job id in
-// the request must name that job, so a job never acts as another), only search, write and
-// notify_owner; a write always gets the job's provenance (brain.ForJob) and its path is recorded; a
-// notification is the job's own (rate limited per job).
+// the request must name that job, so a job never acts as another), only search, write,
+// notify_owner and check_mark; a write always gets the job's provenance (brain.ForJob) and its path
+// is recorded; a notification is the job's own (rate limited per job); a mark carries the job's id.
 func (m *Manager) HandleBrainRequest(ctx context.Context, peer int, r brain.SocketRequest) brain.SocketResponse {
 	fail := func(err error) brain.SocketResponse { return brain.SocketResponse{Error: err.Error()} }
 	j, err := m.Store.Get(r.JobID)
@@ -166,6 +166,12 @@ func (m *Manager) HandleBrainRequest(ctx context.Context, peer int, r brain.Sock
 			resp.Error = err.Error()
 		}
 		return resp
+	case brain.SocketOpCheckMark:
+		c, err := m.MarkCheck(r.Check, r.Text, j.ID)
+		if err != nil {
+			return fail(err)
+		}
+		return brain.SocketResponse{Result: checkObject(c)}
 	}
 	return fail(fmt.Errorf("op %q is not available to a job", r.Op))
 }
@@ -202,6 +208,15 @@ func (m *Manager) peerJob(pid int) (*store.Job, error) {
 		return j, nil
 	}
 	return nil, none
+}
+
+// checkObject is a check as the proxy's JSON answer (what a job may see of it).
+func checkObject(c *store.Check) brain.Object {
+	o := brain.Object{"name": c.Name, "cron": c.Cron, "grace_minutes": c.GraceMinutes, "enabled": c.Enabled}
+	if c.LastMarkAt != nil {
+		o["last_mark_at"] = c.LastMarkAt.Format(time.RFC3339)
+	}
+	return o
 }
 
 // notificationObject is a notification as the proxy's JSON answer.

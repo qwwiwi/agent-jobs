@@ -75,6 +75,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 - **Job** is `agent-jobs run-wrapper` running `claude -p` in its own process group, with a scrubbed git environment, in a git worktree detached at the base commit (or an empty directory).
 - **Job folder** keeps the brief, settings, event stream, report and, after cleanup, the patches.
 - **Schedules (cron)** are built, unreleased (Wave B): the daemon checks them every minute and types a due prompt into the main session or starts a job.
+- **Checks (dead-man's switch)** are built, unreleased (Wave B): work that stays silent while healthy leaves a mark; the daemon alerts the main session once when an expected time passes without one.
 
 ### Lifecycle
 
@@ -283,6 +284,18 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 
 A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts included: a firing must be later than the last one on the local wall clock too, so in the hour repeated when DST ends `*/30 2 * * *` fires at 02:00 and 02:30 once each. If the system clock is set back, schedules pause until the clock passes both persisted watermarks (the instant and the local wall-clock minute of the last firing); a restart does not reset them, and `next_fire_at` shows the firing that resumes them. `agent-jobs schedules --agent A [--json]` lists them.
 
+**Checks** (dead-man's switch; orchestrator only, except `check_mark`), a cron expression in local time saying when something that stays silent while healthy must have reported, plus a grace:
+
+| tool | what it does |
+|---|---|
+| `check_add` | `name` (slug: a-z, 0-9, `-`, `_`; ≤ 64), `cron` (same syntax as schedules), optional `grace_minutes` (default 60, 1..10080) |
+| `check_list` | the checks, oldest first: `state` (ok, late, missed, waiting, disabled) for the latest expected time whose grace has passed, the next expected time, the last mark and the last missed alert |
+| `check_set` | edit in place by `name`: `cron`, `grace_minutes`, `enabled` (false pauses); a new cron or grace, or enabling, re-arms the check |
+| `check_remove` | delete by `name` with its marks, only on the owner's instruction |
+| `check_mark` | orchestrator **and job**: leave a completion mark, optional `note` (one line, ≤ 300 characters); a job's mark goes through the daemon and carries its id. CLI: `agent-jobs check mark --agent A NAME [--note T]` (for scripts and timers outside a job) |
+
+In every tick the daemon takes each enabled check's latest expected time E whose E+grace has passed; with no mark in (P+grace, E+grace], P the previous expected time, it types one line `[jobs:check-missed] <name> expected <E> (no mark within <grace>m)` into the session (several in one tick as one line). Each missed E alerts once (claimed in the store, restarts included); after a long downtime only the latest E alerts; expected times before the check was added or re-armed never alert; DST follows the schedules' rule. Windows of consecutive expected times touch and never overlap, so one mark covers one expected time. Missed checks show in `agent-jobs status` and `system_doctor`; `agent-jobs checks --agent A [--json]` lists them.
+
 **Owner** (orchestrator and job):
 
 | tool | what it does |
@@ -303,6 +316,7 @@ A missed minute (daemon down) is lost, not queued; nothing fires twice, restarts
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
 | Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
+| Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, unreleased (Wave B) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---

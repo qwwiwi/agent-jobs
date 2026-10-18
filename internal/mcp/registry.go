@@ -64,15 +64,23 @@ var OrchestratorOnly = []string{
 	"schedule_list",
 	"schedule_set",
 	"schedule_remove",
+	// Checks (dead-man's switch): only the session adds, edits, lists and removes them (removal only
+	// on the owner's instruction); marking is open to jobs.
+	"check_add",
+	"check_list",
+	"check_set",
+	"check_remove",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
-// team's shared memory, and notify_owner, which reaches the owner only through the agent's own
-// session (rate limited); nothing that reaches another agent.
+// team's shared memory, notify_owner, which reaches the owner only through the agent's own
+// session (rate limited), and check_mark, a completion mark for an existing check; nothing that
+// reaches another agent.
 var JobAllowed = []string{
 	"memory_search",
 	"memory_write",
 	"notify_owner",
+	"check_mark",
 }
 
 // Allowed reports whether role may see and call the tool.
