@@ -130,6 +130,8 @@ A model or a complexity is mandatory: with neither the job is rejected. There is
 
 **Codex runner.** A `gpt-*` model (or `--runner codex`) runs the job on `codex exec` instead of `claude -p`. There are no turn or budget caps there, so the timeout is the only limit and the cost is recorded as unknown; `--reasoning-effort low|medium|high` (default `high`). The guard hook does not run inside codex, so only read-only codex jobs (kinds `review` and `research`, codex sandbox `read-only`) are allowed unless the config sets `codex_write_allowed: true`. Resume of a codex job is refused for now. Config `models` can map single kind × complexity cells to codex models; the defaults above do not change. Details: [ARCHITECTURE](docs/ARCHITECTURE.md#codex-runner-deviations-5).
 
+**Acceptance command.** A fix or general job can carry `acceptance_cmd` (`--acceptance-cmd`, one line, ≤ 1 KB): after claude exits 0 with a report, the wrapper runs it with `/bin/sh -c` in the job's worktree, inside the job's containment, with a scrubbed environment and without the guard (the command is yours, not the model's), for at most `acceptance_timeout_minutes` (default 15, max 60). Exit 0 keeps the job succeeded; anything else fails it with «acceptance failed (exit N)». `job_result` shows `acceptance` (command, exit, duration, the tail of `acceptance.log`); a resume runs it again. Review and research jobs refuse it. It runs the code the job wrote, so it catches mistakes, not a hostile job. Details: [ARCHITECTURE](docs/ARCHITECTURE.md#flows).
+
 **Kinds** add a short checklist to the brief:
 
 | kind | the checklist asks for |
@@ -228,9 +230,9 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits; returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits and `acceptance_cmd`; returns the queued row |
 | `job_status` | status, turns, cost, time |
-| `job_result` | job-done line, report (capped at 256 KB, regular files only) and artifact paths |
+| `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome |
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL; a stopped job is given up |
 | `job_stop` | stop a queued or running job, keep its worktree and session: status `stopped` (resumable) |

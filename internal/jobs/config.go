@@ -102,6 +102,9 @@ type Config struct {
 	// HTTPAPI is the read-only HTTP API for a jobs dashboard (DEVIATIONS #8), served by the daemon.
 	// Off by default; the listen address must be loopback or a unix socket path.
 	HTTPAPI HTTPAPIConfig `json:"http_api"`
+	// AcceptanceTimeoutMinutes is the time limit of a job's acceptance command (acceptance_cmd).
+	// 0 = DefaultAcceptanceTimeoutMinutes (15); at most CeilingAcceptanceTimeoutMinutes (60).
+	AcceptanceTimeoutMinutes int `json:"acceptance_timeout_minutes"`
 }
 
 // HTTPAPIConfig is the http_api section of config.json.
@@ -265,6 +268,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
+	}
+	if err := c.validateAcceptance(); err != nil {
+		return c, err
 	}
 	if err := c.validateCodex(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)

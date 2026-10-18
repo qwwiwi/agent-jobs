@@ -116,6 +116,8 @@ type StartRequest struct {
 	ReasoningEffort string
 	// ScheduleID is the schedule that starts the job (set by the daemon, never by a caller).
 	ScheduleID string
+	// AcceptanceCmd is a shell command the job must pass after claude exits 0 (fix and general jobs only).
+	AcceptanceCmd string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -246,6 +248,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd)
+	if err != nil {
+		return nil, err
+	}
 	effort := strings.TrimSpace(r.ReasoningEffort)
 	if err := ValidateReasoningEffort(effort); err != nil {
 		return nil, err
@@ -287,7 +293,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
-		ScheduleID: r.ScheduleID,
+		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance,
 	}
 	return j, nil
 }
@@ -716,11 +722,11 @@ func (m *Manager) collect() error {
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
 			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-			status, msg := Verdict(code, res, dir)
+			status, msg := m.verdict(j, code, res, dir)
 			m.finish(j, status, res, false, dur, msg, now)
 			continue
 		}
-		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
+		if j.StartedAt != nil && now.After(m.jobDeadline(j)) {
 			m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
 			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
@@ -730,7 +736,7 @@ func (m *Manager) collect() error {
 			// Re-check: the wrapper may have written exit_code right before exiting.
 			if code, ok := readExitCode(dir); ok {
 				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-				status, msg := Verdict(code, res, dir)
+				status, msg := m.verdict(j, code, res, dir)
 				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}

@@ -441,6 +441,7 @@ const (
 	ErrDeliveryFailed     = "delivery_failed"
 	ErrProcessesSurvived  = "processes_survived"
 	ErrRunFailed          = "run_failed"
+	ErrAcceptanceFailed   = "acceptance_failed"
 	ErrUnknown            = "unknown"
 )
 
@@ -454,6 +455,7 @@ var errorMessages = map[string]string{
 	ErrDeliveryFailed:     "the schedule was not delivered to the session",
 	ErrProcessesSurvived:  "processes outlived the job",
 	ErrRunFailed:          "the runner failed or ended without a report",
+	ErrAcceptanceFailed:   "the job's acceptance command did not pass",
 	ErrUnknown:            "see agent-jobs status or the daemon log",
 }
 
@@ -471,6 +473,8 @@ func jobErrorCode(status, text string) string {
 		return ErrCodexConfigRefused
 	case strings.HasPrefix(text, "refused to start") || strings.HasPrefix(text, "launch interrupted"):
 		return ErrLaunchFailed
+	case jobs.IsAcceptanceFailure(text):
+		return ErrAcceptanceFailed
 	case status == store.StatusTimeout || strings.HasPrefix(text, "timeout"):
 		return ErrTimeout
 	case status == store.StatusCancelled || strings.HasPrefix(text, "cancelled"):

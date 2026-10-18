@@ -80,6 +80,9 @@ func DoneLine(j *store.Job) string {
 	if strings.Contains(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
 	}
+	if n := acceptanceNote(j); n != "" {
+		line += " · " + n
+	}
 	if j.Attempt > 1 {
 		line += fmt.Sprintf(" · resumed (attempt %d", j.Attempt)
 		if j.RunMode == store.RunFallback {

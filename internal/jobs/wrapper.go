@@ -280,6 +280,13 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			}
 		}
 	}
+	// The acceptance command (if the job has one) runs only after a clean claude run: exit 0, a report,
+	// a complete sweep. Its result goes into the job row before exit_code says the job is over.
+	if code == 0 && !sw.Incomplete() && hasReport(jobDir) {
+		if rc := runAcceptanceStep(jobDir, token, stderrLog); rc != 0 {
+			return rc
+		}
+	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)
 		return 2

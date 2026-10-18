@@ -124,12 +124,13 @@ func TestErrorsAreCodes(t *testing.T) {
 		{store.StatusCancelled, "cancelled; " + path, ErrCancelled},
 		{store.StatusFailed, jobs.ReasonSurvivors + " " + path, ErrProcessesSurvived},
 		{store.StatusFailed, "claude exited with code 1 " + path, ErrRunFailed},
+		{store.StatusFailed, "acceptance failed (exit 2) " + path, ErrAcceptanceFailed},
 		{store.StatusFailed, "something else " + path, ErrUnknown},
 	} {
 		now := time.Now()
 		j := &store.Job{ID: fmt.Sprintf("261018-10000%d-eeee", i), Agent: "test", Title: "t", Kind: "fix", Brief: "b",
 			Status: c.status, Model: "opus", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 5, CreatedAt: now,
-			StartedAt: &now, FinishedAt: &now, Error: c.text}
+			StartedAt: &now, FinishedAt: &now, Error: c.text, AcceptanceCmd: "make test " + path}
 		if err := f.m.Store.Insert(j); err != nil {
 			t.Fatal(err)
 		}
