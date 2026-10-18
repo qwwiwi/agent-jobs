@@ -17,13 +17,13 @@ import (
 )
 
 // Log archive: when prune cleans a job folder, the job's records for later analysis move into
-// <archive>/<YYYY-MM>/<id>/ (stream.jsonl and stderr.log gzipped, prompt.md, report.md, diffstat.txt
-// copied, meta.json = the job row; for a resumed job also every earlier attempt's attempts/<n>/ run
-// files and report.attempt-<n>.md). The archive lies outside the job folders, so cleaning jobs never
+// <archive>/<YYYY-MM>/<id>/ (stream.jsonl, stderr.log and stream-resume-failed.jsonl gzipped,
+// prompt.md, report.md, diffstat.txt copied, meta.json = the job row; for a resumed job also every
+// earlier attempt's attempts/<n>/ run files and report.attempt-<n>.md). The archive lies outside the job folders, so cleaning jobs never
 // touches it; prune deletes archived months older than log_archive_days.
 var (
 	// archiveGzip are moved: gzipped into the archive, then removed from the job folder.
-	archiveGzip = []string{"stream.jsonl", "stderr.log"}
+	archiveGzip = []string{"stream.jsonl", "stderr.log", "stream-resume-failed.jsonl"}
 	// archiveCopy are copied: the job folder keeps them (report.md and diffstat.txt are prune records).
 	archiveCopy = []string{"prompt.md", "report.md", "diffstat.txt"}
 	// archiveAttemptGzip / archiveAttemptCopy are the same for each earlier attempt's attempts/<n>/.
@@ -75,18 +75,44 @@ func (m *Manager) defaultArchiveDir() string {
 	return filepath.Join(m.StateDir, "archive")
 }
 
-// archiveMonth is the archive month of a job: the UTC month it finished (created when unfinished).
+// archiveMonth is the archive month of a job: the UTC month it was created, so every attempt of a
+// job maps to the same dir.
 func archiveMonth(j *store.Job) string {
-	t := j.CreatedAt
-	if j.FinishedAt != nil {
-		t = *j.FinishedAt
-	}
-	return t.UTC().Format("2006-01")
+	return j.CreatedAt.UTC().Format("2006-01")
 }
 
-// archiveJobDir returns <archive>/<YYYY-MM>/<id>.
+// archiveJobDir returns <archive>/<YYYY-MM>/<id>: the existing archive of the job, else the dir a new
+// archive goes to (the created month). Earlier builds keyed the month by finished_at; such an
+// archive is still found.
 func (m *Manager) archiveJobDir(j *store.Job) string {
-	return filepath.Join(m.ArchiveDir(), archiveMonth(j), j.ID)
+	d, _ := m.existingArchiveDir(j)
+	return d
+}
+
+// existingArchiveDir returns the archive dir of a job and whether something exists there (any
+// entry: even a non-directory blocks a new archive). Without one it returns the created-month dir.
+func (m *Manager) existingArchiveDir(j *store.Job) (string, bool) {
+	dirs := []string{filepath.Join(m.ArchiveDir(), archiveMonth(j), j.ID)}
+	if j.FinishedAt != nil {
+		if legacy := filepath.Join(m.ArchiveDir(), j.FinishedAt.UTC().Format("2006-01"), j.ID); legacy != dirs[0] {
+			dirs = append(dirs, legacy)
+		}
+	}
+	for _, d := range dirs {
+		if _, err := os.Lstat(d); err == nil {
+			return d, true
+		}
+	}
+	return dirs[0], false
+}
+
+// errArchived refuses a resume of a job whose records prune already moved into the archive: a
+// later attempt's records could not be archived next to them, so the job is over.
+func (m *Manager) errArchived(j *store.Job) error {
+	if d, ok := m.existingArchiveDir(j); ok {
+		return fmt.Errorf("job %s: its records were archived by prune (%s); start a new job instead: %w", j.ID, d, store.ErrImmutable)
+	}
+	return nil
 }
 
 // realDir checks that p is a real directory (lstat: a symlink is refused, never followed). With
@@ -200,8 +226,9 @@ func (m *Manager) eachPrunable(f func(j *store.Job, dir string)) error {
 }
 
 // archiveSet lists, relative to a job folder, what its archive moves gzipped (gz) and copies (cp):
-// the top-level records, the reports of earlier attempts and their attempts/<n>/ run files.
-func archiveSet(dir string) (gz, cp []string) {
+// the top-level records, the reports of earlier attempts and their attempts/<n>/ run files (only
+// n below the job's current attempt: a higher n the job made itself is not an attempt).
+func archiveSet(dir string, attempt int) (gz, cp []string) {
 	gz = slices.Clone(archiveGzip)
 	cp = slices.Clone(archiveCopy)
 	if ents, err := os.ReadDir(dir); err == nil {
@@ -211,7 +238,7 @@ func archiveSet(dir string) (gz, cp []string) {
 			}
 		}
 	}
-	for _, n := range attemptNumbers(dir) {
+	for _, n := range attemptNumbers(dir, attempt) {
 		for _, name := range archiveAttemptGzip {
 			gz = append(gz, filepath.Join(attemptsDir, n, name))
 		}
@@ -228,7 +255,7 @@ func archiveSet(dir string) (gz, cp []string) {
 // leftovers of the moved files (a pass interrupted after the rename) are removed.
 func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 	aj := ArchiveJob{ID: j.ID, Dest: m.archiveJobDir(j), Moved: []PruneEntry{}}
-	gz, _ := archiveSet(dir)
+	gz, _ := archiveSet(dir, j.Attempt)
 	moved := func(reason string) {
 		for _, name := range gz {
 			p := filepath.Join(dir, name)
@@ -259,7 +286,7 @@ func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 	case done:
 		// The rename is the completeness signal, but the dir may have been recreated or emptied
 		// since (a sync tool, a partial restore): an original goes only when its copy is there.
-		if err := archivedCopies(dir, aj.Dest); err != nil {
+		if err := archivedCopies(dir, aj.Dest, j.Attempt); err != nil {
 			aj.Error = err.Error()
 			return aj
 		}
@@ -307,9 +334,9 @@ func writableJobDir(dir string) error {
 
 // archivedCopies checks that an existing archive dest is complete for the originals still in the
 // job folder: dest/meta.json and dest/<name>.gz for every one of them, as regular files.
-func archivedCopies(dir, dest string) error {
+func archivedCopies(dir, dest string, attempt int) error {
 	need := []string{"meta.json"}
-	gz, _ := archiveSet(dir)
+	gz, _ := archiveSet(dir, attempt)
 	for _, name := range gz {
 		if fi, err := os.Lstat(filepath.Join(dir, name)); err == nil && fi.Mode().IsRegular() {
 			need = append(need, name+".gz")
@@ -365,8 +392,8 @@ func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 			_ = removeTree(tmp)
 		}
 	}()
-	gz, cp := archiveSet(dir)
-	for _, n := range attemptNumbers(dir) {
+	gz, cp := archiveSet(dir, j.Attempt)
+	for _, n := range attemptNumbers(dir, j.Attempt) {
 		if err := os.MkdirAll(filepath.Join(tmp, attemptsDir, n), 0o700); err != nil {
 			return err
 		}
@@ -527,6 +554,7 @@ type jobMeta struct {
 	ResumedFrom    string     `json:"resumed_from,omitempty"`
 	ScheduleID     string     `json:"schedule_id,omitempty"`
 	Error          string     `json:"error,omitempty"`
+	Attempt        int        `json:"attempt"`
 }
 
 func metaOf(j *store.Job) jobMeta {
@@ -536,6 +564,6 @@ func metaOf(j *store.Job) jobMeta {
 		MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns,
 		CostUSD: j.CostUSD, DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt, CleanedAt: j.CleanedAt, ResumedFrom: j.ResumedFrom, ScheduleID: j.ScheduleID,
-		Error: j.Error,
+		Error: j.Error, Attempt: j.Attempt,
 	}
 }

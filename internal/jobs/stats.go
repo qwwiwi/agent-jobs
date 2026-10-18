@@ -266,8 +266,8 @@ func (m *Manager) hasReport(j *store.Job) bool {
 }
 
 // attemptNumbers lists the earlier attempts kept under root/attempts/<n>/ (real directories only,
-// canonical decimal names), ascending.
-func attemptNumbers(root string) []string {
+// canonical decimal names, 1 <= n < below: the job's current attempt bounds what counts), ascending.
+func attemptNumbers(root string, below int) []string {
 	ad := filepath.Join(root, attemptsDir)
 	if fi, err := os.Lstat(ad); err != nil || !fi.IsDir() {
 		return nil
@@ -279,7 +279,7 @@ func attemptNumbers(root string) []string {
 	var ns []int
 	for _, e := range ents {
 		n, err := strconv.Atoi(e.Name())
-		if err != nil || n < 1 || strconv.Itoa(n) != e.Name() || !e.IsDir() {
+		if err != nil || n < 1 || n >= below || strconv.Itoa(n) != e.Name() || !e.IsDir() {
 			continue
 		}
 		ns = append(ns, n)
@@ -357,7 +357,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if err := add(""); err != nil {
 		return nil, err
 	}
-	attempts := append(attemptNumbers(m.JobDir(j.ID)), attemptNumbers(m.archiveJobDir(j))...)
+	attempts := append(attemptNumbers(m.JobDir(j.ID), j.Attempt), attemptNumbers(m.archiveJobDir(j), j.Attempt)...)
 	slices.Sort(attempts)
 	for _, n := range slices.Compact(attempts) {
 		if err := add(n); err != nil {

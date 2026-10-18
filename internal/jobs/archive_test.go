@@ -349,10 +349,10 @@ func TestArchiveFailedWriteKeepsOriginals(t *testing.T) {
 func TestArchiveAlreadyArchivedNeedsCopy(t *testing.T) {
 	m := newManager(t)
 	old := time.Now().Add(-72 * time.Hour)
-	insertJob(t, m, "d", store.StatusSucceeded, &old, nil)
+	j := insertJob(t, m, "d", store.StatusSucceeded, &old, nil)
 	stream := filepath.Join(m.JobDir("d"), "stream.jsonl")
 	writeFile(t, stream, []byte("{}\n"), 0o600)
-	dest := m.archiveJobDir(&store.Job{ID: "d", FinishedAt: &old})
+	dest := m.archiveJobDir(j)
 	if err := os.MkdirAll(dest, 0o700); err != nil {
 		t.Fatal(err)
 	}

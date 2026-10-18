@@ -602,6 +602,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
+	if err := m.errArchived(j); err != nil {
+		return nil, err
+	}
 	if j.ScopePending {
 		return nil, fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
 	}
@@ -780,6 +783,9 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) {
 	if j.ScopePending {
 		return launchPlan{}, errors.New("the cgroup scope of the previous attempt is not stopped yet")
+	}
+	if err := m.errArchived(j); err != nil {
+		return launchPlan{}, err
 	}
 	dir := m.JobDir(j.ID)
 	prev := j.Attempt - 1

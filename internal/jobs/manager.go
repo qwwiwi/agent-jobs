@@ -852,7 +852,8 @@ func (m *Manager) Cancel(id string) error {
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
-	res := parseStream(filepath.Join(m.JobDir(id), "stream.jsonl"))
+	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
+	res, killed := killedResult(m.JobDir(id))
 	msg := "cancelled"
 	if err := m.endScope(j); err != nil {
 		m.Log.Printf("job %s: %v", id, err)
@@ -860,6 +861,11 @@ func (m *Manager) Cancel(id string) error {
 	}
 	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		return err
+	}
+	if killed {
+		if err := m.Store.SetCostUnknown(id); err != nil {
+			m.Log.Printf("job %s: mark cost unknown: %v", id, err)
+		}
 	}
 	m.noteSweep(id, m.sweepEscaped(id))
 	m.recordStatsOf(id)
