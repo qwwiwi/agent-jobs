@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -136,23 +137,40 @@ func (m *Manager) UndeliveredNotifications() ([]*store.Notification, error) {
 	return m.Store.UndeliveredNotifications(m.Now().Add(-UndeliveredWindow))
 }
 
+// TmuxDeliveryTimeout bounds one delivery (waiting for tmux.lock and every tmux call); a variable
+// so tests can shorten it.
+var TmuxDeliveryTimeout = 10 * time.Second
+
+// errTmuxTimeout is a delivery that did not finish within TmuxDeliveryTimeout.
+var errTmuxTimeout = errors.New("tmux delivery timed out")
+
 // sendTmuxLocked is sendTmux under <state>/tmux.lock (flock): the daemon's job-done lines and
 // notifications from the proxy or the orchestrator's process never interleave their keystrokes.
+// The whole delivery is bounded by TmuxDeliveryTimeout: the lock is polled (LOCK_NB) until then and
+// every tmux call is killed at that deadline, so a hung tmux or lock holder never blocks the caller
+// (the daemon's tick, a proxy call) for longer.
 func (m *Manager) sendTmuxLocked(target, line string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), TmuxDeliveryTimeout)
+	defer cancel()
 	f, err := os.OpenFile(filepath.Join(m.StateDir, "tmux.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("open tmux lock: %w", err)
 	}
 	defer f.Close()
 	for {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-		if !errors.Is(err, syscall.EINTR) {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
 			break
 		}
-	}
-	if err != nil {
-		return fmt.Errorf("tmux lock: %w", err)
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			return fmt.Errorf("tmux lock: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: tmux.lock still held by another delivery after %s", errTmuxTimeout, TmuxDeliveryTimeout)
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-	return m.sendTmux(target, line)
+	return m.sendTmux(ctx, target, line)
 }

@@ -3,9 +3,11 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -179,5 +181,117 @@ func TestProxyNotifyOwnerWithoutBrain(t *testing.T) {
 	if _, err := c.as(queued.ID).NotifyOwner(ctx, "hi", ""); err == nil ||
 		!strings.Contains(err.Error(), "not a running job") {
 		t.Fatalf("queued job: %v", err)
+	}
+}
+
+// stalledTmux installs a fake tmux that hangs (a child sleep it waits for, its pid in pidFile; one
+// line in callsFile per call) and shortens TmuxDeliveryTimeout.
+func stalledTmux(t *testing.T) (pidFile, callsFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	pidFile, callsFile = filepath.Join(dir, "sleep.pid"), filepath.Join(dir, "calls")
+	bin := filepath.Join(dir, "tmux")
+	script := "#!/bin/bash\necho call >> " + callsFile + "\nsleep 60 &\necho $! > " + pidFile + "\nwait\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_JOBS_TMUX_BIN", bin)
+	old := TmuxDeliveryTimeout
+	TmuxDeliveryTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { TmuxDeliveryTimeout = old })
+	return pidFile, callsFile
+}
+
+// Codex review (PR #23): a hung tmux ends at TmuxDeliveryTimeout, its whole process group killed;
+// the timeout is stored on the notification row.
+func TestNotifyOwnerStalledTmuxTimesOut(t *testing.T) {
+	m := newManager(t)
+	pidFile, _ := stalledTmux(t)
+	m.Cfg.NotifyTmuxTarget = "fake-session"
+	start := time.Now()
+	n, err := m.NotifyOwner("job-1", "hello", "")
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("delivery took %s", took)
+	}
+	if err == nil || n == nil || n.Delivered || !strings.Contains(n.Error, "timed out") {
+		t.Fatalf("stalled tmux: %+v %v", n, err)
+	}
+	if got, err := m.Store.GetNotification(n.ID); err != nil || got.Delivered || !strings.Contains(got.Error, "timed out") {
+		t.Fatalf("row: %+v %v", got, err)
+	}
+	b, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if _, err := fmt.Sscan(string(b), &pid); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "tmux child killed", 5*time.Second, func() bool { return gone(pid) })
+}
+
+// A tmux.lock another delivery holds and never releases ends the wait at TmuxDeliveryTimeout; the
+// row keeps the error.
+func TestNotifyOwnerHeldLockTimesOut(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	old := TmuxDeliveryTimeout
+	TmuxDeliveryTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { TmuxDeliveryTimeout = old })
+	f, err := os.OpenFile(filepath.Join(m.StateDir, "tmux.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	n, err := m.NotifyOwner("job-1", "hello", "")
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("lock wait took %s", took)
+	}
+	if err == nil || n == nil || n.Delivered || !strings.Contains(n.Error, "tmux.lock still held") {
+		t.Fatalf("held lock: %+v %v", n, err)
+	}
+	if got, err := m.Store.GetNotification(n.ID); err != nil || !strings.Contains(got.Error, "tmux.lock still held") {
+		t.Fatalf("row: %+v %v", got, err)
+	}
+	// Released, the next delivery goes through.
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	if n, err := m.NotifyOwner("job-2", "hello", ""); err != nil || !n.Delivered {
+		t.Fatalf("after release: %+v %v", n, err)
+	}
+}
+
+// A stalled tmux never holds up the tick: one timed-out job-done line ends the delivery pass for
+// this tick (the jobs stay pending, retried next tick) and the tick returns.
+func TestTickProgressesWithStalledTmux(t *testing.T) {
+	m := newManager(t)
+	t.Setenv("AGENT_JOBS_TMUX_BIN", "/usr/bin/false")
+	m.Cfg.NotifyTmuxTarget = "missing-session"
+	var ids []string
+	for i := 0; i < 3; i++ {
+		ids = append(ids, runToEnd(t, m, enqueue(t, m, "x", nil).ID).ID)
+	}
+	_, calls := stalledTmux(t)
+	queued := enqueue(t, m, "FAKE_SLEEP=5", nil)
+	start := time.Now()
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("tick took %s with a stalled tmux", took)
+	}
+	if b, _ := os.ReadFile(calls); strings.Count(string(b), "call") != 1 {
+		t.Fatalf("tmux called %d times in one tick, want 1", strings.Count(string(b), "call"))
+	}
+	for _, id := range ids {
+		if get(t, m, id).NotifiedAt != nil {
+			t.Fatalf("job %s marked notified", id)
+		}
+	}
+	if s := get(t, m, queued.ID).Status; s != store.StatusRunning {
+		t.Fatalf("queued job not launched in that tick: %s", s)
 	}
 }

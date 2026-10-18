@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -939,7 +940,7 @@ func TestDoneLineSanitized(t *testing.T) {
 	}
 	m := newManager(t)
 	logf := notifyTo(t, m)
-	if err := m.sendTmux("fake-session", "a\x15b\x1bc\rd"); err != nil {
+	if err := m.sendTmux(context.Background(), "fake-session", "a\x15b\x1bc\rd"); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(logf)

@@ -2,7 +2,9 @@ package jobs
 
 import (
 	"archive/tar"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
+	"time"
 	"unicode"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -98,6 +102,11 @@ func (m *Manager) notifyPending() error {
 	for _, j := range jobs {
 		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
+			if errors.Is(err, errTmuxTimeout) {
+				// A stalled tmux (or lock holder) would cost every other line the same wait: the
+				// rest are retried next tick, the tick goes on.
+				break
+			}
 			continue
 		}
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
@@ -108,15 +117,32 @@ func (m *Manager) notifyPending() error {
 }
 
 // sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
-// on the configured tmux socket (-L) when there is one.
-func (m *Manager) sendTmux(target, line string) error {
-	bin := m.Cfg.tmuxBin()
+// on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its
+// end the call's process group is killed and errTmuxTimeout returned.
+func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
 	line = Printable(line, 0)
-	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "-l", line)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
+		return fmt.Errorf("tmux send-keys: %w", err)
 	}
-	if out, err := exec.Command(bin, m.Cfg.tmuxArgs("send-keys", "-t", target, "Enter")...).CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux send-keys Enter: %w: %s", err, strings.TrimSpace(string(out)))
+	if err := m.runTmux(ctx, "send-keys", "-t", target, "Enter"); err != nil {
+		return fmt.Errorf("tmux send-keys Enter: %w", err)
+	}
+	return nil
+}
+
+// runTmux runs one tmux command within ctx, in a process group of its own that is killed when ctx
+// ends (WaitDelay bounds the wait for pipes a straggler may hold open).
+func (m *Manager) runTmux(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, m.Cfg.tmuxBin(), m.Cfg.tmuxArgs(args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
