@@ -321,6 +321,82 @@ func stdinInterpreter(name string) bool {
 	return strings.HasPrefix(name, "python") || stdinInterpreters[name]
 }
 
+// interpSpec describes how an interpreter takes its program on the command line: short options
+// that give it (code, a module or a file), short options with a value attached or next, short
+// options with an attached value only (`perl -i.bak`, `-0777`), and the same for long options.
+type interpSpec struct {
+	codeShort, valueShort, attachShort string
+	codeLong, valueLong                []string
+}
+
+// interpSpecs are the stdin interpreters that may run a program named on the command line (sqlite3
+// reads SQL from stdin unless given after the database, so it always counts as pipe-fed).
+var interpSpecs = map[string]interpSpec{
+	"python": {codeShort: "cm", valueShort: "WX", valueLong: []string{"--check-hash-based-pycs"}},
+	"perl":   {codeShort: "eE", valueShort: "IMm", attachShort: "xiFCdD0"},
+	"node": {codeShort: "ep", valueShort: "rC", codeLong: []string{"--eval", "--print"},
+		valueLong: []string{"--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"}},
+	"ruby": {codeShort: "e", valueShort: "IrCE", attachShort: "FKTWx0i"},
+	"php":  {codeShort: "rfBRFE", valueShort: "cdz"},
+}
+
+// scriptExts are the file extensions taken as a script operand: a bare word (`python3 -W ignore`)
+// may be the value of an option the guard does not know, a script name is not.
+var scriptExts = []string{".py", ".pyw", ".pyc", ".pyz", ".pl", ".pm", ".t", ".js", ".mjs", ".cjs", ".ts", ".rb", ".php"}
+
+// programGiven reports an interpreter call whose program comes from its arguments (a script file,
+// -m, -c, -e, …) rather than from stdin.
+func programGiven(name string, args []string) bool {
+	if strings.HasPrefix(name, "python") {
+		name = "python"
+	}
+	spec, ok := interpSpecs[name]
+	if !ok {
+		return false
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return i+1 < len(args) && isScript(args[i+1])
+		case a == "-":
+			return false
+		case strings.HasPrefix(a, "--"):
+			opt, _, eq := strings.Cut(a, "=")
+			if slices.Contains(spec.codeLong, opt) {
+				return true
+			}
+			if slices.Contains(spec.valueLong, opt) && !eq {
+				i++
+			}
+		case strings.HasPrefix(a, "-"):
+			for j := 1; j < len(a); j++ {
+				if strings.IndexByte(spec.codeShort, a[j]) >= 0 {
+					return true
+				}
+				if strings.IndexByte(spec.valueShort, a[j]) >= 0 {
+					if j == len(a)-1 {
+						i++
+					}
+					break
+				}
+				if strings.IndexByte(spec.attachShort, a[j]) >= 0 {
+					break
+				}
+			}
+		default:
+			return isScript(a)
+		}
+	}
+	return false
+}
+
+// isScript reports a word naming a script file by its extension.
+func isScript(w string) bool {
+	l := strings.ToLower(w)
+	return slices.ContainsFunc(scriptExts, func(e string) bool { return strings.HasSuffix(l, e) && len(l) > len(e) })
+}
+
 func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
@@ -350,13 +426,20 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					}
 				}
 				for k, a := range argv[1:] {
+					code := codeArg(argv, k+1)
+					if code && bigText(a) {
+						if h, ok := s.contains(a, true); ok {
+							return h.reason()
+						}
+						continue
+					}
 					if p, ok := s.hit(a, tree && !ca.destIdx[k]); ok {
 						if _, in := s.hit(a, false); tree && !in {
 							return ancestorBlocked(a, p)
 						}
 						return protectedBlocked(p)
 					}
-					if h, ok := s.contains(a, codeArg(argv, k+1)); ok {
+					if h, ok := s.contains(a, code); ok {
 						return h.reason()
 					}
 					if name != "cd" && name != "pushd" {
@@ -368,20 +451,28 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
 					return h.reason()
 				}
-				feeder := ""
+				feeder, tree := "", true
 				switch {
 				case slices.Contains(v.wrappers, "xargs"):
 					feeder = "`xargs " + name + "`"
 				case i > 0 && stdinInterpreter(name):
 					feeder = "`" + name + "` (its program may come from the pipe)"
+					// With its program in a script file, -m, -c or -e the pipe is data: only a
+					// protected path in it counts, not an ancestor (`ls ~ | python3 x.py`).
+					if programGiven(name, argv[1:]) {
+						feeder, tree = "`"+name+"`", false
+					}
 				}
 				if feeder == "" {
 					continue
 				}
 				for _, prev := range pl.cmds[:i] {
-					for _, w := range append(slices.Clone(prev.words), prev.heredoc) {
-						_, h := s.hit(w, true)
-						_, m := s.contains(w, true)
+					for j, w := range append(slices.Clone(prev.words), prev.heredoc) {
+						h := false
+						if j < len(prev.words) || !bigText(w) {
+							_, h = s.hit(w, tree)
+						}
+						_, m := s.contains(w, tree)
 						if w != "" && (h || m) {
 							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
 								"state (the subagent log or the job database); the guard cannot verify what it is fed."

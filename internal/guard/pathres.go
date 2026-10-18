@@ -20,8 +20,8 @@ import (
 // maxScopeDirs bounds the directories tracked through cd chains; beyond it the directory is unknown.
 const maxScopeDirs = 64
 
-// A whole word longer than maxWordBytes (PATH_MAX: the kernel opens no such path) that splits into
-// several path tokens (inline code, a message) is not resolved as one path: its tokens are.
+// A code word longer than maxWordBytes (PATH_MAX: the kernel opens no such path) that splits into
+// several path tokens (inline code, a here-doc) is not resolved as one path: its tokens are.
 const maxWordBytes = 4096
 
 // protectedBudget is the time the protected-path check may take for one call; past it the call is
@@ -249,9 +249,6 @@ func (s *pathScope) expandAllHomes(w string) string {
 // unresolved cd) is a hit when its segments could lead to a protected path from some directory. A
 // `key=value` word is checked as written and by its value.
 func (s *pathScope) hit(w string, tree bool) (string, bool) {
-	if bigText(w) {
-		return "", false // not one path; contains resolves its tokens
-	}
 	if q, ok := s.hitPath(w, tree); ok {
 		return q, true
 	}
@@ -261,7 +258,10 @@ func (s *pathScope) hit(w string, tree bool) (string, bool) {
 	return "", false
 }
 
-// bigText reports a word longer than any path the kernel opens that holds several path tokens.
+// bigText reports a word longer than any path the kernel opens that holds several path tokens. Only
+// code (inline code, here-docs, here-strings, `--opt=` values) is skipped as one path for it: a
+// plain operand or redirect target is always resolved whole (sqlite3 normalises a long name in
+// userspace and opens it), and a heavy word is bounded by protectedBudget.
 func bigText(w string) bool {
 	return len(w) > maxWordBytes && len(pathTokens(w)) > 1
 }
@@ -395,7 +395,7 @@ func (s *pathScope) match(cands []string, tree bool) (string, bool) {
 // directory (`cp f <dir>`, `unzip -d <dir>`) writes join(dir, name), which is protected for that name.
 func (s *pathScope) parentHit(w string) (string, bool) {
 	exp, ok := s.expandHome(wordValue(w))
-	if !ok || bigText(w) {
+	if !ok {
 		return "", false
 	}
 	for _, p := range s.candidates(exp) {

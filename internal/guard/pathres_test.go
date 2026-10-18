@@ -423,3 +423,89 @@ func TestProtectedFixLoop2Allowed(t *testing.T) {
 		}
 	}
 }
+
+// padTo prefixes tail with `./` segments (and one extra `/` for odd lengths) so the word is n bytes.
+func padTo(n int, tail string) string {
+	k := n - len(tail)
+	pad := strings.Repeat("./", k/2)
+	if k%2 == 1 {
+		pad = ".//" + strings.Repeat("./", k/2-1)
+	}
+	return pad + tail
+}
+
+// Final review of PR #12: a plain operand or redirect target over 4 KB with a space is still one
+// path (sqlite3 normalises it in userspace and opens it), at every length around the bound.
+func TestProtectedLongWordRefused(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	if err := os.Symlink(filepath.Join(state, "subagents"), filepath.Join(cfg.Dir, "S")); err != nil {
+		t.Fatal(err)
+	}
+	for n := 4094; n <= 4098; n++ {
+		lex := padTo(n, "../../../x y/../jobs.db")
+		link := padTo(n, "S/x y/../../jobs.db")
+		for _, w := range []string{lex, link} {
+			if len(w) != n {
+				t.Fatalf("pad: %d != %d", len(w), n)
+			}
+			for _, c := range []string{
+				"sqlite3 \"" + w + "\" \"UPDATE jobs SET subagents=0\"",
+				"echo x > \"" + w + "\"",
+				"cp out.db \"" + w + "\"",
+			} {
+				if Check(c, cfg) == "" {
+					t.Errorf("%d bytes: %.60q…%q allowed", n, c, c[len(c)-40:])
+				}
+			}
+		}
+	}
+	// Inline code over 4 KB is still resolved by its tokens only.
+	code := strings.Repeat("print('a b') ", 4200/13)
+	if r := Check("python3 -c \""+code+"\"", cfg); r != "" {
+		t.Errorf("long inline code refused: %s", r)
+	}
+}
+
+// Final review of PR #12: an interpreter that runs a script file, -m, -c or -e does not read its
+// program from the pipe, so its feeder is checked for protected paths only, not for ancestors.
+func TestProtectedPipeSourceAllowed(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{
+		"ls ~ | python3 -c 'print(1)'",
+		"du -sh ~ | python3 parse.py",
+		"find ~ -name '*.json' | python3 summarize.py",
+		"echo a/b | tr / '\\n' | python3 x.py",
+		"df -h / | python3 x.py",
+		"ls /home | node count.js",
+		"ls -la ../../.. | python3 x.py",
+		"printf '%s\\n' \"$HOME\" | python3 x.py",
+		"ls ~ | python3 -m json.tool",
+		"ls ~ | perl -ne 'print'",
+		"ls ~ | node -e 'process.stdin.pipe(process.stdout)'",
+		"ls ~ | ruby -e 'puts 1'",
+		"ls ~ | python3 -W ignore x.py",
+		"ls ~ | perl -lne 'print'",
+		"ls ~ | perl -i.bak -e 1",
+		"ls ~ | perl -I lib x.pl",
+		"ls ~ | node -r fs count.js",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+	for _, c := range []string{
+		"echo ~/.agent-jobs/thrall/jobs.db | python3 x.py",
+		"ls ../../../jobs.db | node count.js",
+		"ls ~/.agent-jobs | python3 -W x.py",
+		"ls ~/.agent-jobs | python3 -X x.py",
+		"ls ~/.agent-jobs | sqlite3 x.db",
+		"ls ~/.agent-jobs | python3 ignore",
+		"ls ~/.agent-jobs | perl -I x.pl",
+		"ls ~/.agent-jobs | node -r x.js",
+		"ls ~/.agent-jobs | python3 -",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+}
