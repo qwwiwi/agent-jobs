@@ -110,7 +110,7 @@ func TestLoadSymlinkInsideTreeLeavingRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := Load([]string{root})
-	if len(c.Entries) != 0 || !strings.Contains(strings.Join(c.Warnings, " "), "leaves the root") {
+	if len(c.Entries) != 0 || !strings.Contains(strings.Join(c.Warnings, " "), "symlink etc leaves the skill directory") {
 		t.Fatalf("entries %v warnings %v", names(c), c.Warnings)
 	}
 }
@@ -315,5 +315,79 @@ func TestLinkRechecksBudgetAndRefusesSymlinkedDirs(t *testing.T) {
 	}
 	if _, err := Link(work2, []Entry{e}, 400); err == nil {
 		t.Fatal("linked through a symlinked .claude")
+	}
+}
+
+// loadOne loads a single-root catalog and returns its entry names and warnings.
+func loadOne(root string) ([]string, string) {
+	c := Load([]string{root})
+	return names(c), strings.Join(c.Warnings, " ")
+}
+
+func TestLoadRejectsNestedDirectorySymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeCatalog(t, root, []skill{{name: "a"}, {name: "b"}})
+	// a/shared points at <root>/shared (inside the root), whose escape entry leads outside it.
+	if err := os.MkdirAll(filepath.Join(root, "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "shared", "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "shared"), filepath.Join(root, "skills", "a", "shared")); err != nil {
+		t.Fatal(err)
+	}
+	got, warns := loadOne(root)
+	if !slices.Equal(got, []string{"b"}) || !strings.Contains(warns, "symlink shared") {
+		t.Fatalf("entries %v warnings %s", got, warns)
+	}
+}
+
+func TestLoadRejectsSymlinkToSiblingSkill(t *testing.T) {
+	root := t.TempDir()
+	writeCatalog(t, root, []skill{{name: "a"}, {name: "b"}})
+	if err := os.Symlink(filepath.Join(root, "skills", "b"), filepath.Join(root, "skills", "a", "sib")); err != nil {
+		t.Fatal(err)
+	}
+	// A file symlink into the sibling skill leaves b's directory too.
+	if err := os.Symlink(filepath.Join(root, "skills", "a", SkillFile), filepath.Join(root, "skills", "b", "other.md")); err != nil {
+		t.Fatal(err)
+	}
+	got, warns := loadOne(root)
+	if len(got) != 0 || !strings.Contains(warns, "symlink sib") || !strings.Contains(warns, "symlink other.md") {
+		t.Fatalf("entries %v warnings %s", got, warns)
+	}
+}
+
+func TestMeasureCountsFileSymlinkTargets(t *testing.T) {
+	root := t.TempDir()
+	writeCatalog(t, root, []skill{{name: "a", extraKB: 20}})
+	ref := filepath.Join(root, "skills", "a", "ref")
+	if err := os.MkdirAll(ref, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "big.txt"), filepath.Join(ref, "alias.txt")); err != nil {
+		t.Fatal(err)
+	}
+	c := Load([]string{root})
+	e, ok := c.Lookup("a")
+	if !ok || e.SizeKB < 40 {
+		t.Fatalf("a %v size %.1f KB (warnings %v), want the linked file counted", ok, e.SizeKB, c.Warnings)
+	}
+}
+
+func TestLoadRejectsSymlinkCycle(t *testing.T) {
+	root := t.TempDir()
+	writeCatalog(t, root, []skill{{name: "a"}})
+	dir := filepath.Join(root, "skills", "a")
+	if err := os.Symlink("loop2", filepath.Join(dir, "loop1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("loop1", filepath.Join(dir, "loop2")); err != nil {
+		t.Fatal(err)
+	}
+	if got, warns := loadOne(root); len(got) != 0 || !strings.Contains(warns, "symlink loop") {
+		t.Fatalf("entries %v warnings %s", got, warns)
 	}
 }
