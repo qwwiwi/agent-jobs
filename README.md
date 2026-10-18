@@ -540,6 +540,25 @@ agent-jobs version                      # also --version
 - [docs/PLAN.md](docs/PLAN.md): roadmap
 - [CHANGELOG.md](CHANGELOG.md)
 
+## Release checklist
+
+Before a tag, replay the install and a test job from a fresh clone of the release commit:
+
+```bash
+scripts/acceptance-clean-clone.sh [REF]          # default HEAD of this checkout, cloned from origin
+scripts/acceptance-clean-clone.sh --from . REF    # clone this checkout instead (unpushed commits)
+scripts/acceptance-clean-clone.sh --real-model sonnet   # the test job on a real model (1 turn, 0.2 USD)
+```
+
+1. Clones the repository into a fresh temp dir and checks out REF (never prompting: git and ssh run in batch mode, so use an ssh agent or a credential helper); builds the binary there as `install-linux.sh` does.
+2. Runs `scripts/check.sh` in the clone (gofmt, go vet, `go test -count=1 ./...`); `--no-tests` skips it.
+3. Installs as a new user would: `scripts/install-linux.sh --instance accept-<random> --skills-dir <temp>/home/.claude/skills` with HOME, `AGENT_JOBS_HOME` and `systemctl` pointing into the temp dir (on macOS: `agent-jobs init`), with `config.json` pinning `cgroup_scope` off and the read-only HTTP API on. The installed binary must be byte-identical to the build and run; the later steps use it.
+4. Starts `agent-jobs daemon` for that agent in the foreground (no systemd; stopped on exit); `status`, `doctor procs`, `list` and `GET /v1/health` must pass (curl is required).
+5. Runs one job in a scratch git repository and waits for it: by default a stub stands in for `claude` (`AGENT_JOBS_CLAUDE_BIN`, no model, no cost); its status must be `succeeded`, `report.md` must exist and `agent-jobs result` must show the report (with `--real-model`, carrying the marker the brief asks for).
+6. Prints PASS / FAIL with the exit code per step. On success the temp dir is removed (`--keep` keeps it); on failure it is kept and its path printed.
+
+The caller's checkout, state dir, daemon, units, tmux, skills and config are never touched; only the Go caches are shared. Inherited `GIT_*` overrides (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, …) are dropped before the first git command; from the build on, HOME is the temp dir's and the caller's `AGENT_JOBS_*`, `XDG_*_HOME` and `CLAUDE_CONFIG_DIR` are gone. Each step, the daemon and each teardown command run under a supervisor in a process group of their own (the script signals no PID or group; the supervisor signals only its own group); on failure or INT/TERM the active step is stopped, the sandbox's queued and running jobs are cancelled (each `list`/`cancel` with a 10 s deadline: a stuck one fails the run, the daemon is still stopped) and the daemon is stopped, and a repeated signal does not cut that short. With `--real-model` only the daemon gets the caller's HOME and `CLAUDE_CONFIG_DIR` back, so `claude` finds its login; that claude writes its session data there (`~/.claude/projects`, or `$CLAUDE_CONFIG_DIR`), which is expected. Inside a job the binary refuses control commands, so the script refuses to run there unless `--inside-job`, which builds with the test hooks and is not a release acceptance. `ACCEPTANCE_CLEAN_CLONE=1 go test -run TestAcceptanceScriptRun .` runs it (without the test suite) as a Go test.
+
 ## Versioning
 
 Versioning: [SemVer](https://semver.org/); every release is listed in [CHANGELOG.md](CHANGELOG.md). `agent-jobs version` prints the build; `scripts/install-linux.sh` stamps it with `git describe --tags --always --dirty`, a plain `go build` reports `dev`.
