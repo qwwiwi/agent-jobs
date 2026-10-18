@@ -61,6 +61,8 @@ type PruneReport struct {
 	ArchivedBytes int64 `json:"archived_bytes"`
 	// ArchiveExpired are the archived months removed by the archive retention (log_archive_days).
 	ArchiveExpired []PruneEntry `json:"archive_expired"`
+	// RetentionOff says why no archived month is ever expired although log_archive_days > 0.
+	RetentionOff string `json:"retention_off,omitempty"`
 }
 
 // Prune cleans the folders of jobs that finished more than PruneAge ago. Records (pruneRecords) and
@@ -69,8 +71,8 @@ type PruneReport struct {
 // patches are not saved), and a worktree that cleanup deliberately kept for a human (repository
 // drivers) is not touched. Symlinks are removed as links, never followed. With dryRun nothing is
 // removed. Before anything is removed, the job's records for analysis move into the log archive
-// (archiveJob); a failed archive keeps the files it would have moved (the rest is pruned and the job
-// reports the error). Archived months older than the retention are removed (archive roots with the
+// (archiveJob); a failed archive keeps the files it would have moved or copied (the rest is pruned
+// and the job reports the error). Archived months older than the retention are removed (archive roots with the
 // marker only). Runs under the lifecycle lock, so it never races a tick's cleanup.
 func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
@@ -106,7 +108,7 @@ func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 			rep.Jobs = append(rep.Jobs, pj)
 		}
 	}
-	if rep.ArchiveExpired, err = m.expireArchive(dryRun); err != nil {
+	if rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun); err != nil {
 		errs = append(errs, fmt.Errorf("archive retention: %w", err))
 	}
 	if !dryRun {
@@ -142,7 +144,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		}
 	}
 	aj := m.archiveJob(j, dir, dryRun)
-	// A failed archive keeps the files it would have moved; the rest of the folder is still pruned,
+	// A failed archive keeps the files it would have moved or copied; the rest is still pruned,
 	// so a full or missing archive disk does not stop prune from freeing space.
 	archiveFailed := aj.Error != ""
 	fail := func(err string) PruneJob {
@@ -170,7 +172,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		if slices.ContainsFunc(pj.Archived, func(a PruneEntry) bool { return a.Path == p }) {
 			continue // dry run: listed as moved to the archive
 		}
-		if archiveFailed && slices.Contains(archiveGzip, name) {
+		if archiveFailed && (slices.Contains(archiveGzip, name) || slices.Contains(archiveCopy, name)) {
 			pj.Kept = append(pj.Kept, name)
 			continue
 		}

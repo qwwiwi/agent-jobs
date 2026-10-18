@@ -429,3 +429,95 @@ func TestArchiveReadOnlyJobDir(t *testing.T) {
 		t.Fatalf("stream still in the job dir: %v", err)
 	}
 }
+
+// N1: the default root <state>/archive belongs to agent-jobs. One that exists without the marker (an
+// earlier build, a marker write that failed after the mkdir) gets it, so retention works; the dry run
+// writes nothing and says retention is off. A configured root without the marker is reported, never
+// adopted.
+func TestArchiveDefaultRootAdoptsMarker(t *testing.T) {
+	m := newManager(t)
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	m.Now = func() time.Time { return now }
+	root := m.ArchiveDir()
+	writeFile(t, filepath.Join(root, "2024-01", "j", "meta.json"), []byte("{}"), 0o600)
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dry, err := m.Prune(true)
+	if err != nil || len(dry.ArchiveExpired) != 0 || dry.RetentionOff != "retention off: no marker in "+root {
+		t.Fatalf("dry run: %+v %q %v", dry.ArchiveExpired, dry.RetentionOff, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, archiveMarker)); !os.IsNotExist(err) {
+		t.Fatalf("dry run wrote the marker: %v", err)
+	}
+	rep, err := m.Prune(false)
+	if err != nil || len(rep.ArchiveExpired) != 1 || rep.RetentionOff != "" {
+		t.Fatalf("prune: %+v %q %v", rep.ArchiveExpired, rep.RetentionOff, err)
+	}
+	if fi, err := os.Lstat(filepath.Join(root, archiveMarker)); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("marker not written: %v", err)
+	}
+	if fi, _ := os.Lstat(root); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("default root left at %v", fi.Mode().Perm())
+	}
+	if got := names(root); !slices.Equal(got, []string{archiveMarker}) {
+		t.Fatalf("after retention: %v", got)
+	}
+
+	other := filepath.Join(t.TempDir(), "synced")
+	writeFile(t, filepath.Join(other, "2024-01", "x"), []byte("x"), 0o600)
+	m.Cfg.LogArchiveDir = other
+	arep, err := m.Archive(false)
+	if err != nil || len(arep.Expired) != 0 || arep.RetentionOff != "retention off: no marker in "+other {
+		t.Fatalf("configured root: %+v %q %v", arep.Expired, arep.RetentionOff, err)
+	}
+	if _, err := os.Lstat(filepath.Join(other, archiveMarker)); !os.IsNotExist(err) {
+		t.Fatalf("marker written into a configured root: %v", err)
+	}
+	zero := 0
+	m.Cfg.LogArchiveDays = &zero
+	if arep, _ := m.Archive(false); arep.RetentionOff != "" {
+		t.Fatalf("forever still warns: %q", arep.RetentionOff)
+	}
+}
+
+// N2: a failed archive keeps the copied records too: a prompt.md over the small-text limit is not
+// pruned while it has no archive copy.
+func TestPruneWhenArchiveFailsKeepsPrompt(t *testing.T) {
+	m := newManager(t)
+	writeFile(t, m.ArchiveDir(), []byte("not a dir"), 0o600)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "q", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("q"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	writeFile(t, filepath.Join(m.JobDir("q"), "prompt.md"), bytes.Repeat([]byte("p"), PruneSmallTextBytes+1), 0o600)
+	writeFile(t, filepath.Join(m.JobDir("q"), "big.log"), bytes.Repeat([]byte("l"), PruneSmallTextBytes+1), 0o600)
+	if _, err := m.Prune(false); err == nil {
+		t.Fatal("prune with a broken archive succeeded")
+	}
+	if got := names(m.JobDir("q")); !slices.Equal(got, []string{"prompt.md", "stream.jsonl"}) {
+		t.Fatalf("job dir: %v", got)
+	}
+}
+
+// N3: meta.json goes through the same synced O_EXCL write as the archived streams.
+func TestArchiveSyncsMeta(t *testing.T) {
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	insertJob(t, m, "y", store.StatusSucceeded, &old, nil)
+	writeFile(t, filepath.Join(m.JobDir("y"), "stream.jsonl"), []byte("{}\n"), 0o600)
+	var synced []string
+	orig := syncFile
+	syncFile = func(f *os.File) error {
+		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+			synced = append(synced, filepath.Base(f.Name()))
+		}
+		return orig(f)
+	}
+	defer func() { syncFile = orig }()
+	if _, err := m.Archive(false); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(synced, "meta.json") || !slices.Contains(synced, "stream.jsonl.gz") {
+		t.Fatalf("synced files: %v", synced)
+	}
+}

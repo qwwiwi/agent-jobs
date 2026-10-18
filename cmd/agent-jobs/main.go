@@ -693,11 +693,11 @@ func cmdPrune(args []string) error {
 		}
 	}
 	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
-	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, *dry)
+	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
 	return perr
 }
 
-func printArchived(bytes int64, expired []jobs.PruneEntry, dry bool) {
+func printArchived(bytes int64, expired []jobs.PruneEntry, retentionOff string, dry bool) {
 	verb, gone := "moved", "removed"
 	if dry {
 		verb, gone = "would move", "would remove"
@@ -705,6 +705,9 @@ func printArchived(bytes int64, expired []jobs.PruneEntry, dry bool) {
 	fmt.Printf("archive: %s %d bytes into the log archive\n", verb, bytes)
 	for _, e := range expired {
 		fmt.Printf("archive: %s %s  %d  %s\n", gone, e.Path, e.Bytes, e.Reason)
+	}
+	if retentionOff != "" {
+		fmt.Printf("archive: %s\n", retentionOff)
 	}
 }
 
@@ -749,7 +752,7 @@ func cmdArchive(args []string) error {
 		}
 	}
 	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
-	printArchived(n, rep.Expired, *dry)
+	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
 	return aerr
 }
 

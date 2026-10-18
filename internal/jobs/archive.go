@@ -32,6 +32,9 @@ var (
 // synced folder with its own month dirs) is archived into but never expired or chmodded.
 const archiveMarker = ".agent-jobs-archive"
 
+// syncFile fsyncs an archived file before it is closed (a variable so tests can see the calls).
+var syncFile = (*os.File).Sync
+
 // ArchiveJob is what the archive does to one job.
 type ArchiveJob struct {
 	ID    string       `json:"id"`
@@ -49,6 +52,8 @@ type ArchiveReport struct {
 	Days    int          `json:"days"` // retention; 0 = forever
 	Jobs    []ArchiveJob `json:"jobs"`
 	Expired []PruneEntry `json:"expired"` // archived months past the retention
+	// RetentionOff says why no month is ever expired although days > 0 (a root without the marker).
+	RetentionOff string `json:"retention_off,omitempty"`
 }
 
 // ArchiveDir returns the configured archive root (default <state>/archive).
@@ -56,6 +61,11 @@ func (m *Manager) ArchiveDir() string {
 	if m.Cfg.LogArchiveDir != "" {
 		return m.Cfg.LogArchiveDir
 	}
+	return m.defaultArchiveDir()
+}
+
+// defaultArchiveDir is <state>/archive: agent-jobs owns it, whoever created it.
+func (m *Manager) defaultArchiveDir() string {
 	return filepath.Join(m.StateDir, "archive")
 }
 
@@ -96,30 +106,33 @@ func realDir(p string, create bool) (ok bool, err error) {
 	return true, nil
 }
 
-// archiveRoot checks the archive root (a real directory, created on demand with the marker) and
-// keeps a root of ours private: the logs carry tool output, so it is 0700. owned reports the marker;
-// an existing root without it is used as it is (never chmodded).
-func (m *Manager) archiveRoot(create bool) (ok, owned bool, err error) {
+// archiveRoot checks the archive root (a real directory) and keeps a root of ours private: the logs
+// carry tool output, so it is 0700. With mkdir a missing root is made with the marker. With write a
+// root of ours is chmodded, and the default root <state>/archive gets a missing marker back (left
+// without one by an earlier build, or by a marker write that failed after the mkdir). owned reports
+// the marker; any other existing root without it is used as it is (never chmodded).
+func (m *Manager) archiveRoot(mkdir, write bool) (ok, owned bool, err error) {
 	root := m.ArchiveDir()
-	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) && create {
+	_, err = os.Lstat(root)
+	fresh := errors.Is(err, os.ErrNotExist) && mkdir
+	if fresh {
 		if err := os.MkdirAll(root, 0o700); err != nil {
-			return false, false, err
-		}
-		f, err := os.OpenFile(filepath.Join(root, archiveMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-		if err != nil {
-			return false, false, err
-		}
-		_, err = f.WriteString("Log archive of agent-jobs: prune expires the <YYYY-MM> dirs here.\n")
-		if err := errors.Join(err, f.Close()); err != nil {
 			return false, false, err
 		}
 	}
 	if ok, err = realDir(root, false); err != nil || !ok {
 		return ok, false, err
 	}
-	fi, err := os.Lstat(filepath.Join(root, archiveMarker))
+	marker := filepath.Join(root, archiveMarker)
+	fi, err := os.Lstat(marker)
+	if errors.Is(err, os.ErrNotExist) && (fresh || write && filepath.Clean(root) == m.defaultArchiveDir()) {
+		if err := createSynced(marker, []byte("Log archive of agent-jobs: prune expires the <YYYY-MM> dirs here.\n")); err != nil {
+			return true, false, err
+		}
+		fi, err = os.Lstat(marker)
+	}
 	owned = err == nil && fi.Mode().IsRegular()
-	if create && owned {
+	if write && owned {
 		if fi, err := os.Lstat(root); err == nil && fi.Mode().Perm() != 0o700 {
 			if err := os.Chmod(root, 0o700); err != nil {
 				return false, owned, err
@@ -151,7 +164,7 @@ func (m *Manager) Archive(dryRun bool) (ArchiveReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	if rep.Expired, err = m.expireArchive(dryRun); err != nil {
+	if rep.Expired, rep.RetentionOff, err = m.expireArchive(dryRun); err != nil {
 		errs = append(errs, err)
 	}
 	return rep, errors.Join(errs...)
@@ -198,7 +211,7 @@ func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 			return aj
 		}
 	}
-	if _, _, err := m.archiveRoot(!dryRun); err != nil {
+	if _, _, err := m.archiveRoot(!dryRun, !dryRun); err != nil {
 		aj.Error = err.Error()
 		return aj
 	}
@@ -333,7 +346,7 @@ func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, "meta.json"), append(meta, '\n'), 0o600); err != nil {
+	if err := createSynced(filepath.Join(tmp, "meta.json"), append(meta, '\n')); err != nil {
 		return err
 	}
 	if err := os.Chmod(tmp, 0o700); err != nil {
@@ -367,6 +380,16 @@ func openRegular(p string) (f *os.File, ok bool, err error) {
 	return f, true, nil
 }
 
+// createSynced writes data into the new file p (O_EXCL, never through a link), fsynced before close.
+func createSynced(p string, data []byte) error {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	return errors.Join(err, syncFile(f), f.Close())
+}
+
 // archiveFile copies src (a regular file of the job folder, never followed) to dst, gzipped when
 // gz. A missing or non-regular src is skipped.
 func archiveFile(src, dst string, gz bool) error {
@@ -389,7 +412,7 @@ func archiveFile(src, dst string, gz bool) error {
 	if zw != nil {
 		err = errors.Join(err, zw.Close())
 	}
-	err = errors.Join(err, out.Sync(), out.Close())
+	err = errors.Join(err, syncFile(out), out.Close())
 	if err != nil {
 		return fmt.Errorf("archive %s: %w", src, err)
 	}
@@ -398,21 +421,24 @@ func archiveFile(src, dst string, gz bool) error {
 
 // expireArchive removes archived months whose last day is older than the retention (none with 0).
 // Only top-level <YYYY-MM> entries are considered; a symlink is removed as a link, never followed.
-// A root without the marker (not created by the archive) is never expired.
-func (m *Manager) expireArchive(dryRun bool) ([]PruneEntry, error) {
-	out := []PruneEntry{}
+// A root without the marker (not created by the archive) is never expired; off then says so.
+func (m *Manager) expireArchive(dryRun bool) (out []PruneEntry, off string, err error) {
+	out = []PruneEntry{}
 	days := m.Cfg.ArchiveDays()
 	if days == 0 {
-		return out, nil
+		return out, "", nil
 	}
 	root := m.ArchiveDir()
-	if ok, owned, err := m.archiveRoot(false); err != nil || !ok || !owned {
-		return out, err
+	switch ok, owned, err := m.archiveRoot(false, !dryRun); {
+	case err != nil || !ok:
+		return out, "", err
+	case !owned:
+		return out, "retention off: no marker in " + root, nil
 	}
 	cutoff := m.Now().Add(-time.Duration(days) * 24 * time.Hour)
 	ents, err := os.ReadDir(root)
 	if err != nil {
-		return out, err
+		return out, "", err
 	}
 	var errs []error
 	for _, e := range ents {
@@ -433,7 +459,7 @@ func (m *Manager) expireArchive(dryRun bool) ([]PruneEntry, error) {
 		}
 		out = append(out, PruneEntry{Path: p, Bytes: size, Reason: fmt.Sprintf("archived month older than %d days", days)})
 	}
-	return out, errors.Join(errs...)
+	return out, "", errors.Join(errs...)
 }
 
 // jobMeta is meta.json of an archived job: the job row (without the launch token).
