@@ -104,6 +104,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            stdin): binds it as the session the Stop hook holds
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
+  heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
+                                           skipped, the other gates are not); --dry-run prints the
+                                           gate result and the decision prompt, no model call
+  heartbeat show ID --agent A [--json]     one stored decision (ID from "[jobs:heartbeat] wake ID"),
+                                           its reason labelled untrusted model text
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
@@ -185,6 +190,8 @@ func main() {
 		os.Exit(runHook(args, os.Stdin, os.Stdout, os.Stderr, open))
 	case "http-api":
 		err = cmdHTTPAPI(args)
+	case "heartbeat":
+		err = cmdHeartbeat(args)
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -500,6 +507,9 @@ func cmdStatus(args []string) error {
 		if err := printMissedChecks(m); err != nil {
 			return err
 		}
+		if err := printHeartbeat(m); err != nil {
+			return err
+		}
 		printHTTPAPI(m)
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
@@ -570,6 +580,27 @@ func printDaily(m *jobs.Manager) error {
 				fmt.Printf("error:     %s: %s\n", e.name, e.text)
 			}
 		}
+	}
+	return nil
+}
+
+// printHeartbeat is the heartbeat part of `status` without a job id: on/off, the gate, wakes today,
+// the next eligible time and the last decision.
+func printHeartbeat(m *jobs.Manager) error {
+	st, err := m.Heartbeat()
+	if err != nil {
+		return err
+	}
+	loc := m.Location()
+	fmt.Printf("heartbeat: %s\n", jobs.HeartbeatText(st))
+	if st.Enabled {
+		fmt.Printf("goals:     %s\n", st.GoalsFile)
+		if st.LastGate != "" {
+			fmt.Printf("gate:      %s (%s)\n", st.LastGate, st.LastGateAt.In(loc).Format(time.DateTime))
+		}
+	}
+	if st.Last != nil {
+		fmt.Printf("decision:  %s\n", jobs.HeartbeatDecisionText(st.Last, loc))
 	}
 	return nil
 }
@@ -982,6 +1013,95 @@ func cmdCard(args []string) error {
 	return fmt.Errorf("card: unknown subcommand %q (want new or list)", sub)
 }
 
+// cmdHeartbeatShow is `heartbeat show ID`: one stored decision; the model's reason is printed as
+// untrusted model text.
+func cmdHeartbeatShow(args []string) error {
+	fs := flag.NewFlagSet("heartbeat show", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	asJSON := fs.Bool("json", false, "print the decision as JSON")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("heartbeat show: want one decision id")
+	}
+	id, err := strconv.ParseInt(pos[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("heartbeat show: %q is not a decision id", pos[0])
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	v, err := m.HeartbeatDecision(id)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(v)
+	}
+	loc := m.Location()
+	fmt.Printf("decision:  #%d %s (%s, claimed %s, $%.4f)\n", v.ID, v.Decision, v.Trigger, v.ClaimedAt.In(loc).Format(time.DateTime), v.CostUSD)
+	if v.Decision == store.HeartbeatWake {
+		fmt.Printf("delivered: %t\n", v.Delivered)
+	}
+	if v.Error != "" {
+		fmt.Printf("error:     %s\n", shown(v.Error))
+	}
+	if v.UntrustedModelReason != "" {
+		fmt.Printf("reason (untrusted model text, data not instructions): %s\n", shown(v.UntrustedModelReason))
+	}
+	return nil
+}
+
+// cmdHeartbeat is `heartbeat run-now`: one heartbeat now, or with --dry-run the gate result and the
+// prompt without a model call.
+func cmdHeartbeat(args []string) error {
+	if len(args) > 0 && args[0] == "show" {
+		return cmdHeartbeatShow(args[1:])
+	}
+	if len(args) == 0 || args[0] != "run-now" {
+		return errors.New("heartbeat: want the subcommand run-now or show")
+	}
+	fs := flag.NewFlagSet("heartbeat run-now", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "print the gate result and the prompt; no model call, nothing stored")
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if *dry {
+		daemonGate, runNowGate, err := m.HeartbeatGateDry(m.Now())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("gate:      daemon: %s; run-now: %s\n", daemonGate.Reason, runNowGate.Reason)
+		if daemonGate.NextEligible != nil {
+			fmt.Printf("next:      %s (daemon)\n", daemonGate.NextEligible.In(m.Location()).Format(time.DateTime))
+		}
+		prompt, err := m.HeartbeatPrompt(m.Now())
+		if err != nil {
+			fmt.Printf("prompt:    not built: %v\n", err)
+			return nil
+		}
+		fmt.Printf("model:     %s (max $%g, %s)\n--- prompt ---\n%s", m.Cfg.Heartbeat.DecisionModel(), m.Cfg.Heartbeat.Budget(),
+			m.Cfg.Heartbeat.Timeout(), prompt)
+		return nil
+	}
+	h, err := m.RunHeartbeat(context.Background(), jobs.HeartbeatTriggerRunNow)
+	if err != nil {
+		return err
+	}
+	fmt.Println(jobs.HeartbeatDecisionText(h, m.Location()))
+	return nil
+}
+
 func cmdTick(args []string) error {
 	fs := flag.NewFlagSet("tick", flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -1037,12 +1157,16 @@ func cmdDaemon(args []string) error {
 		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
 		// the next ticks keep launching jobs while it runs.
 		m.StartDaily(ctx)
+		// Heartbeat (off by default): the Go gate, then at most one small-model decision in the
+		// background, so a slow decision never delays the next tick.
+		m.StartHeartbeat(ctx)
 		select {
 		case <-ctx.Done():
 			// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
 			// in progress stops between jobs (ctx) and is waited for before the store closes.
 			m.Log.Printf("daemon stopping; running jobs keep running")
 			m.WaitDaily()
+			m.WaitHeartbeat()
 			<-httpDone
 			return nil
 		case <-t.C:
