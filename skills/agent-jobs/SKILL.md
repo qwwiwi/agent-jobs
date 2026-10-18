@@ -27,6 +27,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `model` **or** `complexity` | mandatory, one of them. `complexity` is `light`, `normal` or `hard` and picks the model by kind. With neither, job_start is rejected: there is no default and no classifier |
 | `repo`, `base` | optional: the job gets a git worktree of `repo` at `base` (default HEAD). Without a repo it works in an empty directory |
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
+| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list` |
 
 job_start returns the id at once; the daemon starts the job within a minute, at most two at a time per agent. Do not poll it in a loop: wait for the job-done line.
 
@@ -49,6 +50,7 @@ Inside a job:
 | `job_amend` | add context to a job that is still queued (it keeps its place) |
 | `job_stop` | stop a queued or running job but keep its worktree, uncommitted work and session (status `stopped`) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
+| `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
 
 ## Change a job's course
 
