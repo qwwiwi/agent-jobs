@@ -74,8 +74,8 @@ func TestHeartbeatClaimFinishAbandon(t *testing.T) {
 	}
 }
 
-// The claim re-checks the daily wake cap in its own transaction; a suppressed decision counts
-// toward neither the cap nor the gap.
+// The claim re-checks the daily wake cap in its own transaction; a suppressed decision (a model
+// call happened) holds the gap but is no wake for the daily cap.
 func TestHeartbeatClaimDailyCapAndSuppressed(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
 	if err != nil {
@@ -102,13 +102,17 @@ func TestHeartbeatClaimDailyCapAndSuppressed(t *testing.T) {
 	if err := s.FinishHeartbeat(h2.ID, HeartbeatSuppressed, "x", 0, "suppressed: night", day.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ClaimHeartbeat("daemon", day.Add(3*time.Hour+time.Minute), lim); err != nil {
-		t.Fatalf("a suppressed decision held the gap: %v", err)
+	if _, err := s.ClaimHeartbeat("daemon", day.Add(3*time.Hour+time.Minute), lim); !errors.Is(err, ErrHeartbeatBusy) {
+		t.Fatalf("a suppressed decision did not hold the gap: %v", err)
 	}
-	if last, err := s.LastCountedHeartbeat(); err != nil || last == nil || last.Decision != HeartbeatPending {
-		t.Fatalf("last counted: %+v %v", last, err)
+	if last, err := s.LastHeartbeat(); err != nil || last == nil || last.ID != h2.ID {
+		t.Fatalf("last: %+v %v", last, err)
 	}
 	if n, _ := s.CountHeartbeatWakes(day); n != 1 {
 		t.Fatalf("wakes: %d", n)
+	}
+	// Past the gap the suppressed decision does not use up the daily cap (one wake of two).
+	if _, err := s.ClaimHeartbeat("daemon", day.Add(4*time.Hour), lim); err != nil {
+		t.Fatalf("a suppressed decision counted toward the daily cap: %v", err)
 	}
 }
