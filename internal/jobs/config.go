@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
@@ -99,6 +102,9 @@ type Config struct {
 	// OwnerWaitsMaxHours is how long an «owner reply pending» record of an owner-waits job may hold
 	// the orchestrator's Stop hook before it expires on its own. 0 = DefaultOwnerWaitsMaxHours (6).
 	OwnerWaitsMaxHours int `json:"owner_waits_max_hours"`
+	// HTTPAPI is the read-only HTTP API for a jobs dashboard (DEVIATIONS #8), served by the daemon.
+	// Off by default; the listen address must be loopback or a unix socket path.
+	HTTPAPI HTTPAPIConfig `json:"http_api"`
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -111,6 +117,52 @@ func (c Config) OwnerWaitsMaxAge() time.Duration {
 		return time.Duration(c.OwnerWaitsMaxHours) * time.Hour
 	}
 	return DefaultOwnerWaitsMaxHours * time.Hour
+}
+
+// HTTPAPIConfig is the http_api section of config.json.
+type HTTPAPIConfig struct {
+	// Enabled starts the API inside the daemon. Default false.
+	Enabled bool `json:"enabled"`
+	// Listen is a loopback "ip:port" (127.0.0.0/8 or [::1]) or an absolute unix socket path.
+	// Empty = the unix socket <state>/http-api.sock (HTTPAPISocket).
+	Listen string `json:"listen"`
+}
+
+// HTTPAPISocket is the default listen address of the HTTP API: the unix socket <state>/http-api.sock,
+// inside the agent state dir (mode 700, owned by the agent user), so no other local user can bind
+// or reach it first.
+func HTTPAPISocket(stateDir string) string { return filepath.Join(stateDir, "http-api.sock") }
+
+// HTTPAPIListen is the address the HTTP API listens on: http_api.listen, or HTTPAPISocket.
+func (c Config) HTTPAPIListen(stateDir string) string {
+	if c.HTTPAPI.Listen != "" {
+		return c.HTTPAPI.Listen
+	}
+	return HTTPAPISocket(stateDir)
+}
+
+// ValidateHTTPListen accepts a loopback "ip:port" (an IP literal in 127.0.0.0/8 or ::1, port 0..65535)
+// or an absolute unix socket path; anything else (a wildcard, a LAN address, a host name) is refused.
+func ValidateHTTPListen(listen string) error {
+	if strings.HasPrefix(listen, "/") {
+		if filepath.Clean(listen) != listen || strings.ContainsRune(listen, 0) {
+			return fmt.Errorf("http_api.listen %q: a unix socket path must be absolute and clean", listen)
+		}
+		return nil
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("http_api.listen %q: want a loopback ip:port or an absolute unix socket path: %v", listen, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("http_api.listen %q: port %q is not 0..65535", listen, port)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("http_api.listen %q: the host must be a loopback IP (127.0.0.0/8 or ::1), not %q; "+
+			"the API is local only", listen, host)
+	}
+	return nil
 }
 
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
@@ -234,6 +286,12 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if err := c.validateCodex(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
+	}
+	// An empty listen is the default socket (HTTPAPISocket), resolved against the state dir when served.
+	if c.HTTPAPI.Listen != "" {
+		if err := ValidateHTTPListen(c.HTTPAPI.Listen); err != nil {
+			return c, fmt.Errorf("config.json: %w", err)
+		}
 	}
 	if c.LogArchiveDir == "" {
 		c.LogArchiveDir = filepath.Join(stateDir, "archive")

@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -489,8 +490,11 @@ func convTS(n sql.NullInt64) *time.Time {
 }
 
 // Get returns one job by id.
-func (s *Store) Get(id string) (*Job, error) {
-	j, err := scanJob(s.db.QueryRow(`SELECT `+cols+` FROM jobs WHERE id = ?`, id))
+func (s *Store) Get(id string) (*Job, error) { return s.GetContext(context.Background(), id) }
+
+// GetContext is Get, given up when ctx ends.
+func (s *Store) GetContext(ctx context.Context, id string) (*Job, error) {
+	j, err := scanJob(s.db.QueryRowContext(ctx, `SELECT `+cols+` FROM jobs WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -501,7 +505,11 @@ func (s *Store) Get(id string) (*Job, error) {
 }
 
 func (s *Store) query(q string, args ...any) ([]*Job, error) {
-	rows, err := s.db.Query(`SELECT `+cols+` FROM jobs `+q, args...)
+	return s.queryContext(context.Background(), q, args...)
+}
+
+func (s *Store) queryContext(ctx context.Context, q string, args ...any) ([]*Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM jobs `+q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
 	}
@@ -523,13 +531,31 @@ func (s *Store) ListByStatus(status string) ([]*Job, error) {
 }
 
 // List returns the most recent jobs, newest first.
-func (s *Store) List(limit int) ([]*Job, error) {
-	return s.query(`ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
+func (s *Store) List(limit int) ([]*Job, error) { return s.ListContext(context.Background(), limit) }
+
+// ListContext is List, given up when ctx ends.
+func (s *Store) ListContext(ctx context.Context, limit int) ([]*Job, error) {
+	return s.queryContext(ctx, `ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
 }
 
 // ListRecentByStatus returns the most recent jobs with the given status, newest first.
 func (s *Store) ListRecentByStatus(status string, limit int) ([]*Job, error) {
-	return s.query(`WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, status, limit)
+	return s.ListRecentByStatusContext(context.Background(), status, limit)
+}
+
+// ListRecentByStatusContext is ListRecentByStatus, given up when ctx ends.
+func (s *Store) ListRecentByStatusContext(ctx context.Context, status string, limit int) ([]*Job, error) {
+	return s.queryContext(ctx, `WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`, status, limit)
+}
+
+// CountByStatusContext returns the number of jobs of agent with the given status.
+func (s *Store) CountByStatusContext(ctx context.Context, agent, status string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND status = ?`, agent, status).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count jobs: %w", err)
+	}
+	return n, nil
 }
 
 // ListActivity returns jobs created or finished at or after since, plus every queued and running

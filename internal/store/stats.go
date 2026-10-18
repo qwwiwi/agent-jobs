@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -146,11 +147,16 @@ func (s *Store) GetStats(id string) (*JobStats, error) {
 // ListStats returns the stats rows of jobs finished at or after since (all rows for a zero since),
 // oldest first.
 func (s *Store) ListStats(since time.Time) ([]*JobStats, error) {
+	return s.ListStatsContext(context.Background(), since)
+}
+
+// ListStatsContext is ListStats, given up when ctx ends.
+func (s *Store) ListStatsContext(ctx context.Context, since time.Time) ([]*JobStats, error) {
 	q, args := `SELECT `+statsCols+` FROM job_stats ORDER BY finished_at, id`, []any{}
 	if !since.IsZero() {
 		q, args = `SELECT `+statsCols+` FROM job_stats WHERE finished_at >= ? ORDER BY finished_at, id`, []any{since.Unix()}
 	}
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list stats: %w", err)
 	}
