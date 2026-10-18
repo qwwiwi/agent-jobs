@@ -54,6 +54,9 @@ type Manager struct {
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
+
+	hbMu sync.Mutex     // held while a heartbeat started by StartHeartbeat runs
+	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.

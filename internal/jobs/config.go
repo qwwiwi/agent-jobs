@@ -136,6 +136,9 @@ type Config struct {
 	SkillsMaxPerJob int `json:"skills_max_per_job"`
 	// SkillsMaxKB caps the total size of one job's skills in KB. 0 = skills.DefaultMaxKB (400).
 	SkillsMaxKB float64 `json:"skills_max_kb"`
+	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
+	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
+	Heartbeat HeartbeatConfig `json:"heartbeat"`
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -334,6 +337,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	if err := c.validateCodex(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
+	if err := c.Heartbeat.validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
 	// An empty listen is the default socket (HTTPAPISocket), resolved against the state dir when served.
 	if c.HTTPAPI.Listen != "" {
 		if err := ValidateHTTPListen(c.HTTPAPI.Listen); err != nil {
@@ -348,6 +354,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.CardsDir == "" {
 		c.CardsDir = filepath.Join(stateDir, "cards")
+	}
+	if c.Heartbeat.GoalsFile == "" {
+		c.Heartbeat.GoalsFile = filepath.Join(stateDir, DefaultHeartbeatGoalsFile)
 	}
 	return c, nil
 }

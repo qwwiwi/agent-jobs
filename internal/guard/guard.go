@@ -17,7 +17,10 @@
 //   - agent-jobs itself in any form except `agent-jobs mcp --role job` (no nested jobs), and any change
 //     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets);
 //   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
-//     (isolation worktree/remote, background run, agent team).
+//     (isolation worktree/remote, background run, agent team);
+//   - any tool outside the job allowlist (toolallow.go): schedules, wakeups, messages to other
+//     sessions, notifications, monitors (their command bypasses the Bash checks), worktrees,
+//     questions, MCP tools other than the exact job-role agent-jobs tools, and every unknown tool.
 //
 // Commands are parsed (quotes, separators, env prefixes, wrappers), not matched as raw text, so
 // spelling variants such as `git -C x 'push'`, `/usr/lib/git-core/git-push` or `{git,push}` are still
@@ -114,6 +117,9 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 				"so the guard cannot derive the job's folder; every tool call is refused until the hook is fixed.", nil
 		}
 		cfg.StateDir, cfg.OwnDir = state, own
+	}
+	if !ToolAllowed(in.ToolName) {
+		return toolRefused(in.ToolName), nil
 	}
 	if readTools[in.ToolName] {
 		p, pattern := in.ToolInput.Path, ""
