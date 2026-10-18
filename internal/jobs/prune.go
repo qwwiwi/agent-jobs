@@ -44,9 +44,12 @@ type PruneJob struct {
 	ID      string       `json:"id"`
 	Status  string       `json:"status"`
 	Removed []PruneEntry `json:"removed"`
-	Kept    []string     `json:"kept"`
-	Skipped string       `json:"skipped,omitempty"` // why the folder (or its work dir) was left alone
-	Error   string       `json:"error,omitempty"`
+	// Archived are the files moved (gzipped) into the log archive at ArchiveDest.
+	Archived    []PruneEntry `json:"archived"`
+	ArchiveDest string       `json:"archive_dest,omitempty"`
+	Kept        []string     `json:"kept"`
+	Skipped     string       `json:"skipped,omitempty"` // why the folder (or its work dir) was left alone
+	Error       string       `json:"error,omitempty"`
 }
 
 // PruneReport is the result of one prune pass.
@@ -54,6 +57,12 @@ type PruneReport struct {
 	DryRun bool       `json:"dry_run"`
 	Jobs   []PruneJob `json:"jobs"`
 	Bytes  int64      `json:"bytes"` // total size of what was (or would be) removed
+	// ArchivedBytes is the size of the files moved into the log archive (before gzip).
+	ArchivedBytes int64 `json:"archived_bytes"`
+	// ArchiveExpired are the archived months removed by the archive retention (log_archive_days).
+	ArchiveExpired []PruneEntry `json:"archive_expired"`
+	// RetentionOff says why no archived month is ever expired although log_archive_days > 0.
+	RetentionOff string `json:"retention_off,omitempty"`
 }
 
 // Prune cleans the folders of jobs that finished more than PruneAge ago. Records (pruneRecords) and
@@ -61,9 +70,12 @@ type PruneReport struct {
 // at the top level goes. A repo job whose worktree cleanup has not run yet is skipped entirely (its
 // patches are not saved), and a worktree that cleanup deliberately kept for a human (repository
 // drivers) is not touched. Symlinks are removed as links, never followed. With dryRun nothing is
-// removed. Runs under the lifecycle lock, so it never races a tick's cleanup.
+// removed. Before anything is removed, the job's records for analysis move into the log archive
+// (archiveJob); a failed archive keeps the files it would have moved or copied (the rest is pruned
+// and the job reports the error). Archived months older than the retention are removed (archive roots with the
+// marker only). Runs under the lifecycle lock, so it never races a tick's cleanup.
 func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
-	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}}
+	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
 	unlock, err := m.lock()
 	if err != nil {
 		return rep, err
@@ -87,23 +99,30 @@ func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 			if pj.Error != "" {
 				errs = append(errs, fmt.Errorf("job %s: %s", j.ID, pj.Error))
 			}
-			if len(pj.Removed) == 0 && pj.Error == "" && pj.Skipped == "" {
+			if len(pj.Removed) == 0 && len(pj.Archived) == 0 && pj.Error == "" && pj.Skipped == "" && pj.ArchiveDest == "" {
 				continue // nothing left to prune
 			}
 			for _, e := range pj.Removed {
 				rep.Bytes += e.Bytes
 			}
+			for _, e := range pj.Archived {
+				rep.ArchivedBytes += e.Bytes
+			}
 			rep.Jobs = append(rep.Jobs, pj)
 		}
 	}
+	if rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun); err != nil {
+		errs = append(errs, fmt.Errorf("archive retention: %w", err))
+	}
 	if !dryRun {
-		m.Log.Printf("prune: %d job folders, %d bytes removed", len(rep.Jobs), rep.Bytes)
+		m.Log.Printf("prune: %d job folders, %d bytes removed, %d bytes moved to the archive, %d archived months expired",
+			len(rep.Jobs), rep.Bytes, rep.ArchivedBytes, len(rep.ArchiveExpired))
 	}
 	return rep, errors.Join(errs...)
 }
 
 func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
-	pj := PruneJob{ID: j.ID, Status: j.Status, Removed: []PruneEntry{}, Kept: []string{}}
+	pj := PruneJob{ID: j.ID, Status: j.Status, Removed: []PruneEntry{}, Archived: []PruneEntry{}, Kept: []string{}}
 	dir := m.JobDir(j.ID)
 	fi, err := os.Lstat(dir)
 	switch {
@@ -120,25 +139,49 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Skipped = "worktree cleanup has not run yet (patches not saved), not touched"
 		return pj
 	}
-	if !dryRun && fi.Mode().Perm()&0o700 != 0o700 {
+	if !dryRun {
 		// The job could chmod its own folder; its entries cannot be removed from a read-only dir.
-		if err := os.Chmod(dir, 0o700); err != nil {
+		if err := writableJobDir(dir); err != nil {
 			pj.Error = err.Error()
 			return pj
 		}
 	}
+	aj := m.archiveJob(j, dir, dryRun)
+	// A failed archive keeps the files it would have moved or copied; the rest is still pruned,
+	// so a full or missing archive disk does not stop prune from freeing space.
+	archiveFailed := aj.Error != ""
+	fail := func(err string) PruneJob {
+		if archiveFailed {
+			err = "log archive: " + aj.Error + "; " + err
+		}
+		pj.Error = err
+		return pj
+	}
+	if archiveFailed {
+		pj.Error = "log archive: " + aj.Error
+	} else {
+		pj.Archived = aj.Moved
+		if !aj.Already {
+			pj.ArchiveDest = aj.Dest
+		}
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		pj.Error = err.Error()
-		return pj
+		return fail(err.Error())
 	}
 	for _, e := range ents {
 		name := e.Name()
 		p := filepath.Join(dir, name)
+		if slices.ContainsFunc(pj.Archived, func(a PruneEntry) bool { return a.Path == p }) {
+			continue // dry run: listed as moved to the archive
+		}
+		if archiveFailed && (slices.Contains(archiveGzip, name) || slices.Contains(archiveCopy, name)) {
+			pj.Kept = append(pj.Kept, name)
+			continue
+		}
 		keep, reason, err := pruneDecide(p, name, j)
 		if err != nil {
-			pj.Error = err.Error()
-			return pj
+			return fail(err.Error())
 		}
 		if keep {
 			if reason != "" && pj.Skipped == "" {
@@ -150,8 +193,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		size := treeSize(p)
 		if !dryRun {
 			if err := removeTree(p); err != nil {
-				pj.Error = err.Error()
-				return pj
+				return fail(err.Error())
 			}
 		}
 		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})
@@ -159,7 +201,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 	return pj
 }
 
-// pruneSessions removes the claude session files of a pruned job (DEVIATIONS #14): the transcript
+// pruneSessions removes the claude session files of a pruned job (DEVIATIONS #15): the transcript
 // <id>.jsonl and the <id>/ directory of every session the job ran in (each attempt's). The ids are
 // the job's own (assigned by the daemon), so nothing else in the claude config dir is touched.
 func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {

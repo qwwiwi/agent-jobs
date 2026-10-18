@@ -12,19 +12,20 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 | [#2](https://github.com/qwwiwi/agent-jobs/pull/2) | **Linux port.** systemd user service `agent-jobs@<agent>` with `KillMode=process` (a daemon restart never kills jobs), idempotent installer, owner decisions recorded. |
 | [#3](https://github.com/qwwiwi/agent-jobs/pull/3) | **Guard hardening.** gh flags before the subcommand, no `gh auth status`, file tools cannot write into `.git`. |
 | [#5](https://github.com/qwwiwi/agent-jobs/pull/5) | **Publication prep.** Reference design published without personal names. |
+| [#7](https://github.com/qwwiwi/agent-jobs/pull/7) | **MCP job tools** (supersedes [#4](https://github.com/qwwiwi/agent-jobs/pull/4)). One MCP server per agent in two roles (`orchestrator`, `job` as an allowlist), `job_start/status/result/list/cancel`, model or complexity required, tmux socket, nested-job prevention (marker, ancestry, session and store checks), session sweep before `exit_code`. |
 | [#8](https://github.com/qwwiwi/agent-jobs/pull/8) | **Skill, subagents, job context** (moved out of Wave A). `agent-jobs` skill installed per agent by `scripts/install-linux.sh` (routing rule, model-or-complexity, how to read a result); jobs may use at most three subagents inside their own limits, guard-counted, only the input keys `description`, `prompt`, `subagent_type`, `model`; job profile (≤ 8 KB, `agent-jobs profile --from`) and project cards (≤ 4 KB, `agent-jobs card new\|list`) attached to the brief. |
 
 ## In progress
 
-**[PR #7](https://github.com/qwwiwi/agent-jobs/pull/7): MCP job tools** (supersedes [#4](https://github.com/qwwiwi/agent-jobs/pull/4)).
+**[PR #10](https://github.com/qwwiwi/agent-jobs/pull/10): cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
 
-- One Go MCP server per agent with two roles: `orchestrator` (main session) and `job`. The job role is an allowlist; the server itself refuses hidden tools, and a test fails if a tool is in neither list.
-- `job_start`, `job_status`, `job_result`, `job_list`, `job_cancel` on top of the existing manager.
-- A job's `mcp.json` points at the job-role server.
-- The caller must give a model or a complexity: no classifier, no guessing.
-- tmux socket support for the job-done line.
-- Guard: a job cannot start or control other jobs through the CLI (environment marker, process-ancestry and session checks).
-- Session sweep: after claude exits, the wrapper ends every leftover process of its session before it writes `exit_code`; signals go through pidfds, and survivors fail the job («processes survived the job»).
+1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id>.scope` (config `cgroup_scope`: `auto` by default, `required`, `off`).
+2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.
+3. Before `exit_code` the wrapper ends every other process of its scope's cgroup (pidfd signals, sub-cgroups included); cancel, timeout and every collection stop the whole unit (`systemctl --user stop`) before the row turns terminal.
+4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): the session sweep plus the marker, ancestry, session and store checks, documented as weaker.
+5. Tests: a `setsid` + reparented orphan is refused and killed on the real launch path (and, as a control, missed by the fallback); cancel and timeout stop the scope; a `KillMode=process` daemon unit restart leaves the job scope running. They skip when no user scope can be created.
+
+Also: the job's environment loses the user bus variables, and the guard rejects `systemd-run`, `systemctl --user`, `busctl`, `dbus-send`, `gdbus` and writes under `/sys/fs/cgroup` (the ways out of a scope).
 
 **[PR #9](https://github.com/qwwiwi/agent-jobs/pull/9): prune, doctor procs, system and file tools.**
 
@@ -32,7 +33,7 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 - `agent-jobs doctor procs [--kill]`: processes that outlived their job or session and running rows with a dead pid; report only, `--kill` ends only processes proven to be a finished job's (DEVIATIONS #13).
 - Orchestrator tools `system_doctor`, `system_logs`, `activity_report`, `trash_move`, `trash_restore` (none for jobs).
 
-**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #14). Built on a branch, on review.
+**Wave E2: stop, resume in the same session, amend** (owner approved and prioritised, see [DECISIONS.md](DECISIONS.md); DEVIATIONS #15). Built on a branch, on review.
 
 - Every job gets a session id before launch (`--session-id`); `--no-session-persistence` is gone.
 - `job_stop` / `agent-jobs stop`: a running or queued job ends `stopped`, keeping its worktree, uncommitted work and session.
@@ -42,14 +43,8 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 ## Wave A
 
-- **Cgroup containment for jobs (hardening).** Session and ppid checks can be escaped with `setsid` plus reparenting; a cgroup cannot. On Linux:
-  1. The daemon launches each wrapper in its own transient systemd user scope, `systemd-run --user --scope --unit=agent-jobs-<agent>-<id> …` (or the same call over D-Bus).
-  2. Control commands refuse when `/proc/self/cgroup` names an `agent-jobs-*` job scope. setsid, double-fork and reparenting all stay inside the cgroup.
-  3. On wrapper exit, cancel or timeout the whole scope is stopped (`systemctl --user stop` / kill the unit) before `exit_code` is written, so no descendant survives.
-  4. Fallback when `systemd-run --user` is unavailable (macOS, containers, no user bus): today's sid sweep plus the marker, ancestry, session and store checks. That path is documented as weaker.
-  5. Needs: a reachable user bus for the daemon (linger is already on), a launch-path test that a `setsid` + reparented orphan is still refused and still killed, and a check that `KillMode=process` daemon restarts leave job scopes alone.
-- **Memory, tasks and team tools via the shared brain.** `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
-- **Memory notes in the brief.** The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
+- **Memory, tasks and team tools via the shared brain.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/brain`, `internal/mcp/tools_brain.go`.* `memory_search`, `memory_write`, `memory_already_exists`; `task_create`, `task_list`, `task_update`, `task_get`; `send_message`, `inbox`. Same names as the reference, backed by the team's shared memory and task service (DEVIATIONS #2, #3). Jobs get `memory_search` and `memory_write` only.
+- **Memory notes in the brief.** *Status: built on branch ([PR #13](https://github.com/qwwiwi/agent-jobs/pull/13)), in review; `internal/jobs/memory.go`.* The daemon adds up to six of the closest notes from shared memory to every brief, so a job does not rediscover what is already written down. If memory is unreachable, the job starts anyway and the brief says so.
 
 ## Wave B
 
@@ -68,6 +63,11 @@ Agent Jobs implements the [reference design](REFERENCE.md) 1:1; the only allowed
 
 - **Code-graph index.** The reference's separate MCP server that indexes code as a graph; jobs can read and index. Research first: pick or build the indexer, then integrate.
 
+**Log archive and per-job stats** (owner approved 2026-10-17, see [DECISIONS.md](DECISIONS.md); the stats part of E7 and Wave D observability).
+
+- Prune moves a cleaned job's logs into `<archive>/<YYYY-MM>/<id>/` (gzip) instead of deleting them; `log_archive_dir`, `log_archive_days` (default 365, 0 = forever); `agent-jobs archive --dry-run`.
+- Table `job_stats`, one row per finished job; `agent-jobs stats [--since] [--by kind|model|skill] [--json] [--backfill]` and the orchestrator tool `job_stats`.
+
 ## Wave D
 
 Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.md](DECISIONS.md)); built after Wave C:
@@ -84,7 +84,7 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
 Each item waits for a separate owner go (E2 has it, see [DECISIONS.md](DECISIONS.md)); it is not part of the current mandate (see [DECISIONS.md](DECISIONS.md)). Items that diverge from the reference have a «proposed, not approved» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-not-approved-wave-e). Sources are open-source projects from the 2026-10-17 market scan. The Codex runner and schedules, also seen in those projects, are already in Wave B; Wave E does not change them.
 
 - **E1. Subscription limit: wait for the reset and resume.** Keep the last rate-limit event; hold new launches when the window is near its limit; on a usage-limit error wait for the reset + 60 s + jitter and resume the same session (needs E2). Why: subscription windows, not dollar budgets, stop overnight jobs; `--max-budget-usd` is a client-side estimate, not a subscription cap. Source: arbab. Related: Wave D API-credit fallback (E1 waits, the fallback pays). Priority: high. DEVIATIONS E1.
-- **E2. True session resume.** Assign `--session-id` before launch and drop `--no-session-persistence`, so `job_resume` continues the same claude session instead of starting a fresh job from the saved patches. Why: a timed-out or killed job keeps its context, including turns that produced no commit. Source: agent-dispatch. Related: Wave B Resume (patch carry-over stays as the fallback). Priority: high. **Status: approved by the owner as a priority and built (stop, resume, amend; see In progress); DEVIATIONS #14.**
+- **E2. True session resume.** Assign `--session-id` before launch and drop `--no-session-persistence`, so `job_resume` continues the same claude session instead of starting a fresh job from the saved patches. Why: a timed-out or killed job keeps its context, including turns that produced no commit. Source: agent-dispatch. Related: Wave B Resume (patch carry-over stays as the fallback). Priority: high. **Status: approved by the owner as a priority and built (stop, resume, amend; see In progress); DEVIATIONS #15.**
 - **E3. Structured outcome.** Next to `report.md`, a machine-readable outcome (via `--json-schema`): status `done | partial | blocked`, changed files, checks with their exit codes, a not-verified list. Why: the orchestrator can triage without reading the report, and a job cannot claim a pass the outcome does not show. Source: arbab (fixed report schema), agent-dispatch (`STATUS: done|partial|blocked`). Related: the report contract (Done, PR #1); Wave D Progress section. Priority: high. DEVIATIONS E3.
 - **E4. Verify by exit codes.** Check results are taken from tool exit codes in `stream.jsonl`, never from the model's summary; optionally a separate read-only verify job (no edit tools) runs the checks after a fix. Why: a report is a claim; exit codes are evidence. Source: arbab (verify / probe role). Related: Wave D `acceptance_cmd`. Priority: medium-high. DEVIATIONS E4.
 - **E5. Claude Code native sandbox on top of the guard hook.** No network, no writes to `.git`, enforced by the OS rather than by command parsing (arbab: sandbox with `failIfUnavailable`, `dontAsk` plus an allowlist). Starts as a research spike on Linux (bubblewrap): what works under `claude -p` and what breaks (worktree git dirs, the job store, MCP). Why: the docs say the guard is not a sandbox (DEVIATIONS #9, #12); this would close part of that gap. Source: arbab. Related: Wave A cgroup containment, the guard. Priority: medium. DEVIATIONS E5 (only if adopted).
@@ -96,7 +96,7 @@ Each item waits for a separate owner go (E2 has it, see [DECISIONS.md](DECISIONS
   - Discovery and selection: MCP tool `skill_list(scope?, kind?, repo?)`. Defaults (the `core` skills for the job kind plus the project card's skills) are attached automatically; `job_start(skills=[...])` only adds or excludes (`+name`, `-name`); an unknown name refuses the start. Deterministic matching by kind and project first, hard budget of 5-8 skills per job; semantic retrieval only if matching proves insufficient.
   - Pre-launch skill hook: a PreToolUse hook in the orchestrator session on `job_start`, installed by the agent-jobs skill installer. Without `skills_decision` it denies once with up to about 8 candidates (status and a one-line description each); the orchestrator re-calls with `skills=[...]` or `skills_decision='defaults'`. No model call in the hook (the classifier was rejected, see DECISIONS). One extra round trip per job; deprecated/draft names refused unless explicit; the decision is stored in job metadata.
   - Lifecycle: `status: core | active | draft | deprecated`, `owner`, `last_verified`. deprecated is never loaded; draft only on explicit request. Staleness: not used for 60 days or not verified for 90 days goes to a review list; a weekly digest to the orchestrator.
-  - Stats: skills used (Skill tool calls in the job's session log) and the job outcome go to SQLite; `agent-jobs skills stats` shows uses, success rate, last used, and feeds the sort order of `skill_list`.
+  - Stats: skills used (Skill tool calls in the job's session log) and the job outcome go to SQLite; `agent-jobs skills stats` shows uses, success rate, last used, and feeds the sort order of `skill_list`. Built ahead of the rest (owner approved, see In progress): the `job_stats` table records skills used per job and `agent-jobs stats --by skill` shows uses and success rate.
   - Delivery: copy only the selected skill directories (no symlinks, size cap, sha in job metadata) into the job's project `.claude/skills`; the report lists the skills used. Skills whose scripts reach the network or secrets are flagged; the guard and deny rules still apply; never the whole tree.
   - Native controls: `disable-model-invocation` for side-effect skills, `paths:` globs, `/skill-doctor` for context cost and never-invoked skills, `claude plugin eval` for trigger accuracy of 3-5 critical skills. Not adopted as a base: skills.sh, openskills, skillport (they widen distribution; the goal is narrowing); skillport's «metadata first» idea is borrowed.
   - Evidence, cited, to verify: arXiv 2604.04323 (from a market scan): with many weakly relevant skills the gain drops to near the no-skill baseline; skills refined to the task restore most of it (Terminal-Bench 2.0 57.7% → 65.5%).

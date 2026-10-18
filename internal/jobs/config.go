@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -56,15 +59,38 @@ type Config struct {
 	ClaudeBin string `json:"claude_bin"`
 	// TmuxBin overrides the tmux binary (env AGENT_JOBS_TMUX_BIN wins).
 	TmuxBin string `json:"tmux_bin"`
+	// Brain is the shared brain (team memory, tasks, messages) behind the memory, task and team tools
+	// and the memory notes of a brief. Empty = not configured: those tools say so, briefs carry no notes.
+	Brain brain.Config `json:"brain"`
+	// CgroupScope is the containment of a job's processes (env AGENT_JOBS_CGROUP_SCOPE wins):
+	// "auto" (default) = its own transient systemd user scope when `systemd-run --user` works, else the
+	// weaker session containment; "required" = a job that cannot get a scope is refused; "off" = never.
+	CgroupScope string `json:"cgroup_scope"`
 	// TrashRoots are the absolute directories trash_move may take paths from (and trash_restore put
 	// them back into). Empty = none: trash is closed until the owner names its roots. The agent-jobs
 	// home, the owner rules, the binary, ~/.claude and any `.git` are refused in every root.
 	TrashRoots []string `json:"trash_roots"`
+	// LogArchiveDir is where prune moves the records of a cleaned job for later analysis
+	// (<dir>/<YYYY-MM>/<id>/). Default: <state>/archive. Absolute; may be another disk or a synced folder.
+	LogArchiveDir string `json:"log_archive_dir"`
+	// LogArchiveDays is how long archived months are kept (prune deletes older ones). Nil = 365, 0 = forever.
+	LogArchiveDays *int `json:"log_archive_days"`
 	// IdleAfterResultSeconds is the grace of the idle-after-result rule: claude that printed a final
 	// `result` and then stays silent this long, with no live child but the job MCP server, is ended
 	// and judged by that result. 0 = DefaultIdleAfterResult (3 minutes); IdleAfterResultOff (-1) turns
 	// the rule off (claude's own exit or the timeout ends the job).
 	IdleAfterResultSeconds int `json:"idle_after_result_seconds"`
+}
+
+// DefaultLogArchiveDays is the archive retention when log_archive_days is not set.
+const DefaultLogArchiveDays = 365
+
+// ArchiveDays returns the archive retention in days (0 = forever).
+func (c Config) ArchiveDays() int {
+	if c.LogArchiveDays == nil {
+		return DefaultLogArchiveDays
+	}
+	return *c.LogArchiveDays
 }
 
 // IdleAfterResultOff is the idle_after_result_seconds value that turns the rule off.
@@ -138,6 +164,12 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
 	}
+	if err := c.Brain.Validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
+		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
+	}
 	if c.IdleAfterResultSeconds < IdleAfterResultOff {
 		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
 	}
@@ -145,6 +177,15 @@ func LoadConfig(stateDir string) (Config, error) {
 		if !filepath.IsAbs(r) {
 			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
 		}
+	}
+	if c.LogArchiveDir != "" && !filepath.IsAbs(c.LogArchiveDir) {
+		return c, fmt.Errorf("config.json: log_archive_dir %q must be an absolute path", c.LogArchiveDir)
+	}
+	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
+		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.LogArchiveDir == "" {
+		c.LogArchiveDir = filepath.Join(stateDir, "archive")
 	}
 	if c.OwnerRulesPath == "" {
 		c.OwnerRulesPath = filepath.Join(stateDir, "owner-rules.md")
@@ -252,4 +293,45 @@ func ResolveModel(kind, model, complexity string) (string, error) {
 		return "", err
 	}
 	return model, nil
+}
+
+// PinScopeRequired sets cgroup_scope to "required" in <state>/config.json when the file does not set it
+// yet and a transient user scope can be created right now (the installer runs it: on a host where scopes
+// work, a job never silently falls back to the weaker session containment). Other keys are kept. It
+// returns what it did, for the installer's output.
+func PinScopeRequired(stateDir string) (string, error) {
+	path := filepath.Join(stateDir, "config.json")
+	raw := map[string]json.RawMessage{}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return "", fmt.Errorf("read config: %w", err)
+	default:
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return "", fmt.Errorf("parse config.json: %w", err)
+		}
+	}
+	if v, ok := raw["cgroup_scope"]; ok {
+		return "cgroup_scope already set (" + string(v) + "), left as is", nil
+	}
+	if err := probeScope(); err != nil {
+		return "cgroup_scope left at auto (no user scope on this host: " + err.Error() + ")", nil
+	}
+	raw["cgroup_scope"] = json.RawMessage(`"required"`)
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return "", err
+	}
+	return "cgroup_scope set to required (user scopes work on this host): " + path, nil
 }

@@ -69,6 +69,18 @@ if [[ $prompt == *FAKE_FORGE* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
 fi
 if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
+if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
+  # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a
+  # subreaper), marker dropped. Then it tries a control command for another agent and stays alive.
+  JOBDIR=$(cd .. && pwd) setsid bash -c '( sleep 0.5
+      read -r _ _ _ ppid _ sid _ < /proc/$BASHPID/stat
+      echo "$BASHPID $ppid $sid" > "$JOBDIR/orphan.info"
+      env -u AGENT_JOBS_JOB "$AGENT_JOBS_SELF" list --agent agentb > "$JOBDIR/orphan.out" 2>&1
+      echo "exit=$?" >> "$JOBDIR/orphan.out"
+      : > "$JOBDIR/orphan.ready"
+      exec sleep 300 ) & exit 0' < /dev/null > /dev/null 2>&1
+  for _ in $(seq 200); do [[ -e ../orphan.ready ]] && break; sleep 0.05; done
+fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -117,6 +129,10 @@ fi
 if [[ $prompt == *FAKE_SURVIVOR* ]]; then
   # A leftover in the wrapper's session (re-parented sleep); the test makes it unkillable.
   ( sleep 60 & echo $! > ../survivor.pid )
+fi
+if [[ $prompt == *FAKE_TOOLS* ]]; then
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Skill","input":{"skill":"deploy"}},{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git push"}}]}}'
+  echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"PreToolUse:Bash hook error: [guard]: blocked by guard: ` + "`git push`" + ` reaches outside the job. A job commits locally only"}]}}'
 fi
 if [[ $prompt == *FAKE_IDLE* ]]; then
   # Idle-after-result modes: pause blocks on a FIFO held open read-write (bash builtin, no child).
@@ -215,12 +231,15 @@ func TestMain(m *testing.M) {
 	// Run inside a job (a job working on this repository), the binary under test would refuse its
 	// control commands; the tests set the marker themselves where they need it.
 	_ = os.Unsetenv(JobEnvVar)
+	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
+	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
+	ignoreOuterJob()
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
 	}
 	selfBin = filepath.Join(dir, "agent-jobs")
-	out, err := exec.Command("go", "build", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
+	out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput()
 	if err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
@@ -235,12 +254,31 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// ignoreOuterJob records the wrapper of a job this test process runs in (ancestor or session leader)
+// as outer: not counted by the in-job checks of this process and of the hooked binary under test.
+func ignoreOuterJob() {
+	var pids []string
+	for _, find := range []func() (int, bool){WrapperAncestor, WrapperSession} {
+		if pid, _ := find(); pid > 1 && !isOuterWrapper(pid) {
+			outerWrappers = append(outerWrappers, pid)
+			pids = append(pids, fmt.Sprint(pid))
+		}
+	}
+	if len(pids) > 0 {
+		_ = os.Setenv(outerWrapperEnv, strings.Join(pids, ","))
+	}
+}
+
+const outerWrapperEnv = "AGENT_JOBS_TEST_OUTER_WRAPPER"
+
 func newManager(t *testing.T) *Manager {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("AGENT_JOBS_CLAUDE_BIN", filepath.Join(fakeHelpr, "claude"))
 	t.Setenv("AGENT_JOBS_TMUX_BIN", filepath.Join(fakeHelpr, "tmux"))
+	// Session containment unless a test asks for a scope (scope_test.go): the same on every host.
+	t.Setenv("AGENT_JOBS_CGROUP_SCOPE", ScopeOff)
 	m, err := Open("test")
 	if err != nil {
 		t.Fatal(err)
@@ -392,7 +430,7 @@ func TestSettingsDenyAndGuardHook(t *testing.T) {
 		return string(b)
 	}
 	for _, s := range []string{"Bash(git push:*)", "Bash(git tag:*)", "Bash(gh release:*)", "Bash(gh api:*)", "Bash(gh pr create:*)", "Bash(gh issue comment:*)", "Bash(git -c*)", "Bash(env -S*)", "Bash(git send-pack:*)", "Bash(git http-push:*)",
-		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "WebFetch", "WebSearch",
+		"Bash(claude:*)", "Bash(codex:*)", "Bash(gemini:*)", "Bash(aider:*)", "Bash(cursor-agent:*)", "Bash(claude-code:*)", "Bash(gemini-cli:*)", "Bash(aider-chat:*)", "Bash(npx:*)", "Bash(pnpm dlx:*)", "Bash(pipx run:*)", "Bash(systemd-run:*)", "Bash(systemctl --user:*)", "Bash(busctl:*)", "Bash(dbus-send:*)", "Bash(gdbus:*)", "Bash(qdbus:*)", "Bash(dbus-run-session:*)", "Bash(crontab:*)", "Bash(at:*)", "Bash(batch:*)", "Bash(tmux:*)", "Bash(screen:*)", "Bash(pm2:*)", "Bash(docker:*)", "Bash(podman:*)", "Bash(ssh:*)", "Bash(machinectl:*)", "Bash(loginctl:*)", "Bash(unshare:*)", "Bash(nsenter:*)", "WebFetch", "WebSearch",
 		"Edit(**/.git/**)", "Write(**/.git/**)", "MultiEdit(**/.git/**)", "NotebookEdit(**/.git/**)"} {
 		if !strings.Contains(deny("general"), s) {
 			t.Fatalf("general deny lacks %s", s)
@@ -639,7 +677,7 @@ func TestNotifyOneLineViaTmux(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m", j.ID)
+	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · session only", j.ID)
 	if len(lines) != 2 || lines[0] != "send-keys|-t|fake-session|-l|"+wantLine+"|" || lines[1] != "send-keys|-t|fake-session|Enter|" {
 		t.Fatalf("tmux calls:\n%s", b)
 	}
@@ -1029,7 +1067,7 @@ func TestOrphanWrapperAdopted(t *testing.T) {
 	if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.spawn(j, tok, launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}); err != nil { // "crash": PID never written
+	if _, err := m.spawn(j, tok, "", launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}); err != nil { // "crash": PID never written
 		t.Fatal(err)
 	}
 	if get(t, m, j.ID).PID != 0 {

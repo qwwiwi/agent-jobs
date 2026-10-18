@@ -67,6 +67,19 @@ New facts, a changed plan or a correction while a job exists:
 - Succeeded and cancelled jobs cannot be resumed; start a new job (put the old report's findings in its brief).
 - A stopped job holds its worktree and gets no job-done line until you resume or cancel it: do not leave it.
 
+## Shared brain tools
+
+With a `brain` block in the agent's config, the same server also has the team's shared memory, task board and messages (without it they answer «brain not configured»):
+
+| tool | use |
+|---|---|
+| `memory_search`, `memory_already_exists` | look up notes before writing one or starting work; `from_job` marks an unreviewed note a job wrote |
+| `memory_write` | write a `decision` (immutable), `runbook` or `error_pattern` note |
+| `task_create`, `task_list`, `task_get`, `task_update` | the shared task board; `task_update` sets fields, then moves the status (two steps: a failed move says the fields were already set) |
+| `send_message`, `inbox` | messages to and from other agents; ack the ones you handled |
+
+A job gets `memory_search` and `memory_write` only, through the daemon, and never holds the brain token. A job cannot write a `decision`, and its notes stay out of later briefs: if a job's note is right, write it again yourself.
+
 ## When a job is done
 
 You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. The report is not pushed into the session.

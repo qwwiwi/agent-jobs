@@ -93,6 +93,12 @@ type Job struct {
 	// SessionDigest is the digest of the session transcript recorded when the attempt ended; a resume
 	// continues the session only while the transcript still has it.
 	SessionDigest string
+	// ScopeUnit is the transient systemd user scope the wrapper was launched in
+	// (agent-jobs-<agent>-<id>.scope), empty when the job runs without one (session containment only).
+	ScopeUnit string
+	// ScopePending is set when stopping the job's scope failed: the row is terminal, but processes of
+	// the job may live on; every tick retries the stop until the unit is gone.
+	ScopePending bool
 }
 
 // Attempt is one earlier attempt of a resumed job (the current attempt is the job row itself).
@@ -174,6 +180,11 @@ CREATE TABLE IF NOT EXISTS attempts (
 	finished_at     INTEGER,
 	PRIMARY KEY (job_id, n)
 );
+CREATE TABLE IF NOT EXISTS job_notes (
+	path       TEXT PRIMARY KEY,
+	job_id     TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
 `
 
 // Open opens (and migrates) the database at path.
@@ -184,7 +195,7 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + statsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
@@ -265,6 +276,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN schedule_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN billing TEXT NOT NULL DEFAULT 'subscription'`,
 	`ALTER TABLE jobs ADD COLUMN subagents INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN scope_unit TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN scope_pending INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN run_mode TEXT NOT NULL DEFAULT ''`,
@@ -311,6 +324,41 @@ func (s *Store) SubagentCount(id string) (int, error) {
 	return n, err
 }
 
+// AddJobNote records that job jobID wrote the shared-memory note at path (written through the
+// daemon's brain proxy), so the note is never taken for the agent's own.
+func (s *Store) AddJobNote(path, jobID string, now time.Time) error {
+	if _, err := s.db.Exec(`INSERT INTO job_notes(path, job_id, created_at) VALUES(?, ?, ?)
+		ON CONFLICT(path) DO NOTHING`, path, jobID, now.Unix()); err != nil {
+		return fmt.Errorf("record job note: %w", err)
+	}
+	return nil
+}
+
+// DeleteJobNote forgets that a job wrote the note at path (the orchestrator wrote it again).
+func (s *Store) DeleteJobNote(path string) error {
+	if _, err := s.db.Exec(`DELETE FROM job_notes WHERE path = ?`, path); err != nil {
+		return fmt.Errorf("forget job note: %w", err)
+	}
+	return nil
+}
+
+// JobNotes returns, for those of paths a job wrote, the job's id by path.
+func (s *Store) JobNotes(paths []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, p := range paths {
+		var id string
+		err := s.db.QueryRow(`SELECT job_id FROM job_notes WHERE path = ?`, p).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("job notes: %w", err)
+		}
+		out[p] = id
+	}
+	return out, nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
@@ -318,7 +366,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context, cost_unknown, session_digest`
+	pending_context, cost_unknown, session_digest, scope_unit, scope_pending`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -335,13 +383,13 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -358,7 +406,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending)
 	if err != nil {
 		return nil, err
 	}
@@ -575,10 +623,34 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 	return out, rows.Err()
 }
 
+// Unclaim puts a claimed job that was never spawned back into the queue (the launch that owns it found
+// no cgroup scope right now and retries next tick). The attempt Claim counted is taken back.
+func (s *Store) Unclaim(id, token string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL,
+		scope_unit='', attempt=MAX(attempt-1, 0) WHERE id=? AND status='running' AND launch_token=?`, id, token))
+}
+
 // SetPID records the wrapper's pid/pgid for the launch that owns the job.
 func (s *Store) SetPID(id, token string, pid, pgid int) error {
 	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=? WHERE id=? AND status='running' AND launch_token=?`,
 		pid, pgid, id, token))
+}
+
+// SetScope records the systemd scope unit of the launch that owns the job, before the wrapper is spawned.
+func (s *Store) SetScope(id, token, unit string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET scope_unit=? WHERE id=? AND status='running' AND launch_token=?`,
+		unit, id, token))
+}
+
+// SetScopePending records whether the job's scope still has to be stopped (a failed stop is retried
+// every tick until the unit is gone).
+func (s *Store) SetScopePending(id string, pending bool) error {
+	return affected(s.db.Exec(`UPDATE jobs SET scope_pending=? WHERE id=?`, pending, id))
+}
+
+// ScopePending returns the jobs whose scope stop is still pending, oldest first.
+func (s *Store) ScopePending() ([]*Job, error) {
+	return s.query(`WHERE scope_pending != 0 ORDER BY created_at, rowid`)
 }
 
 // Finish moves a job to a terminal status. With a launch token, only the running job owned by

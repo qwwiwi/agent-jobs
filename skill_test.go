@@ -25,6 +25,7 @@ func TestSkillContent(t *testing.T) {
 		"80 / $10 / 45 min", "200 / $50 / 180",
 		"agent-jobs profile", "agent-jobs card new",
 		"job_stop", "job_resume", "job_amend", "same claude session", "Orchestrator update",
+		"memory_search", "memory_write", "task_update", "send_message", "inbox", "cannot write a `decision`",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("SKILL.md lacks %q", want)

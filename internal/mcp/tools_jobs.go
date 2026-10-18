@@ -63,6 +63,9 @@ type JobView struct {
 	SessionID      string  `json:"session_id,omitempty"`
 	Attempt        int     `json:"attempt"`
 	RunMode        string  `json:"run_mode,omitempty"`
+	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
+	// (the weaker fallback); empty before launch.
+	Containment string `json:"containment,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -80,7 +83,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		RepoPath: j.RepoPath, BaseCommit: j.BaseCommit, CreatedAt: fmtTS(&j.CreatedAt),
 		StartedAt: fmtTS(j.StartedAt), FinishedAt: fmtTS(j.FinishedAt), NotifiedAt: fmtTS(j.NotifiedAt),
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,
-		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID),
+		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode,
 	}
 }

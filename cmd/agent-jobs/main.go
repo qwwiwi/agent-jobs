@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
@@ -51,7 +53,15 @@ const usage = `usage: agent-jobs <command> [flags]
   tick       --agent A                     one daemon pass
   daemon     --agent A                     tick every minute, forever
   prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
-                                           small top-level text files stay)
+                                           small top-level text files stay; stream.jsonl, stderr.log
+                                           move gzipped into the log archive, see archive)
+  archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
+                                           archive (<archive>/<YYYY-MM>/<id>/) and drop months past
+                                           log_archive_days; --dry-run shows what would move
+  stats      --agent A [--since D] [--by kind|model|skill] [--json] [--backfill [--all]]
+                                           per-job summary: counts, success rate, cost and duration
+                                           (median, p90), guard refusal rules, skills; --backfill
+                                           first writes missing rows from job dirs and the archive
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
@@ -111,6 +121,10 @@ func main() {
 		err = cmdDaemon(args)
 	case "prune":
 		err = cmdPrune(args)
+	case "archive":
+		err = cmdArchive(args)
+	case "stats":
+		err = cmdStats(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "version", "--version":
@@ -282,6 +296,7 @@ func open(agent string) (*jobs.Manager, error) {
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	agent := agentFlag(fs)
+	pin := fs.Bool("pin-scope", false, "set cgroup_scope=required in config.json when unset and user scopes work here (installer)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -290,6 +305,13 @@ func cmdInit(args []string) error {
 		return err
 	}
 	defer m.Close()
+	if *pin {
+		msg, err := jobs.PinScopeRequired(m.StateDir)
+		if err != nil {
+			return err
+		}
+		fmt.Println(msg)
+	}
 	// The main session's duties ship with the tool and are rewritten on every init (not user-edited).
 	ob, err := agentjobs.Templates.ReadFile("prompts/orchestrator.md")
 	if err != nil {
@@ -410,6 +432,9 @@ func cmdStatus(args []string) error {
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
 	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
+	if c := jobs.Containment(j); c != "" {
+		fmt.Printf("contain:   %s\n", c)
+	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
@@ -434,11 +459,25 @@ func cmdList(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tTITLE")
+	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD, fmtTime(&j.CreatedAt), j.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD,
+			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// containShort is the containment column of `list`: scope, scope! (stop pending), session, or - (never launched).
+func containShort(j *store.Job) string {
+	switch {
+	case j.ScopeUnit != "" && j.ScopePending:
+		return "scope!"
+	case j.ScopeUnit != "":
+		return "scope"
+	case jobs.Containment(j) == "":
+		return "-"
+	}
+	return "session"
 }
 
 func cmdResult(args []string) error {
@@ -714,6 +753,12 @@ func cmdDaemon(args []string) error {
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
 	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
+	go func() {
+		if err := m.ServeBrain(ctx); err != nil {
+			m.Log.Printf("%v (jobs get no memory tools until the daemon restarts)", err)
+		}
+	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
 	for {
@@ -792,7 +837,142 @@ func cmdPrune(args []string) error {
 		}
 	}
 	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
 	return perr
+}
+
+func printArchived(bytes int64, expired []jobs.PruneEntry, retentionOff string, dry bool) {
+	verb, gone := "moved", "removed"
+	if dry {
+		verb, gone = "would move", "would remove"
+	}
+	fmt.Printf("archive: %s %d bytes into the log archive\n", verb, bytes)
+	for _, e := range expired {
+		fmt.Printf("archive: %s %s  %d  %s\n", gone, e.Path, e.Bytes, e.Reason)
+	}
+	if retentionOff != "" {
+		fmt.Printf("archive: %s\n", retentionOff)
+	}
+}
+
+func cmdArchive(args []string) error {
+	fs := flag.NewFlagSet("archive", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	dry := fs.Bool("dry-run", false, "only list what would move")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	rep, aerr := m.Archive(*dry)
+	if *asJSON {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+		return aerr
+	}
+	keep := "forever"
+	if rep.Days > 0 {
+		keep = fmt.Sprintf("%d days", rep.Days)
+	}
+	fmt.Printf("archive: %s (kept %s)\n", rep.Dir, keep)
+	var n int64
+	for _, j := range rep.Jobs {
+		fmt.Printf("%s  -> %s", j.ID, j.Dest)
+		if j.Already {
+			fmt.Print("  [already archived]")
+		}
+		if j.Error != "" {
+			fmt.Printf("  error: %s", j.Error)
+		}
+		fmt.Println()
+		for _, e := range j.Moved {
+			n += e.Bytes
+			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
+		}
+	}
+	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
+	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
+	return aerr
+}
+
+func cmdStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
+	by := fs.String("by", "kind", "group by kind|model|skill")
+	asJSON := fs.Bool("json", false, "print the report as JSON")
+	backfill := fs.Bool("backfill", false, "first write the missing summary rows from job dirs and the archive")
+	all := fs.Bool("all", false, "with --backfill: rewrite every row, not only the missing ones")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	t, err := jobs.ParseSince(*since, m.Now())
+	if err != nil {
+		return err
+	}
+	if *backfill {
+		b, err := m.BackfillStats(*all)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "backfill: %d rows written, %d present, %d errors\n", b.Recorded, b.Present, len(b.Errors))
+		for _, e := range b.Errors {
+			fmt.Fprintln(os.Stderr, "backfill:", e)
+		}
+	}
+	rep, err := m.Stats(t, *by)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(rep)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	row := func(key string, s jobs.StatsSummary) {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%ds\t%ds\t%d\n", key, s.Jobs,
+			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
+			s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+	}
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	for _, g := range rep.Groups {
+		row(shown(g.Key), g.StatsSummary)
+	}
+	row("total", rep.Totals)
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if len(rep.GuardRules) > 0 {
+		fmt.Println("\nguard refusals by rule:")
+		for _, r := range rep.GuardRules {
+			fmt.Printf("  %-22s %d\n", shown(r.Name), r.Count)
+		}
+	}
+	if len(rep.Skills) > 0 {
+		fmt.Println("\nskills (uses, jobs, success rate):")
+		for _, s := range rep.Skills {
+			fmt.Printf("  %-22s %d  %d  %.0f%%\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100)
+		}
+	}
+	return nil
+}
+
+// shown prints a name taken from a job's stream (a skill, a guard rule, a group key): as it is when
+// every rune is printable, quoted otherwise, so a job cannot plant terminal escape sequences.
+func shown(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0 {
+		return s
+	}
+	return strconv.Quote(s)
 }
 
 func cmdDoctor(args []string) error {

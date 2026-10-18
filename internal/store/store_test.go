@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,58 @@ func TestOpenMigratesStage1Database(t *testing.T) {
 			t.Fatalf("migrated row: %+v", j)
 		}
 		_ = st.Close()
+	}
+}
+
+// Databases created by any parallel branch (with or without `subagents`, the scope columns, the
+// stop/resume columns) open, gain the missing columns, and reopen as a no-op.
+func TestOpenMigratesEitherBranchDatabase(t *testing.T) {
+	resume := []string{"session_id", "attempt", "run_mode", "pending_context", "cost_unknown", "session_digest"}
+	for name, skip := range map[string][]string{
+		"subagents only": append([]string{"scope_"}, resume...), "scope only": append([]string{"subagents"}, resume...),
+		"stop/resume without scope": {"scope_"}, "scope without stop/resume": resume,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "jobs.db")
+			raw, err := sql.Open("sqlite", "file:"+path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(stage1Schema); err != nil {
+				t.Fatal(err)
+			}
+			for _, alter := range migrations {
+				// Other tables (attempts) are created by Open itself, before the migrations run.
+				if strings.HasPrefix(alter, "ALTER TABLE jobs ") && !slices.ContainsFunc(skip, func(c string) bool {
+					return strings.Contains(alter, "COLUMN "+c)
+				}) {
+					if _, err := raw.Exec(alter); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_ = raw.Close()
+			for range 2 {
+				st, err := Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, err := st.SubagentCount("old-1"); err != nil || n != 0 {
+					t.Fatalf("subagents = %d, %v", n, err)
+				}
+				j, err := st.Get("old-1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if j.ScopeUnit != "" || j.ScopePending {
+					t.Fatalf("scope columns: %+v", j)
+				}
+				if j.SessionID != "" || j.Attempt != 0 || j.RunMode != "" || j.CostUnknown {
+					t.Fatalf("session columns: %+v", j)
+				}
+				_ = st.Close()
+			}
+		})
 	}
 }
 

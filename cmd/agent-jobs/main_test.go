@@ -54,3 +54,19 @@ func TestRunWrapperUsage(t *testing.T) {
 		}
 	}
 }
+
+// Names from a job's stream are printed as they are, or quoted when they carry control characters.
+func TestShownQuotesControlChars(t *testing.T) {
+	cases := [][2]string{
+		{"deploy", "deploy"},
+		{"сборка", "сборка"},
+		{"x\x1b]0;pwned\x07", `"x\x1b]0;pwned\a"`},
+		{"a\nb", `"a\nb"`},
+	}
+	for _, c := range cases {
+		in, want := c[0], c[1]
+		if got := shown(in); got != want {
+			t.Errorf("shown(%q) = %s, want %s", in, got, want)
+		}
+	}
+}

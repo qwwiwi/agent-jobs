@@ -23,7 +23,7 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// Stop, resume and amend (PLAN Wave E2, DEVIATIONS #14). A job runs in a claude session whose id is
+// Stop, resume and amend (PLAN Wave E2, DEVIATIONS #15). A job runs in a claude session whose id is
 // assigned before launch; job_stop ends a running job like cancel but keeps it resumable, job_resume
 // queues the next attempt of the same job id in the same work dir and the same session
 // (claude --resume) with the orchestrator's update as the new user message, and job_amend appends
@@ -349,6 +349,9 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		if err := m.Store.Finish(id, "", store.StatusStopped, 0, 0, 0, msg, now); err != nil {
 			return nil, err
 		}
+		if j.Attempt > 0 {
+			m.recordStatsOf(id) // a queued resume: the job's row keeps the earlier attempts
+		}
 		return m.Store.Get(id)
 	case store.StatusRunning:
 	default:
@@ -378,7 +381,13 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		msg += " (cost so far unknown: ended by the stop)"
 	}
 	m.noteFallback(j)
-	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+	// The scope is ended like a cancel's: nothing of the attempt may outlive it. A failed stop stays
+	// pending (retried every tick) and the job cannot be resumed until it succeeds.
+	if err := m.endScope(j); err != nil {
+		m.Log.Printf("job %s: %v", id, err)
+		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
+	}
+	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, Printable(msg, 800), now); err != nil {
 		return nil, err
 	}
 	// Only now (the row is no longer running) does a process left in the job's session count as a
@@ -386,6 +395,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	note := m.sweepEscaped(id)
 	m.noteSweep(id, note)
 	m.recordAttemptEnd(j, res, killed)
+	m.recordStatsOf(id)
 	if note != "" {
 		msg += "; " + note
 	}
@@ -592,6 +602,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
+	if j.ScopePending {
+		return nil, fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
+	}
 	if err := m.checkEscaped(id); err != nil {
 		return nil, err
 	}
@@ -765,6 +778,9 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 // attempt + update) written. The same session is resumed when its transcript is on disk; otherwise
 // the attempt starts in a fresh session from fallback.md.
 func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) {
+	if j.ScopePending {
+		return launchPlan{}, errors.New("the cgroup scope of the previous attempt is not stopped yet")
+	}
 	dir := m.JobDir(j.ID)
 	prev := j.Attempt - 1
 	if err := archiveAttempt(dir, prev); err != nil {
@@ -814,7 +830,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := os.WriteFile(filepath.Join(dir, resumePromptFile), []byte(update), 0o600); err != nil {
 		return launchPlan{}, err
 	}
-	brief, err := m.BuildPrompt(j, rules, cards)
+	brief, err := m.BuildPrompt(j, rules, cards, m.LookupMemoryNotes(j))
 	if err != nil {
 		return launchPlan{}, err
 	}
