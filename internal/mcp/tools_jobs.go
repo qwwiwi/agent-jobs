@@ -28,7 +28,7 @@ const MaxReportBytes = 256 << 10
 // artifactFiles are the files job_result points at when they exist (what the job changed). They are
 // only listed (lstat, regular files only), never read; report.md is the one file read (ReadJobReport).
 var artifactFiles = []string{"report.md", "diffstat.txt", "commits.patch", "staged.patch", "uncommitted.patch",
-	"untracked.tar", "stream.jsonl", "stderr.log"}
+	"untracked.tar", "stream.jsonl", "stderr.log", jobs.AcceptanceLog}
 
 // JobView is one job row as the tools return it.
 type JobView struct {
@@ -71,6 +71,8 @@ type JobView struct {
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
+	// AcceptanceCmd is the command the job must pass after claude exits 0 (empty = none).
+	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -91,6 +93,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
+		AcceptanceCmd: j.AcceptanceCmd,
 	}
 }
 
@@ -135,6 +138,7 @@ type JobStartInput struct {
 	Base            string  `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
 	Runner          string  `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
 	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
+	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only: one-line shell command (max 1 KB) run in the job worktree after claude exits 0; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -148,7 +152,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
-			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort,
+			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -193,6 +197,39 @@ type JobResultOutput struct {
 	Note            string   `json:"note,omitempty"`
 	// Attempts lists every attempt of a resumed job, oldest first; the last one is the current row.
 	Attempts []AttemptView `json:"attempts,omitempty"`
+	// Acceptance is the acceptance command's outcome (jobs with acceptance_cmd only).
+	Acceptance *AcceptanceView `json:"acceptance,omitempty"`
+}
+
+// MaxAcceptanceTailBytes caps the acceptance log tail job_result returns; the log keeps 64 KB.
+const MaxAcceptanceTailBytes = 16 << 10
+
+// AcceptanceView is the acceptance command of a job and how it ended.
+type AcceptanceView struct {
+	Cmd string `json:"cmd"`
+	// Ran is false when the command did not run (claude failed, or the job is not finished).
+	Ran bool `json:"ran"`
+	// Exit is the exit code (128+signal when killed by a signal); -1 with TimedOut.
+	Exit        int  `json:"exit"`
+	TimedOut    bool `json:"timed_out,omitempty"`
+	DurationSec int  `json:"duration_sec"`
+	// LogTail is the end of acceptance.log (stdout and stderr), at most MaxAcceptanceTailBytes; not redacted.
+	LogTail string `json:"log_tail,omitempty"`
+}
+
+// acceptanceView is the AcceptanceView of j, nil when it has no acceptance command.
+func acceptanceView(m *jobs.Manager, j *store.Job) *AcceptanceView {
+	if j.AcceptanceCmd == "" {
+		return nil
+	}
+	v := &AcceptanceView{Cmd: j.AcceptanceCmd, DurationSec: j.AcceptanceDurationSec}
+	if j.AcceptanceExit != nil {
+		v.Ran, v.Exit, v.TimedOut = true, *j.AcceptanceExit, *j.AcceptanceExit == store.AcceptanceTimedOut
+	}
+	if tail, err := jobs.ReadAcceptanceLogTail(m.JobDir(j.ID), MaxAcceptanceTailBytes); err == nil {
+		v.LogTail = tail
+	}
+	return v
 }
 
 func addJobResult(s *sdk.Server, d Deps) {
@@ -217,6 +254,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 			return nil, out, nil
 		}
 		out.DoneLine = jobs.DoneLine(j)
+		out.Acceptance = acceptanceView(m, j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {
 			if fi, err := os.Lstat(filepath.Join(dir, f)); err == nil && fi.Mode().IsRegular() {

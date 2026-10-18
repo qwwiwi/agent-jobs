@@ -30,6 +30,8 @@ type Schedule struct {
 	MaxBudgetUSD    float64 `json:"max_budget_usd,omitempty"`
 	TimeoutMinutes  int     `json:"timeout_minutes,omitempty"`
 	RepoPath        string  `json:"repo,omitempty"`
+	// AcceptanceCmd is the acceptance command of the jobs it starts (see Job.AcceptanceCmd).
+	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
 	// Base is the ref resolved in RepoPath at each firing ("" = HEAD).
 	Base      string    `json:"base,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
@@ -67,13 +69,20 @@ CREATE TABLE IF NOT EXISTS schedules (
 	last_fired_at    INTEGER,
 	last_fired_local TEXT NOT NULL DEFAULT '',
 	last_job_id      TEXT NOT NULL DEFAULT '',
-	last_error       TEXT NOT NULL DEFAULT ''
+	last_error       TEXT NOT NULL DEFAULT '',
+	acceptance_cmd   TEXT NOT NULL DEFAULT ''
 );
 `
 
+// scheduleMigrations add columns to the schedules table introduced after it, in order (run after
+// schedulesSchema; a fresh table already has them). Never edit or reorder a row.
+var scheduleMigrations = []string{
+	`ALTER TABLE schedules ADD COLUMN acceptance_cmd TEXT NOT NULL DEFAULT ''`,
+}
+
 const scheduleCols = `id, cron, prompt, enabled, kind, title, model, complexity, runner, reasoning_effort,
 	max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at,
-	last_fired_at, last_fired_local, last_job_id, last_error`
+	last_fired_at, last_fired_local, last_job_id, last_error, acceptance_cmd`
 
 // AddSchedule inserts s (enabled as given) and returns it with its id. Validation is the caller's.
 // A job schedule without a title gets the neutral "schedule <id>" in the same transaction.
@@ -84,10 +93,10 @@ func (s *Store) AddSchedule(sc *Schedule, now time.Time) (*Schedule, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.Exec(`INSERT INTO schedules (cron, prompt, enabled, kind, title, model, complexity, runner,
-		reasoning_effort, max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		reasoning_effort, max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at, acceptance_cmd)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sc.Cron, sc.Prompt, sc.Enabled, sc.Kind, sc.Title, sc.Model, sc.Complexity, sc.Runner, sc.ReasoningEffort,
-		sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath, sc.Base, now.Unix(), now.Unix())
+		sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath, sc.Base, now.Unix(), now.Unix(), sc.AcceptanceCmd)
 	if err != nil {
 		return nil, fmt.Errorf("add schedule: %w", err)
 	}
@@ -112,7 +121,7 @@ func scanSchedule(r scanner) (*Schedule, error) {
 	var fired sql.NullInt64
 	if err := r.Scan(&sc.ID, &sc.Cron, &sc.Prompt, &sc.Enabled, &sc.Kind, &sc.Title, &sc.Model, &sc.Complexity,
 		&sc.Runner, &sc.ReasoningEffort, &sc.MaxTurns, &sc.MaxBudgetUSD, &sc.TimeoutMinutes, &sc.RepoPath, &sc.Base,
-		&created, &updated, &fired, &sc.LastFiredLocal, &sc.LastJobID, &sc.LastError); err != nil {
+		&created, &updated, &fired, &sc.LastFiredLocal, &sc.LastJobID, &sc.LastError, &sc.AcceptanceCmd); err != nil {
 		return nil, err
 	}
 	sc.CreatedAt, sc.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)

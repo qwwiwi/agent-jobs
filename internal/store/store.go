@@ -102,7 +102,20 @@ type Job struct {
 	// ScopePending is set when stopping the job's scope failed: the row is terminal, but processes of
 	// the job may live on; every tick retries the stop until the unit is gone.
 	ScopePending bool
+	// AcceptanceCmd is the orchestrator's shell command a job must pass after claude exits 0 (empty = none).
+	AcceptanceCmd string
+	// AcceptanceStartedAt is when the wrapper started the acceptance command of the current attempt
+	// (the daemon then allows it the acceptance timeout on top of the job's), nil before.
+	AcceptanceStartedAt *time.Time
+	// AcceptanceExit is the acceptance command's exit code of the current attempt (AcceptanceTimedOut for
+	// a timeout), nil when it did not run.
+	AcceptanceExit *int
+	// AcceptanceDurationSec is how long the acceptance command ran.
+	AcceptanceDurationSec int
 }
+
+// AcceptanceTimedOut is the AcceptanceExit of an acceptance command ended by its timeout.
+const AcceptanceTimedOut = -1
 
 // CostIsUnknown reports whether the job's cost is not known: a codex job always (codex reports no
 // price, so even a queued or running one has no cost to show), a claude job when CostUnknown is set.
@@ -227,6 +240,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: schedules: %w", err)
 	}
+	for _, alter := range scheduleMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: schedules: %w", err)
+		}
+	}
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
@@ -307,6 +326,10 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_cmd TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_started_at INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_exit INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN acceptance_duration_sec INTEGER NOT NULL DEFAULT 0`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -421,7 +444,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	max_turns, max_budget_usd, timeout_minutes, pid, pgid, created_at, started_at,
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
-	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort`
+	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
+	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -438,13 +462,14 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
-		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort)
+		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
+		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -456,14 +481,20 @@ type scanner interface{ Scan(dest ...any) error }
 func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
-	var started, finished, notified, cleaned sql.NullInt64
+	var started, finished, notified, cleaned, accStarted, accExit sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
-		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort)
+		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
+		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec)
 	if err != nil {
 		return nil, err
+	}
+	j.AcceptanceStartedAt = convTS(accStarted)
+	if accExit.Valid {
+		e := int(accExit.Int64)
+		j.AcceptanceExit = &e
 	}
 	j.CreatedAt = time.Unix(created, 0)
 	j.StartedAt, j.FinishedAt, j.NotifiedAt, j.CleanedAt = convTS(started), convTS(finished), convTS(notified), convTS(cleaned)
@@ -665,7 +696,8 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', max_turns=?, max_budget_usd=?,
+		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', acceptance_started_at=NULL,
+		acceptance_exit=NULL, acceptance_duration_sec=0, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
@@ -708,6 +740,20 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 func (s *Store) Unclaim(id, token string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL,
 		scope_unit='', attempt=MAX(attempt-1, 0) WHERE id=? AND status='running' AND launch_token=?`, id, token))
+}
+
+// SetAcceptanceStarted records, for the running launch that owns the job, that its acceptance command
+// started now.
+func (s *Store) SetAcceptanceStarted(id, token string, now time.Time) error {
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_started_at=? WHERE id=? AND status='running' AND launch_token=?`,
+		now.Unix(), id, token))
+}
+
+// SetAcceptanceResult records the acceptance command's exit code (AcceptanceTimedOut for a timeout)
+// and duration for the running launch that owns the job.
+func (s *Store) SetAcceptanceResult(id, token string, exit, durationSec int) error {
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_exit=?, acceptance_duration_sec=? WHERE id=? AND status='running'
+		AND launch_token=?`, exit, durationSec, id, token))
 }
 
 // SetPID records the wrapper's pid/pgid for the launch that owns the job.

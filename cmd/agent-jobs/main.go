@@ -37,6 +37,8 @@ const usage = `usage: agent-jobs <command> [flags]
              [--runner claude|codex] [--reasoning-effort low|medium|high]
                                            a gpt-* model runs on codex exec (read-only kinds
                                            review/research unless codex_write_allowed)
+             [--acceptance-cmd CMD]       fix/general: one-line shell command the job must
+                                           pass in its worktree after claude exits 0
   status     --agent A [<id>]              a job; without an id: the daily automation
                                            (prune + doctor procs) and its last run
   list       --agent A [--limit N] [--status S] [--json]
@@ -386,6 +388,7 @@ func cmdStart(args []string) error {
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
 	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
 	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
+	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -473,6 +476,9 @@ func cmdStatus(args []string) error {
 		fmt.Printf("contain:   %s\n", c)
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
+	if j.AcceptanceCmd != "" {
+		fmt.Printf("accept:    %s (%s)\n", j.AcceptanceCmd, acceptanceWord(j))
+	}
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
 	}
@@ -587,6 +593,19 @@ func cmdList(args []string) error {
 			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// acceptanceWord is how a job's acceptance command ended: not run, passed, timeout or exit N.
+func acceptanceWord(j *store.Job) string {
+	switch {
+	case j.AcceptanceExit == nil:
+		return "not run"
+	case *j.AcceptanceExit == 0:
+		return fmt.Sprintf("passed in %ds", j.AcceptanceDurationSec)
+	case *j.AcceptanceExit == store.AcceptanceTimedOut:
+		return fmt.Sprintf("timeout after %ds", j.AcceptanceDurationSec)
+	}
+	return fmt.Sprintf("exit %d after %ds", *j.AcceptanceExit, j.AcceptanceDurationSec)
 }
 
 // costWord is a cost in a sentence: "$1.23", or "cost unknown".

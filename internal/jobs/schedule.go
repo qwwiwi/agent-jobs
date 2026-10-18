@@ -45,6 +45,7 @@ type ScheduleRequest struct {
 	Base            string
 	Runner          string
 	ReasoningEffort string
+	AcceptanceCmd   string
 }
 
 // SchedulePrompt validates a schedule's prompt: required, valid UTF-8, one line (no control or
@@ -101,8 +102,9 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	sc := &store.Schedule{Cron: cron, Prompt: prompt, Enabled: true}
 	if r.Kind == "" {
 		if r.Title != "" || r.Model != "" || r.Complexity != "" || r.MaxTurns != 0 || r.MaxBudgetUSD != 0 ||
-			r.TimeoutMinutes != 0 || r.Repo != "" || r.Base != "" || r.Runner != "" || r.ReasoningEffort != "" {
-			return nil, errors.New("job fields (title, model, complexity, limits, repo, base, runner, reasoning_effort) " +
+			r.TimeoutMinutes != 0 || r.Repo != "" || r.Base != "" || r.Runner != "" || r.ReasoningEffort != "" ||
+			r.AcceptanceCmd != "" {
+			return nil, errors.New("job fields (title, model, complexity, limits, repo, base, runner, reasoning_effort, acceptance_cmd) " +
 				"need a kind; without a kind the prompt goes into the session")
 		}
 		if m.Cfg.NotifyTmuxTarget == "" {
@@ -123,7 +125,7 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	j, err := m.newJob(StartRequest{
 		Title: title, Kind: r.Kind, Brief: prompt, RepoPath: r.Repo, Base: r.Base, Model: r.Model,
 		Complexity: r.Complexity, MaxTurns: r.MaxTurns, MaxBudgetUSD: r.MaxBudgetUSD, TimeoutMinutes: r.TimeoutMinutes,
-		Runner: r.Runner, ReasoningEffort: r.ReasoningEffort,
+		Runner: r.Runner, ReasoningEffort: r.ReasoningEffort, AcceptanceCmd: r.AcceptanceCmd,
 	})
 	if err != nil {
 		return nil, err
@@ -133,6 +135,7 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	}
 	sc.Kind, sc.Title, sc.Model, sc.Complexity, sc.Runner, sc.ReasoningEffort = j.Kind, j.Title, j.Model, j.Complexity, j.Runner, j.ReasoningEffort
 	sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath = j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.RepoPath
+	sc.AcceptanceCmd = j.AcceptanceCmd
 	if j.RepoPath != "" {
 		sc.Base = strings.TrimSpace(r.Base) // a ref, resolved again at each firing ("" = HEAD)
 	}
@@ -301,6 +304,7 @@ func (m *Manager) fireSchedules() error {
 			Title: ScheduleTitle(sc), Kind: sc.Kind, Brief: sc.Prompt, RepoPath: sc.RepoPath, Base: sc.Base, Model: sc.Model,
 			Complexity: sc.Complexity, MaxTurns: sc.MaxTurns, MaxBudgetUSD: sc.MaxBudgetUSD, TimeoutMinutes: sc.TimeoutMinutes,
 			Runner: sc.Runner, ReasoningEffort: sc.ReasoningEffort, ScheduleID: strconv.FormatInt(sc.ID, 10),
+			AcceptanceCmd: sc.AcceptanceCmd,
 		})
 		if err != nil {
 			ferr = err.Error()
