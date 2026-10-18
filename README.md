@@ -33,8 +33,8 @@ That is what a job avoids:
 - **Notifications and result turns re-read the full parent.** A job costs the parent one short line when it finishes, and one read of the report.
 - **A foreground subagent keeps the parent's turn open.** The session cannot talk or decide until it returns. A job returns an id at once and the session stays free.
 - **A job is its own process with hard limits.** Subagents can be scoped too (turn limits, tool allowlists, MCP servers). What a job adds is the combination: a separate `claude -p` process with its own full context, its own git worktree, a USD budget (`--max-budget-usd`) and a wall-clock timeout enforced by the daemon, survival across a restart of the parent, and a fixed report contract.
-- **A job outlives the session.** Subagents die with their session; a job runs in its own process group and survives a session or daemon restart. Resuming an interrupted job from its saved patches is planned (Wave B).
-- **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most `max_running` run per agent, default two) and, with schedules (planned, Wave B), can run when the window is quiet.
+- **A job outlives the session.** Subagents die with their session; a job runs in its own process group and survives a session or daemon restart. An interrupted job can be resumed in its own session (`job_resume`, Wave E2).
+- **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most `max_running` run per agent, default two) and, with schedules (Wave B), can run when the window is quiet.
 - **A job is a full session.** A subagent starts with only its prompt and is often routed to a cheaper model. A job is a full top-level Claude Code run with its own model choice and the full tool set, inside the limits above.
 
 We do not publish an "N× cheaper" or "N× faster" figure yet, because we have not measured one per task. The benchmark below is how we will.
@@ -76,8 +76,8 @@ One main session, many workers. The session writes a brief for a stranger (a job
 - **Queue** is one SQLite table per agent. A tick claims a job with a random launch token before spawning anything, and only that tick can finish it, so a job is never launched twice.
 - **Job** is `agent-jobs run-wrapper` running `claude -p` in its own process group, with a scrubbed git environment, in a git worktree detached at the base commit (or an empty directory).
 - **Job folder** keeps the brief, settings, event stream, report and, after cleanup, the patches.
-- **Schedules (cron)** are built, unreleased (Wave B): the daemon checks them every minute and types a due prompt into the main session or starts a job.
-- **Checks (dead-man's switch)** are built, unreleased (Wave B): work that stays silent while healthy leaves a mark; the daemon alerts the main session once when an expected time passes without one.
+- **Schedules (cron)** are built, released in 0.4.0 (Wave B): the daemon checks them every minute and types a due prompt into the main session or starts a job.
+- **Checks (dead-man's switch)** are built, released in 0.4.0 (Wave B): work that stays silent while healthy leaves a mark; the daemon alerts the main session once when an expected time passes without one.
 
 ### Lifecycle
 
@@ -321,7 +321,7 @@ In every tick the daemon judges each enabled check's expected times whose grace 
 |---|---|
 | `notify_owner` | ask for the owner's attention: `text` (one line, ≤ 300 characters, control characters refused, `[jobs:` inside it defanged), optional `urgency` (normal \| high). agent-jobs sends nothing to a messenger itself: one line `[jobs:notify-owner] …` (with `job <id>:` from a job) is typed into the notify target like the job-done line, and the agent's session relays it over its own channel. A job: at most 3, at most one a minute (through the daemon); the agent: at most 20 an hour. Every admitted call is stored; a refused one (invalid text or urgency, over a limit) is an error and stores nothing. An undelivered one (no target, tmux refused or not done within 10 s) is an error and shows in `agent-jobs status` and `system_doctor`. CLI: `agent-jobs notify-owner --agent A --text T [--urgency high]` |
 
-**Owner waits** (built, unreleased): a job started at the owner's request is marked (`job_start` with `owner_waits: true`, `agent-jobs start --owner-waits`). Its job-done line ends with `· owner waits`. When the job has finished, it is recorded as «owner reply pending» for the agent *before* its line is typed into the session, so the session never sees the line without the record. A Stop hook in the orchestrator session, `agent-jobs hook stop --agent A`, then blocks the end of a turn (`{"decision":"block","reason":"…"}`) until the session has written to the owner and called `owner_replied`; it blocks at most once per turn (with `stop_hook_active` it always allows, so it never loops) and fails open (any error, and any incomplete hook input, allows the stop).
+**Owner waits** (built, released in 0.4.0): a job started at the owner's request is marked (`job_start` with `owner_waits: true`, `agent-jobs start --owner-waits`). Its job-done line ends with `· owner waits`. When the job has finished, it is recorded as «owner reply pending» for the agent *before* its line is typed into the session, so the session never sees the line without the record. A Stop hook in the orchestrator session, `agent-jobs hook stop --agent A`, then blocks the end of a turn (`{"decision":"block","reason":"…"}`) until the session has written to the owner and called `owner_replied`; it blocks at most once per turn (with `stop_hook_active` it always allows, so it never loops) and fails open (any error, and any incomplete hook input, allows the stop).
 
 The hook holds **only the orchestrator session**: `agent-jobs hook bind --agent A`, run from that session's SessionStart hook, records its `session_id`. A bind is accepted only when all hold: (a) it runs in the tmux pane of `notify_tmux_target` (`$TMUX_PANE` equals the pane tmux resolves the target to); (b) the hook input's `cwd` is inside `orchestrator_dir` (config); (c) it is not inside a job. With no `notify_tmux_target` or no `orchestrator_dir` configured every bind is refused, and the Stop hook then never blocks. Replacing a binding obeys the same checks: a new session, `/clear` or a resume in the same pane and directory rebinds, while another project's session with the same hooks, or a process elsewhere, cannot take it over; a refused bind keeps the old binding. A process the orchestrator itself starts in that pane and directory (its own subagent) is inside the orchestrator's trust domain and is not defended against. The Stop hook blocks only when its input's `session_id` equals the bound one; with no session bound, or in any other session that has the hook configured, it allows.
 
@@ -358,13 +358,13 @@ Register both hooks in the orchestrator's Claude Code settings (the `settings.js
 | Team | `send_message`, `inbox` | none | built (shared brain) |
 | System | `system_doctor`, `system_logs`, `activity_report` | none | built |
 | Files | `trash_move`, `trash_restore` | none | built |
-| Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, unreleased (Wave B) |
-| Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, unreleased (Wave B) |
-| Owner | `notify_owner` | `notify_owner` | built, unreleased (Wave B) |
-| Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, unreleased (Wave B) |
-| Owner | `owner_replied` («owner waits» Stop hook) | none | built, unreleased (Wave D) |
-| Heartbeat | `heartbeat_get` (a stored decision) | none | built, unreleased (Wave D) |
-| Skills | `skill_list` (catalog, content search) | the selected skills, linked into the worktree | built, unreleased (Wave E7, job-side part) |
+| Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, released in 0.4.0 (Wave B) |
+| Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, released in 0.4.0 (Wave B) |
+| Owner | `notify_owner` | `notify_owner` | built, released in 0.4.0 (Wave B) |
+| Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, released in 0.4.0 (Wave B) |
+| Owner | `owner_replied` («owner waits» Stop hook) | none | built, released in 0.4.0 (Wave D) |
+| Heartbeat | `heartbeat_get` (a stored decision) | none | built, released in 0.4.0 (Wave D) |
+| Skills | `skill_list` (catalog, content search) | the selected skills, linked into the worktree | built, released in 0.4.0 (Wave E7, job-side part) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
 ---
