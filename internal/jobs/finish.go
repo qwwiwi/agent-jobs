@@ -151,13 +151,13 @@ func (m *Manager) runTmux(ctx context.Context, args ...string) error {
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
 	if ctx.Err() != nil {
 		return fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
 	}
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 }
 
 func (m *Manager) cleanupDue() error {
