@@ -16,16 +16,17 @@ type ScheduleAddInput struct {
 	Kind   string `json:"kind,omitempty" jsonschema:"omit to deliver the prompt into this session; review | fix | research | general to start a job instead (then model or complexity is required, like job_start)"`
 	Title  string `json:"title,omitempty" jsonschema:"job schedules: title of the jobs it starts; default \"schedule <id>\" (never taken from the prompt)"`
 	// The job fields below are validated like job_start and stored on the schedule at creation.
-	Model           string  `json:"model,omitempty" jsonschema:"job schedules: explicit model (a gpt-* model runs on codex exec)"`
-	Complexity      string  `json:"complexity,omitempty" jsonschema:"job schedules: light | normal | hard; the model is resolved now and stored"`
-	MaxTurns        int     `json:"max_turns,omitempty" jsonschema:"job schedules: turn limit; default 80, ceiling 200"`
-	TimeoutMinutes  int     `json:"timeout_minutes,omitempty" jsonschema:"job schedules: wall-clock limit in minutes; default 45, ceiling 180"`
-	MaxBudgetUSD    float64 `json:"max_budget_usd,omitempty" jsonschema:"job schedules: spend cap in USD; default 10, ceiling 50"`
-	Repo            string  `json:"repo,omitempty" jsonschema:"job schedules: absolute path of a git repository"`
-	Base            string  `json:"base,omitempty" jsonschema:"job schedules: ref in repo, resolved at each firing; default HEAD"`
-	Runner          string  `json:"runner,omitempty" jsonschema:"job schedules: claude | codex (codex rules as in job_start)"`
-	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex job schedules only: low | medium | high"`
-	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general job schedules only: the acceptance command of the jobs it starts (see job_start)"`
+	Model           string   `json:"model,omitempty" jsonschema:"job schedules: explicit model (a gpt-* model runs on codex exec)"`
+	Complexity      string   `json:"complexity,omitempty" jsonschema:"job schedules: light | normal | hard; the model is resolved now and stored"`
+	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"job schedules: turn limit; default 80, ceiling 200"`
+	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"job schedules: wall-clock limit in minutes; default 45, ceiling 180"`
+	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"job schedules: spend cap in USD; default 10, ceiling 50"`
+	Repo            string   `json:"repo,omitempty" jsonschema:"job schedules: absolute path of a git repository"`
+	Base            string   `json:"base,omitempty" jsonschema:"job schedules: ref in repo, resolved at each firing; default HEAD"`
+	Runner          string   `json:"runner,omitempty" jsonschema:"job schedules: claude | codex (codex rules as in job_start)"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"codex job schedules only: low | medium | high"`
+	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general job schedules only: the acceptance command of the jobs it starts (see job_start)"`
+	Skills          []string `json:"skills,omitempty" jsonschema:"job schedules: edits to the default skills of each job it starts, as in job_start (+name or name adds, -name removes); checked now and again at each firing"`
 }
 
 // ScheduleSetInput is schedule_set's input.
@@ -86,7 +87,7 @@ func addScheduleAdd(s *sdk.Server, d Deps) {
 		sc, err := d.Manager.AddSchedule(jobs.ScheduleRequest{
 			Cron: in.Cron, Prompt: in.Prompt, Kind: in.Kind, Title: in.Title, Model: in.Model, Complexity: in.Complexity,
 			MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
-			Repo: in.Repo, Base: in.Base, Runner: in.Runner, ReasoningEffort: in.ReasoningEffort,
+			Repo: in.Repo, Base: in.Base, Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, Skills: in.Skills,
 			AcceptanceCmd: in.AcceptanceCmd,
 		})
 		if err != nil {

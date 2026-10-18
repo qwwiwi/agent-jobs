@@ -42,6 +42,9 @@ var OrchestratorOnly = []string{
 	"job_resume",
 	"job_amend",
 	"job_stats",
+	// The skill catalog (E7): the session chooses a job's skills; a job gets them delivered, it does
+	// not browse the catalog.
+	"skill_list",
 	"memory_already_exists",
 	"task_create",
 	"task_list",

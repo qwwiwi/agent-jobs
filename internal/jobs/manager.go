@@ -122,6 +122,8 @@ type StartRequest struct {
 	// OwnerWaits marks a job started at the owner's request: when its job-done line is delivered the
 	// orchestrator's Stop hook holds the session until owner_replied (or the record expires).
 	OwnerWaits bool
+	// Skills are edits to the job's default skills (E7): "name" or "+name" adds, "-name" removes.
+	Skills []string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -294,13 +296,17 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	selected, err := m.selectSkills(r.Kind, repo, r.Skills)
+	if err != nil {
+		return nil, err
+	}
 	now := m.Now()
 	j := &store.Job{
 		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
-		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits,
+		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 	}
 	return j, nil
 }
@@ -418,6 +424,7 @@ func (m *Manager) launchQueued() error {
 			return nil // the next queued jobs would meet the same user manager
 		} else if err != nil {
 			m.Log.Printf("job %s refused to start: %s", j.ID, RedactText(err.Error()))
+			m.removeSkills(j)
 			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
@@ -495,7 +502,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunNew); err != nil {
 			return fmt.Errorf("record session: %w", err)
 		}
-		if err := m.prepare(j, m.JobDir(j.ID)); err != nil {
+		if err := m.prepare(j, token, m.JobDir(j.ID)); err != nil {
 			return err
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
@@ -926,11 +933,21 @@ func killedResult(runner, dir string) (res StreamResult, killed bool) {
 // failed attempt can be resumed, so what it left outside its process group is swept first.
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) {
 	m.noteFallback(j)
+	delivered := slices.Clone(j.SkillsDelivered)
+	m.removeSkills(j)
 	// Whatever ended the job, nothing of it may outlive the row turning terminal.
 	if err := m.endScope(j); err != nil {
 		// Fail closed: the job is over for the daemon, but it must not count as a clean finish.
 		m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
 		status, msg = scopeStopFailed(status, msg, err)
+	} else if err := m.checkSkillLinks(j, delivered); err != nil {
+		// Checked once nothing of the job runs any more.
+		m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
+		if status == store.StatusTimeout {
+			msg = RedactPrintable(msg+"; "+err.Error(), 300)
+		} else {
+			status, msg = store.StatusFailed, RedactPrintable(err.Error(), 300)
+		}
 	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
@@ -1102,6 +1119,7 @@ func (m *Manager) Cancel(id string) error {
 		return nil
 	case store.StatusRunning:
 		m.killRunning(j)
+		m.removeSkills(j)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}

@@ -33,7 +33,9 @@ type Schedule struct {
 	// AcceptanceCmd is the acceptance command of the jobs it starts (see Job.AcceptanceCmd).
 	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
 	// Base is the ref resolved in RepoPath at each firing ("" = HEAD).
-	Base      string    `json:"base,omitempty"`
+	Base string `json:"base,omitempty"`
+	// Skills are the skill edits (+name, -name) applied at each firing to the job's default skills.
+	Skills    []string  `json:"skills,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	// LastFiredAt is the minute the schedule last fired (claimed), nil when never.
@@ -75,14 +77,16 @@ CREATE TABLE IF NOT EXISTS schedules (
 `
 
 // scheduleMigrations add columns to the schedules table introduced after it, in order (run after
-// schedulesSchema; a fresh table already has them). Never edit or reorder a row.
+// schedulesSchema; a column a fresh table already has is a tolerated duplicate). Never edit or
+// reorder a row.
 var scheduleMigrations = []string{
+	`ALTER TABLE schedules ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE schedules ADD COLUMN acceptance_cmd TEXT NOT NULL DEFAULT ''`,
 }
 
 const scheduleCols = `id, cron, prompt, enabled, kind, title, model, complexity, runner, reasoning_effort,
 	max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at,
-	last_fired_at, last_fired_local, last_job_id, last_error, acceptance_cmd`
+	last_fired_at, last_fired_local, last_job_id, last_error, skills, acceptance_cmd`
 
 // AddSchedule inserts s (enabled as given) and returns it with its id. Validation is the caller's.
 // A job schedule without a title gets the neutral "schedule <id>" in the same transaction.
@@ -93,10 +97,12 @@ func (s *Store) AddSchedule(sc *Schedule, now time.Time) (*Schedule, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.Exec(`INSERT INTO schedules (cron, prompt, enabled, kind, title, model, complexity, runner,
-		reasoning_effort, max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at, acceptance_cmd)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		reasoning_effort, max_turns, max_budget_usd, timeout_minutes, repo_path, base, created_at, updated_at, skills,
+		acceptance_cmd)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		sc.Cron, sc.Prompt, sc.Enabled, sc.Kind, sc.Title, sc.Model, sc.Complexity, sc.Runner, sc.ReasoningEffort,
-		sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath, sc.Base, now.Unix(), now.Unix(), sc.AcceptanceCmd)
+		sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath, sc.Base, now.Unix(), now.Unix(), JoinNames(sc.Skills),
+		sc.AcceptanceCmd)
 	if err != nil {
 		return nil, fmt.Errorf("add schedule: %w", err)
 	}
@@ -119,11 +125,13 @@ func scanSchedule(r scanner) (*Schedule, error) {
 	var sc Schedule
 	var created, updated int64
 	var fired sql.NullInt64
+	var skills string
 	if err := r.Scan(&sc.ID, &sc.Cron, &sc.Prompt, &sc.Enabled, &sc.Kind, &sc.Title, &sc.Model, &sc.Complexity,
 		&sc.Runner, &sc.ReasoningEffort, &sc.MaxTurns, &sc.MaxBudgetUSD, &sc.TimeoutMinutes, &sc.RepoPath, &sc.Base,
-		&created, &updated, &fired, &sc.LastFiredLocal, &sc.LastJobID, &sc.LastError, &sc.AcceptanceCmd); err != nil {
+		&created, &updated, &fired, &sc.LastFiredLocal, &sc.LastJobID, &sc.LastError, &skills, &sc.AcceptanceCmd); err != nil {
 		return nil, err
 	}
+	sc.Skills = SplitNames(skills)
 	sc.CreatedAt, sc.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 	sc.LastFiredAt = convTS(fired)
 	return &sc, nil

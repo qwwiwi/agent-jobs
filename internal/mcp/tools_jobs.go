@@ -76,6 +76,11 @@ type JobView struct {
 	Containment string `json:"containment,omitempty"`
 	// AcceptanceCmd is the command the job must pass after claude exits 0 (empty = none).
 	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
+	// Skills are the catalog skills selected at job_start; SkillsDelivered those linked into the work
+	// dir for the current attempt; SkillsNote why a selected one was not (repository wins, codex).
+	Skills          []string `json:"skills,omitempty"`
+	SkillsDelivered []string `json:"skills_delivered,omitempty"`
+	SkillsNote      string   `json:"skills_note,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -96,7 +101,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
-		AcceptanceCmd: j.AcceptanceCmd,
+		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 	}
 }
 
@@ -129,20 +134,21 @@ func getJob(m *jobs.Manager, id string) (*store.Job, error) {
 // kind × complexity table picks the model); with neither the call is rejected (owner 2026-10-17:
 // no classifier, no guessing). Limits follow the defaults and ceilings.
 type JobStartInput struct {
-	Title           string  `json:"title" jsonschema:"short title; shown in the job-done line"`
-	Kind            string  `json:"kind" jsonschema:"review | fix | research | general (sets the checklist and whether web tools are open: only research)"`
-	Brief           string  `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
-	Model           string  `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec; give this or complexity"`
-	Complexity      string  `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
-	MaxTurns        int     `json:"max_turns,omitempty" jsonschema:"turn limit; default 80, ceiling 200"`
-	TimeoutMinutes  int     `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
-	MaxBudgetUSD    float64 `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
-	Repo            string  `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
-	Base            string  `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
-	Runner          string  `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
-	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
-	AcceptanceCmd   string  `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
-	OwnerWaits      bool    `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
+	Title           string   `json:"title" jsonschema:"short title; shown in the job-done line"`
+	Kind            string   `json:"kind" jsonschema:"review | fix | research | general (sets the checklist and whether web tools are open: only research)"`
+	Brief           string   `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
+	Model           string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec; give this or complexity"`
+	Complexity      string   `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
+	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 80, ceiling 200"`
+	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
+	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
+	Repo            string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
+	Base            string   `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
+	Runner          string   `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
+	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
+	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
+	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. See skill_list"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -157,7 +163,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
-			OwnerWaits: in.OwnerWaits,
+			OwnerWaits: in.OwnerWaits, Skills: in.Skills,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)

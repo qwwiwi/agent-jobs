@@ -317,6 +317,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)
 	}
+	st.SkillsDelivered = slices.Clone(j.SkillsDelivered)
 	earlier, err := m.Store.Attempts(j.ID)
 	if err != nil {
 		return nil, err
@@ -471,13 +472,16 @@ type NameCount struct {
 	Count int    `json:"count"`
 }
 
-// SkillUse is how often a skill was used: in how many jobs, how many calls, and how those jobs ended.
+// SkillUse is how often a skill was used: in how many jobs, how many calls, and how those jobs ended;
+// Delivered counts the jobs it was linked into (E7), DeliveredUnused those of them that never used it.
 type SkillUse struct {
-	Name        string  `json:"name"`
-	Jobs        int     `json:"jobs"`
-	Uses        int     `json:"uses"`
-	Succeeded   int     `json:"succeeded"`
-	SuccessRate float64 `json:"success_rate"`
+	Name            string  `json:"name"`
+	Jobs            int     `json:"jobs"`
+	Uses            int     `json:"uses"`
+	Succeeded       int     `json:"succeeded"`
+	SuccessRate     float64 `json:"success_rate"`
+	Delivered       int     `json:"delivered"`
+	DeliveredUnused int     `json:"delivered_unused"`
 }
 
 // StatsReport is the output of `agent-jobs stats` and the job_stats MCP tool.
@@ -572,16 +576,27 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 		for n, c := range r.ToolCalls {
 			tools[n] += c
 		}
-		for n, c := range r.Skills {
+		use := func(n string) *SkillUse {
 			u := skills[n]
 			if u == nil {
 				u = &SkillUse{Name: n}
 				skills[n] = u
 			}
+			return u
+		}
+		for n, c := range r.Skills {
+			u := use(n)
 			u.Jobs++
 			u.Uses += c
 			if r.Status == store.StatusSucceeded {
 				u.Succeeded++
+			}
+		}
+		for _, n := range r.SkillsDelivered {
+			u := use(n)
+			u.Delivered++
+			if r.Skills[n] == 0 {
+				u.DeliveredUnused++
 			}
 		}
 	}
@@ -603,6 +618,9 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 		sa, sb := rep.Skills[a], rep.Skills[b]
 		if sa.Uses != sb.Uses {
 			return sa.Uses > sb.Uses
+		}
+		if sa.Delivered != sb.Delivered {
+			return sa.Delivered > sb.Delivered
 		}
 		return sa.Name < sb.Name
 	})

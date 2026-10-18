@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
+	"github.com/qwwiwi/agent-jobs/internal/skills"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -126,6 +127,15 @@ type Config struct {
 	// and the wrapper, which reloads config.json, does not run it). The command runs the job's code
 	// outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
+	// SkillRoots are absolute directories of skill catalogs (E7), each holding index.json; earlier roots
+	// win a duplicate name. A missing or invalid root is a warning (status, system_doctor), never fatal.
+	// Empty = no catalog: jobs see only their repository's own .claude/skills.
+	SkillRoots []string `json:"skill_roots"`
+	// SkillsMaxPerJob caps the skills selected for one job. 0 = skills.DefaultMaxPerJob (6), at most
+	// skills.CeilingMaxPerJob (8).
+	SkillsMaxPerJob int `json:"skills_max_per_job"`
+	// SkillsMaxKB caps the total size of one job's skills in KB. 0 = skills.DefaultMaxKB (400).
+	SkillsMaxKB float64 `json:"skills_max_kb"`
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -292,6 +302,13 @@ func LoadConfig(stateDir string) (Config, error) {
 		if !filepath.IsAbs(r) {
 			return c, fmt.Errorf("config.json: trash_roots entry %q must be an absolute path", r)
 		}
+	}
+	if c.SkillsMaxPerJob < 0 || c.SkillsMaxPerJob > skills.CeilingMaxPerJob {
+		return c, fmt.Errorf("config.json: skills_max_per_job %d must be 0 (default %d) .. %d", c.SkillsMaxPerJob,
+			skills.DefaultMaxPerJob, skills.CeilingMaxPerJob)
+	}
+	if c.SkillsMaxKB < 0 {
+		return c, fmt.Errorf("config.json: skills_max_kb %g must be 0 (default %d) or positive", c.SkillsMaxKB, skills.DefaultMaxKB)
 	}
 	if c.LogArchiveDir != "" && !filepath.IsAbs(c.LogArchiveDir) {
 		return c, fmt.Errorf("config.json: log_archive_dir %q must be an absolute path", c.LogArchiveDir)

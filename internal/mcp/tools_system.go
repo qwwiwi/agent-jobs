@@ -43,6 +43,9 @@ type SystemDoctorOutput struct {
 	// OwnerHookSession is the orchestrator session the Stop hook holds (`agent-jobs hook bind` from
 	// its SessionStart hook); "" when none is bound, and then the hook holds no session.
 	OwnerHookSession string `json:"owner_hook_session"`
+	// SkillWarnings are skill catalog roots or entries (config skill_roots) that did not load: warnings,
+	// not problems (jobs still start, without those skills).
+	SkillWarnings []string `json:"skill_warnings,omitempty"`
 }
 
 func addSystemDoctor(s *sdk.Server, d Deps) {
@@ -56,10 +59,11 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"not delivered to the session, and dead-man's switch checks whose latest expected time passed without a mark " +
 			"(also when a late mark came) or whose missed alert is pending or failed, and the owner-waits jobs whose result the owner has not been told yet " +
 			"(owner_reply_pending; not a problem, owner_replied clears them) with the session their Stop hook holds " +
-			"(owner_hook_session; empty: none bound). ok=false lists the problems.",
+			"(owner_hook_session; empty: none bound), and skill_warnings for skill catalog roots or entries that did not load. " +
+			"ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
-		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks()}
+		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks(), SkillWarnings: m.SkillWarnings()}
 		var err error
 		if out.Queue, err = m.Queue(); err != nil {
 			return nil, out, err

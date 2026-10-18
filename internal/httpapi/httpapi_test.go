@@ -160,7 +160,7 @@ func TestNonLoopbackRefused(t *testing.T) {
 
 func TestUnauthorized(t *testing.T) {
 	f := newFixture(t)
-	for _, p := range []string{"/v1/health", "/v1/jobs", "/v1/jobs/x", "/v1/stats", "/v1/schedules", "/nope"} {
+	for _, p := range []string{"/v1/health", "/v1/jobs", "/v1/jobs/x", "/v1/stats", "/v1/schedules", "/v1/skills", "/nope"} {
 		for _, tok := range []string{"", "wrong", f.token + "x", f.token[:len(f.token)-1]} {
 			res, b := f.do(t, http.MethodGet, p, tok)
 			if res.StatusCode != http.StatusUnauthorized {
@@ -226,7 +226,7 @@ func TestMethodNotAllowed(t *testing.T) {
 	f.insert(t, "261018-100000-aaaa", store.StatusQueued)
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete,
 		http.MethodOptions, http.MethodHead} {
-		for _, p := range []string{"/v1/jobs", "/v1/jobs/261018-100000-aaaa", "/v1/stats", "/v1/schedules", "/v1/health"} {
+		for _, p := range []string{"/v1/jobs", "/v1/jobs/261018-100000-aaaa", "/v1/stats", "/v1/schedules", "/v1/skills", "/v1/health"} {
 			res, _ := f.do(t, method, p, f.token)
 			if res.StatusCode != http.StatusMethodNotAllowed {
 				t.Fatalf("%s %s: %d, want 405", method, p, res.StatusCode)
