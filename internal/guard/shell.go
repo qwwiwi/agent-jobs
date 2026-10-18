@@ -16,7 +16,7 @@ type simpleCmd struct {
 	words   []string
 	dyn     []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
 	raw     string // source text with single-quoted content removed (for `$?` detection)
-	heredoc string // bodies of the here-documents attached to this command
+	heredoc string // bodies of the here-documents and words of the here-strings attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
@@ -55,6 +55,7 @@ const (
 	redirFile
 	redirHeredoc
 	redirHeredocStrip
+	redirHereString
 )
 
 type pendingHeredoc struct {
@@ -112,6 +113,8 @@ func (p *parser) endWord() {
 		if p.redirIn {
 			p.cmd.inRedirs = append(p.cmd.inRedirs, w)
 		}
+	case redirHereString: // its word is checked like a here-doc body
+		p.cmd.heredoc += w + "\n"
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
 	}
@@ -374,6 +377,7 @@ func (p *parser) redirect() {
 		switch {
 		case p.peek(0) == '<': // here-string <<<
 			p.i++
+			kind = redirHereString
 		case p.peek(0) == '-':
 			p.i++
 			kind = redirHeredocStrip
