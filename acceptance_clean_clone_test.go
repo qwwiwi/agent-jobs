@@ -26,12 +26,31 @@ func acceptanceRun(t *testing.T, extra []string, argv0 []string, args ...string)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The caller's Go caches: a temp HOME would otherwise download every module into the test's dir.
+	goEnv, err := exec.Command(goBin, "env", "GOCACHE", "GOMODCACHE", "GOPATH").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := strings.Split(strings.TrimSpace(string(goEnv)), "\n")
+	if len(g) != 3 {
+		t.Fatalf("go env: %q", goEnv)
+	}
+	// A short TMPDIR: the daemon's unix sockets live under it (the script refuses a long one).
+	tmp, err := os.MkdirTemp("", "aj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = exec.Command("chmod", "-R", "u+w", tmp).Run()
+		_ = os.RemoveAll(tmp)
+	})
 	argv := append(append(append([]string{}, argv0...), "bash", script), args...)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append([]string{
 		"HOME=" + t.TempDir(),
-		"TMPDIR=" + t.TempDir(),
+		"TMPDIR=" + tmp,
 		"PATH=" + filepath.Dir(goBin) + ":/usr/local/bin:/usr/bin:/bin",
+		"GOCACHE=" + g[0], "GOMODCACHE=" + g[1], "GOPATH=" + g[2],
 	}, extra...)
 	out, err := cmd.CombinedOutput()
 	code := 0
@@ -119,12 +138,36 @@ func TestAcceptanceScriptInsideJob(t *testing.T) {
 	}
 }
 
+// A TMPDIR too long for the daemon's unix sockets is refused before anything is cloned, and the
+// empty temp dir is removed again.
+func TestAcceptanceScriptLongTmpdir(t *testing.T) {
+	long := filepath.Join(t.TempDir(), strings.Repeat("d", 60))
+	if err := os.MkdirAll(long, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--from", filepath.Join(long, "nowhere")}
+	extra := []string{"TMPDIR=" + long}
+	if insideJob() {
+		args = append(args, "--inside-job")
+		if v := os.Getenv("AGENT_JOBS_JOB"); v != "" {
+			extra = append(extra, "AGENT_JOBS_JOB="+v)
+		}
+	}
+	out, code := acceptanceRun(t, extra, nil, args...)
+	if code != 2 || !strings.Contains(out, "too long for its unix sockets") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if entries, err := os.ReadDir(long); err != nil || len(entries) != 0 {
+		t.Fatalf("temp dir left behind: %v %v", entries, err)
+	}
+}
+
 // TestAcceptanceScriptRun is the whole acceptance (clone of this checkout, build, install, daemon,
 // dry job) without the test suite; it waits for two daemon ticks, so it runs only on request:
-// AGENT_JOBS_TEST_ACCEPTANCE=1 go test -run TestAcceptanceScriptRun .
+// ACCEPTANCE_CLEAN_CLONE=1 go test -run TestAcceptanceScriptRun .
 func TestAcceptanceScriptRun(t *testing.T) {
-	if os.Getenv("AGENT_JOBS_TEST_ACCEPTANCE") != "1" {
-		t.Skip("set AGENT_JOBS_TEST_ACCEPTANCE=1 to run the full acceptance (about 3 minutes)")
+	if os.Getenv("ACCEPTANCE_CLEAN_CLONE") != "1" {
+		t.Skip("set ACCEPTANCE_CLEAN_CLONE=1 to run the full acceptance (about 3 minutes)")
 	}
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux only")
