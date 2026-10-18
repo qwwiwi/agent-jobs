@@ -242,19 +242,31 @@ release_signal() {
 }
 
 # supervisor FD RCFILE TIMEOUT GRACE CMD...: the body of a supervisor, the leader of a process group
-# of its own (spawn). It runs CMD (INT/TERM back to default, explicit errexit) in its group and reads
-# its control fd, a FIFO the script holds open: `done RC` (CMD ended), `stop` (the script's teardown)
-# or `timeout` (TIMEOUT seconds passed, 0 = none) send TERM to the group (the supervisor ignores it),
-# GRACE seconds later `kill` ends the wait. Then it writes CMD's exit code (124 after a timeout, 143
-# when stopped before the start) to RCFILE and KILLs its own group: whatever CMD left behind, and the
-# supervisor itself. Only a member of the group signals the group (kill 0), so no group id is ever
-# signalled after it could have been reused; the script itself signals no process.
+# of its own (spawn; checked first: if it is not, it runs nothing and signals nothing, exit code 125).
+# It runs CMD (TERM back to default, explicit errexit) in its group and reads its control fd, a FIFO
+# the script holds open: `ready` (CMD's TERM is back to default), `done RC` (CMD ended), `stop` (the
+# script's teardown) or `timeout` (TIMEOUT seconds passed, 0 = none) send TERM to the group (the
+# supervisor ignores it; held until `ready`), GRACE seconds later `kill` ends the wait. Then it writes
+# CMD's exit code (124 after a timeout, 143 when stopped before the start) to RCFILE and KILLs its own
+# group: whatever CMD left behind, and the supervisor itself. Only a member of the group signals the
+# group (kill 0), so no group id is ever signalled after it could have been reused; the script itself
+# signals no process.
 supervisor() {
-  local fd="$1" rcf="$2" timeout="$3" grace="$4" line rc="" timed_out=0 f
+  local fd="$1" rcf="$2" timeout="$3" grace="$4" line rc="" timed_out=0 ready=0 term=0 f pgrp
   shift 4
   set +e
   trap '' INT TERM
   for f in "${SUP_FDS[@]}"; do [ "$f" = "$fd" ] || exec {f}>&-; done
+  if [ -r "/proc/$BASHPID/stat" ]; then
+    pgrp="$(stat_field "$BASHPID" 5)"
+  else
+    pgrp="$(ps -o pgid= -p "$BASHPID" | tr -d ' ')"
+  fi
+  if [ "$pgrp" != "$BASHPID" ]; then
+    echo "acceptance: supervisor $BASHPID is not its group's leader (group '$pgrp'); not run: $*" >&2
+    echo 125 >"$rcf"
+    exit 0
+  fi
   # @acceptance-test-hook: supervisor start@
   # A stop that arrived before the start: nothing runs.
   if read -r -t 0 -u "$fd"; then
@@ -263,8 +275,9 @@ supervisor() {
   fi
   {
     (
-      for f in "${SUP_FDS[@]}"; do exec {f}>&-; done
       trap - INT TERM
+      echo ready >&"$fd"
+      for f in "${SUP_FDS[@]}"; do exec {f}>&-; done
       set -e
       "$@"
     )
@@ -275,13 +288,18 @@ supervisor() {
   fi
   while read -r line <&"$fd"; do
     case "$line" in
+      ready)
+        ready=1
+        if [ "$term" = 1 ]; then kill -TERM 0; fi
+        ;;
       "done "*) rc="${line#done }"; break ;;
       stop|timeout)
         if [ "$line" = timeout ]; then
           timed_out=1
           echo "acceptance: timed out after ${timeout}s: $*" >&2
         fi
-        kill -TERM 0
+        term=1
+        if [ "$ready" = 1 ]; then kill -TERM 0; fi
         { sleep "$grace"; echo kill >&"$fd"; } </dev/null >/dev/null 2>&1 &
         ;;
       kill) break ;;
