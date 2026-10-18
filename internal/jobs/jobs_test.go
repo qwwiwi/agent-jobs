@@ -248,7 +248,7 @@ func TestMain(m *testing.M) {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	fakeHelpr = dir
-	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux} {
+	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux, "codex": fakeCodex} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			log.Fatal(err)
 		}

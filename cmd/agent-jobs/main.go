@@ -33,6 +33,9 @@ const usage = `usage: agent-jobs <command> [flags]
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
+             [--runner claude|codex] [--reasoning-effort low|medium|high]
+                                           a gpt-* model runs on codex exec (read-only kinds
+                                           review/research unless codex_write_allowed)
   status     --agent A [<id>]              a job; without an id: the daily automation
                                            (prune + doctor procs) and its last run
   list       --agent A [--limit N]
@@ -71,7 +74,7 @@ const usage = `usage: agent-jobs <command> [flags]
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] -- <claude> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -188,7 +191,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] -- <claude> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -203,6 +206,8 @@ func runWrapper(args []string) int {
 			opts.FallbackPrompt = rest[1]
 		case "--fallback-session":
 			opts.FallbackSession = rest[1]
+		case "--runner":
+			opts.Runner = rest[1]
 		default:
 			fmt.Fprintln(os.Stderr, u)
 			return 2
@@ -369,6 +374,8 @@ func cmdStart(args []string) error {
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
+	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
+	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -445,8 +452,8 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	fmt.Printf("id:        %s\ntitle:     %s\nkind:      %s\nstatus:    %s\nmodel:     %s\n", j.ID, j.Title, j.Kind, j.Status, j.Model)
-	fmt.Printf("limits:    %d turns · $%g · %dm\n", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
-	fmt.Printf("usage:     %d turns · $%.2f · %ds\n", j.Turns, j.CostUSD, j.DurationSec)
+	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
+	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
@@ -537,10 +544,19 @@ func cmdList(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t$%.2f\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns, j.CostUSD,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
+			jobs.CostText(j.CostUSD, j.CostIsUnknown()),
 			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// costWord is a cost in a sentence: "$1.23", or "cost unknown".
+func costWord(cost float64, unknown bool) string {
+	if unknown {
+		return "cost unknown"
+	}
+	return jobs.CostText(cost, false)
 }
 
 // containShort is the containment column of `list`: scope, scope! (stop pending), session, or - (never launched).
@@ -581,10 +597,7 @@ func cmdResult(args []string) error {
 		return err
 	}
 	for _, a := range atts {
-		cost := fmt.Sprintf("$%.2f", a.CostUSD)
-		if a.CostUnknown {
-			cost = "cost unknown"
-		}
+		cost := costWord(a.CostUSD, a.CostUnknown)
 		fmt.Printf("attempt %d: %s %s · %d turns · %s · %ds · %s\n", a.N, a.Mode, a.Status, a.Turns, cost,
 			a.DurationSec, filepath.Join(m.JobDir(id), jobs.AttemptReportName(a.N)))
 	}
@@ -638,8 +651,8 @@ func cmdStop(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("stopped %s (%d turns, $%.2f); resume with: agent-jobs resume --agent %s %s --context ...\n",
-		j.ID, j.Turns, j.CostUSD, *agent, j.ID)
+	fmt.Printf("stopped %s (%d turns, %s); resume with: agent-jobs resume --agent %s %s --context ...\n",
+		j.ID, j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), *agent, j.ID)
 	return nil
 }
 
@@ -1077,11 +1090,12 @@ func cmdStats(args []string) error {
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	row := func(key string, s jobs.StatsSummary) {
-		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%ds\t%ds\t%d\n", key, s.Jobs,
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\n", key, s.Jobs,
 			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
-			s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
 	}
-	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	// COST, MEDIAN and P90 are over the jobs with a known cost; COST? counts the others (codex, killed).
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS")
 	for _, g := range rep.Groups {
 		row(shown(g.Key), g.StatsSummary)
 	}
