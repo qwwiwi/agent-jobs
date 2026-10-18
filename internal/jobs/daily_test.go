@@ -1,11 +1,14 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -349,8 +352,16 @@ func TestDailyAbandonedScanHoldsLock(t *testing.T) {
 	if d, _ := m.Daily(); d.Result == nil || !strings.Contains(d.Result.ProcsError, "deadline") {
 		t.Fatalf("abandoned scan: %+v", d.Result)
 	}
-	if startAt(t, m, at(11, 5, 0)) {
-		t.Fatal("the next day's run started while the abandoned scan still ran")
+	logs := &syncBuffer{}
+	m.Log = log.New(logs, "", 0)
+	// The day after is skipped while the scan runs, with one log line however many ticks find it.
+	for range 3 {
+		if startAt(t, m, at(11, 5, 0)) {
+			t.Fatal("the next day's run started while the abandoned scan still ran")
+		}
+	}
+	if n := strings.Count(logs.String(), "previous daily run (2027-03-10) still in progress, skipping"); n != 1 {
+		t.Fatalf("skip logged %d times, want 1:\n%s", n, logs.String())
 	}
 	close(hang)
 	<-scanned
@@ -361,4 +372,22 @@ func TestDailyAbandonedScanHoldsLock(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the daily goroutine writing while the test reads.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

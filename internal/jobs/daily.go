@@ -90,7 +90,8 @@ func (m *Manager) StartDaily(ctx context.Context) bool {
 		return false
 	}
 	if !m.dailyMu.TryLock() {
-		return false // the previous run is still going
+		m.noteDailySkip(day) // the previous run is still going
+		return false
 	}
 	ok, err := m.Store.ClaimDaily(day, m.Now())
 	if err != nil || !ok {
@@ -100,6 +101,9 @@ func (m *Manager) StartDaily(ctx context.Context) bool {
 		}
 		return false
 	}
+	m.dailyNoteMu.Lock()
+	m.dailyHeld = day
+	m.dailyNoteMu.Unlock()
 	m.dailyWG.Add(1)
 	go func() {
 		defer m.dailyWG.Done()
@@ -115,6 +119,19 @@ func (m *Manager) StartDaily(ctx context.Context) bool {
 		m.dailyMu.Unlock()
 	}()
 	return true
+}
+
+// noteDailySkip logs, at most once per day, that day's run is skipped because an earlier day's run
+// (a hung step, or a doctor procs scan abandoned at its time-box) still holds the daily lock. The
+// tick that finds today's own run in progress logs nothing.
+func (m *Manager) noteDailySkip(day string) {
+	m.dailyNoteMu.Lock()
+	defer m.dailyNoteMu.Unlock()
+	if m.dailyHeld == day || m.dailySkipped == day {
+		return
+	}
+	m.dailySkipped = day
+	m.Log.Printf("daily %s: previous daily run (%s) still in progress, skipping", day, m.dailyHeld)
 }
 
 // WaitDaily waits until a daily run started by StartDaily has ended. A doctor procs scan abandoned

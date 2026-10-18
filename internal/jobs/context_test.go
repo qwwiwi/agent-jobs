@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -94,6 +95,19 @@ func TestJobBriefAndLaunchCarrySubagentRules(t *testing.T) {
 	}
 	if within := strings.HasPrefix(m.SubagentLogPath(j.ID), dir+string(filepath.Separator)); within {
 		t.Fatal("the subagent log must lie outside the job directory")
+	}
+	// The guard derives the state dir and the job's folder from the subagent log: the job database
+	// is unreadable through the hook, the job's own prompt stays readable.
+	if s, o, ok := guard.StateLayout(m.SubagentLogPath(j.ID)); !ok || s != m.StateDir || o != dir {
+		t.Fatalf("guard.StateLayout = %q %q %v, want %q %q", s, o, ok, m.StateDir, dir)
+	}
+	readDB := map[string]any{"tool_name": "Read", "tool_input": map[string]any{"file_path": filepath.Join(m.StateDir, "jobs.db")}}
+	if code := runHook(t, cmd, readDB); code != 2 {
+		t.Fatalf("Read of jobs.db: exit %d, want 2", code)
+	}
+	readPrompt := map[string]any{"tool_name": "Read", "tool_input": map[string]any{"file_path": filepath.Join(dir, "prompt.md")}}
+	if code := runHook(t, cmd, readPrompt); code != 0 {
+		t.Fatalf("Read of the job's own prompt: exit %d, want 0", code)
 	}
 	agent := map[string]any{"tool_name": "Agent", "tool_input": map[string]any{"description": "d", "prompt": "p"}}
 	for i := 1; i <= 3; i++ {
