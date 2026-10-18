@@ -1877,8 +1877,18 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	if b := read("gitconfig"); strings.Count(b, "=") != 2 || !strings.Contains(b, "Job Bot") {
 		t.Fatalf("gitconfig must hold only the identity: %q", b)
 	}
-	// Without the scrub the same hook does run (the test proves something).
-	if out, err := exec.Command("git", "-C", repo, "commit", "--allow-empty", "-qm", "x").CombinedOutput(); err == nil {
+	// Without the scrub the same hook does run (the test proves something). The plain git runs with
+	// a config of its own (identity, the repository's hooks dir, no global/system config), so the
+	// caller's environment (an empty HOME, a sandbox without identity, a hooksPath) cannot decide it.
+	plainHome := t.TempDir()
+	plainGit := func(args ...string) *exec.Cmd {
+		c := exec.Command("git", append([]string{"-C", repo, "-c", "user.name=Plain", "-c", "user.email=plain@example.invalid",
+			"-c", "core.hooksPath=" + filepath.Join(repo, ".git", "hooks")}, args...)...)
+		c.Env = append(os.Environ(), "HOME="+plainHome, "XDG_CONFIG_HOME="+plainHome,
+			"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+		return c
+	}
+	if out, err := plainGit("commit", "--allow-empty", "-qm", "x").CombinedOutput(); err == nil {
 		t.Fatalf("precondition: hook must block a plain commit: %s", out)
 	}
 	if _, err := os.Stat(marker); err != nil {
@@ -1887,7 +1897,7 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = exec.Command("git", "-C", repo, "diff").CombinedOutput()
+	_, _ = plainGit("diff").CombinedOutput()
 	for _, k := range []string{"diff.external", "core.fsmonitor"} {
 		if _, err := os.Stat(filepath.Join(ranDir, k+".ran")); err != nil {
 			t.Fatalf("precondition: repo-local %s did not run without the overrides", k)
