@@ -54,26 +54,52 @@ var reName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 // ValidName reports whether s can be a skill name.
 func ValidName(s string) bool { return reName.MatchString(s) && !strings.Contains(s, "..") }
 
-// rawEntry is one entry of index.json as written by the catalog's own tooling.
+// rawEntry is one entry of index.json as written by the catalog's own tooling. Only the fields
+// agent-jobs needs are typed; the informational ones (owner, origin, last_verified, has_scripts)
+// are free-form: a value of another type is ignored, never an error. Other fields (place, sha256,
+// size_kb, ...) are not read.
 type rawEntry struct {
-	Name         string   `json:"name"`
-	Place        string   `json:"place"`
-	Path         string   `json:"path"`
-	Status       string   `json:"status"`
-	Kinds        []string `json:"kinds"`
-	Projects     []string `json:"projects"`
-	Owner        string   `json:"owner"`
-	Origin       string   `json:"origin"`
-	LastVerified string   `json:"last_verified"`
-	SHA256       string   `json:"sha256"`
-	SizeKB       float64  `json:"size_kb"`
-	HasScripts   bool     `json:"has_scripts"`
-	Risk         []string `json:"risk"`
+	Name         string          `json:"name"`
+	Path         string          `json:"path"`
+	Status       string          `json:"status"`
+	Kinds        []string        `json:"kinds"`
+	Projects     []string        `json:"projects"`
+	Risk         []string        `json:"risk"`
+	Owner        json.RawMessage `json:"owner"`
+	Origin       json.RawMessage `json:"origin"`
+	LastVerified json.RawMessage `json:"last_verified"`
+	HasScripts   json.RawMessage `json:"has_scripts"`
 }
 
+// rawIndex keeps each entry raw, so one malformed entry is skipped on its own, not with its root.
 type rawIndex struct {
-	Version json.RawMessage `json:"version"`
-	Skills  []rawEntry      `json:"skills"`
+	Version json.RawMessage   `json:"version"`
+	Skills  []json.RawMessage `json:"skills"`
+}
+
+// parseEntry decodes one raw index entry; on error it still returns the entry's name when that is
+// a string, for the warning.
+func parseEntry(b json.RawMessage) (rawEntry, error) {
+	var r rawEntry
+	if err := json.Unmarshal(b, &r); err != nil {
+		var n struct {
+			Name json.RawMessage `json:"name"`
+		}
+		_ = json.Unmarshal(b, &n)
+		var name string
+		_ = json.Unmarshal(n.Name, &name)
+		return rawEntry{Name: name}, err
+	}
+	return r, nil
+}
+
+// infoString returns an informational field when it is a JSON string, else "".
+func infoString(b json.RawMessage) string {
+	var s string
+	if json.Unmarshal(b, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 // Entry is one valid skill of the catalog.
@@ -164,7 +190,12 @@ func (c *Catalog) loadRoot(root string) {
 	}
 	c.Roots = append(c.Roots, real)
 	seen := map[string]bool{}
-	for i, r := range idx.Skills {
+	for i, b := range idx.Skills {
+		r, err := parseEntry(b)
+		if err != nil {
+			c.warn("skill root %s: entry %d (%q): %v, skipped", root, i, r.Name, err)
+			continue
+		}
 		e, err := validate(real, r)
 		if err != nil {
 			c.warn("skill root %s: entry %d (%q): %v, skipped", root, i, r.Name, err)
@@ -245,10 +276,11 @@ func validate(root string, r rawEntry) (Entry, error) {
 		return Entry{}, err
 	}
 	e := Entry{
-		Name: r.Name, Status: r.Status, Kinds: lower(r.Kinds), Projects: slices.Clone(r.Projects), Owner: r.Owner,
-		Origin: r.Origin, LastVerified: r.LastVerified, HasScripts: r.HasScripts, Risk: slices.Clone(r.Risk),
-		SizeKB: size, Root: root, Dir: dir,
+		Name: r.Name, Status: r.Status, Kinds: lower(r.Kinds), Projects: slices.Clone(r.Projects),
+		Owner: infoString(r.Owner), Origin: infoString(r.Origin), LastVerified: infoString(r.LastVerified),
+		Risk: slices.Clone(r.Risk), SizeKB: size, Root: root, Dir: dir,
 	}
+	_ = json.Unmarshal(r.HasScripts, &e.HasScripts) // free-form: anything but a bool leaves false
 	if e.Kinds == nil {
 		e.Kinds = []string{}
 	}
