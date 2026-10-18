@@ -277,8 +277,11 @@ step_build() {
   cd "$CLONE"
   # As install-linux.sh: no go env file and no GOFLAGS, so no stray build tags.
   GOENV=off GOFLAGS='' go build "${tags[@]}" -trimpath -ldflags "-X main.version=$version" -o "$BIN" ./cmd/agent-jobs
-  "$BIN" version
-  "$BIN" version | grep -qF -- "$version"
+  # Captured, not piped into grep -q: with pipefail an early grep exit is a SIGPIPE failure (141).
+  local out
+  out="$("$BIN" version)"
+  echo "$out"
+  grep -qF -- "$version" <<<"$out"
 }
 
 step_tests() {
@@ -361,8 +364,10 @@ step_daemon() {
 }
 
 step_status() {
-  "$BIN" status --agent "$AGENT"
-  "$BIN" status --agent "$AGENT" | grep -q "^http api:  "
+  local out
+  out="$("$BIN" status --agent "$AGENT")"
+  echo "$out"
+  grep -q "^http api:  " <<<"$out"
   "$BIN" doctor procs --agent "$AGENT"
   "$BIN" list --agent "$AGENT"
   if command -v curl >/dev/null 2>&1; then
