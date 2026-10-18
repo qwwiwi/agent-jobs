@@ -168,15 +168,31 @@ func TestWrapperFailsJobWhenProcessesSurvive(t *testing.T) {
 	t.Setenv("AGENT_JOBS_TEST_SWEEP_GRACE_MS", "20")
 	m := newManager(t)
 	m.SelfBin = hooked
-	j := runToEnd(t, m, enqueue(t, m, "FAKE_SURVIVOR", nil).ID)
-	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "survivor.pid")); err == nil {
-		var pid int
-		if _, err := fmt.Sscan(strings.TrimSpace(string(b)), &pid); err == nil && pid > 1 {
-			t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
-			if !alive(pid) {
-				t.Fatalf("survivor %d is gone: the hook did not make it unkillable", pid)
+	id := enqueue(t, m, "FAKE_SURVIVOR", nil).ID
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool {
+		_, ok := readExitCode(m.JobDir(id))
+		return ok
+	})
+	// Checked before the daemon collects the job: its sweep of a failed job (no test hook in this
+	// process) then ends the survivor.
+	survivor := 0
+	if b, err := os.ReadFile(filepath.Join(m.JobDir(id), "survivor.pid")); err == nil {
+		if _, err := fmt.Sscan(strings.TrimSpace(string(b)), &survivor); err == nil && survivor > 1 {
+			t.Cleanup(func() { _ = syscall.Kill(survivor, syscall.SIGKILL) })
+			if !alive(survivor) {
+				t.Fatalf("survivor %d is gone: the hook did not make it unkillable", survivor)
 			}
 		}
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	j := get(t, m, id)
+	if survivor > 1 {
+		waitFor(t, "survivor swept by the daemon", 10*time.Second, func() bool { return !procAlive(survivor) })
 	}
 	if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, ReasonSurvivors) {
 		t.Fatalf("job: %s %q", j.Status, j.Error)

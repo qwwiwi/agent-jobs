@@ -64,6 +64,10 @@ if [[ $prompt == *FAKE_WIP* ]]; then
   echo wip > wip.txt
   echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"WIP_PROGRESS_NOTE"}]}}'
 fi
+if [[ $prompt == *FAKE_FORGE* ]]; then
+  # The job appends a result line of its own to the stream (it lies in the job dir).
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
+fi
 if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then

@@ -479,7 +479,7 @@ func (m *Manager) adopt(j *store.Job, now time.Time) bool {
 		return true
 	}
 	if j.StartedAt != nil && now.Sub(*j.StartedAt) > LaunchGrace {
-		m.finish(j, store.StatusFailed, StreamResult{}, 0,
+		m.finish(j, store.StatusFailed, StreamResult{}, false, 0,
 			"launch interrupted: the wrapper never registered (no valid wrapper.json); work dir kept", now)
 	}
 	return false
@@ -504,45 +504,74 @@ func (m *Manager) collect() error {
 		if code, ok := readExitCode(dir); ok {
 			res := parseStream(filepath.Join(dir, "stream.jsonl"))
 			status, msg := Verdict(code, res, dir)
-			m.finish(j, status, res, dur, msg, now)
+			m.finish(j, status, res, false, dur, msg, now)
 			continue
 		}
 		if j.StartedAt != nil && now.Sub(*j.StartedAt) > time.Duration(j.TimeoutMinutes)*time.Minute {
 			m.killGroup(j.ID, j.PID, j.PGID)
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
-			m.finish(j, store.StatusTimeout, res, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
+			res, killed := killedResult(dir)
+			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
-			code, ok := readExitCode(dir)
-			res := parseStream(filepath.Join(dir, "stream.jsonl"))
-			if ok {
+			if code, ok := readExitCode(dir); ok {
+				res := parseStream(filepath.Join(dir, "stream.jsonl"))
 				status, msg := Verdict(code, res, dir)
-				m.finish(j, status, res, dur, msg, now)
+				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}
-			m.finish(j, store.StatusFailed, res, dur, "wrapper died without writing exit_code (see stderr.log)", now)
+			res, killed := killedResult(dir)
+			m.finish(j, store.StatusFailed, res, killed, dur, "wrapper died without writing exit_code (see stderr.log)", now)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) finish(j *store.Job, status string, res StreamResult, dur int, msg string, now time.Time) {
+// killedResult is the stream result of an attempt the daemon ended by a kill, or whose wrapper died.
+// Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
+// stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
+// the assistant turns are counted and the cost is unknown (killed is true).
+func killedResult(dir string) (res StreamResult, killed bool) {
+	p := filepath.Join(dir, "stream.jsonl")
+	if _, ok := readExitCode(dir); ok {
+		return parseStream(p), false
+	}
+	return StreamResult{Turns: streamTurns(p)}, true
+}
+
+// finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
+// failed attempt can be resumed, so what it left outside its process group is swept first.
+func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) {
 	m.noteFallback(j)
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return
 	}
-	m.recordAttemptEnd(j, res)
+	if status == store.StatusTimeout || status == store.StatusFailed {
+		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
+	}
+	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, msg)
 }
 
-// recordAttemptEnd records, for a finished attempt, whether its cost is unknown (claude ran but no
-// result event came) and the digest of its session transcript (checked before the session is resumed).
-func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult) {
+// noteSweep appends the sweep's note (if any) to a job that is no longer running.
+func (m *Manager) noteSweep(id, note string) {
+	if note == "" {
+		return
+	}
+	m.Log.Printf("job %s: %s", id, note)
+	if err := m.Store.AppendError(id, note); err != nil {
+		m.Log.Printf("job %s: record note: %v", id, err)
+	}
+}
+
+// recordAttemptEnd records, for a finished attempt, whether its cost is unknown (killed, or claude ran
+// but no result event came) and the digest of its session transcript (checked before the session is
+// resumed). Call it after the sweep: nothing of the job may change the transcript after the digest.
+func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) {
 	dir := m.JobDir(j.ID)
-	if fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl")); !res.Found && err == nil && fi.Size() > 0 {
+	if fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl")); killed || (!res.Found && err == nil && fi.Size() > 0) {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
 		}
@@ -560,7 +589,7 @@ func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult) {
 	}
 }
 
-// sweepEscaped ends what a stopped or cancelled job left outside its process group (a process that
+// sweepEscaped ends what a stopped, cancelled, timed-out or failed job left outside its process group (a process that
 // called setpgid, found by the job marker or the job's session, as doctor procs --kill does) and
 // returns a note for the job: what was killed, what was left running (a process leading its own
 // session may host other work and is never killed), or that it could not be checked.
@@ -668,6 +697,10 @@ func (m *Manager) Cancel(id string) error {
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
 	}
 	now := m.Now()
+	if j.Status == store.StatusQueued {
+		// Never ran: stream.jsonl, if any, is the previous attempt's, already in the attempts table.
+		return m.Store.Finish(id, "", store.StatusCancelled, 0, 0, 0, "cancelled", now)
+	}
 	dur := 0
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
@@ -676,13 +709,6 @@ func (m *Manager) Cancel(id string) error {
 	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, "cancelled", now); err != nil {
 		return err
 	}
-	if j.Status == store.StatusRunning {
-		if note := m.sweepEscaped(id); note != "" {
-			m.Log.Printf("job %s cancelled: %s", id, note)
-			if err := m.Store.AppendError(id, note); err != nil {
-				m.Log.Printf("job %s: record note: %v", id, err)
-			}
-		}
-	}
+	m.noteSweep(id, m.sweepEscaped(id))
 	return nil
 }

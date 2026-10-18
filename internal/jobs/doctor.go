@@ -186,6 +186,27 @@ func selfAndAncestors() map[int]bool {
 	return out
 }
 
+// markedProcs returns the live processes of this user (not this one or its ancestors) that carry
+// the marker of job id.
+func markedProcs(id string) ([]int, error) {
+	ents, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, err
+	}
+	skip := selfAndAncestors()
+	var out []int
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || skip[pid] || !procOwnedByMe(pid) {
+			continue
+		}
+		if p, err := procStatFull(pid); err == nil && p.state != "Z" && procMarker(pid) == id {
+			out = append(out, pid)
+		}
+	}
+	return out, nil
+}
+
 func procExists(pid int) bool {
 	_, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid)))
 	return err == nil

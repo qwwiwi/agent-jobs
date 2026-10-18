@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -208,42 +211,111 @@ func (m *Manager) sessionIntact(j *store.Job) (bool, string) {
 	return true, ""
 }
 
-// checkProjectClaude refuses to run the next attempt when what claude loads from the project at
-// start may have changed since the job began: claude reads <work>/.claude (settings, local settings,
-// hooks, skills, agents), and those run outside the guard. For a repository job it must equal the
-// job's base commit (nothing changed, staged, untracked or ignored there); a job without a repository
-// has none; the job dir (--add-dir) never has one.
+// projectClaudeNames are what claude loads from the project as settings, hooks, skills, agents and
+// instructions: a .claude dir and CLAUDE.md / CLAUDE.local.md (also nested ones, in the dirs it reads).
+var projectClaudeNames = []string{".claude", "CLAUDE.md", "CLAUDE.local.md"}
+
+// projectClaudePathspecs match projectClaudeNames (and what is under them) at any depth.
+var projectClaudePathspecs = []string{":(glob)**/.claude", ":(glob)**/.claude/**", ":(glob)**/CLAUDE.md",
+	":(glob)**/CLAUDE.local.md"}
+
+// checkProjectClaude refuses to run the next attempt when what claude loads from the project may
+// have changed since the job began: claude reads <work>/.claude (settings, local settings, hooks,
+// skills, agents) and CLAUDE.md / CLAUDE.local.md from the work dir, its parents and its subdirs; the
+// .claude ones run outside the guard, the CLAUDE.md ones become the next attempt's instructions. For
+// a repository job none of them may differ from the job's base commit (nothing changed, staged,
+// untracked or ignored there); a job without a repository has none; the job dir (--add-dir, a parent
+// of work/) never has one.
 func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	refuse := func(what string) error {
-		return fmt.Errorf("%s: claude loads settings, hooks, skills and agents from it at start, outside the guard, "+
+		return fmt.Errorf("%s: claude loads settings, hooks, skills, agents and instructions from it, outside the guard, "+
 			"so this job cannot be resumed (remove it, or start a new job)", what)
 	}
-	if _, err := os.Lstat(filepath.Join(m.JobDir(j.ID), ".claude")); err == nil {
-		return refuse("the job dir has a .claude")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, name := range projectClaudeNames {
+		if _, err := os.Lstat(filepath.Join(m.JobDir(j.ID), name)); err == nil {
+			return refuse("the job dir has a " + name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	if _, err := os.Lstat(work); errors.Is(err, os.ErrNotExist) {
 		return nil // restored from the saved ref before the launch, then checked again
 	}
 	if j.RepoPath == "" {
-		if _, err := os.Lstat(filepath.Join(work, ".claude")); err == nil {
-			return refuse("work/.claude exists in a job without a repository")
-		} else if !errors.Is(err, os.ErrNotExist) {
+		found := ""
+		err := filepath.WalkDir(work, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if slices.Contains(projectClaudeNames, d.Name()) {
+				found, _ = filepath.Rel(work, path)
+				return fs.SkipAll
+			}
+			return nil
+		})
+		if err != nil {
 			return err
+		}
+		if found != "" {
+			return refuse("work/" + filepath.ToSlash(found) + " exists in a job without a repository")
 		}
 		return nil
 	}
-	st, err := git(work, "status", "--porcelain", "--ignored", "--untracked-files=all", "--", ".claude")
+	st, err := git(work, append([]string{"status", "--porcelain", "--ignored", "--untracked-files=all", "--"},
+		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
 	}
-	diff, err := git(work, "diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--", ".claude")
+	diff, err := git(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
+		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
 	}
 	if st != "" || diff != "" {
-		return refuse("work/.claude differs from the job's base commit")
+		return refuse("work/.claude, a CLAUDE.md or a CLAUDE.local.md differs from the job's base commit")
+	}
+	return nil
+}
+
+// checkEscaped refuses the next attempt while a process of the job is alive outside a running
+// wrapper (the sweep never kills one that leads its own session, and it may fail): between the
+// checks and the launch it could change the work dir, the transcript or the prompts. Called only
+// while no wrapper of the job runs (a stopped, failed or timed-out row, or a claimed row before its
+// spawn), so every process with the job's marker is such a process; doctor procs also finds the
+// markerless ones left in the session of the job's last wrapper.
+func (m *Manager) checkEscaped(id string) error {
+	if runtime.GOOS != "linux" || !procExists(os.Getpid()) {
+		return nil // no process scan (needs Linux /proc); the sweep cannot run there either
+	}
+	refuse := func(err error) error {
+		return fmt.Errorf("processes of the job outside its process group not checked, so it cannot be resumed: %w", err)
+	}
+	rep, err := m.doctorProcs(false, id)
+	if err != nil {
+		return refuse(err)
+	}
+	marked, err := markedProcs(id)
+	if err != nil {
+		return refuse(err)
+	}
+	seen := map[int]bool{}
+	var live []string
+	add := func(pid int, cmd string) {
+		if !seen[pid] {
+			seen[pid] = true
+			live = append(live, fmt.Sprintf("pid %d %s", pid, Printable(cmd, 80)))
+		}
+	}
+	for _, g := range rep.Ghosts {
+		add(g.PID, g.Cmdline)
+	}
+	for _, pid := range marked {
+		argv, _ := procCmdline(pid)
+		add(pid, strings.Join(argv, " "))
+	}
+	if len(live) > 0 {
+		return fmt.Errorf("process(es) of the job still run outside its process group: %s; end them (see doctor procs) "+
+			"before resuming", strings.Join(live, ", "))
 	}
 	return nil
 }
@@ -291,7 +363,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		// The job ended before the stop: collect it as the tick would.
 		res := parseStream(filepath.Join(dir, "stream.jsonl"))
 		status, verdict := Verdict(code, res, dir)
-		m.finish(j, status, res, dur, verdict, now)
+		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
 		if gerr != nil {
 			return nil, gerr
@@ -299,24 +371,23 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s ended before the stop (%s): %w", id, cur.Status, store.ErrImmutable)
 	}
 	m.killRunning(j)
-	res := parseStream(filepath.Join(dir, "stream.jsonl"))
-	if !res.Found {
-		// Killed before its result event: count the assistant turns written so far; cost is unknown
-		// (recorded as such: a resume counts this attempt at its whole budget).
-		res.Turns = streamTurns(filepath.Join(dir, "stream.jsonl"))
-		msg += " (cost so far unknown: no result event)"
+	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
+	// resume counts this attempt at its whole budget), whatever result line the stream holds.
+	res, killed := killedResult(dir)
+	if killed {
+		msg += " (cost so far unknown: ended by the stop)"
 	}
 	m.noteFallback(j)
 	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		return nil, err
 	}
-	m.recordAttemptEnd(j, res)
-	// Only now (the row is no longer running) does a process left in the job's session count as a ghost.
-	if note := m.sweepEscaped(id); note != "" {
+	// Only now (the row is no longer running) does a process left in the job's session count as a
+	// ghost; it is swept before the transcript digest is taken.
+	note := m.sweepEscaped(id)
+	m.noteSweep(id, note)
+	m.recordAttemptEnd(j, res, killed)
+	if note != "" {
 		msg += "; " + note
-		if err := m.Store.AppendError(id, note); err != nil {
-			m.Log.Printf("job %s: record note: %v", id, err)
-		}
 	}
 	m.Log.Printf("job %s stopped (%s)", id, msg)
 	return m.Store.Get(id)
@@ -521,6 +592,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
+	if err := m.checkEscaped(id); err != nil {
+		return nil, err
+	}
 	if err := m.checkProjectClaude(j, filepath.Join(m.JobDir(id), "work")); err != nil {
 		return nil, err
 	}
@@ -533,8 +607,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		return nil, err
 	}
 	update := strings.TrimSpace(context)
-	if j.StartedAt == nil && strings.TrimSpace(j.PendingContext) != "" {
-		// A resume stopped while still queued never ran: its update is kept, this one follows.
+	if (j.StartedAt == nil || neverRan(j.Turns, j.Error)) && strings.TrimSpace(j.PendingContext) != "" {
+		// A resume stopped while still queued, or whose launch was refused, never ran: its update is
+		// kept, this one follows.
 		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
 	}
 	if err := m.Store.Requeue(id, lim, update, ""); err != nil {
@@ -542,6 +617,12 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	}
 	m.Log.Printf("job %s: resume queued (attempt %d)", id, j.Attempt+1)
 	return m.Store.Get(id)
+}
+
+// neverRan reports whether an attempt ended without claude ever running: its launch was refused or
+// interrupted before the wrapper registered.
+func neverRan(turns int, errMsg string) bool {
+	return turns == 0 && (strings.HasPrefix(errMsg, "refused to start") || strings.HasPrefix(errMsg, "launch interrupted"))
 }
 
 func pick(v, d int) int {
@@ -720,6 +801,9 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	} else if err := os.MkdirAll(work, 0o700); err != nil {
 		return launchPlan{}, err
 	}
+	if err := m.checkEscaped(j.ID); err != nil {
+		return launchPlan{}, err
+	}
 	if err := m.checkProjectClaude(j, work); err != nil {
 		return launchPlan{}, err
 	}
@@ -766,12 +850,16 @@ func (m *Manager) resumeMessage(j *store.Job) string {
 		updateBlock(j.PendingContext), j.Attempt, j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 }
 
-// previousAttempt summarizes the last archived attempt for a fresh session: its status and usage,
-// then its report, else the last assistant text of its stream, plus where its changes are.
+// previousAttempt summarizes the last archived attempt that ran claude for a fresh session: its
+// status and usage, then its report, else the last assistant text of its stream, plus where its
+// changes are.
 func (m *Manager) previousAttempt(j *store.Job, dir string) string {
 	var b strings.Builder
 	b.WriteString("## Previous attempt\n\n")
 	atts, err := m.Store.Attempts(j.ID)
+	for err == nil && len(atts) > 0 && neverRan(atts[len(atts)-1].Turns, atts[len(atts)-1].Error) {
+		atts = atts[:len(atts)-1]
+	}
 	if err != nil || len(atts) == 0 {
 		b.WriteString("(no record of the previous attempt)\n")
 		return b.String()
