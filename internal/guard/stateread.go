@@ -347,7 +347,12 @@ func recursive(name string, args []string) bool {
 		}
 		return slices.ContainsFunc(args, func(a string) bool {
 			if strings.HasPrefix(a, "--") {
-				return a == "--recursive" || (name == "cp" && a == "--archive")
+				// GNU accepts any unambiguous prefix: `--rec` (ls has --reverse), cp `--ar`
+				if _, _, ok := longOpt(a, len("--rec"), "--recursive"); ok {
+					return true
+				}
+				_, _, ok := longOpt(a, len("--ar"), "--archive")
+				return ok && name == "cp"
 			}
 			return strings.HasPrefix(a, "-") && strings.ContainsAny(a, flags)
 		})
@@ -656,19 +661,25 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 					if !ok {
 						return stateBlocked("the symlink target `"+w+"`", w)
 					}
-					var raws, lexical []string
-					for _, d := range at.dirs {
-						for _, l := range definite {
-							if lp, ok := r.expandHome(l); ok {
-								raws = append(raws, filepath.Join(d, lp)+"/"+t)
+					// under places a link directory (or link) in each working directory; an absolute one
+					// stays as written (`ln -s . ~/L` links to $HOME, not to <cwd>/$HOME).
+					under := func(links []string) (out []string) {
+						for _, l := range links {
+							lp, ok := r.expandHome(l)
+							if !ok {
+								continue
+							}
+							if filepath.IsAbs(lp) {
+								out = append(out, lp+"/"+t)
+								continue
+							}
+							for _, d := range at.dirs {
+								out = append(out, filepath.Join(d, lp)+"/"+t)
 							}
 						}
-						for _, l := range speculative {
-							if lp, ok := r.expandHome(l); ok {
-								lexical = append(lexical, filepath.Join(d, lp)+"/"+t)
-							}
-						}
+						return out
 					}
+					raws, lexical := under(definite), under(speculative)
 					if filepath.IsAbs(t) {
 						raws, lexical = []string{t}, nil
 					}

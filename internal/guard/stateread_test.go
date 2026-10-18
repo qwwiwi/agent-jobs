@@ -292,3 +292,31 @@ func TestStateReadInvalidLayoutRefusesAll(t *testing.T) {
 		}
 	}
 }
+
+// Fix loop 2 of PR #24: an absolute link directory (`ln -s . ~/L`, `-t ~`, `--target-directory=~`)
+// is not joined with the working directory, and abbreviated recursive long options count.
+func TestStateReadLoop2Refused(t *testing.T) {
+	state, own, cfg := stateReadSetup(t)
+	home := filepath.Dir(filepath.Dir(state))
+	for _, c := range []string{
+		// an absolute link directory next to the state: own/../k is another job's folder
+		"ln -s -t " + own + " ../k", "ln -st " + own + " ../k", "ln -s --target-directory=" + own + " ../k",
+		"ln -s --target-directory " + own + " ../k", "ln -s ../k " + own + "/L", "ln -s ../../k " + own + "/work",
+		"ln -s . ~/L", "ln -s . ~/L; cat ~/L/.agent-jobs/thrall/jobs.db", "ln -s . " + home + "/L",
+		"ln -s . ~/L && cat ~/L/.agent-jobs/thrall/jobs.db", "ln -s ./.agent-jobs ~/A",
+		"ln -st ~ ./.agent-jobs", "ln -s -t ~ ./.agent-jobs", "ln -s -t " + home + " ./.agent-jobs",
+		"ln -s --target-directory=" + home + " ./.agent-jobs", "ln -s --target-directory ~ ./.agent-jobs",
+		"ln -s . " + home, "ln -s ./.agent-jobs/thrall/jobs.db ~/d",
+		"ls --rec ~", "ls --recu ~", "ls --recursive=x ~", "cp --rec ~ /tmp/x", "cp --arch ~ /tmp/x",
+		"grep --recurs x ~", "grep --rec x ~", "grep --dereference-rec x ~",
+	} {
+		if r := Check(c, cfg); !stateRefusal(r) {
+			t.Errorf("%q: %q, want a state-read refusal", c, r)
+		}
+	}
+	for _, c := range []string{"ln -s . sub2", "ln -s main.go /tmp/m.go", "ls --reverse ~", "ln -s -t " + own + " work/main.go", "cp --remove-destination a b"} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
