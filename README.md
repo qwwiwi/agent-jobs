@@ -118,9 +118,9 @@ Use amend while a job waits, stop and resume when a running job needs new facts 
 | Turns (`--max-turns`) | 80 | 200 |
 | Budget (`--max-budget-usd`) | $10 | $50 |
 | Time (`--timeout-minutes`) | 45 min | 180 min |
-| Running per agent | 2 | |
+| Running per agent (`max_running`) | 2 | 8 |
 
-A request above a ceiling is **rejected, never clamped**, so a job never stops for a reason its author could not see. Zero or omitted means the default; negative values are rejected.
+A request above a ceiling is **rejected, never clamped**, so a job never stops for a reason its author could not see. Zero or omitted means the default; negative values are rejected. Exception: `max_running` (a config.json key) takes the default only when the key is absent; an explicit 0, `null` or any value outside 1..8 is a config error.
 
 **Model.** Pass `--model`, or a `--complexity` (`light` / `normal` / `hard`) that maps to a model by kind:
 
@@ -376,7 +376,7 @@ Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.30
 **Build and check**
 
 ```bash
-go build -ldflags "-X main.version=v0.3.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.4.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```
