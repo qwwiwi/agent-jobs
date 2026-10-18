@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -72,53 +73,100 @@ type PruneReport struct {
 // drivers) is not touched. Symlinks are removed as links, never followed. With dryRun nothing is
 // removed. Before anything is removed, the job's records for analysis move into the log archive
 // (archiveJob); a failed archive keeps the files it would have moved or copied (the rest is pruned
-// and the job reports the error). Archived months older than the retention are removed (archive roots with the
-// marker only). Runs under the lifecycle lock, so it never races a tick's cleanup.
+// and the job reports the error). Archived months older than the retention are removed first (archive roots with the
+// marker only). Each job is pruned under the lifecycle lock, taken per job and its row re-read
+// under it, so prune never races a tick's cleanup or a resume, and a long prune (the daily run)
+// never holds up the ticks between jobs.
 func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
+	return m.PruneContext(context.Background(), dryRun)
+}
+
+// PruneContext is Prune bounded by ctx: the archive retention runs first, then once ctx is done no
+// further job is started (the one in progress finishes) and the error says so; the report covers
+// what was done.
+func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, error) {
 	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
-	unlock, err := m.lock()
-	if err != nil {
-		return rep, err
-	}
-	defer unlock()
 	cutoff := m.Now().Add(-PruneAge)
-	var errs []error
-	for _, status := range []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled} {
+	var ids []string
+	for _, status := range pruneStatuses {
 		list, err := m.Store.ListByStatus(status)
 		if err != nil {
 			return rep, err
 		}
 		for _, j := range list {
-			if j.FinishedAt == nil || j.FinishedAt.After(cutoff) {
-				continue
+			if j.FinishedAt != nil && !j.FinishedAt.After(cutoff) {
+				ids = append(ids, j.ID)
 			}
-			pj := m.pruneJob(j, dryRun)
-			if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
-				m.pruneSessions(j, dryRun, &pj)
-			}
-			if pj.Error != "" {
-				errs = append(errs, fmt.Errorf("job %s: %s", j.ID, pj.Error))
-			}
-			if len(pj.Removed) == 0 && len(pj.Archived) == 0 && pj.Error == "" && pj.Skipped == "" && pj.ArchiveDest == "" {
-				continue // nothing left to prune
-			}
-			for _, e := range pj.Removed {
-				rep.Bytes += e.Bytes
-			}
-			for _, e := range pj.Archived {
-				rep.ArchivedBytes += e.Bytes
-			}
-			rep.Jobs = append(rep.Jobs, pj)
 		}
 	}
-	if rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun); err != nil {
+	// Archive retention runs first, so a per-job pass cut short by ctx never starves it.
+	var errs []error
+	unlock, err := m.lock()
+	if err != nil {
+		return rep, err
+	}
+	rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
+	unlock()
+	if err != nil {
 		errs = append(errs, fmt.Errorf("archive retention: %w", err))
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("prune stopped before job %s: %w", id, err))
+			break
+		}
+		pj, ok, err := m.pruneOne(id, cutoff, dryRun)
+		if err != nil {
+			return rep, errors.Join(append(errs, err)...)
+		}
+		if !ok {
+			continue
+		}
+		if pj.Error != "" {
+			errs = append(errs, fmt.Errorf("job %s: %s", id, pj.Error))
+		}
+		if len(pj.Removed) == 0 && len(pj.Archived) == 0 && pj.Error == "" && pj.Skipped == "" && pj.ArchiveDest == "" {
+			continue // nothing left to prune
+		}
+		for _, e := range pj.Removed {
+			rep.Bytes += e.Bytes
+		}
+		for _, e := range pj.Archived {
+			rep.ArchivedBytes += e.Bytes
+		}
+		rep.Jobs = append(rep.Jobs, pj)
 	}
 	if !dryRun {
 		m.Log.Printf("prune: %d job folders, %d bytes removed, %d bytes moved to the archive, %d archived months expired",
 			len(rep.Jobs), rep.Bytes, rep.ArchivedBytes, len(rep.ArchiveExpired))
 	}
 	return rep, errors.Join(errs...)
+}
+
+// pruneStatuses are the statuses prune cleans (stopped jobs are resumable and stay as they are).
+var pruneStatuses = []string{store.StatusSucceeded, store.StatusFailed, store.StatusTimeout, store.StatusCancelled}
+
+// pruneOne prunes one job under the lifecycle lock, after re-reading its row: a job resumed or
+// otherwise changed since the listing (no longer terminal, or finished after cutoff) is left alone
+// (ok false).
+func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, bool, error) {
+	unlock, err := m.lock()
+	if err != nil {
+		return PruneJob{}, false, err
+	}
+	defer unlock()
+	j, err := m.Store.Get(id)
+	if err != nil {
+		return PruneJob{}, false, err
+	}
+	if !slices.Contains(pruneStatuses, j.Status) || j.FinishedAt == nil || j.FinishedAt.After(cutoff) {
+		return PruneJob{}, false, nil
+	}
+	pj := m.pruneJob(j, dryRun)
+	if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
+		m.pruneSessions(j, dryRun, &pj)
+	}
+	return pj, true, nil
 }
 
 func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {

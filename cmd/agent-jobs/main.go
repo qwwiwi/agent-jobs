@@ -36,7 +36,8 @@ const usage = `usage: agent-jobs <command> [flags]
              [--runner claude|codex] [--reasoning-effort low|medium|high]
                                            a gpt-* model runs on codex exec (read-only kinds
                                            review/research unless codex_write_allowed)
-  status     --agent A <id>
+  status     --agent A [<id>]              a job; without an id: the daily automation
+                                           (prune + doctor procs) and its last run
   list       --agent A [--limit N]
   result     --agent A <id>                print report.md
   cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
@@ -423,16 +424,22 @@ func fmtTime(t *time.Time) string {
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	agent := agentFlag(fs)
-	id, err := oneID(fs, args)
+	pos, err := parse(fs, args)
 	if err != nil {
 		return err
+	}
+	if len(pos) > 1 {
+		return errors.New("at most one job id expected")
 	}
 	m, err := open(*agent)
 	if err != nil {
 		return err
 	}
 	defer m.Close()
-	j, err := m.Store.Get(id)
+	if len(pos) == 0 {
+		return printDaily(m)
+	}
+	j, err := m.Store.Get(pos[0])
 	if err != nil {
 		return err
 	}
@@ -449,6 +456,41 @@ func cmdStatus(args []string) error {
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
+	}
+	return nil
+}
+
+// printDaily is `status` without a job id: the daily automation (prune and doctor procs) and its
+// last run.
+func printDaily(m *jobs.Manager) error {
+	d, err := m.Daily()
+	if err != nil {
+		return err
+	}
+	if !d.Enabled {
+		fmt.Println("daily:     off (daily_off)")
+	} else {
+		fmt.Printf("daily:     prune + doctor procs (report only) once a day after %02d:00 local time\n", d.Hour)
+	}
+	if d.LastDay == "" {
+		fmt.Println("last run:  never")
+		return nil
+	}
+	state := "finished " + fmtTime(d.FinishedAt)
+	if d.Running {
+		state = "not finished (running, or the daemon stopped during it)"
+	}
+	fmt.Printf("last run:  %s, started %s, %s\n", d.LastDay, fmtTime(d.StartedAt), state)
+	if r := d.Result; r != nil {
+		fmt.Printf("prune:     %d jobs, %d bytes freed, %d jobs archived (%d bytes), %d archived months expired\n",
+			r.JobsPruned, r.BytesFreed, r.JobsArchived, r.ArchivedBytes, r.ArchiveExpired)
+		fmt.Printf("procs:     %d ghosts (%d job, %d leaders, %d suspects), %d dead rows\n",
+			r.Ghosts, r.JobGhosts, r.Leaders, r.Suspects, r.DeadRows)
+		for _, e := range []struct{ name, text string }{{"prune", r.PruneError}, {"procs", r.ProcsError}, {"run", r.Error}} {
+			if e.text != "" {
+				fmt.Printf("error:     %s: %s\n", e.name, e.text)
+			}
+		}
 	}
 	return nil
 }
@@ -776,10 +818,15 @@ func cmdDaemon(args []string) error {
 		if err := m.Tick(); err != nil {
 			m.Log.Printf("tick: %v", err)
 		}
+		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
+		// the next ticks keep launching jobs while it runs.
+		m.StartDaily(ctx)
 		select {
 		case <-ctx.Done():
-			// Jobs run in their own sessions: stopping the daemon does not touch them.
+			// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
+			// in progress stops between jobs (ctx) and is waited for before the store closes.
 			m.Log.Printf("daemon stopping; running jobs keep running")
+			m.WaitDaily()
 			return nil
 		case <-t.C:
 		}

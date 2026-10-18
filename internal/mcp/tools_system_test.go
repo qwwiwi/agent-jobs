@@ -72,6 +72,36 @@ func TestSystemDoctor(t *testing.T) {
 	}
 }
 
+// system_doctor shows the last daily run (time and counts); a failed step is a problem.
+func TestSystemDoctorDaily(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin // the guard hook probe runs the real binary
+	cs := connect(t, mustServer(t, m))
+	var out SystemDoctorOutput
+	call(t, cs, "system_doctor", map[string]any{}, &out)
+	if !out.Daily.Enabled || out.Daily.Hour != jobs.DefaultDailyHour || out.Daily.LastDay != "" || out.Daily.Result != nil {
+		t.Fatalf("never ran: %+v", out.Daily)
+	}
+	now := time.Now()
+	if ok, err := m.Store.ClaimDaily("2026-10-18", now); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	res := `{"jobs_pruned":3,"bytes_freed":4096,"jobs_archived":2,"ghosts":1,"job_ghosts":1,"prune_error":"job x: boom"}`
+	if err := m.Store.FinishDaily("2026-10-18", now, res); err != nil {
+		t.Fatal(err)
+	}
+	out = SystemDoctorOutput{}
+	call(t, cs, "system_doctor", map[string]any{}, &out)
+	d := out.Daily
+	if d.LastDay != "2026-10-18" || d.FinishedAt == nil || d.Running || d.Result == nil || d.Result.JobsPruned != 3 ||
+		d.Result.BytesFreed != 4096 || d.Result.JobsArchived != 2 || d.Result.Ghosts != 1 {
+		t.Fatalf("daily: %+v %+v", d, d.Result)
+	}
+	if !slices.ContainsFunc(out.Problems, func(p string) bool { return strings.Contains(p, "daily 2026-10-18 prune: job x: boom") }) {
+		t.Fatalf("a failed daily prune must be a problem: %v", out.Problems)
+	}
+}
+
 func TestSystemLogs(t *testing.T) {
 	m := newManager(t)
 	cs := connect(t, mustServer(t, m))
