@@ -29,6 +29,10 @@ type StreamResult struct {
 	Runner string
 	// Token usage (codex streams only).
 	InputTokens, CachedInputTokens, OutputTokens int64
+	// Skipped counts lines over the line limit that were skipped unread (codex streams only).
+	Skipped int
+	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
+	Err string
 }
 
 // program names the runner of a stream result in messages.

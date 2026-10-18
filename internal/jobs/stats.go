@@ -66,8 +66,9 @@ type statsInput struct {
 }
 
 // readLines calls f for every line of r up to max bytes; longer lines are skipped (read through in
-// chunks, never held whole), so memory stays bounded whatever the stream holds.
-func readLines(r io.Reader, max int, f func([]byte)) error {
+// chunks, never held whole), so memory stays bounded whatever the stream holds. It returns the number
+// of lines skipped.
+func readLines(r io.Reader, max int, f func([]byte)) (skipped int, err error) {
 	br := bufio.NewReaderSize(r, 64<<10)
 	var buf []byte
 	skip := false
@@ -84,16 +85,20 @@ func readLines(r io.Reader, max int, f func([]byte)) error {
 		case err == nil:
 			if !skip {
 				f(bytes.TrimRight(buf, "\r\n"))
+			} else {
+				skipped++
 			}
 			buf, skip = buf[:0], false
 		case errors.Is(err, bufio.ErrBufferFull):
 		case errors.Is(err, io.EOF):
-			if !skip && len(buf) > 0 {
+			if skip {
+				skipped++
+			} else if len(buf) > 0 {
 				f(buf)
 			}
-			return nil
+			return skipped, nil
 		default:
-			return err
+			return skipped, err
 		}
 	}
 }
@@ -135,7 +140,7 @@ func resultText(raw json.RawMessage) string {
 func ParseStreamStats(r io.Reader) (StreamStats, error) {
 	st := StreamStats{ToolCalls: map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}}
 	subagentCalls := map[string]bool{}
-	err := readLines(r, MaxStreamLineBytes, func(line []byte) {
+	_, err := readLines(r, MaxStreamLineBytes, func(line []byte) {
 		var ev statsEvent
 		if json.Unmarshal(line, &ev) != nil {
 			return
@@ -303,8 +308,9 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	}
 	st := &store.JobStats{
 		ID: j.ID, Kind: j.Kind, Model: j.Model, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
-		DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt,
-		ToolCalls: map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
+		CostUnknown: j.CostUnknown, DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
+		FinishedAt: j.FinishedAt,
+		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
 		RecordedAt: m.Now(),
 	}
 	if j.RepoPath != "" {
@@ -314,9 +320,12 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The cost is unknown when no attempt reported one (a codex job); a resumed job with a killed
+	// attempt still counts the cost its other attempts reported.
 	for _, a := range earlier {
 		st.Turns += a.Turns
 		st.CostUSD += a.CostUSD
+		st.CostUnknown = st.CostUnknown && a.CostUnknown
 		st.DurationSec += a.DurationSec
 	}
 	if len(earlier) > 0 && earlier[0].StartedAt != nil {
@@ -444,6 +453,8 @@ type StatsSummary struct {
 	GuardRefusals     int            `json:"guard_refusals"`
 	Subagents         int            `json:"subagents"`
 	WithoutReport     int            `json:"without_report"`
+	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
+	CostUnknownJobs int `json:"cost_unknown_jobs"`
 }
 
 // StatsGroup is the summary of one group (a kind, a model or a skill).
@@ -632,14 +643,18 @@ func summarize(rows []*store.JobStats) StatsSummary {
 	durs := make([]int, 0, len(rows))
 	for _, r := range rows {
 		s.ByStatus[r.Status]++
-		s.CostTotalUSD += r.CostUSD
+		if r.CostUnknown {
+			s.CostUnknownJobs++
+		} else {
+			s.CostTotalUSD += r.CostUSD
+			costs = append(costs, r.CostUSD)
+		}
 		s.Turns += r.Turns
 		s.GuardRefusals += r.GuardRefusals
 		s.Subagents += r.Subagents
 		if !r.HasReport {
 			s.WithoutReport++
 		}
-		costs = append(costs, r.CostUSD)
 		durs = append(durs, r.DurationSec)
 	}
 	slices.Sort(costs)

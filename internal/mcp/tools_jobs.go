@@ -49,22 +49,27 @@ type JobView struct {
 	TimeoutMinutes  int     `json:"timeout_minutes"`
 	Turns           int     `json:"turns"`
 	CostUSD         float64 `json:"cost_usd"`
-	DurationSec     int     `json:"duration_sec"`
-	RepoPath        string  `json:"repo_path,omitempty"`
-	BaseCommit      string  `json:"base_commit,omitempty"`
-	CreatedAt       string  `json:"created_at"`
-	StartedAt       string  `json:"started_at,omitempty"`
-	FinishedAt      string  `json:"finished_at,omitempty"`
-	NotifiedAt      string  `json:"notified_at,omitempty"`
-	CleanedAt       string  `json:"cleaned_at,omitempty"`
-	OwnerWaits      bool    `json:"owner_waits"`
-	ResumedFrom     string  `json:"resumed_from,omitempty"`
-	ScheduleID      string  `json:"schedule_id,omitempty"`
-	Error           string  `json:"error,omitempty"`
-	JobDir          string  `json:"job_dir"`
-	SessionID       string  `json:"session_id,omitempty"`
-	Attempt         int     `json:"attempt"`
-	RunMode         string  `json:"run_mode,omitempty"`
+	// CostUnknown: the cost was never reported (a codex job, a killed attempt); cost_usd is not a cost then.
+	CostUnknown bool `json:"cost_unknown"`
+	// Limits is "n/a (codex)" for a codex job: max_turns and max_budget_usd (0) do not apply, the
+	// timeout is the only limit.
+	Limits      string `json:"limits,omitempty"`
+	DurationSec int    `json:"duration_sec"`
+	RepoPath    string `json:"repo_path,omitempty"`
+	BaseCommit  string `json:"base_commit,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	StartedAt   string `json:"started_at,omitempty"`
+	FinishedAt  string `json:"finished_at,omitempty"`
+	NotifiedAt  string `json:"notified_at,omitempty"`
+	CleanedAt   string `json:"cleaned_at,omitempty"`
+	OwnerWaits  bool   `json:"owner_waits"`
+	ResumedFrom string `json:"resumed_from,omitempty"`
+	ScheduleID  string `json:"schedule_id,omitempty"`
+	Error       string `json:"error,omitempty"`
+	JobDir      string `json:"job_dir"`
+	SessionID   string `json:"session_id,omitempty"`
+	Attempt     int    `json:"attempt"`
+	RunMode     string `json:"run_mode,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -81,13 +86,22 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 	return JobView{
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
-		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, DurationSec: j.DurationSec,
+		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostUnknown,
+		Limits: limitsNote(j), DurationSec: j.DurationSec,
 		RepoPath: j.RepoPath, BaseCommit: j.BaseCommit, CreatedAt: fmtTS(&j.CreatedAt),
 		StartedAt: fmtTS(j.StartedAt), FinishedAt: fmtTS(j.FinishedAt), NotifiedAt: fmtTS(j.NotifiedAt),
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 	}
+}
+
+// limitsNote is JobView.Limits: "n/a (codex)" for a codex job, "" otherwise.
+func limitsNote(j *store.Job) string {
+	if j.Runner == store.RunnerCodex {
+		return jobs.CodexLimitsNA
+	}
+	return ""
 }
 
 func finished(status string) bool {
@@ -170,7 +184,9 @@ type JobResultOutput struct {
 	Finished bool   `json:"finished"`
 	// DoneLine is the same line the session got when the job ended.
 	DoneLine string `json:"done_line,omitempty"`
-	Error    string `json:"error,omitempty"`
+	// CostUnknown: the job's cost was never reported (a codex job, a killed attempt).
+	CostUnknown bool   `json:"cost_unknown"`
+	Error       string `json:"error,omitempty"`
 	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain).
 	Report          string   `json:"report,omitempty"`
 	ReportMissing   bool     `json:"report_missing,omitempty"`
@@ -226,7 +242,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, JobResultOutput{}, err
 		}
-		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: j.Error, Artifacts: []string{}}
+		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: j.Error,
+			CostUnknown: j.CostUnknown, Artifacts: []string{}}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
 		}

@@ -239,6 +239,7 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			return nil, err
 		}
 		effort = m.Cfg.reasoningEffort(effort)
+		turns, budget = 0, 0 // not enforced on codex: stored as 0, shown as n/a (codex)
 	} else if effort != "" {
 		return nil, errors.New("reasoning_effort applies only to a codex job")
 	}
@@ -415,12 +416,17 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return err
 	}
 	var plan launchPlan
+	var codexCfg Config
 	if j.Runner == store.RunnerCodex {
 		if j.Attempt > 1 {
 			return errCodexResume
 		}
-		// The config may have changed since the job was queued.
-		if err := m.Cfg.checkCodexJob(j.Kind); err != nil {
+		// The launch is authorized by config.json as it is now, not by the daemon's startup snapshot:
+		// codex_write_allowed may have been turned off while the job was queued.
+		if codexCfg, err = reloadCodexConfig(m.StateDir); err != nil {
+			return err
+		}
+		if err := codexCfg.checkCodexJob(j.Kind); err != nil {
 			return err
 		}
 	}
@@ -442,7 +448,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
 		if j.Runner == store.RunnerCodex {
-			plan = launchPlan{bin: m.Cfg.codexBin(), args: CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort)),
+			plan = launchPlan{bin: codexCfg.codexBin(), args: CodexArgs(j, codexCfg.reasoningEffort(j.ReasoningEffort)),
 				wrapper: []string{"--runner", store.RunnerCodex}}
 		}
 	}
@@ -829,7 +835,7 @@ func (m *Manager) killRunning(j *store.Job) {
 }
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
-// exit 0 without a report is a failure.
+// exit 0 without a report is a failure; so is a codex exit 0 whose stream has no terminal turn.completed.
 // A sweep marker (processes outlived claude) fails the job whatever claude's exit was.
 func Verdict(code int, res StreamResult, dir string) (string, string) {
 	if reason := sweepFailure(dir); reason != "" {
@@ -848,6 +854,11 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 	}
 	if res.IsError {
 		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
+	}
+	if res.Runner == store.RunnerCodex {
+		if reason := codexStreamFailure(res); reason != "" {
+			return store.StatusFailed, reason
+		}
 	}
 	if !hasReport(dir) {
 		return store.StatusFailed, "exit 0 without a report"

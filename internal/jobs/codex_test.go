@@ -29,6 +29,10 @@ if [[ $prompt == *FAKE_CODEX_FAIL* ]]; then
   echo '{"type":"turn.failed","error":{"message":"model overloaded"}}'
   exit 1
 fi
+if [[ $prompt == *FAKE_CODEX_NOTERMINAL* ]]; then
+  echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"## Summary\npartial"}}'
+  exit 0
+fi
 if [[ $prompt != *FAKE_CODEX_NOREPORT* ]]; then
   echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"## Summary\ncodex ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}}'
 fi
@@ -56,8 +60,8 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 	if j.Status != store.StatusSucceeded {
 		t.Fatalf("got %s %q", j.Status, j.Error)
 	}
-	if j.Turns != 2 || j.CostUSD != 0 || !j.CostUnknown {
-		t.Fatalf("turns=%d cost=%v unknown=%v", j.Turns, j.CostUSD, j.CostUnknown)
+	if j.Turns != 2 || j.CostUSD != 0 || !j.CostUnknown || j.MaxTurns != 0 || j.MaxBudgetUSD != 0 {
+		t.Fatalf("turns=%d cost=%v unknown=%v limits=%d/%v", j.Turns, j.CostUSD, j.CostUnknown, j.MaxTurns, j.MaxBudgetUSD)
 	}
 	dir := m.JobDir(j.ID)
 	rep, _ := os.ReadFile(filepath.Join(dir, "report.md"))
@@ -65,7 +69,15 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		t.Fatalf("report.md: %q", rep)
 	}
 	argv, _ := os.ReadFile(filepath.Join(dir, "argv.txt"))
-	want := "exec\n--json\n-m\ngpt-6.1-sol\n-c\nmodel_reasoning_effort=high\n--sandbox\nread-only\n--skip-git-repo-check\n-\n"
+	want := "exec\n--json\n--ignore-user-config\n--ignore-rules\n--ephemeral\n--skip-git-repo-check\n" +
+		"-s\nread-only\n-c\napproval_policy=\"never\"\n-c\nmcp_servers={}\n" +
+		"--disable\napps\n--disable\nbrowser_use\n--disable\nbrowser_use_external\n" +
+		"--disable\nbrowser_use_full_cdp_access\n--disable\ncomputer_use\n--disable\nimage_generation\n" +
+		"--disable\nmulti_agent\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
+		"--disable\nskill_mcp_dependency_install\n--disable\ndaemon_auto_start\n" +
+		"--disable\nin_app_local_automation\n--disable\ngoals\n--disable\nrealtime_conversation\n" +
+		"--disable\nworktrees\n--disable\nhooks\n" +
+		"-m\ngpt-6.1-sol\n-c\nmodel_reasoning_effort=high\n-\n"
 	if string(argv) != want {
 		t.Fatalf("codex argv:\n%s\nwant:\n%s", argv, want)
 	}
@@ -79,6 +91,33 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 	}
 	if log, _ := os.ReadFile(filepath.Join(dir, "stderr.log")); !strings.Contains(string(log), "input 1200 (cached 800), output 90 tokens") {
 		t.Fatalf("usage not logged: %s", log)
+	}
+	// Unknown cost and the absent turn/budget caps are said as such, never as $0.00 or a number.
+	if line := DoneLine(j); !strings.Contains(line, "· cost unknown ·") || strings.Contains(line, "$0.00") {
+		t.Fatalf("done line %q", line)
+	}
+	if c := CostText(j.CostUSD, j.CostUnknown); c != "unknown" {
+		t.Fatalf("cost text %q", c)
+	}
+	if l := LimitsText(j); l != "n/a (codex) turns · n/a (codex) budget · 45m" {
+		t.Fatalf("limits text %q", l)
+	}
+	claude := &store.Job{Runner: store.RunnerClaude, MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45}
+	if l, c := LimitsText(claude), CostText(1.234, false); l != "80 turns · $10 · 45m" || c != "$1.23" {
+		t.Fatalf("claude limits %q cost %q", l, c)
+	}
+}
+
+// TestCodexWithoutTerminalEventFails: exit 0 and an agent message, but no turn.completed (the stream
+// ended early): the job fails and the partial message does not become the report.
+func TestCodexWithoutTerminalEventFails(t *testing.T) {
+	m := newCodexManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_NOTERMINAL", codexReview).ID)
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "turn.completed") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	if hasReport(m.JobDir(j.ID)) {
+		t.Fatal("a partial agent message must not become report.md")
 	}
 }
 
@@ -169,22 +208,48 @@ func TestCodexWriteJobRefusedByDefault(t *testing.T) {
 			t.Fatalf("%s codex job: %v", kind, err)
 		}
 	}
-	// A queued write job is refused at launch too when the config no longer allows it.
+	// A queued write job is refused at launch when the config on disk no longer allows it: the launch
+	// reloads config.json, the daemon's startup snapshot does not authorize it.
+	writeCodexConfig(t, m, `{"codex_write_allowed":true}`)
 	m.Cfg.CodexWriteAllowed = true
 	j := enqueue(t, m, "fix it", func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" })
-	m.Cfg.CodexWriteAllowed = false
+	writeCodexConfig(t, m, `{"codex_write_allowed":false}`)
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
 	}
 	if got := get(t, m, j.ID); got.Status != store.StatusFailed || !strings.Contains(got.Error, "codex_write_allowed") {
 		t.Fatalf("got %s %q", got.Status, got.Error)
 	}
-	// Allowed: workspace-write sandbox.
-	m.Cfg.CodexWriteAllowed = true
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt")); err == nil {
+		t.Fatal("refused job must not run codex")
+	}
+	// A config that does not load refuses the launch too (read-only jobs included).
+	writeCodexConfig(t, m, `{"codex_write_allowed":true}`)
+	j = enqueue(t, m, "fix it", func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" })
+	ro := enqueue(t, m, "review it", codexReview)
+	writeCodexConfig(t, m, `{"codex_reasoning_effort":"max"}`)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{j.ID, ro.ID} {
+		if got := get(t, m, id); got.Status != store.StatusFailed || !strings.Contains(got.Error, "config") {
+			t.Fatalf("invalid config: got %s %q", got.Status, got.Error)
+		}
+	}
+	// Allowed on disk: workspace-write sandbox.
+	writeCodexConfig(t, m, `{"codex_write_allowed":true}`)
 	j = runToEnd(t, m, enqueue(t, m, "fix it", func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" }).ID)
 	argv, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "argv.txt"))
-	if j.Status != store.StatusSucceeded || !strings.Contains(string(argv), "--sandbox\nworkspace-write\n") {
+	if j.Status != store.StatusSucceeded || !strings.Contains(string(argv), "-s\nworkspace-write\n") {
 		t.Fatalf("got %s %q argv %q", j.Status, j.Error, argv)
+	}
+}
+
+// writeCodexConfig rewrites the manager's config.json on disk (the daemon's m.Cfg is left as is).
+func writeCodexConfig(t *testing.T, m *Manager, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -305,5 +370,64 @@ func TestParseCodexStreamRealSample(t *testing.T) {
 	}
 	if r.InputTokens != 18525 || r.CachedInputTokens != 12288 || r.OutputTokens != 5 || r.CostUSD != 0 {
 		t.Fatalf("usage %+v", r)
+	}
+}
+
+// TestParseCodexStreamStrict: a line over the limit is skipped and counted (the messages after it still
+// count), a stream without a terminal turn.completed is not a success, and a later turn that started but
+// never ended voids the earlier completion.
+func TestParseCodexStreamStrict(t *testing.T) {
+	old := codexMaxLineBytes
+	codexMaxLineBytes = 1 << 10
+	t.Cleanup(func() { codexMaxLineBytes = old })
+	p := filepath.Join(t.TempDir(), "stream.jsonl")
+	write := func(lines ...string) StreamResult {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return ParseCodexStream(p)
+	}
+	huge := `{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"` + strings.Repeat("x", 8<<10) + `"}}`
+	first := `{"type":"item.completed","item":{"type":"agent_message","text":"first"}}`
+	last := `{"type":"item.completed","item":{"type":"agent_message","text":"last"}}`
+	done := `{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}`
+	r := write(`{"type":"turn.started"}`, first, huge, last, done+"\n")
+	if !r.Found || r.IsError || r.Text != "last" || r.Skipped != 1 || r.Err != "" || r.Turns != 2 {
+		t.Fatalf("oversized line between messages: %+v", r)
+	}
+	if st, msg := Verdict(0, r, t.TempDir()); st != store.StatusFailed || msg != "exit 0 without a report" {
+		t.Fatalf("verdict %s %q", st, msg)
+	}
+	// Missing turn.completed with exit 0.
+	r = write(`{"type":"turn.started"}`, first+"\n")
+	if r.Found || r.Text != "first" {
+		t.Fatalf("no terminal event: %+v", r)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("## Summary\nx\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, msg := Verdict(0, r, dir); st != store.StatusFailed || !strings.Contains(msg, "turn.completed") {
+		t.Fatalf("verdict without terminal event: %s %q", st, msg)
+	}
+	// Truncated stream: a later turn started and its last line is cut.
+	r = write(`{"type":"turn.started"}`, first, done, `{"type":"turn.started"}`, `{"type":"item.completed","item":{"type":"agent_mess`)
+	if r.Found {
+		t.Fatalf("truncated stream: %+v", r)
+	}
+	if st, _ := Verdict(0, r, dir); st != store.StatusFailed {
+		t.Fatalf("truncated stream verdict %s", st)
+	}
+	// The failed turn is terminal but an error.
+	r = write(`{"type":"turn.started"}`, `{"type":"turn.failed","error":{"message":"quota"}}`)
+	if st, msg := Verdict(0, r, dir); st != store.StatusFailed || !strings.Contains(msg, "quota") {
+		t.Fatalf("failed turn verdict %s %q", st, msg)
+	}
+	// A read error is propagated (a directory is not a stream).
+	if r := ParseCodexStream(t.TempDir()); r.Err == "" {
+		t.Fatalf("read error not propagated: %+v", r)
+	} else if st, msg := Verdict(0, r, dir); st != store.StatusFailed || !strings.Contains(msg, "stream") {
+		t.Fatalf("read error verdict %s %q", st, msg)
 	}
 }

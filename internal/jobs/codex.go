@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,6 +79,16 @@ func (c Config) checkCodexJob(kind string) error {
 	return nil
 }
 
+// reloadCodexConfig reads and validates config.json for the launch of a codex job; a config that does
+// not load refuses the launch (fail closed).
+func reloadCodexConfig(stateDir string) (Config, error) {
+	cfg, err := LoadConfig(stateDir)
+	if err != nil {
+		return Config{}, fmt.Errorf("codex job not launched: config reload failed: %w", err)
+	}
+	return cfg, nil
+}
+
 // reasoningEffort returns the effort of a codex job: the job's own, else the config's, else the default.
 func (c Config) reasoningEffort(job string) string {
 	if job != "" {
@@ -126,16 +135,38 @@ func (c Config) codexBin() string {
 	return "codex"
 }
 
-// CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout, the
-// job's model and reasoning effort, the kind's sandbox, no git-repo check (a job without a repo works
-// in an empty dir); the prompt arrives on stdin ("-"). The working dir is the job's work dir (set by
-// the wrapper).
-func CodexArgs(j *store.Job, effort string) []string {
-	return []string{
-		"exec", "--json", "-m", j.Model, "-c", "model_reasoning_effort=" + effort,
-		"--sandbox", CodexSandbox(j.Kind), "--skip-git-repo-check", "-",
-	}
+// CodexDisabledFeatures are the codex features every codex job runs without (`--disable <f>` each):
+// whatever could act outside the shell sandbox (apps, browsers, computer use, plugins, MCP installs,
+// hooks, background daemons and automations, worktrees, sub-agents) or a one-shot job has no use for.
+// With --ignore-user-config, --ignore-rules, --ephemeral and an empty mcp_servers table, a job never
+// inherits the owner's codex config, rules, MCP servers, apps or plugins: the sandbox is the whole
+// containment (this exact command line verified on codex-cli 0.162.1).
+var CodexDisabledFeatures = []string{
+	"apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
+	"image_generation", "multi_agent", "plugins", "plugin_sharing", "remote_plugin",
+	"skill_mcp_dependency_install", "daemon_auto_start", "in_app_local_automation", "goals",
+	"realtime_conversation", "worktrees", "hooks",
 }
+
+// CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,
+// isolated from the owner's codex setup (no user config, rules or session files, no MCP servers, the
+// CodexDisabledFeatures off, never asks for approval), no git-repo check (a job without a repo works in
+// an empty dir), the kind's sandbox, the job's model and reasoning effort; the prompt arrives on stdin
+// ("-"). The working dir is the job's work dir (set by the wrapper).
+func CodexArgs(j *store.Job, effort string) []string {
+	args := []string{
+		"exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
+		"-s", CodexSandbox(j.Kind), "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
+	}
+	for _, f := range CodexDisabledFeatures {
+		args = append(args, "--disable", f)
+	}
+	return append(args, "-m", j.Model, "-c", "model_reasoning_effort="+effort, "-")
+}
+
+// codexMaxLineBytes caps one line of a codex stream; a longer line (a huge command output) is skipped
+// and counted, never held whole.
+var codexMaxLineBytes = MaxStreamLineBytes
 
 // codexEvent is one line of `codex exec --json` output (the fields this package reads).
 type codexEvent struct {
@@ -154,29 +185,34 @@ type codexEvent struct {
 	} `json:"error"`
 }
 
-// ParseCodexStream reads a `codex exec --json` stream: Found when a turn ended (turn.completed or
-// turn.failed), IsError when the last turn failed, Text = the last agent message, Turns = the completed
-// items other than reasoning and error warnings (messages, commands, file changes, tool calls), and the
-// token usage summed over the turns. The cost is never known (codex reports no price).
+// ParseCodexStream reads a `codex exec --json` stream: Found when the last turn ended (turn.completed
+// or turn.failed; a turn.started after it voids it, so a stream cut inside a later turn is not ended),
+// IsError when that turn failed, Text = the last agent message, Turns = the completed items other than
+// reasoning and error warnings (messages, commands, file changes, tool calls), and the token usage
+// summed over the turns. Lines over codexMaxLineBytes are skipped and counted (Skipped); a read error
+// is kept in Err. The cost is never known (codex reports no price).
 func ParseCodexStream(path string) StreamResult {
 	out := StreamResult{Runner: store.RunnerCodex}
 	f, err := os.Open(path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			out.Err = err.Error()
+		}
 		return out
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	for sc.Scan() {
+	skipped, err := readLines(f, codexMaxLineBytes, func(line []byte) {
 		var ev codexEvent
-		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
-			continue
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return
 		}
 		switch ev.Type {
+		case "turn.started":
+			out.Found, out.IsError, out.Subtype = false, false, ""
 		case "item.completed":
 			// "error" items are warnings (e.g. unrecognized config settings), not work done.
 			if ev.Item.Type == "reasoning" || ev.Item.Type == "error" || ev.Item.Type == "" {
-				continue
+				return
 			}
 			out.Turns++
 			if ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
@@ -195,21 +231,46 @@ func ParseCodexStream(path string) StreamResult {
 				out.Subtype += ": " + msg
 			}
 		}
+	})
+	out.Skipped = skipped
+	if err != nil {
+		out.Err = err.Error()
 	}
 	return out
+}
+
+// codexStreamFailure is why a codex stream does not count as a success whatever codex's exit code: it
+// could not be read to its end, or its last turn has no terminal turn.completed event. "" = it does.
+func codexStreamFailure(res StreamResult) string {
+	switch {
+	case res.Err != "":
+		return "codex stream not read to its end: " + Printable(res.Err, 200)
+	case !res.Found:
+		return "codex stream has no terminal turn.completed event (codex stopped early or the stream is truncated)"
+	}
+	return ""
 }
 
 // errCodexResume is the refusal of a resume of a codex job.
 var errCodexResume = errors.New("resume of a codex job is not supported: start a new job " +
 	"(codex exec has a resume subcommand, but it is not verified to work under the job's containment yet)")
 
-// writeCodexReport writes the last agent message of a codex stream as report.md when the job did not
-// write report.md itself, and logs the token usage to stderr.log.
+// writeCodexReport writes the last agent message of a codex stream as report.md when the stream ended
+// in a completed turn and the job did not write report.md itself, and logs the token usage to
+// stderr.log.
 func writeCodexReport(jobDir string, log io.Writer) {
 	res := ParseCodexStream(filepath.Join(jobDir, "stream.jsonl"))
 	fmt.Fprintf(log, "run-wrapper: codex usage: input %d (cached %d), output %d tokens; %d items\n",
 		res.InputTokens, res.CachedInputTokens, res.OutputTokens, res.Turns)
-	if hasReport(jobDir) || res.Text == "" {
+	if res.Skipped > 0 {
+		fmt.Fprintf(log, "run-wrapper: codex stream: %d line(s) over %d bytes skipped\n", res.Skipped, codexMaxLineBytes)
+	}
+	// Only a stream that ended in a completed turn has a final message: an earlier one is not the report.
+	if reason := codexStreamFailure(res); reason != "" {
+		fmt.Fprintln(log, "run-wrapper:", reason)
+		return
+	}
+	if res.IsError || hasReport(jobDir) || res.Text == "" {
 		return
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(res.Text+"\n")); err != nil {

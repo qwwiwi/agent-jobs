@@ -39,12 +39,37 @@ func Printable(s string, max int) string {
 	return out
 }
 
+// CostText is a cost for people: "unknown" when it is not known (a codex job, a killed attempt), never
+// $0.00 for it.
+func CostText(cost float64, unknown bool) string {
+	if unknown {
+		return "unknown"
+	}
+	return fmt.Sprintf("$%.2f", cost)
+}
+
+// CodexLimitsNA is how the turn and budget caps of a codex job are shown: codex has none, the timeout
+// is its only limit.
+const CodexLimitsNA = "n/a (codex)"
+
+// LimitsText is a job's limits for people: turns · budget · timeout.
+func LimitsText(j *store.Job) string {
+	if j.Runner == store.RunnerCodex {
+		return fmt.Sprintf("%s turns · %s budget · %dm", CodexLimitsNA, CodexLimitsNA, j.TimeoutMinutes)
+	}
+	return fmt.Sprintf("%d turns · $%g · %dm", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
+}
+
 // DoneLine is the one line delivered to the agent's live session.
 // A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 func DoneLine(j *store.Job) string {
-	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · $%.2f · %dm",
-		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, j.CostUSD, (j.DurationSec+30)/60)
+	cost := CostText(j.CostUSD, j.CostUnknown)
+	if j.CostUnknown {
+		cost = "cost " + cost
+	}
+	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
+		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
 	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
 		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
 	}
