@@ -291,6 +291,8 @@ git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/ch
 scripts/check.sh                       # gofmt, go vet, go test
 ```
 
+Contributing: commit messages are English-only; `scripts/check.sh` (and so the pre-push hook) refuses unpushed commits (`origin/main..HEAD`) whose subject or body contains Cyrillic.
+
 **Initialise an agent**
 
 ```bash
