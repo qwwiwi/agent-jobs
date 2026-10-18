@@ -39,7 +39,8 @@ var NotifyLimits = store.NotifyLimits{PerJob: 3, JobInterval: time.Minute, PerAg
 const UndeliveredWindow = 24 * time.Hour
 
 // notifyText validates a notification's text: required, valid UTF-8, one line (no control or
-// format character, bidi overrides included), then Printable capped to MaxNotifyRunes and defanged
+// format character, bidi overrides included), then redacted and Printable capped to MaxNotifyRunes
+// (RedactPrintable) and defanged
 // so it cannot pass for another tag (defangTags).
 func notifyText(s string) (string, error) {
 	if !utf8.ValidString(s) {
@@ -48,7 +49,7 @@ func notifyText(s string) (string, error) {
 	if containsControl(s) {
 		return "", errors.New("text contains a control or format character (newline, tab, escape, bidi, …); a notification is one line")
 	}
-	t := defangTags(Printable(s, MaxNotifyRunes))
+	t := defangTags(RedactPrintable(s, MaxNotifyRunes))
 	if t == "" {
 		return "", errors.New("text is required")
 	}
@@ -150,6 +151,13 @@ var errTmuxTimeout = errors.New("tmux delivery timed out")
 // every tmux call is killed at that deadline, so a hung tmux or lock holder never blocks the caller
 // (the daemon's tick, a proxy call) for longer.
 func (m *Manager) sendTmuxLocked(target, line string) error {
+	return m.withTmuxLock(func(ctx context.Context) error { return m.sendTmux(ctx, target, line) })
+}
+
+// withTmuxLock runs fn holding <state>/tmux.lock, with a context that ends TmuxDeliveryTimeout
+// after the call started (waiting for the lock included). An error taking the lock is returned
+// without running fn.
+func (m *Manager) withTmuxLock(fn func(ctx context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), TmuxDeliveryTimeout)
 	defer cancel()
 	f, err := os.OpenFile(filepath.Join(m.StateDir, "tmux.lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -172,5 +180,5 @@ func (m *Manager) sendTmuxLocked(target, line string) error {
 		}
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-	return m.sendTmux(ctx, target, line)
+	return fn(ctx)
 }

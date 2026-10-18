@@ -450,3 +450,31 @@ func TestArchiveRedactsPendingReport(t *testing.T) {
 		}
 	}
 }
+
+// TestRedactMainPaths: the owner-waits, notify_owner and check paths redact the job's text before
+// they cut it (a secret cut short no longer matches its format) or store it.
+func TestRedactMainPaths(t *testing.T) {
+	secret := "ghp_" + rep("Q", 36)
+	leaks := func(s string) bool { return strings.Contains(s, "ghp_") || strings.Contains(s, rep("Q", 8)) }
+
+	title := rep("t", MaxTitleRunes-10) + " " + secret
+	out := StopHookDecision(StopHookInput{HookEventName: "Stop", SessionID: "s"},
+		[]*store.OwnerPending{{JobID: "j1", Title: title, Status: store.StatusSucceeded, State: "delivered"}})
+	if out == nil || leaks(out.Reason) {
+		t.Fatalf("stop hook reason leaks the title's secret: %+v", out)
+	}
+
+	n, err := notifyText(rep("n", MaxNotifyRunes-10) + " " + secret)
+	if err != nil || leaks(n) {
+		t.Fatalf("notifyText = %q, %v", n, err)
+	}
+
+	note, err := MarkNote("done " + secret)
+	if err != nil || leaks(note) || !strings.Contains(note, "[redacted:github]") {
+		t.Fatalf("MarkNote = %q, %v", note, err)
+	}
+
+	if _, err := CheckName("x " + secret); err == nil || leaks(err.Error()) {
+		t.Fatalf("CheckName error leaks the secret: %v", err)
+	}
+}

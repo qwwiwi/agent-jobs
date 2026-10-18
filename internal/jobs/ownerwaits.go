@@ -152,7 +152,7 @@ func StopHookDecision(in StopHookInput, pending []*store.OwnerPending) *StopHook
 	parts := make([]string, 0, len(pending))
 	for _, p := range pending {
 		parts = append(parts, fmt.Sprintf("job %s «%s» (%s; %s)", Printable(p.JobID, 64),
-			Printable(p.Title, MaxTitleRunes), p.Status, ownerPendingState(p.State)))
+			RedactPrintable(p.Title, MaxTitleRunes), p.Status, ownerPendingState(p.State)))
 	}
 	return &StopHookOutput{
 		Decision: "block",
