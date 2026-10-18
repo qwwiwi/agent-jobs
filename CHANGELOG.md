@@ -17,6 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 - `prune` takes the lifecycle lock per job (re-reading the row under it) instead of once for the whole pass, and stops between jobs when its context ends (`PruneContext`).
 
+### Fixed
+- `TestOuterWrapperHookOnlyInTestBuild` passes inside a job scope: there the release build refuses on the scope check first, and the test expects that message (outside a scope it still expects the wrapper refusal).
+- The daily run logs «previous daily run (<day>) still in progress, skipping» once per day when an earlier day's run (a hung step, an abandoned doctor procs scan) still holds the daily lock; before, the day was skipped silently.
+
+### Security
+- Guard: a job no longer reads the agent's state outside its own folder. With the job's subagent log given (`<state>/subagents/<id>.log`), the guard derives the state dir and the job folder (`<state>/jobs/<id>`) and refuses the `Read`, `Grep` and `Glob` tools there (Grep, and Glob with `**`, also on an ancestor of the state dir), and every Bash word, path-like piece of a word or here-document (inline code, option values, assignments) and redirection that resolves there – plain readers included (`cat`, `grep -a`, `head`, `tail`, `less`, `od`, `xxd`, `base64`, `strings`, `cp`, …) – plus an ancestor of the state dir for recursive readers (`grep -r`, `rg`, `ag`, `ack`, `zip`, `find` with an action). The job's own folder (prompt, report, work) stays readable.
+- Guard state-read rule hardened (PR #24 review): a path with `..` resolves the way the kernel does (a symlink before the `..` is followed; a `..` after a component that does not exist yet is refused), `ln -s`/`cp -s` targets into the state or to an ancestor of it are refused, and so is any `..` word in a call that creates a symlink; glob words and Glob tool patterns are refused when a wildcard at or above the state dir can match it (`~/.agent-jobs/thr*/jobs.db`); `env -C`/`--chdir`, `git -C`, `sudo -D`, `make|tar|go … -C` and `--chdir`/`--cwd`/`--prefix`/… are resolved, an unresolved one or `chroot` refused; `grep -d recurse`/`--directories=recurse` and abbreviated long forms, `find` in any form, `tar`, `rsync`, `tree`, `cp -r`, `ls -R`, the working directory of a recursive reader and the stages feeding `xargs` count as recursive reads of an ancestor; each top-level command resolves against the cds before it (`cat ../prompt.md; cd ..` is allowed); a non-empty `--subagent-log` of the wrong shape refuses every tool call instead of disabling the rule.
+- Guard: a bare redirection with no command word (`> .git/config`, `> jobs.db`, `< jobs.db`) is now parsed as a command and checked; before, the parser dropped it.
+
 ## [0.3.0] - 2026-10-18
 
 No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released here in 0.3.0.

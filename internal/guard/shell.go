@@ -21,6 +21,8 @@ type simpleCmd struct {
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
 	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
+	// inRedirs are the sources of input redirections and here-strings (`<f`, `<>f`, `<<<w`).
+	inRedirs []string
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -76,6 +78,7 @@ type parser struct {
 	quoted   bool // current word contains quoting
 	redir    redirKind
 	redirOut bool // the pending redirFile target is written to
+	redirIn  bool // the pending redirFile source is read (`<`, `<>`, `<<<`)
 	heredocs []pendingHeredoc
 	paren    int    // current `( … )` depth
 	sep      string // separator that ended the previous pipeline
@@ -106,16 +109,20 @@ func (p *parser) endWord() {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
 			p.cmd.outDyn = append(p.cmd.outDyn, p.dyn)
 		}
+		if p.redirIn {
+			p.cmd.inRedirs = append(p.cmd.inRedirs, w)
+		}
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
 	}
 	p.started, p.dyn, p.quoted = false, false, false
-	p.redir, p.redirOut = redirNone, false
+	p.redir, p.redirOut, p.redirIn = redirNone, false, false
 }
 
 func (p *parser) endCmd() {
 	p.endWord()
-	if len(p.cmd.words) > 0 || p.cmd.heredoc != "" || len(p.heredocs) > 0 {
+	// A bare redirection is a command too: `> f` truncates f, `< f` opens it.
+	if len(p.cmd.words) > 0 || p.cmd.heredoc != "" || len(p.heredocs) > 0 || len(p.cmd.outRedirs) > 0 || len(p.cmd.inRedirs) > 0 {
 		p.pipe.cmds = append(p.pipe.cmds, p.cmd)
 	}
 	p.cmd = &simpleCmd{}
@@ -377,7 +384,7 @@ func (p *parser) redirect() {
 		out = out || p.peek(0) == '>' // `<>file` opens it for writing too
 		p.i++
 	}
-	p.redir, p.redirOut = kind, out
+	p.redir, p.redirOut, p.redirIn = kind, out, op == '<' && kind == redirFile
 }
 
 func (p *parser) double() {

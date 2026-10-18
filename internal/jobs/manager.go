@@ -47,6 +47,9 @@ type Manager struct {
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
 	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
+	dailyNoteMu  sync.Mutex     // guards dailyHeld and dailySkipped
+	dailyHeld    string         // the day whose run holds dailyMu
+	dailySkipped string         // the day a skip was last logged (at most one line per day)
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)

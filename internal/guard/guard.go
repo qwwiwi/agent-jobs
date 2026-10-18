@@ -60,6 +60,11 @@ type Config struct {
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
 	// database that holds the counter. File tools and literal Bash targets into them are refused.
 	Protected []string
+	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
+	// reads it, except its own folder OwnDir. Empty = reads are not checked.
+	StateDir string
+	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
+	OwnDir string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -70,6 +75,8 @@ type HookInput struct {
 		Command      string `json:"command"`
 		FilePath     string `json:"file_path"`
 		NotebookPath string `json:"notebook_path"`
+		Path         string `json:"path"`    // Grep, Glob
+		Pattern      string `json:"pattern"` // Glob (Grep's pattern is a regexp, not a path)
 	} `json:"tool_input"`
 	// RawInput is tool_input as sent (subagent calls are checked on fields of their own).
 	RawInput json.RawMessage `json:"-"`
@@ -97,6 +104,25 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	in.RawInput = raw.ToolInput
 	if cfg.Dir == "" {
 		cfg.Dir = in.Cwd
+	}
+	if cfg.StateDir == "" {
+		state, own, ok := StateLayout(cfg.SubagentLog)
+		if !ok && cfg.SubagentLog != "" {
+			// A misconfigured hook must not silently turn the state-read rule off: fail closed.
+			return "blocked by guard: the subagent log `" + cfg.SubagentLog + "` is not <state>/subagents/<id>.log, " +
+				"so the guard cannot derive the job's folder; every tool call is refused until the hook is fixed.", nil
+		}
+		cfg.StateDir, cfg.OwnDir = state, own
+	}
+	if readTools[in.ToolName] {
+		p, pattern := in.ToolInput.Path, ""
+		switch in.ToolName {
+		case "Read":
+			p = in.ToolInput.FilePath
+		case "Glob":
+			pattern = in.ToolInput.Pattern
+		}
+		return CheckFileRead(in.ToolName, p, pattern, cfg), nil
 	}
 	if fileTools[in.ToolName] {
 		p := in.ToolInput.FilePath
@@ -288,7 +314,7 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
