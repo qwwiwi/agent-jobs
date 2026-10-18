@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,7 @@ func LimitsText(j *store.Job) string {
 // DoneLine is the one line delivered to the agent's live session.
 // A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
+// An owner-waits job ends the line with OwnerWaitsMarker.
 func DoneLine(j *store.Job) string {
 	cost := CostText(j.CostUSD, j.CostIsUnknown())
 	if j.CostIsUnknown() {
@@ -86,6 +88,9 @@ func DoneLine(j *store.Job) string {
 			line += ", fresh session"
 		}
 		line += ")"
+	}
+	if j.OwnerWaits {
+		line += " · " + OwnerWaitsMarker
 	}
 	return line
 }
@@ -118,6 +123,11 @@ func (m *Manager) notifyPending() error {
 	if t == "" {
 		for _, j := range jobs {
 			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j))
+			if j.OwnerWaits {
+				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
+					return err
+				}
+			}
 			if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 				return err
 			}
@@ -125,6 +135,13 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	for _, j := range jobs {
+		// An owner-waits job's pending record exists before its line can reach the session, so an
+		// owner_replied right after the line (before the mark below) has a record to clear.
+		if j.OwnerWaits {
+			if err := m.Store.BeginOwnerPending(j.ID, store.OwnerDelivering, m.Now()); err != nil {
+				return err
+			}
+		}
 		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
 			if errors.Is(err, errTmuxTimeout) {
@@ -134,12 +151,19 @@ func (m *Manager) notifyPending() error {
 			}
 			continue
 		}
+		if afterDoneLineSent != nil {
+			afterDoneLineSent(j)
+		}
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// afterDoneLineSent, when set (tests only), runs after tmux accepted a job-done line and before the
+// job is marked notified: the gap where the session may already act on the line.
+var afterDoneLineSent func(j *store.Job)
 
 // sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
 // on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its
@@ -171,18 +195,26 @@ func tmuxArgEscape(s string) string {
 // runTmux runs one tmux command within ctx, in a process group of its own that is killed when ctx
 // ends (WaitDelay bounds the wait for pipes a straggler may hold open).
 func (m *Manager) runTmux(ctx context.Context, args ...string) error {
+	_, err := m.runTmuxOutput(ctx, args...)
+	return err
+}
+
+// runTmuxOutput is runTmux that returns the command's stdout.
+func (m *Manager) runTmuxOutput(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, m.Cfg.tmuxBin(), m.Cfg.tmuxArgs(args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
 	if err == nil {
-		return nil
+		return stdout.String(), nil
 	}
 	if ctx.Err() != nil {
-		return fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
+		return "", fmt.Errorf("%w (%v)", errTmuxTimeout, ctx.Err())
 	}
-	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()+stdout.String()))
 }
 
 func (m *Manager) cleanupDue() error {
