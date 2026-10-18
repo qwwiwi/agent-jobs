@@ -161,9 +161,9 @@ Each was checked with `grep -n -i` for its key terms in `docs/DEVIATIONS.md`; no
 
 Heartbeat (REFERENCE.md 106), listed here before, is built since (Wave D, `internal/jobs/heartbeat.go`, `internal/store/heartbeats.go`, off by default); its only difference from the reference is the model, deviation #1. See the Schedules table above.
 
-### Rows listed but still «owner OK pending»
+### Rows that were «owner OK pending»
 
-DEVIATIONS #4 (job-role `notify_owner`), #9 (guard additions) and #10 (extra patches) say «owner OK pending». They are listed, so not findings of this check, but they are not approved yet. Since 2026-10-18 also #17 (`schedule_set`, `check_*` part; `job_stats` is approved), #23 (state reads), #25 (owner-waits release) and #26 (idle-after-result), whose behaviour no DECISIONS.md row names.
+DEVIATIONS #4, #9, #10, #17, #23, #25 and #26 were approved by the owner on 2026-10-18 (DECISIONS.md, Telegram msg 64585). No listed row is pending now.
 
 ### PLAN.md / PLAN.ru.md status lines that did not match main (fixed in this commit)
 
