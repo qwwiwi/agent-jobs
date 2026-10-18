@@ -68,6 +68,9 @@ type JobView struct {
 	SessionID   string `json:"session_id,omitempty"`
 	Attempt     int    `json:"attempt"`
 	RunMode     string `json:"run_mode,omitempty"`
+	// SizeWarning (job_start only): the brief names many files or has many "## " headings, so it may
+	// be more than one job.
+	SizeWarning string `json:"size_warning,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -161,7 +164,9 @@ func addJobStart(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
 		}
-		return nil, view(d.Manager, j), nil
+		v := view(d.Manager, j)
+		v.SizeWarning = d.Manager.Cfg.BriefSizeWarning(in.Brief)
+		return nil, v, nil
 	})
 }
 
@@ -193,7 +198,13 @@ type JobResultOutput struct {
 	// CostUnknown: the job's cost was never reported (a codex job, a killed attempt).
 	CostUnknown bool   `json:"cost_unknown"`
 	Error       string `json:"error,omitempty"`
-	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain).
+	// NotDone is the report's "Not done / uncertain" section, read first.
+	NotDone string `json:"not_done,omitempty"`
+	// Progress is the report's "Progress" section (timestamped one-line steps), shown after NotDone;
+	// empty when the report has none (not an error).
+	Progress string `json:"progress,omitempty"`
+	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Progress),
+	// secret-looking values redacted.
 	Report          string   `json:"report,omitempty"`
 	ReportMissing   bool     `json:"report_missing,omitempty"`
 	ReportTruncated bool     `json:"report_truncated,omitempty"`
@@ -207,7 +218,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_result",
 		Description: "The report of a finished job (report.md) with its job-done line and the paths of what it changed " +
-			"(patches, diffstat, logs). Read \"Not done / uncertain\" first; the report is a claim, check the diff. " +
+			"(patches, diffstat, logs). Read \"Not done / uncertain\" first (not_done), then the job's steps (progress); " +
+			"the report is a claim, check the diff. Secret-looking values are shown as [redacted:<kind>]. " +
 			"For a queued or running job it returns the status only.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobIDInput) (*sdk.CallToolResult, JobResultOutput, error) {
 		m := d.Manager
@@ -215,7 +227,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, JobResultOutput{}, err
 		}
-		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: j.Error,
+		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: jobs.RedactText(j.Error),
 			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
@@ -242,7 +254,11 @@ func addJobResult(s *sdk.Server, d Deps) {
 		case err != nil:
 			return nil, JobResultOutput{}, fmt.Errorf("read report: %w", err)
 		default:
-			out.Report, out.ReportTruncated = report, truncated
+			// Always redacted on the fly: the report of a job whose in-place redaction is still pending
+			// (or of a running job) may hold raw secrets.
+			out.Report, out.ReportTruncated = jobs.RedactRead(report, truncated), truncated
+			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress)
+			out.NotDone, out.Progress = secs[0], secs[1]
 			if truncated {
 				out.Note = fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md"))
 			}

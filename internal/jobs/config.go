@@ -100,6 +100,16 @@ type Config struct {
 	DailyHour *int `json:"daily_hour"`
 	// DailyOff turns the daily automation off (prune and doctor procs then run only by hand).
 	DailyOff bool `json:"daily_off"`
+	// KeepRawReports keeps the unredacted report of a job as report.raw.md (0600) next to the redacted
+	// report.md. Off by default: secret-looking values are replaced in place and the original is gone.
+	KeepRawReports bool `json:"keep_raw_reports"`
+	// MaxBriefBytes is the largest brief job_start accepts. 0 = DefaultMaxBriefBytes (32 KB).
+	MaxBriefBytes int `json:"max_brief_bytes"`
+	// BriefWarnFiles: a brief naming more files than this gets a size_warning. 0 = DefaultBriefWarnFiles (40).
+	BriefWarnFiles int `json:"brief_warn_files"`
+	// BriefWarnHeadings: a brief with more "## " headings than this gets a size_warning (it likely asks
+	// for more than one deliverable). 0 = DefaultBriefWarnHeadings (8).
+	BriefWarnHeadings int `json:"brief_warn_headings"`
 	// OwnerWaitsMaxHours is how long an «owner reply pending» record of an owner-waits job may hold
 	// the orchestrator's Stop hook before it expires on its own. 0 = DefaultOwnerWaitsMaxHours (6).
 	OwnerWaitsMaxHours int `json:"owner_waits_max_hours"`
@@ -307,6 +317,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
+	}
+	if c.MaxBriefBytes < 0 || c.BriefWarnFiles < 0 || c.BriefWarnHeadings < 0 {
+		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)

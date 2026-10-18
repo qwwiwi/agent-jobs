@@ -142,16 +142,21 @@ A model or a complexity is mandatory: with neither the job is rejected. There is
 
 ## Report contract
 
-A job's final message is its report, saved verbatim as `report.md`. Exactly four sections, in this order:
+A job's final message is its report, saved as `report.md`. Exactly four sections, in this order, then a Progress section:
 
 ```
 ## Summary
 ## Findings / Changes
 ## Evidence
 ## Not done / uncertain
+## Progress
 ```
 
-The last section is mandatory and is read first: it makes the job name what it did not do. A job that ends without a report is marked `failed`.
+«Not done / uncertain» is mandatory and is read first: it makes the job name what it did not do. Progress lists the job's steps, one timestamped line each (`- HH:MM UTC …`); `job_result` returns both sections as `not_done` and `progress`, and `agent-jobs result` prints them before the rest. A report without Progress is not an error. A job that ends without a report is marked `failed`.
+
+**Secret redaction.** When a job ends, secret-looking values in its `report.md` are replaced in place with `[redacted:<kind>]`: Anthropic, OpenAI, GitHub, Slack, AWS, Google and Telegram bot tokens, JWTs, PEM private key blocks, `Bearer <token>`, and `key=value` / `"key": "value"` where the key contains `token`, `secret`, `password`, `passwd` or `api_key` and the value is 16+ characters. The original is gone unless `keep_raw_reports: true` keeps it as `report.raw.md` (0600). Values are replaced whole however long they are. Only the first 4 MiB of a report is read and scanned; the rest is replaced by an «unscanned» note. If the rewrite fails (or the daemon dies before it), the job stays `redaction_pending` and every tick retries; `job_result`, `agent-jobs result` and the HTTP API redact the report on the fly anyway. The job-done line, the daemon log, the stats row and the previous-attempt excerpts in a resumed brief are redacted the same way. Git SHAs, UUIDs and short base64 stay. It is a safety net, not a guarantee: `stream.jsonl` and `stderr.log` are kept raw (and archived raw), so the job folder and the archive stay private.
+
+**Brief size.** `job_start` refuses a brief above `max_brief_bytes` (default 32 KB) and returns a `size_warning` when the brief names more than `brief_warn_files` files (default 40) or has more than `brief_warn_headings` `## ` headings (default 8): it may be more than one job.
 
 ## Cleanup and patches
 
@@ -408,6 +413,8 @@ Optional `~/.agent-jobs/my-agent/config.json`:
 - `git_name` / `git_email`: the job's git identity; a job cannot override it.
 - `daily_hour`: local hour (0..23, default 4) after which the daemon runs `prune` and `doctor procs` (report only) once a day; `daily_off: true` turns that off. `agent-jobs status --agent A` (no id) shows the last run.
 - `log_archive_dir`: absolute path of the log archive (default `<state>/archive`); `log_archive_days`: how long archived months are kept (default 365, 0 = forever).
+- `keep_raw_reports`: keep the unredacted report as `report.raw.md` (0600) next to the redacted `report.md` (default false).
+- `max_brief_bytes`: largest brief `job_start` accepts (default 32768); `brief_warn_files` (default 40) and `brief_warn_headings` (default 8): above these a queued job gets a `size_warning`.
 - `brain`: the shared brain behind the memory, task and team tools and the memory notes of a brief (see «Shared brain» below). Absent = not configured.
 - `cgroup_scope`: `auto` (default: a transient systemd user scope per job when `systemd-run --user` works, else the weaker session containment), `required` (refuse jobs that cannot get a scope), `off`.
 - `skill_roots`: absolute directories of skill catalogs for jobs, each holding an `index.json` (see «Skills for jobs» below); earlier roots win a duplicate name; a missing or invalid root is a warning in `status` and `system_doctor`, never fatal. `skills_max_per_job` (default 6, at most 8) and `skills_max_kb` (default 400) cap one job's skills.

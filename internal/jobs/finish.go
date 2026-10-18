@@ -75,7 +75,7 @@ func DoneLine(j *store.Job) string {
 		cost = "cost " + cost
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
-		Printable(j.ID, 64), Printable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
+		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
 	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
 		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
 	}
@@ -92,7 +92,7 @@ func DoneLine(j *store.Job) string {
 	if j.OwnerWaits {
 		line += " · " + OwnerWaitsMarker
 	}
-	return line
+	return RedactText(line) // the title and the error come from the brief and the job
 }
 
 // Containment says how a launched job's processes were contained: "scope <unit>" (its own systemd user
@@ -143,7 +143,7 @@ func (m *Manager) notifyPending() error {
 			}
 		}
 		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
-			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
+			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {
 				// A stalled tmux (or lock holder) would cost every other line the same wait: the
 				// rest are retried next tick, the tick goes on.
@@ -231,7 +231,7 @@ func (m *Manager) cleanupDue() error {
 			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
 		if err := m.Cleanup(j); err != nil {
-			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %v", j.ID, err)
+			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", j.ID, RedactText(err.Error()))
 			continue
 		}
 		if err := m.Store.MarkCleaned(j.ID, now); err != nil {

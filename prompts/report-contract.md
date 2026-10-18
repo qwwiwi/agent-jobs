@@ -2,7 +2,7 @@
 
 Your FINAL message is the report. It is saved verbatim as `report.md`; a job that ends without it is marked failed. It is a claim, not a result: the orchestrator will verify it.
 
-Use exactly these four sections, in this order:
+Use exactly these four sections, in this order, then a Progress section:
 
 ```
 ## Summary
@@ -16,6 +16,9 @@ Use exactly these four sections, in this order:
 
 ## Not done / uncertain
 <what you did not do, could not verify, or are unsure about; write "nothing" only if truly nothing>
+
+## Progress
+<one line per step you took, oldest first: "- HH:MM UTC <what you did>"; take the time from `date -u +%H:%M`, or write "--:--" when you do not know it>
 ```
 
-The last section is mandatory and is read first.
+"Not done / uncertain" is mandatory and is read first. Progress is read after it: keep each step to one line.

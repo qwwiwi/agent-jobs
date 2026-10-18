@@ -328,3 +328,75 @@ func TestRequeueOfNeverRunAttemptSkipsArchive(t *testing.T) {
 		t.Fatalf("digest: %+v", j)
 	}
 }
+
+// A database from before redaction_pending: every job that existed then is marked pending (queued
+// and running ones write their report later, finished ones were never redacted by this build), once.
+func TestRedactionPendingMigrationBackfill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1770000000, 0)
+	statuses := map[string]string{"q": StatusQueued, "r": StatusRunning, "done": StatusSucceeded, "stop": StatusStopped}
+	for id, st := range statuses {
+		j := &Job{ID: id, Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: st, Model: "opus", CreatedAt: now}
+		if err := s.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pre-migration fixture: the same database without the column.
+	if _, err := s.db.Exec(`ALTER TABLE jobs DROP COLUMN redaction_pending`); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	for id := range statuses {
+		var p int
+		if err := s.db.QueryRow(`SELECT redaction_pending FROM jobs WHERE id=?`, id).Scan(&p); err != nil || p != 1 {
+			t.Errorf("%s: redaction_pending %d %v, want 1", id, p, err)
+		}
+	}
+	ids, err := s.RedactionPending()
+	if slices.Sort(ids); err != nil || !slices.Equal(ids, []string{"done", "stop"}) {
+		t.Fatalf("pending: %v %v", ids, err)
+	}
+	// Once only: a later Open keeps a cleared mark.
+	if err := s.ClearRedactionPending("done"); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if ids, _ := s.RedactionPending(); !slices.Equal(ids, []string{"stop"}) {
+		t.Fatalf("pending after a second open: %v", ids)
+	}
+}
+
+// Finish persists the pending mark with the terminal status, before any redaction is tried: a running
+// row whose mark was never set (claimed by an older build) is still redacted.
+func TestFinishMarksRedactionPending(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Unix(1770000000, 0)
+	j := &Job{ID: "r", Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: StatusRunning, Model: "opus", CreatedAt: now}
+	if err := s.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE jobs SET redaction_pending=0, launch_token='tok' WHERE id='r'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish("r", "tok", StatusFailed, 1, 0, 1, "x", now); err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := s.RedactionPending(); err != nil || !slices.Equal(ids, []string{"r"}) {
+		t.Fatalf("pending after finish: %v %v", ids, err)
+	}
+}
