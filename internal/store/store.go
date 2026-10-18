@@ -235,6 +235,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner pending: %w", err)
 	}
+	for _, alter := range ownerPendingMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: owner pending: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 

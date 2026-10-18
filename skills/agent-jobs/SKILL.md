@@ -97,7 +97,7 @@ A job (or you, with `notify_owner`) can ask for the owner's attention. agent-job
 
 ## The owner waits: `owner_waits` and `owner_replied`
 
-When the owner asked for the work, start the job with `owner_waits: true`. Its job-done line then ends with `· owner waits`: read the report, write the result to the owner over your own channel, then call `owner_replied` (with the job id, or without one for all). Until then the Stop hook (`agent-jobs hook stop`, if registered in this session's settings) blocks the end of your turn once with a reminder. A pending record expires on its own after `owner_waits_max_hours` (default 6); `system_doctor` lists pending ones (`owner_reply_pending`).
+When the owner asked for the work, start the job with `owner_waits: true`. Its job-done line then ends with `· owner waits`: read the report, write the result to the owner over your own channel, then call `owner_replied` (with the job id, or without one for all). Until then the Stop hook (`agent-jobs hook stop`, if registered in this session's settings together with `agent-jobs hook bind` in SessionStart, which binds this session) blocks the end of your turn once with a reminder; other sessions are never held. You may call `owner_replied` as soon as you have written to the owner, even before the job-done line arrives. With notify off no line arrives at all: the reminder says so, check the job with `job_status`. A pending record expires on its own after `owner_waits_max_hours` (default 6); `system_doctor` lists pending ones (`owner_reply_pending`).
 
 ## Job context
 

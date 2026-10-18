@@ -50,6 +50,16 @@ func TestOwnerRepliedTool(t *testing.T) {
 	if len(doc.OwnerPending) != 2 || slices.ContainsFunc(doc.Problems, func(p string) bool { return strings.Contains(p, "owner repl") }) {
 		t.Fatalf("doctor: %+v %v", doc.OwnerPending, doc.Problems)
 	}
+	if doc.OwnerHookSession != "" {
+		t.Fatalf("no session bound yet: %q", doc.OwnerHookSession)
+	}
+	if err := m.BindHookSession("orch-1"); err != nil {
+		t.Fatal(err)
+	}
+	call(t, cs, "system_doctor", map[string]any{}, &doc)
+	if doc.OwnerHookSession != "orch-1" {
+		t.Fatalf("bound session: %q", doc.OwnerHookSession)
+	}
 
 	var out OwnerRepliedOutput
 	call(t, cs, "owner_replied", map[string]any{"job_id": a.ID}, &out)

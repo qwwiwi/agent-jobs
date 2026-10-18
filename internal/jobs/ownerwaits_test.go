@@ -80,8 +80,17 @@ func TestOwnerWaitsPendingOnDelivery(t *testing.T) {
 		t.Fatalf("owner_replied all with none: %v %v", cleared, err)
 	}
 
-	// Max age: a record older than owner_waits_max_hours expires on the next look.
+	// A cleared record stays cleared when the same attempt's line is marked again.
 	if err := m.Store.MarkNotified(w.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if list, _, _ := m.OwnerPending(); len(list) != 0 {
+		t.Fatalf("a cleared record came back: %+v", list)
+	}
+
+	// Max age: a record older than owner_waits_max_hours expires on the next look.
+	w2 := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	if err := m.Store.MarkNotified(w2.ID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	m.Cfg.OwnerWaitsMaxHours = 2
@@ -122,14 +131,14 @@ func TestStopHookDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := StopHookDecision(in, pending)
-	if out == nil || out.Decision != "block" || !strings.Contains(out.Reason, "job j1 «the[2J report» (succeeded)") ||
+	if out == nil || out.Decision != "block" || !strings.Contains(out.Reason, "job j1 «the[2J report» (succeeded; its job-done line arrived)") ||
 		!strings.Contains(out.Reason, "owner_replied") || hasControl(out.Reason) {
 		t.Fatalf("block: %+v", out)
 	}
 	if out := StopHookDecision(in, nil); out != nil {
 		t.Fatalf("nothing pending must allow: %+v", out)
 	}
-	active, err := ParseStopHookInput(strings.NewReader(`{"hook_event_name":"Stop","stop_hook_active":true}`))
+	active, err := ParseStopHookInput(strings.NewReader(`{"session_id":"s","hook_event_name":"Stop","stop_hook_active":true}`))
 	if err != nil || !StopHookSkips(active) {
 		t.Fatalf("stop_hook_active: %+v %v", active, err)
 	}
@@ -139,13 +148,120 @@ func TestStopHookDecision(t *testing.T) {
 	if out := StopHookDecision(StopHookInput{HookEventName: "SubagentStop"}, pending); out != nil {
 		t.Fatalf("another event must allow: %+v", out)
 	}
-	if in, err := ParseStopHookInput(strings.NewReader("")); err != nil || StopHookDecision(in, pending) == nil {
-		t.Fatalf("empty input blocks while pending: %v", err)
-	}
 	if _, err := ParseStopHookInput(strings.NewReader("{not json")); err == nil {
 		t.Fatal("bad JSON must be an error")
 	}
 	if _, err := ParseStopHookInput(strings.NewReader(strings.Repeat(" ", MaxHookInputBytes+1))); err == nil {
 		t.Fatal("oversized input must be an error")
+	}
+}
+
+// Incomplete or invalid hook input is an error (the hook then allows the stop), never an inactive
+// Stop event: a missing stop_hook_active is not false, a missing session_id cannot match the bound
+// session. Another event needs only its name.
+func TestStopHookInputValidation(t *testing.T) {
+	for _, bad := range []string{
+		"", "  \n", "null", "{}", "[]", `"Stop"`, "{not json",
+		`{"session_id":"s","stop_hook_active":false}`,
+		`{"hook_event_name":"","session_id":"s","stop_hook_active":false}`,
+		`{"hook_event_name":"Stop","stop_hook_active":false}`,
+		`{"hook_event_name":"Stop","session_id":"","stop_hook_active":false}`,
+		`{"hook_event_name":"Stop","session_id":"s"}`,
+		`{"hook_event_name":"Stop","session_id":"s","stop_hook_active":null}`,
+		`{"hook_event_name":"Stop","session_id":"s","stop_hook_active":"false"}`,
+		`{"hook_event_name":"Stop","session_id":1,"stop_hook_active":false}`,
+	} {
+		if in, err := ParseStopHookInput(strings.NewReader(bad)); err == nil {
+			t.Fatalf("%q must be an error, got %+v", bad, in)
+		}
+	}
+	in, err := ParseStopHookInput(strings.NewReader(`{"hook_event_name":"SubagentStop"}`))
+	if err != nil || !StopHookSkips(in) {
+		t.Fatalf("another event: %+v %v", in, err)
+	}
+	in, err = ParseStopHookInput(strings.NewReader(`{"session_id":"s","hook_event_name":"Stop","stop_hook_active":false,"transcript_path":"/x"}`))
+	if err != nil || StopHookSkips(in) || in.SessionID != "s" {
+		t.Fatalf("complete Stop event: %+v %v", in, err)
+	}
+}
+
+// The pending record exists before the job-done line reaches the session: a Stop hook in the gap
+// between delivery and the notified mark already blocks, and an owner_replied in that gap clears the
+// record for good (the mark does not bring it back).
+func TestOwnerRepliedInDeliveryGap(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	w := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	if err := m.Cancel(w.ID); err != nil {
+		t.Fatal(err)
+	}
+	var gapPending []*store.OwnerPending
+	var gapCleared []string
+	var gapErr error
+	afterDoneLineSent = func(j *store.Job) {
+		gapPending, _, _ = m.OwnerPending()
+		gapCleared, gapErr = m.OwnerReplied(j.ID)
+	}
+	t.Cleanup(func() { afterDoneLineSent = nil })
+	if err := m.notifyPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(gapPending) != 1 || gapPending[0].JobID != w.ID {
+		t.Fatalf("in the gap the record must already be pending: %+v", gapPending)
+	}
+	if gapErr != nil || len(gapCleared) != 1 || gapCleared[0] != w.ID {
+		t.Fatalf("owner_replied in the gap: %v %v", gapCleared, gapErr)
+	}
+	if list, _, _ := m.OwnerPending(); len(list) != 0 {
+		t.Fatalf("the reply in the gap was lost, still pending: %+v", list)
+	}
+	if j, _ := m.Store.Get(w.ID); j.NotifiedAt == nil {
+		t.Fatal("the job is not marked notified")
+	}
+}
+
+// owner_replied with the id of a finished owner-waits job whose line is not out yet acknowledges it:
+// the later line records nothing pending.
+func TestOwnerRepliedBeforeDelivery(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	w := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	queued := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	if _, err := m.OwnerReplied(queued.ID); err == nil {
+		t.Fatal("owner_replied on an unfinished job must be an error")
+	}
+	if err := m.Cancel(w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if cleared, err := m.OwnerReplied(w.ID); err != nil || len(cleared) != 1 {
+		t.Fatalf("owner_replied before the line: %v %v", cleared, err)
+	}
+	if err := m.notifyPending(); err != nil {
+		t.Fatal(err)
+	}
+	if list, _, _ := m.OwnerPending(); len(list) != 0 {
+		t.Fatalf("pending after an early reply: %+v", list)
+	}
+}
+
+// With notify off (no notify_tmux_target) the job still records the pending reply, and the hook's
+// reason does not claim a job-done line arrived.
+func TestOwnerWaitsNotifyOffReason(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.NotifyTmuxTarget = ""
+	w := enqueue(t, m, "brief", func(r *StartRequest) { r.OwnerWaits = true })
+	if err := m.Cancel(w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.notifyPending(); err != nil {
+		t.Fatal(err)
+	}
+	list, _, err := m.OwnerPending()
+	if err != nil || len(list) != 1 {
+		t.Fatalf("pending with notify off: %+v %v", list, err)
+	}
+	out := StopHookDecision(StopHookInput{HookEventName: "Stop", SessionID: "s"}, list)
+	if out == nil || strings.Contains(out.Reason, "arrived") || !strings.Contains(out.Reason, "notify is off") {
+		t.Fatalf("notify-off reason: %+v", out)
 	}
 }

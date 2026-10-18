@@ -122,6 +122,11 @@ func (m *Manager) notifyPending() error {
 	if t == "" {
 		for _, j := range jobs {
 			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j))
+			if j.OwnerWaits {
+				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
+					return err
+				}
+			}
 			if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 				return err
 			}
@@ -129,6 +134,13 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	for _, j := range jobs {
+		// An owner-waits job's pending record exists before its line can reach the session, so an
+		// owner_replied right after the line (before the mark below) has a record to clear.
+		if j.OwnerWaits {
+			if err := m.Store.BeginOwnerPending(j.ID, store.OwnerDelivering, m.Now()); err != nil {
+				return err
+			}
+		}
 		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
 			if errors.Is(err, errTmuxTimeout) {
@@ -138,12 +150,19 @@ func (m *Manager) notifyPending() error {
 			}
 			continue
 		}
+		if afterDoneLineSent != nil {
+			afterDoneLineSent(j)
+		}
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// afterDoneLineSent, when set (tests only), runs after tmux accepted a job-done line and before the
+// job is marked notified: the gap where the session may already act on the line.
+var afterDoneLineSent func(j *store.Job)
 
 // sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
 // on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its

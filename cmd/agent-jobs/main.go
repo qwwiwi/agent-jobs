@@ -77,7 +77,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            for the session to relay (rate limited, stored)
   hook stop  --agent A                     Stop hook of the orchestrator session (JSON on stdin):
                                            blocks the stop once per turn while an owner-waits job's
-                                           reply to the owner is pending (owner_replied clears it)
+                                           reply to the owner is pending (owner_replied clears it);
+                                           holds only the session bound by hook bind
+  hook bind  --agent A                     SessionStart hook of the orchestrator session (JSON on
+                                           stdin): binds it as the session the Stop hook holds
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
@@ -541,7 +544,8 @@ func printUndelivered(m *jobs.Manager) error {
 }
 
 // printOwnerPending is the very end of `status` without a job id: owner-waits jobs whose result the
-// owner has not been told yet (they hold the Stop hook until owner_replied or they expire).
+// owner has not been told yet (they hold the Stop hook until owner_replied or they expire), and the
+// orchestrator session the Stop hook holds.
 func printOwnerPending(m *jobs.Manager) error {
 	list, _, err := m.OwnerPending()
 	if err != nil {
@@ -549,12 +553,22 @@ func printOwnerPending(m *jobs.Manager) error {
 	}
 	if len(list) == 0 {
 		fmt.Println("owner:     no owner replies pending")
+	} else {
+		fmt.Printf("owner:     %d owner replies pending (expire after %s; owner_replied clears them)\n", len(list), m.Cfg.OwnerWaitsMaxAge())
+		for _, p := range list {
+			fmt.Printf("  job %s %s, line %s, since %s: %s\n", p.JobID, p.Status, p.State, fmtTime(&p.CreatedAt),
+				jobs.Printable(p.Title, jobs.MaxTitleRunes))
+		}
+	}
+	session, at, err := m.Store.HookSession()
+	if err != nil {
+		return err
+	}
+	if session == "" {
+		fmt.Println("hook:      no orchestrator session bound (hook bind not run): the Stop hook holds no session")
 		return nil
 	}
-	fmt.Printf("owner:     %d owner replies pending (expire after %s; owner_replied clears them)\n", len(list), m.Cfg.OwnerWaitsMaxAge())
-	for _, p := range list {
-		fmt.Printf("  job %s %s since %s: %s\n", p.JobID, p.Status, fmtTime(&p.CreatedAt), jobs.Printable(p.Title, jobs.MaxTitleRunes))
-	}
+	fmt.Printf("hook:      the Stop hook holds session %s (bound %s)\n", jobs.Printable(session, 64), fmtTime(&at))
 	return nil
 }
 
@@ -1252,18 +1266,31 @@ func cmdDoctor(args []string) error {
 	return nil
 }
 
-// runHook serves `hook stop --agent A`, the Stop hook of the orchestrator session: it reads the
-// Claude Code hook JSON on stdin and prints the block decision while an owner reply is pending. It
-// fails open: any error allows the stop with exit 1 (a non-blocking hook error; exit 2 would block).
+// runHook serves the hooks of the orchestrator session (Claude Code hook JSON on stdin):
+//
+//	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds
+//	hook stop --agent A   Stop hook: prints the block decision while an owner reply is pending, for
+//	                      the bound session only
+//
+// Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
+// output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding.
 func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
 	fail := func(err error) int {
-		fmt.Fprintln(stderr, "agent-jobs hook stop:", err, "(the stop is allowed)")
+		if sub == "bind" {
+			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no session bound)")
+		} else {
+			fmt.Fprintln(stderr, "agent-jobs hook stop:", err, "(the stop is allowed)")
+		}
 		return 1
 	}
-	if len(args) == 0 || args[0] != "stop" {
-		return fail(errors.New("usage: agent-jobs hook stop --agent A (Claude Code Stop hook, JSON on stdin)"))
+	if sub != "stop" && sub != "bind" {
+		return fail(errors.New("usage: agent-jobs hook stop|bind --agent A (Claude Code Stop / SessionStart hook, JSON on stdin)"))
 	}
-	fs := flag.NewFlagSet("hook stop", flag.ContinueOnError)
+	fs := flag.NewFlagSet("hook "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args[1:])
@@ -1272,6 +1299,22 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	}
 	if len(pos) > 0 {
 		return fail(errors.New("no positional arguments"))
+	}
+	if sub == "bind" {
+		session, err := jobs.ParseSessionStartInput(stdin)
+		if err != nil {
+			return fail(err)
+		}
+		m, err := opener(*agent)
+		if err != nil {
+			return fail(err)
+		}
+		defer m.Close()
+		// Nothing on stdout: a SessionStart hook's stdout becomes session context.
+		if err := m.BindHookSession(session); err != nil {
+			return fail(err)
+		}
+		return 0
 	}
 	in, err := jobs.ParseStopHookInput(stdin)
 	if err != nil {
@@ -1285,6 +1328,12 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return fail(err)
 	}
 	defer m.Close()
+	if holds, err := m.StopHookHolds(in.SessionID); err != nil || !holds {
+		if err != nil {
+			return fail(err)
+		}
+		return 0
+	}
 	pending, _, err := m.OwnerPending()
 	if err != nil {
 		return fail(err)
