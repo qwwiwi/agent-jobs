@@ -228,6 +228,16 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: schedules: %w", err)
 	}
+	if _, err := db.Exec(checksSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: checks: %w", err)
+	}
+	for _, alter := range checksMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: checks: %w", err)
+		}
+	}
 	if _, err := db.Exec(notificationsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
@@ -333,6 +343,8 @@ var migrationBackfills = map[string]string{
 	// and died before the rewrite). All are marked; redaction is idempotent, and a job without a
 	// regular report.md is just cleared on the next tick.
 	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`: `UPDATE jobs SET redaction_pending=1`,
+	checksAlertStateAlter: checksAlertStateFill,
+	checksAlertsMoved:     checksAlertsFill,
 }
 
 // migrate runs one migration and its backfill, if any, in one transaction; a column that is already
