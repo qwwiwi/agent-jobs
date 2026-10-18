@@ -175,7 +175,7 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		if slices.ContainsFunc(pj.Archived, func(a PruneEntry) bool { return a.Path == p }) {
 			continue // dry run: listed as moved to the archive
 		}
-		if archiveFailed && (slices.Contains(archiveGzip, name) || slices.Contains(archiveCopy, name)) {
+		if archiveFailed && (slices.Contains(archiveGzip, name) || slices.Contains(archiveCopy, name) || name == attemptsDir) {
 			pj.Kept = append(pj.Kept, name)
 			continue
 		}

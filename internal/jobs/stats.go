@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -202,18 +203,40 @@ func ParseStreamStats(r io.Reader) (StreamStats, error) {
 // streamSource opens a job's stream: <jobdir>/stream.jsonl, else the archived stream.jsonl.gz.
 // Files are opened without following links. src is "job_dir", "archive" or "none" (nil reader).
 func (m *Manager) streamSource(j *store.Job) (rc io.ReadCloser, src string, err error) {
-	f, ok, err := openRegular(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
-	if err != nil {
-		return nil, "", err
+	return m.openStream(j, "")
+}
+
+// openStream opens the stream of the current attempt (attempt "") or of the earlier attempt
+// attempts/<attempt>/ (resumed jobs): in the job folder, else gzipped in the archive.
+func (m *Manager) openStream(j *store.Job, attempt string) (rc io.ReadCloser, src string, err error) {
+	rel := "stream.jsonl"
+	if attempt != "" {
+		if ok, err := realDir(filepath.Join(m.JobDir(j.ID), attemptsDir, attempt), false); err == nil && ok {
+			rel = filepath.Join(attemptsDir, attempt, rel)
+		} else {
+			rel = "" // not in the job folder (pruned): only the archive may have it
+		}
 	}
-	if ok {
-		return f, "job_dir", nil
+	if rel != "" {
+		f, ok, err := openRegular(filepath.Join(m.JobDir(j.ID), rel))
+		if err != nil {
+			return nil, "", err
+		}
+		if ok {
+			return f, "job_dir", nil
+		}
 	}
 	adir := m.archiveJobDir(j)
 	if real, err := realDir(adir, false); err != nil || !real {
 		return nil, "none", err
 	}
-	f, ok, err = openRegular(filepath.Join(adir, "stream.jsonl.gz"))
+	if attempt != "" {
+		adir = filepath.Join(adir, attemptsDir, attempt)
+		if real, err := realDir(adir, false); err != nil || !real {
+			return nil, "none", err
+		}
+	}
+	f, ok, err := openRegular(filepath.Join(adir, "stream.jsonl.gz"))
 	if err != nil || !ok {
 		return nil, "none", err
 	}
@@ -242,8 +265,38 @@ func (m *Manager) hasReport(j *store.Job) bool {
 	return false
 }
 
+// attemptNumbers lists the earlier attempts kept under root/attempts/<n>/ (real directories only,
+// canonical decimal names), ascending.
+func attemptNumbers(root string) []string {
+	ad := filepath.Join(root, attemptsDir)
+	if fi, err := os.Lstat(ad); err != nil || !fi.IsDir() {
+		return nil
+	}
+	ents, err := os.ReadDir(ad)
+	if err != nil {
+		return nil
+	}
+	var ns []int
+	for _, e := range ents {
+		n, err := strconv.Atoi(e.Name())
+		if err != nil || n < 1 || strconv.Itoa(n) != e.Name() || !e.IsDir() {
+			continue
+		}
+		ns = append(ns, n)
+	}
+	slices.Sort(ns)
+	out := make([]string, len(ns))
+	for i, n := range ns {
+		out[i] = strconv.Itoa(n)
+	}
+	return out
+}
+
 // RecordStats computes the stats row of a terminal job from its row and its stream (job folder or
-// archive) and writes it. The caller holds the lifecycle lock (finish, cancel, prune, backfill).
+// archive) and writes it. The caller holds the lifecycle lock (finish, cancel, stop, prune, backfill).
+// A resumed job keeps one row: it is rewritten at the end of every attempt (a stop included) with the
+// totals of all attempts so far (the attempts table plus the row; the streams of attempts/<n>/ plus the
+// current one), so a resume never counts an attempt twice.
 func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if !finished(j.Status) {
 		return nil, fmt.Errorf("job %s is %s, not finished", j.ID, j.Status)
@@ -257,19 +310,59 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)
 	}
-	rc, src, err := m.streamSource(j)
+	earlier, err := m.Store.Attempts(j.ID)
 	if err != nil {
 		return nil, err
 	}
-	st.Source = src
-	if rc != nil {
+	for _, a := range earlier {
+		st.Turns += a.Turns
+		st.CostUSD += a.CostUSD
+		st.DurationSec += a.DurationSec
+	}
+	if len(earlier) > 0 && earlier[0].StartedAt != nil {
+		st.StartedAt = earlier[0].StartedAt
+	}
+	add := func(attempt string) error {
+		rc, src, err := m.openStream(j, attempt)
+		if err != nil {
+			return err
+		}
+		if attempt == "" {
+			st.Source = src
+		}
+		if rc == nil {
+			return nil
+		}
 		ss, err := ParseStreamStats(rc)
 		_ = rc.Close()
 		if err != nil {
-			return nil, fmt.Errorf("parse stream of %s: %w", j.ID, err)
+			return fmt.Errorf("parse stream of %s: %w", j.ID, err)
 		}
-		st.ToolCalls, st.Skills, st.GuardRefusals, st.GuardRules = ss.ToolCalls, ss.Skills, ss.GuardRefusals, ss.GuardRules
-		st.Subagents, st.ResultSubtype = ss.Subagents, ss.ResultSubtype
+		for k, v := range ss.ToolCalls {
+			st.ToolCalls[k] += v
+		}
+		for k, v := range ss.Skills {
+			st.Skills[k] += v
+		}
+		for k, v := range ss.GuardRules {
+			st.GuardRules[k] += v
+		}
+		st.GuardRefusals += ss.GuardRefusals
+		st.Subagents += ss.Subagents
+		if attempt == "" {
+			st.ResultSubtype = ss.ResultSubtype
+		}
+		return nil
+	}
+	if err := add(""); err != nil {
+		return nil, err
+	}
+	attempts := append(attemptNumbers(m.JobDir(j.ID)), attemptNumbers(m.archiveJobDir(j))...)
+	slices.Sort(attempts)
+	for _, n := range slices.Compact(attempts) {
+		if err := add(n); err != nil {
+			return nil, err
+		}
 	}
 	// The store's counter is what the guard allowed; it outlives the stream.
 	if n, err := m.Store.SubagentCount(j.ID); err == nil && n > st.Subagents {

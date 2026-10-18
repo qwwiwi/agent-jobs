@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"syscall"
 	"time"
 
@@ -17,14 +18,19 @@ import (
 
 // Log archive: when prune cleans a job folder, the job's records for later analysis move into
 // <archive>/<YYYY-MM>/<id>/ (stream.jsonl and stderr.log gzipped, prompt.md, report.md, diffstat.txt
-// copied, meta.json = the job row). The archive lies outside the job folders, so cleaning jobs never
+// copied, meta.json = the job row; for a resumed job also every earlier attempt's attempts/<n>/ run
+// files and report.attempt-<n>.md). The archive lies outside the job folders, so cleaning jobs never
 // touches it; prune deletes archived months older than log_archive_days.
 var (
 	// archiveGzip are moved: gzipped into the archive, then removed from the job folder.
 	archiveGzip = []string{"stream.jsonl", "stderr.log"}
 	// archiveCopy are copied: the job folder keeps them (report.md and diffstat.txt are prune records).
 	archiveCopy = []string{"prompt.md", "report.md", "diffstat.txt"}
-	reMonth     = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}$`)
+	// archiveAttemptGzip / archiveAttemptCopy are the same for each earlier attempt's attempts/<n>/.
+	archiveAttemptGzip = []string{"stream.jsonl", "stderr.log", "stream-resume-failed.jsonl"}
+	archiveAttemptCopy = []string{resumePromptFile, fallbackPromptFile}
+	reAttemptReport    = regexp.MustCompile(`^report\.attempt-[0-9]+\.md$`)
+	reMonth            = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}$`)
 )
 
 // archiveMarker is written into an archive root the archive created. Retention and the 0700 chmod
@@ -179,7 +185,9 @@ func (m *Manager) eachPrunable(f func(j *store.Job, dir string)) error {
 		return err
 	}
 	for _, j := range list {
-		if j.FinishedAt == nil || j.FinishedAt.After(cutoff) || (j.RepoPath != "" && j.CleanedAt == nil) {
+		// A stopped job is never pruned: its records are what a resume continues from.
+		if j.Status == store.StatusStopped || j.FinishedAt == nil || j.FinishedAt.After(cutoff) ||
+			(j.RepoPath != "" && j.CleanedAt == nil) {
 			continue
 		}
 		dir := m.JobDir(j.ID)
@@ -191,14 +199,38 @@ func (m *Manager) eachPrunable(f func(j *store.Job, dir string)) error {
 	return nil
 }
 
+// archiveSet lists, relative to a job folder, what its archive moves gzipped (gz) and copies (cp):
+// the top-level records, the reports of earlier attempts and their attempts/<n>/ run files.
+func archiveSet(dir string) (gz, cp []string) {
+	gz = slices.Clone(archiveGzip)
+	cp = slices.Clone(archiveCopy)
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			if reAttemptReport.MatchString(e.Name()) {
+				cp = append(cp, e.Name())
+			}
+		}
+	}
+	for _, n := range attemptNumbers(dir) {
+		for _, name := range archiveAttemptGzip {
+			gz = append(gz, filepath.Join(attemptsDir, n, name))
+		}
+		for _, name := range archiveAttemptCopy {
+			cp = append(cp, filepath.Join(attemptsDir, n, name))
+		}
+	}
+	return gz, cp
+}
+
 // archiveJob copies a job's records into <archive>/<YYYY-MM>/<id>/ (built in a temporary dir and
 // renamed into place, so a half-written archive is never taken for a done one), then removes the
 // gzipped originals from the job folder. A job archived by an earlier pass is not archived again;
 // leftovers of the moved files (a pass interrupted after the rename) are removed.
 func (m *Manager) archiveJob(j *store.Job, dir string, dryRun bool) ArchiveJob {
 	aj := ArchiveJob{ID: j.ID, Dest: m.archiveJobDir(j), Moved: []PruneEntry{}}
+	gz, _ := archiveSet(dir)
 	moved := func(reason string) {
-		for _, name := range archiveGzip {
+		for _, name := range gz {
 			p := filepath.Join(dir, name)
 			if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
 				aj.Moved = append(aj.Moved, PruneEntry{Path: p, Bytes: fi.Size(), Reason: reason})
@@ -277,7 +309,8 @@ func writableJobDir(dir string) error {
 // job folder: dest/meta.json and dest/<name>.gz for every one of them, as regular files.
 func archivedCopies(dir, dest string) error {
 	need := []string{"meta.json"}
-	for _, name := range archiveGzip {
+	gz, _ := archiveSet(dir)
+	for _, name := range gz {
 		if fi, err := os.Lstat(filepath.Join(dir, name)); err == nil && fi.Mode().IsRegular() {
 			need = append(need, name+".gz")
 		}
@@ -332,12 +365,18 @@ func (m *Manager) writeArchive(j *store.Job, dir, dest string) error {
 			_ = removeTree(tmp)
 		}
 	}()
-	for _, name := range archiveGzip {
+	gz, cp := archiveSet(dir)
+	for _, n := range attemptNumbers(dir) {
+		if err := os.MkdirAll(filepath.Join(tmp, attemptsDir, n), 0o700); err != nil {
+			return err
+		}
+	}
+	for _, name := range gz {
 		if err := archiveFile(filepath.Join(dir, name), filepath.Join(tmp, name+".gz"), true); err != nil {
 			return err
 		}
 	}
-	for _, name := range archiveCopy {
+	for _, name := range cp {
 		if err := archiveFile(filepath.Join(dir, name), filepath.Join(tmp, name), false); err != nil {
 			return err
 		}
