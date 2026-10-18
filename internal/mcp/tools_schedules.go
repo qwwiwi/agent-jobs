@@ -14,7 +14,7 @@ type ScheduleAddInput struct {
 	Cron   string `json:"cron" jsonschema:"5-field cron expression in the host's local time: minute hour day-of-month month day-of-week; ranges a-b, steps /n, lists a,b; month and weekday names; @hourly @daily @weekly @monthly @yearly"`
 	Prompt string `json:"prompt" jsonschema:"the instruction, one line, at most 2000 characters: typed into this session, or the job's brief when a kind is given"`
 	Kind   string `json:"kind,omitempty" jsonschema:"omit to deliver the prompt into this session; review | fix | research | general to start a job instead (then model or complexity is required, like job_start)"`
-	Title  string `json:"title,omitempty" jsonschema:"job schedules: title of the jobs it starts; default from the prompt"`
+	Title  string `json:"title,omitempty" jsonschema:"job schedules: title of the jobs it starts; default \"schedule <id>\" (never taken from the prompt)"`
 	// The job fields below are validated like job_start and stored on the schedule at creation.
 	Model           string  `json:"model,omitempty" jsonschema:"job schedules: explicit model (a gpt-* model runs on codex exec)"`
 	Complexity      string  `json:"complexity,omitempty" jsonschema:"job schedules: light | normal | hard; the model is resolved now and stored"`

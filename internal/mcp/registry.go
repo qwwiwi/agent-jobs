@@ -64,6 +64,8 @@ var OrchestratorOnly = []string{
 	"schedule_list",
 	"schedule_set",
 	"schedule_remove",
+	// «Owner waits»: only the session that writes to the owner clears the pending record.
+	"owner_replied",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

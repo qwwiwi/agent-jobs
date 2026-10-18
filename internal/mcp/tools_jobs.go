@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,7 +26,7 @@ const (
 const MaxReportBytes = 256 << 10
 
 // artifactFiles are the files job_result points at when they exist (what the job changed). They are
-// only listed (lstat, regular files only), never read; report.md is the one file read (readCapped).
+// only listed (lstat, regular files only), never read; report.md is the one file read (ReadJobReport).
 var artifactFiles = []string{"report.md", "diffstat.txt", "commits.patch", "staged.patch", "uncommitted.patch",
 	"untracked.tar", "stream.jsonl", "stderr.log"}
 
@@ -140,6 +138,7 @@ type JobStartInput struct {
 	Base            string  `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
 	Runner          string  `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
 	ReasoningEffort string  `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
+	OwnerWaits      bool    `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -153,7 +152,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
-			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort,
+			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, OwnerWaits: in.OwnerWaits,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -208,39 +207,6 @@ type JobResultOutput struct {
 	Attempts []AttemptView `json:"attempts,omitempty"`
 }
 
-// errNotRegular marks a job file that is not a regular file (FIFO, device, socket, directory, symlink).
-var errNotRegular = errors.New("not a regular file")
-
-// readCapped reads at most max bytes of path; truncated reports whether there was more. The job dir
-// is writable by the job, so the file is opened without following a symlink and without blocking
-// (a FIFO would otherwise hang the open forever), the opened fd is checked to be a regular file,
-// and only then read.
-func readCapped(path string, max int) (string, bool, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return "", false, fmt.Errorf("%s: %w (symlink)", path, errNotRegular)
-		}
-		return "", false, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return "", false, err
-	}
-	if !fi.Mode().IsRegular() {
-		return "", false, fmt.Errorf("%s: %w (%s)", path, errNotRegular, fi.Mode().Type())
-	}
-	b, err := io.ReadAll(io.LimitReader(f, int64(max)+1))
-	if err != nil {
-		return "", false, err
-	}
-	if len(b) > max {
-		return string(b[:max]), true, nil
-	}
-	return string(b), false, nil
-}
-
 func addJobResult(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_result",
@@ -270,7 +236,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 				out.Artifacts = append(out.Artifacts, filepath.Join(dir, f))
 			}
 		}
-		report, truncated, err := readCapped(filepath.Join(dir, "report.md"), MaxReportBytes)
+		report, truncated, err := ReadJobReport(m.StateDir, j.ID, MaxReportBytes)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			out.ReportMissing = true

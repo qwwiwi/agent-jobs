@@ -111,7 +111,9 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 		}
 		return m.Store.AddSchedule(sc, m.Now())
 	}
-	title := fmt.Sprintf("schedule: %s", Printable(prompt, 60))
+	// Without a title the stored title is neutral ("schedule <id>", set by the store at insert), never
+	// derived from the prompt: titles are shown where prompts are not (the HTTP API).
+	title := "schedule"
 	if r.Title != "" {
 		if !utf8.ValidString(r.Title) || containsControl(r.Title) {
 			return nil, errors.New("title contains a control or format character, or is not valid UTF-8")
@@ -126,12 +128,40 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 	if err != nil {
 		return nil, err
 	}
+	if r.Title == "" {
+		j.Title = ""
+	}
 	sc.Kind, sc.Title, sc.Model, sc.Complexity, sc.Runner, sc.ReasoningEffort = j.Kind, j.Title, j.Model, j.Complexity, j.Runner, j.ReasoningEffort
 	sc.MaxTurns, sc.MaxBudgetUSD, sc.TimeoutMinutes, sc.RepoPath = j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.RepoPath
 	if j.RepoPath != "" {
 		sc.Base = strings.TrimSpace(r.Base) // a ref, resolved again at each firing ("" = HEAD)
 	}
 	return m.Store.AddSchedule(sc, m.Now())
+}
+
+// legacyScheduleTitle is the prefix of the title a schedule without one got before titles turned
+// neutral: "schedule: " and the first 60 characters of the prompt.
+const legacyScheduleTitle = "schedule: "
+
+// NeutralScheduleTitle is the title of a schedule (and of the jobs it fires) created without one.
+func NeutralScheduleTitle(id string) string { return "schedule " + id }
+
+// ScheduleTitle is a schedule's title as jobs and the HTTP API get it: the neutral title for one
+// created without a title, including an older row whose stored title is the prompt prefix.
+func ScheduleTitle(sc *store.Schedule) string {
+	if sc.Title == "" || strings.HasPrefix(sc.Title, legacyScheduleTitle) {
+		return NeutralScheduleTitle(strconv.FormatInt(sc.ID, 10))
+	}
+	return sc.Title
+}
+
+// JobTitle is a job's title as the HTTP API shows it: the neutral schedule title for a job fired by
+// a schedule whose title came from its prompt (older rows), else the job's own title.
+func JobTitle(j *store.Job) string {
+	if j.ScheduleID != "" && strings.HasPrefix(j.Title, legacyScheduleTitle) {
+		return NeutralScheduleTitle(j.ScheduleID)
+	}
+	return j.Title
 }
 
 // ListSchedules returns every schedule, oldest first.
@@ -268,7 +298,7 @@ func (m *Manager) fireSchedules() error {
 		}
 		jobID, ferr := "", ""
 		j, err := m.Enqueue(StartRequest{
-			Title: sc.Title, Kind: sc.Kind, Brief: sc.Prompt, RepoPath: sc.RepoPath, Base: sc.Base, Model: sc.Model,
+			Title: ScheduleTitle(sc), Kind: sc.Kind, Brief: sc.Prompt, RepoPath: sc.RepoPath, Base: sc.Base, Model: sc.Model,
 			Complexity: sc.Complexity, MaxTurns: sc.MaxTurns, MaxBudgetUSD: sc.MaxBudgetUSD, TimeoutMinutes: sc.TimeoutMinutes,
 			Runner: sc.Runner, ReasoningEffort: sc.ReasoningEffort, ScheduleID: strconv.FormatInt(sc.ID, 10),
 		})

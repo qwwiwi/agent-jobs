@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -517,7 +518,12 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 
 // Stats summarizes the stats rows of jobs finished at or after since, grouped by kind, model or skill.
 func (m *Manager) Stats(since time.Time, by string) (StatsReport, error) {
-	rows, err := m.Store.ListStats(since)
+	return m.StatsContext(context.Background(), since, by)
+}
+
+// StatsContext is Stats, given up when ctx ends.
+func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) (StatsReport, error) {
+	rows, err := m.Store.ListStatsContext(ctx, since)
 	if err != nil {
 		return StatsReport{}, err
 	}
