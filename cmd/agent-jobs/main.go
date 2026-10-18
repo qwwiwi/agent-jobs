@@ -450,6 +450,9 @@ func cmdStart(args []string) error {
 		return err
 	}
 	fmt.Println(j.ID)
+	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
+		fmt.Fprintln(os.Stderr, "size_warning:", w)
+	}
 	return nil
 }
 
@@ -632,7 +635,7 @@ func printOwnerPending(m *jobs.Manager) error {
 		fmt.Printf("owner:     %d owner replies pending (expire after %s; owner_replied clears them)\n", len(list), m.Cfg.OwnerWaitsMaxAge())
 		for _, p := range list {
 			fmt.Printf("  job %s %s, line %s, since %s: %s\n", p.JobID, p.Status, p.State, fmtTime(&p.CreatedAt),
-				jobs.Printable(p.Title, jobs.MaxTitleRunes))
+				jobs.RedactPrintable(p.Title, jobs.MaxTitleRunes))
 		}
 	}
 	session, at, err := m.Store.HookSession()
@@ -726,7 +729,7 @@ func cmdResult(args []string) error {
 	}
 	fmt.Println(jobs.DoneLine(j))
 	if j.Error != "" {
-		fmt.Println("error:", j.Error)
+		fmt.Println("error:", jobs.RedactText(j.Error))
 	}
 	atts, err := m.Store.Attempts(id)
 	if err != nil {
@@ -740,11 +743,21 @@ func cmdResult(args []string) error {
 	if len(atts) > 0 {
 		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
 	}
-	b, err := os.ReadFile(filepath.Join(m.JobDir(id), "report.md"))
-	if err != nil {
+	// The bounded reader of job_result: never through a link, never a FIFO or another non-regular
+	// file, at most the scan cap.
+	text, truncated, err := mcp.ReadJobReport(m.StateDir, id, jobs.MaxRedactBytes)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("no report.md (status %s): see %s", j.Status, filepath.Join(m.JobDir(id), "stderr.log"))
+	case err != nil:
+		return fmt.Errorf("report.md not read: %w", err)
 	}
-	fmt.Print("\n" + string(b))
+	// Redacted on the fly (the in-place redaction may be pending), "Not done / uncertain" first and
+	// "Progress" after it, like job_result.
+	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactRead(text, truncated)))
+	if truncated {
+		fmt.Printf("\n[report cut at %d bytes; full file: %s]\n", jobs.MaxRedactBytes, filepath.Join(m.JobDir(id), "report.md"))
+	}
 	return nil
 }
 
@@ -1249,7 +1262,7 @@ func cmdChecks(args []string) error {
 			next = "-"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\n", v.Name, jobs.CheckStateText(v), v.Cron, v.GraceMinutes, exp, next,
-			fmtTime(v.LastMarkAt), jobs.Printable(v.LastMarkNote, 60))
+			fmtTime(v.LastMarkAt), jobs.RedactPrintable(v.LastMarkNote, 60))
 	}
 	return w.Flush()
 }

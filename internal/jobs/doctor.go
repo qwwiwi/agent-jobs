@@ -348,7 +348,7 @@ func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 		p.cmdline, _ = procCmdline(pid)
 		p.marker = procMarker(pid)
 		started := at(p.start)
-		g := Ghost{PID: pid, PPID: p.ppid, SID: p.sid, Cmdline: Printable(strings.Join(p.cmdline, " "), 300),
+		g := Ghost{PID: pid, PPID: p.ppid, SID: p.sid, Cmdline: RedactPrintable(strings.Join(p.cmdline, " "), 300),
 			StartedAt: started.UTC().Format(time.RFC3339), start: p.start}
 		leaderGone := p.sid > 1 && p.sid != pid && !procExists(p.sid)
 		var sessJob *store.Job // the finished job whose run window holds this process and its session

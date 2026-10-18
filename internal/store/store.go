@@ -338,6 +338,7 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN skills_delivered TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN skills_note TEXT NOT NULL DEFAULT ''`,
@@ -353,6 +354,11 @@ var migrationBackfills = map[string]string{
 	`ALTER TABLE job_stats ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0`: `UPDATE job_stats SET cost_unknown=1
 		WHERE id IN (SELECT j.id FROM jobs j WHERE j.runner='codex' OR (j.cost_unknown=1 AND NOT EXISTS
 			(SELECT 1 FROM attempts a WHERE a.job_id=j.id AND a.cost_unknown=0)))`,
+	// Every job that existed before the column may hold an unredacted report: a queued or running
+	// attempt writes one later, a finished one was settled by a build that did not redact (or did
+	// and died before the rewrite). All are marked; redaction is idempotent, and a job without a
+	// regular report.md is just cleared on the next tick.
+	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`: `UPDATE jobs SET redaction_pending=1`,
 	checksAlertStateAlter: checksAlertStateFill,
 	checksAlertsMoved:     checksAlertsFill,
 }
@@ -634,8 +640,37 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	if token == "" {
 		return errors.New("claim: empty launch token")
 	}
+	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
+	// report of the ended attempt has been redacted (ClearRedactionPending).
 	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?,
-		attempt=attempt+1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+		attempt=attempt+1, redaction_pending=1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+}
+
+// RedactionPending returns the ids of the jobs that are no longer queued or running and whose
+// report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.
+func (s *Store) RedactionPending() ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM jobs WHERE redaction_pending != 0 AND status NOT IN ('queued','running')
+		ORDER BY created_at, rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ClearRedactionPending records that the report of the ended attempt is redacted. A job that was
+// requeued or claimed again meanwhile keeps the mark (its new attempt may write a new report).
+func (s *Store) ClearRedactionPending(id string) error {
+	_, err := s.db.Exec(`UPDATE jobs SET redaction_pending=0 WHERE id=? AND status NOT IN ('queued','running')`, id)
+	return err
 }
 
 // SetSession records the claude session id and run mode of the running launch that owns the job.
@@ -801,7 +836,10 @@ func (s *Store) Finish(id, token, status string, turns int, cost float64, durati
 	if status == StatusQueued || status == StatusRunning {
 		return fmt.Errorf("finish: %q is not a terminal status", status)
 	}
-	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=? WHERE id=? AND `
+	// redaction_pending is set in the same update: the report of the ended attempt counts as
+	// unredacted until it was redacted (ClearRedactionPending), whatever set or cleared it before.
+	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=?, redaction_pending=1
+		WHERE id=? AND `
 	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), id}
 	if token == "" {
 		q += `status IN ('queued','running','stopped')`
