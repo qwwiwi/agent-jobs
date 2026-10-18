@@ -138,16 +138,77 @@ func TestCronNext(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := cr.Next(from); !got.Equal(c.want) {
-			t.Fatalf("%q: next %s, want %s", c.expr, got, c.want)
+		if got, err := cr.Next(from); err != nil || !got.Equal(c.want) {
+			t.Fatalf("%q: next %s %v, want %s", c.expr, got, err, c.want)
 		}
 	}
 	never, err := ParseCron("0 0 30 2 *")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := never.Next(from); !n.IsZero() {
-		t.Fatalf("30 February fires at %s", n)
+	if n, err := never.Next(from); err == nil || !n.IsZero() {
+		t.Fatalf("30 February fires at %s (%v)", n, err)
+	}
+}
+
+// Codex review (PR #25): America/Havana springs forward at midnight (2027-03-14 00:00 normalises
+// back to 03-13 23:00), which held the day loop on one date forever. Next returns within a bound:
+// a missing midnight minute moves to the next day, an existing one that day is found.
+func TestCronNextHavanaMidnightGap(t *testing.T) {
+	loc, err := time.LoadLocation("America/Havana")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2027, 3, 13, 12, 0, 0, 0, loc)
+	for _, c := range []struct {
+		expr string
+		want time.Time
+	}{
+		{"0 0 * * *", time.Date(2027, 3, 15, 0, 0, 0, 0, loc)},
+		{"30 0 * * *", time.Date(2027, 3, 15, 0, 30, 0, 0, loc)},
+		{"0 1 * * *", time.Date(2027, 3, 14, 1, 0, 0, 0, loc)},
+		{"* * * * *", time.Date(2027, 3, 13, 12, 1, 0, 0, loc)},
+		{"0 0 14 3 *", time.Date(2028, 3, 14, 0, 0, 0, 0, loc)},
+	} {
+		cr, err := ParseCron(c.expr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		within(t, 5*time.Second, c.expr, func() {
+			if got, err := cr.Next(from); err != nil || !got.Equal(c.want) {
+				t.Errorf("%q: next %s %v, want %s", c.expr, got, err, c.want)
+			}
+		})
+	}
+	cr, err := ParseCron("* * * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	within(t, 5*time.Second, "every minute across the gap", func() {
+		at := time.Date(2027, 3, 13, 23, 59, 0, 0, loc)
+		if got, err := cr.Next(at); err != nil || !got.Equal(at.Add(time.Minute)) || got.Hour() != 1 {
+			t.Errorf("next after 23:59: %s %v, want 01:00 CDT", got, err)
+		}
+	})
+}
+
+// Both instants of an ambiguous wall time are due, in order: before the Berlin fold the next
+// 02:00 is the first (CEST) one, inside the fold the second (CET) one.
+func TestCronNextFold(t *testing.T) {
+	loc := berlin(t)
+	cr, err := ParseCron("0 2 * * *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cest := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct{ from, want time.Time }{
+		{cest.Add(-time.Hour), cest},
+		{cest.Add(30 * time.Minute), cest.Add(time.Hour)},
+		{cest.Add(time.Hour), time.Date(2026, 10, 26, 2, 0, 0, 0, loc)},
+	} {
+		if got, err := cr.Next(c.from.In(loc)); err != nil || !got.Equal(c.want) {
+			t.Fatalf("from %s: next %s %v, want %s", c.from.In(loc), got, err, c.want.In(loc))
+		}
 	}
 }
 
@@ -161,7 +222,7 @@ func TestCronDST(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 2026-03-29 02:00 CET jumps to 03:00 CEST: 02:30 does not exist that day.
-	if n := cr.Next(time.Date(2026, 3, 28, 12, 0, 0, 0, loc)); !n.Equal(time.Date(2026, 3, 30, 2, 30, 0, 0, loc)) {
+	if n, _ := cr.Next(time.Date(2026, 3, 28, 12, 0, 0, 0, loc)); !n.Equal(time.Date(2026, 3, 30, 2, 30, 0, 0, loc)) {
 		t.Fatalf("spring forward: next %s", n)
 	}
 	for m := time.Date(2026, 3, 29, 0, 0, 0, 0, loc); m.Before(time.Date(2026, 3, 29, 6, 0, 0, 0, loc)); m = m.Add(time.Minute) {

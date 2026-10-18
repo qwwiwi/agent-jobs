@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -17,7 +16,9 @@ import (
 // (several schedules due in the same minute arrive as one line); with a kind it starts a job with
 // the model and limits stored at creation, and the session only sees that job's job-done line.
 // A firing is claimed in the store before delivery: a missed minute (daemon down, a failed
-// delivery) is lost, never queued, and a minute never fires twice, restarts included.
+// delivery) is lost, never queued. Every firing must be later than the last one both in absolute
+// time and on the local wall clock (a watermark), so nothing fires twice, restarts and the hour
+// repeated when DST ends included.
 
 // MaxSchedulePromptRunes caps a schedule's prompt (longer is refused, never cut: it is an instruction).
 const MaxSchedulePromptRunes = 2000
@@ -48,7 +49,7 @@ type ScheduleRequest struct {
 
 // SchedulePrompt validates a schedule's prompt: required, valid UTF-8, one line (no control or
 // format character, bidi overrides included), at most MaxSchedulePromptRunes, then Printable and
-// defanged so it never reads as a tag of its own (defangJobsTags).
+// defanged so it never reads as a tag of its own (defangTags, the notify_owner rule).
 func SchedulePrompt(s string) (string, error) {
 	if !utf8.ValidString(s) {
 		return "", errors.New("prompt is not valid UTF-8")
@@ -59,35 +60,11 @@ func SchedulePrompt(s string) (string, error) {
 	if n := utf8.RuneCountInString(s); n > MaxSchedulePromptRunes {
 		return "", fmt.Errorf("prompt has %d characters, at most %d", n, MaxSchedulePromptRunes)
 	}
-	t := defangJobsTags(Printable(s, 0))
+	t := defangTags(Printable(s, 0))
 	if t == "" {
 		return "", errors.New("prompt is required")
 	}
 	return t, nil
-}
-
-// defangJobsTags turns every "[jobs:" (ASCII letters in any case) into "(jobs:" and a leading "["
-// into "(", so text typed into the session never passes for a tag of its own (the notify_owner rule).
-func defangJobsTags(s string) string {
-	b := []byte(s)
-	const tag = "[jobs:"
-	for i := 0; i+len(tag) <= len(b); i++ {
-		if b[i] != '[' {
-			continue
-		}
-		word := b[i+1 : i+len(tag)]
-		ascii := true
-		for _, c := range word {
-			ascii = ascii && c < utf8.RuneSelf
-		}
-		if ascii && strings.EqualFold(string(word), tag[1:]) {
-			b[i] = '('
-		}
-	}
-	if len(b) > 0 && b[0] == '[' {
-		b[0] = '('
-	}
-	return string(b)
 }
 
 func (m *Manager) loc() *time.Location {
@@ -103,8 +80,8 @@ func (m *Manager) parseScheduleCron(expr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c.Next(m.Now().In(m.loc())).IsZero() {
-		return "", fmt.Errorf("cron expression %q never fires", strings.TrimSpace(expr))
+	if _, err := c.Next(m.Now().In(m.loc())); err != nil {
+		return "", fmt.Errorf("cron expression %q never fires (%v)", strings.TrimSpace(expr), err)
 	}
 	return strings.Join(strings.Fields(expr), " "), nil
 }
@@ -160,7 +137,18 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 // ListSchedules returns every schedule, oldest first.
 func (m *Manager) ListSchedules() ([]*store.Schedule, error) { return m.Store.ListSchedules(false) }
 
-// NextFire is the next minute the schedule fires (nil when disabled or it never fires).
+// scheduleLocalLayout is a firing's local wall-clock minute as stored (last_fired_local); it sorts
+// as a string, which the claim's watermark relies on.
+const scheduleLocalLayout = "2006-01-02 15:04"
+
+// maxNextFireSkips bounds NextFire's walk past due minutes the watermark suppresses (the rest of a
+// repeated DST hour, or a clock stepped back: a day of every-minute firings).
+const maxNextFireSkips = 2 * 24 * 60
+
+// NextFire is the next minute the schedule fires (nil when disabled, it never fires, or the
+// watermark suppresses every firing within maxNextFireSkips). Like the claim, it skips a due
+// minute whose instant or local wall-clock minute is not later than the last firing's, so a
+// suppressed second pass of a repeated DST hour is never advertised.
 func (m *Manager) NextFire(sc *store.Schedule) *time.Time {
 	if !sc.Enabled {
 		return nil
@@ -169,11 +157,18 @@ func (m *Manager) NextFire(sc *store.Schedule) *time.Time {
 	if err != nil {
 		return nil
 	}
-	n := c.Next(m.Now().In(m.loc()))
-	if n.IsZero() {
-		return nil
+	t := m.Now().In(m.loc())
+	for i := 0; i < maxNextFireSkips; i++ {
+		n, err := c.Next(t)
+		if err != nil {
+			return nil
+		}
+		if n.Format(scheduleLocalLayout) > sc.LastFiredLocal && (sc.LastFiredAt == nil || n.After(*sc.LastFiredAt)) {
+			return &n
+		}
+		t = n
 	}
-	return &n
+	return nil
 }
 
 // SetSchedule edits a schedule in place: its cron, its prompt, enabled, or any of them (at least one).
@@ -229,9 +224,11 @@ func ScheduleLine(due []*store.Schedule) string {
 }
 
 // fireSchedules fires every enabled schedule due at the current minute (local wall clock): each one
-// is claimed in the store first (at most once per minute, restart-safe), then job schedules are
-// queued with their stored model and limits and session schedules are typed as one line. A failed
-// delivery is logged and recorded on the schedule; the firing is lost, never retried later.
+// is claimed in the store first (past the watermark of its last firing, restart-safe), then job
+// schedules are queued with their stored model and limits and session schedules are typed as one
+// line through the bounded, serialized delivery (sendTmuxLocked: tmux.lock, TmuxDeliveryTimeout),
+// so a stalled tmux never holds the tick. A failed delivery is logged and recorded on the schedule;
+// the firing is lost, never retried later.
 func (m *Manager) fireSchedules() error {
 	list, err := m.Store.ListSchedules(true)
 	if err != nil || len(list) == 0 {
@@ -239,7 +236,7 @@ func (m *Manager) fireSchedules() error {
 	}
 	now := m.Now().In(m.loc())
 	minute := now.Truncate(time.Minute)
-	local := minute.Format("2006-01-02 15:04")
+	local := minute.Format(scheduleLocalLayout)
 	var session []*store.Schedule
 	var errs []error
 	for _, sc := range list {
@@ -286,7 +283,7 @@ func (m *Manager) fireSchedules() error {
 		if t := m.Cfg.NotifyTmuxTarget; t == "" {
 			ferr = "notify off (notify_tmux_target not configured)"
 			m.Log.Printf("schedule: %s, firing lost: %s", ferr, line)
-		} else if err := m.sendTmux(context.Background(), t, line); err != nil {
+		} else if err := m.sendTmuxLocked(t, line); err != nil {
 			ferr = err.Error()
 			m.Log.Printf("schedule: delivery failed, firing lost: %v", err)
 		}

@@ -179,37 +179,95 @@ func (c *Cron) dayMatch(t time.Time) bool {
 	return dom && dow
 }
 
-// cronHorizon bounds Next: the longest gap a valid expression can have is a leap day on a given
-// weekday (28 years); 30 years covers it.
+// cronHorizon bounds Next in years: the longest gap a valid expression can have is a leap day
+// (8 years across a century that is not a leap year); 30 years covers it with room.
 const cronHorizon = 30
 
-// Next returns the first due minute strictly after t, in t's location, or the zero time when the
-// expression never fires (e.g. "0 0 30 2 *"). A wall-clock minute that does not exist on that day
-// (skipped by a DST change) is never due.
-func (c *Cron) Next(t time.Time) time.Time {
+// Next returns the first due minute strictly after t, in t's location, or an error when there is
+// none within cronHorizon years (an expression that never fires, e.g. "0 0 30 2 *"). A wall-clock
+// minute that does not exist on that day (skipped by a DST change) is never due; one that exists
+// twice (the hour repeated when DST ends) is due at both instants. The search walks calendar days
+// in UTC, where no day is skipped or repeated, so a day that starts in a DST gap (Havana springs
+// forward at midnight) cannot hold it: every step is a new date and the number of steps is bounded.
+func (c *Cron) Next(t time.Time) (time.Time, error) {
 	loc := t.Location()
 	t = t.Truncate(time.Minute).Add(time.Minute)
 	y, mo, d := t.Date()
-	end := time.Date(y+cronHorizon, mo, d, 0, 0, 0, 0, loc)
-	for day := time.Date(y, mo, d, 0, 0, 0, 0, loc); day.Before(end); day = time.Date(day.Year(), day.Month(), day.Day()+1, 0, 0, 0, 0, loc) {
+	// From the day before: an instant after t can still read the previous date when DST ends at midnight.
+	first := time.Date(y, mo, d-1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i <= cronHorizon*366; i++ {
+		day := first.AddDate(0, 0, i)
 		if !c.dayMatch(day) {
 			continue
 		}
-		for h := 0; h < 24; h++ {
-			if c.hour&(1<<h) == 0 {
+		if n := c.firstOnDay(day, loc, t); !n.IsZero() {
+			// A fold across midnight can put the next date's first instant earlier.
+			if next := day.AddDate(0, 0, 1); offsetChanges(day, loc) && c.dayMatch(next) {
+				if n2 := c.firstOnDay(next, loc, t); !n2.IsZero() && n2.Before(n) {
+					n = n2
+				}
+			}
+			return n, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("no firing within %d years", cronHorizon)
+}
+
+// firstOnDay returns the earliest instant not before t that is a due minute of the civil date day
+// (a UTC midnight) on loc's wall clock, or the zero time. On a day without an offset change instants
+// follow the wall clock, so the first valid minute is the earliest; on a day with one every due
+// minute is checked.
+func (c *Cron) firstOnDay(day time.Time, loc *time.Location, t time.Time) time.Time {
+	scan := offsetChanges(day, loc)
+	var best time.Time
+	for h := 0; h < 24; h++ {
+		if c.hour&(1<<h) == 0 {
+			continue
+		}
+		for mi := 0; mi < 60; mi++ {
+			if c.minute&(1<<mi) == 0 {
 				continue
 			}
-			for mi := 0; mi < 60; mi++ {
-				if c.minute&(1<<mi) == 0 {
-					continue
-				}
-				cand := time.Date(day.Year(), day.Month(), day.Day(), h, mi, 0, 0, loc)
-				if cand.Hour() != h || cand.Minute() != mi || cand.Before(t) {
-					continue // a skipped wall-clock minute (DST), or already past
-				}
-				return cand
+			u := wallInstant(day.Year(), day.Month(), day.Day(), h, mi, loc, t)
+			if u.IsZero() {
+				continue // a skipped wall-clock minute (DST), or already past
+			}
+			if !scan {
+				return u
+			}
+			if best.IsZero() || u.Before(best) {
+				best = u
 			}
 		}
 	}
-	return time.Time{}
+	return best
+}
+
+// offsetChanges reports whether loc's UTC offset changes within a day and a half around the civil
+// date day (DST transitions are months apart, so one comparison of the two ends finds them).
+func offsetChanges(day time.Time, loc *time.Location) bool {
+	noon := day.Add(12 * time.Hour)
+	_, a := noon.Add(-36 * time.Hour).In(loc).Zone()
+	_, b := noon.Add(36 * time.Hour).In(loc).Zone()
+	return a != b
+}
+
+// wallInstant returns the earliest instant not before t whose wall clock in loc reads
+// y-mo-d h:mi, or the zero time (none: a DST gap, or every instant is before t). An ambiguous wall
+// time (DST ends) has two instants; time.Date picks one of them, so both nearby offsets are tried.
+func wallInstant(y int, mo time.Month, d, h, mi int, loc *time.Location, t time.Time) time.Time {
+	wall := time.Date(y, mo, d, h, mi, 0, 0, time.UTC)
+	var best time.Time
+	for _, probe := range []time.Duration{-24 * time.Hour, 0, 24 * time.Hour} {
+		_, off := wall.Add(probe).In(loc).Zone()
+		u := wall.Add(-time.Duration(off) * time.Second).In(loc)
+		uy, umo, ud := u.Date()
+		if uy != y || umo != mo || ud != d || u.Hour() != h || u.Minute() != mi || u.Before(t) {
+			continue
+		}
+		if best.IsZero() || u.Before(best) {
+			best = u
+		}
+	}
+	return best
 }

@@ -89,3 +89,35 @@ func TestSchedulesRoundTripAndClaim(t *testing.T) {
 		t.Fatalf("set removed: %v", err)
 	}
 }
+
+// Codex review (PR #25): the local wall-clock minute is a watermark. In the repeated hour at the
+// end of DST the absolute time goes on while the local minute goes back; a claim needs both to be
+// strictly later than the last firing, so 02:00 and 02:30 of the second pass are refused.
+func TestScheduleClaimLocalWatermark(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sc, err := s.AddSchedule(&Schedule{Cron: "*/30 2 * * *", Prompt: "p", Enabled: true}, time.Unix(1770000000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC) // 02:00 CEST
+	for i, c := range []struct {
+		at    time.Time
+		local string
+		want  bool
+	}{
+		{first, "2026-10-25 02:00", true},
+		{first.Add(30 * time.Minute), "2026-10-25 02:30", true},
+		{first.Add(time.Hour), "2026-10-25 02:00", false},                  // 02:00 CET: local went back
+		{first.Add(90 * time.Minute), "2026-10-25 02:30", false},           // 02:30 CET: same local minute
+		{first.Add(26 * time.Hour), "2026-10-26 02:00", true},              // next day
+		{first.Add(26*time.Hour - time.Minute), "2026-10-26 01:59", false}, // absolute went back
+	} {
+		if ok, err := s.ClaimScheduleFiring(sc.ID, c.at, c.local); err != nil || ok != c.want {
+			t.Fatalf("claim %d (%s): %t %v, want %t", i, c.local, ok, err, c.want)
+		}
+	}
+}

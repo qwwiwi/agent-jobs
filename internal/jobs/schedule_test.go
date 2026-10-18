@@ -250,8 +250,10 @@ func TestScheduleFailedDeliveryIsLost(t *testing.T) {
 	}
 }
 
-// DST end: the repeated hour reads 02:30 twice; a fixed-time schedule fires once, an every-30-minutes
-// schedule fires in both passes (real time goes on). Spring forward: 02:30 does not exist, no firing.
+// DST end: the repeated hour reads 02:00..02:59 twice; the local-minute watermark lets a schedule
+// fire only at a wall-clock minute later than its last firing, so a fixed time fires once and an
+// every-30-minutes schedule fires at 02:00 and 02:30 once each (Codex review PR #25: not four times).
+// Spring forward: 02:30 does not exist, no firing.
 func TestScheduleDSTFallBackFiresOnce(t *testing.T) {
 	loc := berlin(t)
 	m, now, logf := scheduleManager(t, loc)
@@ -267,8 +269,8 @@ func TestScheduleDSTFallBackFiresOnce(t *testing.T) {
 		nDaily += strings.Count(l, "schedule "+itoa(daily.ID)+": daily")
 		nHalf += strings.Count(l, "schedule "+itoa(half.ID)+": half")
 	}
-	if nDaily != 1 || nHalf != 4 { // half: 02:00, 02:30 CEST, 02:00, 02:30 CET
-		t.Fatalf("fall back: daily %d (want 1), half %d (want 4)", nDaily, nHalf)
+	if nDaily != 1 || nHalf != 2 { // half: 02:00, 02:30 CEST; the CET pass is suppressed
+		t.Fatalf("fall back: daily %d (want 1), half %d (want 2)", nDaily, nHalf)
 	}
 
 	m2, now2, logf2 := scheduleManager(t, loc)

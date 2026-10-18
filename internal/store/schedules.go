@@ -35,7 +35,8 @@ type Schedule struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	// LastFiredAt is the minute the schedule last fired (claimed), nil when never.
 	LastFiredAt *time.Time `json:"last_fired_at,omitempty"`
-	// LastFiredLocal is that minute on the local wall clock, "YYYY-MM-DD HH:MM".
+	// LastFiredLocal is that minute on the local wall clock, "YYYY-MM-DD HH:MM": the watermark a
+	// later firing's local minute must exceed (see ClaimScheduleFiring).
 	LastFiredLocal string `json:"-"`
 	// LastJobID is the job the last firing started (job schedules).
 	LastJobID string `json:"last_job_id,omitempty"`
@@ -176,14 +177,17 @@ func (s *Store) RemoveSchedule(id int64) error {
 	return nil
 }
 
-// ClaimScheduleFiring records minute (truncated to the minute) as the schedule's last firing,
-// unless it already fired at that minute or later, or at the same local wall-clock minute (the
-// repeated hour when DST ends). One atomic statement: two daemons, or a restarted one, never fire a
-// schedule twice for a minute; a claim made before a crash still counts (a lost firing, never a
+// ClaimScheduleFiring records minute (truncated to the minute) and local, its wall-clock minute
+// "YYYY-MM-DD HH:MM", as the schedule's last firing, only when both are strictly later than the
+// last firing's: the absolute time and the local minute (compared as strings, the layout sorts) are
+// increasing watermarks. In the hour repeated when DST ends the absolute time goes on while the
+// local minute goes back, so nothing fires again until the wall clock passes the last firing; a
+// clock stepped back never re-fires either. One atomic statement: two daemons, or a restarted one,
+// never fire a schedule twice; a claim made before a crash still counts (a lost firing, never a
 // repeated one).
 func (s *Store) ClaimScheduleFiring(id int64, minute time.Time, local string) (bool, error) {
 	res, err := s.db.Exec(`UPDATE schedules SET last_fired_at = ?1, last_fired_local = ?2, last_job_id = '', last_error = ''
-		WHERE id = ?3 AND enabled = 1 AND (last_fired_at IS NULL OR last_fired_at < ?1) AND last_fired_local <> ?2`,
+		WHERE id = ?3 AND enabled = 1 AND (last_fired_at IS NULL OR last_fired_at < ?1) AND last_fired_local < ?2`,
 		minute.Unix(), local, id)
 	if err != nil {
 		return false, fmt.Errorf("claim schedule: %w", err)
