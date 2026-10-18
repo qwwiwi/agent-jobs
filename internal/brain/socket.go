@@ -19,6 +19,9 @@ import (
 const (
 	SocketOpSearch = "search"
 	SocketOpWrite  = "write"
+	// SocketOpNotify is notify_owner: not a brain call, the daemon types the line into the
+	// orchestrator session (jobs.Manager.NotifyOwner). It works with or without a brain.
+	SocketOpNotify = "notify_owner"
 )
 
 // MaxSocketMessage bounds one request or response on the socket.
@@ -31,6 +34,9 @@ type SocketRequest struct {
 	Query string     `json:"query,omitempty"`
 	Limit int        `json:"limit,omitempty"`
 	Note  *NoteInput `json:"note,omitempty"`
+	// Text and Urgency are notify_owner's input.
+	Text    string `json:"text,omitempty"`
+	Urgency string `json:"urgency,omitempty"`
 }
 
 // SocketResponse is the daemon's answer; Error is set when the call failed.
@@ -100,6 +106,13 @@ func (c SocketClient) Write(ctx context.Context, n NoteInput) (Object, error) {
 		return nil, err
 	}
 	return resp.Result, nil
+}
+
+// NotifyOwner asks the daemon to deliver a notification for the owner; the answer is the stored
+// notification (also with an error when it was stored but not delivered).
+func (c SocketClient) NotifyOwner(ctx context.Context, text, urgency string) (Object, error) {
+	resp, err := c.do(ctx, SocketRequest{Op: SocketOpNotify, Text: text, Urgency: urgency})
+	return resp.Result, err
 }
 
 func (SocketClient) CreateTask(context.Context, TaskInput) (Object, error)   { return nil, ErrJobRole }

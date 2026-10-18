@@ -203,12 +203,13 @@ func TestBrainProxySocketFile(t *testing.T) {
 	if err := m.ServeBrain(context.Background()); err == nil || !strings.Contains(err.Error(), "another process") {
 		t.Fatalf("second proxy: %v", err)
 	}
-	m2 := newManager(t) // a disabled brain serves nothing
-	if err := m2.ServeBrain(context.Background()); err != nil {
-		t.Fatal(err)
+	// Without a brain the socket is still served (notify_owner needs it), until the context ends.
+	m2 := newManager(t)
+	if !brain.IsDisabled(m2.Brain) {
+		t.Fatal("test manager has a brain")
 	}
-	if _, err := os.Lstat(BrainSocketPath(m2.StateDir)); !os.IsNotExist(err) {
-		t.Fatalf("socket without a brain: %v", err)
+	if fi, err := os.Lstat(serveProxy(t, m2)); err != nil || fi.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("socket without a brain: %v %v", fi, err)
 	}
 }
 

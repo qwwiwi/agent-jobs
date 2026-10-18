@@ -33,14 +33,12 @@ func (m *Manager) brainAgent() string {
 	return m.Agent
 }
 
-// ServeBrain runs the brain proxy for the agent's jobs until ctx ends: a unix socket (mode 600) on
-// which a running job's MCP server asks for memory_search and memory_write. The daemon holds the
-// token; the job never does. Without a brain it returns at once. A socket another live daemon
-// answers on is left alone (error); a stale one is replaced.
+// ServeBrain runs the job proxy for the agent's jobs until ctx ends: a unix socket (mode 600) on
+// which a running job's MCP server asks for memory_search, memory_write and notify_owner. The daemon
+// holds the brain token; the job never does. Without a brain the socket still serves notify_owner
+// (the memory calls answer «brain not configured»). A socket another live daemon answers on is left
+// alone (error); a stale one is replaced.
 func (m *Manager) ServeBrain(ctx context.Context) error {
-	if brain.IsDisabled(m.Brain) {
-		return nil
-	}
 	p := BrainSocketPath(m.StateDir)
 	if fi, err := os.Lstat(p); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
@@ -92,8 +90,9 @@ func (m *Manager) ServeBrain(ctx context.Context) error {
 	}
 }
 
-// HandleBrainRequest answers one proxy call: only for a running job of this agent, only search and
-// write; a write always gets the job's provenance (brain.ForJob) and its path is recorded.
+// HandleBrainRequest answers one proxy call: only for a running job of this agent, only search,
+// write and notify_owner; a write always gets the job's provenance (brain.ForJob) and its path is
+// recorded; a notification is the job's own (its id from the checked request, rate limited per job).
 func (m *Manager) HandleBrainRequest(ctx context.Context, r brain.SocketRequest) brain.SocketResponse {
 	fail := func(err error) brain.SocketResponse { return brain.SocketResponse{Error: err.Error()} }
 	j, err := m.Store.Get(r.JobID)
@@ -140,6 +139,26 @@ func (m *Manager) HandleBrainRequest(ctx context.Context, r brain.SocketRequest)
 			return fail(fmt.Errorf("the note was written but could not be tracked as this job's (%v); %w", err, errJobWritesOff))
 		}
 		return brain.SocketResponse{Result: o}
+	case brain.SocketOpNotify:
+		n, err := m.NotifyOwner(j.ID, r.Text, r.Urgency)
+		resp := brain.SocketResponse{}
+		if n != nil {
+			resp.Result = notificationObject(n)
+		}
+		if err != nil {
+			resp.Error = err.Error()
+		}
+		return resp
 	}
 	return fail(fmt.Errorf("op %q is not available to a job", r.Op))
+}
+
+// notificationObject is a notification as the proxy's JSON answer.
+func notificationObject(n *store.Notification) brain.Object {
+	o := brain.Object{"id": n.ID, "job_id": n.JobID, "text": n.Text, "urgency": n.Urgency,
+		"created_at": n.CreatedAt.Format(time.RFC3339), "delivered": n.Delivered}
+	if n.Error != "" {
+		o["error"] = n.Error
+	}
+	return o
 }

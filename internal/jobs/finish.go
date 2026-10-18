@@ -96,7 +96,7 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	for _, j := range jobs {
-		if err := m.sendTmux(t, DoneLine(j)); err != nil {
+		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %v", j.ID, err)
 			continue
 		}

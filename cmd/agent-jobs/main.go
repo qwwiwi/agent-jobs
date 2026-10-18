@@ -65,6 +65,9 @@ const usage = `usage: agent-jobs <command> [flags]
                                            first writes missing rows from job dirs and the archive
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
+  notify-owner --agent A --text T [--urgency normal|high]
+                                           one "[jobs:notify-owner] T" line into the notify target
+                                           for the session to relay (rate limited, stored)
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   version                                  print the version (also --version)
@@ -130,6 +133,8 @@ func main() {
 		err = cmdStats(args)
 	case "intentions":
 		err = cmdIntentions(args)
+	case "notify-owner":
+		err = cmdNotifyOwner(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "version", "--version":
@@ -430,7 +435,10 @@ func cmdStatus(args []string) error {
 	}
 	defer m.Close()
 	if len(pos) == 0 {
-		return printDaily(m)
+		if err := printDaily(m); err != nil {
+			return err
+		}
+		return printUndelivered(m)
 	}
 	j, err := m.Store.Get(pos[0])
 	if err != nil {
@@ -484,6 +492,28 @@ func printDaily(m *jobs.Manager) error {
 				fmt.Printf("error:     %s: %s\n", e.name, e.text)
 			}
 		}
+	}
+	return nil
+}
+
+// printUndelivered is the end of `status` without a job id: notify_owner notifications of the last
+// 24 h that did not reach the session.
+func printUndelivered(m *jobs.Manager) error {
+	list, err := m.UndeliveredNotifications()
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("notify:    no undelivered owner notifications in the last 24 h")
+		return nil
+	}
+	fmt.Printf("notify:    %d owner notifications not delivered in the last 24 h\n", len(list))
+	for _, n := range list {
+		from := "orchestrator"
+		if n.JobID != "" {
+			from = "job " + n.JobID
+		}
+		fmt.Printf("  #%d %s %s (%s): %s · error: %s\n", n.ID, fmtTime(&n.CreatedAt), from, n.Urgency, n.Text, n.Error)
 	}
 	return nil
 }
@@ -802,7 +832,7 @@ func cmdDaemon(args []string) error {
 	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
 	go func() {
 		if err := m.ServeBrain(ctx); err != nil {
-			m.Log.Printf("%v (jobs get no memory tools until the daemon restarts)", err)
+			m.Log.Printf("%v (jobs get no memory tools and no notify_owner until the daemon restarts)", err)
 		}
 	}()
 	t := time.NewTicker(jobs.TickInterval)
@@ -981,6 +1011,31 @@ func cmdIntentions(args []string) error {
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", it.ID, it.Status, it.Priority, due, fmtTime(&it.UpdatedAt), it.Text)
 	}
 	return w.Flush()
+}
+
+func cmdNotifyOwner(args []string) error {
+	fs := flag.NewFlagSet("notify-owner", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	text := fs.String("text", "", "the message for the owner, one line (at most 300 characters)")
+	urgency := fs.String("urgency", "", "normal|high (default normal)")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) > 0 {
+		return errors.New("no positional arguments: give the message with --text")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	n, err := m.NotifyOwner("", *text, *urgency)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("notification %d delivered: %s\n", n.ID, jobs.NotifyLine(n))
+	return nil
 }
 
 func cmdStats(args []string) error {

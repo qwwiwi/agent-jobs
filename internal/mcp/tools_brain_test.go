@@ -35,7 +35,8 @@ func brainServer(t *testing.T, role Role, b brain.Brain, jobID string) *sdk.Clie
 }
 
 // Reference, "MCP tools": the orchestrator gets every memory, task and team tool; a job gets
-// memory_search and memory_write only, and the job-role server refuses the rest.
+// memory_search and memory_write only (plus notify_owner, tools_notify_test.go), and the job-role
+// server refuses the rest.
 func TestBrainToolsPerRole(t *testing.T) {
 	orch := toolNames(t, brainServer(t, RoleOrchestrator, &brain.Fake{}, ""))
 	for _, n := range brainTools {
@@ -44,7 +45,7 @@ func TestBrainToolsPerRole(t *testing.T) {
 		}
 	}
 	job := brainServer(t, RoleJob, &brain.Fake{}, "j1")
-	if got := toolNames(t, job); !slices.Equal(got, []string{"memory_search", "memory_write"}) {
+	if got := toolNames(t, job); !slices.Equal(got, []string{"memory_search", "memory_write", "notify_owner"}) {
 		t.Fatalf("job role lists %v", got)
 	}
 	for _, n := range brainTools[2:] {
