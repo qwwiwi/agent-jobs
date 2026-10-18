@@ -78,11 +78,18 @@ func (f *fixture) insert(t *testing.T, id, status string) *store.Job {
 	return j
 }
 
+// newRequest is httptest.NewRequest addressed to localhost (its default Host is example.com).
+func newRequest(method, path string) *http.Request {
+	r := httptest.NewRequest(method, path, nil)
+	r.Host = "localhost"
+	return r
+}
+
 // do sends one request with the given bearer token ("" = no Authorization header).
 func (f *fixture) do(t *testing.T, method, path, token string) (*http.Response, []byte) {
 	t.Helper()
 	f.now = f.now.Add(time.Second)
-	r := httptest.NewRequest(method, path, nil)
+	r := newRequest(method, path)
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -114,8 +121,8 @@ func TestOffByDefault(t *testing.T) {
 	if m.Cfg.HTTPAPI.Enabled {
 		t.Fatal("http_api enabled without config")
 	}
-	if m.Cfg.HTTPAPI.Listen != jobs.DefaultHTTPAPIListen {
-		t.Fatalf("listen %q, want default %q", m.Cfg.HTTPAPI.Listen, jobs.DefaultHTTPAPIListen)
+	if want := filepath.Join(m.StateDir, "http-api.sock"); m.Cfg.HTTPAPI.Listen != "" || m.Cfg.HTTPAPIListen(m.StateDir) != want {
+		t.Fatalf("listen %q (%q), want the default socket %q", m.Cfg.HTTPAPI.Listen, m.Cfg.HTTPAPIListen(m.StateDir), want)
 	}
 	if err := Serve(context.Background(), m, "v"); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("Serve with the API off: %v, want ErrDisabled", err)
@@ -166,7 +173,7 @@ func TestUnauthorized(t *testing.T) {
 		}
 	}
 	// Another scheme with the right value is refused.
-	r := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	r := newRequest(http.MethodGet, "/v1/health")
 	r.Header.Set("Authorization", "Basic "+f.token)
 	w := httptest.NewRecorder()
 	f.api.ServeHTTP(w, r)
@@ -314,8 +321,8 @@ func TestJobGet(t *testing.T) {
 	if out["id"] != j.ID || out["status"] != store.StatusFailed {
 		t.Fatalf("job %v", out)
 	}
-	if e, _ := out["error"].(string); !strings.Contains(e, "<repo>") {
-		t.Fatalf("error %q: the repository path is not masked", e)
+	if out["error_code"] != ErrUnknown || out["error_message"] != errorMessages[ErrUnknown] || out["error"] != nil {
+		t.Fatalf("error %v %v %v: want a code and its fixed message only", out["error_code"], out["error_message"], out["error"])
 	}
 	if _, ok := out["report"]; ok {
 		t.Fatal("report returned without ?report=1")
@@ -421,7 +428,7 @@ func TestRateLimit(t *testing.T) {
 	f.now = f.now.Add(time.Minute)
 	got429 := 0
 	for range RateBurst + 5 {
-		r := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+		r := newRequest(http.MethodGet, "/v1/health")
 		r.Header.Set("Authorization", "Bearer "+f.token)
 		w := httptest.NewRecorder()
 		f.api.ServeHTTP(w, r)
@@ -433,7 +440,7 @@ func TestRateLimit(t *testing.T) {
 		t.Fatalf("429s within one instant: %d, want 5", got429)
 	}
 	// Another client has its own bucket.
-	r := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	r := newRequest(http.MethodGet, "/v1/health")
 	r.RemoteAddr = "127.0.0.2:5555"
 	r.Header.Set("Authorization", "Bearer "+f.token)
 	w := httptest.NewRecorder()

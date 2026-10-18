@@ -109,12 +109,22 @@ type HTTPAPIConfig struct {
 	// Enabled starts the API inside the daemon. Default false.
 	Enabled bool `json:"enabled"`
 	// Listen is a loopback "ip:port" (127.0.0.0/8 or [::1]) or an absolute unix socket path.
-	// Empty = DefaultHTTPAPIListen.
+	// Empty = the unix socket <state>/http-api.sock (HTTPAPISocket).
 	Listen string `json:"listen"`
 }
 
-// DefaultHTTPAPIListen is the listen address of the HTTP API when http_api.listen is not set.
-const DefaultHTTPAPIListen = "127.0.0.1:7781"
+// HTTPAPISocket is the default listen address of the HTTP API: the unix socket <state>/http-api.sock,
+// inside the agent state dir (mode 700, owned by the agent user), so no other local user can bind
+// or reach it first.
+func HTTPAPISocket(stateDir string) string { return filepath.Join(stateDir, "http-api.sock") }
+
+// HTTPAPIListen is the address the HTTP API listens on: http_api.listen, or HTTPAPISocket.
+func (c Config) HTTPAPIListen(stateDir string) string {
+	if c.HTTPAPI.Listen != "" {
+		return c.HTTPAPI.Listen
+	}
+	return HTTPAPISocket(stateDir)
+}
 
 // ValidateHTTPListen accepts a loopback "ip:port" (an IP literal in 127.0.0.0/8 or ::1, port 0..65535)
 // or an absolute unix socket path; anything else (a wildcard, a LAN address, a host name) is refused.
@@ -259,11 +269,11 @@ func LoadConfig(stateDir string) (Config, error) {
 	if err := c.validateCodex(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
-	if c.HTTPAPI.Listen == "" {
-		c.HTTPAPI.Listen = DefaultHTTPAPIListen
-	}
-	if err := ValidateHTTPListen(c.HTTPAPI.Listen); err != nil {
-		return c, fmt.Errorf("config.json: %w", err)
+	// An empty listen is the default socket (HTTPAPISocket), resolved against the state dir when served.
+	if c.HTTPAPI.Listen != "" {
+		if err := ValidateHTTPListen(c.HTTPAPI.Listen); err != nil {
+			return c, fmt.Errorf("config.json: %w", err)
+		}
 	}
 	if c.LogArchiveDir == "" {
 		c.LogArchiveDir = filepath.Join(stateDir, "archive")

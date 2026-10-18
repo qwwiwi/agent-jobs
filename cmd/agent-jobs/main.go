@@ -455,6 +455,7 @@ func cmdStatus(args []string) error {
 		if err := printDaily(m); err != nil {
 			return err
 		}
+		printHTTPAPI(m)
 		return printUndelivered(m)
 	}
 	j, err := m.Store.Get(pos[0])
@@ -513,6 +514,19 @@ func printDaily(m *jobs.Manager) error {
 	return nil
 }
 
+// printHTTPAPI is the http api line of `status` without a job id, when http_api is enabled: where
+// it listens, or "http api not serving: <reason>".
+func printHTTPAPI(m *jobs.Manager) {
+	c, ok := m.HTTPAPICheck()
+	switch {
+	case !ok:
+	case c.OK:
+		fmt.Printf("http api:  %s\n", c.Detail)
+	default:
+		fmt.Println(c.Detail)
+	}
+}
+
 // printUndelivered is the end of `status` without a job id: notify_owner notifications of the last
 // 24 h that did not reach the session.
 func printUndelivered(m *jobs.Manager) error {
@@ -550,7 +564,7 @@ func cmdList(args []string) error {
 	}
 	defer m.Close()
 	if *asJSON {
-		out, err := httpapi.ListJobs(m, *status, *limit)
+		out, err := httpapi.ListJobs(context.Background(), m, *status, *limit)
 		if err != nil {
 			return err
 		}
