@@ -55,7 +55,8 @@ type SystemDoctorOutput struct {
 func addSystemDoctor(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "system_doctor",
-		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue, " +
+		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue " +
+			"(configured_max_running is the value this MCP server loaded from config.json at its start; the daemon's active cap is max_running in /v1/health), " +
 			"processes that outlived their job or session and running rows with a dead pid (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +

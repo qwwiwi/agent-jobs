@@ -32,7 +32,7 @@ A job is started with `job_start` (MCP) or `agent-jobs start` (CLI). Give it:
 
 ## Concurrency
 
-At most two jobs run per agent at a time; the rest wait in the queue and start on a later daemon tick (once a minute). Several coders can work on the same repository at once: every job gets its own git worktree, so they do not see each other's changes. Give parallel jobs work that will merge cleanly, or run them one after another.
+At most `max_running` jobs run per agent at a time (config.json, default two, 1..8); the rest wait in the queue and start on a later daemon tick (once a minute). Several coders can work on the same repository at once: every job gets its own git worktree, so they do not see each other's changes. Give parallel jobs work that will merge cleanly, or run them one after another.
 
 ## The pipeline
 
