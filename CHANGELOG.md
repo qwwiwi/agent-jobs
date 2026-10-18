@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `prune` takes the lifecycle lock per job (re-reading the row under it) instead of once for the whole pass, and stops between jobs when its context ends (`PruneContext`).
 
 ### Fixed
+- Skills: a catalog `index.json` whose informational fields (`origin`, `owner`, `last_verified`, `has_scripts`, `place`, `sha256`, `size_kb`, ...) have an unexpected type (e.g. `origin` as an object) no longer drops the whole root with «parse index.json: cannot unmarshal ...»: only `name`, `path`, `status`, `kinds`, `projects` and `risk` are typed, the informational fields are free-form (a non-string `origin`/`owner`/`last_verified` or a non-bool `has_scripts` reads as empty) and unknown fields are ignored; an entry malformed in a needed field (or not an object) is skipped with a warning naming its index and name in `status` and `system_doctor`, the other entries of the root still load.
 - `TestOuterWrapperHookOnlyInTestBuild` passes inside a job scope: there the release build refuses on the scope check first, and the test expects that message (outside a scope it still expects the wrapper refusal).
 - The daily run logs «previous daily run (<day>) still in progress, skipping» once per day when an earlier day's run (a hung step, an abandoned doctor procs scan) still holds the daily lock; before, the day was skipped silently.
 

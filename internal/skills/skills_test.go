@@ -458,3 +458,79 @@ func TestUnlinkUnreadableParentKeepsNames(t *testing.T) {
 		t.Fatalf("left %v err %v", left, err)
 	}
 }
+
+// writeRawIndex writes index.json as given and a SKILL.md for each name under skills/<name>.
+func writeRawIndex(t *testing.T, root, index string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		dir := filepath.Join(root, "skills", n)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, SkillFile), []byte("# "+n+"\n\nBody.\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, IndexFile), []byte(index), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadInformationalFieldsAreFreeForm(t *testing.T) {
+	root := t.TempDir()
+	writeRawIndex(t, root, `{"version": 1, "skills": [
+		{"name": "obj", "path": "skills/obj", "status": "core", "kinds": ["code"], "projects": [], "risk": [],
+		 "origin": {"host": "example.org", "path": "a/b"}, "owner": {"team": "x"}, "place": 3,
+		 "last_verified": "2026-10-01", "has_scripts": "yes", "sha256": "abc", "size_kb": "big", "extra": [1]},
+		{"name": "str", "path": "skills/str", "status": "active", "kinds": [], "projects": [], "risk": [],
+		 "origin": "upstream", "owner": "me", "has_scripts": true, "last_verified": 20261001},
+		{"name": "none", "path": "skills/none", "status": "active"}
+	]}`, "obj", "str", "none")
+	c := Load([]string{root})
+	if got := names(c); !slices.Equal(got, []string{"none", "obj", "str"}) {
+		t.Fatalf("entries %v, warnings %v", got, c.Warnings)
+	}
+	if len(c.Warnings) != 0 {
+		t.Fatalf("warnings %v", c.Warnings)
+	}
+	obj, _ := c.Lookup("obj")
+	if obj.Origin != "" || obj.Owner != "" || obj.HasScripts || obj.LastVerified != "2026-10-01" {
+		t.Fatalf("obj %+v", obj)
+	}
+	str, _ := c.Lookup("str")
+	if str.Origin != "upstream" || str.Owner != "me" || !str.HasScripts || str.LastVerified != "" {
+		t.Fatalf("str %+v", str)
+	}
+	none, _ := c.Lookup("none")
+	if none.Origin != "" || none.Kinds == nil || none.Risk == nil {
+		t.Fatalf("none %+v", none)
+	}
+}
+
+func TestLoadSkipsMalformedEntryKeepsRoot(t *testing.T) {
+	root := t.TempDir()
+	writeRawIndex(t, root, `{"version": 1, "skills": [
+		{"name": "good", "path": "skills/good", "status": "core", "kinds": ["code"], "projects": [], "risk": []},
+		{"name": "badkinds", "path": "skills/badkinds", "status": "core", "kinds": "code"},
+		{"name": "badrisk", "path": "skills/badrisk", "status": "core", "risk": {"level": 1}},
+		42,
+		{"name": {"x": 1}, "path": "skills/x", "status": "core"},
+		{"name": "also-good", "path": "skills/also-good", "status": "active"}
+	]}`, "good", "badkinds", "badrisk", "also-good")
+	c := Load([]string{root})
+	if got := names(c); !slices.Equal(got, []string{"also-good", "good"}) {
+		t.Fatalf("entries %v, warnings %v", got, c.Warnings)
+	}
+	if len(c.Roots) != 1 {
+		t.Fatalf("roots %v", c.Roots)
+	}
+	w := strings.Join(c.Warnings, "\n")
+	for _, want := range []string{`entry 1 ("badkinds")`, `entry 2 ("badrisk")`, "entry 3 (", "entry 4 (", "kinds", "risk"} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warnings %q lack %q", w, want)
+		}
+	}
+	if strings.Contains(w, "parse index.json") || len(c.Warnings) != 4 {
+		t.Fatalf("warnings %q", w)
+	}
+}
