@@ -296,6 +296,10 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
 			cut = len(body)
 		}
 		body, dropped = body[cut:], dropped+int64(cut)
+		// A key block whose BEGIN line was cut off: its body and END line go too.
+		if kept, n := redactHeadCutPEM(string(body)); n > 0 {
+			body = []byte(kept)
+		}
 		body = append([]byte(fmt.Sprintf("[... %d earlier bytes cut, last %d kept ...]\n", dropped, len(body))), body...)
 	}
 	if err := writeAtomic(filepath.Join(jobDir, AcceptanceLog), body); err != nil {
@@ -418,7 +422,8 @@ func (t *tailBuffer) Bytes() []byte { return append([]byte(nil), t.buf...) }
 // ReadAcceptanceLogTail returns the end of <stateDir>/jobs/<id>/acceptance.log, at most max bytes, as
 // valid UTF-8 with secret-looking values redacted (like report.md: at most acceptanceReadCap bytes
 // are read, and the text is redacted before it is cut to max; a line cut at the start of the read or
-// of the tail is dropped whole, so no part of a value split by a cut is shown). The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
+// of the tail is dropped whole, so no part of a value split by a cut is shown, and what such a cut
+// left of a PEM key block, its body and END line, is redacted). The job dir is writable by the job, so the log is opened like report.md (OpenJobFile: never
 // following a symlinked jobs or job dir or log, and only a regular file of this user with one link).
 func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 	f, size, err := OpenJobFile(stateDir, id, AcceptanceLog, os.Getuid())
@@ -438,7 +443,7 @@ func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 	}
 	s := strings.ToValidUTF8(string(b), "�")
 	if off > 0 {
-		s = dropFirstLine(s)
+		s, _ = redactHeadCutPEM(dropFirstLine(s))
 	}
 	s = RedactText(s)
 	if cut := int64(len(s)) - max; cut > 0 {
@@ -447,6 +452,7 @@ func ReadAcceptanceLogTail(stateDir, id string, max int64) (string, error) {
 		if head != '\n' {
 			s = dropFirstLine(s)
 		}
+		s, _ = redactHeadCutPEM(s)
 	}
 	return s, nil
 }

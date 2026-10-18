@@ -27,6 +27,18 @@ type redactRule struct {
 	group int
 }
 
+// pemBeginRe and pemEndRe are the header and footer lines of a PEM private key block (PKCS#1/#8,
+// EC, OPENSSH, ENCRYPTED, ...) and of an armored PGP private key block.
+const (
+	pemBeginRe = `-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`
+	pemEndRe   = `-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----`
+)
+
+var (
+	pemBegin = regexp.MustCompile(pemBeginRe)
+	pemEnd   = regexp.MustCompile(pemEndRe)
+)
+
 // redactRules run in this order: the specific token formats first, the generic key=value last, so a
 // value already replaced by a specific rule ("[redacted:...]") is not matched again (values never
 // contain '['). All are RE2 (linear time), and a variable-length value is matched whole (no upper
@@ -35,9 +47,9 @@ type redactRule struct {
 // A boundary before a value is a captured class (RE2 has no lookaround) outside the secret group,
 // and none is matched after it, so two values one separator apart are both found.
 var redactRules = []redactRule{
-	{"private-key", regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----`), 0},
+	{"private-key", regexp.MustCompile(pemBeginRe + `[\s\S]*?` + pemEndRe), 0},
 	// A key block cut off before its END line: the header and the base64 lines after it.
-	{"private-key", regexp.MustCompile(`-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----(?:\r?\n[A-Za-z0-9+/=:\- ]+)*`), 0},
+	{"private-key", regexp.MustCompile(pemBeginRe + `(?:\r?\n[A-Za-z0-9+/=:\- ]+)*`), 0},
 	{"anthropic", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}`), 0},
 	{"openai", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`), 0},
 	{"github", regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`), 0},
@@ -67,6 +79,9 @@ func Redact(s string) (string, int) {
 // followed it, replaced by a note (and counted as one redaction).
 func redactScanned(s string, unscanned int64) (string, int) {
 	n := 0
+	if unscanned > 0 {
+		s, n = redactTailCutPEM(s)
+	}
 	for _, r := range redactRules {
 		var k int
 		s, k = r.apply(s)
@@ -96,6 +111,46 @@ func lineCut(s string) int {
 	return strings.LastIndexByte(s, '\n') + 1
 }
 
+// A cut can split a PEM private key block, and dropping the partial line at the cut may take its
+// header or footer with it: what is left (base64 lines and the other marker) matches no rule. So a
+// text cut at its end loses everything from a BEGIN line with no END line after it, and a text cut
+// at its start everything up to an END line with no BEGIN line before it; both become
+// [redacted:private-key]. A complete block is left to Redact.
+
+// redactTailCutPEM redacts a text cut at its end (more followed): from the first BEGIN line after
+// the last END line (a block whose END was cut off) to the end of the text.
+func redactTailCutPEM(s string) (string, int) {
+	from := 0
+	if ends := pemEnd.FindAllStringIndex(s, -1); len(ends) > 0 {
+		from = ends[len(ends)-1][1]
+	}
+	b := pemBegin.FindStringIndex(s[from:])
+	if b == nil {
+		return s, 0
+	}
+	return s[:from+b[0]] + "[redacted:private-key]\n", 1
+}
+
+// redactHeadCutPEM redacts a text cut at its start (more preceded it): from the start through the
+// last END line before the first BEGIN line (a block whose BEGIN was cut off), that whole line.
+func redactHeadCutPEM(s string) (string, int) {
+	to := len(s)
+	if b := pemBegin.FindStringIndex(s); b != nil {
+		to = b[0]
+	}
+	ends := pemEnd.FindAllStringIndex(s[:to], -1)
+	if len(ends) == 0 {
+		return s, 0
+	}
+	end := ends[len(ends)-1][1]
+	if i := strings.IndexByte(s[end:], '\n'); i >= 0 {
+		end += i
+	} else {
+		end = len(s)
+	}
+	return "[redacted:private-key]" + s[end:], 1
+}
+
 // RedactText is Redact without the count.
 func RedactText(s string) string {
 	out, _ := Redact(s)
@@ -104,10 +159,11 @@ func RedactText(s string) string {
 
 // RedactRead redacts a text read up to a byte cap: when truncated (the file went on), the last
 // incomplete line is dropped whole first (all of the text when it has no line break), so a value cut
-// by the read cap is not shown in part.
+// by the read cap is not shown in part; a PEM key block cut off by it is redacted from its BEGIN line
+// on (redactTailCutPEM).
 func RedactRead(s string, truncated bool) string {
 	if truncated {
-		s = s[:lineCut(s)]
+		s, _ = redactTailCutPEM(s[:lineCut(s)])
 	}
 	return RedactText(s)
 }
