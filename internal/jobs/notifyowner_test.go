@@ -295,3 +295,47 @@ func TestTickProgressesWithStalledTmux(t *testing.T) {
 		t.Fatalf("queued job not launched in that tick: %s", s)
 	}
 }
+
+// tmuxArgDecode is tmux's handling of one command-line argument (cmd-parse.y,
+// cmd_parse_from_arguments): a final ';' is a command separator and dropped, unless a backslash
+// precedes it, which then becomes the ';'. sep reports a separator.
+func tmuxArgDecode(arg string) (s string, sep bool) {
+	if !strings.HasSuffix(arg, ";") {
+		return arg, false
+	}
+	arg = arg[:len(arg)-1]
+	if strings.HasSuffix(arg, `\`) {
+		return arg[:len(arg)-1] + ";", false
+	}
+	return arg, true
+}
+
+// Codex review (PR #23): a trailing ';' (or "\;") of the text survives tmux's argument parser, so the
+// session shows the text as sent.
+func TestTmuxTrailingSemicolon(t *testing.T) {
+	for _, s := range []string{"done;", `done\;`, "a; b", ";;", `x\\;`, "plain", "semi;colon", ";"} {
+		if got, sep := tmuxArgDecode(tmuxArgEscape(s)); sep || got != s {
+			t.Fatalf("%q: tmux reads %q (separator %v)", s, got, sep)
+		}
+	}
+	m := newManager(t)
+	now := fixedClock(m)
+	logf := notifyTo(t, m)
+	for _, text := range []string{"deploy done;", `path ends in \;`} {
+		if n, err := m.NotifyOwner("", text, ""); err != nil || !n.Delivered {
+			t.Fatalf("%q: %+v %v", text, n, err)
+		}
+		*now = now.Add(time.Minute)
+	}
+	b, err := os.ReadFile(logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `send-keys|-t|fake-session|-l|[jobs:notify-owner] deploy done\;|` + "\n" +
+		"send-keys|-t|fake-session|Enter|\n" +
+		`send-keys|-t|fake-session|-l|[jobs:notify-owner] path ends in \\;|` + "\n" +
+		"send-keys|-t|fake-session|Enter|\n"
+	if string(b) != want {
+		t.Fatalf("tmux argv:\n%s\nwant:\n%s", b, want)
+	}
+}

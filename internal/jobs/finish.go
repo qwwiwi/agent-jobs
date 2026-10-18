@@ -120,7 +120,7 @@ func (m *Manager) notifyPending() error {
 // on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its
 // end the call's process group is killed and errTmuxTimeout returned.
 func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
-	line = Printable(line, 0)
+	line = tmuxArgEscape(Printable(line, 0))
 	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
 		return fmt.Errorf("tmux send-keys: %w", err)
 	}
@@ -128,6 +128,19 @@ func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
 		return fmt.Errorf("tmux send-keys Enter: %w", err)
 	}
 	return nil
+}
+
+// tmuxArgEscape keeps a final ';' of an argument literal. tmux parses its command-line arguments
+// for command separators (cmd-parse.y, cmd_parse_from_arguments): an argument ending in ';' ends a
+// command there and loses that ';', except when it ends in "\;", which becomes ';' (tmux(1),
+// PARSING SYNTAX: a trailing semicolon meant as an argument is escaped for tmux). Only the final
+// character is looked at, once, so a backslash before a final ';' is all it takes: "a;" is sent as
+// "a\;" (typed "a;") and "a\;" as "a\\;" (typed "a\;"). A ';' anywhere else is literal already.
+func tmuxArgEscape(s string) string {
+	if strings.HasSuffix(s, ";") {
+		return s[:len(s)-1] + `\;`
+	}
+	return s
 }
 
 // runTmux runs one tmux command within ctx, in a process group of its own that is killed when ctx
