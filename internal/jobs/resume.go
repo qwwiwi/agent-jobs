@@ -303,7 +303,7 @@ func (m *Manager) checkEscaped(id string) error {
 	add := func(pid int, cmd string) {
 		if !seen[pid] {
 			seen[pid] = true
-			live = append(live, fmt.Sprintf("pid %d %s", pid, Printable(cmd, 80)))
+			live = append(live, fmt.Sprintf("pid %d %s", pid, RedactPrintable(cmd, 80)))
 		}
 	}
 	for _, g := range rep.Ghosts {
@@ -340,7 +340,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	}
 	defer unlockAdmit()
 	msg := "stopped by the orchestrator"
-	if r := Printable(reason, 500); r != "" {
+	if r := RedactPrintable(reason, 500); r != "" {
 		msg += ": " + r
 	}
 	now := m.Now()
@@ -387,7 +387,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 	}
-	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, Printable(msg, 800), now); err != nil {
+	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, RedactPrintable(msg, 800), now); err != nil {
 		return nil, err
 	}
 	// Only now (the row is no longer running) does a process left in the job's session count as a
@@ -892,7 +892,7 @@ func (m *Manager) previousAttempt(j *store.Job, dir string) string {
 	a := atts[len(atts)-1]
 	fmt.Fprintf(&b, "Attempt %d of this job ended %s after %d turns", a.N, a.Status, a.Turns)
 	if a.Error != "" {
-		fmt.Fprintf(&b, " (%s)", Printable(a.Error, 300))
+		fmt.Fprintf(&b, " (%s)", RedactPrintable(a.Error, 300))
 	}
 	b.WriteString(".\n\n")
 	if rep, err := readSmall(filepath.Join(dir, AttemptReportName(a.N)), maxPrevReportBytes); err == nil && strings.TrimSpace(rep) != "" {

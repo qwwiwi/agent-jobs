@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -17,9 +16,6 @@ import (
 // backtracking; what lies past the cap is not shown at all (it could not be checked). redactReport
 // never reads more than this (plus one byte) of a report.
 const MaxRedactBytes = 4 << 20
-
-// cutWindow is how far back from a cut a line break is looked for (see scanCut).
-const cutWindow = 64 << 10
 
 // RawReportName is the unredacted copy of report.md, kept (0600) only with keep_raw_reports.
 const RawReportName = "report.raw.md"
@@ -91,28 +87,13 @@ func scanCut(s string, max int) int {
 	return lineCut(s[:max])
 }
 
-// lineCut is where a text cut at its end (more followed) is cut back to: right after the last line
-// break in its last cutWindow bytes (no secret format but a PEM block spans lines, and a cut-off PEM
-// block has its own rule), else before a trailing incomplete rune. So a value is not split into a
-// scanned or shown prefix too short to match and an unscanned rest.
+// lineCut is where a text cut at its end (more followed) is cut back to: right after its last line
+// break, however far back that is, and 0 when it has none (the whole text is one incomplete line).
+// The incomplete final line is always dropped whole: a value split by the cut would leave a prefix
+// too short to match its format but long enough to be useful (no secret format but a PEM block spans
+// lines, and a cut-off PEM block has its own rule).
 func lineCut(s string) int {
-	lo := len(s) - cutWindow
-	if lo < 0 {
-		lo = 0
-	}
-	if i := strings.LastIndexByte(s[lo:], '\n'); i >= 0 {
-		return lo + i + 1
-	}
-	cut := len(s)
-	for i := len(s) - 1; i >= 0 && i >= len(s)-utf8.UTFMax; i-- {
-		if utf8.RuneStart(s[i]) {
-			if !utf8.FullRuneInString(s[i:]) {
-				cut = i
-			}
-			break
-		}
-	}
-	return cut
+	return strings.LastIndexByte(s, '\n') + 1
 }
 
 // RedactText is Redact without the count.
@@ -122,12 +103,20 @@ func RedactText(s string) string {
 }
 
 // RedactRead redacts a text read up to a byte cap: when truncated (the file went on), the last
-// partial line is dropped first, so a value cut by the read cap is not shown in part.
+// incomplete line is dropped whole first (all of the text when it has no line break), so a value cut
+// by the read cap is not shown in part.
 func RedactRead(s string, truncated bool) string {
 	if truncated {
 		s = s[:lineCut(s)]
 	}
 	return RedactText(s)
+}
+
+// RedactPrintable is Printable(s, max) for job-derived text: redacted before it is cut to max runes,
+// since a value cut short no longer matches its format, and again after Printable (dropped control
+// characters may join the parts of a value).
+func RedactPrintable(s string, max int) string {
+	return Printable(RedactText(Printable(RedactText(s), 0)), max)
 }
 
 func (r redactRule) apply(s string) (string, int) {

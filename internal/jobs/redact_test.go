@@ -349,3 +349,104 @@ func TestRedactReadTruncated(t *testing.T) {
 		t.Fatalf("whole: %q", out)
 	}
 }
+
+// Job-derived text is redacted before it is cut: a token cut by the cap to fewer characters than its
+// format needs would otherwise be stored and shown almost whole.
+func TestRedactBeforeCut(t *testing.T) {
+	tok := "ghp_" + rep("Q", 36)
+	// The token starts 29 runes before the cut (at max-1, then "…"): 25 of its characters survive the cut.
+	msg := rep("a", 269) + " " + tok + " tail"
+	if out := RedactPrintable(msg, 300); strings.Contains(out, rep("Q", 10)) {
+		t.Fatalf("RedactPrintable leaked a cut token: %q", out[250:])
+	}
+	// Control characters dropped by Printable cannot join a value's parts after the redaction.
+	if out := RedactPrintable("ghp_"+rep("Q", 20)+"\x00"+rep("Q", 20), 0); strings.Contains(out, rep("Q", 10)) {
+		t.Fatalf("joined token left: %q", out)
+	}
+	status, out := scopeStopFailed(store.StatusTimeout, msg, errors.New("unit busy"))
+	if status != store.StatusTimeout || strings.Contains(RedactText(out), rep("Q", 10)) {
+		t.Fatalf("timeout message: %s %q", status, out)
+	}
+	status, out = scopeStopFailed(store.StatusSucceeded, "", errors.New(rep("e", 200)+" "+tok))
+	if status != store.StatusFailed || strings.Contains(RedactText(out), rep("Q", 10)) {
+		t.Fatalf("failed message: %s %q", status, out)
+	}
+	j := &store.Job{ID: "id", Title: rep("t", 100) + " " + tok, Status: store.StatusSucceeded}
+	if l := DoneLine(j); strings.Contains(l, rep("Q", 10)) {
+		t.Fatalf("done line leaked a cut title token: %q", l)
+	}
+}
+
+// A text cut at a cap always loses its whole incomplete final line, however long; with no line break
+// at all nothing of it is kept.
+func TestRedactReadDropsWholePartialLine(t *testing.T) {
+	tok := "ghp_" + rep("Q", 25) // what is left of a 40-character token cut by the read cap
+	for _, c := range []struct{ name, in, want string }{
+		{"no newline", "API_KEY=" + rep("k", 10), ""},
+		{"no newline, long", rep("a", 100<<10) + " " + tok, ""},
+		{"final line past 64 KiB", "## Summary\nok\n" + rep("a", 70<<10) + " " + tok, "## Summary\nok\n"},
+	} {
+		if out := RedactRead(c.in, true); out != c.want {
+			t.Errorf("%s: kept %d bytes %q…, want %q", c.name, len(out), out[:min(len(out), 40)], c.want)
+		}
+	}
+}
+
+// An oversized text or report whose last line before the scan cap is longer than 64 KiB and holds a
+// token straddling the cap: the whole line goes, nothing of the token is shown.
+func TestRedactOversizedStraddlingToken(t *testing.T) {
+	head := "## Summary\nok\n"
+	tok := "ghp_" + rep("Q", 40)
+	pad := MaxRedactBytes - len(head) - 4 - 25 - 1 // 25 token characters before the cap
+	big := head + rep("a", pad) + " " + tok + "\nafter\n"
+	out, _ := Redact(big)
+	if strings.Contains(out, rep("Q", 10)) || !strings.HasPrefix(out, head+"\n[redacted:unscanned") {
+		t.Fatalf("Redact: %d bytes, head %q", len(out), out[:min(len(out), 80)])
+	}
+	m := newManager(t)
+	dir := m.JobDir("big")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(p, []byte(big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.redactReport("big"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if strings.Contains(string(b), rep("Q", 10)) || !strings.HasPrefix(string(b), head+"\n[redacted:unscanned") {
+		t.Fatalf("report.md: %d bytes, head %q", len(b), b[:min(len(b), 80)])
+	}
+	// No line break at all before the cap: only the note is left.
+	if out, _ := Redact(rep("a", MaxRedactBytes-29) + " " + tok); strings.Contains(out, "aaaa") || !strings.HasPrefix(out, "\n[redacted:unscanned") {
+		t.Fatalf("no line break: %d bytes, head %q", len(out), out[:min(len(out), 80)])
+	}
+}
+
+// The archive never holds an unredacted report: a report whose in-place redaction is still pending
+// (here: never done) is redacted on the fly into the archive, earlier attempts' reports too.
+func TestArchiveRedactsPendingReport(t *testing.T) {
+	m := newManager(t)
+	now := time.Now()
+	m.Now = func() time.Time { return now }
+	old := now.Add(-49 * time.Hour)
+	insertJob(t, m, "old", store.StatusSucceeded, &old, nil)
+	dir := m.JobDir("old")
+	fillJobDir(t, dir, t.TempDir())
+	tok := "ghp_" + rep("Q", 36)
+	writeFile(t, filepath.Join(dir, "report.md"), []byte("## Summary\nused "+tok+"\n"), 0o600)
+	writeFile(t, filepath.Join(dir, AttemptReportName(1)), []byte("## Summary\nfirst "+tok+"\n"), 0o600)
+	rep0, err := m.Archive(false)
+	if err != nil || len(rep0.Jobs) != 1 {
+		t.Fatalf("archive: %+v %v", rep0, err)
+	}
+	dest := rep0.Jobs[0].Dest
+	for _, name := range []string{"report.md", AttemptReportName(1)} {
+		b, err := os.ReadFile(filepath.Join(dest, name))
+		if err != nil || strings.Contains(string(b), "ghp_") || !strings.Contains(string(b), "[redacted:github]") {
+			t.Fatalf("archived %s: %q %v", name, b, err)
+		}
+	}
+}

@@ -773,12 +773,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	if err := m.endScope(j); err != nil {
 		// Fail closed: the job is over for the daemon, but it must not count as a clean finish.
 		m.Log.Printf("job %s: %s", j.ID, RedactText(err.Error()))
-		note := ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
-		if status == store.StatusTimeout {
-			msg = Printable(msg+"; "+note, 300)
-		} else {
-			status, msg = store.StatusFailed, Printable(note, 300)
-		}
+		status, msg = scopeStopFailed(status, msg, err)
 	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
@@ -790,6 +785,17 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
+}
+
+// scopeStopFailed is the status and message of an attempt whose scope could not be stopped: a timeout
+// stays a timeout, anything else fails. The message (the job's own text, the error) is redacted
+// before it is cut.
+func scopeStopFailed(status, msg string, err error) (string, string) {
+	note := ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
+	if status == store.StatusTimeout {
+		return status, RedactPrintable(msg+"; "+note, 300)
+	}
+	return store.StatusFailed, RedactPrintable(note, 300)
 }
 
 // noteSweep appends the sweep's note (if any) to a job that is no longer running.
@@ -852,7 +858,7 @@ func (m *Manager) sweepEscaped(id string) string {
 		if g.KillError != "" {
 			why = g.KillError
 		}
-		left = append(left, fmt.Sprintf("pid %d %s (%s)", g.PID, Printable(g.Cmdline, 80), why))
+		left = append(left, fmt.Sprintf("pid %d %s (%s)", g.PID, RedactPrintable(g.Cmdline, 80), why))
 	}
 	if len(left) > 0 {
 		notes = append(notes, "left running: "+strings.Join(left, ", ")+"; see doctor procs")
@@ -960,7 +966,7 @@ func (m *Manager) Cancel(id string) error {
 	msg := "cancelled"
 	if err := m.endScope(j); err != nil {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
-		msg = Printable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
+		msg = RedactPrintable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
 	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		return err
