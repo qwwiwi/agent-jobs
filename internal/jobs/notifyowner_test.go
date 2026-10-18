@@ -296,26 +296,25 @@ func TestTickProgressesWithStalledTmux(t *testing.T) {
 	}
 }
 
-// tmuxArgDecode is tmux's handling of one command-line argument (cmd-parse.y,
-// cmd_parse_from_arguments): a final ';' is a command separator and dropped, unless a backslash
-// precedes it, which then becomes the ';'. sep reports a separator.
-func tmuxArgDecode(arg string) (s string, sep bool) {
-	if !strings.HasSuffix(arg, ";") {
-		return arg, false
-	}
-	arg = arg[:len(arg)-1]
-	if strings.HasSuffix(arg, `\`) {
-		return arg[:len(arg)-1] + ";", false
-	}
-	return arg, true
-}
-
-// Codex review (PR #23): a trailing ';' (or "\;") of the text survives tmux's argument parser, so the
-// session shows the text as sent.
+// Codex review (PR #23) and control review: a trailing ';' of the text never reaches tmux as the
+// argument's final byte, whatever backslashes precede it (tmux 3.4 types "a\\;" as "a;", so
+// backslash escaping is not reliable); a single space is appended instead and nothing else changes.
 func TestTmuxTrailingSemicolon(t *testing.T) {
-	for _, s := range []string{"done;", `done\;`, "a; b", ";;", `x\\;`, "plain", "semi;colon", ";"} {
-		if got, sep := tmuxArgDecode(tmuxArgEscape(s)); sep || got != s {
-			t.Fatalf("%q: tmux reads %q (separator %v)", s, got, sep)
+	for _, c := range []struct{ in, want string }{
+		{"done;", "done; "},
+		{`done\;`, `done\; `},
+		{`x\\;`, `x\\; `},
+		{`x\\\;`, `x\\\; `},
+		{";;", ";; "},
+		{";", "; "},
+		{"a; b", "a; b"},
+		{"semi;colon", "semi;colon"},
+		{"plain", "plain"},
+		{`ends in \`, `ends in \`},
+		{"", ""},
+	} {
+		if got := tmuxArgEscape(c.in); got != c.want {
+			t.Fatalf("%q: sent as %q, want %q", c.in, got, c.want)
 		}
 	}
 	m := newManager(t)
@@ -331,9 +330,9 @@ func TestTmuxTrailingSemicolon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `send-keys|-t|fake-session|-l|[jobs:notify-owner] deploy done\;|` + "\n" +
+	want := `send-keys|-t|fake-session|-l|[jobs:notify-owner] deploy done; |` + "\n" +
 		"send-keys|-t|fake-session|Enter|\n" +
-		`send-keys|-t|fake-session|-l|[jobs:notify-owner] path ends in \\;|` + "\n" +
+		`send-keys|-t|fake-session|-l|[jobs:notify-owner] path ends in \; |` + "\n" +
 		"send-keys|-t|fake-session|Enter|\n"
 	if string(b) != want {
 		t.Fatalf("tmux argv:\n%s\nwant:\n%s", b, want)
