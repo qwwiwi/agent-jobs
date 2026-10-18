@@ -59,7 +59,6 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
 
 - **Heartbeat.** The daemon decides whether to wake the agent for its own goals: a cheap Go check (time, daily limit, night), then a small model decides (DEVIATIONS #1). *Status: not built.*
 - **«Owner waits» Stop hook.** A job started at the owner's request is marked; until the orchestrator has written to the owner, a Stop hook does not let the session end its turn silently. *Status: built, unreleased; `internal/jobs/ownerwaits.go`, `internal/store/ownerwaits.go`, `internal/mcp/tools_ownerwaits.go`.* `job_start` `owner_waits` / `agent-jobs start --owner-waits` (store column `owner_waits`); the job-done line ends with `· owner waits`, and the finished job records «owner reply pending» before that line is delivered (table `owner_pending`, marked delivered in the same transaction as `notified_at`); `agent-jobs hook bind --agent A` (SessionStart) binds the orchestrator session, and `agent-jobs hook stop --agent A`, its Stop hook, blocks only that session, once per turn while a record is pending (never with `stop_hook_active`, fails open, also on incomplete input); the orchestrator tool `owner_replied` (job id or all) clears it; a record expires after `owner_waits_max_hours` (default 6); `agent-jobs status` and `system_doctor` show pending ones.
-- **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. To be built switched off; turning it on (real money) needs its own owner «да». *Status: not built (only a `billing` column, always `subscription`).*
 - **Read-only HTTP API** for a jobs dashboard (DEVIATIONS #8). *Status: built, unreleased; `internal/httpapi`.* Off by default (`http_api.enabled`), loopback or unix socket only, bearer token `<state>/http-api.token` (`agent-jobs http-api token --rotate`) on every endpoint; GET only: `/v1/health`, `/v1/jobs`, `/v1/jobs/{id}` (`?report=1`, 64 KB cap), `/v1/stats`, `/v1/schedules`; no briefs, prompts, env, config or paths outside the agent state; server timeouts, 8 KB headers, 10 requests/s per client.
 - **Acceptance from a clean clone.** The whole install and a test job are replayed from a fresh clone before a release. *Status: not built.*
 - **Autopilot items 23-27:** risky-first review, a Progress section in reports, a job size check, secret redaction in reports and logs, an `acceptance_cmd` a job must pass.
@@ -67,6 +66,12 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
   - **Secret redaction.** *Status: built, unreleased; `internal/jobs/redact.go`.* Known token formats (Anthropic, OpenAI, GitHub, Slack, AWS, Google, Telegram bot, JWT, PEM private keys, `Bearer`, generic `token|secret|password|passwd|api_key = <16+ chars>`) become `[redacted:<kind>]` in `report.md` (in place when the job ends; `keep_raw_reports: true` keeps a 0600 `report.raw.md`), the job-done line, `job_result` and `agent-jobs result`, the stats row and the previous-attempt excerpts of a resumed brief. RE2 only, scan capped at 4 MiB.
   - **Progress section.** *Status: built, unreleased; `prompts/report-contract.md`, `internal/jobs/report.go`.* The report contract asks for `## Progress` (one timestamped line per step) after «Not done / uncertain»; `job_result` returns `not_done` and `progress`, `agent-jobs result` prints those two sections first. A missing section is not an error.
   - **Job size check.** *Status: built, unreleased; `internal/jobs/briefsize.go`.* `job_start` (and schedules with a kind) refuse a brief above `max_brief_bytes` (default 32 KB); `size_warning` in the `job_start` result when the brief names more than `brief_warn_files` files (default 40) or has more than `brief_warn_headings` `## ` headings (default 8).
+
+## Deferred by the owner
+
+Not in the current release scope; kept in the plan with its description.
+
+- **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. To be built switched off; turning it on (real money) needs its own owner «да». *Status: deferred by the owner 2026-10-18, not built (see [DECISIONS.md](DECISIONS.md)): «we will do it later»; it stays in the plan, not in the current release. Only a `billing` column exists, always `subscription`.*
 
 ## Wave E: borrowed ideas (planned; E2 approved and built)
 
@@ -110,6 +115,8 @@ Ideas recorded for later; none is approved or scheduled. Each needs an owner go 
   - Why: some failures are capability limits, not bad luck. Lives in: daemon retry policy. Source: Autopilot, phases/5-subagents.md, 6-review.md.
 - I7. Leave time spent waiting for the owner out of job_stats durations.
   - Why: durations then measure work, not owner latency. Lives in: job_stats. Source: Autopilot, phases/8-final.md.
+- I8. Allow `Monitor` in jobs once its command goes through the same guard checks as a Bash command (and a WebSocket monitor is refused or checked). Today it is refused: it runs its own command outside the Bash guard (CONFORMANCE U1).
+  - Why: job history shows jobs reaching for `Monitor` (11 calls) and `ScheduleWakeup` (12) to wait for builds; a checked `Monitor` would give them a native wait. `ScheduleWakeup` stays refused (the daemon owns a job's lifetime). Lives in: `internal/guard/toolallow.go`, `internal/jobs/prepare.go`. Source: Codex review of the U1 fix, 2026-10-18.
 
 Source for all: the public "Autopilot" skill, https://github.com/nick-vels/skills (skills/autopilot, version 2.x, read 2026-10-18), files phases/1-manifest.md, 2-briefing.md, 4-plan.md, 5-subagents.md, 6-review.md, 8-final.md, 9-memory.md, prompts/executor.md, prompts/review.md.
 
