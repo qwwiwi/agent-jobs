@@ -155,7 +155,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_start",
 		Description: "Queue a background claude -p job (or codex exec: a gpt-* model or runner codex) and return its id immediately. The daemon starts it within a minute " +
-			"(at most 2 running per agent). The job commits locally only; it never pushes or messages anyone. " +
+			"(at most max_running per agent run at once: config.json key max_running, default 2). The job commits locally only; it never pushes or messages anyone. " +
 			"State an explicit model or a complexity (light|normal|hard); with neither the call is rejected. " +
 			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {

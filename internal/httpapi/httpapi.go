@@ -516,6 +516,8 @@ type HealthOutput struct {
 	UptimeSec int64  `json:"uptime_sec"`
 	Running   int    `json:"running"`
 	Queued    int    `json:"queued"`
+	// MaxRunning is the effective cap on running jobs (config max_running, default 2).
+	MaxRunning int `json:"max_running"`
 	// Heartbeat is the heartbeat state without the goals file (neither its path nor its text) and
 	// without the model's reason.
 	Heartbeat HeartbeatView `json:"heartbeat"`
@@ -560,7 +562,8 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, HealthOutput{Version: capField(a.version), StartedAt: a.started.UTC().Format(time.RFC3339),
-		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued, Heartbeat: heartbeatView(hb)})
+		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued, MaxRunning: a.m.Cfg.MaxRunningJobs(),
+		Heartbeat: heartbeatView(hb)})
 }
 
 // JobView is one job as the API (and `agent-jobs list --json`) shows it: the job row without its brief,

@@ -131,11 +131,13 @@ type QueueStatus struct {
 	Running        int `json:"running"`
 	PendingNotify  int `json:"pending_notify"`
 	PendingCleanup int `json:"pending_cleanup"`
+	// MaxRunning is the effective cap on running jobs (config max_running, default 2).
+	MaxRunning int `json:"max_running"`
 }
 
 // Queue reports the queue.
 func (m *Manager) Queue() (QueueStatus, error) {
-	var q QueueStatus
+	q := QueueStatus{MaxRunning: m.Cfg.MaxRunningJobs()}
 	for _, c := range []struct {
 		n *int
 		f func() ([]*store.Job, error)

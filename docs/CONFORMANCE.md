@@ -15,7 +15,7 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | «calls the MCP tool `job_start` with a title, a kind of work and a brief» | 1:1 (+ required model or complexity: deviation #6) | `internal/mcp/tools_jobs.go:156`, `internal/jobs/manager.go:222-230` |
 | «returns an id at once … goes into a queue in SQLite» | 1:1 | `internal/jobs/manager.go:306` (`Status: store.StatusQueued`), `internal/store/store.go:176` |
 | «Once a minute the daemon» | 1:1 | `internal/jobs/config.go:36` (`TickInterval = time.Minute`), `cmd/agent-jobs/main.go:1031` |
-| «at most two jobs per agent» | 1:1 | `internal/jobs/config.go:30` (`MaxRunningPerAgent = 2`), `internal/jobs/manager.go:406` |
+| «at most two jobs per agent» | deviation #27 (configurable `max_running`, default 2) | `internal/jobs/config.go` (`DefaultMaxRunningPerAgent = 2`, `CeilingMaxRunningPerAgent = 8`, config `max_running`), `internal/jobs/manager.go` (`launchQueued`) |
 | Launch argv `claude -p --output-format stream-json --verbose --model M --max-turns N --max-budget-usd B --permission-mode bypassPermissions --settings … --setting-sources project --mcp-config … --strict-mcp-config --add-dir <jobdir> < prompt.md` | 1:1 flag by flag | `internal/jobs/manager.go:441-459`; stdin `internal/jobs/wrapper.go:406` |
 | «`--no-session-persistence`» | deviation #15 (`--session-id`, `--resume`) | `internal/jobs/manager.go:441-459` |
 | Second runner | deviation #5 (`codex exec`) | `internal/jobs/codex.go` |
