@@ -408,3 +408,62 @@ func TestRedactPEMDecoratedMarkers(t *testing.T) {
 		t.Errorf("escaped: %q", out)
 	}
 }
+
+// An armored PGP key whose BEGIN line a cut took: armor headers, a blank line, full body lines, a
+// short last one and the checksum line ("=Ab12") right above the END line. The short last line does
+// not end the body run when the checksum line (or a blank line) follows it.
+func TestRedactPEMOrphanPGPChecksum(t *testing.T) {
+	g := newTestPEM("PGP PRIVATE KEY BLOCK", "Version: GnuPG v2", "Comment: test key", "")
+	lines := strings.Split(g.text, "\n")
+	end := lines[len(lines)-1]
+	body := strings.Join(lines[1:len(lines)-1], "\n")
+	for name, orphan := range map[string]string{
+		"crc":             body + "\n=Ab12\n" + end,
+		"blank crc":       body + "\n\n=Ab12\n" + end,
+		"crc blank":       body + "\n=Ab12\n\n" + end,
+		"crc crlf":        strings.ReplaceAll(body+"\n=Ab12\n"+end, "\n", "\r\n"),
+		"crc indented":    "  " + strings.ReplaceAll(body+"\n=Ab12\n"+end, "\n", "\n  "),
+		"no headers, crc": strings.Join(g.body, "\n") + "\n=Ab12\n" + end,
+	} {
+		for bname, before := range map[string]string{
+			"prose":    "prose line\n",
+			"cut note": "[... 4096 earlier bytes cut]\n",
+		} {
+			in := before + orphan + "\nafter\n"
+			if out := RedactText(in); g.leaks(out) || !strings.HasPrefix(out, before) ||
+				!strings.HasSuffix(out, "\nafter\n") || !strings.Contains(out, "[redacted:private-key]") {
+				t.Errorf("%s after %s: %q", name, bname, out)
+			}
+		}
+	}
+}
+
+// A decorated key block whose BEGIN line is gone: every body line (and header and blank line) carries
+// the same diff or quote prefix as its END line, with or without whitespace after it.
+func TestRedactPEMDecoratedOrphan(t *testing.T) {
+	for kname, p := range map[string]testPEM{
+		"rsa":     newTestPEM("RSA PRIVATE KEY"),
+		"rsa enc": newTestPEM("RSA PRIVATE KEY", "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0011AABB", ""),
+		"pgp":     newTestPEM("PGP PRIVATE KEY BLOCK", "Version: GnuPG v2", ""),
+	} {
+		lines := strings.Split(p.text, "\n")[1:]
+		for _, prefix := range []string{"> ", ">", ">> ", "# ", "#", "| ", "|", "* ", "*", "+ ", "+", "- ", "-", "+> ", "\t> ", ">\t"} {
+			deco := make([]string, len(lines))
+			for i, l := range lines {
+				deco[i] = prefix + l
+			}
+			orphan := strings.Join(deco, "\n")
+			for bname, before := range map[string]string{
+				"prose":    "prose line\n",
+				"cut note": "[... 4096 earlier bytes cut]\n",
+				"none":     "",
+			} {
+				in := before + orphan + "\nafter\n"
+				if out := RedactText(in); p.leaks(out) || !strings.HasPrefix(out, before) ||
+					!strings.HasSuffix(out, "\nafter\n") || !strings.Contains(out, "[redacted:private-key]") {
+					t.Errorf("%s prefix %q after %s: %q", kname, prefix, bname, out)
+				}
+			}
+		}
+	}
+}
