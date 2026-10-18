@@ -43,15 +43,17 @@ We do not publish an "N× cheaper" or "N× faster" figure yet, because we have n
 
 **Method.** The same task is run three ways: as a foreground subagent, as a background subagent, and as a job.
 
-- **Tokens:** sum `cache_read + input + output` from the parent session's JSONL plus the subagent sidechain, against the job's own JSONL (`stream.jsonl`) plus the parent's tokens for the job-done line and the report read.
+- **Tokens:** report `input`, `cache_creation`, `cache_read` and `output` (the usage fields `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`) separately, and their sum. Sources: the parent session's JSONL plus the subagent sidechain, against the job's own JSONL (`stream.jsonl`) plus the parent's tokens for the job-done line and the report read.
+- **Priced total (primary comparison):** the four fields times the list price of the model that ran them, each at its own rate (they are billed differently), in $ per run. For subscription runs it is an equivalent cost, not money spent.
+- **Acceptance:** the same acceptance check for all three modes; a run counts only if the task's check passes, so cost is compared on equal results.
 - **Wall time:** from start to a usable result.
 - **Parent busy:** minutes during which the parent session could not take another request.
 
-| Run | Task | Tokens (cache_read + input + output) | Wall time | Parent busy (min) | Notes |
-|---|---|---|---|---|---|
-| Foreground subagent | | | | | |
-| Background subagent | | | | | |
-| Job | | | | | |
+| Run | Task | Input | Cache creation | Cache read | Output | Token sum | Priced total ($) | Acceptance passed | Wall time | Parent busy (min) | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Foreground subagent | | | | | | | | | | | |
+| Background subagent | | | | | | | | | | | |
+| Job | | | | | | | | | | | |
 
 Results will be filled in here when the runs are done.
 
