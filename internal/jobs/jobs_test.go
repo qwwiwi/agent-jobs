@@ -85,6 +85,13 @@ if [[ $prompt == *FAKE_FORGE* ]]; then
   # The job appends a result line of its own to the stream (it lies in the job dir).
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
 fi
+if [[ $prompt == *FAKE_PLANT_FALLBACK* ]]; then
+  # The job plants a transcript of its own and a fallback marker naming it (both in its write reach
+  # as far as the file system goes).
+  planted=11111111-1111-4111-8111-111111111111
+  if [[ -n "${FAKE_SESSIONS-}" ]]; then mkdir -p "$proj" && echo '{"type":"user","message":"planted"}' > "$proj/$planted.jsonl"; fi
+  echo "$planted" > ../fallback_session
+fi
 if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
   # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a

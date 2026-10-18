@@ -185,9 +185,10 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The subagent tool (Agent, formerly Task) is not denied: a job may use up to three subagents, which
 // run inside the job's process, under these settings and this hook, within the job's limits.
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
-// the guard): a job reads its skills but never changes the catalog through them.
+// the guard): a job reads its skills but never changes the catalog through them. So are the claude
+// project dirs of the job's work dir (sessionProtected): the job never writes a session transcript.
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
-	protected := m.skillProtected(j)
+	protected := append(m.skillProtected(j), m.sessionProtected(j)...)
 	return m.settings(j.Kind, m.guardCommand(j.ID, protected, gitDirs...), skillDenyRules(protected)...)
 }
 

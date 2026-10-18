@@ -154,6 +154,9 @@ func (m *Manager) sendTmuxLocked(target, line string) error {
 	return m.withTmuxLock(func(ctx context.Context) error { return m.sendTmux(ctx, target, line) })
 }
 
+// tmuxLockWaiting runs each time withTmuxLock finds tmux.lock held and waits for it (a test hook).
+var tmuxLockWaiting = func() {}
+
 // withTmuxLock runs fn holding <state>/tmux.lock, with a context that ends TmuxDeliveryTimeout
 // after the call started (waiting for the lock included). An error taking the lock is returned
 // without running fn.
@@ -173,6 +176,7 @@ func (m *Manager) withTmuxLock(fn func(ctx context.Context) error) error {
 		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
 			return fmt.Errorf("tmux lock: %w", err)
 		}
+		tmuxLockWaiting()
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w: tmux.lock still held by another delivery after %s", errTmuxTimeout, TmuxDeliveryTimeout)

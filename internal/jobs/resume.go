@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -146,6 +147,34 @@ func (m *Manager) transcriptPath(j *store.Job) string {
 	return ""
 }
 
+// sessionProtected are the claude project dirs of the job's work dir, as written and with symlinks
+// resolved (claude names the project after the physical cwd): they hold the transcript and the session
+// dir of every session the job runs in, its own and a resume's fallback. A job never writes there: a
+// transcript the job wrote during the run would be digested at its end as its own and resumed later.
+// A project dir name claude cuts (longer than maxProjectDirName, with a hash suffix) cannot be named
+// in advance, so then the whole <config>/projects is protected.
+func (m *Manager) sessionProtected(j *store.Job) []string {
+	cfg, err := ClaudeConfigDir()
+	if err != nil {
+		return nil
+	}
+	projects := filepath.Join(cfg, "projects")
+	dir := m.JobDir(j.ID)
+	works := []string{filepath.Join(dir, "work")}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		works = append(works, filepath.Join(r, "work"))
+	}
+	var out []string
+	for _, w := range works {
+		name := ProjectDirName(w)
+		if len(name) > maxProjectDirName {
+			return []string{projects}
+		}
+		out = append(out, filepath.Join(projects, name))
+	}
+	return out
+}
+
 // sessionDigest is the SHA-256 of a session's transcript and of the <id>/ directory next to it (tool
 // results, subagent transcripts): names, types, symlink targets and regular files' contents.
 func sessionDigest(transcript, sessionID string) (string, error) {
@@ -247,20 +276,7 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	// ignored (their exclude line kept) or untracked (the line gone).
 	left := m.leftSkillLinks(j, work)
 	if j.RepoPath == "" {
-		found := ""
-		err := filepath.WalkDir(work, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if path == filepath.Join(work, ".claude") && onlySkillLinks(work, left) {
-				return fs.SkipDir
-			}
-			if slices.Contains(projectClaudeNames, d.Name()) {
-				found, _ = filepath.Rel(work, path)
-				return fs.SkipAll
-			}
-			return nil
-		})
+		found, err := m.findProjectClaude(j, work, left)
 		if err != nil {
 			return err
 		}
@@ -292,6 +308,51 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 		return refuse("work/.claude, a CLAUDE.md or a CLAUDE.local.md differs from the job's base commit")
 	}
 	return nil
+}
+
+// Bounds of the walk of a repo-less work dir before a resume (variables so tests can lower them).
+var (
+	maxProjectWalkEntries = 200_000
+	projectWalkBudget     = 30 * time.Second
+)
+
+// findProjectClaude walks a repo-less work dir for projectClaudeNames and returns the first one found
+// (relative to work), "" when there is none. The walk is bounded: past maxProjectWalkEntries entries or
+// projectWalkBudget it refuses the resume (fail closed: what was not seen may hold one). A subdirectory
+// it cannot read is skipped with a note in the log: claude, running as the same user, cannot read it
+// either.
+func (m *Manager) findProjectClaude(j *store.Job, work string, left []string) (string, error) {
+	found, entries := "", 0
+	deadline := time.Now().Add(projectWalkBudget)
+	var skipped []string
+	err := filepath.WalkDir(work, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if path != work && d != nil && d.IsDir() && errors.Is(err, fs.ErrPermission) {
+				rel, _ := filepath.Rel(work, path)
+				skipped = append(skipped, rel)
+				return fs.SkipDir
+			}
+			return err
+		}
+		if entries++; entries > maxProjectWalkEntries || time.Now().After(deadline) {
+			return fmt.Errorf("work/ is too large to check for a .claude, CLAUDE.md or CLAUDE.local.md (more than %d "+
+				"entries or %s), so this job cannot be resumed (remove what it does not need, or start a new job)",
+				maxProjectWalkEntries, projectWalkBudget)
+		}
+		if path == filepath.Join(work, ".claude") && onlySkillLinks(work, left) {
+			return fs.SkipDir
+		}
+		if slices.Contains(projectClaudeNames, d.Name()) {
+			found, _ = filepath.Rel(work, path)
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if len(skipped) > 0 {
+		m.Log.Printf("job %s: resume check skipped %d unreadable dir(s) of work/ (claude cannot read them either): %s",
+			j.ID, len(skipped), RedactPrintable(strings.Join(skipped, ", "), 300))
+	}
+	return found, err
 }
 
 // onlySkillLinks reports whether work/.claude holds nothing but the directory skills with links of
@@ -403,7 +464,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	}
 	if code, ok := readExitCode(dir); ok {
 		// The job ended before the stop: collect it as the tick would.
-		res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+		res := m.endedResult(j)
 		status, verdict := Verdict(code, res, dir)
 		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
@@ -416,7 +477,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	m.removeSkills(j)
 	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
 	// resume counts this attempt at its whole budget), whatever result line the stream holds.
-	res, killed := killedResult(j.Runner, dir)
+	res, killed := m.killedResult(j)
 	if killed {
 		msg += " (cost so far unknown: ended by the stop)"
 	}
@@ -730,15 +791,22 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 }
 
 // noteFallback records the fresh session a resume fell back to (FallbackMarker, written by the
-// wrapper) on the running row, so the next resume continues that session.
+// wrapper) on the running row, so the next resume continues that session. The marker lies in the job
+// dir, which the job can write: it counts only in a resume launch and only when it names the fallback
+// session the daemon generated for that launch (recorded before the spawn).
 func (m *Manager) noteFallback(j *store.Job) {
 	b, err := readSmall(filepath.Join(m.JobDir(j.ID), FallbackMarker), 128)
 	if err != nil {
 		return
 	}
 	sid := strings.TrimSpace(b)
-	if !ValidSessionID(sid) {
-		m.Log.Printf("job %s: ignoring invalid %s", j.ID, FallbackMarker)
+	if j.RunMode != store.RunResume {
+		m.Log.Printf("job %s: ignoring %s: the attempt is not a resume launch", j.ID, FallbackMarker)
+		return
+	}
+	want, err := m.Store.FallbackSession(j.ID, j.LaunchToken)
+	if err != nil || !ValidSessionID(sid) || sid != want {
+		m.Log.Printf("job %s: ignoring %s: not the fallback session generated for this launch", j.ID, FallbackMarker)
 		return
 	}
 	if err := m.Store.SetSession(j.ID, j.LaunchToken, sid, store.RunFallback); err != nil {
@@ -896,6 +964,10 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	intact, why := m.sessionIntact(j)
 	if intact {
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunResume); err != nil {
+			return launchPlan{}, err
+		}
+		// The only fallback session the daemon accepts back from the wrapper (noteFallback).
+		if err := m.Store.SetFallbackSession(j.ID, token, fresh); err != nil {
 			return launchPlan{}, err
 		}
 		j.RunMode = store.RunResume
