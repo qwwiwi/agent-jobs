@@ -252,11 +252,21 @@ func TestHealth(t *testing.T) {
 	f.insert(t, "261018-100001-bbbb", store.StatusRunning)
 	f.insert(t, "261018-100002-cccc", store.StatusRunning)
 	out := f.get(t, "/v1/health", http.StatusOK)
-	if out["version"] != "v-test" || out["running"] != 2.0 || out["queued"] != 1.0 {
+	if out["version"] != "v-test" || out["running"] != 2.0 || out["queued"] != 1.0 || out["max_running"] != 2.0 {
 		t.Fatalf("health %v", out)
 	}
 	if _, ok := out["uptime_sec"].(float64); !ok {
 		t.Fatalf("health without uptime: %v", out)
+	}
+}
+
+// /v1/health shows the max_running of the manager that serves it (the daemon's).
+func TestHealthMaxRunningConfigured(t *testing.T) {
+	f := newFixture(t)
+	five := 5
+	f.m.Cfg.MaxRunning = &five
+	if out := f.get(t, "/v1/health", http.StatusOK); out["max_running"] != 5.0 {
+		t.Fatalf("health %v", out)
 	}
 }
 

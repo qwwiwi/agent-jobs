@@ -501,6 +501,9 @@ func cmdStatus(args []string) error {
 	}
 	defer m.Close()
 	if len(pos) == 0 {
+		if err := printQueue(m); err != nil {
+			return err
+		}
 		if err := printDaily(m); err != nil {
 			return err
 		}
@@ -546,6 +549,17 @@ func cmdStatus(args []string) error {
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
 	}
+	return nil
+}
+
+// printQueue is `status` without a job id: running and queued jobs and max_running as config.json
+// says now (the daemon uses the value it read at its start).
+func printQueue(m *jobs.Manager) error {
+	q, err := m.Queue()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
 	return nil
 }
 
