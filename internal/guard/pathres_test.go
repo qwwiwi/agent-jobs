@@ -602,3 +602,132 @@ func TestProtectedShellClusterInlineCode(t *testing.T) {
 		t.Error("bash -o pipefail <long path> allowed")
 	}
 }
+
+// setFoldCase simulates a case-insensitive (true) or case-sensitive (false) file system.
+func setFoldCase(t *testing.T, v bool) {
+	t.Helper()
+	old := foldCase
+	foldCase = v
+	t.Cleanup(func() { foldCase = old })
+}
+
+// #41: on a case-insensitive file system every case variant of a protected path is refused.
+func TestProtectedCaseFolded(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	setFoldCase(t, true)
+	for _, c := range []string{
+		// the issue's probe rows
+		"rm " + state + "/jobs.db",
+		"rm " + state + "/JOBS.DB",
+		"sqlite3 " + state + "/Jobs.DB 'UPDATE jobs SET subagents=0'",
+		"rm -rf " + state + "/SUBAGENTS",
+		"rm ../../../JOBS.DB",
+		// the same through the other checks (redirect, option value, inline code, ancestor, parent, cd)
+		"rm ~/.agent-jobs/THRALL/jobs.db",
+		"echo x > " + state + "/Subagents/j.log",
+		"dd if=/dev/null of=" + state + "/JOBS.DB-WAL",
+		"python3 -c \"open('" + state + "/JOBS.db','w')\"",
+		"python3 -c \"open('../../../Jobs.db','w')\"",
+		"rm -r " + filepath.Dir(state) + "/THRALL",
+		"cp evil " + state + "/SUBAGENTS/",
+		"cd \"$X\" && rm SUBAGENTS/j.log",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+	for _, p := range []string{
+		state + "/jobs.db", state + "/JOBS.DB", state + "/Jobs.db", state + "/SUBAGENTS/j.log",
+		state + "/jobs.db-SHM",
+	} {
+		if CheckFileWrite("Write", p, cfg) == "" {
+			t.Errorf("CheckFileWrite(%q) allowed", p)
+		}
+	}
+	for _, c := range []string{"cat " + state + "/JOBS.DB", "rm -rf build", "rm out/JOBS.DB", "cp a b"} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+	if r := CheckFileWrite("Write", filepath.Join(cfg.Dir, "OUT.txt"), cfg); r != "" {
+		t.Errorf("worktree write refused: %s", r)
+	}
+	s := &pathScope{protected: []string{"/h/.agent-jobs/thrall/subagents", "/h/.agent-jobs/thrall/jobs.db"}}
+	if !s.couldReach("SUBAGENTS/j.log", false) || !s.couldReach("Thrall/JOBS.DB", false) || !s.couldReach("THRALL", true) {
+		t.Error("couldReach misses a case variant")
+	}
+}
+
+// #41: on a case-sensitive file system the case variants are other files and stay allowed.
+func TestProtectedCaseSensitive(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	setFoldCase(t, false)
+	for _, c := range []string{"rm " + state + "/JOBS.DB", "rm -rf " + state + "/SUBAGENTS"} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+	if r := CheckFileWrite("Write", state+"/JOBS.DB", cfg); r != "" {
+		t.Errorf("CheckFileWrite JOBS.DB refused: %s", r)
+	}
+	if CheckFileWrite("Write", state+"/jobs.db", cfg) == "" {
+		t.Error("CheckFileWrite jobs.db allowed")
+	}
+}
+
+// #48: the ancestor rule covers every archive and copy tool, not tar alone (cwd <state>/jobs/j/work,
+// so ../../../.. is the agent-jobs home).
+func TestProtectedAncestorArchivers(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{
+		// the issue's probe rows
+		"tar -C ../../../.. -xf a.tar",
+		"bsdtar -C ../../../.. -xf a.tar",
+		"gtar -C ../../../.. -xf a.tar",
+		"unzip -o a.zip -d ../../../..",
+		"ditto src ../../../..",
+		"cpio -pdm ../../../.. < list",
+		"cp -R src/. ../../../..",
+		// the other names, a path and an upper-case name, attached directory options
+		"pax -rw src ../../../..",
+		"7z x a.7z -o../../../..",
+		"7za x a.7z -o../../../..",
+		"7zz x a.7z -o../../../..",
+		"/usr/bin/BSDTAR -C ../../../.. -xf a.tar",
+		"tar -C../../../.. -xf a.tar",
+		"unzip -o a.zip -d../../../..",
+		// PR #50 review: clustered short options, upper-case 7-Zip switches, cpio -D
+		"bsdtar -xC../../../.. -f a.tar",
+		"tar -xC../../../.. -f a.tar",
+		"gtar -xvC../../../.. -f a.tar",
+		"tar -xC ../../../.. -f a.tar",
+		"tar -xvzC../../../.. -f a.tar",
+		"7z x a.7z -y -O../../../..",
+		"7za x a.7z -O../../../..",
+		"7zz x a.7z -O../../../..",
+		"unzip -od../../../.. a.zip",
+		"unzip -qqd../../../.. a.zip",
+		"cpio -idmD../../../.. < a.cpio",
+		"cpio -D../../../.. -idm < a.cpio",
+		// PR #50 control round: unzip negation clusters and a repeated -P
+		"unzip -o --qd../../../.. a.zip",
+		"unzip -o -Pdummy -Pd../../../.. a.zip",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+	for _, c := range []string{
+		"tar -tf a.tar", "unzip -l a.zip", "unzip -o a.zip -d build", "tar -xf a.tar -C build",
+		"unzip -o a.zip -d ..", "bsdtar -xf a.tar -C ..", "ditto src build", "7z x a.7z -obuild",
+		"7z l a.7z", "cpio -idm < a.cpio", "pax -r < a.pax",
+		"tar -xCbuild -f a.tar", "bsdtar -xvCbuild -f a.tar", "gtar -xC build -f a.tar", "tar -xC.. -f a.tar",
+		"tar -xfC../../../..", "7z x a.7z -y -Obuild", "7za x a.7z -O..", "unzip -od build a.zip",
+		"unzip -qqdbuild a.zip", "unzip -PC../../../.. a.zip", "cpio -idmDbuild < a.cpio",
+		"cpio -idmE../../../..D < a.cpio",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
