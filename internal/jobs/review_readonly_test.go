@@ -52,6 +52,7 @@ func TestReviewChangedWorktreeWarning(t *testing.T) {
 		{"review", "FAKE_ONLY_UNTRACKED", true},
 		{"review", "FAKE_ONLY_UNSTAGED", true},
 		{"review", "FAKE_ONLY_COMMIT", true},
+		{"review", "FAKE_RM_WORKTREE", true},
 		{"review", "nothing", false},
 		{"fix", "FAKE_ONLY_UNTRACKED", false},
 	} {

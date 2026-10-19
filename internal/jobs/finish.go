@@ -111,14 +111,19 @@ func DoneLine(j *store.Job) string {
 const ReviewChangedWarning = "WARNING: review job changed the worktree"
 
 // noteReviewChanges appends ReviewChangedWarning to a finished review job whose worktree has commits
-// past the base, staged, unstaged or untracked (not ignored) changes. Run after the skill links are
-// removed (they are not the job's change).
+// past the base, staged, unstaged or untracked (not ignored) changes, or whose prepared worktree is
+// gone or inaccessible. Run after the skill links are removed (they are not the job's change).
 func (m *Manager) noteReviewChanges(j *store.Job) {
 	if j.Kind != "review" || j.RepoPath == "" {
 		return
 	}
 	work := filepath.Join(m.JobDir(j.ID), "work")
 	if _, err := os.Stat(work); err != nil {
+		// No worktree.json: prepare never created the worktree, so there is nothing to compare.
+		if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "worktree.json")); err != nil {
+			return
+		}
+		m.appendReviewNote(j, []string{"worktree missing or inaccessible"})
 		return
 	}
 	var what []string
@@ -142,6 +147,11 @@ func (m *Manager) noteReviewChanges(j *store.Job) {
 	if len(what) == 0 {
 		return
 	}
+	m.appendReviewNote(j, what)
+}
+
+// appendReviewNote logs ReviewChangedWarning with what was found and appends it to the job's error.
+func (m *Manager) appendReviewNote(j *store.Job, what []string) {
 	note := ReviewChangedWarning + " (" + strings.Join(what, ", ") + ")"
 	m.Log.Printf("job %s: %s", j.ID, note)
 	if err := m.Store.AppendError(j.ID, note); err != nil {
