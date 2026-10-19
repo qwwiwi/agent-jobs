@@ -125,6 +125,7 @@ fi
 if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
+if [[ $prompt == *FAKE_RM_WORKTREE* ]]; then wt=$PWD; cd ..; rm -rf "$wt"; fi
 if [[ $prompt == *FAKE_FORKENV* ]]; then env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true; fi
 if [[ $prompt == *FAKE_GITENV* ]]; then
   env | grep -E '^(GIT_|PAGER=|EDITOR=|VISUAL=)' | sort > ../gitenv.txt
@@ -723,7 +724,7 @@ func TestNotifyOneLineViaTmux(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · session only", j.ID)
+	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · model sonnet · effort medium · session only", j.ID)
 	if len(lines) != 2 || lines[0] != "send-keys|-t|fake-session|-l|"+wantLine+"|" || lines[1] != "send-keys|-t|fake-session|Enter|" {
 		t.Fatalf("tmux calls:\n%s", b)
 	}

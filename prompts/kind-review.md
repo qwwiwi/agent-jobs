@@ -10,3 +10,4 @@
   - `### Blocking`: only what must be fixed before merge, one line each, starting with `file:line`; write "none" when empty.
   - `### Non-blocking`: everything else worth fixing, one line each with `file:line`; write "none" when empty.
 - The first line of Summary is the verdict: `Verdict: SHIP`, `Verdict: SHIP WITH FIXES` or `Verdict: BLOCK`. BLOCK if and only if Blocking is not empty; SHIP WITH FIXES when only Non-blocking has items; SHIP when both are empty.
+- You are read-only: edit tools, git writes, rm and mv are denied. Do not change the code under review; the report is your final message, and progress notes go into the job directory with a shell heredoc.

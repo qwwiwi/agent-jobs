@@ -116,7 +116,8 @@ type StartRequest struct {
 	TimeoutMinutes int
 	// Runner is claude or codex; empty = by model (gpt-* runs on codex, everything else on claude).
 	Runner string
-	// ReasoningEffort is the codex reasoning effort (low|medium|high); empty = config, else high.
+	// ReasoningEffort is the job's reasoning effort: low|medium|high on codex (empty = config, else high),
+	// low|medium|high|xhigh|max on claude (empty = effort_by_kind, else the kind's default).
 	ReasoningEffort string
 	// ScheduleID is the schedule that starts the job (set by the daemon, never by a caller).
 	ScheduleID string
@@ -265,7 +266,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		return nil, err
 	}
 	effort := strings.TrimSpace(r.ReasoningEffort)
-	if err := ValidateReasoningEffort(effort); err != nil {
+	if err := ValidateReasoningEffort(runner, effort); err != nil {
 		return nil, err
 	}
 	if runner == store.RunnerCodex {
@@ -278,8 +279,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 		effort = m.Cfg.reasoningEffort(effort)
 		turns, budget = 0, 0 // not enforced on codex: stored as 0, shown as n/a (codex)
-	} else if effort != "" {
-		return nil, errors.New("reasoning_effort applies only to a codex job")
+	} else {
+		// Passed as --effort, so a project effortLevel in the worktree cannot change it.
+		effort = m.Cfg.claudeEffort(r.Kind, effort)
 	}
 	var repo, base string
 	if r.RepoPath != "" {
@@ -453,7 +455,7 @@ func ResumeClaudeArgs(j *store.Job, jobDir string) []string {
 }
 
 func claudeBaseArgs(j *store.Job, jobDir string) []string {
-	return []string{
+	args := []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
 		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
 		"--permission-mode", "bypassPermissions",
@@ -461,6 +463,12 @@ func claudeBaseArgs(j *store.Job, jobDir string) []string {
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
 	}
+	// The flag outranks an effortLevel in the worktree's project settings; a row from before the effort
+	// was recorded has none and runs at the CLI default.
+	if j.ReasoningEffort != "" {
+		args = append(args, "--effort", j.ReasoningEffort)
+	}
+	return args
 }
 
 // launchPlan is what one launch runs: the program (empty = claude), its arguments and the wrapper's
@@ -989,6 +997,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	if status == store.StatusTimeout || status == store.StatusFailed {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
+	m.noteReviewChanges(j)
 	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
