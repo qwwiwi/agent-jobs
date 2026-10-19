@@ -71,6 +71,13 @@ type JobView struct {
 	// SizeWarning (job_start only): the brief names many files or has many "## " headings, so it may
 	// be more than one job.
 	SizeWarning string `json:"size_warning,omitempty"`
+	// SameRepoJobs (job_start only): the other queued or running jobs on the same repository, an
+	// advisory (the job is queued anyway).
+	SameRepoJobs string `json:"same_repo_jobs,omitempty"`
+	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
+	BaseBranch string `json:"base_branch,omitempty"`
+	// MergeNote is that check, made when the job-done line was sent.
+	MergeNote string `json:"merge_note,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -105,7 +112,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
-		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote,
+		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
 	}
 }
 
@@ -161,7 +168,9 @@ func addJobStart(s *sdk.Server, d Deps) {
 		Description: "Queue a background claude -p job (or codex exec: a gpt-* model or runner codex) and return its id immediately. The daemon starts it within a minute " +
 			"(at most max_running per agent run at once: config.json key max_running, default 2). The job commits locally only; it never pushes or messages anyone. " +
 			"State an explicit model or a complexity (light|normal|hard); with neither the call is rejected. " +
-			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped.",
+			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped. " +
+			"same_repo_jobs names other queued or running jobs on the same repository (advisory). A repo job records its " +
+			"base_branch; its job-done line says whether its commits still merge onto that branch (git merge-tree).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
@@ -174,6 +183,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 		}
 		v := view(d.Manager, j)
 		v.SizeWarning = d.Manager.Cfg.BriefSizeWarning(in.Brief)
+		v.SameRepoJobs = d.Manager.SameRepoNote(j)
 		return nil, v, nil
 	})
 }
