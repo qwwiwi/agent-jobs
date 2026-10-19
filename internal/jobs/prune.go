@@ -363,6 +363,39 @@ func treeSize(p string) int64 {
 	return n
 }
 
+// jobDirSize is the size of job j's folder dir (treeSize), the worktree of a repo job left out: it is
+// the repository's checkout, removed by cleanup. tmp is the part in the job's temp dir (JobTmpDir).
+func jobDirSize(j *store.Job, dir string) (total, tmp int64) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range ents {
+		if e.Name() == "work" && j.RepoPath != "" {
+			continue
+		}
+		n := treeSize(filepath.Join(dir, e.Name()))
+		total += n
+		if e.Name() == JobTmpDir && e.IsDir() {
+			tmp = n
+		}
+	}
+	return total, tmp
+}
+
+// recordDirSize measures the folder of a job whose attempt ended and records it on the row (the stats
+// row and the job-done line show it). A failure is logged, never fatal.
+func (m *Manager) recordDirSize(id string) {
+	j, err := m.Store.Get(id)
+	if err == nil {
+		n, _ := jobDirSize(j, m.JobDir(id))
+		err = m.Store.SetDirBytes(id, n)
+	}
+	if err != nil {
+		m.Log.Printf("job %s: record job dir size: %v", id, err)
+	}
+}
+
 // removeTree removes p and everything under it without following symlinks. A job may leave
 // read-only directories behind (and the job dir holds a 0500 no-hooks/), so on a failure every real
 // directory under p is made writable and the removal is retried once.

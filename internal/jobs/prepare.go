@@ -318,6 +318,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create job dir: %w", err)
 	}
+	if _, err := ensureJobTmp(dir); err != nil {
+		return fmt.Errorf("create job temp dir: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(m.SubagentLogPath(j.ID)), 0o700); err != nil {
 		return fmt.Errorf("create subagent log dir: %w", err)
 	}

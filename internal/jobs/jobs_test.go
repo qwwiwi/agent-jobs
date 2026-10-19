@@ -98,6 +98,18 @@ if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
       exec sleep 300 ) & exit 0' < /dev/null > /dev/null 2>&1
   for _ in $(seq 200); do [[ -e ../orphan.ready ]] && break; sleep 0.05; done
 fi
+if [[ $prompt == *FAKE_TMPENV* ]]; then env | grep -E '^(TMPDIR|GOTMPDIR|TMP|TEMP)=' | sort > ../tmpenv.txt || true; fi
+if [[ $prompt == *FAKE_BIGTMP* ]]; then
+  head -c 3145728 /dev/zero > "$TMPDIR/big.bin"
+  head -c 3145728 /dev/zero > big-in-work.bin
+fi
+if [[ $prompt == *FAKE_GOTEST* ]]; then
+  # A go test that sleeps (go keeps its go-build work dir in the temp dir); killed with the job.
+  mkdir -p gt && printf 'module gt\n\ngo 1.21\n' > gt/go.mod
+  printf 'package gt\n\nimport (\n\t"os"\n\t"testing"\n\t"time"\n)\n\nfunc TestSleep(t *testing.T) {\n\t_ = os.WriteFile(os.Getenv("GT_MARK"), nil, 0o600)\n\ttime.Sleep(2 * time.Minute)\n}\n' > gt/gt_test.go
+  mark="$(cd .. && pwd)/gotest.running"
+  (cd gt && GT_MARK="$mark" go test -count=1 . > /dev/null 2>&1 &)
+fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -955,7 +967,7 @@ func hasControl(s string) bool {
 // B1: the title can't smuggle control characters (Ctrl-U, ESC, CR/LF, tabs) into tmux.
 func TestDoneLineSanitized(t *testing.T) {
 	j := &store.Job{ID: "id1", Title: "x\x15echo injected #\x1b[2J\r\nnext\tcol\x7f‮end​", Status: store.StatusSucceeded}
-	line := DoneLine(j)
+	line := DoneLine(j, 0)
 	if hasControl(line) {
 		t.Fatalf("control chars in line: %q", line)
 	}
@@ -963,7 +975,7 @@ func TestDoneLineSanitized(t *testing.T) {
 		t.Fatalf("printable text lost: %q", line)
 	}
 	j.Title = strings.Repeat("я", 1000)
-	if n := len([]rune(DoneLine(j))); n > 220 {
+	if n := len([]rune(DoneLine(j, 0))); n > 220 {
 		t.Fatalf("title not capped: line is %d runes", n)
 	}
 	m := newManager(t)

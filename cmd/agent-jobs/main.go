@@ -792,7 +792,7 @@ func cmdResult(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(jobs.DoneLine(j))
+	fmt.Println(jobs.DoneLine(j, m.Cfg.JobDirNoteBytes()))
 	if j.Error != "" {
 		fmt.Println("error:", jobs.RedactText(j.Error))
 	}

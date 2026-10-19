@@ -548,6 +548,7 @@ var renameFile = os.Rename
 // its stats row written. A failed redaction stays pending (retryRedactions).
 func (m *Manager) settled(id string) {
 	m.redactAndClear(id)
+	m.recordDirSize(id)
 	m.recordStatsOf(id)
 }
 

@@ -104,6 +104,9 @@ type Config struct {
 	// DailyHour is the local hour (0..23) after which the daemon runs the daily automation (prune and
 	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
 	DailyHour *int `json:"daily_hour"`
+	// JobDirNoteMB is the job folder size (MB, worktree of a repo job left out) from which the
+	// job-done line says how big the folder is. Nil = DefaultJobDirNoteMB (100), 0 = never.
+	JobDirNoteMB *int `json:"job_dir_note_mb"`
 	// MaxRunning is how many jobs of this agent run at once; the rest wait in the queue.
 	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8); explicit null is refused.
 	MaxRunning *int `json:"max_running"`
@@ -216,6 +219,18 @@ func (c Config) MaxRunningJobs() int {
 	return *c.MaxRunning
 }
 
+// DefaultJobDirNoteMB is job_dir_note_mb when it is not set.
+const DefaultJobDirNoteMB = 100
+
+// JobDirNoteBytes returns the job folder size from which the job-done line shows it (0 = never).
+func (c Config) JobDirNoteBytes() int64 {
+	mb := DefaultJobDirNoteMB
+	if c.JobDirNoteMB != nil {
+		mb = *c.JobDirNoteMB
+	}
+	return int64(mb) << 20
+}
+
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
 const DefaultDailyHour = 4
 
@@ -319,6 +334,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
 		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
+	}
+	if c.JobDirNoteMB != nil && *c.JobDirNoteMB < 0 {
+		return c, fmt.Errorf("config.json: job_dir_note_mb %d must be 0 (never) or positive", *c.JobDirNoteMB)
 	}
 	if c.IdleAfterResultSeconds < IdleAfterResultOff {
 		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)

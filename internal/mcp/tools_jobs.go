@@ -218,6 +218,8 @@ type JobResultOutput struct {
 	Attempts []AttemptView `json:"attempts,omitempty"`
 	// Acceptance is the acceptance command's outcome (jobs with acceptance_cmd only).
 	Acceptance *AcceptanceView `json:"acceptance,omitempty"`
+	// JobDirBytes is the size of the job folder when the job ended (worktree of a repo job left out).
+	JobDirBytes int64 `json:"job_dir_bytes"`
 }
 
 // MaxAcceptanceTailBytes caps the acceptance log tail job_result returns; the log keeps 64 KB.
@@ -273,7 +275,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 			out.Note = "job is " + j.Status + "; the session gets a [jobs:job-done] line when it ends"
 			return nil, out, nil
 		}
-		out.DoneLine = jobs.DoneLine(j)
+		out.DoneLine = jobs.DoneLine(j, m.Cfg.JobDirNoteBytes())
+		out.JobDirBytes = j.DirBytes
 		out.Acceptance = acceptanceView(m, j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {

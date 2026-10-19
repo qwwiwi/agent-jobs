@@ -12,11 +12,11 @@ import (
 // The job-done line of an owner-waits job ends with the marker; other jobs' lines do not carry it.
 func TestDoneLineOwnerWaitsMarker(t *testing.T) {
 	j := &store.Job{ID: "id1", Title: "t", Status: store.StatusSucceeded}
-	if line := DoneLine(j); strings.Contains(line, OwnerWaitsMarker) {
+	if line := DoneLine(j, 0); strings.Contains(line, OwnerWaitsMarker) {
 		t.Fatalf("plain job carries the marker: %q", line)
 	}
 	j.OwnerWaits, j.Attempt = true, 2
-	if line := DoneLine(j); !strings.HasSuffix(line, " · resumed (attempt 2) · owner waits") {
+	if line := DoneLine(j, 0); !strings.HasSuffix(line, " · resumed (attempt 2) · owner waits") {
 		t.Fatalf("owner-waits line: %q", line)
 	}
 }

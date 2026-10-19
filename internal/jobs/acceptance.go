@@ -366,7 +366,7 @@ func runAcceptanceCmd(parent context.Context, jobDir, cmdline string, timeout ti
 var acceptanceEnvKeys = []string{"PATH", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TERM"}
 
 // acceptanceEnv is the acceptance command's environment: the allow-listed variables of env, HOME a
-// fresh throwaway dir <jobDir>/acceptance-home (its tmp/ as TMPDIR), so no tool finds the agent's
+// fresh throwaway dir <jobDir>/acceptance-home (its tmp/ as the temp dir, TempEnv), so no tool finds the agent's
 // dotfiles, credentials or state dir through HOME; then the job's git environment (GitEnv) and the job
 // marker (JobEnv), so it starts no nested job and doctor procs can find what it leaves.
 func acceptanceEnv(jobDir string, env []string) ([]string, error) {
@@ -382,14 +382,14 @@ func acceptanceEnv(jobDir string, env []string) ([]string, error) {
 	if err := os.MkdirAll(filepath.Join(home, "tmp"), 0o700); err != nil {
 		return nil, err
 	}
-	keep := []string{"HOME=" + home, "TMPDIR=" + filepath.Join(home, "tmp")}
+	keep := []string{"HOME=" + home}
 	for _, kv := range env {
 		k, _, _ := strings.Cut(kv, "=")
 		if slices.Contains(acceptanceEnvKeys, k) || strings.HasPrefix(k, "LC_") {
 			keep = append(keep, kv)
 		}
 	}
-	keep, err = GitEnv(jobDir, keep)
+	keep, err = GitEnv(jobDir, TempEnv(keep, filepath.Join(home, "tmp")))
 	if err != nil {
 		return nil, err
 	}
