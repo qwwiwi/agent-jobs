@@ -537,7 +537,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return err
 	}
 	// If the daemon dies before this line, the next tick adopts the wrapper via wrapper.json.
-	if err := m.Store.SetPID(j.ID, token, pid, pid); err != nil {
+	if err := m.Store.SetSpawnedPID(j.ID, token, pid); err != nil {
 		m.Log.Printf("job %s: record pid %d: %v (adopted next tick via wrapper.json)", j.ID, pid, err)
 	}
 	containment := "session only"
@@ -592,6 +592,14 @@ func groupAlive(pgid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// liveSpawnedGroup reports whether the job's process group as the daemon recorded it at the spawn
+// (PGIDSpawned; never a group adopted from the job-writable wrapper.json) still has members. A pgid is
+// not reused while its group has members, so a live group with that id is still the job's, whether
+// its wrapper is alive or not.
+func liveSpawnedGroup(j *store.Job) bool {
+	return j.PGIDSpawned && plausibleGroup(j.PGID) == nil && groupAlive(j.PGID)
+}
+
 // killFn sends a signal (syscall.Kill); a variable so tests can see every kill without risking one.
 var killFn = syscall.Kill
 
@@ -639,7 +647,7 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) {
 		m.Log.Printf("job %s: stop scope: %v; falling back to the process group", j.ID, err)
 	}
 	if pgid != 0 {
-		m.killGroup(j.ID, pid, pgid)
+		m.killGroup(j.ID, pid, pgid, j.PGIDSpawned && pgid == j.PGID)
 	}
 }
 
@@ -792,13 +800,40 @@ func (m *Manager) retryScopeStops() error {
 }
 
 // killGroup sends SIGTERM to the wrapper's process group, waits up to KillGrace, then SIGKILL.
-// It refuses (and logs) unless pgid is plausible and is the live wrapper pid's group.
-func (m *Manager) killGroup(id string, pid, pgid int) {
+// It refuses (and logs) unless pgid is plausible and is the live wrapper pid's group, or, once the
+// wrapper is gone, the group the daemon recorded at the spawn (spawned) and it is still alive.
+func (m *Manager) killGroup(id string, pid, pgid int, spawned bool) {
 	if err := verifyGroup(pid, pgid); err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: %v", id, pgid, err)
-		return
+		if !spawned || alive(pid) || plausibleGroup(pgid) != nil {
+			m.Log.Printf("job %s: refusing to kill process group %d: %v", id, pgid, err)
+			return
+		}
+		if !groupAlive(pgid) {
+			return
+		}
+		m.Log.Printf("job %s: wrapper pid %d is gone; ending process group %d recorded at its spawn", id, pid, pgid)
 	}
 	m.signalGroup(pgid)
+}
+
+// endOrphanedGroup ends what is left of a job whose wrapper died without writing exit_code: its
+// process group as recorded at the spawn (liveSpawnedGroup; a group adopted from wrapper.json is never
+// signalled here) and its acceptance command. It returns a note for the row, "" when no group was left.
+func (m *Manager) endOrphanedGroup(j *store.Job) string {
+	defer m.killAcceptance(j.ID)
+	if !liveSpawnedGroup(j) {
+		return ""
+	}
+	g := j.PGID
+	m.Log.Printf("job %s: wrapper died, its process group %d is still alive; ending it", j.ID, g)
+	m.signalGroup(g)
+	for i := 0; i < 20 && groupAlive(g); i++ {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if groupAlive(g) {
+		return fmt.Sprintf("leftover process group %d survived SIGKILL; %s", g, ReasonSurvivors)
+	}
+	return fmt.Sprintf("leftover process group %d killed", g)
 }
 
 // signalGroup sends SIGTERM to the process group, waits up to KillGrace, then SIGKILL.
@@ -911,8 +946,14 @@ func (m *Manager) collect() error {
 				m.finish(j, status, res, false, dur, msg, now)
 				continue
 			}
+			// Nothing of the job may outlive the row: claude would spend on, write the worktree that
+			// cleanup removes, and race a resume in the same session.
+			msg := "wrapper died without writing exit_code (see stderr.log)"
+			if note := m.endOrphanedGroup(j); note != "" {
+				msg += "; " + note
+			}
 			res, killed := killedResult(j.Runner, dir)
-			m.finish(j, store.StatusFailed, res, killed, dur, "wrapper died without writing exit_code (see stderr.log)", now)
+			m.finish(j, store.StatusFailed, res, killed, dur, msg, now)
 		}
 	}
 	return nil

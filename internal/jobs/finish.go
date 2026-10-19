@@ -325,6 +325,9 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if j.RepoPath == "" {
 		return nil // empty work dir, nothing to preserve; prune comes later
 	}
+	if liveSpawnedGroup(j) {
+		return fmt.Errorf("refusing to touch %s: process group %d of the job is still alive", work, j.PGID)
+	}
 	fi, err := os.Lstat(work)
 	if os.IsNotExist(err) {
 		return nil // already removed
