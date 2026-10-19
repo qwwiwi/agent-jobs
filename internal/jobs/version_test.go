@@ -66,3 +66,36 @@ func TestDaemonInfoMismatch(t *testing.T) {
 		t.Fatalf("other version: %q", s)
 	}
 }
+
+// With digests the build is compared by content at any path: the same version string ("dev") from
+// another binary at another path is a mismatch, an identical copy elsewhere is not.
+func TestDaemonMismatchBinaryDigest(t *testing.T) {
+	m := newManager(t)
+	dir := t.TempDir()
+	write := func(name, content string) FileIdentity {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		id, err := ReadIdentity(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	daemon := write("daemon-bin", "build one")
+	m.SelfBin = daemon.Path
+	if err := m.WriteDaemonInfo(); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := m.ReadDaemonInfo(); err != nil || d.Binary.SHA256 != daemon.SHA256 || d.Binary.SHA256 == "" {
+		t.Fatalf("daemon.json digest: %+v %v", d, err)
+	}
+	if s := m.DaemonMismatch(write("copy-bin", "build one")); s != "" {
+		t.Fatalf("identical copy at another path: %q", s)
+	}
+	if s := m.DaemonMismatch(write("other-bin", "build two")); !strings.Contains(s, "different builds") {
+		t.Fatalf("other build at another path: %q", s)
+	}
+}
