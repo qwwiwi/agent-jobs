@@ -280,7 +280,7 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 
 | tool | what it does |
 |---|---|
-| `system_doctor` | disk (free space, what `prune` would free), queue, ghost processes and dead running rows (report only), hooks (the guard blocks `git push` and allows `ls`, owner rules readable, notify target exists); `ok=false` lists the problems |
+| `system_doctor` | disk (free space, what `prune` would free), queue, ghost processes and dead running rows (report only), hooks (the guard blocks `git push` and allows `ls`, owner rules readable, notify target exists), `mcp_server` (this server's version against the daemon's `daemon.json` and the installed binary; on Linux the agent's `agent-jobs mcp --role orchestrator` processes whose `/proc/<pid>/exe` is deleted or not the installed binary); `ok=false` lists the problems |
 | `system_logs` | the last lines of the daemon log (`<state>/daemon.log` under launchd, else the systemd user journal of `agent-jobs@<agent>`), or with `job_id` that job's `stderr.log` |
 | `activity_report` | jobs started and finished over a window (default 24 h): counts by status, cost, turns, time, the jobs themselves |
 | `trash_move` | reversible deletion instead of `rm`: one rename into `~/.agent-jobs/<agent>/trash/<id>/`; only absolute paths inside `trash_roots` (config; **no default**: without it nothing can be moved), never the agent-jobs home (any agent's state), the owner rules, the agent-jobs binary, `~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude.json` or a path with a `.git` component; symlinks never followed out, never across filesystems |
@@ -493,6 +493,8 @@ scripts/install-linux.sh --instance my-agent --uninstall
 ```
 
 No sudo; current user only; idempotent. The skill goes to `--skills-dir` (default `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`) as `agent-jobs/SKILL.md`; `--no-skill` skips it. A skill edited locally is left as is (with a notice) unless `--force-skill`, which keeps a backup. The unit uses `KillMode=process`, so restarting the daemon never kills running jobs: the next daemon adopts and collects them. Each job runs in its own scope under the user manager, outside the daemon's service, so a restart does not touch it either way. Enable lingering (`loginctl enable-linger $USER`) for the daemon to survive logout.
+
+**Upgrade notes.** An upgrade restarts the daemon, but not the orchestrator session's MCP server (`agent-jobs mcp --role orchestrator`, started once per session): until the session is restarted, or `/mcp` reconnects it, the old binary serves the tools, so new `job_start` parameters, defaults and checks do not apply. The server notices: on every tool call it compares its binary (device, inode, size, mtime) with the file on disk and then adds the line `agent-jobs MCP server is older than the installed binary (started <t>, binary replaced <t>); restart the session ...` to the result; `job_start` (in `warnings`) and `system_doctor` also compare it with the daemon, which records its version and binary in `<state>/daemon.json` at start. `config.json` itself needs no restart: the server reloads it before a call when it changed (a file that does not load keeps the previous config, with a warning); only the `brain` block is read at start and needs a restart. A byte-identical reinstall also counts as a replaced binary (new inode and mtime).
 
 **Run the daemon on macOS (launchd)**
 
