@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 )
@@ -24,9 +25,29 @@ type TokenUsage struct {
 	CacheWrite int64 `json:"cache_write"`
 }
 
-// Add returns the sum of u and o.
-func (u TokenUsage) Add(o TokenUsage) TokenUsage {
-	return TokenUsage{u.Input + o.Input, u.Output + o.Output, u.CacheRead + o.CacheRead, u.CacheWrite + o.CacheWrite}
+// Valid reports whether no count of u is negative.
+func (u TokenUsage) Valid() bool {
+	return u.Input >= 0 && u.Output >= 0 && u.CacheRead >= 0 && u.CacheWrite >= 0
+}
+
+// Add returns the sum of u and o; ok is false when a count is negative (that field sums to 0) or a sum
+// overflows int64 (that field saturates at math.MaxInt64).
+func (u TokenUsage) Add(o TokenUsage) (sum TokenUsage, ok bool) {
+	ok = true
+	add := func(a, b int64) int64 {
+		switch {
+		case a < 0 || b < 0:
+			ok = false
+			return 0
+		case a > math.MaxInt64-b:
+			ok = false
+			return math.MaxInt64
+		}
+		return a + b
+	}
+	sum = TokenUsage{add(u.Input, o.Input), add(u.Output, o.Output), add(u.CacheRead, o.CacheRead),
+		add(u.CacheWrite, o.CacheWrite)}
+	return sum, ok
 }
 
 // Cost prices u at p.

@@ -105,7 +105,8 @@ func countsJSON(m map[string]int) (string, error) {
 	return string(b), err
 }
 
-// PutStats writes (or replaces) the stats row of a job.
+// PutStats writes (or replaces) the stats row of a job. The outcome comes from the job row when there
+// is one, read by the same statement: a SetOutcome after st was built is never overwritten.
 func (s *Store) PutStats(st *JobStats) error {
 	var cols [3]string
 	for i, m := range []map[string]int{st.ToolCalls, st.Skills, st.GuardRules} {
@@ -115,11 +116,13 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+		COALESCE((SELECT outcome FROM jobs WHERE id=?), ?), COALESCE((SELECT outcome_note FROM jobs WHERE id=?), ?),
+		?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
 		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
-		JoinNames(st.SkillsDelivered), st.Outcome, st.OutcomeNote, st.CostEstimatedUSD, st.CostSource, st.InputTokens,
+		JoinNames(st.SkillsDelivered), st.ID, st.Outcome, st.ID, st.OutcomeNote, st.CostEstimatedUSD, st.CostSource, st.InputTokens,
 		st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)

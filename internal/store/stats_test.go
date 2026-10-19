@@ -139,3 +139,40 @@ func TestJobStatsCostUnknownMigration(t *testing.T) {
 		t.Error("the backfill ran again on a later Open")
 	}
 }
+
+// A stats write built from the job row before a concurrent SetOutcome keeps the outcome: PutStats takes
+// it from the job row, not from the stale struct.
+func TestPutStatsKeepsConcurrentOutcome(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Unix(1770000000, 0)
+	if err := s.Insert(&Job{ID: "a", Agent: "ag", Title: "t", Kind: "fix", Brief: "b", Status: StatusSucceeded,
+		Model: "opus", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	stale := &JobStats{ID: "a", Kind: "fix", Model: "opus", Status: StatusSucceeded, CreatedAt: now, FinishedAt: &now,
+		RecordedAt: now}
+	if err := s.PutStats(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOutcome("a", "ag", "accepted", "used", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutStats(stale); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := s.GetStats("a"); err != nil || st.Outcome != "accepted" || st.OutcomeNote != "used" {
+		t.Fatalf("outcome overwritten: %+v %v", st, err)
+	}
+	// A row with no job row keeps the struct's outcome.
+	if err := s.PutStats(&JobStats{ID: "gone", Kind: "fix", Model: "opus", Status: StatusFailed, CreatedAt: now,
+		RecordedAt: now, Outcome: "discarded", OutcomeNote: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := s.GetStats("gone"); err != nil || st.Outcome != "discarded" || st.OutcomeNote != "n" {
+		t.Fatalf("orphan row: %+v %v", st, err)
+	}
+}

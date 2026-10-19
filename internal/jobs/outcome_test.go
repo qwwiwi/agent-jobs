@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -229,5 +230,63 @@ func TestRequeueClearsOutcome(t *testing.T) {
 	}
 	if j := get(t, m, "f"); j.Outcome != "" || j.OutcomeNote != "" || j.OutcomeAt != nil {
 		t.Fatalf("outcome kept: %+v", j)
+	}
+}
+
+// Usage that cannot be real (negative counts, codex cached input above the input, sums that overflow
+// int64) is not priced: the attempt's cost stays unknown, never an estimate.
+func TestInvalidTokenUsageCostUnknown(t *testing.T) {
+	m := newManager(t)
+	big := fmt.Sprint(int64(math.MaxInt64))
+	for _, c := range []struct {
+		name, stream string
+		source       string
+	}{
+		{"valid", `{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+			store.CostSourceEstimated},
+		{"negative claude", `{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":10,"output_tokens":-5}}}`,
+			store.CostSourceUnknown},
+		{"negative codex", `{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":-1}}`,
+			store.CostSourceUnknown},
+		{"codex cached above input", `{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":40,"output_tokens":1}}`,
+			store.CostSourceUnknown},
+		{"claude sum overflow", `{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":` + big + `}}}` + "\n" +
+			`{"type":"assistant","message":{"id":"m2","content":[],"usage":{"input_tokens":1}}}`, store.CostSourceUnknown},
+		{"codex sum overflow", `{"type":"turn.completed","usage":{"input_tokens":` + big + `,"output_tokens":1}}` + "\n" +
+			`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`, store.CostSourceUnknown},
+	} {
+		ss, err := ParseStreamStats(strings.NewReader(c.stream))
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := &store.JobStats{}
+		m.estimateCost(st, &store.Job{Model: "sonnet", CostUnknown: true}, nil, map[string]*StreamStats{"": &ss})
+		if st.CostSource != c.source || (c.source == store.CostSourceUnknown && st.CostEstimatedUSD != 0) {
+			t.Errorf("%s: source %q estimate %v, want %q", c.name, st.CostSource, st.CostEstimatedUSD, c.source)
+		}
+	}
+}
+
+// RecordStats with a job row read before a concurrent job_outcome keeps the outcome on the stats row.
+func TestRecordStatsKeepsConcurrentOutcome(t *testing.T) {
+	m := newManager(t)
+	now := time.Now()
+	if err := m.Store.Insert(&store.Job{ID: "a", Agent: m.Agent, Title: "a", Kind: "fix", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1, CreatedAt: now,
+		FinishedAt: &now, CostUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stale := get(t, m, "a")
+	if _, err := m.RecordStats(stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetOutcome("a", OutcomeAccepted, "kept"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RecordStats(stale); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := m.Store.GetStats("a"); err != nil || st.Outcome != OutcomeAccepted || st.OutcomeNote != "kept" {
+		t.Fatalf("outcome overwritten: %+v %v", st, err)
 	}
 }
