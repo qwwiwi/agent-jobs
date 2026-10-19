@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 - Guard (#41): on macOS and Windows, whose default file systems ignore case, protected paths (`jobs.db` and its `-wal`/`-shm`/`-journal` files, `subagents/`) are compared case-folded by the Bash checks (arguments, redirections, ancestors, option values, inline code) and by the file tools, so `JOBS.DB`, `Jobs.db` or `SUBAGENTS/j.log` no longer bypass the guard; Linux is unchanged.
+- Guard (#48): the ancestor-destination rule covers `bsdtar`, `gtar`, `unzip`, `ditto`, `cpio`, `pax`, `7z`, `7za` and `7zz` besides `tar` (looked up by the lower-cased base name), and the attached directory options `tar -C<dir>`, `unzip -d<dir>` and `7z x -o<dir>`; `unzip -o a.zip -d <ancestor of state>` and the like are refused, listing and extraction into the worktree or job directory stay allowed.
 
 ## [0.4.0] - 2026-10-18
 
