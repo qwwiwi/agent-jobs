@@ -59,6 +59,7 @@ func TestTimeoutIgnoresForgedResultAndSweeps(t *testing.T) {
 		t.Skip("python3 not found")
 	}
 	m := newManager(t)
+	noAutoContinue(m)
 	sessionsHome(t, true)
 	j := startRunning(t, m, "FAKE_FORGE FAKE_ESCAPE FAKE_SLEEP_ONCE=30", nil)
 	esc := waitPidFile(t, filepath.Join(m.JobDir(j.ID), "escaped.pid"))

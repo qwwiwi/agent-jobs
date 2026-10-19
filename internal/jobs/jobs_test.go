@@ -242,6 +242,19 @@ if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
 fi
+if [[ $prompt == *FAKE_MIDTASK* ]]; then
+  # Ends its turn mid-task: the final message is no report.
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Now let me check the remaining callers in store.go."}'
+  exit 0
+fi
+if [[ $prompt =~ (FAKE_MAX_TURNS_ALWAYS|FAKE_MAX_TURNS_ONCE) && ( $prompt == *FAKE_MAX_TURNS_ALWAYS* || ! -d ../attempts ) ]]; then
+  # Stops at its turn limit with no report, after a progress note naming its mode (so a continuation
+  # whose update quotes the note runs in the same mode).
+  printf -- '- done: step one of %s\n- next: step two\n' "${BASH_REMATCH[1]}" >> ../PROGRESS.md
+  echo '{"type":"assistant","message":{"id":"mt1","content":[{"type":"text","text":"Now let me check step two."}]}}'
+  echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":7,"total_cost_usd":0.4,"result":""}'
+  exit 1
+fi
 echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.25,"result":"## Summary\nok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
 `
 
@@ -613,6 +626,7 @@ func TestConcurrencyCapTwo(t *testing.T) {
 
 func TestTimeoutKillsProcessGroup(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := enqueue(t, m, "FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)

@@ -1541,12 +1541,13 @@ func cmdStats(args []string) error {
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	row := func(key string, s jobs.StatsSummary) {
-		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\n", key, s.Jobs,
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\t%d\n", key, s.Jobs,
 			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
-			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals, s.ReportOffContract)
 	}
 	// COST, MEDIAN and P90 are over the jobs with a known cost; COST? counts the others (codex, killed).
-	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	// OFF-CONTRACT counts the reports without a Summary or a Not done / uncertain section.
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS\tOFF-CONTRACT")
 	for _, g := range rep.Groups {
 		row(shown(g.Key), g.StatsSummary)
 	}

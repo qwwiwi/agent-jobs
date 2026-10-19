@@ -167,7 +167,7 @@ func acceptanceNote(j *store.Job) string {
 func (m *Manager) verdict(j *store.Job, code int, res StreamResult, dir string) (string, string) {
 	status, msg := Verdict(code, res, dir)
 	if status != store.StatusSucceeded || j.AcceptanceCmd == "" {
-		return status, msg
+		return m.reportContract(j, status, msg, dir)
 	}
 	fresh, err := m.Store.Get(j.ID)
 	if err != nil {
@@ -176,7 +176,30 @@ func (m *Manager) verdict(j *store.Job, code int, res StreamResult, dir string) 
 	if reason := AcceptanceFailure(fresh); reason != "" {
 		return store.StatusFailed, reason
 	}
-	return status, msg
+	return m.reportContract(j, status, msg, dir)
+}
+
+// reportContract checks the report of a succeeded claude job against the report contract: one
+// without a "## Summary" or "## Not done / uncertain" section keeps its status with the note added to
+// its message (report_contract warn, the default) or fails with it (fail).
+func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string, string) {
+	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
+		return status, msg
+	}
+	report, err := readSmall(filepath.Join(dir, "report.md"), maxContractReportBytes+1)
+	if err != nil || len(report) > maxContractReportBytes {
+		return status, msg // Verdict saw a report; one unreadable now, or longer than the limit, is not judged here
+	}
+	note := reportContractNote(report)
+	switch {
+	case note == "":
+		return status, msg
+	case m.Cfg.ReportContract == ReportContractFail:
+		return store.StatusFailed, note
+	case msg != "":
+		return status, msg + "; " + note
+	}
+	return status, note
 }
 
 // wrapperAcceptance is what the wrapper needs to run a job's acceptance command.

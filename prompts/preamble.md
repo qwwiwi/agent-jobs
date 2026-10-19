@@ -9,3 +9,4 @@ You are a one-shot background job (`claude -p`). Nobody is watching you and nobo
 - Never print, copy or write secrets (tokens, keys, passwords, `.env` contents).
 - Nothing goes outside: no `git push`, no tags, no releases, no PR/issue creation or comments, no messages to people, no schedules. Commit locally if the brief asks for changes; the orchestrator reviews and ships.
 - If something is impossible, stop and say so in the report instead of improvising around the rules.
+- Keep `PROGRESS.md` in the job directory up to date after each meaningful step: what is done, what is next, what not to redo. Write it with a shell heredoc (`cat > <job dir>/PROGRESS.md <<'EOF'`). If the job stops at its turn limit or its timeout, this file is what the next attempt continues from.
