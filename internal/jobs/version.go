@@ -1,9 +1,12 @@
 package jobs
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,13 +19,15 @@ import (
 var Version = "dev"
 
 // FileIdentity identifies one file on disk: replacing it (a new inode), rewriting it in place (size,
-// mtime) or moving another file over it all change the identity.
+// mtime) or moving another file over it all change the identity. SHA256 (ReadIdentity only) identifies
+// the content wherever it lies.
 type FileIdentity struct {
 	Path    string    `json:"path"`
 	Dev     uint64    `json:"dev"`
 	Ino     uint64    `json:"ino"`
 	Size    int64     `json:"size"`
 	ModTime time.Time `json:"mtime"`
+	SHA256  string    `json:"sha256,omitempty"`
 }
 
 // StatIdentity returns the identity of the file at path (links followed).
@@ -35,6 +40,29 @@ func StatIdentity(path string) (FileIdentity, error) {
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 		id.Dev, id.Ino = uint64(st.Dev), st.Ino // Dev is int32 on darwin
 	}
+	return id, nil
+}
+
+// ReadIdentity is StatIdentity plus the SHA-256 of the content, both taken from one open file.
+func ReadIdentity(path string) (FileIdentity, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	id := FileIdentity{Path: path, Size: fi.Size(), ModTime: fi.ModTime()}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		id.Dev, id.Ino = uint64(st.Dev), st.Ino // Dev is int32 on darwin
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return FileIdentity{}, err
+	}
+	id.SHA256 = hex.EncodeToString(h.Sum(nil))
 	return id, nil
 }
 
@@ -56,7 +84,7 @@ type DaemonInfo struct {
 
 // WriteDaemonInfo records the daemon's version and binary identity in <state>/daemon.json.
 func (m *Manager) WriteDaemonInfo() error {
-	bin, err := StatIdentity(m.SelfBin)
+	bin, err := ReadIdentity(m.SelfBin)
 	if err != nil {
 		return fmt.Errorf("daemon.json: %w", err)
 	}
@@ -81,8 +109,9 @@ func (m *Manager) ReadDaemonInfo() (*DaemonInfo, error) {
 }
 
 // DaemonMismatch compares the running daemon (daemon.json) with this process, started from the binary
-// whose identity was self at its start: a different version, or the same version string from another
-// build of the same path. "" when they match or when there is no daemon.json.
+// whose identity was self at its start (ReadIdentity): a different version, or the same version string
+// from another build (another content digest at any path; without digests, another file identity at
+// the same path). "" when they match or when there is no daemon.json.
 func (m *Manager) DaemonMismatch(self FileIdentity) string {
 	d, err := m.ReadDaemonInfo()
 	if errors.Is(err, os.ErrNotExist) {
@@ -95,6 +124,11 @@ func (m *Manager) DaemonMismatch(self FileIdentity) string {
 	case d.Version != Version:
 		return fmt.Sprintf("the daemon runs agent-jobs %s, this MCP server %s; restart the session (or /mcp reconnect) "+
 			"or the daemon so both run the installed binary", Printable(d.Version, 64), Version)
+	case d.Binary.SHA256 != "" && self.SHA256 != "":
+		if d.Binary.SHA256 != self.SHA256 {
+			return fmt.Sprintf("the daemon (%s) and this MCP server (%s) run different builds (both say %s); restart the "+
+				"session (or /mcp reconnect) or the daemon so both run the installed binary", Printable(d.Binary.Path, 200), self.Path, Version)
+		}
 	case d.Binary.Path == self.Path && !d.Binary.Same(self):
 		return fmt.Sprintf("the daemon and this MCP server run different builds of %s (both say %s); restart the "+
 			"session (or /mcp reconnect) or the daemon so both run the installed binary", self.Path, Version)

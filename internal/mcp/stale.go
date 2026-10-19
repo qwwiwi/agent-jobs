@@ -11,6 +11,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
 
@@ -21,28 +22,33 @@ import (
 type ServerWatch struct {
 	m       *jobs.Manager
 	started time.Time
-	self    jobs.FileIdentity // the binary when the server started
+	self    jobs.FileIdentity // the binary when the server started (with its digest)
 	selfErr error
+	brain   brain.Config // the brain block m.Brain (and Deps.Brain, Deps.MinScore) were built from
 
-	// mu is held shared by every tool call and exclusively while the config is swapped, so no handler
-	// sees m.Cfg change under it.
+	// mu is held shared by every tool call and exclusively while the config is reloaded and swapped, so
+	// no handler sees m.Cfg change under it.
 	mu sync.RWMutex
 
-	// cfgMu guards the fields below. It is never held while waiting for mu: a call holding mu shared may
-	// take cfgMu (ConfigWarning), so the reverse order would deadlock.
-	cfgMu   sync.Mutex
-	cfgID   jobs.FileIdentity
-	cfgOK   bool   // config.json existed at the last check
-	cfgErr  string // why the changed config.json was not loaded ("" = loaded)
-	cfgGen  uint64 // bumped for every loaded config
-	usedGen uint64 // the generation in m.Cfg (guarded by mu)
+	// cfgMu guards the fields below, which change only while mu is held exclusively, together with
+	// m.Cfg: a call that sees the new identity finds the new config in force. cfgMu is never held while
+	// waiting for mu: a call holding mu shared may take cfgMu (ConfigWarning), so that order would
+	// deadlock.
+	cfgMu      sync.Mutex
+	cfgChecked bool // config.json was checked since the server started
+	cfgID      jobs.FileIdentity
+	cfgOK      bool   // config.json existed at the last check
+	cfgErr     string // why the changed config.json was not loaded ("" = loaded)
+	brainMoved bool   // the loaded config has another brain block than the one in use
+
+	beforeSwap func() // test hook: a reload is about to wait for mu
 }
 
-// NewServerWatch records the identity of m's binary and of config.json now.
+// NewServerWatch records the identity and digest of m's binary now. config.json is reloaded before the
+// first tool call: m.Cfg was loaded earlier, and a later identity would not prove what it holds.
 func NewServerWatch(m *jobs.Manager) *ServerWatch {
-	w := &ServerWatch{m: m, started: m.Now()}
-	w.self, w.selfErr = jobs.StatIdentity(m.SelfBin)
-	w.cfgID, w.cfgOK = w.configIdentity()
+	w := &ServerWatch{m: m, started: m.Now(), brain: m.Cfg.Brain}
+	w.self, w.selfErr = jobs.ReadIdentity(m.SelfBin)
 	return w
 }
 
@@ -53,43 +59,56 @@ func (w *ServerWatch) configIdentity() (jobs.FileIdentity, bool) {
 	return id, err == nil
 }
 
+// configChanged reports whether config.json differs from the last loaded one (cfgMu held).
+func (w *ServerWatch) configChanged(id jobs.FileIdentity, ok bool) bool {
+	return !w.cfgChecked || ok != w.cfgOK || (ok && !id.Same(w.cfgID))
+}
+
 // refreshConfig reloads config.json when it changed since the last check. A config that does not load
-// keeps the previous one in force and is reported (ConfigWarning) until the file changes again.
+// keeps the previous one in force and is reported (ConfigWarning) until the file changes again. The
+// identity is taken before the file is read, so a write in between only causes one more reload.
 func (w *ServerWatch) refreshConfig() {
-	w.cfgMu.Lock()
 	id, ok := w.configIdentity()
-	if ok == w.cfgOK && (!ok || id.Same(w.cfgID)) {
-		w.cfgMu.Unlock()
+	w.cfgMu.Lock()
+	changed := w.configChanged(id, ok)
+	w.cfgMu.Unlock()
+	if !changed {
 		return
 	}
-	w.cfgID, w.cfgOK = id, ok
+	if w.beforeSwap != nil {
+		w.beforeSwap()
+	}
+	w.mu.Lock() // once no call runs
+	defer w.mu.Unlock()
+	id, ok = w.configIdentity()
+	w.cfgMu.Lock()
+	defer w.cfgMu.Unlock()
+	if !w.configChanged(id, ok) { // another call reloaded it meanwhile
+		return
+	}
+	w.cfgChecked, w.cfgID, w.cfgOK = true, id, ok
 	cfg, err := jobs.LoadConfig(w.m.StateDir)
 	if err != nil {
 		w.cfgErr = err.Error()
-		w.cfgMu.Unlock()
 		return
 	}
-	w.cfgErr = ""
-	w.cfgGen++
-	gen := w.cfgGen
-	w.cfgMu.Unlock()
-	// Swapped once no call runs; a slower refresh of an older file never replaces a newer config.
-	w.mu.Lock()
-	if gen > w.usedGen {
-		w.m.Cfg, w.usedGen = cfg, gen
-	}
-	w.mu.Unlock()
+	w.m.Cfg, w.cfgErr, w.brainMoved = cfg, "", cfg.Brain != w.brain
 }
 
-// ConfigWarning says that a changed config.json did not load ("" = none).
+// ConfigWarning says that a changed config.json did not load, or that its brain block changed and is
+// not applied ("" = none).
 func (w *ServerWatch) ConfigWarning() string {
 	w.cfgMu.Lock()
 	defer w.cfgMu.Unlock()
-	if w.cfgErr == "" {
-		return ""
+	switch {
+	case w.cfgErr != "":
+		return "config.json changed but does not load (" + jobs.RedactPrintable(w.cfgErr, 200) +
+			"); this MCP server keeps the config it loaded before"
+	case w.brainMoved:
+		return "config.json changed its brain block; this MCP server keeps the brain it started with " +
+			"until the session restarts (or /mcp reconnect)"
 	}
-	return "config.json changed but does not load (" + jobs.RedactPrintable(w.cfgErr, 200) +
-		"); this MCP server keeps the config it loaded before"
+	return ""
 }
 
 // StaleBinary says that the binary on disk is not the one this server started from ("" = it is).

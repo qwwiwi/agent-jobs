@@ -214,13 +214,15 @@ func TestStaleMCPProcessOverStdio(t *testing.T) {
 func TestConfigReloadDoesNotDeadlockRunningCall(t *testing.T) {
 	m := newManager(t)
 	w := NewServerWatch(m)
+	waiting := make(chan struct{})
+	w.beforeSwap = func() { close(waiting) }
 	w.mu.RLock() // a running tool call
 	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{"max_brief_bytes": 1234}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	reloaded := make(chan struct{})
 	go func() { w.refreshConfig(); close(reloaded) }()
-	time.Sleep(100 * time.Millisecond) // the reload now waits for the running call
+	<-waiting // the reload now waits for the running call
 	warned := make(chan string)
 	go func() { warned <- w.ConfigWarning() }()
 	select {
@@ -236,5 +238,67 @@ func TestConfigReloadDoesNotDeadlockRunningCall(t *testing.T) {
 	}
 	if m.Cfg.MaxBriefBytes != 1234 {
 		t.Fatalf("config not swapped: %d", m.Cfg.MaxBriefBytes)
+	}
+}
+
+// A call that arrives while another call's reload has not swapped the config yet does not run on the
+// old config: the new identity becomes visible only with the new config.
+func TestConfigIdentityVisibleOnlyAfterSwap(t *testing.T) {
+	m := newManager(t)
+	w := NewServerWatch(m)
+	w.refreshConfig() // the first check
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{"max_brief_bytes": 4321}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seen := -1
+	w.beforeSwap = func() {
+		w.beforeSwap = nil
+		// Another call, between the first reload's check and its swap.
+		w.refreshConfig()
+		w.mu.RLock()
+		seen = m.Cfg.MaxBriefBytes
+		w.mu.RUnlock()
+	}
+	w.refreshConfig()
+	if seen != 4321 || m.Cfg.MaxBriefBytes != 4321 {
+		t.Fatalf("concurrent call saw max_brief_bytes %d (now %d)", seen, m.Cfg.MaxBriefBytes)
+	}
+}
+
+// config.json written after the manager loaded it but before the server's first call is applied: the
+// first call reloads, whatever the file's identity when the watch was created.
+func TestConfigChangedBeforeFirstCall(t *testing.T) {
+	m := newManager(t)
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{"max_brief_bytes": 2345}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := NewServerWatch(m)
+	w.refreshConfig()
+	if m.Cfg.MaxBriefBytes != 2345 {
+		t.Fatalf("config of the first call: %d", m.Cfg.MaxBriefBytes)
+	}
+}
+
+// A reloaded brain block is not applied to the brain built at start, and the result says so.
+func TestConfigBrainChangeWarns(t *testing.T) {
+	m := newManager(t)
+	w := NewServerWatch(m)
+	cfg := filepath.Join(m.StateDir, "config.json")
+	if err := os.WriteFile(cfg, []byte(`{"max_brief_bytes": 3456}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.refreshConfig()
+	if s := w.ConfigWarning(); s != "" {
+		t.Fatalf("no brain change: %q", s)
+	}
+	if err := os.WriteFile(cfg, []byte(`{"brain": {"recall_url": "http://127.0.0.1:9/recall", "token_env": "BRAIN_TOKEN"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.refreshConfig()
+	if m.Cfg.Brain.RecallURL == "" {
+		t.Fatalf("config not reloaded: %+v", m.Cfg.Brain)
+	}
+	if s := w.ConfigWarning(); !strings.Contains(s, "brain block") || !strings.Contains(s, "/mcp reconnect") {
+		t.Fatalf("brain change: %q", s)
 	}
 }
