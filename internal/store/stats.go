@@ -43,6 +43,8 @@ type JobStats struct {
 	// Source is where the stream was read from: "job_dir", "archive" or "none".
 	Source     string    `json:"source"`
 	RecordedAt time.Time `json:"recorded_at"`
+	// DirBytes is the size of the job directory when the job ended (worktree of a repo job left out).
+	DirBytes int64 `json:"dir_bytes"`
 }
 
 const statsSchema = `
@@ -73,7 +75,7 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
 	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
-	cost_unknown, skills_delivered`
+	cost_unknown, skills_delivered, dir_bytes`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -93,11 +95,11 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
 		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
-		JoinNames(st.SkillsDelivered))
+		JoinNames(st.SkillsDelivered), st.DirBytes)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -111,7 +113,7 @@ func scanStats(r scanner) (*JobStats, error) {
 	var tools, skills, rules, delivered string
 	if err := r.Scan(&st.ID, &st.Kind, &st.Model, &st.Status, &st.Turns, &st.CostUSD, &st.DurationSec, &created,
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
-		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered); err != nil {
+		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered, &st.DirBytes); err != nil {
 		return nil, err
 	}
 	st.SkillsDelivered = SplitNames(delivered)

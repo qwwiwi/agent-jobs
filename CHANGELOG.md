@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Job folder size (#43): when an attempt ends, the job folder is measured (the worktree of a repo job left out, symlinks not followed) and stored on the job row and the stats row (columns `jobs.dir_bytes`, `job_stats.dir_bytes`); `job_result` returns `job_dir_bytes`, the job-done line ends with `· job dir <size>` from config `job_dir_note_mb` on (default 100, `0` never), and `system_doctor` lists the five largest job folders with their temp-dir share (`disk.largest_job_dirs`) and the total of all job temp dirs (`disk.job_tmp_bytes`).
+
 ### Fixed
+- A job's temp files no longer land in the daemon's temp dir (#43): `prepare` creates `<jobdir>/tmp` (0700) and claude (or codex) runs with `TMPDIR`, `GOTMPDIR`, `TMP` and `TEMP` set to it (one helper, `TempEnv`, shared with the acceptance command, which now gets all four for its own `tmp/`). What a killed job leaves there (`go-build*` work dirs of an interrupted `go test`) is removed by the existing 48-hour prune with the rest of the folder. A symlink in place of `tmp/` is refused.
 - A wrapper that dies alone (OOM, a crash, a stray kill) no longer leaves claude running after its row turned terminal (#42): the daemon records whether a job's process group is the one it spawned (new column `jobs.pgid_spawned`; a group adopted from the job-writable `wrapper.json` is never marked). When the wrapper died without `exit_code`, the next tick ends that group (SIGTERM, grace, SIGKILL) and the job's acceptance command before the row turns `failed`, and the error says `leftover process group N killed` (or that it survived SIGKILL); the timeout and cancel/stop kill do the same once the wrapper pid is gone. While that group is alive, on every platform, `job_resume` is refused and cleanup and prune leave the job's worktree and folder alone.
 
 ## [0.4.0] - 2026-10-18

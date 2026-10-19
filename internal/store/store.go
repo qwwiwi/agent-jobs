@@ -126,6 +126,9 @@ type Job struct {
 	// not one adopted from the job-writable wrapper.json (SetPID). Only such a group may be signalled
 	// once its wrapper is gone: a pgid is not reused while its group has members.
 	PGIDSpawned bool
+	// DirBytes is the size of the job directory measured when the attempt ended (the worktree of a
+	// repo job left out; symlinks not followed), 0 before.
+	DirBytes int64
 	// Skills are the catalog skills selected for the job at job_start (E7), sorted by name.
 	Skills []string
 	// SkillsDelivered are the skills linked into the job's work dir for the current attempt (removed
@@ -383,6 +386,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN pgid_spawned INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -507,7 +512,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
-	acceptance_pgid, timed_out_at, pgid_spawned`
+	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -524,7 +529,7 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
@@ -533,7 +538,7 @@ func (s *Store) Insert(j *Job) error {
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
-		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned)
+		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes)
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -554,7 +559,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
-		&j.PGIDSpawned)
+		&j.PGIDSpawned, &j.DirBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +798,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', acceptance_started_at=NULL,
+		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, error='', acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
@@ -888,6 +893,11 @@ func (s *Store) SetPID(id, token string, pid, pgid int) error {
 func (s *Store) SetSpawnedPID(id, token string, pid int) error {
 	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=?, pgid_spawned=1 WHERE id=? AND status='running' AND launch_token=?`,
 		pid, pid, id, token))
+}
+
+// SetDirBytes records the size of the job directory measured when an attempt ended.
+func (s *Store) SetDirBytes(id string, n int64) error {
+	return affected(s.db.Exec(`UPDATE jobs SET dir_bytes=? WHERE id=?`, n, id))
 }
 
 // SetScope records the systemd scope unit of the launch that owns the job, before the wrapper is spawned.
