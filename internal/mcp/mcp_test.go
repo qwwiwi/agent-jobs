@@ -324,7 +324,7 @@ func TestJobToolsLifecycle(t *testing.T) {
 	if res.CostUnknown {
 		t.Fatalf("job_result: cost of a claude job is known: %+v", res)
 	}
-	if !res.Finished || res.Report != report || res.ReportMissing || res.DoneLine != jobs.DoneLine(done) ||
+	if !res.Finished || res.Report != report || res.ReportMissing || res.DoneLine != jobs.DoneLine(done, 0) ||
 		!slices.Contains(res.Artifacts, filepath.Join(dir, "commits.patch")) || !slices.Contains(res.Artifacts, filepath.Join(dir, "report.md")) {
 		t.Fatalf("job_result: %+v", res)
 	}

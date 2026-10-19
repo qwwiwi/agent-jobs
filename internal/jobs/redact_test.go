@@ -103,7 +103,7 @@ func TestRedactStats(t *testing.T) {
 
 func TestDoneLineRedacted(t *testing.T) {
 	j := &store.Job{ID: "id", Title: "rotate ghp_" + rep("Z", 36), Status: store.StatusSucceeded}
-	if l := DoneLine(j); strings.Contains(l, rep("Z", 36)) || !strings.Contains(l, "[redacted:github]") {
+	if l := DoneLine(j, 0); strings.Contains(l, rep("Z", 36)) || !strings.Contains(l, "[redacted:github]") {
 		t.Fatalf("done line: %q", l)
 	}
 }
@@ -378,7 +378,7 @@ func TestRedactBeforeCut(t *testing.T) {
 		t.Fatalf("failed message: %s %q", status, out)
 	}
 	j := &store.Job{ID: "id", Title: rep("t", 100) + " " + tok, Status: store.StatusSucceeded}
-	if l := DoneLine(j); strings.Contains(l, rep("Q", 10)) {
+	if l := DoneLine(j, 0); strings.Contains(l, rep("Q", 10)) {
 		t.Fatalf("done line leaked a cut title token: %q", l)
 	}
 }

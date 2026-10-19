@@ -119,7 +119,7 @@ func TestStopRunningThenResumeSameSession(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(work, "wip.txt")); err != nil {
 		t.Fatal("the resumed attempt must run in the same work dir")
 	}
-	if line := DoneLine(j); !strings.Contains(line, "resumed (attempt 2)") || strings.Contains(line, "fresh session") {
+	if line := DoneLine(j, 0); !strings.Contains(line, "resumed (attempt 2)") || strings.Contains(line, "fresh session") {
 		t.Fatalf("done line: %s", line)
 	}
 	atts, err := m.Store.Attempts(j.ID)
@@ -233,7 +233,7 @@ func TestStopQueuedThenResumeStartsWithUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := runToEnd(t, m, j.ID)
-	if done.Status != store.StatusSucceeded || done.Attempt != 1 || done.MaxTurns != 7 || strings.Contains(DoneLine(done), "resumed") {
+	if done.Status != store.StatusSucceeded || done.Attempt != 1 || done.MaxTurns != 7 || strings.Contains(DoneLine(done, 0), "resumed") {
 		t.Fatalf("after resume: %+v", done)
 	}
 	prompt := readFile(t, filepath.Join(m.JobDir(j.ID), "prompt.md"))
@@ -274,7 +274,7 @@ func TestResumeMissingSessionFallsBack(t *testing.T) {
 			t.Fatalf("fallback prompt lacks %q:\n%s", s, stdin)
 		}
 	}
-	if line := DoneLine(j); !strings.Contains(line, "resumed (attempt 2, fresh session)") {
+	if line := DoneLine(j, 0); !strings.Contains(line, "resumed (attempt 2, fresh session)") {
 		t.Fatalf("done line: %s", line)
 	}
 }

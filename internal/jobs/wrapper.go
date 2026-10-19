@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -425,6 +427,13 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
 		return 127, false
 	}
+	// Created by prepare; again here for an attempt prepared by an older build.
+	tmp, err := ensureJobTmp(jobDir)
+	if err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: job temp dir:", err)
+		return 127, false
+	}
+	env = TempEnv(env, tmp)
 	if runner != store.RunnerCodex {
 		env = ForkSubagentEnv(env)
 	}
@@ -445,6 +454,48 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 		return 127, false
 	}
 	return 0, closed
+}
+
+// JobTmpDir is the job's own temp dir inside its folder (<jobDir>/tmp): what the job's tools leave in
+// the temp dir (go build work dirs of a killed `go test`) is pruned with the folder.
+const JobTmpDir = "tmp"
+
+// tempEnvKeys are the variables tools read for the temp dir (TempEnv sets them all).
+var tempEnvKeys = []string{"TMPDIR", "GOTMPDIR", "TMP", "TEMP"}
+
+// TempEnv returns env without any inherited tempEnvKeys, then each of them set to dir.
+func TempEnv(env []string, dir string) []string {
+	out := make([]string, 0, len(env)+len(tempEnvKeys))
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); !slices.Contains(tempEnvKeys, k) {
+			out = append(out, kv)
+		}
+	}
+	for _, k := range tempEnvKeys {
+		out = append(out, k+"="+dir)
+	}
+	return out
+}
+
+// ensureJobTmp creates the job's temp dir (0700) if it is missing and returns its absolute path. The
+// job can write its folder: anything there but a real directory (a symlink) is refused.
+func ensureJobTmp(jobDir string) (string, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(abs, JobTmpDir)
+	if err := os.Mkdir(p, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", err
+	}
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("%s is not a real directory (%s)", p, fi.Mode().Type())
+	}
+	return p, nil
 }
 
 // ForkSubagentEnvVar switches Claude Code's fork subagents (on by default in `claude -p` since the

@@ -123,7 +123,7 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		t.Fatalf("usage not logged: %s", log)
 	}
 	// Unknown cost and the absent turn/budget caps are said as such, never as $0.00 or a number.
-	if line := DoneLine(j); !strings.Contains(line, "· cost unknown ·") || strings.Contains(line, "$0.00") {
+	if line := DoneLine(j, 0); !strings.Contains(line, "· cost unknown ·") || strings.Contains(line, "$0.00") {
 		t.Fatalf("done line %q", line)
 	}
 	if c := CostText(j.CostUSD, j.CostUnknown); c != "unknown" {

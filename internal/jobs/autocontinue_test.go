@@ -85,7 +85,7 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 	if err != nil || st.Turns != 10 || st.CostUSD < 0.649 || st.CostUSD > 0.651 {
 		t.Fatalf("stats do not count attempt 1: %+v %v", st, err)
 	}
-	if line := DoneLine(got); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 stopped at its turn limit after 7 turns (cost $0.40))") {
+	if line := DoneLine(got, 0); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 stopped at its turn limit after 7 turns (cost $0.40))") {
 		t.Fatalf("done line: %s", line)
 	}
 }
@@ -112,7 +112,7 @@ func TestAutoContinueOnlyOnce(t *testing.T) {
 	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); !strings.Contains(r, "Attempt 2 stopped at its turn limit") {
 		t.Fatalf("stop report of attempt 2:\n%s", r)
 	}
-	if line := DoneLine(got); !strings.Contains(line, "auto-continued (attempt 2;") {
+	if line := DoneLine(got, 0); !strings.Contains(line, "auto-continued (attempt 2;") {
 		t.Fatalf("done line: %s", line)
 	}
 }
@@ -131,8 +131,8 @@ func TestAutoContinueOffAndStopped(t *testing.T) {
 	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); !strings.Contains(r, "stopped at its turn limit") {
 		t.Fatalf("no stop report:\n%s", r)
 	}
-	if strings.Contains(DoneLine(j), "auto-continued") {
-		t.Fatalf("done line: %s", DoneLine(j))
+	if strings.Contains(DoneLine(j, 0), "auto-continued") {
+		t.Fatalf("done line: %s", DoneLine(j, 0))
 	}
 	if st, err := m.Store.GetStats(j.ID); err != nil || st.HasReport {
 		t.Fatalf("the stop report counts as the job's report in the stats: %+v %v", st, err)
@@ -180,7 +180,7 @@ func TestAutoContinueAfterTimeout(t *testing.T) {
 	if _, cost, _ := attemptsUsage(got, atts); cost < 10.249 || cost > 10.251 {
 		t.Fatalf("accounted cost $%g, want $10.25", cost)
 	}
-	if line := DoneLine(got); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 timed out") {
+	if line := DoneLine(got, 0); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 timed out") {
 		t.Fatalf("done line: %s", line)
 	}
 }
@@ -251,12 +251,12 @@ func TestReportContractNote(t *testing.T) {
 	if j.Status != store.StatusSucceeded || j.Error != NoteNoSummary {
 		t.Fatalf("mid-task report: %s %q", j.Status, j.Error)
 	}
-	if line := DoneLine(j); !strings.HasSuffix(line, " · "+NoteNoSummary) {
+	if line := DoneLine(j, 0); !strings.HasSuffix(line, " · "+NoteNoSummary) {
 		t.Fatalf("done line: %s", line)
 	}
 	ok := runToEnd(t, m, enqueue(t, m, "do the thing", nil).ID)
-	if ok.Status != store.StatusSucceeded || ok.Error != "" || strings.Contains(DoneLine(ok), "report has no") {
-		t.Fatalf("contract report: %s %q %s", ok.Status, ok.Error, DoneLine(ok))
+	if ok.Status != store.StatusSucceeded || ok.Error != "" || strings.Contains(DoneLine(ok, 0), "report has no") {
+		t.Fatalf("contract report: %s %q %s", ok.Status, ok.Error, DoneLine(ok, 0))
 	}
 	rep, err := m.Stats(time.Time{}, "kind")
 	if err != nil || rep.Totals.ReportOffContract != 1 || len(rep.Groups) != 1 || rep.Groups[0].ReportOffContract != 1 {
