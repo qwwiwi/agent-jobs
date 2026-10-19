@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Benchmark (docs/BENCHMARK.md, README «Benchmark»): the same three tasks (bug fix, DM lead sweep, research report) as a foreground subagent, a background subagent and a job, 2 runs each, Opus 5.5; limits, tokens by class, priced total, acceptance, wall time and parent-busy time, plus real-usage numbers of one agent's jobs. Scripts in `scripts/bench/` (isolated setup, runner, acceptance checks, measurement, read-only usage aggregation).
+
 ## [0.4.0] - 2026-10-18
 
 ### Added
