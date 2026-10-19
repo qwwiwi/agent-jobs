@@ -400,7 +400,7 @@ func (s *pathScope) parentHit(w string) (string, bool) {
 	}
 	for _, p := range s.candidates(exp) {
 		for _, q := range s.protected {
-			if filepath.Join(p, filepath.Base(q)) == q {
+			if fold(filepath.Join(p, filepath.Base(q))) == fold(q) {
 				return q, true
 			}
 		}
@@ -419,9 +419,9 @@ func (s *pathScope) couldReach(rel string, tree bool) bool {
 	if rel == "." {
 		return tree
 	}
-	segs := strings.Split(filepath.ToSlash(rel), "/")
+	segs := strings.Split(filepath.ToSlash(fold(rel)), "/")
 	for _, q := range s.protected {
-		qs := strings.Split(strings.Trim(filepath.ToSlash(q), "/"), "/")
+		qs := strings.Split(strings.Trim(filepath.ToSlash(fold(q)), "/"), "/")
 		for k := range qs {
 			n := min(len(segs), len(qs)-k)
 			if slices.Equal(segs[:n], qs[k:k+n]) && (len(segs) >= len(qs)-k || tree) {
@@ -489,12 +489,13 @@ func percentDecode(w string) string {
 }
 
 func (s *pathScope) containsText(w string, code bool) (textHit, bool) {
+	fw := fold(w)
 	for _, q := range s.protected {
-		if strings.Contains(w, q) {
+		if strings.Contains(fw, fold(q)) {
 			return textHit{q: q}, true
 		}
 		for _, d := range s.dirs {
-			if rel, err := filepath.Rel(d, q); err == nil && !onlyDotDot(rel) && strings.Contains(w, rel) {
+			if rel, err := filepath.Rel(d, q); err == nil && !onlyDotDot(rel) && strings.Contains(fw, fold(rel)) {
 				return textHit{q: q}, true
 			}
 		}
@@ -622,10 +623,62 @@ func pathTokens(w string) []string {
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
 // argument: with an ancestor of a protected path as an argument they reach it (`rm -r <state>`,
-// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`).
+// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`). Looked
+// up by the lower-cased base name of the program.
 var treeWriters = map[string]bool{
 	"rm": true, "rmdir": true, "unlink": true, "mv": true, "cp": true, "install": true, "ln": true,
 	"rsync": true, "chmod": true, "chown": true, "chgrp": true, "tar": true, "shred": true,
+	"bsdtar": true, "gtar": true, "unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true,
+	"7za": true, "7zz": true,
+}
+
+// clusterDirOpts are the archive tools whose short options cluster like getopt: the directory
+// option (`dir`) takes the rest of the word as its value (`tar -xvC<dir>`, `unzip -qd<dir>`,
+// `cpio -idmD<dir>`), and so does any option in `vals`, which ends the cluster with a value of its
+// own (`tar -xfC…` names the archive `C…`). Only the options that take a value in every variant
+// (GNU and BSD tar, GNU and BSD cpio) are in `vals`: an unknown letter counts as a flag, so the scan
+// goes on to the directory option (fail closed). A directory option ending the word takes the next
+// word, which is checked whole as an ancestor already. unzip has no value option in `vals`: its `-P`
+// takes the rest of the word only for the first password, a repeated `-P` is skipped and the scan
+// goes on (`-Pdummy -Pd<dir>`), so any `d` in the word counts; a `-` inside a cluster negates the
+// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too.
+var clusterDirOpts = map[string]struct {
+	dir  byte
+	vals string
+}{
+	"tar": {'C', "bITXf"}, "bsdtar": {'C', "bITXf"}, "gtar": {'C', "bITXf"},
+	"unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
+}
+
+// sevenZips take switches case-insensitively, one per word: `-o<dir>` and `-O<dir>` both set the
+// output directory.
+var sevenZips = map[string]bool{"7z": true, "7za": true, "7zz": true}
+
+// attachedDir returns the directory attached to an archive tool's directory option in the same
+// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
+func attachedDir(name, a string) (string, bool) {
+	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
+		return "", false
+	}
+	if sevenZips[name] {
+		if a[1] != 'o' && a[1] != 'O' {
+			return "", false
+		}
+		return a[2:], true
+	}
+	opt, ok := clusterDirOpts[name]
+	if !ok {
+		return "", false
+	}
+	for j := 1; j < len(a)-1; j++ {
+		switch c := a[j]; {
+		case c == opt.dir:
+			return a[j+1:], true
+		case strings.IndexByte(opt.vals, c) >= 0:
+			return "", false
+		}
+	}
+	return "", false
 }
 
 // findActs reports a find with an action that writes or runs something (-delete, -exec, -fprint, …).

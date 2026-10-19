@@ -24,7 +24,7 @@ type ScheduleAddInput struct {
 	Repo            string   `json:"repo,omitempty" jsonschema:"job schedules: absolute path of a git repository"`
 	Base            string   `json:"base,omitempty" jsonschema:"job schedules: ref in repo, resolved at each firing; default HEAD"`
 	Runner          string   `json:"runner,omitempty" jsonschema:"job schedules: claude | codex (codex rules as in job_start)"`
-	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"codex job schedules only: low | medium | high"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"job schedules: reasoning effort as in job_start (claude low | medium | high | xhigh | max, codex low | medium | high); the default is resolved now and stored"`
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general job schedules only: the acceptance command of the jobs it starts (see job_start)"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"job schedules: edits to the default skills of each job it starts, as in job_start (+name or name adds, -name removes); checked now and again at each firing"`
 }
