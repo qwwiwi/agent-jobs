@@ -29,9 +29,13 @@ const (
 	CodexSandboxWrite    = "workspace-write"
 )
 
-// ReasoningEfforts are the accepted codex reasoning efforts; DefaultReasoningEffort applies when neither
-// the job nor the config names one.
-var ReasoningEfforts = []string{"low", "medium", "high"}
+// ReasoningEfforts are the accepted reasoning efforts per runner: codex's model_reasoning_effort values
+// and the claude CLI's --effort values. DefaultReasoningEffort applies to a codex job when neither the
+// job nor the config names one; a claude job takes its kind's default (effort_by_kind).
+var ReasoningEfforts = map[string][]string{
+	store.RunnerCodex:  {"low", "medium", "high"},
+	store.RunnerClaude: {"low", "medium", "high", "xhigh", "max"},
+}
 
 // DefaultReasoningEffort is the codex reasoning effort when neither the job nor the config sets one.
 const DefaultReasoningEffort = "high"
@@ -105,16 +109,21 @@ func (c Config) reasoningEffort(job string) string {
 	return DefaultReasoningEffort
 }
 
-// ValidateReasoningEffort rejects an effort other than low|medium|high (empty is accepted: default).
-func ValidateReasoningEffort(e string) error {
-	if e != "" && !slices.Contains(ReasoningEfforts, e) {
-		return fmt.Errorf("reasoning effort %q must be one of %s", e, strings.Join(ReasoningEfforts, "|"))
+// ValidateReasoningEffort rejects an effort the runner does not take: low|medium|high on codex,
+// low|medium|high|xhigh|max on claude (empty is accepted: default).
+func ValidateReasoningEffort(runner, e string) error {
+	values, ok := ReasoningEfforts[runner]
+	if !ok {
+		return fmt.Errorf("runner %q has no reasoning efforts", runner)
+	}
+	if e != "" && !slices.Contains(values, e) {
+		return fmt.Errorf("reasoning effort %q must be one of %s for a %s job", e, strings.Join(values, "|"), runner)
 	}
 	return nil
 }
 
 func (c Config) validateCodex() error {
-	if err := ValidateReasoningEffort(c.CodexReasoningEffort); err != nil {
+	if err := ValidateReasoningEffort(store.RunnerCodex, c.CodexReasoningEffort); err != nil {
 		return fmt.Errorf("codex_reasoning_effort: %w", err)
 	}
 	for kind, row := range c.Models {

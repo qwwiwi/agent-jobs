@@ -67,7 +67,7 @@ A job commits locally and never pushes, by design: in a job's Bash calls the den
 When a job finishes, the session gets one line:
 
 ```
-[jobs:job-done] job 261015-124136-70d3 review auth module succeeded · 3 turns · $0.25 · 0m
+[jobs:job-done] job 261015-124136-70d3 review auth module succeeded · 3 turns · $0.25 · 0m · model sonnet · effort high
 ```
 
 Read the report with `job_result` (or `agent-jobs result --agent <agent> <id>`):

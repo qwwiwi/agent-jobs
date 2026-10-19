@@ -126,16 +126,28 @@ var denyRules = []string{
 // webTools are closed for every kind except research.
 var webTools = []string{"WebFetch", "WebSearch"}
 
+// reviewWriteRules are the first layer of a claude review job's read-only mode, as the codex sandbox
+// makes a codex one read-only: no edit tools, no git writes to the worktree's history or index, no
+// rm/mv. Reads, search and test runners stay allowed. Prefix rules do not catch every shell write
+// (sed -i, redirections): the guard, told the worktree with --read-only, refuses those.
+var reviewWriteRules = []string{
+	"Edit", "Write", "MultiEdit", "NotebookEdit",
+	"Bash(git commit:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(git reset:*)",
+	"Bash(git checkout -b:*)", "Bash(git stash:*)", "Bash(rm:*)", "Bash(mv:*)",
+}
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
 // without a subagent log (every subagent refused). Jobs get JobGuardCommand.
-func (m *Manager) GuardCommand(gitDirs ...string) string { return m.guardCommand("", nil, gitDirs...) }
+func (m *Manager) GuardCommand(gitDirs ...string) string {
+	return m.guardCommand("", "", nil, gitDirs...)
+}
 
 // JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
 // guard.MaxSubagentsPerJob subagents per job.
 func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
-	return m.guardCommand(id, m.skillProtected(nil), gitDirs...)
+	return m.guardCommand(id, "", m.skillProtected(nil), gitDirs...)
 }
 
 // ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
@@ -151,7 +163,8 @@ func (m *Manager) SubagentLogPath(id string) string {
 	return filepath.Join(m.StateDir, "subagents", id+".log")
 }
 
-func (m *Manager) guardCommand(jobID string, extraProtected []string, gitDirs ...string) string {
+// guardCommand builds the hook command line; readOnly is the worktree of a review job ("" = none).
+func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Cfg.OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -172,6 +185,9 @@ func (m *Manager) guardCommand(jobID string, extraProtected []string, gitDirs ..
 			parts = append(parts, "--protect", shellQuote(p))
 		}
 	}
+	if readOnly != "" {
+		parts = append(parts, "--read-only", shellQuote(readOnly))
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -185,16 +201,24 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The subagent tool (Agent, formerly Task) is not denied: a job may use up to three subagents, which
 // run inside the job's process, under these settings and this hook, within the job's limits.
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
-// the guard): a job reads its skills but never changes the catalog through them.
+// the guard): a job reads its skills but never changes the catalog through them. A review job's
+// worktree is read-only (--read-only for the guard).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := m.skillProtected(j)
-	return m.settings(j.Kind, m.guardCommand(j.ID, protected, gitDirs...), skillDenyRules(protected)...)
+	readOnly := ""
+	if j.Kind == "review" {
+		readOnly = filepath.Join(m.JobDir(j.ID), "work")
+	}
+	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gitDirs...), skillDenyRules(protected)...)
 }
 
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
 	deny := append(append([]string{}, denyRules...), extraDeny...)
 	if kind != "research" {
 		deny = append(deny, webTools...)
+	}
+	if kind == "review" {
+		deny = append(deny, reviewWriteRules...)
 	}
 	return map[string]any{
 		// Settings given with --settings outrank project settings: a .claude/settings.json in the work dir

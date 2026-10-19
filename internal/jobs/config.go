@@ -17,6 +17,7 @@ import (
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/skills"
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -75,6 +76,9 @@ type Config struct {
 	CodexWriteAllowed bool `json:"codex_write_allowed"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`
+	// EffortByKind overrides the default reasoning effort of claude jobs per kind
+	// (low|medium|high|xhigh|max), e.g. {"general": "low"}. Unset kinds keep DefaultEffortByKind.
+	EffortByKind map[string]string `json:"effort_by_kind"`
 	// Models overrides cells of the kind × complexity model table (DEVIATIONS #6), e.g.
 	// {"review": {"hard": "gpt-6.1-sol"}}. A gpt-* model runs the job on codex. Unset cells keep the defaults.
 	Models map[string]map[string]string `json:"models"`
@@ -214,6 +218,34 @@ func (c Config) MaxRunningJobs() int {
 		return DefaultMaxRunningPerAgent
 	}
 	return *c.MaxRunning
+}
+
+// DefaultEffortByKind is the reasoning effort of a claude job of each kind when neither the job nor
+// effort_by_kind names one.
+var DefaultEffortByKind = map[string]string{"review": "high", "research": "high", "fix": "high", "general": "medium"}
+
+// claudeEffort returns the effort of a claude job: the job's own, else the config's for its kind,
+// else the kind's default.
+func (c Config) claudeEffort(kind, job string) string {
+	if job != "" {
+		return job
+	}
+	if e := c.EffortByKind[kind]; e != "" {
+		return e
+	}
+	return DefaultEffortByKind[kind]
+}
+
+func (c Config) validateEffortByKind() error {
+	for kind, e := range c.EffortByKind {
+		if !slices.Contains(Kinds, kind) {
+			return fmt.Errorf("effort_by_kind: unknown kind %q (want %s)", kind, strings.Join(Kinds, "|"))
+		}
+		if err := ValidateReasoningEffort(store.RunnerClaude, e); err != nil {
+			return fmt.Errorf("effort_by_kind.%s: %w", kind, err)
+		}
+	}
+	return nil
 }
 
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
@@ -361,6 +393,9 @@ func LoadConfig(stateDir string) (Config, error) {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.validateEffortByKind(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {

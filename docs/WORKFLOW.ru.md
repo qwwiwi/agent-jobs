@@ -67,7 +67,7 @@
 Когда джоба закончилась, сессия получает одну строку:
 
 ```
-[jobs:job-done] job 261015-124136-70d3 review auth module succeeded · 3 turns · $0.25 · 0m
+[jobs:job-done] job 261015-124136-70d3 review auth module succeeded · 3 turns · $0.25 · 0m · model sonnet · effort high
 ```
 
 Отчёт читается через `job_result` (или `agent-jobs result --agent <agent> <id>`):
