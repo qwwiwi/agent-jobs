@@ -186,9 +186,9 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
 		return status, msg
 	}
-	report, err := readSmall(filepath.Join(dir, "report.md"), maxContractReportBytes)
-	if err != nil {
-		return status, msg // Verdict saw a report; one unreadable now is not judged here
+	report, err := readSmall(filepath.Join(dir, "report.md"), maxContractReportBytes+1)
+	if err != nil || len(report) > maxContractReportBytes {
+		return status, msg // Verdict saw a report; one unreadable now, or longer than the limit, is not judged here
 	}
 	note := reportContractNote(report)
 	switch {

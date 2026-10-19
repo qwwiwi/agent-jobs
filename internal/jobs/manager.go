@@ -898,6 +898,14 @@ func (m *Manager) collect() error {
 			}
 			m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
+			if !killed {
+				// The wrapper wrote exit_code since the check above: the attempt ended by itself, so its
+				// own verdict is recorded (and auto-continued only as such), not a timeout.
+				if code, ok := readExitCode(dir); ok {
+					m.collectExited(j, code, dur, now)
+					continue
+				}
+			}
 			if j.Runner != store.RunnerCodex {
 				m.writeStopReport(j, dir, stopTimeout, res.Turns)
 			}
