@@ -72,10 +72,15 @@ func LimitsText(j *store.Job) string {
 // within the walk's bounds, says how big it is; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // An owner-waits job ends the line with OwnerWaitsMarker.
-func DoneLine(j *store.Job, dirNote int64) string {
-	cost := CostText(j.CostUSD, j.CostIsUnknown())
-	if j.CostIsUnknown() {
-		cost = "cost " + cost
+func DoneLine(j *store.Job, dirNote int64) string { return doneLine(j, dirNote, "") }
+
+// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate).
+func doneLine(j *store.Job, dirNote int64, cost string) string {
+	if cost == "" {
+		cost = CostText(j.CostUSD, j.CostIsUnknown())
+		if j.CostIsUnknown() {
+			cost = "cost " + cost
+		}
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
 		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
@@ -115,6 +120,9 @@ func DoneLine(j *store.Job, dirNote int64) string {
 			line += ", fresh session"
 		}
 		line += ")"
+	}
+	if j.MergeNote != "" {
+		line += " · " + j.MergeNote
 	}
 	if j.OwnerWaits {
 		line += " · " + OwnerWaitsMarker
@@ -205,6 +213,34 @@ func Containment(j *store.Job) string {
 	return "session only"
 }
 
+// DoneLineFor is the job-done line as notify delivers it: a job whose cost was not reported but could be
+// estimated from its tokens (its stats row) shows "cost $0.42 est." instead of "cost unknown".
+func (m *Manager) DoneLineFor(j *store.Job) string {
+	cost := ""
+	if j.CostIsUnknown() {
+		if st, err := m.Store.GetStats(j.ID); err == nil && st.CostSource == store.CostSourceEstimated {
+			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
+		}
+	}
+	return doneLine(j, m.Cfg.JobDirNoteBytes(), cost)
+}
+
+// checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
+// a failure to record it is logged, the line then still carries it. Each delivery attempt checks
+// again: the job's head or its branch may have moved since a failed one, and MergeNote's cache keeps
+// a retry with neither moved from running merge-tree again. A new "" (the head reset to the base, or
+// the worktree gone) is recorded too, so an earlier result is not sent.
+func (m *Manager) checkMerge(j *store.Job) {
+	note := m.MergeNote(j)
+	if note == j.MergeNote {
+		return
+	}
+	j.MergeNote = note
+	if err := m.Store.SetMergeNote(j.ID, note); err != nil {
+		m.Log.Printf("job %s: record merge check: %v", j.ID, err)
+	}
+}
+
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
 // line; a failing tmux keeps it pending and it is retried next tick (cleanup waits for a delivered
 // notify, so the worktree is kept meanwhile). With no target configured, notify is off: the line is
@@ -217,7 +253,8 @@ func (m *Manager) notifyPending() error {
 	t := m.Cfg.NotifyTmuxTarget
 	if t == "" {
 		for _, j := range jobs {
-			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j, m.Cfg.JobDirNoteBytes()))
+			m.checkMerge(j)
+			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", m.DoneLineFor(j))
 			if j.OwnerWaits {
 				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
 					return err
@@ -226,6 +263,7 @@ func (m *Manager) notifyPending() error {
 			if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 				return err
 			}
+			m.forgetMergeNote(j.ID)
 		}
 		return nil
 	}
@@ -237,7 +275,8 @@ func (m *Manager) notifyPending() error {
 				return err
 			}
 		}
-		if err := m.sendTmuxLocked(t, DoneLine(j, m.Cfg.JobDirNoteBytes())); err != nil {
+		m.checkMerge(j)
+		if err := m.sendTmuxLocked(t, m.DoneLineFor(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {
 				// A stalled tmux (or lock holder) would cost every other line the same wait: the
@@ -252,6 +291,7 @@ func (m *Manager) notifyPending() error {
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 			return err
 		}
+		m.forgetMergeNote(j.ID)
 	}
 	return nil
 }

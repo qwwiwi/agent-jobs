@@ -58,6 +58,9 @@ type Manager struct {
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
 
+	mergeMu     sync.Mutex
+	mergeChecks map[string]mergeCheck // job ID -> its last merge-tree result (MergeNote)
+
 	hbMu sync.Mutex     // held while a heartbeat started by StartHeartbeat runs
 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
 }
@@ -225,16 +228,45 @@ func git(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Enqueue validates the request and inserts a queued job. It returns immediately.
+// Enqueue validates the request and inserts a queued job. It returns immediately. A codex job past the
+// codex daily cap (codex_jobs_per_day) is refused.
 func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	j, err := m.newJob(r)
 	if err != nil {
 		return nil, err
 	}
+	if limit := m.Cfg.CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
+		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			n, _ := m.Store.CountCodexSince(m.Agent, j.CreatedAt.Add(-CodexCapWindow))
+			return nil, fmt.Errorf("codex daily cap reached: %d codex jobs of agent %s in the last 24 hours, limit %d "+
+				"(config codex_jobs_per_day, per agent; 0 turns it off); start a claude job or wait", n, m.Agent, limit)
+		}
+		return j, nil
+	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err
 	}
 	return j, nil
+}
+
+// CodexCapWindow is the window of the codex daily cap.
+const CodexCapWindow = 24 * time.Hour
+
+// CodexJobsToday is the codex daily cap's state: "n/limit" (codex jobs of the agent created in the last
+// 24 hours), "n (cap off)" when codex_jobs_per_day is 0.
+func (m *Manager) CodexJobsToday() (string, error) {
+	n, err := m.Store.CountCodexSince(m.Agent, m.Now().Add(-CodexCapWindow))
+	if err != nil {
+		return "", err
+	}
+	if limit := m.Cfg.CodexDailyCap(); limit > 0 {
+		return fmt.Sprintf("%d/%d", n, limit), nil
+	}
+	return fmt.Sprintf("%d (cap off)", n), nil
 }
 
 // newJob validates the request (the job_start rules: kind, limits, model, runner, codex rules,
@@ -286,7 +318,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		// Passed as --effort, so a project effortLevel in the worktree cannot change it.
 		effort = m.Cfg.claudeEffort(r.Kind, effort)
 	}
-	var repo, base string
+	var repo, base, branch string
 	if r.RepoPath != "" {
 		if repo, err = filepath.Abs(r.RepoPath); err != nil {
 			return nil, fmt.Errorf("repo path: %w", err)
@@ -301,6 +333,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if base, err = git(repo, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
 			return nil, fmt.Errorf("base %q: %w", ref, err)
 		}
+		branch = baseBranch(repo, ref)
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
@@ -315,6 +348,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
+		BaseBranch: branch,
 	}
 	return j, nil
 }

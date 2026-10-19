@@ -98,6 +98,12 @@ if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
       exec sleep 300 ) & exit 0' < /dev/null > /dev/null 2>&1
   for _ in $(seq 200); do [[ -e ../orphan.ready ]] && break; sleep 0.05; done
 fi
+if [[ $prompt == *FAKE_USAGE* ]]; then
+  # Assistant usage in the stream: message m1 arrives as two events (counted once), m2 once.
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":1000,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":1000,"output_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+  echo '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"c"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":0}}}'
+fi
 if [[ $prompt == *FAKE_TMPENV* ]]; then env | grep -E '^(TMPDIR|GOTMPDIR|TMP|TEMP)=' | sort > ../tmpenv.txt || true; fi
 if [[ $prompt == *FAKE_BIGTMP* ]]; then
   head -c 3145728 /dev/zero > "$TMPDIR/big.bin"
@@ -128,6 +134,11 @@ if [[ $prompt == *FAKE_STAGED* ]]; then
   echo more >> committed.txt
   mkdir -p d
   echo u > d/new-untracked.txt
+fi
+if [[ $prompt == *FAKE_EDIT_TRACKED* ]]; then
+  # Rewrites the line every job edits, with this job's id: two such jobs conflict.
+  echo "edited by $AGENT_JOBS_JOB" > tracked.txt
+  git -c user.name=T -c user.email=t@example.com commit -qam "edit tracked by job"
 fi
 if [[ $prompt == *FAKE_ONLY_COMMIT* ]]; then
   echo c > only-commit.txt
