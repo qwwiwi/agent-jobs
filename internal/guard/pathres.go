@@ -400,7 +400,7 @@ func (s *pathScope) parentHit(w string) (string, bool) {
 	}
 	for _, p := range s.candidates(exp) {
 		for _, q := range s.protected {
-			if filepath.Join(p, filepath.Base(q)) == q {
+			if fold(filepath.Join(p, filepath.Base(q))) == fold(q) {
 				return q, true
 			}
 		}
@@ -419,9 +419,9 @@ func (s *pathScope) couldReach(rel string, tree bool) bool {
 	if rel == "." {
 		return tree
 	}
-	segs := strings.Split(filepath.ToSlash(rel), "/")
+	segs := strings.Split(filepath.ToSlash(fold(rel)), "/")
 	for _, q := range s.protected {
-		qs := strings.Split(strings.Trim(filepath.ToSlash(q), "/"), "/")
+		qs := strings.Split(strings.Trim(filepath.ToSlash(fold(q)), "/"), "/")
 		for k := range qs {
 			n := min(len(segs), len(qs)-k)
 			if slices.Equal(segs[:n], qs[k:k+n]) && (len(segs) >= len(qs)-k || tree) {
@@ -489,12 +489,13 @@ func percentDecode(w string) string {
 }
 
 func (s *pathScope) containsText(w string, code bool) (textHit, bool) {
+	fw := fold(w)
 	for _, q := range s.protected {
-		if strings.Contains(w, q) {
+		if strings.Contains(fw, fold(q)) {
 			return textHit{q: q}, true
 		}
 		for _, d := range s.dirs {
-			if rel, err := filepath.Rel(d, q); err == nil && !onlyDotDot(rel) && strings.Contains(w, rel) {
+			if rel, err := filepath.Rel(d, q); err == nil && !onlyDotDot(rel) && strings.Contains(fw, fold(rel)) {
 				return textHit{q: q}, true
 			}
 		}
