@@ -888,9 +888,7 @@ func (m *Manager) collect() error {
 		}
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
-			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-			status, msg := m.verdict(j, code, res, dir)
-			m.finish(j, status, res, false, dur, msg, now)
+			m.collectExited(j, code, dur, now)
 			continue
 		}
 		if j.StartedAt != nil && now.After(jobDeadline(j)) {
@@ -908,15 +906,27 @@ func (m *Manager) collect() error {
 			}
 			m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
-			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
+			if !killed {
+				// The wrapper wrote exit_code since the check above: the attempt ended by itself, so its
+				// own verdict is recorded (and auto-continued only as such), not a timeout.
+				if code, ok := readExitCode(dir); ok {
+					m.collectExited(j, code, dur, now)
+					continue
+				}
+			}
+			if j.Runner != store.RunnerCodex {
+				m.writeStopReport(j, dir, stopTimeout, res.Turns)
+			}
+			msg := fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes)
+			if st, got, ok := m.finish(j, store.StatusTimeout, res, killed, dur, msg, now); ok && st == store.StatusTimeout && got == msg {
+				m.autoContinue(j.ID, stopTimeout)
+			}
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
 			if code, ok := readExitCode(dir); ok {
-				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-				status, msg := m.verdict(j, code, res, dir)
-				m.finish(j, status, res, false, dur, msg, now)
+				m.collectExited(j, code, dur, now)
 				continue
 			}
 			res, killed := killedResult(j.Runner, dir)
@@ -924,6 +934,23 @@ func (m *Manager) collect() error {
 		}
 	}
 	return nil
+}
+
+// collectExited finishes an attempt whose wrapper wrote exit_code. An attempt stopped at its turn
+// limit gets a stop report when it wrote none and is then continued once (autoContinue).
+func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
+	dir := m.JobDir(j.ID)
+	res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+	status, msg := m.verdict(j, code, res, dir)
+	// Written after the verdict: the stop report must never make the attempt count as reported.
+	turnLimit := turnLimitStop(j, res) && status == store.StatusFailed
+	if turnLimit {
+		m.writeStopReport(j, dir, stopTurnLimit, res.Turns)
+	}
+	// Continued only when finish recorded the verdict as it was (not a failed scope stop or skill-link check).
+	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); turnLimit && ok && st == status && got == msg {
+		m.autoContinue(j.ID, stopTurnLimit)
+	}
 }
 
 // killedResult is the stream result of an attempt the daemon ended by a kill, or whose wrapper died.
@@ -942,8 +969,10 @@ func killedResult(runner, dir string) (res StreamResult, killed bool) {
 }
 
 // finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
-// failed attempt can be resumed, so what it left outside its process group is swept first.
-func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) {
+// failed attempt can be resumed, so what it left outside its process group is swept first. It returns
+// the status and message recorded (a failed scope stop or skill-link check changes them; ok is false
+// when the row was not finished).
+func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) (string, string, bool) {
 	m.noteFallback(j)
 	delivered := slices.Clone(j.SkillsDelivered)
 	m.removeSkills(j)
@@ -963,7 +992,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	}
 	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
-		return
+		return status, msg, false
 	}
 	if status == store.StatusTimeout || status == store.StatusFailed {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
@@ -972,6 +1001,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
+	return status, msg, true
 }
 
 // scopeStopFailed is the status and message of an attempt whose scope could not be stopped: a timeout

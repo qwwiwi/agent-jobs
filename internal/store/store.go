@@ -380,6 +380,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
 	jobStatsEffortAlter,
+	`ALTER TABLE job_stats ADD COLUMN report_off_contract INTEGER NOT NULL DEFAULT 0`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`

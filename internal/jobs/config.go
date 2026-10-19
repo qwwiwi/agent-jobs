@@ -152,6 +152,38 @@ type Config struct {
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
+	// ReportContract is what happens to a claude job that ends succeeded with a report missing the
+	// "## Summary" or "## Not done / uncertain" section: "warn" (default; it stays succeeded with a
+	// note in its error, on the job-done line and in the stats) or "fail" (it fails with that note).
+	ReportContract string `json:"report_contract"`
+	// AutoContinue continues a claude attempt stopped at its turn limit or its timeout once, in the same
+	// session, with a fresh allowance (AutoContinueFraction). Nil (absent) = on; false turns it off.
+	AutoContinue *bool `json:"auto_continue"`
+	// AutoContinueFraction is the automatic continuation's allowance as a fraction of the job's original
+	// limits (turns, budget, minutes), each capped by what the across-attempt ceilings leave.
+	// 0 = DefaultAutoContinueFraction (0.5); at most 1.
+	AutoContinueFraction float64 `json:"auto_continue_fraction"`
+}
+
+// Report contract modes (config report_contract).
+const (
+	ReportContractWarn = "warn"
+	ReportContractFail = "fail"
+)
+
+// DefaultAutoContinueFraction is the automatic continuation's share of the original limits when
+// auto_continue_fraction is not set.
+const DefaultAutoContinueFraction = 0.5
+
+// AutoContinueOn reports whether a stopped attempt is continued automatically (auto_continue, default on).
+func (c Config) AutoContinueOn() bool { return c.AutoContinue == nil || *c.AutoContinue }
+
+// AutoContinueShare returns the automatic continuation's fraction of the original limits.
+func (c Config) AutoContinueShare() float64 {
+	if c.AutoContinueFraction > 0 {
+		return c.AutoContinueFraction
+	}
+	return DefaultAutoContinueFraction
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -342,6 +374,9 @@ func LoadConfig(stateDir string) (Config, error) {
 			return c, fmt.Errorf("config.json: max_running must be an integer 1..%d, not null (omit the key for default %d)",
 				CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
 		}
+		if v, ok := raw["auto_continue"]; ok && strings.TrimSpace(string(v)) == "null" {
+			return c, errors.New("config.json: auto_continue must be true or false, not null (omit the key for default true)")
+		}
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
@@ -385,6 +420,13 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
+	}
+	if c.ReportContract != "" && c.ReportContract != ReportContractWarn && c.ReportContract != ReportContractFail {
+		return c, fmt.Errorf("config.json: report_contract %q must be warn (default) or fail", c.ReportContract)
+	}
+	if c.AutoContinueFraction < 0 || c.AutoContinueFraction > 1 {
+		return c, fmt.Errorf("config.json: auto_continue_fraction %g must be 0 (default %g) .. 1", c.AutoContinueFraction,
+			DefaultAutoContinueFraction)
 	}
 	if err := c.validateAcceptance(); err != nil {
 		return c, err

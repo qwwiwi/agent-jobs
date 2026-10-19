@@ -261,11 +261,12 @@ type gzReadCloser struct {
 
 func (g gzReadCloser) Close() error { return errors.Join(g.Reader.Close(), g.f.Close()) }
 
-// hasReport reports whether a non-empty report.md exists in the job folder or the archive.
+// hasReport reports whether a non-empty report.md exists in the job folder or the archive. A stop
+// report the daemon wrote for an attempt that left none does not count.
 func (m *Manager) hasReport(j *store.Job) bool {
 	for _, p := range []string{filepath.Join(m.JobDir(j.ID), "report.md"), filepath.Join(m.archiveJobDir(j), "report.md")} {
 		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
-			return true
+			return !isStopReport(p)
 		}
 	}
 	return false
@@ -312,7 +313,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
-		RecordedAt: m.Now(),
+		RecordedAt: m.Now(), ReportOffContract: OffContractNote(j.Error) != "",
 	}
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)
@@ -456,6 +457,8 @@ type StatsSummary struct {
 	GuardRefusals     int            `json:"guard_refusals"`
 	Subagents         int            `json:"subagents"`
 	WithoutReport     int            `json:"without_report"`
+	// ReportOffContract counts the jobs whose report lacks the Summary or the Not done / uncertain section.
+	ReportOffContract int `json:"report_off_contract"`
 	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
 }
@@ -684,6 +687,9 @@ func summarize(rows []*store.JobStats) StatsSummary {
 		s.Subagents += r.Subagents
 		if !r.HasReport {
 			s.WithoutReport++
+		}
+		if r.ReportOffContract {
+			s.ReportOffContract++
 		}
 		durs = append(durs, r.DurationSec)
 	}
