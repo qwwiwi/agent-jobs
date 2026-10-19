@@ -35,7 +35,7 @@ const usage = `usage: agent-jobs <command> [flags]
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
-             [--runner claude|codex] [--reasoning-effort low|medium|high] [--owner-waits]
+             [--runner claude|codex] [--reasoning-effort low|medium|high|xhigh|max] [--owner-waits]
              [--skills a,+b,-c]
                                            a gpt-* model runs on codex exec (read-only kinds
                                            review/research unless codex_write_allowed);
@@ -72,7 +72,7 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
-  stats      --agent A [--since D] [--by kind|model|skill] [--json] [--backfill [--all]]
+  stats      --agent A [--since D] [--by kind|model|skill|effort] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
                                            delivered); --backfill first writes missing rows from
@@ -427,7 +427,8 @@ func cmdStart(args []string) error {
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
 	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")
-	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "codex reasoning effort low|medium|high (default: config, else high)")
+	fs.StringVar(&r.ReasoningEffort, "reasoning-effort", "", "reasoning effort: low|medium|high on codex (default: config, else high), "+
+		"low|medium|high|xhigh|max on claude (default: effort_by_kind, else high; general medium)")
 	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job (needs config acceptance_allowed)")
 	fs.BoolVar(&r.OwnerWaits, "owner-waits", false, "the owner asked for this job: its done line says «owner waits» and the Stop hook holds the session until owner_replied")
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
@@ -527,6 +528,9 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	fmt.Printf("id:        %s\ntitle:     %s\nkind:      %s\nstatus:    %s\nmodel:     %s\n", j.ID, j.Title, j.Kind, j.Status, j.Model)
+	if j.ReasoningEffort != "" {
+		fmt.Printf("effort:    %s\n", j.ReasoningEffort)
+	}
 	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
 	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
@@ -1486,7 +1490,7 @@ func cmdStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
-	by := fs.String("by", "kind", "group by kind|model|skill (skill,repo: the skills rating by repository)")
+	by := fs.String("by", "kind", "group by kind|model|skill|effort (skill,repo: the skills rating by repository)")
 	byRepo := fs.Bool("by-repo", false, "with --by skill: the skills rating with a per-repository breakdown")
 	repo := fs.String("repo", "", "with --by-repo: only jobs of this repository (folder name)")
 	limit := fs.Int("limit", httpapi.DefaultSkillsLimit, "with --by-repo: at most this many skills")

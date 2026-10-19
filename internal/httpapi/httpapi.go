@@ -797,7 +797,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	}
 	by := q.Get("by")
 	if by != "" && !slices.Contains(jobs.StatsGroupBy, by) {
-		writeError(w, http.StatusBadRequest, "by must be kind|model|skill")
+		writeError(w, http.StatusBadRequest, "by must be "+strings.Join(jobs.StatsGroupBy, "|"))
 		return
 	}
 	rep, err := a.m.StatsContext(r.Context(), since, by)
