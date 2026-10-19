@@ -623,10 +623,28 @@ func pathTokens(w string) []string {
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
 // argument: with an ancestor of a protected path as an argument they reach it (`rm -r <state>`,
-// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`).
+// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`). Looked
+// up by the lower-cased base name of the program.
 var treeWriters = map[string]bool{
 	"rm": true, "rmdir": true, "unlink": true, "mv": true, "cp": true, "install": true, "ln": true,
 	"rsync": true, "chmod": true, "chown": true, "chgrp": true, "tar": true, "shred": true,
+	"bsdtar": true, "gtar": true, "unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true,
+	"7za": true, "7zz": true,
+}
+
+// attachedDirOpts are the options of archive tools whose value, attached to the option in the same
+// word, is the directory they extract into (`tar -C<dir>`, `unzip -d<dir>`, `7z x -o<dir>`).
+var attachedDirOpts = map[string]string{
+	"tar": "-C", "bsdtar": "-C", "gtar": "-C", "unzip": "-d", "7z": "-o", "7za": "-o", "7zz": "-o",
+}
+
+// attachedDir returns the directory attached to an archive tool's directory option (`-C<dir>`).
+func attachedDir(name, a string) (string, bool) {
+	opt, ok := attachedDirOpts[name]
+	if !ok || len(a) <= len(opt) || !strings.HasPrefix(a, opt) {
+		return "", false
+	}
+	return a[len(opt):], true
 }
 
 // findActs reports a find with an action that writes or runs something (-delete, -exec, -fprint, …).

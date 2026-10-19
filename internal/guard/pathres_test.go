@@ -674,3 +674,40 @@ func TestProtectedCaseSensitive(t *testing.T) {
 		t.Error("CheckFileWrite jobs.db allowed")
 	}
 }
+
+// #48: the ancestor rule covers every archive and copy tool, not tar alone (cwd <state>/jobs/j/work,
+// so ../../../.. is the agent-jobs home).
+func TestProtectedAncestorArchivers(t *testing.T) {
+	_, _, _, cfg := protectedSetup(t)
+	for _, c := range []string{
+		// the issue's probe rows
+		"tar -C ../../../.. -xf a.tar",
+		"bsdtar -C ../../../.. -xf a.tar",
+		"gtar -C ../../../.. -xf a.tar",
+		"unzip -o a.zip -d ../../../..",
+		"ditto src ../../../..",
+		"cpio -pdm ../../../.. < list",
+		"cp -R src/. ../../../..",
+		// the other names, a path and an upper-case name, attached directory options
+		"pax -rw src ../../../..",
+		"7z x a.7z -o../../../..",
+		"7za x a.7z -o../../../..",
+		"7zz x a.7z -o../../../..",
+		"/usr/bin/BSDTAR -C ../../../.. -xf a.tar",
+		"tar -C../../../.. -xf a.tar",
+		"unzip -o a.zip -d../../../..",
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+	for _, c := range []string{
+		"tar -tf a.tar", "unzip -l a.zip", "unzip -o a.zip -d build", "tar -xf a.tar -C build",
+		"unzip -o a.zip -d ..", "bsdtar -xf a.tar -C ..", "ditto src build", "7z x a.7z -obuild",
+		"7z l a.7z", "cpio -idm < a.cpio", "pax -r < a.pax",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
