@@ -84,7 +84,7 @@ A job gets `memory_search` and `memory_write` only, through the daemon, and neve
 
 ## When a job is done
 
-You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. The report is not pushed into the session.
+You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m · model <m> · effort <e>`. The report is not pushed into the session.
 
 1. Read it with `job_result` when you are ready. Read the section **«Not done / uncertain» first**: it names what the job did not do or could not verify.
 2. The report is a claim, not a result. Check the diff yourself against `base_commit`: in the worktree while it exists, afterwards `commits.patch`, `staged.patch`, `uncommitted.patch`, `untracked.tar`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`. Run the checks yourself.

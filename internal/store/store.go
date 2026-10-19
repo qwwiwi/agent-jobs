@@ -71,7 +71,8 @@ type Job struct {
 	Complexity string
 	// Runner is the program that runs the job: "claude" (claude -p) or "codex" (codex exec, S3-M1).
 	Runner string
-	// ReasoningEffort is the codex reasoning effort (low|medium|high) of a codex job, empty for claude.
+	// ReasoningEffort is the job's reasoning effort: low|medium|high on codex, low|medium|high|xhigh|max
+	// on claude (passed as --effort); empty for claude rows from before it was recorded.
 	ReasoningEffort string
 	// OwnerWaits marks a job the owner asked for: its delivered job-done line records «owner reply
 	// pending» (owner_pending), which holds the orchestrator's Stop hook until owner_replied.
@@ -388,12 +389,16 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_deadline INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
+	jobStatsEffortAlter,
+	`ALTER TABLE job_stats ADD COLUMN report_off_contract INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN pgid_spawned INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE job_stats ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN dir_tmp_bytes INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN dir_partial INTEGER NOT NULL DEFAULT 0`,
 }
+
+const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
 // they run in the same transaction as the ALTER, so only once, by the process that added the column.
@@ -409,6 +414,10 @@ var migrationBackfills = map[string]string{
 	// and died before the rewrite). All are marked; redaction is idempotent, and a job without a
 	// regular report.md is just cleared on the next tick.
 	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`: `UPDATE jobs SET redaction_pending=1`,
+	// Existing stats rows take the effort recorded on their job (codex jobs; claude rows from before the
+	// effort was recorded stay empty). A stats row whose job was pruned keeps the default.
+	jobStatsEffortAlter: `UPDATE job_stats SET effort = COALESCE((SELECT j.reasoning_effort FROM jobs j
+		WHERE j.id = job_stats.id), '')`,
 	checksAlertStateAlter: checksAlertStateFill,
 	checksAlertsMoved:     checksAlertsFill,
 }

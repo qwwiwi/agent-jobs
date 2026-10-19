@@ -12,9 +12,11 @@ import (
 // JobStats is one row of the job_stats table: the summary of a finished job, written when the job
 // reaches a terminal status (or by a backfill from its job dir or the log archive).
 type JobStats struct {
-	ID      string  `json:"id"`
-	Kind    string  `json:"kind"`
-	Model   string  `json:"model"`
+	ID    string `json:"id"`
+	Kind  string `json:"kind"`
+	Model string `json:"model"`
+	// Effort is the reasoning effort the job ran at ("" when it was not recorded).
+	Effort  string  `json:"effort,omitempty"`
 	Status  string  `json:"status"`
 	Turns   int     `json:"turns"`
 	CostUSD float64 `json:"cost_usd"`
@@ -38,6 +40,8 @@ type JobStats struct {
 	GuardRules    map[string]int `json:"guard_rules"`
 	Subagents     int            `json:"subagents"`
 	HasReport     bool           `json:"has_report"`
+	// ReportOffContract: the job's report lacks the Summary or the Not done / uncertain section.
+	ReportOffContract bool `json:"report_off_contract,omitempty"`
 	// ResultSubtype is the subtype of the last `result` event ("" when there was none).
 	ResultSubtype string `json:"result_subtype,omitempty"`
 	// Source is where the stream was read from: "job_dir", "archive" or "none".
@@ -75,7 +79,7 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
 	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
-	cost_unknown, skills_delivered, dir_bytes`
+	cost_unknown, skills_delivered, effort, report_off_contract, dir_bytes`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -95,11 +99,11 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
 		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
-		JoinNames(st.SkillsDelivered), st.DirBytes)
+		JoinNames(st.SkillsDelivered), st.Effort, st.ReportOffContract, st.DirBytes)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -113,7 +117,8 @@ func scanStats(r scanner) (*JobStats, error) {
 	var tools, skills, rules, delivered string
 	if err := r.Scan(&st.ID, &st.Kind, &st.Model, &st.Status, &st.Turns, &st.CostUSD, &st.DurationSec, &created,
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
-		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered, &st.DirBytes); err != nil {
+		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered, &st.Effort, &st.ReportOffContract,
+		&st.DirBytes); err != nil {
 		return nil, err
 	}
 	st.SkillsDelivered = SplitNames(delivered)
