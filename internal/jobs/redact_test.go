@@ -273,7 +273,13 @@ func TestRedactReportTmpInTheWay(t *testing.T) {
 // A failed rewrite leaves the job's redaction pending; the next tick retries until it succeeds.
 func TestRedactionPendingRetried(t *testing.T) {
 	m := newManager(t)
-	renameFile = func(string, string) error { return errors.New("disk says no") }
+	// Only the report's rewrite fails: the job files written at launch go through renameFile too.
+	renameFile = func(old, new string) error {
+		if filepath.Base(new) == "report.md" {
+			return errors.New("disk says no")
+		}
+		return os.Rename(old, new)
+	}
 	defer func() { renameFile = os.Rename }()
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_SECRET_REPORT", nil).ID)
 	p := filepath.Join(m.JobDir(j.ID), "report.md")
