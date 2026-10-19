@@ -291,6 +291,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	subagentJob := fs.String("subagent-job", "", "the job id whose subagent counter --subagent-db holds")
 	var protected multi
 	fs.Var(&protected, "protect", "a path (file or dir) a job never writes (repeatable)")
+	readOnly := fs.String("read-only", "", "the worktree of a review job: no tool call writes inside it")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -311,7 +312,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	}
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
-		SubagentReserve: reserve, Protected: protected,
+		SubagentReserve: reserve, Protected: protected, ReadOnly: *readOnly,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.

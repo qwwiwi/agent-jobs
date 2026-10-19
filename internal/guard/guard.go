@@ -18,6 +18,7 @@
 //     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets);
 //   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
 //     (isolation worktree/remote, background run, agent team);
+//   - in a review job (Config.ReadOnly), any write into the job's worktree (readonly.go);
 //   - any tool outside the job allowlist (toolallow.go): schedules, wakeups, messages to other
 //     sessions, notifications, monitors (their command bypasses the Bash checks), worktrees,
 //     questions, MCP tools other than the exact job-role agent-jobs tools, and every unknown tool.
@@ -69,6 +70,8 @@ type Config struct {
 	StateDir string
 	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
 	OwnDir string
+	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
+	ReadOnly string
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -257,6 +260,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		}
 		if inJobGitDir(p, cfg.Protected) {
 			return protectedBlocked(p)
+		}
+		if readOnlyFile(p, cfg) {
+			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
 	}
 	return ""
@@ -505,7 +511,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
