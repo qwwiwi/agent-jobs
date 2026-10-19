@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- Claude review jobs are read-only by deny rules (#39): kind `review` adds `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Bash(git commit:*)`, `git merge` / `rebase` / `reset` / `checkout -b` / `stash`, `Bash(rm:*)` and `Bash(mv:*)` to the job's deny list (reads, search and test runners stay allowed), so the same kind is read-only on claude as on codex. The review checklist says so and asks for progress notes through a shell heredoc. Prefix rules do not catch every shell write (`sed -i`, redirections).
+
 ## [0.4.0] - 2026-10-18
 
 ### Added
