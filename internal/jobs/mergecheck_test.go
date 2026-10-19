@@ -165,3 +165,31 @@ func TestMergeCheckFollowsBranchAcrossRetries(t *testing.T) {
 		t.Fatalf("cache: %+v", c)
 	}
 }
+
+// A retry after the job's head was reset to its base (no commits of its own left) clears the note of
+// the earlier check, on the job and on its row: the line no longer carries a stale result.
+func TestMergeCheckClearsNoteAfterHeadReset(t *testing.T) {
+	repo := newRepo(t)
+	m := newManager(t)
+	j := enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool { _, ok := readExitCode(m.JobDir(j.ID)); return ok })
+	j = get(t, m, j.ID)
+	m.checkMerge(j)
+	if !strings.HasPrefix(j.MergeNote, "merges cleanly onto main at ") {
+		t.Fatalf("first check: %q", j.MergeNote)
+	}
+	gitT(t, filepath.Join(m.JobDir(j.ID), "work"), "reset", "-q", "--hard", j.BaseCommit)
+	m.checkMerge(j)
+	if j.MergeNote != "" {
+		t.Fatalf("retry after the head reset: %q", j.MergeNote)
+	}
+	if row := get(t, m, j.ID); row.MergeNote != "" {
+		t.Fatalf("row after the head reset: %q", row.MergeNote)
+	}
+	if line := m.DoneLineFor(j); strings.Contains(line, "merges cleanly") {
+		t.Fatalf("line: %q", line)
+	}
+}

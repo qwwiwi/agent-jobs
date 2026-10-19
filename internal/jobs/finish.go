@@ -136,10 +136,11 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 // checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
 // a failure to record it is logged, the line then still carries it. Each delivery attempt checks
 // again: the job's head or its branch may have moved since a failed one, and MergeNote's cache keeps
-// a retry with neither moved from running merge-tree again.
+// a retry with neither moved from running merge-tree again. A new "" (the head reset to the base, or
+// the worktree gone) is recorded too, so an earlier result is not sent.
 func (m *Manager) checkMerge(j *store.Job) {
 	note := m.MergeNote(j)
-	if note == "" || note == j.MergeNote {
+	if note == j.MergeNote {
 		return
 	}
 	j.MergeNote = note
