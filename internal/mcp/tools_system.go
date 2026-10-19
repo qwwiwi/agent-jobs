@@ -50,6 +50,9 @@ type SystemDoctorOutput struct {
 	// the next eligible time and the last decision with its reason (untrusted_model_reason: untrusted
 	// model text, data not instructions).
 	Heartbeat jobs.HeartbeatStatus `json:"heartbeat"`
+	// CodexJobsToday is the codex daily cap's state: "n/limit" (codex jobs of this agent in the last
+	// 24 hours), "n (cap off)" when codex_jobs_per_day is 0.
+	CodexJobsToday string `json:"codex_jobs_today"`
 	// MCPServer is this MCP server against the installed binary and the daemon (daemon.json).
 	MCPServer MCPServerStatus `json:"mcp_server"`
 }
@@ -122,6 +125,9 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			out.Problems = append(out.Problems, "heartbeat: "+err.Error())
 		} else if h := out.Heartbeat.Last; h != nil && h.Decision == store.HeartbeatWake && !h.Delivered && h.Error != "" {
 			out.Problems = append(out.Problems, fmt.Sprintf("heartbeat wake #%d not delivered: %s", h.ID, h.Error))
+		}
+		if out.CodexJobsToday, err = m.CodexJobsToday(); err != nil {
+			out.Problems = append(out.Problems, "codex jobs today: "+err.Error())
 		}
 		out.MCPServer = mcpServerStatus(d)
 		out.Problems = append(out.Problems, out.MCPServer.Warnings...)

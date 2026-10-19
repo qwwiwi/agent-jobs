@@ -81,6 +81,9 @@ type JobView struct {
 	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
 	// config.json did not load, or the daemon runs another version (restart the session).
 	Warnings []string `json:"warnings,omitempty"`
+	// CodexJobsToday (job_start of a codex job only): codex jobs of this agent in the last 24 hours
+	// against the daily cap, "n/limit".
+	CodexJobsToday string `json:"codex_jobs_today,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -172,6 +175,8 @@ func addJobStart(s *sdk.Server, d Deps) {
 			"(at most max_running per agent run at once: config.json key max_running, default 2). The job commits locally only; it never pushes or messages anyone. " +
 			"State an explicit model or a complexity (light|normal|hard); with neither the call is rejected. " +
 			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped. " +
+			"A codex job counts against the agent's codex daily cap (config codex_jobs_per_day, default 3 in 24 h, 0 = off; " +
+			"past it job_start is refused); its reply shows codex_jobs_today n/limit. " +
 			"same_repo_jobs names other queued or running jobs on the same repository (advisory). A repo job records its " +
 			"base_branch; its job-done line says whether its commits still merge onto that branch (git merge-tree).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {
@@ -189,6 +194,11 @@ func addJobStart(s *sdk.Server, d Deps) {
 		v.SameRepoJobs = d.Manager.SameRepoNote(j)
 		if d.Watch != nil {
 			v.Warnings = d.Watch.Warnings("job_start")
+		}
+		if j.Runner == store.RunnerCodex {
+			if v.CodexJobsToday, err = d.Manager.CodexJobsToday(); err != nil {
+				v.CodexJobsToday = "unknown: " + err.Error()
+			}
 		}
 		return nil, v, nil
 	})
