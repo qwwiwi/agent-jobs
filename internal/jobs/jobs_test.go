@@ -104,6 +104,18 @@ if [[ $prompt == *FAKE_USAGE* ]]; then
   echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":1000,"output_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
   echo '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"c"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":0}}}'
 fi
+if [[ $prompt == *FAKE_TMPENV* ]]; then env | grep -E '^(TMPDIR|GOTMPDIR|TMP|TEMP)=' | sort > ../tmpenv.txt || true; fi
+if [[ $prompt == *FAKE_BIGTMP* ]]; then
+  head -c 3145728 /dev/zero > "$TMPDIR/big.bin"
+  head -c 3145728 /dev/zero > big-in-work.bin
+fi
+if [[ $prompt == *FAKE_GOTEST* ]]; then
+  # A go test that sleeps (go keeps its go-build work dir in the temp dir); killed with the job.
+  mkdir -p gt && printf 'module gt\n\ngo 1.21\n' > gt/go.mod
+  printf 'package gt\n\nimport (\n\t"os"\n\t"testing"\n\t"time"\n)\n\nfunc TestSleep(t *testing.T) {\n\t_ = os.WriteFile(os.Getenv("GT_MARK"), nil, 0o600)\n\ttime.Sleep(2 * time.Minute)\n}\n' > gt/gt_test.go
+  mark="$(cd .. && pwd)/gotest.running"
+  (cd gt && GT_MARK="$mark" go test -count=1 . > /dev/null 2>&1 &)
+fi
 if [[ $prompt =~ FAKE_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_COMMIT* ]]; then
   echo new > committed.txt
@@ -136,6 +148,7 @@ fi
 if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
+if [[ $prompt == *FAKE_RM_WORKTREE* ]]; then wt=$PWD; cd ..; rm -rf "$wt"; fi
 if [[ $prompt == *FAKE_FORKENV* ]]; then env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true; fi
 if [[ $prompt == *FAKE_GITENV* ]]; then
   env | grep -E '^(GIT_|PAGER=|EDITOR=|VISUAL=)' | sort > ../gitenv.txt
@@ -251,6 +264,19 @@ fi
 if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
+fi
+if [[ $prompt == *FAKE_MIDTASK* ]]; then
+  # Ends its turn mid-task: the final message is no report.
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Now let me check the remaining callers in store.go."}'
+  exit 0
+fi
+if [[ $prompt =~ (FAKE_MAX_TURNS_ALWAYS|FAKE_MAX_TURNS_ONCE) && ( $prompt == *FAKE_MAX_TURNS_ALWAYS* || ! -d ../attempts ) ]]; then
+  # Stops at its turn limit with no report, after a progress note naming its mode (so a continuation
+  # whose update quotes the note runs in the same mode).
+  printf -- '- done: step one of %s\n- next: step two\n' "${BASH_REMATCH[1]}" >> ../PROGRESS.md
+  echo '{"type":"assistant","message":{"id":"mt1","content":[{"type":"text","text":"Now let me check step two."}]}}'
+  echo '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":7,"total_cost_usd":0.4,"result":""}'
+  exit 1
 fi
 echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.25,"result":"## Summary\nok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
 `
@@ -623,6 +649,7 @@ func TestConcurrencyCapTwo(t *testing.T) {
 
 func TestTimeoutKillsProcessGroup(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := enqueue(t, m, "FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
@@ -720,7 +747,7 @@ func TestNotifyOneLineViaTmux(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · session only", j.ID)
+	wantLine := fmt.Sprintf("[jobs:job-done] job %s review auth module succeeded · 3 turns · $0.25 · 0m · model sonnet · effort medium · session only", j.ID)
 	if len(lines) != 2 || lines[0] != "send-keys|-t|fake-session|-l|"+wantLine+"|" || lines[1] != "send-keys|-t|fake-session|Enter|" {
 		t.Fatalf("tmux calls:\n%s", b)
 	}
@@ -966,7 +993,7 @@ func hasControl(s string) bool {
 // B1: the title can't smuggle control characters (Ctrl-U, ESC, CR/LF, tabs) into tmux.
 func TestDoneLineSanitized(t *testing.T) {
 	j := &store.Job{ID: "id1", Title: "x\x15echo injected #\x1b[2J\r\nnext\tcol\x7f‮end​", Status: store.StatusSucceeded}
-	line := DoneLine(j)
+	line := DoneLine(j, 0)
 	if hasControl(line) {
 		t.Fatalf("control chars in line: %q", line)
 	}
@@ -974,7 +1001,7 @@ func TestDoneLineSanitized(t *testing.T) {
 		t.Fatalf("printable text lost: %q", line)
 	}
 	j.Title = strings.Repeat("я", 1000)
-	if n := len([]rune(DoneLine(j))); n > 220 {
+	if n := len([]rune(DoneLine(j, 0))); n > 220 {
 		t.Fatalf("title not capped: line is %d runes", n)
 	}
 	m := newManager(t)
@@ -1613,10 +1640,10 @@ func TestKillRefusesImplausibleGroup(t *testing.T) {
 	if len(kills) != 0 {
 		t.Fatalf("signalled process groups %v", kills)
 	}
-	// The real group is signalled.
-	m.killGroup("real", pid, pid)
-	if len(kills) == 0 || kills[0] != -pid {
-		t.Fatalf("real group not signalled: %v", kills)
+	// A plausible live group whose leader is not the job's wrapper is not signalled either (#52).
+	m.killGroup(jt, pid, pid)
+	if len(kills) != 0 {
+		t.Fatalf("a group led by a process that is not the job's wrapper was signalled: %v", kills)
 	}
 }
 

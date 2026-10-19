@@ -100,3 +100,36 @@ func ReadFirst(report string) string {
 	b.WriteString(strings.Join(append(append(first, progress...), rest...), "\n"))
 	return b.String()
 }
+
+// Notes of a claude job whose report breaks the report contract (config report_contract). The first
+// says the model most likely ended its turn mid-task: it wrote what it would do next and stopped.
+const (
+	NoteNoSummary = "report has no Summary section: likely stopped mid-task"
+	NoteNoNotDone = "report has no Not done / uncertain section"
+)
+
+// maxContractReportBytes bounds how much of report.md the contract check reads.
+const maxContractReportBytes = 1 << 20
+
+// reportContractNote returns the note for a report without a "## Summary" or a "## Not done /
+// uncertain" section ("" when both are there).
+func reportContractNote(report string) string {
+	_, secs := splitReport(report)
+	if _, ok := sectionBody(secs, strings.TrimPrefix(reportHeading, "## ")); !ok {
+		return NoteNoSummary
+	}
+	if _, ok := sectionBody(secs, SectionNotDone); !ok {
+		return NoteNoNotDone
+	}
+	return ""
+}
+
+// OffContractNote returns the report contract note a job's error carries, "" when none.
+func OffContractNote(errMsg string) string {
+	for _, n := range []string{NoteNoSummary, NoteNoNotDone} {
+		if strings.Contains(errMsg, n) {
+			return n
+		}
+	}
+	return ""
+}

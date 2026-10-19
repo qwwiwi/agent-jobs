@@ -178,7 +178,8 @@ func TestScheduleJobKindCodexRules(t *testing.T) {
 	}{
 		{ScheduleRequest{Cron: "@daily", Prompt: "x", Kind: "fix", Model: "gpt-5.5"}, "codex_write_allowed"},
 		{ScheduleRequest{Cron: "@daily", Prompt: "x", Kind: "review", Model: "gpt-5.5", MaxTurns: 10}, "do not apply to a codex job"},
-		{ScheduleRequest{Cron: "@daily", Prompt: "x", Kind: "review", Model: "sonnet", ReasoningEffort: "high"}, "only to a codex job"},
+		{ScheduleRequest{Cron: "@daily", Prompt: "x", Kind: "review", Model: "sonnet", ReasoningEffort: "turbo"}, "low|medium|high|xhigh|max"},
+		{ScheduleRequest{Cron: "@daily", Prompt: "x", Kind: "review", Model: "gpt-5.5", ReasoningEffort: "max"}, "low|medium|high for a codex job"},
 	} {
 		if _, err := m.AddSchedule(c.r); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Fatalf("%+v: %v, want %q", c.r, err, c.want)

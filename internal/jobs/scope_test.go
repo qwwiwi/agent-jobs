@@ -262,6 +262,7 @@ func TestScopeStoppedOnCancelAndTimeout(t *testing.T) {
 	for _, how := range []string{"cancel", "timeout"} {
 		t.Run(how, func(t *testing.T) {
 			m := scopedManager(t)
+			noAutoContinue(m)
 			t.Setenv("AGENT_JOBS_SELF", selfBin)
 			j := enqueue(t, m, "FAKE_SETSID_ORPHAN FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
 			if err := m.Tick(); err != nil {
@@ -420,7 +421,7 @@ func TestFailedScopeStopIsRetried(t *testing.T) {
 		if got.Status != c.status || !got.ScopePending || !strings.Contains(got.Error, ReasonSurvivors) {
 			t.Fatalf("after a failed stop: %s pending=%v %q, want %s pending", got.Status, got.ScopePending, got.Error, c.status)
 		}
-		if line := DoneLine(got); !strings.Contains(line, "stop pending") || !strings.Contains(line, ReasonSurvivors) {
+		if line := DoneLine(got, 0); !strings.Contains(line, "stop pending") || !strings.Contains(line, ReasonSurvivors) {
 			t.Fatalf("job-done line hides the pending stop: %q", line)
 		}
 	}
@@ -842,8 +843,8 @@ func TestScopeProbeFailureRequeuesOnceScopesWorked(t *testing.T) {
 			}
 			got := runToEnd(t, m, j.ID)
 			if got.Status != store.StatusSucceeded || Containment(got) != "session only" ||
-				!strings.Contains(DoneLine(got), "session only") {
-				t.Fatalf("auto after the window: %s %q %q", got.Status, Containment(got), DoneLine(got))
+				!strings.Contains(DoneLine(got, 0), "session only") {
+				t.Fatalf("auto after the window: %s %q %q", got.Status, Containment(got), DoneLine(got, 0))
 			}
 		})
 	}

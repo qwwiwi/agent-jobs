@@ -200,7 +200,7 @@ func TestWrapperFailsJobWhenProcessesSurvive(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "exit_code")); err != nil {
 		t.Fatalf("exit_code missing: %v", err)
 	}
-	if line := DoneLine(j); !strings.HasSuffix(line, " · "+ReasonSurvivors) {
+	if line := DoneLine(j, 0); !strings.HasSuffix(line, " · "+ReasonSurvivors) {
 		t.Fatalf("job-done line: %q", line)
 	}
 }
