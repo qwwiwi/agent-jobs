@@ -880,9 +880,7 @@ func (m *Manager) collect() error {
 		}
 		// exit_code is written last: the stream is read only after it is seen, so it is complete.
 		if code, ok := readExitCode(dir); ok {
-			res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-			status, msg := m.verdict(j, code, res, dir)
-			m.finish(j, status, res, false, dur, msg, now)
+			m.collectExited(j, code, dur, now)
 			continue
 		}
 		if j.StartedAt != nil && now.After(jobDeadline(j)) {
@@ -900,15 +898,18 @@ func (m *Manager) collect() error {
 			}
 			m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
-			m.finish(j, store.StatusTimeout, res, killed, dur, fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes), now)
+			if j.Runner != store.RunnerCodex {
+				m.writeStopReport(j, dir, stopTimeout, res.Turns)
+			}
+			msg := fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes)
+			m.finish(j, store.StatusTimeout, res, killed, dur, msg, now)
+			m.autoContinue(j.ID, stopTimeout, msg)
 			continue
 		}
 		if !alive(j.PID) {
 			// Re-check: the wrapper may have written exit_code right before exiting.
 			if code, ok := readExitCode(dir); ok {
-				res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-				status, msg := m.verdict(j, code, res, dir)
-				m.finish(j, status, res, false, dur, msg, now)
+				m.collectExited(j, code, dur, now)
 				continue
 			}
 			res, killed := killedResult(j.Runner, dir)
@@ -916,6 +917,23 @@ func (m *Manager) collect() error {
 		}
 	}
 	return nil
+}
+
+// collectExited finishes an attempt whose wrapper wrote exit_code. An attempt stopped at its turn
+// limit gets a stop report when it wrote none and is then continued once (autoContinue).
+func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
+	dir := m.JobDir(j.ID)
+	res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+	status, msg := m.verdict(j, code, res, dir)
+	// Written after the verdict: the stop report must never make the attempt count as reported.
+	turnLimit := turnLimitStop(j, res) && status == store.StatusFailed
+	if turnLimit {
+		m.writeStopReport(j, dir, stopTurnLimit, res.Turns)
+	}
+	m.finish(j, status, res, false, dur, msg, now)
+	if turnLimit {
+		m.autoContinue(j.ID, stopTurnLimit, msg)
+	}
 }
 
 // killedResult is the stream result of an attempt the daemon ended by a kill, or whose wrapper died.

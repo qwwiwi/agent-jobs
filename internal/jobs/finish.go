@@ -85,7 +85,16 @@ func DoneLine(j *store.Job) string {
 	if n := acceptanceNote(j); n != "" {
 		line += " · " + n
 	}
-	if j.Attempt > 1 {
+	if n := OffContractNote(j.Error); n != "" {
+		line += " · " + n
+	}
+	if why, ok := autoContinuedFrom(j.PendingContext); ok && j.Attempt > 1 {
+		line += fmt.Sprintf(" · auto-continued (attempt %d; %s", j.Attempt, why)
+		if j.RunMode == store.RunFallback {
+			line += "; fresh session"
+		}
+		line += ")"
+	} else if j.Attempt > 1 {
 		line += fmt.Sprintf(" · resumed (attempt %d", j.Attempt)
 		if j.RunMode == store.RunFallback {
 			line += ", fresh session"
