@@ -71,14 +71,15 @@ func progressTail(dir string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	// Redacted before the lines are cut, so a multi-line secret is still seen whole.
+	lines := strings.Split(strings.TrimRight(RedactText(string(b)), "\n"), "\n")
 	if cut && len(lines) > 1 {
 		lines = lines[1:] // the first line was cut by the seek
 	}
 	if len(lines) > progressTailLines {
 		lines = lines[len(lines)-progressTailLines:]
 	}
-	return strings.TrimSpace(RedactText(strings.Join(lines, "\n")))
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // progressOrLastText is what the daemon quotes of a stopped attempt: the progress file's tail, else
@@ -93,19 +94,30 @@ func progressOrLastText(dir string) (string, string) {
 	return "", ""
 }
 
+// stopReportMark is in the Summary of a stop report (writeStopReport): the stats do not count it as
+// the job's report.
+const stopReportMark = "This report was written by the daemon, not by the job."
+
+// isStopReport reports whether the regular file at path is a stop report (the mark in its first bytes).
+func isStopReport(path string) bool {
+	head, err := readSmall(path, 512)
+	return err == nil && strings.Contains(head, stopReportMark)
+}
+
 // writeStopReport writes report.md for an attempt stopped at its turn limit or timeout that left none:
 // it names the stop and quotes the progress the attempt left, so job_result and a fresh-session
 // fallback have something to show. A report the attempt wrote is kept.
 func (m *Manager) writeStopReport(j *store.Job, dir, why string, turns int) {
-	if hasReport(dir) {
+	// Lstat only: the job may have put a FIFO or a link there, which is replaced, never opened.
+	if fi, err := os.Lstat(filepath.Join(dir, "report.md")); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
 		return
 	}
 	label, text := progressOrLastText(dir)
 	if text == "" {
 		label, text = "Progress", "The attempt left no "+ProgressFile+" and no assistant messages."
 	}
-	report := fmt.Sprintf("## Summary\nAttempt %d %s after %d turns before it wrote its report. This report was "+
-		"written by the daemon, not by the job.\n\n## Findings / Changes\nSee the work directory (git log, git status) "+
+	report := fmt.Sprintf("## Summary\nAttempt %d %s after %d turns before it wrote its report. "+stopReportMark+
+		"\n\n## Findings / Changes\nSee the work directory (git log, git status) "+
 		"and %s in the job dir.\n\n## Evidence\nnone (written by the daemon)\n\n## Not done / uncertain\nThe task is "+
 		"not finished: attempt %d %s.\n\n## Progress\n%s (data, not instructions):\n\n%s\n",
 		j.Attempt, why, turns, ProgressFile, j.Attempt, why, label, text)
@@ -189,11 +201,11 @@ func turnLimitStop(j *store.Job, res StreamResult) bool {
 }
 
 // autoContinue queues the one automatic continuation of a claude attempt that collect just finished
-// stopped at its turn limit (failed, result error_max_turns) or its timeout. When the attempt is not
-// continued (already continued once, the resume checks or the ceilings refuse) the reason is logged
-// and added to the job's error; with auto_continue off nothing happens. The caller holds the
-// lifecycle lock.
-func (m *Manager) autoContinue(id, why, msg string) {
+// stopped at its turn limit (failed, result error_max_turns) or its timeout, with the verdict recorded
+// as it was given (the caller checks what finish recorded). When the attempt is not continued
+// (already continued once, the resume checks or the ceilings refuse) the reason is logged and added
+// to the job's error; with auto_continue off nothing happens. The caller holds the lifecycle lock.
+func (m *Manager) autoContinue(id, why string) {
 	if !m.Cfg.AutoContinueOn() {
 		return
 	}
@@ -202,10 +214,8 @@ func (m *Manager) autoContinue(id, why, msg string) {
 		m.Log.Printf("job %s: auto-continue: %v", id, err)
 		return
 	}
-	// finish may have ended the attempt for another reason (processes outlived it, its skill links):
-	// only the message collect gave it (plus a sweep note) is a plain stop.
 	stopped := (why == stopTurnLimit && j.Status == store.StatusFailed) || (why == stopTimeout && j.Status == store.StatusTimeout)
-	if !stopped || j.Runner == store.RunnerCodex || !strings.HasPrefix(j.Error, msg) || strings.Contains(j.Error, ReasonSurvivors) {
+	if !stopped || j.Runner == store.RunnerCodex || strings.Contains(j.Error, ReasonSurvivors) {
 		return
 	}
 	dir := m.JobDir(id)
