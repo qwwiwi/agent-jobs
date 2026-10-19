@@ -75,6 +75,11 @@ type Config struct {
 	CodexWriteAllowed bool `json:"codex_write_allowed"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`
+	// CodexJobsPerDay caps the codex jobs of this agent created in the last 24 hours, whatever became of
+	// them (job_start, agent-jobs start and schedule firings past it are refused). Nil (absent) =
+	// DefaultCodexJobsPerDay (3); 0 turns the cap off. The count is per agent (each agent has its own
+	// state dir); a host-wide cap would need a counter shared by all agents.
+	CodexJobsPerDay *int `json:"codex_jobs_per_day"`
 	// Models overrides cells of the kind × complexity model table (DEVIATIONS #6), e.g.
 	// {"review": {"hard": "gpt-6.1-sol"}}. A gpt-* model runs the job on codex. Unset cells keep the defaults.
 	Models map[string]map[string]string `json:"models"`
@@ -152,6 +157,17 @@ type Config struct {
 	// the cost of attempts that ended without a reported one (killed, timed out, codex). A model with no
 	// price here or in the built-in table keeps an unknown cost.
 	ModelPrices map[string]ModelPrice `json:"model_prices"`
+}
+
+// DefaultCodexJobsPerDay is the codex daily cap when codex_jobs_per_day is not set.
+const DefaultCodexJobsPerDay = 3
+
+// CodexDailyCap returns the codex daily cap (0 = off).
+func (c Config) CodexDailyCap() int {
+	if c.CodexJobsPerDay == nil {
+		return DefaultCodexJobsPerDay
+	}
+	return *c.CodexJobsPerDay
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -310,6 +326,10 @@ func LoadConfig(stateDir string) (Config, error) {
 			}
 		}
 		// null decodes to a nil pointer, which reads as absent; an explicit null is a mistake.
+		if v, ok := raw["codex_jobs_per_day"]; ok && strings.TrimSpace(string(v)) == "null" {
+			return c, fmt.Errorf("config.json: codex_jobs_per_day must be an integer (0 = off), not null (omit the key for default %d)",
+				DefaultCodexJobsPerDay)
+		}
 		if v, ok := raw["max_running"]; ok && strings.TrimSpace(string(v)) == "null" {
 			return c, fmt.Errorf("config.json: max_running must be an integer 1..%d, not null (omit the key for default %d)",
 				CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
@@ -354,6 +374,10 @@ func LoadConfig(stateDir string) (Config, error) {
 	if c.MaxRunning != nil && (*c.MaxRunning < 1 || *c.MaxRunning > CeilingMaxRunningPerAgent) {
 		return c, fmt.Errorf("config.json: max_running %d must be 1..%d (absent = default %d)", *c.MaxRunning,
 			CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
+	}
+	if c.CodexJobsPerDay != nil && *c.CodexJobsPerDay < 0 {
+		return c, fmt.Errorf("config.json: codex_jobs_per_day %d must be 0 (off) or more (absent = default %d)",
+			*c.CodexJobsPerDay, DefaultCodexJobsPerDay)
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)

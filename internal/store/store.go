@@ -538,14 +538,51 @@ func ts(t *time.Time) any {
 
 // Insert adds a new job row. Empty Runner / Billing get their defaults.
 func (s *Store) Insert(j *Job) error {
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (`+insertMarks+`)`, insertArgs(j)...)
+	if err != nil {
+		return fmt.Errorf("insert job: %w", err)
+	}
+	return nil
+}
+
+// InsertCapped adds a new job row unless agent already has limit codex jobs created at or after since
+// (the codex daily cap): the count and the insert are one statement, so two processes starting codex
+// jobs at once cannot both pass the cap. It returns false, nothing inserted, at the cap.
+func (s *Store) InsertCapped(j *Job, since time.Time, limit int) (bool, error) {
+	args := append(insertArgs(j), j.Agent, RunnerCodex, since.Unix(), limit)
+	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (SELECT COUNT(*) FROM jobs
+		WHERE agent = ? AND runner = ? AND created_at >= ?) < ?`, args...)
+	if err != nil {
+		return false, fmt.Errorf("insert job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// CountCodexSince returns how many codex jobs of agent were created at or after since, whatever became
+// of them.
+func (s *Store) CountCodexSince(agent string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE agent = ? AND runner = ? AND created_at >= ?`,
+		agent, RunnerCodex, since.Unix()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count codex jobs: %w", err)
+	}
+	return n, nil
+}
+
+// insertMarks are the placeholders of one jobs row (one per column of cols).
+var insertMarks = strings.TrimSuffix(strings.Repeat("?,", strings.Count(cols, ",")+1), ",")
+
+// insertArgs are the values of j for cols; empty Runner / Billing get their defaults.
+func insertArgs(j *Job) []any {
 	if j.Runner == "" {
 		j.Runner = RunnerClaude
 	}
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
+	return []any{j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
@@ -553,11 +590,7 @@ func (s *Store) Insert(j *Job) error {
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
-		j.AcceptancePGID, ts(j.TimedOutAt), j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote)
-	if err != nil {
-		return fmt.Errorf("insert job: %w", err)
-	}
-	return nil
+		j.AcceptancePGID, ts(j.TimedOutAt), j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote}
 }
 
 type scanner interface{ Scan(dest ...any) error }

@@ -58,6 +58,9 @@ func newCodexManager(t *testing.T) *Manager {
 	prevDir := codexSystemConfigDir
 	codexSystemConfigDir = filepath.Join(t.TempDir(), "no-etc-codex")
 	t.Cleanup(func() { codexSystemConfigDir = prevDir })
+	// These tests start more codex jobs than the default daily cap; the cap has its own tests.
+	off := 0
+	m.Cfg.CodexJobsPerDay = &off
 	return m
 }
 
