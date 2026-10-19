@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -126,6 +127,9 @@ func TestAutoContinueOffAndStopped(t *testing.T) {
 	if strings.Contains(DoneLine(j), "auto-continued") {
 		t.Fatalf("done line: %s", DoneLine(j))
 	}
+	if st, err := m.Store.GetStats(j.ID); err != nil || st.HasReport {
+		t.Fatalf("the stop report counts as the job's report in the stats: %+v %v", st, err)
+	}
 
 	m2 := newManager(t)
 	s := startAndStop(t, m2, nil)
@@ -167,6 +171,40 @@ func TestAutoContinueAfterTimeout(t *testing.T) {
 	}
 	if line := DoneLine(got); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 timed out") {
 		t.Fatalf("done line: %s", line)
+	}
+}
+
+// A FIFO (or link) the job left as report.md is replaced by the stop report, never opened; a report
+// the job wrote is kept.
+func TestStopReportReplacesFIFO(t *testing.T) {
+	m := newManager(t)
+	dir := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(dir, "report.md"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ProgressFile), []byte("- done: a\n- next: b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		m.writeStopReport(&store.Job{ID: "x", Attempt: 1}, dir, stopTimeout, 3)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writeStopReport blocked on a FIFO report.md")
+	}
+	r := readFile(t, filepath.Join(dir, "report.md"))
+	if !strings.Contains(r, "Attempt 1 timed out after 3 turns") || !strings.Contains(r, "- next: b") || !isStopReport(filepath.Join(dir, "report.md")) {
+		t.Fatalf("stop report:\n%s", r)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("## Summary\nown\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.writeStopReport(&store.Job{ID: "x", Attempt: 1}, dir, stopTimeout, 3)
+	if r := readFile(t, filepath.Join(dir, "report.md")); r != "## Summary\nown\n" {
+		t.Fatalf("the job's own report was replaced: %q", r)
 	}
 }
 
