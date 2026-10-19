@@ -130,6 +130,11 @@ type Job struct {
 	SkillsDelivered []string
 	// SkillsNote says why a selected skill was not delivered (repository wins, codex runner), "" otherwise.
 	SkillsNote string
+	// Outcome is what the orchestrator did with the result (job_outcome): accepted, extended, reworked,
+	// rerun or discarded; "" until recorded. OutcomeNote is its optional note (at most 300 characters).
+	Outcome     string
+	OutcomeNote string
+	OutcomeAt   *time.Time
 }
 
 // AcceptanceTimedOut is the AcceptanceExit of an acceptance command ended by its timeout.
@@ -378,6 +383,17 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_deadline INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN outcome_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN outcome_at INTEGER`,
+	`ALTER TABLE job_stats ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN outcome_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN cost_estimated_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cost_source TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
@@ -502,7 +518,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
-	acceptance_pgid, timed_out_at`
+	acceptance_pgid, timed_out_at, outcome, outcome_note, outcome_at`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -519,7 +535,7 @@ func (s *Store) Insert(j *Job) error {
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
@@ -528,7 +544,7 @@ func (s *Store) Insert(j *Job) error {
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
-		j.AcceptancePGID, ts(j.TimedOutAt))
+		j.AcceptancePGID, ts(j.TimedOutAt), j.Outcome, j.OutcomeNote, ts(j.OutcomeAt))
 	if err != nil {
 		return fmt.Errorf("insert job: %w", err)
 	}
@@ -540,7 +556,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
-	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut sql.NullInt64
+	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
 	var skills, delivered string
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
@@ -548,11 +564,13 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
 		&skills, &delivered, &j.SkillsNote,
-		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut)
+		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
+		&j.Outcome, &j.OutcomeNote, &outcomeAt)
 	if err != nil {
 		return nil, err
 	}
 	j.Skills, j.SkillsDelivered = SplitNames(skills), SplitNames(delivered)
+	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
 		e := int(accExit.Int64)
@@ -771,7 +789,8 @@ type ResumeLimits struct {
 // never ran, and its attempt number is already archived), then the row goes back to queued with the new limits
 // and context, its run fields reset (notify and cleanup start over). brief, when not empty, replaces
 // the brief (a job stopped before it ever ran gets the update appended to its brief instead).
-// It keeps created_at, so the job keeps its original queue position.
+// It keeps created_at, so the job keeps its original queue position. A recorded outcome (job_outcome)
+// was about the previous attempt's result and is cleared.
 func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -789,7 +808,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
 		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
-		timeout_minutes=?, pending_context=?`
+		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
 		q += `, brief=?`

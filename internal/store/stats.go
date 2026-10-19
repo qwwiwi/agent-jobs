@@ -43,7 +43,28 @@ type JobStats struct {
 	// Source is where the stream was read from: "job_dir", "archive" or "none".
 	Source     string    `json:"source"`
 	RecordedAt time.Time `json:"recorded_at"`
+	// Outcome is what the orchestrator did with the result (job_outcome), "" = not recorded.
+	Outcome     string `json:"outcome,omitempty"`
+	OutcomeNote string `json:"outcome_note,omitempty"`
+	// CostEstimatedUSD is the list-price estimate, from the stream's token usage, of the attempts that
+	// ended without a reported cost (killed, timed out, codex); kept apart from the billed CostUSD.
+	CostEstimatedUSD float64 `json:"cost_estimated_usd,omitempty"`
+	// CostSource is "result" (every attempt reported its cost), "estimated" (the attempts without one
+	// were priced from their tokens) or "unknown" (some could not be priced); "" for rows from before.
+	CostSource string `json:"cost_source,omitempty"`
+	// Token totals over all attempts, from the stream (each assistant message once by its id).
+	InputTokens      int64 `json:"input_tokens,omitempty"`
+	OutputTokens     int64 `json:"output_tokens,omitempty"`
+	CacheReadTokens  int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
 }
+
+// Cost sources of a stats row.
+const (
+	CostSourceResult    = "result"
+	CostSourceEstimated = "estimated"
+	CostSourceUnknown   = "unknown"
+)
 
 const statsSchema = `
 CREATE TABLE IF NOT EXISTS job_stats (
@@ -73,7 +94,8 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
 	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
-	cost_unknown, skills_delivered`
+	cost_unknown, skills_delivered, outcome, outcome_note, cost_estimated_usd, cost_source, input_tokens, output_tokens,
+	cache_read_tokens, cache_write_tokens`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -93,11 +115,12 @@ func (s *Store) PutStats(st *JobStats) error {
 		}
 		cols[i] = v
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
 		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
-		JoinNames(st.SkillsDelivered))
+		JoinNames(st.SkillsDelivered), st.Outcome, st.OutcomeNote, st.CostEstimatedUSD, st.CostSource, st.InputTokens,
+		st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -111,7 +134,8 @@ func scanStats(r scanner) (*JobStats, error) {
 	var tools, skills, rules, delivered string
 	if err := r.Scan(&st.ID, &st.Kind, &st.Model, &st.Status, &st.Turns, &st.CostUSD, &st.DurationSec, &created,
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
-		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered); err != nil {
+		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered, &st.Outcome, &st.OutcomeNote, &st.CostEstimatedUSD,
+		&st.CostSource, &st.InputTokens, &st.OutputTokens, &st.CacheReadTokens, &st.CacheWriteTokens); err != nil {
 		return nil, err
 	}
 	st.SkillsDelivered = SplitNames(delivered)
@@ -179,4 +203,30 @@ func (s *Store) ListStatsContext(ctx context.Context, since time.Time) ([]*JobSt
 // ListTerminal returns every job in a terminal status, oldest first.
 func (s *Store) ListTerminal() ([]*Job, error) {
 	return s.query(`WHERE status NOT IN ('queued','running') ORDER BY created_at, rowid`)
+}
+
+// SetOutcome records what the orchestrator did with a finished job's result, on the job row and on
+// its stats row (when there is one); a later call overwrites it. Only a job of agent that is no
+// longer queued, running or stopped can take one (ErrImmutable otherwise, ErrNotFound for no row).
+func (s *Store) SetOutcome(id, agent, outcome, note string, now time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`UPDATE jobs SET outcome=?, outcome_note=?, outcome_at=? WHERE id=? AND agent=?
+		AND status NOT IN ('queued','running','stopped')`, outcome, note, now.Unix(), id, agent)
+	if err := affected(res, err); err != nil {
+		if errors.Is(err, ErrImmutable) {
+			var n int
+			if qerr := tx.QueryRow(`SELECT COUNT(*) FROM jobs WHERE id=?`, id).Scan(&n); qerr == nil && n == 0 {
+				return ErrNotFound
+			}
+		}
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE job_stats SET outcome=?, outcome_note=? WHERE id=?`, outcome, note, id); err != nil {
+		return fmt.Errorf("set outcome: %w", err)
+	}
+	return tx.Commit()
 }

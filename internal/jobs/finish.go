@@ -69,10 +69,15 @@ func LimitsText(j *store.Job) string {
 // A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // An owner-waits job ends the line with OwnerWaitsMarker.
-func DoneLine(j *store.Job) string {
-	cost := CostText(j.CostUSD, j.CostIsUnknown())
-	if j.CostIsUnknown() {
-		cost = "cost " + cost
+func DoneLine(j *store.Job) string { return doneLine(j, "") }
+
+// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate).
+func doneLine(j *store.Job, cost string) string {
+	if cost == "" {
+		cost = CostText(j.CostUSD, j.CostIsUnknown())
+		if j.CostIsUnknown() {
+			cost = "cost " + cost
+		}
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
 		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
@@ -113,6 +118,18 @@ func Containment(j *store.Job) string {
 	return "session only"
 }
 
+// DoneLineFor is the job-done line as notify delivers it: a job whose cost was not reported but could be
+// estimated from its tokens (its stats row) shows "cost $0.42 est." instead of "cost unknown".
+func (m *Manager) DoneLineFor(j *store.Job) string {
+	cost := ""
+	if j.CostIsUnknown() {
+		if st, err := m.Store.GetStats(j.ID); err == nil && st.CostSource == store.CostSourceEstimated {
+			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
+		}
+	}
+	return doneLine(j, cost)
+}
+
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
 // line; a failing tmux keeps it pending and it is retried next tick (cleanup waits for a delivered
 // notify, so the worktree is kept meanwhile). With no target configured, notify is off: the line is
@@ -125,7 +142,7 @@ func (m *Manager) notifyPending() error {
 	t := m.Cfg.NotifyTmuxTarget
 	if t == "" {
 		for _, j := range jobs {
-			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j))
+			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", m.DoneLineFor(j))
 			if j.OwnerWaits {
 				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
 					return err
@@ -145,7 +162,7 @@ func (m *Manager) notifyPending() error {
 				return err
 			}
 		}
-		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
+		if err := m.sendTmuxLocked(t, m.DoneLineFor(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {
 				// A stalled tmux (or lock holder) would cost every other line the same wait: the

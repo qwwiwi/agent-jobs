@@ -50,6 +50,7 @@ Inside a job:
 | `job_amend` | add context to a job that is still queued (it keeps its place) |
 | `job_stop` | stop a queued or running job but keep its worktree, uncommitted work and session (status `stopped`) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
+| `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
 
 ## Change a job's course
