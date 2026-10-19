@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +97,71 @@ func TestBaseBranchFromRef(t *testing.T) {
 	defer func() { MergeCheckTimeout = old }()
 	if n := m.MergeNote(get(t, m, j.ID)); !strings.Contains(n, "not checked: timed out") {
 		t.Fatalf("note: %q", n)
+	}
+}
+
+// The merge check runs no repository-controlled command: a merge driver defined in the shared repo
+// config and selected by a committed .gitattributes is not run, the check reports the conflict.
+func TestMergeCheckRunsNoMergeDriver(t *testing.T) {
+	repo := newRepo(t)
+	marker := filepath.Join(t.TempDir(), "driver-ran")
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("* merge=evil\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", ".gitattributes")
+	gitT(t, repo, "commit", "-qm", "attributes")
+	gitT(t, repo, "config", "merge.evil.driver", "touch "+marker)
+	m := newManager(t)
+	j := enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool { _, ok := readExitCode(m.JobDir(j.ID)); return ok })
+	// main changes the same line meanwhile: a content merge the driver would take over.
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2 on main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "commit", "-qam", "main edit")
+	note := m.MergeNote(get(t, m, j.ID))
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the merge check ran the repository's merge driver")
+	}
+	if !strings.HasPrefix(note, "WARNING: conflicts with main at ") || !strings.Contains(note, "tracked.txt") {
+		t.Fatalf("note: %q", note)
+	}
+}
+
+// A merge check made for a failed delivery is redone on the retry when the branch moved meanwhile; a
+// timed out check is not cached.
+func TestMergeCheckFollowsBranchAcrossRetries(t *testing.T) {
+	repo := newRepo(t)
+	m := newManager(t)
+	j := enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "exit_code", 15*time.Second, func() bool { _, ok := readExitCode(m.JobDir(j.ID)); return ok })
+	j = get(t, m, j.ID)
+	m.checkMerge(j)
+	if !strings.HasPrefix(j.MergeNote, "merges cleanly onto main at ") {
+		t.Fatalf("first check: %q", j.MergeNote)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2 on main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "commit", "-qam", "main edit")
+	tip := gitT(t, repo, "rev-parse", "main")
+	old := MergeCheckTimeout
+	MergeCheckTimeout = time.Nanosecond
+	if n := m.MergeNote(j); !strings.Contains(n, "not checked: timed out") {
+		t.Fatalf("timed out note: %q", n)
+	}
+	MergeCheckTimeout = old
+	m.checkMerge(j)
+	if !strings.HasPrefix(j.MergeNote, "WARNING: conflicts with main at "+tip[:12]) {
+		t.Fatalf("retry after the branch moved: %q", j.MergeNote)
+	}
+	if c := m.mergeChecks[j.ID]; c.tip != tip || c.note != j.MergeNote {
+		t.Fatalf("cache: %+v", c)
 	}
 }

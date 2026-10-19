@@ -134,14 +134,12 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 }
 
 // checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
-// a failure to record it is logged, the line then still carries it. A recorded check is kept while a
-// failed delivery is retried, so a stalled tmux does not cost the tick a merge check per job each time.
+// a failure to record it is logged, the line then still carries it. Each delivery attempt checks
+// again: the job's head or its branch may have moved since a failed one, and MergeNote's cache keeps
+// a retry with neither moved from running merge-tree again.
 func (m *Manager) checkMerge(j *store.Job) {
-	if j.MergeNote != "" {
-		return
-	}
 	note := m.MergeNote(j)
-	if note == "" {
+	if note == "" || note == j.MergeNote {
 		return
 	}
 	j.MergeNote = note
@@ -172,6 +170,7 @@ func (m *Manager) notifyPending() error {
 			if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 				return err
 			}
+			m.forgetMergeNote(j.ID)
 		}
 		return nil
 	}
@@ -199,6 +198,7 @@ func (m *Manager) notifyPending() error {
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
 			return err
 		}
+		m.forgetMergeNote(j.ID)
 	}
 	return nil
 }

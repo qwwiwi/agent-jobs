@@ -55,6 +55,9 @@ type Manager struct {
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
 
+	mergeMu     sync.Mutex
+	mergeChecks map[string]mergeCheck // job ID -> its last merge-tree result (MergeNote)
+
 	hbMu sync.Mutex     // held while a heartbeat started by StartHeartbeat runs
 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
 }

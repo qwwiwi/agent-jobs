@@ -67,8 +67,13 @@ func shortSHA(sha string) string {
 // gitCtx runs git within ctx (its process group is killed when ctx ends) and returns stdout, the exit
 // code (-1 when git did not exit by itself) and stderr.
 func gitCtx(ctx context.Context, dir string, args ...string) (string, int, string, error) {
+	return gitEnvCtx(ctx, daemonGitEnv(), dir, args...)
+}
+
+// gitEnvCtx is gitCtx with the given environment.
+func gitEnvCtx(ctx context.Context, env []string, dir string, args ...string) (string, int, string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
@@ -88,10 +93,66 @@ func gitCtx(ctx context.Context, dir string, args ...string) (string, int, strin
 	return stdout.String(), 0, strings.TrimSpace(stderr.String()), nil
 }
 
+// isolatedMergeTree runs `git merge-tree --write-tree` of tip and head so that nothing the repository
+// (or a job writing to its shared config) controls can run a command: the merge happens in a temporary
+// bare repository with an empty config, no system or global config, an empty HOME and XDG_CONFIG_HOME,
+// no work tree or index to take .gitattributes from, and the real repository's objects reached as an
+// alternate. No merge driver is defined there, so a `merge=<driver>` attribute falls back to the
+// built-in text merge; the trees merge-tree writes stay in the temporary repository.
+func isolatedMergeTree(ctx context.Context, repo, tip, head string) (string, int, string, error) {
+	common, err := gitCtxOK(ctx, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", -1, "", err
+	}
+	format, err := gitCtxOK(ctx, repo, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", -1, "", err
+	}
+	tmp, err := os.MkdirTemp("", "agent-jobs-merge-check-")
+	if err != nil {
+		return "", -1, "", err
+	}
+	defer os.RemoveAll(tmp)
+	home := filepath.Join(tmp, "home")
+	bare := filepath.Join(tmp, "repo.git")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		return "", -1, "", err
+	}
+	env := append(daemonGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"HOME="+home, "XDG_CONFIG_HOME="+home, "GIT_ATTR_NOSYSTEM=1")
+	run := func(dir string, args ...string) (string, int, string, error) {
+		return gitEnvCtx(ctx, env, dir, args...)
+	}
+	if _, code, stderr, err := run(tmp, "init", "-q", "--bare", "--template=", "--object-format="+format, bare); err != nil || code != 0 {
+		if err == nil {
+			err = fmt.Errorf("git init exited %d: %s", code, stderr)
+		}
+		return "", -1, "", err
+	}
+	alternates := filepath.Join(bare, "objects", "info", "alternates")
+	if err := os.MkdirAll(filepath.Dir(alternates), 0o700); err != nil {
+		return "", -1, "", err
+	}
+	if err := os.WriteFile(alternates, []byte(filepath.Join(common, "objects")+"\n"), 0o600); err != nil {
+		return "", -1, "", err
+	}
+	return run(bare, "-c", "core.attributesFile="+os.DevNull, "merge-tree", "--write-tree", "--name-only", "--no-messages", tip, head)
+}
+
+// gitCtxOK is gitCtx for a call that must exit 0: its trimmed stdout, else an error.
+func gitCtxOK(ctx context.Context, dir string, args ...string) (string, error) {
+	out, code, stderr, err := gitCtx(ctx, dir, args...)
+	if err == nil && code != 0 {
+		err = fmt.Errorf("git %s exited %d: %s", args[0], code, stderr)
+	}
+	return strings.TrimSpace(out), err
+}
+
 // MergeNote is the job-done line's merge check of a repository job with commits beyond its base:
 // whether `git merge-tree --write-tree` (objects only, no ref moves) merges the job's head onto the
 // current tip of its base branch, within MergeCheckTimeout. "" for a job without a repository, a
-// worktree or commits of its own.
+// worktree or commits of its own. A merge-tree result is cached against the job's head and the
+// branch tip it was checked at (until the job is notified); a failed or timed out check is not.
 func (m *Manager) MergeNote(j *store.Job) string {
 	if j.RepoPath == "" || j.BaseCommit == "" {
 		return ""
@@ -112,13 +173,7 @@ func (m *Manager) MergeNote(j *store.Job) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), MergeCheckTimeout)
 	defer cancel()
-	run := func(dir string, args ...string) (string, error) {
-		out, code, stderr, err := gitCtx(ctx, dir, args...)
-		if err == nil && code != 0 {
-			err = fmt.Errorf("git %s exited %d: %s", args[0], code, stderr)
-		}
-		return strings.TrimSpace(out), err
-	}
+	run := func(dir string, args ...string) (string, error) { return gitCtxOK(ctx, dir, args...) }
 	head, err := run(work, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return notChecked(err.Error())
@@ -140,12 +195,17 @@ func (m *Manager) MergeNote(j *store.Job) string {
 	if err != nil {
 		return notChecked("branch " + shortBranch(j.BaseBranch) + " not found")
 	}
-	out, code, stderr, err := gitCtx(ctx, j.RepoPath, "merge-tree", "--write-tree", "--name-only", "--no-messages", tip, head)
+	if note, ok := m.cachedMergeNote(j.ID, head, tip); ok {
+		return note
+	}
+	out, code, stderr, err := isolatedMergeTree(ctx, j.RepoPath, tip, head)
 	switch {
 	case err != nil:
 		return notChecked(err.Error())
 	case code == 0:
-		return fmt.Sprintf("merges cleanly onto %s at %s", Printable(branch, 80), shortSHA(tip))
+		note := fmt.Sprintf("merges cleanly onto %s at %s", Printable(branch, 80), shortSHA(tip))
+		m.cacheMergeNote(j.ID, head, tip, note)
+		return note
 	case code != 1:
 		if strings.Contains(stderr, "usage") || strings.Contains(stderr, "unknown option") {
 			return notChecked("git older than 2.38 (no merge-tree --write-tree)")
@@ -176,7 +236,37 @@ func (m *Manager) MergeNote(j *store.Job) string {
 			}
 		}
 	}
+	m.cacheMergeNote(j.ID, head, tip, note)
 	return note
+}
+
+// mergeCheck is a cached merge-tree result: the note for the job's head merged onto tip.
+type mergeCheck struct{ head, tip, note string }
+
+func (m *Manager) cachedMergeNote(id, head, tip string) (string, bool) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	c, ok := m.mergeChecks[id]
+	if !ok || c.head != head || c.tip != tip {
+		return "", false
+	}
+	return c.note, true
+}
+
+func (m *Manager) cacheMergeNote(id, head, tip, note string) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	if m.mergeChecks == nil {
+		m.mergeChecks = map[string]mergeCheck{}
+	}
+	m.mergeChecks[id] = mergeCheck{head, tip, note}
+}
+
+// forgetMergeNote drops the cached merge check of a job that has been notified.
+func (m *Manager) forgetMergeNote(id string) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	delete(m.mergeChecks, id)
 }
 
 // capList joins at most n items, then "(+k more)".
