@@ -638,13 +638,16 @@ var treeWriters = map[string]bool{
 // own (`tar -xfC…` names the archive `C…`). Only the options that take a value in every variant
 // (GNU and BSD tar, GNU and BSD cpio) are in `vals`: an unknown letter counts as a flag, so the scan
 // goes on to the directory option (fail closed). A directory option ending the word takes the next
-// word, which is checked whole as an ancestor already.
+// word, which is checked whole as an ancestor already. unzip has no value option in `vals`: its `-P`
+// takes the rest of the word only for the first password, a repeated `-P` is skipped and the scan
+// goes on (`-Pdummy -Pd<dir>`), so any `d` in the word counts; a `-` inside a cluster negates the
+// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too.
 var clusterDirOpts = map[string]struct {
 	dir  byte
 	vals string
 }{
 	"tar": {'C', "bITXf"}, "bsdtar": {'C', "bITXf"}, "gtar": {'C', "bITXf"},
-	"unzip": {'d', "P"}, "cpio": {'D', "CEFHIMOR"},
+	"unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
 }
 
 // sevenZips take switches case-insensitively, one per word: `-o<dir>` and `-O<dir>` both set the
@@ -654,7 +657,7 @@ var sevenZips = map[string]bool{"7z": true, "7za": true, "7zz": true}
 // attachedDir returns the directory attached to an archive tool's directory option in the same
 // word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
 func attachedDir(name, a string) (string, bool) {
-	if len(a) < 3 || a[0] != '-' || a[1] == '-' {
+	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
 		return "", false
 	}
 	if sevenZips[name] {
