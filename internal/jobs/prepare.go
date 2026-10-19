@@ -3,6 +3,7 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -278,7 +279,16 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	return writeFileReplace(path, append(b, '\n'))
+}
+
+// writeFileReplace writes data to path through replaceFile: whatever the job left at path (a FIFO, a
+// link) is replaced, never opened.
+func writeFileReplace(path string, data []byte) error {
+	return replaceFile(filepath.Dir(path), filepath.Base(path), func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
 }
 
 // JobMCPServerName is the job-role server's key in the job's mcp.json.

@@ -41,11 +41,19 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 	sessionsHome(t, true)
 	j := enqueue(t, m, "FAKE_MAX_TURNS_ONCE", nil)
 	tick(t, m)
+	sid := get(t, m, j.ID).SessionID
 	waitExit(t, m, j.ID)
 	tick(t, m) // collects attempt 1, queues and launches attempt 2
 	got := get(t, m, j.ID)
 	if got.Status != store.StatusRunning || got.Attempt != 2 || got.RunMode != store.RunResume {
 		t.Fatalf("after the turn-limit stop: %s attempt %d mode %s %q", got.Status, got.Attempt, got.RunMode, got.Error)
+	}
+	// The continuation resumes attempt 1's session: claude gets --resume with its id.
+	waitExit(t, m, j.ID)
+	launches := strings.Split(readFile(t, filepath.Join(m.JobDir(j.ID), "argv-all.txt")), "---\n")
+	if sid == "" || got.SessionID != sid || len(launches) < 2 || !strings.Contains(launches[0], "--session-id\n"+sid+"\n") ||
+		!strings.Contains(launches[1], "--resume\n"+sid+"\n") {
+		t.Fatalf("attempt 2 did not resume session %q (row %q):\n%v", sid, got.SessionID, launches)
 	}
 	if got.MaxTurns != 40 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 23 {
 		t.Fatalf("continuation limits: %d turns $%g %d min", got.MaxTurns, got.MaxBudgetUSD, got.TimeoutMinutes)
@@ -61,7 +69,6 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 		!strings.Contains(r, "- next: step two") || reportContractNote(r) != "" {
 		t.Fatalf("stop report of attempt 1:\n%s", r)
 	}
-	waitExit(t, m, j.ID)
 	tick(t, m)
 	got = get(t, m, j.ID)
 	if got.Status != store.StatusSucceeded || got.Attempt != 2 || got.Turns != 3 {
@@ -168,6 +175,10 @@ func TestAutoContinueAfterTimeout(t *testing.T) {
 	atts, err := m.Store.Attempts(j.ID)
 	if got.Status != store.StatusSucceeded || err != nil || len(atts) != 1 || atts[0].Status != store.StatusTimeout || !atts[0].CostUnknown {
 		t.Fatalf("continuation: %s %q attempts %+v %v", got.Status, got.Error, atts, err)
+	}
+	// Attempt 1's unknown cost counts at its whole $10 budget, plus the continuation's own $0.25.
+	if _, cost, _ := attemptsUsage(got, atts); cost < 10.249 || cost > 10.251 {
+		t.Fatalf("accounted cost $%g, want $10.25", cost)
 	}
 	if line := DoneLine(got); !strings.Contains(line, "auto-continued (attempt 2; attempt 1 timed out") {
 		t.Fatalf("done line: %s", line)
@@ -300,5 +311,130 @@ func TestPreambleAsksForProgressFile(t *testing.T) {
 	j := runToEnd(t, m, enqueue(t, m, "do the thing", nil).ID)
 	if p := readFile(t, filepath.Join(m.JobDir(j.ID), "prompt.md")); !strings.Contains(p, "Keep `PROGRESS.md` in the job directory up to date") {
 		t.Fatal("prompt.md lacks the progress-file rule")
+	}
+}
+
+// A FIFO the stopped attempt left at settings.json or mcp.json is replaced when the continuation
+// rewrites them, never opened: the tick does not block.
+func TestAutoContinueReplacesFIFOJobFiles(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	j := enqueue(t, m, "FAKE_MAX_TURNS_ONCE", nil)
+	tick(t, m)
+	waitExit(t, m, j.ID)
+	dir := m.JobDir(j.ID)
+	for _, name := range []string{"settings.json", "mcp.json"} {
+		p := filepath.Join(dir, name)
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mkfifo(p, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.Tick() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		// Release the blocked writer so the daemon goroutine ends.
+		for _, name := range []string{"settings.json", "mcp.json"} {
+			if f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+				defer f.Close()
+			}
+		}
+		<-done
+		t.Fatal("auto-continue blocked on a FIFO job file")
+	}
+	got := get(t, m, j.ID)
+	if got.Attempt != 2 || got.RunMode != store.RunResume {
+		t.Fatalf("not continued: %s attempt %d %q", got.Status, got.Attempt, got.Error)
+	}
+	for _, name := range []string{"settings.json", "mcp.json"} {
+		if fi, err := os.Lstat(filepath.Join(dir, name)); err != nil || !fi.Mode().IsRegular() {
+			t.Fatalf("%s not replaced by a regular file: %v %v", name, fi, err)
+		}
+	}
+	waitExit(t, m, j.ID)
+	tick(t, m)
+}
+
+// A tail cut inside one long line drops that partial line: a secret whose prefix was cut off is never
+// quoted.
+func TestProgressTailDropsCutLine(t *testing.T) {
+	dir := t.TempDir()
+	long := "api_key=" + strings.Repeat("S", progressTailBytes+100)
+	if err := os.WriteFile(filepath.Join(dir, ProgressFile), []byte(long+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := progressTail(dir); got != "" {
+		t.Fatalf("cut single line quoted (%d bytes)", len(got))
+	}
+	if err := os.WriteFile(filepath.Join(dir, ProgressFile), []byte(long+"\n- next: b\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := progressTail(dir); got != "- next: b" {
+		t.Fatalf("tail: %.80q", got)
+	}
+}
+
+// exit_code written after collect's first check but before the timeout's kill: the attempt ended by
+// itself, so its own verdict is recorded (here error_max_budget_usd), not a timeout, and it is not
+// auto-continued.
+func TestTimeoutLateExitCodeCollectsVerdict(t *testing.T) {
+	m := newManager(t)
+	m.KillGrace = 200 * time.Millisecond
+	start := time.Now().Add(-20 * time.Minute)
+	w := liveChild(t)
+	j := &store.Job{ID: "261019-100000-late", Agent: m.Agent, Title: "t", Kind: "fix", Brief: "b", Status: store.StatusRunning,
+		Model: "sonnet", MaxTurns: 10, MaxBudgetUSD: 1, TimeoutMinutes: 10, CreatedAt: start, StartedAt: &start,
+		LaunchToken: "tok", PID: w.Process.Pid, Attempt: 1}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	dir := m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	beforeTimeoutClaim = func(id string) {
+		if id != j.ID {
+			return
+		}
+		res := `{"type":"result","subtype":"error_max_budget_usd","is_error":true,"num_turns":4,"total_cost_usd":1.02,"result":""}` + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(res), 0o600); err != nil {
+			t.Error(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "exit_code"), []byte("1\n"), 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { beforeTimeoutClaim = func(string) {} })
+	if err := m.collect(); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusFailed || got.Attempt != 1 || strings.Contains(got.Error, "timeout") ||
+		got.CostUnknown || got.Turns != 4 || got.PendingContext != "" {
+		t.Fatalf("late exit_code: %s attempt %d turns %d unknown %v %q", got.Status, got.Attempt, got.Turns, got.CostUnknown, got.Error)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "report.md")); err == nil {
+		t.Fatal("a stop report was written for an attempt that ended by itself")
+	}
+}
+
+// A compliant report longer than the read limit is not judged on its first part: the check is
+// inconclusive and adds no note.
+func TestReportContractLongReport(t *testing.T) {
+	m := newManager(t)
+	dir := t.TempDir()
+	long := "## Summary\nok\n\n## Evidence\n" + strings.Repeat("x\n", maxContractReportBytes) + "\n## Not done / uncertain\nnothing\n"
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(long), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, msg := m.reportContract(&store.Job{ID: "x"}, store.StatusSucceeded, "", dir); st != store.StatusSucceeded || msg != "" {
+		t.Fatalf("long report: %s %q", st, msg)
 	}
 }

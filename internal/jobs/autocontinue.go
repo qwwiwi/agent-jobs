@@ -50,7 +50,8 @@ func autoContinuedFrom(ctx string) (string, bool) {
 
 // progressTail returns the last progressTailLines lines of the job's progress file (at most
 // progressTailBytes from its end), redacted; "" when there is none. A link or a non-regular file is
-// not read.
+// not read. A tail cut by the seek drops its first, partial line: it may be the end of a secret whose
+// prefix (the part redaction recognizes) was cut off.
 func progressTail(dir string) string {
 	f, err := os.OpenFile(filepath.Join(dir, ProgressFile), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -73,7 +74,7 @@ func progressTail(dir string) string {
 	}
 	// Redacted before the lines are cut, so a multi-line secret is still seen whole.
 	lines := strings.Split(strings.TrimRight(RedactText(string(b)), "\n"), "\n")
-	if cut && len(lines) > 1 {
+	if cut {
 		lines = lines[1:] // the first line was cut by the seek
 	}
 	if len(lines) > progressTailLines {

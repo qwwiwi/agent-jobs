@@ -897,7 +897,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{}, err
 	}
 	update := m.resumeMessage(j)
-	if err := os.WriteFile(filepath.Join(dir, resumePromptFile), []byte(update), 0o600); err != nil {
+	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
 		return launchPlan{}, err
 	}
 	brief, err := m.BuildPrompt(j, rules, cards, m.LookupMemoryNotes(j))
@@ -907,7 +907,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	fallback := brief + "\n" + m.previousAttempt(j, dir) + "\n" + update +
 		"\nNote: the previous claude session could not be resumed, so this is a fresh session in the same work " +
 		"directory. Say so in the \"Not done / uncertain\" section of your report.\n"
-	if err := os.WriteFile(filepath.Join(dir, fallbackPromptFile), []byte(fallback), 0o600); err != nil {
+	if err := writeFileReplace(filepath.Join(dir, fallbackPromptFile), []byte(fallback)); err != nil {
 		return launchPlan{}, err
 	}
 	fresh := NewSessionID()
