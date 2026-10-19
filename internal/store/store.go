@@ -378,6 +378,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_deadline INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
+	`ALTER TABLE job_stats ADD COLUMN report_off_contract INTEGER NOT NULL DEFAULT 0`,
 }
 
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:

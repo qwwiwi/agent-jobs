@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Off-contract reports (#46): a claude job that ends `succeeded` with a report lacking `## Summary` keeps its status with the error `report has no Summary section: likely stopped mid-task` (lacking `## Not done / uncertain`: `report has no Not done / uncertain section`), shown on the job-done line and in `job_status` / `job_result`; `job_stats` and `agent-jobs stats` count them per group as `report_off_contract` (`OFF-CONTRACT`). Config `report_contract: warn | fail` (default `warn`; `fail` fails such a job). The check reuses the report section parser.
+- Auto-continue (#38): a claude attempt stopped at its turn limit (`error_max_turns`) or its timeout is continued once, in the same tick, through the `job_resume` path (same job id, work dir and session, same resume checks), with `auto_continue_fraction` (default 0.5) of the job's original limits, each capped by what the 200-turn / $50 / 180-minute ceilings leave across attempts. The update carries the tail of `PROGRESS.md`, else the attempt's last assistant text. A second stop is final (`not auto-continued: …` in the error); stopped, cancelled, budget-stopped, otherwise failed and codex jobs are never continued. The job-done line says `auto-continued (attempt 2; attempt 1 stopped at its turn limit after N turns (cost $X))`; the first attempt's turns and cost stay in the attempts table, the stats and the ceilings. Config `auto_continue` (default `true`).
+- The preamble asks every job to keep `PROGRESS.md` in its job dir up to date after each meaningful step (done, next, not to redo). A turn-limit or timeout stop without a report gets a daemon-written `report.md` that names the stop and quotes that progress.
+
 ## [0.4.0] - 2026-10-18
 
 ### Added

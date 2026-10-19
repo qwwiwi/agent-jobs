@@ -312,7 +312,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
-		RecordedAt: m.Now(),
+		RecordedAt: m.Now(), ReportOffContract: OffContractNote(j.Error) != "",
 	}
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)
@@ -456,6 +456,8 @@ type StatsSummary struct {
 	GuardRefusals     int            `json:"guard_refusals"`
 	Subagents         int            `json:"subagents"`
 	WithoutReport     int            `json:"without_report"`
+	// ReportOffContract counts the jobs whose report lacks the Summary or the Not done / uncertain section.
+	ReportOffContract int `json:"report_off_contract"`
 	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
 }
@@ -679,6 +681,9 @@ func summarize(rows []*store.JobStats) StatsSummary {
 		s.Subagents += r.Subagents
 		if !r.HasReport {
 			s.WithoutReport++
+		}
+		if r.ReportOffContract {
+			s.ReportOffContract++
 		}
 		durs = append(durs, r.DurationSec)
 	}

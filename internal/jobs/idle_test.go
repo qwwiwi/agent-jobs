@@ -73,6 +73,7 @@ func TestIdleAfterResultWithoutReport(t *testing.T) {
 // A failed result subtype, then silence: closed and failed.
 func TestIdleAfterResultFailedSubtype(t *testing.T) {
 	m := idleManager(t)
+	noAutoContinue(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_IDLE_FAIL", nil).ID)
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, ReasonIdleClosed) ||
 		!strings.Contains(j.Error, "error_max_turns") {
@@ -120,11 +121,11 @@ func TestIdleAfterResultNormalExitUnchanged(t *testing.T) {
 }
 
 // A normal exit whose result text is empty: report.md comes from the last assistant text with the
-// report sections.
+// report sections (this one has no Not done / uncertain section, which the row notes).
 func TestReportFromAssistantTextOnNormalExit(t *testing.T) {
 	m := newManager(t)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_ASSISTANT_REPORT", nil).ID)
-	if j.Status != store.StatusSucceeded || j.Error != "" {
+	if j.Status != store.StatusSucceeded || j.Error != NoteNoNotDone {
 		t.Fatalf("job: %s %q", j.Status, j.Error)
 	}
 	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); r != "## Summary\nfrom assistant\n" {
