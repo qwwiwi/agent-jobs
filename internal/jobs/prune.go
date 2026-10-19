@@ -166,6 +166,9 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 	if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
 	}
+	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
+		m.recordDirSize(id) // the disk status reads the recorded size
+	}
 	return pj, true, nil
 }
 
@@ -363,33 +366,112 @@ func treeSize(p string) int64 {
 	return n
 }
 
-// jobDirSize is the size of job j's folder dir (treeSize), the worktree of a repo job left out: it is
-// the repository's checkout, removed by cleanup. tmp is the part in the job's temp dir (JobTmpDir).
-func jobDirSize(j *store.Job, dir string) (total, tmp int64) {
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, 0
-	}
-	for _, e := range ents {
-		if e.Name() == "work" && j.RepoPath != "" {
-			continue
-		}
-		n := treeSize(filepath.Join(dir, e.Name()))
-		total += n
-		if e.Name() == JobTmpDir && e.IsDir() {
-			tmp = n
-		}
-	}
-	return total, tmp
+// Bounds of one job folder measurement (jobDirSize), which runs synchronously when a job settles: a
+// walk stops after this many entries or this long, and the size is then recorded as partial.
+var (
+	dirWalkMaxEntries = 200_000
+	dirWalkBudget     = 2 * time.Second
+)
+
+// DirSize is a measured job folder: Bytes in all, TmpBytes of them in its temp dir (JobTmpDir).
+// Partial means the bounded walk stopped early: both are lower bounds.
+type DirSize struct {
+	Bytes    int64
+	TmpBytes int64
+	Partial  bool
 }
 
-// recordDirSize measures the folder of a job whose attempt ended and records it on the row (the stats
-// row and the job-done line show it). A failure is logged, never fatal.
+// dirWalk is one bounded walk: every directory is opened relative to its parent's descriptor with
+// O_NOFOLLOW and every entry is lstat'ed through it, so no symlink is followed, not even a directory
+// swapped for one mid-walk.
+type dirWalk struct {
+	left     int
+	deadline time.Time
+	partial  bool
+}
+
+// each calls fn with the lstat of every entry of the open directory fd (closed on return), until the
+// walk runs out of entries or time.
+func (w *dirWalk) each(fd int, fn func(name string, st *unix.Stat_t)) {
+	f := os.NewFile(uintptr(fd), "dir")
+	defer f.Close()
+	for !w.partial {
+		names, err := f.Readdirnames(512)
+		for _, name := range names {
+			if w.left--; w.left < 0 || time.Now().After(w.deadline) {
+				w.partial = true
+				return
+			}
+			var st unix.Stat_t
+			if unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil {
+				fn(name, &st)
+			}
+		}
+		if err != nil {
+			return // io.EOF, or a directory that cannot be read further
+		}
+	}
+}
+
+// size sums the sizes of everything in the directory name under dirfd (symlinks counted as links).
+// A directory that cannot be opened counts as its entry alone.
+func (w *dirWalk) size(dirfd int, name string, depth int) int64 {
+	if depth > maxChmodDepth {
+		w.partial = true
+		return 0
+	}
+	fd, err := openDirNoFollow(dirfd, name)
+	if err != nil {
+		return 0
+	}
+	var n int64
+	w.each(fd, func(c string, st *unix.Stat_t) {
+		n += st.Size
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			n += w.size(fd, c, depth+1)
+		}
+	})
+	return n
+}
+
+// jobDirSize measures job j's folder dir, the worktree of a repo job left out (it is the repository's
+// checkout, removed by cleanup), within dirWalkMaxEntries and dirWalkBudget. The job can write its
+// folder: a dir that is not a real directory (a symlink) is refused, and nothing under it is followed.
+func jobDirSize(j *store.Job, dir string) (DirSize, error) {
+	fd, err := openDirNoFollow(unix.AT_FDCWD, dir)
+	if err != nil {
+		return DirSize{}, err
+	}
+	w := &dirWalk{left: dirWalkMaxEntries, deadline: time.Now().Add(dirWalkBudget)}
+	var s DirSize
+	w.each(fd, func(name string, st *unix.Stat_t) {
+		if name == "work" && j.RepoPath != "" {
+			return
+		}
+		n := st.Size
+		isDir := st.Mode&unix.S_IFMT == unix.S_IFDIR
+		if isDir {
+			n += w.size(fd, name, 1)
+		}
+		s.Bytes += n
+		if name == JobTmpDir && isDir {
+			s.TmpBytes = n
+		}
+	})
+	s.Partial = w.partial
+	return s, nil
+}
+
+// recordDirSize measures the folder of a job (when its attempt ended, again after a prune) and records
+// it on the row (the stats row, the job-done line and the disk status show it). A failure is logged,
+// never fatal.
 func (m *Manager) recordDirSize(id string) {
 	j, err := m.Store.Get(id)
 	if err == nil {
-		n, _ := jobDirSize(j, m.JobDir(id))
-		err = m.Store.SetDirBytes(id, n)
+		var s DirSize
+		if s, err = jobDirSize(j, m.JobDir(id)); err == nil {
+			err = m.Store.SetDirBytes(id, s.Bytes, s.TmpBytes, s.Partial)
+		}
 	}
 	if err != nil {
 		m.Log.Printf("job %s: record job dir size: %v", id, err)

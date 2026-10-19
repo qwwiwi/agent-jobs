@@ -44,15 +44,18 @@ type DiskStatus struct {
 const MaxLargestJobDirs = 5
 
 // JobDirUsage is the size of one job folder; TmpBytes is the part in its temp dir (JobTmpDir).
+// Partial: the walk that measured it stopped at its bound, both are lower bounds.
 type JobDirUsage struct {
 	ID       string `json:"id"`
 	Status   string `json:"status"`
 	Bytes    int64  `json:"bytes"`
 	TmpBytes int64  `json:"tmp_bytes"`
+	Partial  bool   `json:"partial,omitempty"`
 }
 
-// largestJobDirs measures the folder of every job in the store and returns the largest ones, biggest
-// first, and the total of their temp dirs.
+// largestJobDirs returns the largest job folders, biggest first, and the total of their temp dirs,
+// from the sizes recorded on the rows (recordDirSize: when an attempt ended, after a prune); nothing
+// is walked here. A job that is still running has no recorded size yet.
 func (m *Manager) largestJobDirs() ([]JobDirUsage, int64, error) {
 	all, err := m.Store.List(-1) // negative: no limit
 	if err != nil {
@@ -61,10 +64,9 @@ func (m *Manager) largestJobDirs() ([]JobDirUsage, int64, error) {
 	var out []JobDirUsage
 	var tmp int64
 	for _, j := range all {
-		n, t := jobDirSize(j, m.JobDir(j.ID))
-		tmp += t
-		if n > 0 {
-			out = append(out, JobDirUsage{ID: j.ID, Status: j.Status, Bytes: n, TmpBytes: t})
+		tmp += j.DirTmpBytes
+		if j.DirBytes > 0 {
+			out = append(out, JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial})
 		}
 	}
 	slices.SortStableFunc(out, func(a, b JobDirUsage) int { return cmp.Compare(b.Bytes, a.Bytes) })

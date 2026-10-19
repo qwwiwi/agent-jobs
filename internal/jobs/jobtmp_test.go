@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 func TestTempEnvReplacesEveryTempVariable(t *testing.T) {
@@ -169,5 +172,101 @@ func TestJobDirNoteConfig(t *testing.T) {
 		if err != nil || c.JobDirNoteBytes() != want {
 			t.Fatalf("job_dir_note_mb %s: %d %v, want %d", v, c.JobDirNoteBytes(), err, want)
 		}
+	}
+}
+
+// writeBytes writes a file of n bytes at p.
+func writeBytes(t *testing.T, p string, n int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, make([]byte, n), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #43 review: the job can write its folder; the size walk follows no symlink, neither one put in place
+// of the folder itself nor one inside it (to a directory or a file).
+func TestJobDirSizeFollowsNoSymlink(t *testing.T) {
+	const mb = 1 << 20
+	outside := t.TempDir()
+	writeBytes(t, filepath.Join(outside, "big"), 4*mb)
+	base := t.TempDir()
+	dir := filepath.Join(base, "job")
+	writeBytes(t, filepath.Join(dir, "small"), 100)
+	for name, target := range map[string]string{"dirlink": outside, "filelink": filepath.Join(outside, "big"),
+		JobTmpDir: outside} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := jobDirSize(&store.Job{}, dir)
+	if err != nil || s.Bytes >= mb || s.TmpBytes != 0 || s.Partial {
+		t.Fatalf("job dir with symlinks inside: %+v %v, want only the links and the small file counted", s, err)
+	}
+	root := filepath.Join(base, "rootlink")
+	if err := os.Symlink(outside, root); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := jobDirSize(&store.Job{}, root); err == nil {
+		t.Fatalf("a symlinked job folder was measured: %+v", s)
+	}
+}
+
+// #43 review: the walk that runs when a job settles is bounded by entries and by time; a size it
+// could not finish is recorded as partial, and the disk status reads the recorded sizes instead of
+// walking every job folder again.
+func TestJobDirSizeBoundedAndCached(t *testing.T) {
+	oldMax, oldBudget := dirWalkMaxEntries, dirWalkBudget
+	t.Cleanup(func() { dirWalkMaxEntries, dirWalkBudget = oldMax, oldBudget })
+	dir := t.TempDir()
+	for i := 0; i < 50; i++ {
+		writeBytes(t, filepath.Join(dir, "d", fmt.Sprintf("f%02d", i)), 10)
+	}
+	full, err := jobDirSize(&store.Job{}, dir)
+	if err != nil || full.Partial || full.Bytes < 500 {
+		t.Fatalf("unbounded: %+v %v", full, err)
+	}
+	dirWalkMaxEntries = 10
+	if s, err := jobDirSize(&store.Job{}, dir); err != nil || !s.Partial || s.Bytes >= full.Bytes {
+		t.Fatalf("entry cap: %+v %v, want partial", s, err)
+	}
+	dirWalkMaxEntries, dirWalkBudget = oldMax, -time.Second
+	if s, err := jobDirSize(&store.Job{}, dir); err != nil || !s.Partial {
+		t.Fatalf("time budget: %+v %v, want partial", s, err)
+	}
+	dirWalkBudget = oldBudget
+
+	m := newManager(t)
+	j := enqueue(t, m, "x", nil)
+	jd := m.JobDir(j.ID)
+	writeBytes(t, filepath.Join(jd, JobTmpDir, "a"), 3000)
+	for i := 0; i < 20; i++ {
+		writeBytes(t, filepath.Join(jd, "many", fmt.Sprint(i)), 1)
+	}
+	dirWalkMaxEntries = 5
+	m.recordDirSize(j.ID)
+	got := get(t, m, j.ID)
+	if !got.DirPartial || got.DirBytes == 0 {
+		t.Fatalf("recorded size %d partial %v", got.DirBytes, got.DirPartial)
+	}
+	if l := DoneLine(got, 1<<30); !strings.Contains(l, "not fully measured") {
+		t.Fatalf("done line of a partial size: %s", l)
+	}
+	dirWalkMaxEntries = oldMax
+	m.recordDirSize(j.ID)
+	got = get(t, m, j.ID)
+	if got.DirPartial || got.DirTmpBytes < 3000 {
+		t.Fatalf("recorded size %d tmp %d partial %v", got.DirBytes, got.DirTmpBytes, got.DirPartial)
+	}
+
+	writeBytes(t, filepath.Join(jd, "later"), 1<<20) // not walked by the disk status
+	d := m.Disk()
+	if len(d.LargestJobDirs) != 1 || d.LargestJobDirs[0].Bytes != got.DirBytes || d.JobTmpBytes != got.DirTmpBytes {
+		t.Fatalf("disk status %+v tmp %d, want the recorded %d / %d", d.LargestJobDirs, d.JobTmpBytes, got.DirBytes, got.DirTmpBytes)
 	}
 }
