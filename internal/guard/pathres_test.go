@@ -696,6 +696,19 @@ func TestProtectedAncestorArchivers(t *testing.T) {
 		"/usr/bin/BSDTAR -C ../../../.. -xf a.tar",
 		"tar -C../../../.. -xf a.tar",
 		"unzip -o a.zip -d../../../..",
+		// PR #50 review: clustered short options, upper-case 7-Zip switches, cpio -D
+		"bsdtar -xC../../../.. -f a.tar",
+		"tar -xC../../../.. -f a.tar",
+		"gtar -xvC../../../.. -f a.tar",
+		"tar -xC ../../../.. -f a.tar",
+		"tar -xvzC../../../.. -f a.tar",
+		"7z x a.7z -y -O../../../..",
+		"7za x a.7z -O../../../..",
+		"7zz x a.7z -O../../../..",
+		"unzip -od../../../.. a.zip",
+		"unzip -qqd../../../.. a.zip",
+		"cpio -idmD../../../.. < a.cpio",
+		"cpio -D../../../.. -idm < a.cpio",
 	} {
 		if Check(c, cfg) == "" {
 			t.Errorf("%q allowed", c)
@@ -705,6 +718,10 @@ func TestProtectedAncestorArchivers(t *testing.T) {
 		"tar -tf a.tar", "unzip -l a.zip", "unzip -o a.zip -d build", "tar -xf a.tar -C build",
 		"unzip -o a.zip -d ..", "bsdtar -xf a.tar -C ..", "ditto src build", "7z x a.7z -obuild",
 		"7z l a.7z", "cpio -idm < a.cpio", "pax -r < a.pax",
+		"tar -xCbuild -f a.tar", "bsdtar -xvCbuild -f a.tar", "gtar -xC build -f a.tar", "tar -xC.. -f a.tar",
+		"tar -xfC../../../..", "7z x a.7z -y -Obuild", "7za x a.7z -O..", "unzip -od build a.zip",
+		"unzip -qqdbuild a.zip", "unzip -PC../../../.. a.zip", "cpio -idmDbuild < a.cpio",
+		"cpio -idmE../../../..D < a.cpio",
 	} {
 		if r := Check(c, cfg); r != "" {
 			t.Errorf("%q refused: %s", c, r)

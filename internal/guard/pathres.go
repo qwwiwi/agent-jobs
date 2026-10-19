@@ -632,19 +632,50 @@ var treeWriters = map[string]bool{
 	"7za": true, "7zz": true,
 }
 
-// attachedDirOpts are the options of archive tools whose value, attached to the option in the same
-// word, is the directory they extract into (`tar -C<dir>`, `unzip -d<dir>`, `7z x -o<dir>`).
-var attachedDirOpts = map[string]string{
-	"tar": "-C", "bsdtar": "-C", "gtar": "-C", "unzip": "-d", "7z": "-o", "7za": "-o", "7zz": "-o",
+// clusterDirOpts are the archive tools whose short options cluster like getopt: the directory
+// option (`dir`) takes the rest of the word as its value (`tar -xvC<dir>`, `unzip -qd<dir>`,
+// `cpio -idmD<dir>`), and so does any option in `vals`, which ends the cluster with a value of its
+// own (`tar -xfC…` names the archive `C…`). Only the options that take a value in every variant
+// (GNU and BSD tar, GNU and BSD cpio) are in `vals`: an unknown letter counts as a flag, so the scan
+// goes on to the directory option (fail closed). A directory option ending the word takes the next
+// word, which is checked whole as an ancestor already.
+var clusterDirOpts = map[string]struct {
+	dir  byte
+	vals string
+}{
+	"tar": {'C', "bITXf"}, "bsdtar": {'C', "bITXf"}, "gtar": {'C', "bITXf"},
+	"unzip": {'d', "P"}, "cpio": {'D', "CEFHIMOR"},
 }
 
-// attachedDir returns the directory attached to an archive tool's directory option (`-C<dir>`).
+// sevenZips take switches case-insensitively, one per word: `-o<dir>` and `-O<dir>` both set the
+// output directory.
+var sevenZips = map[string]bool{"7z": true, "7za": true, "7zz": true}
+
+// attachedDir returns the directory attached to an archive tool's directory option in the same
+// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
 func attachedDir(name, a string) (string, bool) {
-	opt, ok := attachedDirOpts[name]
-	if !ok || len(a) <= len(opt) || !strings.HasPrefix(a, opt) {
+	if len(a) < 3 || a[0] != '-' || a[1] == '-' {
 		return "", false
 	}
-	return a[len(opt):], true
+	if sevenZips[name] {
+		if a[1] != 'o' && a[1] != 'O' {
+			return "", false
+		}
+		return a[2:], true
+	}
+	opt, ok := clusterDirOpts[name]
+	if !ok {
+		return "", false
+	}
+	for j := 1; j < len(a)-1; j++ {
+		switch c := a[j]; {
+		case c == opt.dir:
+			return a[j+1:], true
+		case strings.IndexByte(opt.vals, c) >= 0:
+			return "", false
+		}
+	}
+	return "", false
 }
 
 // findActs reports a find with an action that writes or runs something (-delete, -exec, -fprint, …).
