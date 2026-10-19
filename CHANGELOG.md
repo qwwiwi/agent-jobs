@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+- Guard (#41): on macOS and Windows, whose default file systems ignore case, protected paths (`jobs.db` and its `-wal`/`-shm`/`-journal` files, `subagents/`) are compared case-folded by the Bash checks (arguments, redirections, ancestors, option values, inline code) and by the file tools, so `JOBS.DB`, `Jobs.db` or `SUBAGENTS/j.log` no longer bypass the guard; Linux is unchanged.
+
 ## [0.4.0] - 2026-10-18
 
 ### Added
