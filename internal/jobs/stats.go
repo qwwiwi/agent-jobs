@@ -318,11 +318,12 @@ type gzReadCloser struct {
 
 func (g gzReadCloser) Close() error { return errors.Join(g.Reader.Close(), g.f.Close()) }
 
-// hasReport reports whether a non-empty report.md exists in the job folder or the archive.
+// hasReport reports whether a non-empty report.md exists in the job folder or the archive. A stop
+// report the daemon wrote for an attempt that left none does not count.
 func (m *Manager) hasReport(j *store.Job) bool {
 	for _, p := range []string{filepath.Join(m.JobDir(j.ID), "report.md"), filepath.Join(m.archiveJobDir(j), "report.md")} {
 		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
-			return true
+			return !isStopReport(p)
 		}
 	}
 	return false
@@ -365,11 +366,11 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		return nil, fmt.Errorf("job %s is %s, not finished", j.ID, j.Status)
 	}
 	st := &store.JobStats{
-		ID: j.ID, Kind: j.Kind, Model: j.Model, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
+		ID: j.ID, Kind: j.Kind, Model: j.Model, Effort: j.ReasoningEffort, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
-		RecordedAt: m.Now(),
+		RecordedAt: m.Now(), ReportOffContract: OffContractNote(j.Error) != "", DirBytes: j.DirBytes,
 	}
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)
@@ -547,7 +548,7 @@ func (m *Manager) BackfillStats(all bool) (BackfillReport, error) {
 }
 
 // Stats grouping keys.
-var StatsGroupBy = []string{"kind", "model", "skill", "repo"}
+var StatsGroupBy = []string{"kind", "model", "skill", "effort", "repo"}
 
 // Outcomes job_outcome records: what the orchestrator did with a job's result.
 const (
@@ -618,6 +619,8 @@ type StatsSummary struct {
 	GuardRefusals     int            `json:"guard_refusals"`
 	Subagents         int            `json:"subagents"`
 	WithoutReport     int            `json:"without_report"`
+	// ReportOffContract counts the jobs whose report lacks the Summary or the Not done / uncertain section.
+	ReportOffContract int `json:"report_off_contract"`
 	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
 	// CostEstimatedUSD is the part of CostTotalUSD estimated from token usage at list prices (attempts
@@ -633,7 +636,7 @@ type StatsSummary struct {
 	CostPerUsableResultUSD float64 `json:"cost_per_usable_result_usd"`
 }
 
-// StatsGroup is the summary of one group (a kind, a model or a skill).
+// StatsGroup is the summary of one group (a kind, a model, a skill, an effort or a repo).
 type StatsGroup struct {
 	Key string `json:"key"`
 	StatsSummary
@@ -693,7 +696,7 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("since %q: want <n>d, a duration such as 36h, or a date YYYY-MM-DD", s)
 }
 
-// Stats summarizes the stats rows of jobs finished at or after since, grouped by kind, model or skill.
+// Stats summarizes the stats rows of jobs finished at or after since, grouped by kind, model, skill or effort.
 func (m *Manager) Stats(since time.Time, by string) (StatsReport, error) {
 	return m.StatsContext(context.Background(), since, by)
 }
@@ -711,9 +714,9 @@ func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) 
 	return rep, err
 }
 
-// Summarize aggregates stats rows (pure: no I/O). by is kind, model, skill or repo (default kind); with
-// skill a job counts in every skill it used, and jobs without one under "(none)" (repo: jobs without a
-// repository).
+// Summarize aggregates stats rows (pure: no I/O). by is kind, model, skill, effort or repo (default kind);
+// with skill a job counts in every skill it used, and jobs without one under "(none)" (effort: jobs from
+// before the effort was recorded; repo: jobs without a repository).
 func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 	if by == "" {
 		by = "kind"
@@ -733,6 +736,11 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 			keys = []string{r.Kind}
 		case "model":
 			keys = []string{r.Model}
+		case "effort":
+			keys = []string{r.Effort}
+			if r.Effort == "" {
+				keys = []string{"(none)"} // a job from before the effort was recorded
+			}
 		case "repo":
 			keys = []string{r.Repo}
 			if r.Repo == "" {
@@ -874,6 +882,9 @@ func summarize(rows []*store.JobStats) StatsSummary {
 		s.Subagents += r.Subagents
 		if !r.HasReport {
 			s.WithoutReport++
+		}
+		if r.ReportOffContract {
+			s.ReportOffContract++
 		}
 		durs = append(durs, r.DurationSec)
 	}

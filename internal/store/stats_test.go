@@ -176,3 +176,47 @@ func TestPutStatsKeepsConcurrentOutcome(t *testing.T) {
 		t.Fatalf("orphan row: %+v %v", st, err)
 	}
 }
+
+// A database from before job_stats.effort gains the column filled from the effort recorded on each job;
+// a new row round-trips its effort.
+func TestJobStatsEffortMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1770000000, 0)
+	for _, j := range []*Job{
+		{ID: "high", Runner: RunnerClaude, Model: "opus", ReasoningEffort: "high"},
+		{ID: "old", Runner: RunnerClaude, Model: "opus"},
+	} {
+		j.Agent, j.Title, j.Kind, j.Brief, j.Status, j.CreatedAt = "a", "t", "fix", "b", StatusSucceeded, now
+		if err := s.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutStats(&JobStats{ID: j.ID, Kind: j.Kind, Model: j.Model, Status: j.Status, CreatedAt: now,
+			FinishedAt: &now, RecordedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE job_stats DROP COLUMN effort`); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for id, want := range map[string]string{"high": "high", "old": ""} {
+		if st, err := s.GetStats(id); err != nil || st.Effort != want {
+			t.Errorf("%s: effort %+v %v, want %q", id, st, err, want)
+		}
+	}
+	if err := s.PutStats(&JobStats{ID: "new", Kind: "fix", Model: "opus", Effort: "xhigh", Status: StatusSucceeded,
+		CreatedAt: now, FinishedAt: &now, RecordedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := s.GetStats("new"); st == nil || st.Effort != "xhigh" {
+		t.Fatalf("round trip: %+v", st)
+	}
+}

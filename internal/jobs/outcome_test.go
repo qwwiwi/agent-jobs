@@ -65,6 +65,7 @@ func TestModelPricesValidated(t *testing.T) {
 // and mark as estimated; the job-done line shows it as "est.".
 func TestTimedOutJobEstimatedCost(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := enqueue(t, m, "FAKE_USAGE FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
@@ -102,6 +103,58 @@ func TestTimedOutJobEstimatedCost(t *testing.T) {
 	}
 	if line := m.DoneLineFor(j); !strings.Contains(line, "cost "+EstimatedCostText(want)) {
 		t.Fatalf("done line: %s", line)
+	}
+}
+
+// An auto-continued job is checked for its merge only when its final attempt is notified (the requeued
+// attempt is never notified), and its stats price the timed-out attempt's tokens next to the
+// continuation's reported cost. The job-done line says «auto-continued» before the merge note.
+func TestAutoContinuedJobMergeCheckAndEstimate(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	j := enqueue(t, m, "FAKE_USAGE FAKE_SLEEP=60", func(r *StartRequest) {
+		r.RepoPath, r.Kind, r.TimeoutMinutes = repo, "fix", 10
+	})
+	tick(t, m)
+	waitFor(t, "usage in the stream", 10*time.Second, func() bool {
+		b, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
+		return strings.Contains(string(b), `"m2"`)
+	})
+	later := time.Now().Add(11 * time.Minute)
+	m.Now = func() time.Time { return later }
+	tick(t, m)
+	got := get(t, m, j.ID)
+	if got.Attempt != 2 || finished(got.Status) || got.NotifiedAt != nil || got.MergeNote != "" {
+		t.Fatalf("after the timeout: %s attempt %d notified %v merge note %q %q", got.Status, got.Attempt,
+			got.NotifiedAt, got.MergeNote, got.Error)
+	}
+	waitExit(t, m, j.ID)
+	// The job's work: a commit past the base, so the final notify has something to check.
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if err := os.WriteFile(filepath.Join(work, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, work, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qam", "continued work")
+	tick(t, m)
+	got = get(t, m, j.ID)
+	if got.Status != store.StatusSucceeded || got.NotifiedAt == nil || !strings.HasPrefix(got.MergeNote, "merges cleanly onto main at ") {
+		t.Fatalf("final: %s notified %v merge note %q %q", got.Status, got.NotifiedAt, got.MergeNote, got.Error)
+	}
+	st, err := m.Store.GetStats(j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Attempt 1 (timed out, no reported cost) priced from its tokens; attempt 2 reported its cost.
+	want := (1000*2.0 + 100000*10.0 + 1e6*0.2) / 1e6
+	if st.CostSource != store.CostSourceEstimated || math.Abs(st.CostEstimatedUSD-want) > 1e-4 || st.CostUSD <= 0 ||
+		st.InputTokens != 1000 || st.OutputTokens != 100000 || st.CacheReadTokens != 1e6 {
+		t.Fatalf("stats: %+v (want estimate %v)", st, want)
+	}
+	line := m.DoneLineFor(got)
+	ac, mn := strings.Index(line, "· auto-continued (attempt 2; attempt 1 timed out"), strings.Index(line, "· "+got.MergeNote)
+	if ac < 0 || mn < ac {
+		t.Fatalf("done line order: %s", line)
 	}
 }
 
@@ -191,6 +244,7 @@ func TestSetOutcomeAndStats(t *testing.T) {
 // "$0.00 est.".
 func TestTimedOutJobWithoutUsageStaysUnknown(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := enqueue(t, m, "FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)

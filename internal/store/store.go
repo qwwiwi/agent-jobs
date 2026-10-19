@@ -71,7 +71,8 @@ type Job struct {
 	Complexity string
 	// Runner is the program that runs the job: "claude" (claude -p) or "codex" (codex exec, S3-M1).
 	Runner string
-	// ReasoningEffort is the codex reasoning effort (low|medium|high) of a codex job, empty for claude.
+	// ReasoningEffort is the job's reasoning effort: low|medium|high on codex, low|medium|high|xhigh|max
+	// on claude (passed as --effort); empty for claude rows from before it was recorded.
 	ReasoningEffort string
 	// OwnerWaits marks a job the owner asked for: its delivered job-done line records «owner reply
 	// pending» (owner_pending), which holds the orchestrator's Stop hook until owner_replied.
@@ -122,6 +123,16 @@ type Job struct {
 	// TimedOutAt is when the daemon decided to time the running attempt out (nil before). Set by
 	// ClaimTimeout; once set, the acceptance command can no longer start.
 	TimedOutAt *time.Time
+	// PGIDSpawned marks a PGID the daemon recorded itself when it spawned the wrapper (SetSpawnedPID),
+	// not one adopted from the job-writable wrapper.json (SetPID). Only such a group may be signalled
+	// once its wrapper is gone, and only its members shown to be the job's: the id may have been reused.
+	PGIDSpawned bool
+	// DirBytes is the size of the job directory last measured (when the attempt ended, again after a
+	// prune; the worktree of a repo job left out; symlinks not followed), 0 before. DirTmpBytes is the
+	// part in its temp dir. DirPartial: the bounded walk stopped early, both are lower bounds.
+	DirBytes    int64
+	DirTmpBytes int64
+	DirPartial  bool
 	// Skills are the catalog skills selected for the job at job_start (E7), sorted by name.
 	Skills []string
 	// SkillsDelivered are the skills linked into the job's work dir for the current attempt (removed
@@ -390,6 +401,13 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN acceptance_deadline INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN acceptance_pgid INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN timed_out_at INTEGER`,
+	jobStatsEffortAlter,
+	`ALTER TABLE job_stats ADD COLUMN report_off_contract INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN pgid_spawned INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN dir_tmp_bytes INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN dir_partial INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN outcome_note TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN outcome_at INTEGER`,
@@ -405,6 +423,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN merge_note TEXT NOT NULL DEFAULT ''`,
 }
 
+const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
+
 // migrationBackfills fill a column added by a migration (the key) for the rows that existed before it:
 // they run in the same transaction as the ALTER, so only once, by the process that added the column.
 var migrationBackfills = map[string]string{
@@ -419,6 +439,10 @@ var migrationBackfills = map[string]string{
 	// and died before the rewrite). All are marked; redaction is idempotent, and a job without a
 	// regular report.md is just cleared on the next tick.
 	`ALTER TABLE jobs ADD COLUMN redaction_pending INTEGER NOT NULL DEFAULT 0`: `UPDATE jobs SET redaction_pending=1`,
+	// Existing stats rows take the effort recorded on their job (codex jobs; claude rows from before the
+	// effort was recorded stay empty). A stats row whose job was pruned keeps the default.
+	jobStatsEffortAlter: `UPDATE job_stats SET effort = COALESCE((SELECT j.reasoning_effort FROM jobs j
+		WHERE j.id = job_stats.id), '')`,
 	checksAlertStateAlter: checksAlertStateFill,
 	checksAlertsMoved:     checksAlertsFill,
 }
@@ -527,7 +551,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
-	acceptance_pgid, timed_out_at, outcome, outcome_note, outcome_at, base_branch, merge_note`
+	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
+	base_branch, merge_note`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -590,7 +615,8 @@ func insertArgs(j *Job) []any {
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
-		j.AcceptancePGID, ts(j.TimedOutAt), j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote}
+		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote}
 }
 
 type scanner interface{ Scan(dest ...any) error }
@@ -607,6 +633,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
+		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote)
 	if err != nil {
 		return nil, err
@@ -752,7 +779,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	}
 	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
 	// report of the ended attempt has been redacted (ClearRedactionPending).
-	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, launch_token=?, started_at=?,
+	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
 		attempt=attempt+1, redaction_pending=1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
 }
 
@@ -857,8 +884,9 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
-	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL, merge_note='',
-		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, error='', acceptance_started_at=NULL,
+	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
+		merge_note='', cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
+		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
@@ -900,7 +928,7 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 // Unclaim puts a claimed job that was never spawned back into the queue (the launch that owns it found
 // no cgroup scope right now and retries next tick). The attempt Claim counted is taken back.
 func (s *Store) Unclaim(id, token string) error {
-	return affected(s.db.Exec(`UPDATE jobs SET status='queued', pid=0, pgid=0, launch_token='', started_at=NULL,
+	return affected(s.db.Exec(`UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL,
 		scope_unit='', attempt=MAX(attempt-1, 0) WHERE id=? AND status='running' AND launch_token=?`, id, token))
 }
 
@@ -942,10 +970,29 @@ func (s *Store) ClaimTimeout(id, token string, now time.Time) (bool, error) {
 	return n > 0, err
 }
 
-// SetPID records the wrapper's pid/pgid for the launch that owns the job.
+// SetPID records the wrapper's pid/pgid, adopted from wrapper.json, for the launch that owns the job.
 func (s *Store) SetPID(id, token string, pid, pgid int) error {
-	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=? WHERE id=? AND status='running' AND launch_token=?`,
+	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=?, pgid_spawned=0 WHERE id=? AND status='running' AND launch_token=?`,
 		pid, pgid, id, token))
+}
+
+// SetSpawnedPID records the pid of the wrapper the daemon itself just spawned (in a new session, so
+// its process group is its pid) for the launch that owns the job; the group is marked PGIDSpawned.
+func (s *Store) SetSpawnedPID(id, token string, pid int) error {
+	return affected(s.db.Exec(`UPDATE jobs SET pid=?, pgid=?, pgid_spawned=1 WHERE id=? AND status='running' AND launch_token=?`,
+		pid, pid, id, token))
+}
+
+// ClearPGIDSpawned forgets that a finished job's recorded pgid is the one its wrapper was spawned
+// with: called once that group is gone, after which the id may be reused by an unrelated group.
+func (s *Store) ClearPGIDSpawned(id string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET pgid_spawned=0 WHERE id=? AND status NOT IN ('queued','running')`, id))
+}
+
+// SetDirBytes records the size of the job directory as just measured: total bytes, the part in its
+// temp dir, and whether the bounded walk stopped early (both then lower bounds).
+func (s *Store) SetDirBytes(id string, n, tmp int64, partial bool) error {
+	return affected(s.db.Exec(`UPDATE jobs SET dir_bytes=?, dir_tmp_bytes=?, dir_partial=? WHERE id=?`, n, tmp, partial, id))
 }
 
 // SetScope records the systemd scope unit of the launch that owns the job, before the wrapper is spawned.
