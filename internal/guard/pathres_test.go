@@ -709,6 +709,9 @@ func TestProtectedAncestorArchivers(t *testing.T) {
 		"unzip -qqd../../../.. a.zip",
 		"cpio -idmD../../../.. < a.cpio",
 		"cpio -D../../../.. -idm < a.cpio",
+		// PR #50 control round: unzip negation clusters and a repeated -P
+		"unzip -o --qd../../../.. a.zip",
+		"unzip -o -Pdummy -Pd../../../.. a.zip",
 	} {
 		if Check(c, cfg) == "" {
 			t.Errorf("%q allowed", c)
