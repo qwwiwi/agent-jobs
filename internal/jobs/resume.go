@@ -323,6 +323,15 @@ func onlySkillLinks(work string, names []string) bool {
 // spawn), so every process with the job's marker is such a process; doctor procs also finds the
 // markerless ones left in the session of the job's last wrapper.
 func (m *Manager) checkEscaped(id string) error {
+	// On every platform: the group recorded at the last spawn may outlive a wrapper that died.
+	j, err := m.Store.Get(id)
+	if err != nil {
+		return err
+	}
+	if liveSpawnedGroup(j) {
+		return fmt.Errorf("the process group %d of the job's last attempt is still alive; end it (job_cancel, or kill the group) "+
+			"before resuming", j.PGID)
+	}
 	if runtime.GOOS != "linux" || !procExists(os.Getpid()) {
 		return nil // no process scan (needs Linux /proc); the sweep cannot run there either
 	}

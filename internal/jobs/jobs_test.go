@@ -1603,7 +1603,7 @@ func TestKillRefusesImplausibleGroup(t *testing.T) {
 		t.Fatalf("signalled process groups %v", kills)
 	}
 	// The real group is signalled.
-	m.killGroup("real", pid, pid)
+	m.killGroup("real", pid, pid, false)
 	if len(kills) == 0 || kills[0] != -pid {
 		t.Fatalf("real group not signalled: %v", kills)
 	}

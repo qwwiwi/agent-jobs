@@ -183,6 +183,10 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Skipped = "job folder is not a real directory (" + fi.Mode().Type().String() + "), not touched"
 		return pj
 	}
+	if liveSpawnedGroup(j) {
+		pj.Skipped = fmt.Sprintf("process group %d of the job is still alive, not touched", j.PGID)
+		return pj
+	}
 	if j.RepoPath != "" && j.CleanedAt == nil {
 		pj.Skipped = "worktree cleanup has not run yet (patches not saved), not touched"
 		return pj
