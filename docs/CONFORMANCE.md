@@ -28,7 +28,7 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | Defaults / ceilings 80/200 turns, $10/$50, 45/180 min | 1:1 | `internal/jobs/config.go:24-29` |
 | «A request above a ceiling is rejected, not silently cut down» | 1:1 | `internal/jobs/manager.go:151` (`limits rejected (not clamped)`) |
 | «concurrent per agent 2» (no ceiling) | 1:1 (a constant, not configurable) | `internal/jobs/config.go:30` |
-| Job-done line `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m` | deviation #7 (tag `[jobs:…]`); extra suffixes: containment #14, survivors #9, `resumed (attempt N)` #15, `owner waits` (reference line 90), acceptance note (deviation, Finding U3 → #18) | `internal/jobs/finish.go:72-98` |
+| Job-done line `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m` | deviation #7 (tag `[jobs:…]`); extra suffixes: `model <m> · effort <e>` (issue #40), containment #14, `WARNING: review job changed the worktree` (issue #39), survivors #9, `resumed (attempt N)` #15, `owner waits` (reference line 90), acceptance note (deviation, Finding U3 → #18) | `internal/jobs/finish.go:72-98` |
 | «The report itself is not poured into the session; … `job_result`» | 1:1 | `internal/mcp/tools_jobs.go:256` |
 | Model choice | deviation #6 (kind × complexity) | `internal/jobs/config.go:398-405, 444` |
 

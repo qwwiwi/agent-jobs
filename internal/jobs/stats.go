@@ -309,7 +309,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		return nil, fmt.Errorf("job %s is %s, not finished", j.ID, j.Status)
 	}
 	st := &store.JobStats{
-		ID: j.ID, Kind: j.Kind, Model: j.Model, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
+		ID: j.ID, Kind: j.Kind, Model: j.Model, Effort: j.ReasoningEffort, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
@@ -441,7 +441,7 @@ func (m *Manager) BackfillStats(all bool) (BackfillReport, error) {
 }
 
 // Stats grouping keys.
-var StatsGroupBy = []string{"kind", "model", "skill"}
+var StatsGroupBy = []string{"kind", "model", "skill", "effort"}
 
 // StatsSummary aggregates a set of finished jobs. Percentiles are nearest-rank.
 type StatsSummary struct {
@@ -463,7 +463,7 @@ type StatsSummary struct {
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
 }
 
-// StatsGroup is the summary of one group (a kind, a model or a skill).
+// StatsGroup is the summary of one group (a kind, a model, a skill or an effort).
 type StatsGroup struct {
 	Key string `json:"key"`
 	StatsSummary
@@ -523,7 +523,7 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("since %q: want <n>d, a duration such as 36h, or a date YYYY-MM-DD", s)
 }
 
-// Stats summarizes the stats rows of jobs finished at or after since, grouped by kind, model or skill.
+// Stats summarizes the stats rows of jobs finished at or after since, grouped by kind, model, skill or effort.
 func (m *Manager) Stats(since time.Time, by string) (StatsReport, error) {
 	return m.StatsContext(context.Background(), since, by)
 }
@@ -541,7 +541,7 @@ func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) 
 	return rep, err
 }
 
-// Summarize aggregates stats rows (pure: no I/O). by is kind, model or skill (default kind); with
+// Summarize aggregates stats rows (pure: no I/O). by is kind, model, skill or effort (default kind); with
 // skill a job counts in every skill it used, and jobs without one under "(none)".
 func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 	if by == "" {
@@ -562,6 +562,11 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 			keys = []string{r.Kind}
 		case "model":
 			keys = []string{r.Model}
+		case "effort":
+			keys = []string{r.Effort}
+			if r.Effort == "" {
+				keys = []string{"(none)"} // a job from before the effort was recorded
+			}
 		case "skill":
 			for s := range r.Skills {
 				keys = append(keys, s)
