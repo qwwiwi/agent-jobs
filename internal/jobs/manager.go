@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -673,7 +676,7 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) {
 		}
 		return
 	}
-	m.killGroup(j.ID, pid, pgid)
+	m.killGroup(j, pid, pgid)
 }
 
 // killAcceptance ends the acceptance command's process group recorded in the job row (read now: it is
@@ -860,13 +863,78 @@ func (m *Manager) retryScopeStops() error {
 }
 
 // killGroup sends SIGTERM to the wrapper's process group, waits up to KillGrace, then SIGKILL.
-// It refuses (and logs) unless pgid is plausible and is the live wrapper pid's group.
-func (m *Manager) killGroup(id string, pid, pgid int) {
+// It refuses (and logs) unless pgid is plausible, is the live wrapper pid's group and that pid is
+// shown to be this job's wrapper (jobWrapper), since a live pid alone proves nothing: the wrapper may
+// have died and its pid and group id been reused by an unrelated group. On Linux the leader is pinned
+// by a pidfd while it is checked, and the group is signalled only while that same leader is alive (a
+// group id cannot be reused while its leader lives). Without /proc (macOS) the identity cannot be read
+// and only the group check applies, as before.
+func (m *Manager) killGroup(j *store.Job, pid, pgid int) {
 	if err := verifyGroup(pid, pgid); err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: %v", id, pgid, err)
+		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
+		return
+	}
+	if !procAvailable() {
+		m.signalGroup(pgid)
+		return
+	}
+	fd, err := pidfdOpen(pid)
+	if err != nil {
+		m.Log.Printf("job %s: refusing to kill process group %d: pidfd_open %d: %v", j.ID, pgid, pid, err)
+		return
+	}
+	defer unix.Close(fd)
+	// Checked only now: the descriptor pins one process, so these reads are of that process (or, if it
+	// died meanwhile, of a stranger, and then the liveness check below fails).
+	if err := verifyGroup(pid, pgid); err != nil {
+		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
+		return
+	}
+	if !jobWrapper(j, m.JobDir(j.ID))(pid) {
+		m.Log.Printf("job %s: refusing to kill process group %d: pid %d is not proven to be the job's wrapper (a recycled pid?)", j.ID, pgid, pid)
+		return
+	}
+	if err := pidfdSend(fd, 0); err != nil {
+		m.Log.Printf("job %s: refusing to kill process group %d: wrapper pid %d: %v", j.ID, pgid, pid, err)
 		return
 	}
 	m.signalGroup(pgid)
+}
+
+// procAvailable reports whether process identities can be read from /proc (Linux).
+func procAvailable() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(procRoot, "self", "stat"))
+	return err == nil
+}
+
+// jobWrapper reports whether pid is the wrapper of job j: a live (non-zombie) process whose argv is
+// `run-wrapper <jobDir> --token <the job's launch token>` and, for a job run in a scope, which lives in
+// that scope's cgroup.
+func jobWrapper(j *store.Job, jobDir string) func(int) bool {
+	return func(pid int) bool {
+		if j.LaunchToken == "" {
+			return false
+		}
+		if p, err := procStatFull(pid); err != nil || p.state == "Z" {
+			return false
+		}
+		argv, err := procCmdline(pid)
+		if err != nil || !IsWrapperCmdline(argv) {
+			return false
+		}
+		i := slices.Index(argv, "run-wrapper")
+		if i < 0 || len(argv) < i+4 || argv[i+1] != jobDir || argv[i+3] != j.LaunchToken {
+			return false
+		}
+		if j.ScopeUnit == "" {
+			return true
+		}
+		b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
+		return err == nil && jobScopeIn(string(b)) == j.ScopeUnit
+	}
 }
 
 // endOrphanedGroup ends what is left of a job whose wrapper died without writing exit_code: its
