@@ -20,6 +20,7 @@ Two questions: does a job burn the subscription limits more or less economically
 - **Limits:** on these tasks a job is **not** more economical. It spent about 30% more limit-weighted tokens than a subagent for the same accepted result. Two causes, both structural: the job is a full top-level Claude Code session (system prompt, full tool set, preamble and kind checklist; its worker side cost $2.58 against $1.71 and $1.45), and its parent spends two turns and about twice as many model calls (8.5 against 4.0 and 4.7 per run: start, then `job_result`, the diff check and the cherry-pick from the job's worktree).
 - **Speed:** a job is two to three times slower on short tasks: the daemon ticks once a minute, so a job waits up to a minute to start and its job-done line waits for the next tick (the harness waits 65 s, the worst case).
 - **Parent freed:** yes against a foreground subagent (0.73 against 1.65 min busy per task), but a background subagent frees the parent at least as well (0.47 min).
+- **Carry cost (addendum below):** in the coordinator's real main session a subagent's result is re-read until the next compaction – median 2.6k tokens × 139 later calls ≈ $0.10 per hand-off, ≈ $8 a day. It does not flip the result: the job's extra parent calls at the real 288k context cost more ($0.18), and per hand-off the job stays ≈ $0.34 (+38%) more expensive; a job wins in 2.6% of the real hand-offs.
 - **Main-session context:** a parent with the context of a real long-lived session (230–480k tokens per call measured below) pays that context on every extra call; at 300k tokens the job's 4–4.5 extra parent calls add about 1.2M cache-read tokens (≈ $0.25) per task, so the gap grows in real use rather than shrinking.
 
 ## Method
@@ -138,6 +139,71 @@ These are different tasks: the coding agent cuts its work into many small jobs (
 | Cache-read tokens a day | ≈ 650M | ≈ 1.0B |
 
 The agent did roughly ten times as many delegated tasks a day with jobs, at about twice the daily usage. The main session's own usage grew 3.4× because it orchestrates ten times as many hand-offs; its context per call fell (also affected by an earlier auto-compact window change). The host keeps only the current rate-limit snapshot, not a history, so limit burn per day before and after cannot be compared directly.
+
+## Addendum: carry cost of a hand-off in a real main session
+
+**Question.** The controlled benchmark prices a hand-off up to the parent's answer. In a long-lived main session a subagent's result does not leave: the `Agent` tool result (and, for a background subagent, its `<task-notification>`) stays in the context and is re-read from cache on every later main-session call until the next compaction. A job hands back about one line. Does this carry cost flip the result?
+
+**Data.** The coordinator's main session on macOS (Opus 5 / 5.5, the `jarvis-channel/plugin` project folder), every hand-off from 2026-10-12 00:00 to 2026-10-19 ≈ 19:00 UTC: 7 session files, **497 hand-offs** (468 background, 29 foreground), 8,962 main-session API calls, 35 compactions, 2.75B cache-read tokens in the main session. Script: `scripts/bench/carry_cost.py` (usage fields, tool ids and text lengths only; prints aggregates).
+
+**Method.**
+
+- **Result tokens** = characters of everything the hand-off put into the parent context (the `Agent` tool result, plus the task notification with its `<result>` and usage block) ÷ chars per token. Chars per token is measured, not assumed: on 1,328 turns opened by a task notification, the context growth between the last call before and the first call after is linear in the notification length (least squares: **2.25 chars per token**, intercept 504 tokens = the fixed hook context, median residual 93 tokens). Russian text, XML tags and paths tokenise far denser than the 3.5 a rough estimate would use; the earlier "≈ 1.6k tokens / ≈ 250k per subagent" row above used chars ÷ 4 and is low by about 1.7×.
+- **Later calls** = main-chain API calls (unique message ids, `<synthetic>` excluded) after the result entered the context, up to the next `compact_boundary` or the end of the file.
+- **Carry ($)** = result tokens × later calls at the cache-read price ($0.20 / MTok, Opus 5.5 list, same table as above), plus one cache write ($8 / MTok, 1 h) when the result enters; a later call whose cache read is below 90% of the context at the hand-off is a cache miss and is priced at the write price for the result (183 such calls in total).
+- **Job alternative**: carry of a 30-token line, priced the same way, **plus the extra parent calls**: the benchmark's job parent made 8.5 calls against 4.0 / 4.7, so +4 calls per hand-off at the real context size (mean of the first five later calls). The benchmark already priced those 4 calls at its own ≈ 68k context per call, so only the excess is added: 4 × (real context − 68k) × $0.20 / MTok.
+- **Per hand-off total** = the benchmark's mean cost for the mode (foreground $0.85, background $0.81, job $1.08, all six runs) + the main-session terms above.
+
+**Results.**
+
+| Per hand-off | Median | p90 |
+|---|---|---|
+| Result tokens in the parent context | 2.6k | 4.2k |
+| Later main-session calls until compaction | 139 | 373 |
+| Carry tokens (result × later calls) | 373k | 1.02M |
+| Parent context per call at the hand-off | 288k | 609k |
+| Subagent carry | $0.10 | $0.27 |
+| Job: extra parent calls at the real context | $0.18 | $0.43 |
+| Job: carry of the one-line result | $0.001 | $0.003 |
+| **Subagent total** (benchmark + carry) | **$0.91** | $1.07 |
+| **Job total** (benchmark + carry + extra calls) | **$1.26** | $1.52 |
+
+| Day (UTC) | Hand-offs | Carry tokens | Subagent carry ($) | Job extra parent calls ($) | Job 1-line carry ($) | Subagent total ($) | Job total ($) | Job − subagent ($) |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-12 | 57 | 43.8M | 13.03 | 20.45 | 0.12 | 59.24 | 82.39 | +23.14 |
+| 2026-10-13 | 1 | 0.05M | 0.02 | 0.41 | 0.00 | 0.83 | 1.50 | +0.67 |
+| 2026-10-14 | 124 | 92.5M | 22.65 | 33.13 | 0.23 | 123.11 | 167.84 | +44.72 |
+| 2026-10-15 | 59 | 36.7M | 8.46 | 16.21 | 0.11 | 56.07 | 80.31 | +24.23 |
+| 2026-10-16 | 115 | 35.6M | 9.90 | 14.58 | 0.10 | 102.75 | 139.40 | +36.65 |
+| 2026-10-17 | 64 | 17.2M | 5.07 | 8.93 | 0.05 | 56.76 | 78.39 | +21.62 |
+| 2026-10-18 | 47 | 14.2M | 4.25 | 5.89 | 0.04 | 42.66 | 56.90 | +14.23 |
+| 2026-10-19 (partial) | 30 | 7.6M | 2.11 | 3.94 | 0.02 | 26.41 | 36.50 | +10.08 |
+| **8 days** | **497** | **248M** | **65.51** | **103.53** | **0.68** | **467.85** | **643.21** | **+175.36** |
+
+- **The carry is real but does not flip the result.** Subagent results re-read in the main session cost 248M cache-read tokens in 8 days – 9% of the main session's 2.75B cache reads, $65.5 ≈ $8 a day, 14% of the subagent total. But a job pays more in the same main session: its ≈ 4 extra parent calls each re-read the whole 288k-token context, $0.18 per hand-off against a $0.10 carry. Per hand-off the job is **$0.34 more expensive (median; +38%)**, **≈ $22 a day more** (+$175 over 8 days, $468 → $643).
+- **Break-even.** A job is cheaper only when result tokens × later calls > (job − subagent benchmark gap) ÷ cache-read price + 4 × (context − 68k): for a background subagent **1.39M + 4 × (context − 68k) tokens**, for a foreground one 1.17M + 4 × (context − 68k). At the median 288k context that is **≈ 2.3M carry tokens** – for example a 10k-token result re-read 230 times. The carry is linear in the result size and the job's extra calls are linear in the context size, so the larger the context, the further away the break-even.
+- **Share above it: 13 of 497 hand-offs (2.6%)**, all with long results (2.9k–16k tokens) re-read 110–590 times at a context of 130–320k, below the p90.
+- **Compaction resets the carry.** 454 hand-offs (91%) had their carry cut by a later compaction (median 139 later calls; $60.3 of the $65.5); 43 had no compaction after them (the session ended or is still running, median 148 later calls so far, $5.2) – their carry is a lower bound. 35 compactions in 8 days; most hand-offs happen after the session's first compaction. The 400k auto-compact window (set on 2026-10-15) is what bounds the carry: halving the window would roughly halve it.
+
+**Sensitivity.**
+
+- **Honest job follow-up content.** A job's parent does not read only one line: in the benchmark the job-done line itself is ≈ 185 tokens and the follow-up (`job_result`, the diff check, the cherry-pick output) adds 2.9k–5.7k tokens, which then carries exactly like a subagent result. With the benchmark's median 4.8k tokens as the job's carry, the job is $1.37 per hand-off (+$0.51) and cheaper in 2 of 497 hand-offs (0.4%). The subagent side here counts only the result, not the parent's own verification output, so this variant is biased against jobs; the truth is between the two.
+- **Lean job** (no extra parent calls at all – the parent trusts the one-line result and never reads `job_result` or the diff): $1.09 per hand-off, still +$0.17 at the median, cheaper in 8.5% of hand-offs. The job's structural overhead (a full top-level session on the worker side, $2.58 against $1.45–1.71 in the benchmark) remains.
+
+**Caveats.**
+
+- The benchmark costs are means of three small tasks; real hand-offs are larger, and the worker-side gap between a job and a subagent on larger tasks is not measured.
+- A larger context in the main session also makes compaction come sooner; this second-order effect (each hand-off brings the next compaction a little closer) is not modelled.
+- One agent, one main session family, 8 days; Opus 5 and Opus 5.5 calls are both priced at the Opus 5.5 list price.
+- The +4 extra parent calls come from the benchmark's job flow (job-done turn, `job_result`, diff, cherry-pick); a parent that skips the follow-up has fewer.
+- Cache-miss detection is a heuristic (cache read below 90% of the context at the hand-off).
+
+Reproduce (read-only, prints aggregates only):
+
+```bash
+python3 -I scripts/bench/carry_cost.py --projects ~/.claude/projects --project-filter=<main-session-folder> \
+  --since 2026-10-12 --bench-results scripts/bench/results-20261019.jsonl
+```
 
 ## Caveats
 
