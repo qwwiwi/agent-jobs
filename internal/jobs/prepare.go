@@ -126,6 +126,15 @@ var denyRules = []string{
 // webTools are closed for every kind except research.
 var webTools = []string{"WebFetch", "WebSearch"}
 
+// reviewWriteRules make a claude review job read-only by rule, as the codex sandbox makes a codex one:
+// no edit tools, no git writes to the worktree's history or index, no rm/mv. Reads, search and test
+// runners stay allowed. Prefix rules do not catch every shell write (sed -i, redirections).
+var reviewWriteRules = []string{
+	"Edit", "Write", "MultiEdit", "NotebookEdit",
+	"Bash(git commit:*)", "Bash(git merge:*)", "Bash(git rebase:*)", "Bash(git reset:*)",
+	"Bash(git checkout -b:*)", "Bash(git stash:*)", "Bash(rm:*)", "Bash(mv:*)",
+}
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
@@ -195,6 +204,9 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 	deny := append(append([]string{}, denyRules...), extraDeny...)
 	if kind != "research" {
 		deny = append(deny, webTools...)
+	}
+	if kind == "review" {
+		deny = append(deny, reviewWriteRules...)
 	}
 	return map[string]any{
 		// Settings given with --settings outrank project settings: a .claude/settings.json in the work dir
