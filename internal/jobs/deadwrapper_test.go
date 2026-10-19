@@ -347,3 +347,34 @@ func TestCancelEndsGenuineWrapperGroup(t *testing.T) {
 		t.Fatalf("status %s, want cancelled", got.Status)
 	}
 }
+
+// Merge of #52 with auto-continue (#38): a timed-out attempt whose wrapper died and whose spawned group
+// survived every signal is not continued automatically (the resume check refuses a live group), and
+// the job says why; nothing is requeued while the group lives.
+func TestAutoContinueRefusedWhileSpawnedGroupAlive(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	realKill, realSend := killFn, pidfdSend
+	killFn = func(int, syscall.Signal) error { return nil }
+	pidfdSend = func(int, syscall.Signal) error { return nil }
+	t.Cleanup(func() { killFn, pidfdSend = realKill, realSend })
+	m.KillGrace = 200 * time.Millisecond
+
+	j := enqueue(t, m, "FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 10 })
+	g := startAndKillWrapper(t, m, j.ID)
+	later := time.Now().Add(11 * time.Minute)
+	m.Now = func() time.Time { return later }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusTimeout || got.Attempt != 1 {
+		t.Fatalf("after the timeout: %s attempt %d %q", got.Status, got.Attempt, got.Error)
+	}
+	if !strings.Contains(got.Error, "not auto-continued") || !strings.Contains(got.Error, "still alive") {
+		t.Fatalf("error %q does not say the live group blocked the continuation", got.Error)
+	}
+	if !groupAlive(g) || !got.PGIDSpawned {
+		t.Fatalf("group alive %v, mark %v: the live group must stay recorded", groupAlive(g), got.PGIDSpawned)
+	}
+}
