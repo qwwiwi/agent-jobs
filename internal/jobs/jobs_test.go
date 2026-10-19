@@ -1614,10 +1614,10 @@ func TestKillRefusesImplausibleGroup(t *testing.T) {
 	if len(kills) != 0 {
 		t.Fatalf("signalled process groups %v", kills)
 	}
-	// The real group is signalled.
-	m.killGroup("real", pid, pid)
-	if len(kills) == 0 || kills[0] != -pid {
-		t.Fatalf("real group not signalled: %v", kills)
+	// A plausible live group whose leader is not the job's wrapper is not signalled either (#52).
+	m.killGroup(jt, pid, pid)
+	if len(kills) != 0 {
+		t.Fatalf("a group led by a process that is not the job's wrapper was signalled: %v", kills)
 	}
 }
 

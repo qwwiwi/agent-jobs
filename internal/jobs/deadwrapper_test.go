@@ -265,3 +265,85 @@ func TestJobGroupMemberNeedsMarkerAndScope(t *testing.T) {
 		t.Error("a session-only job's marked member refused")
 	}
 }
+
+// #52 review: a recorded wrapper pid that is alive proves nothing either: the wrapper may have died and
+// its pid and group id been reused by an unrelated group whose leader is alive. Neither a cancel nor a
+// timeout signals that group, whether it was recorded at the spawn or adopted from wrapper.json.
+func TestLiveRecycledWrapperGroupNeverSignalled(t *testing.T) {
+	var kills []int
+	realKill := killFn
+	killFn = func(pid int, _ syscall.Signal) error { kills = append(kills, pid); return nil }
+	t.Cleanup(func() { killFn = realKill })
+
+	other := exec.Command("sleep", "30")
+	other.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	other.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, JobEnvVar+"=") })
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	g := other.Process.Pid
+
+	m := newManager(t)
+	m.KillGrace = 200 * time.Millisecond
+	for _, tc := range []struct {
+		spawned, timeout bool
+	}{{true, false}, {true, true}, {false, false}, {false, true}} {
+		j := enqueue(t, m, "x", nil)
+		tok := fmt.Sprintf("tok-%v-%v", tc.spawned, tc.timeout)
+		if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
+			t.Fatal(err)
+		}
+		set := func() error { return m.Store.SetPID(j.ID, tok, g, g) }
+		if tc.spawned {
+			set = func() error { return m.Store.SetSpawnedPID(j.ID, tok, g) }
+		}
+		if err := set(); err != nil {
+			t.Fatal(err)
+		}
+		if tc.timeout {
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(time.Duration(DefaultTimeoutMinutes+1) * time.Minute) }
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			m.Now = time.Now
+		} else if err := m.Cancel(j.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := get(t, m, j.ID); got.Status == store.StatusRunning {
+			t.Fatalf("%+v: still running", tc)
+		}
+		if slices.Contains(kills, -g) || slices.Contains(kills, g) {
+			t.Fatalf("%+v: unrelated group %d with a live leader signalled: %v", tc, g, kills)
+		}
+	}
+	if !alive(g) {
+		t.Fatal("unrelated leader gone")
+	}
+}
+
+// #52 review: the identity check keeps ending a genuine job: its live wrapper is shown to be the job's
+// and its whole group is signalled on cancel.
+func TestCancelEndsGenuineWrapperGroup(t *testing.T) {
+	m := newManager(t)
+	j := enqueue(t, m, "FAKE_SLEEP=60", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "fake claude", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
+		return err == nil
+	})
+	j = get(t, m, j.ID)
+	if !jobWrapper(j, m.JobDir(j.ID))(j.PID) {
+		t.Fatalf("the job's own wrapper pid %d is not recognised", j.PID)
+	}
+	if err := m.Cancel(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "group gone", 5*time.Second, func() bool { return !groupAlive(j.PGID) })
+	if got := get(t, m, j.ID); got.Status != store.StatusCancelled {
+		t.Fatalf("status %s, want cancelled", got.Status)
+	}
+}
