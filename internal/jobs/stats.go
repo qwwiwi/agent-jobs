@@ -40,6 +40,9 @@ type StreamStats struct {
 	// Tokens sums the usage of the assistant messages (each message id once, its largest usage) of a
 	// claude stream, or of the turn.completed events of a codex stream.
 	Tokens TokenUsage
+	// TokensInvalid: some usage cannot be real (a negative count, codex cached input above the input,
+	// a sum past int64); Tokens is then not priced and not counted.
+	TokensInvalid bool
 }
 
 // statsUsage is the usage of a claude assistant message or of a codex turn.completed event.
@@ -171,20 +174,31 @@ func ParseStreamStats(r io.Reader) (StreamStats, error) {
 		}
 		if ev.Type == "turn.completed" && ev.Usage != nil {
 			u := ev.Usage
-			anon = anon.Add(TokenUsage{Input: max(u.InputTokens-u.CachedInputTokens, 0), Output: u.OutputTokens,
+			if u.CachedInputTokens < 0 || u.CachedInputTokens > u.InputTokens {
+				st.TokensInvalid = true
+				return
+			}
+			var ok bool
+			anon, ok = anon.Add(TokenUsage{Input: u.InputTokens - u.CachedInputTokens, Output: u.OutputTokens,
 				CacheRead: u.CachedInputTokens})
+			st.TokensInvalid = st.TokensInvalid || !ok
 			return
 		}
 		if ev.Type == "assistant" && ev.Message != nil && ev.Message.Usage != nil {
 			u := ev.Message.Usage
 			t := TokenUsage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens,
 				CacheWrite: u.CacheCreationInputTokens}
-			if id := ev.Message.ID; id != "" {
+			switch id := ev.Message.ID; {
+			case !t.Valid():
+				st.TokensInvalid = true
+			case id != "":
 				o := byID[id]
 				byID[id] = TokenUsage{max(o.Input, t.Input), max(o.Output, t.Output), max(o.CacheRead, t.CacheRead),
 					max(o.CacheWrite, t.CacheWrite)}
-			} else {
-				anon = anon.Add(t)
+			default:
+				var ok bool
+				anon, ok = anon.Add(t)
+				st.TokensInvalid = st.TokensInvalid || !ok
 			}
 		}
 		if ev.Message == nil || (ev.Type != "assistant" && ev.Type != "user") {
@@ -242,7 +256,9 @@ func ParseStreamStats(r io.Reader) (StreamStats, error) {
 	})
 	st.Tokens = anon
 	for _, t := range byID {
-		st.Tokens = st.Tokens.Add(t)
+		var ok bool
+		st.Tokens, ok = st.Tokens.Add(t)
+		st.TokensInvalid = st.TokensInvalid || !ok
 	}
 	return st, err
 }
@@ -404,10 +420,12 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		}
 		st.GuardRefusals += ss.GuardRefusals
 		st.Subagents += ss.Subagents
-		st.InputTokens += ss.Tokens.Input
-		st.OutputTokens += ss.Tokens.Output
-		st.CacheReadTokens += ss.Tokens.CacheRead
-		st.CacheWriteTokens += ss.Tokens.CacheWrite
+		if !ss.TokensInvalid {
+			// The totals saturate rather than wrap; each attempt is priced from its own stream.
+			t, _ := TokenUsage{st.InputTokens, st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens}.Add(ss.Tokens)
+			st.InputTokens, st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens = t.Input, t.Output, t.CacheRead,
+				t.CacheWrite
+		}
 		if attempt == "" {
 			st.ResultSubtype = ss.ResultSubtype
 		}
@@ -446,8 +464,9 @@ func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store
 	price := func(model string, ss *StreamStats) {
 		unknown++
 		// No stream, or no usage in it (killed before its first message, a codex turn that never
-		// completed): nothing to price, the cost stays unknown rather than a "$0.00 est.".
-		if ss == nil || ss.Tokens == (TokenUsage{}) {
+		// completed), or usage that cannot be real: nothing to price, the cost stays unknown rather
+		// than a "$0.00 est." or a figure from bad counts.
+		if ss == nil || ss.TokensInvalid || ss.Tokens == (TokenUsage{}) {
 			return
 		}
 		if p, ok := m.Cfg.PriceFor(model); ok {
