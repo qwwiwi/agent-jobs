@@ -93,11 +93,11 @@ func TestEffortByKindConfig(t *testing.T) {
 func TestDoneLineShowsEffort(t *testing.T) {
 	j := &store.Job{ID: "id", Title: "t", Status: store.StatusSucceeded, Model: "opus", ReasoningEffort: "high",
 		ScopeUnit: "u", StartedAt: &time.Time{}}
-	if l := DoneLine(j); !strings.Contains(l, "· model opus · effort high") {
+	if l := DoneLine(j, 0); !strings.Contains(l, "· model opus · effort high") {
 		t.Fatalf("done line: %s", l)
 	}
 	j.ReasoningEffort = ""
-	if l := DoneLine(j); strings.Contains(l, "effort") {
+	if l := DoneLine(j, 0); strings.Contains(l, "effort") {
 		t.Fatalf("done line without effort: %s", l)
 	}
 }

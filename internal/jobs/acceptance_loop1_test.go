@@ -270,7 +270,7 @@ func TestAcceptanceOptIn(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "acc-ran")); err == nil {
 		t.Fatal("acceptance ran with acceptance_allowed off")
 	}
-	if line := DoneLine(j); !strings.Contains(line, "· acceptance did not run") {
+	if line := DoneLine(j, 0); !strings.Contains(line, "· acceptance did not run") {
 		t.Fatalf("done line: %s", line)
 	}
 }
@@ -288,7 +288,7 @@ func TestAcceptanceNoteWithoutResult(t *testing.T) {
 		if n := acceptanceNote(j); n != want {
 			t.Fatalf("%q: note %q, want %q", errText, n, want)
 		}
-		if line := DoneLine(j); !strings.Contains(line, "· "+want) {
+		if line := DoneLine(j, 0); !strings.Contains(line, "· "+want) {
 			t.Fatalf("done line: %s", line)
 		}
 	}

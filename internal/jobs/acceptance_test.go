@@ -75,7 +75,7 @@ func TestAcceptancePass(t *testing.T) {
 		j.AcceptancePGID != 0 {
 		t.Fatalf("recorded deadline %v (start %v), pgid %d", j.AcceptanceDeadline, j.AcceptanceStartedAt, j.AcceptancePGID)
 	}
-	if line := DoneLine(j); strings.Contains(line, "acceptance") || !strings.Contains(line, " succeeded ") {
+	if line := DoneLine(j, 0); strings.Contains(line, "acceptance") || !strings.Contains(line, " succeeded ") {
 		t.Fatalf("done line: %s", line)
 	}
 }
@@ -91,7 +91,7 @@ func TestAcceptanceFail(t *testing.T) {
 	if j.AcceptanceExit == nil || *j.AcceptanceExit != 3 {
 		t.Fatalf("acceptance exit: %+v", j.AcceptanceExit)
 	}
-	if line := DoneLine(j); !strings.Contains(line, " failed ") || !strings.Contains(line, "acceptance failed (exit 3)") {
+	if line := DoneLine(j, 0); !strings.Contains(line, " failed ") || !strings.Contains(line, "acceptance failed (exit 3)") {
 		t.Fatalf("done line: %s", line)
 	}
 	if log := readFile(t, filepath.Join(m.JobDir(j.ID), AcceptanceLog)); !strings.Contains(log, "ACC_BAD") {

@@ -313,7 +313,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
-		RecordedAt: m.Now(), ReportOffContract: OffContractNote(j.Error) != "",
+		RecordedAt: m.Now(), ReportOffContract: OffContractNote(j.Error) != "", DirBytes: j.DirBytes,
 	}
 	if j.RepoPath != "" {
 		st.Repo = filepath.Base(j.RepoPath)

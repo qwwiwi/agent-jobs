@@ -66,7 +66,7 @@ func TestReviewChangedWorktreeWarning(t *testing.T) {
 			if got := strings.Contains(j.Error, ReviewChangedWarning); got != c.warn { // job_result's error
 				t.Fatalf("warning in the error = %v, want %v: %q", got, c.warn, j.Error)
 			}
-			line := DoneLine(j)
+			line := DoneLine(j, 0)
 			if got := strings.Contains(line, ReviewChangedWarning); got != c.warn {
 				t.Fatalf("warning on the done line = %v, want %v: %s", got, c.warn, line)
 			}

@@ -67,10 +67,12 @@ func LimitsText(j *store.Job) string {
 
 // DoneLine is the one line delivered to the agent's live session.
 // The model and the reasoning effort follow the duration (rows from before the effort was recorded
-// show neither). A job failed because processes survived it says so at the end of the line; a resumed attempt
+// show neither). A job failed because processes survived it says so at the end of the line; a job
+// whose folder is at least dirNote bytes (Config.JobDirNoteBytes; 0 = never), or too big to measure
+// within the walk's bounds, says how big it is; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // An owner-waits job ends the line with OwnerWaitsMarker.
-func DoneLine(j *store.Job) string {
+func DoneLine(j *store.Job, dirNote int64) string {
 	cost := CostText(j.CostUSD, j.CostIsUnknown())
 	if j.CostIsUnknown() {
 		cost = "cost " + cost
@@ -92,6 +94,12 @@ func DoneLine(j *store.Job) string {
 	if n := acceptanceNote(j); n != "" {
 		line += " · " + n
 	}
+	switch {
+	case dirNote > 0 && j.DirPartial:
+		line += " · job dir at least " + SizeText(j.DirBytes) + " (not fully measured)"
+	case dirNote > 0 && j.DirBytes >= dirNote:
+		line += " · job dir " + SizeText(j.DirBytes)
+	}
 	if n := OffContractNote(j.Error); n != "" {
 		line += " · " + n
 	}
@@ -112,6 +120,20 @@ func DoneLine(j *store.Job) string {
 		line += " · " + OwnerWaitsMarker
 	}
 	return RedactText(line) // the title and the error come from the brief and the job
+}
+
+// SizeText is a byte count for people, in binary units ("512 B", "1.5 MB", "2.0 GB").
+func SizeText(n int64) string {
+	const unit = 1 << 10
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	v, i := float64(n)/unit, 0
+	for v >= unit && i < 3 {
+		v /= unit
+		i++
+	}
+	return fmt.Sprintf("%.1f %cB", v, "KMGT"[i])
 }
 
 // ReviewChangedWarning marks a review job whose worktree differed from its base when it ended: the
@@ -195,7 +217,7 @@ func (m *Manager) notifyPending() error {
 	t := m.Cfg.NotifyTmuxTarget
 	if t == "" {
 		for _, j := range jobs {
-			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j))
+			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", DoneLine(j, m.Cfg.JobDirNoteBytes()))
 			if j.OwnerWaits {
 				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
 					return err
@@ -215,7 +237,7 @@ func (m *Manager) notifyPending() error {
 				return err
 			}
 		}
-		if err := m.sendTmuxLocked(t, DoneLine(j)); err != nil {
+		if err := m.sendTmuxLocked(t, DoneLine(j, m.Cfg.JobDirNoteBytes())); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {
 				// A stalled tmux (or lock holder) would cost every other line the same wait: the
@@ -394,6 +416,9 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	work := filepath.Join(dir, "work")
 	if j.RepoPath == "" {
 		return nil // empty work dir, nothing to preserve; prune comes later
+	}
+	if m.spawnedGroupAlive(j) {
+		return fmt.Errorf("refusing to touch %s: process group %d of the job is still alive", work, j.PGID)
 	}
 	fi, err := os.Lstat(work)
 	if os.IsNotExist(err) {
