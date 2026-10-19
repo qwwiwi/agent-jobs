@@ -67,7 +67,8 @@ func LimitsText(j *store.Job) string {
 
 // DoneLine is the one line delivered to the agent's live session.
 // A job failed because processes survived it says so at the end of the line; a job whose folder is
-// at least dirNote bytes (Config.JobDirNoteBytes; 0 = never) says how big it is; a resumed attempt
+// at least dirNote bytes (Config.JobDirNoteBytes; 0 = never), or too big to measure within the walk's
+// bounds, says how big it is; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // An owner-waits job ends the line with OwnerWaitsMarker.
 func DoneLine(j *store.Job, dirNote int64) string {
@@ -86,7 +87,10 @@ func DoneLine(j *store.Job, dirNote int64) string {
 	if n := acceptanceNote(j); n != "" {
 		line += " · " + n
 	}
-	if dirNote > 0 && j.DirBytes >= dirNote {
+	switch {
+	case dirNote > 0 && j.DirPartial:
+		line += " · job dir at least " + SizeText(j.DirBytes) + " (not fully measured)"
+	case dirNote > 0 && j.DirBytes >= dirNote:
 		line += " · job dir " + SizeText(j.DirBytes)
 	}
 	if j.Attempt > 1 {
