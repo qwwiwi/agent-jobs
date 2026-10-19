@@ -86,6 +86,9 @@ func DoneLine(j *store.Job) string {
 	if strings.Contains(j.Error, ReasonSurvivors) {
 		line += " · " + ReasonSurvivors
 	}
+	if strings.Contains(j.Error, ReviewChangedWarning) {
+		line += " · " + ReviewChangedWarning
+	}
 	if n := acceptanceNote(j); n != "" {
 		line += " · " + n
 	}
@@ -100,6 +103,50 @@ func DoneLine(j *store.Job) string {
 		line += " · " + OwnerWaitsMarker
 	}
 	return RedactText(line) // the title and the error come from the brief and the job
+}
+
+// ReviewChangedWarning marks a review job whose worktree differed from its base when it ended: the
+// guard refuses writes into it (--read-only), so this is the second layer (a program that wrote by
+// itself, a script the job ran). It is appended to the job's error and shown on the job-done line.
+const ReviewChangedWarning = "WARNING: review job changed the worktree"
+
+// noteReviewChanges appends ReviewChangedWarning to a finished review job whose worktree has commits
+// past the base, staged, unstaged or untracked (not ignored) changes. Run after the skill links are
+// removed (they are not the job's change).
+func (m *Manager) noteReviewChanges(j *store.Job) {
+	if j.Kind != "review" || j.RepoPath == "" {
+		return
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if _, err := os.Stat(work); err != nil {
+		return
+	}
+	var what []string
+	head, err := git(work, "rev-parse", "HEAD")
+	if err == nil {
+		var base string
+		if base, err = git(work, "rev-parse", "--verify", j.BaseCommit+"^{commit}"); err == nil && head != base {
+			what = append(what, "HEAD moved from the base commit")
+		}
+	}
+	if err == nil {
+		var st string
+		if st, err = git(work, "status", "--porcelain", "--untracked-files=all"); err == nil && st != "" {
+			what = append(what, fmt.Sprintf("%d changed or untracked paths", len(strings.Split(st, "\n"))))
+		}
+	}
+	if err != nil {
+		m.Log.Printf("job %s: review worktree check: %s", j.ID, RedactText(err.Error()))
+		what = append(what, "worktree check failed")
+	}
+	if len(what) == 0 {
+		return
+	}
+	note := ReviewChangedWarning + " (" + strings.Join(what, ", ") + ")"
+	m.Log.Printf("job %s: %s", j.ID, note)
+	if err := m.Store.AppendError(j.ID, note); err != nil {
+		m.Log.Printf("job %s: record note: %v", j.ID, err)
+	}
 }
 
 // Containment says how a launched job's processes were contained: "scope <unit>" (its own systemd user

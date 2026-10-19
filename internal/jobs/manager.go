@@ -968,6 +968,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	if status == store.StatusTimeout || status == store.StatusFailed {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
+	m.noteReviewChanges(j)
 	m.recordAttemptEnd(j, res, killed)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
