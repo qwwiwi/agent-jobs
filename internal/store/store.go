@@ -895,6 +895,12 @@ func (s *Store) SetSpawnedPID(id, token string, pid int) error {
 		pid, pid, id, token))
 }
 
+// ClearPGIDSpawned forgets that a finished job's recorded pgid is the one its wrapper was spawned
+// with: called once that group is gone, after which the id may be reused by an unrelated group.
+func (s *Store) ClearPGIDSpawned(id string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET pgid_spawned=0 WHERE id=? AND status NOT IN ('queued','running')`, id))
+}
+
 // SetDirBytes records the size of the job directory measured when an attempt ended.
 func (s *Store) SetDirBytes(id string, n int64) error {
 	return affected(s.db.Exec(`UPDATE jobs SET dir_bytes=? WHERE id=?`, n, id))

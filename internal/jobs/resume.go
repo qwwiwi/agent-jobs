@@ -328,7 +328,7 @@ func (m *Manager) checkEscaped(id string) error {
 	if err != nil {
 		return err
 	}
-	if liveSpawnedGroup(j) {
+	if m.spawnedGroupAlive(j) {
 		return fmt.Errorf("the process group %d of the job's last attempt is still alive; end it (job_cancel, or kill the group) "+
 			"before resuming", j.PGID)
 	}
