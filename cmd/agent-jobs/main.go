@@ -72,7 +72,7 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
-  stats      --agent A [--since D] [--by kind|model|skill|effort] [--json] [--backfill [--all]]
+  stats      --agent A [--since D] [--by kind|model|skill|effort|repo] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
                                            delivered); --backfill first writes missing rows from
@@ -125,6 +125,7 @@ const usage = `usage: agent-jobs <command> [flags]
 var version = "dev"
 
 func main() {
+	jobs.Version = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -466,6 +467,9 @@ func cmdStart(args []string) error {
 	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
 		fmt.Fprintln(os.Stderr, "size_warning:", w)
 	}
+	if n := m.SameRepoNote(j); n != "" {
+		fmt.Fprintln(os.Stderr, "note:", n)
+	}
 	return nil
 }
 
@@ -797,7 +801,7 @@ func cmdResult(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(jobs.DoneLine(j, m.Cfg.JobDirNoteBytes()))
+	fmt.Println(m.DoneLineFor(j))
 	if j.Error != "" {
 		fmt.Println("error:", jobs.RedactText(j.Error))
 	}
@@ -1150,6 +1154,10 @@ func cmdDaemon(args []string) error {
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
 	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	// What the daemon runs: the orchestrator's MCP server compares itself with it (job_start, system_doctor).
+	if err := m.WriteDaemonInfo(); err != nil {
+		m.Log.Printf("%v (MCP servers cannot compare their version with the daemon's)", err)
+	}
 	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
 	go func() {
 		if err := m.ServeBrain(ctx); err != nil {
@@ -1491,7 +1499,7 @@ func cmdStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
-	by := fs.String("by", "kind", "group by kind|model|skill|effort (skill,repo: the skills rating by repository)")
+	by := fs.String("by", "kind", "group by kind|model|skill|effort|repo (skill,repo: the skills rating by repository)")
 	byRepo := fs.Bool("by-repo", false, "with --by skill: the skills rating with a per-repository breakdown")
 	repo := fs.String("repo", "", "with --by-repo: only jobs of this repository (folder name)")
 	limit := fs.Int("limit", httpapi.DefaultSkillsLimit, "with --by-repo: at most this many skills")
@@ -1541,13 +1549,32 @@ func cmdStats(args []string) error {
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	row := func(key string, s jobs.StatsSummary) {
-		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\t%d\n", key, s.Jobs,
-			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
-			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals, s.ReportOffContract)
+		cost := fmt.Sprintf("$%.2f", s.CostTotalUSD)
+		if s.CostEstimatedUSD > 0 {
+			cost += " (" + jobs.EstimatedCostText(s.CostEstimatedUSD) + ")"
+		}
+		perUsable := "-"
+		if s.CostPerUsableResultUSD > 0 {
+			perUsable = fmt.Sprintf("$%.2f", s.CostPerUsableResultUSD)
+		}
+		var outcomes []string
+		for _, o := range jobs.Outcomes {
+			if n := s.Outcomes[o]; n > 0 {
+				outcomes = append(outcomes, fmt.Sprintf("%s %.0f%%", o, s.OutcomeShares[o]*100))
+			}
+		}
+		if len(outcomes) == 0 {
+			outcomes = []string{"-"}
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t%s\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\t%d\t%s\t%d\t%s\n", key, s.Jobs,
+			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, cost, s.CostMedianUSD, s.CostP90USD,
+			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals, s.ReportOffContract,
+			strings.Join(outcomes, ", "), s.Unrecorded, perUsable)
 	}
-	// COST, MEDIAN and P90 are over the jobs with a known cost; COST? counts the others (codex, killed).
-	// OFF-CONTRACT counts the reports without a Summary or a Not done / uncertain section.
-	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS\tOFF-CONTRACT")
+	// COST, MEDIAN and P90 are over the jobs with a known or estimated cost ("est." is the part priced
+	// from token usage); COST? counts the others. OFF-CONTRACT counts the reports without a Summary or a
+	// Not done / uncertain section. $/USABLE is the cost per accepted or extended result.
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS\tOFF-CONTRACT\tOUTCOMES\tUNRECORDED\t$/USABLE")
 	for _, g := range rep.Groups {
 		row(shown(g.Key), g.StatsSummary)
 	}

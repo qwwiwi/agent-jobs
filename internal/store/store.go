@@ -141,6 +141,18 @@ type Job struct {
 	SkillsDelivered []string
 	// SkillsNote says why a selected skill was not delivered (repository wins, codex runner), "" otherwise.
 	SkillsNote string
+	// Outcome is what the orchestrator did with the result (job_outcome): accepted, extended, reworked,
+	// rerun or discarded; "" until recorded. OutcomeNote is its optional note (at most 300 characters).
+	Outcome     string
+	OutcomeNote string
+	OutcomeAt   *time.Time
+	// BaseBranch is the branch the job's commits will be landed on: the full ref (refs/heads/<b> or
+	// refs/remotes/<r>/<b>) the job was given, or the branch checked out in the repository when it was
+	// queued; "" when the base was a tag, a commit or a detached HEAD.
+	BaseBranch string
+	// MergeNote is the merge check of the job's commits onto BaseBranch, made when its job-done line
+	// was sent ("" = none: no repository or no commits of its own).
+	MergeNote string
 }
 
 // AcceptanceTimedOut is the AcceptanceExit of an acceptance command ended by its timeout.
@@ -396,6 +408,19 @@ var migrations = []string{
 	`ALTER TABLE job_stats ADD COLUMN dir_bytes INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN dir_tmp_bytes INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN dir_partial INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN outcome_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN outcome_at INTEGER`,
+	`ALTER TABLE job_stats ADD COLUMN outcome TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN outcome_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN cost_estimated_usd REAL NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cost_source TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE job_stats ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN merge_note TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -526,7 +551,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
-	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial`
+	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
+	base_branch, merge_note`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -537,14 +563,51 @@ func ts(t *time.Time) any {
 
 // Insert adds a new job row. Empty Runner / Billing get their defaults.
 func (s *Store) Insert(j *Job) error {
+	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (`+insertMarks+`)`, insertArgs(j)...)
+	if err != nil {
+		return fmt.Errorf("insert job: %w", err)
+	}
+	return nil
+}
+
+// InsertCapped adds a new job row unless agent already has limit codex jobs created at or after since
+// (the codex daily cap): the count and the insert are one statement, so two processes starting codex
+// jobs at once cannot both pass the cap. It returns false, nothing inserted, at the cap.
+func (s *Store) InsertCapped(j *Job, since time.Time, limit int) (bool, error) {
+	args := append(insertArgs(j), j.Agent, RunnerCodex, since.Unix(), limit)
+	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (SELECT COUNT(*) FROM jobs
+		WHERE agent = ? AND runner = ? AND created_at >= ?) < ?`, args...)
+	if err != nil {
+		return false, fmt.Errorf("insert job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// CountCodexSince returns how many codex jobs of agent were created at or after since, whatever became
+// of them.
+func (s *Store) CountCodexSince(agent string, since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE agent = ? AND runner = ? AND created_at >= ?`,
+		agent, RunnerCodex, since.Unix()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count codex jobs: %w", err)
+	}
+	return n, nil
+}
+
+// insertMarks are the placeholders of one jobs row (one per column of cols).
+var insertMarks = strings.TrimSuffix(strings.Repeat("?,", strings.Count(cols, ",")+1), ",")
+
+// insertArgs are the values of j for cols; empty Runner / Billing get their defaults.
+func insertArgs(j *Job) []any {
 	if j.Runner == "" {
 		j.Runner = RunnerClaude
 	}
 	if j.Billing == "" {
 		j.Billing = BillingSubscription
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
+	return []any{j.ID, j.Agent, j.Title, j.Kind, j.Brief, j.RepoPath, j.BaseCommit, j.Status, j.Model,
 		j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes, j.PID, j.PGID, j.CreatedAt.Unix(),
 		ts(j.StartedAt), ts(j.FinishedAt), ts(j.NotifiedAt), ts(j.CleanedAt),
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
@@ -552,11 +615,8 @@ func (s *Store) Insert(j *Job) error {
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
-		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial)
-	if err != nil {
-		return fmt.Errorf("insert job: %w", err)
-	}
-	return nil
+		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote}
 }
 
 type scanner interface{ Scan(dest ...any) error }
@@ -564,7 +624,7 @@ type scanner interface{ Scan(dest ...any) error }
 func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
-	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut sql.NullInt64
+	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
 	var skills, delivered string
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
@@ -573,11 +633,13 @@ func scanJob(r scanner) (*Job, error) {
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
-		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial)
+		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote)
 	if err != nil {
 		return nil, err
 	}
 	j.Skills, j.SkillsDelivered = SplitNames(skills), SplitNames(delivered)
+	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
 		e := int(accExit.Int64)
@@ -683,6 +745,11 @@ func (s *Store) PendingNotify() ([]*Job, error) {
 	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NULL ORDER BY finished_at`)
 }
 
+// ListActiveOnRepo returns the queued and running jobs on repository repo other than id, oldest first.
+func (s *Store) ListActiveOnRepo(repo, id string) ([]*Job, error) {
+	return s.query(`WHERE repo_path = ? AND id != ? AND status IN ('queued','running') ORDER BY created_at, rowid`, repo, id)
+}
+
 // CountRunning returns the number of running jobs.
 func (s *Store) CountRunning() (int, error) {
 	var n int
@@ -770,6 +837,11 @@ func (s *Store) SetSessionDigest(id, digest string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET session_digest=? WHERE id=?`, digest, id))
 }
 
+// SetMergeNote records the merge check of a job that is no longer queued or running.
+func (s *Store) SetMergeNote(id, note string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET merge_note=? WHERE id=? AND status NOT IN ('queued','running')`, note, id))
+}
+
 // AppendError appends a note to the error of a job that is no longer running.
 func (s *Store) AppendError(id, note string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET error = CASE error WHEN '' THEN ? ELSE error || '; ' || ? END
@@ -796,7 +868,8 @@ type ResumeLimits struct {
 // never ran, and its attempt number is already archived), then the row goes back to queued with the new limits
 // and context, its run fields reset (notify and cleanup start over). brief, when not empty, replaces
 // the brief (a job stopped before it ever ran gets the update appended to its brief instead).
-// It keeps created_at, so the job keeps its original queue position.
+// It keeps created_at, so the job keeps its original queue position. A recorded outcome (job_outcome)
+// was about the previous attempt's result and is cleared.
 func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -812,9 +885,10 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='', acceptance_started_at=NULL,
+		merge_note='', cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
+		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
-		timeout_minutes=?, pending_context=?`
+		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
 		q += `, brief=?`

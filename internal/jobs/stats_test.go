@@ -205,7 +205,7 @@ func TestSummarizeGrouping(t *testing.T) {
 	if got := fmt.Sprint(rep.Skills); got != "[{deploy 2 3 1 0.5 0 0} {review 2 2 1 0.5 0 0}]" {
 		t.Fatalf("skills: %s", got)
 	}
-	if _, err := Summarize(rows, "repo"); err == nil {
+	if _, err := Summarize(rows, "owner"); err == nil {
 		t.Fatal("unknown --by accepted")
 	}
 	if empty, err := Summarize(nil, "kind"); err != nil || empty.Totals.Jobs != 0 || empty.Groups == nil {
