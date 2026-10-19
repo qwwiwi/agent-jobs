@@ -123,6 +123,11 @@ if [[ $prompt == *FAKE_STAGED* ]]; then
   mkdir -p d
   echo u > d/new-untracked.txt
 fi
+if [[ $prompt == *FAKE_EDIT_TRACKED* ]]; then
+  # Rewrites the line every job edits, with this job's id: two such jobs conflict.
+  echo "edited by $AGENT_JOBS_JOB" > tracked.txt
+  git -c user.name=T -c user.email=t@example.com commit -qam "edit tracked by job"
+fi
 if [[ $prompt == *FAKE_ONLY_COMMIT* ]]; then
   echo c > only-commit.txt
   git add only-commit.txt

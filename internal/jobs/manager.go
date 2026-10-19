@@ -281,7 +281,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if effort != "" {
 		return nil, errors.New("reasoning_effort applies only to a codex job")
 	}
-	var repo, base string
+	var repo, base, branch string
 	if r.RepoPath != "" {
 		if repo, err = filepath.Abs(r.RepoPath); err != nil {
 			return nil, fmt.Errorf("repo path: %w", err)
@@ -296,6 +296,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if base, err = git(repo, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
 			return nil, fmt.Errorf("base %q: %w", ref, err)
 		}
+		branch = baseBranch(repo, ref)
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
@@ -310,6 +311,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
+		BaseBranch: branch,
 	}
 	return j, nil
 }

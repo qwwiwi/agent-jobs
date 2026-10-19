@@ -97,6 +97,9 @@ func doneLine(j *store.Job, cost string) string {
 		}
 		line += ")"
 	}
+	if j.MergeNote != "" {
+		line += " · " + j.MergeNote
+	}
 	if j.OwnerWaits {
 		line += " · " + OwnerWaitsMarker
 	}
@@ -130,6 +133,23 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 	return doneLine(j, cost)
 }
 
+// checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
+// a failure to record it is logged, the line then still carries it. A recorded check is kept while a
+// failed delivery is retried, so a stalled tmux does not cost the tick a merge check per job each time.
+func (m *Manager) checkMerge(j *store.Job) {
+	if j.MergeNote != "" {
+		return
+	}
+	note := m.MergeNote(j)
+	if note == "" {
+		return
+	}
+	j.MergeNote = note
+	if err := m.Store.SetMergeNote(j.ID, note); err != nil {
+		m.Log.Printf("job %s: record merge check: %v", j.ID, err)
+	}
+}
+
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
 // line; a failing tmux keeps it pending and it is retried next tick (cleanup waits for a delivered
 // notify, so the worktree is kept meanwhile). With no target configured, notify is off: the line is
@@ -142,6 +162,7 @@ func (m *Manager) notifyPending() error {
 	t := m.Cfg.NotifyTmuxTarget
 	if t == "" {
 		for _, j := range jobs {
+			m.checkMerge(j)
 			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", m.DoneLineFor(j))
 			if j.OwnerWaits {
 				if err := m.Store.BeginOwnerPending(j.ID, store.OwnerNotifyOff, m.Now()); err != nil {
@@ -162,6 +183,7 @@ func (m *Manager) notifyPending() error {
 				return err
 			}
 		}
+		m.checkMerge(j)
 		if err := m.sendTmuxLocked(t, m.DoneLineFor(j)); err != nil {
 			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
 			if errors.Is(err, errTmuxTimeout) {

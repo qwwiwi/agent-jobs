@@ -3,6 +3,7 @@ package mcp
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,5 +73,28 @@ func TestJobStartBriefSize(t *testing.T) {
 	call(t, cs, "job_start", startArgs(nil), &small)
 	if small.ID == "" || small.SizeWarning != "" {
 		t.Fatalf("small brief: %+v", small)
+	}
+}
+
+// job_start on a repository with another queued or running job names it in same_repo_jobs, and
+// still queues the job.
+func TestJobStartSameRepoAdvisory(t *testing.T) {
+	m := newManager(t)
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"-c", "user.name=T", "-c", "user.email=t@example.com",
+		"commit", "-q", "--allow-empty", "-m", "init"}} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	cs := connect(t, mustServer(t, m))
+	var first, second JobView
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = repo }), &first)
+	if first.SameRepoJobs != "" || first.BaseBranch != "refs/heads/main" {
+		t.Fatalf("first: %+v", first)
+	}
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = repo }), &second)
+	if second.Status != "queued" || !strings.Contains(second.SameRepoJobs, first.ID+" queued") {
+		t.Fatalf("second: %+v", second)
 	}
 }

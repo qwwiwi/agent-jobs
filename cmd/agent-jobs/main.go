@@ -464,6 +464,9 @@ func cmdStart(args []string) error {
 	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
 		fmt.Fprintln(os.Stderr, "size_warning:", w)
 	}
+	if n := m.SameRepoNote(j); n != "" {
+		fmt.Fprintln(os.Stderr, "note:", n)
+	}
 	return nil
 }
 
