@@ -60,6 +60,9 @@ func TestDeadWrapperKillsSpawnedGroup(t *testing.T) {
 	if groupAlive(g) {
 		t.Fatal("the job's process group outlived the tick")
 	}
+	if j.PGIDSpawned {
+		t.Fatal("the mark of the killed group was kept")
+	}
 }
 
 // #42: while the group of a job whose wrapper died is still alive (here: every signal is swallowed),
@@ -105,6 +108,9 @@ func TestDeadWrapperLiveGroupBlocksResumeAndCleanup(t *testing.T) {
 	waitFor(t, "group gone", 5*time.Second, func() bool { return !groupAlive(g) })
 	if err := m.Cleanup(j); err != nil {
 		t.Fatalf("cleanup once the group is gone: %v", err)
+	}
+	if get(t, m, j.ID).PGIDSpawned {
+		t.Fatal("the mark of a group that is gone was kept: a later group reusing the id would block the job")
 	}
 	if _, err := m.Resume(j.ID, "more", Limits{}); err != nil && strings.Contains(err.Error(), "still alive") {
 		t.Fatalf("resume refused once the group is gone: %v", err)

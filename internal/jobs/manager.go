@@ -600,6 +600,22 @@ func liveSpawnedGroup(j *store.Job) bool {
 	return j.PGIDSpawned && plausibleGroup(j.PGID) == nil && groupAlive(j.PGID)
 }
 
+// spawnedGroupAlive is liveSpawnedGroup for a job that is no longer running: once its group is gone
+// the mark is cleared, so a later group that reuses the id never holds up its cleanup, prune or resume.
+func (m *Manager) spawnedGroupAlive(j *store.Job) bool {
+	if liveSpawnedGroup(j) {
+		return true
+	}
+	if j.PGIDSpawned && finished(j.Status) {
+		if err := m.Store.ClearPGIDSpawned(j.ID); err != nil {
+			m.Log.Printf("job %s: forget spawned process group: %v", j.ID, err)
+		} else {
+			j.PGIDSpawned = false
+		}
+	}
+	return false
+}
+
 // killFn sends a signal (syscall.Kill); a variable so tests can see every kill without risking one.
 var killFn = syscall.Kill
 
