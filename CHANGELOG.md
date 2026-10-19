@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Explicit reasoning effort for claude jobs (#40): `reasoning_effort` (`job_start`, `schedule_add`, `agent-jobs start --reasoning-effort`) now applies to claude jobs too, `low|medium|high|xhigh|max`, validated by the same `ValidateReasoningEffort` with a value list per runner (codex stays `low|medium|high`; an unknown value is refused naming the runner's values). Without one a claude job takes config `effort_by_kind` (new, validated at load) or the kind's default: `high` for review, research and fix, `medium` for general. The effort is passed as `claude --effort <e>` on fresh and resumed attempts, so a project `effortLevel` cannot override it; it is stored on the row (claude jobs too; rows from before stay empty and run without the flag), kept across `job_resume`, stored on job schedules, shown in `job_status` / `job_result` / `job_list` (`reasoning_effort`), `agent-jobs status <id>` (`effort:`) and the job-done line (`· model <m> · effort <e>`). `job_stats` gains column `effort` (additive migration, backfilled from the jobs table) and `effort` joins `StatsGroupBy` (`agent-jobs stats --by effort`, `job_stats` `by`, `GET /v1/stats?by=effort`).
+
 ### Changed
 - Claude review jobs are read-only by deny rules (#39): kind `review` adds `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `Bash(git commit:*)`, `git merge` / `rebase` / `reset` / `checkout -b` / `stash`, `Bash(rm:*)` and `Bash(mv:*)` to the job's deny list (reads, search and test runners stay allowed), so the same kind is read-only on claude as on codex. The review checklist says so and asks for progress notes through a shell heredoc. Prefix rules do not catch every shell write (`sed -i`, redirections).
 

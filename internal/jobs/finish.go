@@ -66,7 +66,8 @@ func LimitsText(j *store.Job) string {
 }
 
 // DoneLine is the one line delivered to the agent's live session.
-// A job failed because processes survived it says so at the end of the line; a resumed attempt
+// The model and the reasoning effort follow the duration (rows from before the effort was recorded
+// show neither). A job failed because processes survived it says so at the end of the line; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // An owner-waits job ends the line with OwnerWaitsMarker.
 func DoneLine(j *store.Job) string {
@@ -76,6 +77,9 @@ func DoneLine(j *store.Job) string {
 	}
 	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
 		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
+	if j.ReasoningEffort != "" {
+		line += fmt.Sprintf(" · model %s · effort %s", Printable(j.Model, 64), j.ReasoningEffort)
+	}
 	if c := Containment(j); c != "" && (j.ScopeUnit == "" || j.ScopePending) {
 		line += " · " + c // the weaker containment, or a scope stop still pending, is said on the line
 	}
