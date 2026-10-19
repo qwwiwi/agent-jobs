@@ -43,6 +43,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 )
@@ -204,9 +205,24 @@ func inGitDir(p string) bool {
 	})
 }
 
-// within reports whether p is d or lies inside it (both absolute and clean).
+// foldCase is set where the default file system ignores case (macOS APFS and HFS+, Windows NTFS):
+// there `JOBS.DB` names the same file as `jobs.db`, so protected paths are compared case-folded. On
+// a case-sensitive volume of such a system the guard refuses more, never less. Tests set it to
+// simulate a case-insensitive file system on Linux.
+var foldCase = runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+
+// fold returns a path or text as the file system compares names: lower-cased under foldCase.
+func fold(p string) string {
+	if foldCase {
+		return strings.ToLower(p)
+	}
+	return p
+}
+
+// within reports whether p is d or lies inside it (both absolute and clean), case-folded under
+// foldCase.
 func within(p, d string) bool {
-	rel, err := filepath.Rel(d, p)
+	rel, err := filepath.Rel(fold(d), fold(p))
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
@@ -450,6 +466,14 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 							return h.reason()
 						}
 						continue
+					}
+					if d, ok := attachedDir(name, a); ok {
+						if p, ok := s.hit(d, true); ok {
+							if _, in := s.hit(d, false); !in {
+								return ancestorBlocked(a, p)
+							}
+							return protectedBlocked(p)
+						}
 					}
 					if p, ok := s.hit(a, tree && !ca.destIdx[k]); ok {
 						if _, in := s.hit(a, false); tree && !in {
