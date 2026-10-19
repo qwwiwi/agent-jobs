@@ -81,6 +81,9 @@ type JobView struct {
 	Skills          []string `json:"skills,omitempty"`
 	SkillsDelivered []string `json:"skills_delivered,omitempty"`
 	SkillsNote      string   `json:"skills_note,omitempty"`
+	// Outcome is what the orchestrator recorded with job_outcome ("" = none yet).
+	Outcome     string `json:"outcome,omitempty"`
+	OutcomeNote string `json:"outcome_note,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -102,6 +105,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
+		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote,
 	}
 }
 
@@ -273,7 +277,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 			out.Note = "job is " + j.Status + "; the session gets a [jobs:job-done] line when it ends"
 			return nil, out, nil
 		}
-		out.DoneLine = jobs.DoneLine(j)
+		out.DoneLine = d.Manager.DoneLineFor(j)
 		out.Acceptance = acceptanceView(m, j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {

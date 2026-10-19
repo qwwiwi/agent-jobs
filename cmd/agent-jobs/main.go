@@ -792,7 +792,7 @@ func cmdResult(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(jobs.DoneLine(j))
+	fmt.Println(m.DoneLineFor(j))
 	if j.Error != "" {
 		fmt.Println("error:", jobs.RedactText(j.Error))
 	}
@@ -1486,7 +1486,7 @@ func cmdStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
-	by := fs.String("by", "kind", "group by kind|model|skill (skill,repo: the skills rating by repository)")
+	by := fs.String("by", "kind", "group by kind|model|skill|repo (skill,repo: the skills rating by repository)")
 	byRepo := fs.Bool("by-repo", false, "with --by skill: the skills rating with a per-repository breakdown")
 	repo := fs.String("repo", "", "with --by-repo: only jobs of this repository (folder name)")
 	limit := fs.Int("limit", httpapi.DefaultSkillsLimit, "with --by-repo: at most this many skills")
@@ -1536,12 +1536,31 @@ func cmdStats(args []string) error {
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	row := func(key string, s jobs.StatsSummary) {
-		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t$%.2f\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\n", key, s.Jobs,
-			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, s.CostTotalUSD, s.CostMedianUSD, s.CostP90USD,
-			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals)
+		cost := fmt.Sprintf("$%.2f", s.CostTotalUSD)
+		if s.CostEstimatedUSD > 0 {
+			cost += " (" + jobs.EstimatedCostText(s.CostEstimatedUSD) + ")"
+		}
+		perUsable := "-"
+		if s.CostPerUsableResultUSD > 0 {
+			perUsable = fmt.Sprintf("$%.2f", s.CostPerUsableResultUSD)
+		}
+		var outcomes []string
+		for _, o := range jobs.Outcomes {
+			if n := s.Outcomes[o]; n > 0 {
+				outcomes = append(outcomes, fmt.Sprintf("%s %.0f%%", o, s.OutcomeShares[o]*100))
+			}
+		}
+		if len(outcomes) == 0 {
+			outcomes = []string{"-"}
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.0f%%\t%s\t$%.2f\t$%.2f\t%d\t%ds\t%ds\t%d\t%s\t%d\t%s\n", key, s.Jobs,
+			s.ByStatus[store.StatusSucceeded], s.SuccessRate*100, cost, s.CostMedianUSD, s.CostP90USD,
+			s.CostUnknownJobs, s.DurationMedianSec, s.DurationP90Sec, s.GuardRefusals, strings.Join(outcomes, ", "),
+			s.Unrecorded, perUsable)
 	}
-	// COST, MEDIAN and P90 are over the jobs with a known cost; COST? counts the others (codex, killed).
-	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS")
+	// COST, MEDIAN and P90 are over the jobs with a known or estimated cost ("est." is the part priced
+	// from token usage); COST? counts the others. $/USABLE is the cost per accepted or extended result.
+	fmt.Fprintln(w, strings.ToUpper(rep.By)+"\tJOBS\tOK\tRATE\tCOST\tMEDIAN\tP90\tCOST?\tDUR MEDIAN\tDUR P90\tREFUSALS\tOUTCOMES\tUNRECORDED\t$/USABLE")
 	for _, g := range rep.Groups {
 		row(shown(g.Key), g.StatsSummary)
 	}

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- Job outcomes (#44): the orchestrator-only MCP tool `job_outcome(id, outcome, note?)` records what was done with a finished job's result (`accepted`, `extended`, `reworked`, `rerun`, `discarded`; note ≤ 300 characters) on the job row and its `job_stats` row; a second call overwrites it, unknown ids, other agents' jobs and queued, running or stopped jobs are refused. `job_stats` / `agent-jobs stats` report per group the outcome counts and shares, `unrecorded` (finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended); `--by repo` groups by repository. The agent-jobs skill and the server instructions tell the session to call it.
+- Estimated cost of unreported attempts (#44): the stats row records the stream's token totals (each assistant message once by its id; codex `turn.completed` usage) and prices the attempts that ended without a result event (timed out, cancelled, stopped, dead wrapper, codex) at list prices: `cost_estimated_usd`, `cost_source` = `result` | `estimated` | `unknown`. Estimated jobs count in the cost figures (`cost_estimated_usd`, `estimated_jobs`), the stats table and the job-done line show `$0.42 est.`; config `model_prices` adds or overrides prices (codex models have no built-in row and stay `unknown` without one).
+
 ## [0.4.0] - 2026-10-18
 
 ### Added

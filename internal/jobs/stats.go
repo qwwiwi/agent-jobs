@@ -37,6 +37,18 @@ type StreamStats struct {
 	Turns         int
 	CostUSD       float64
 	Found         bool // a result event was seen
+	// Tokens sums the usage of the assistant messages (each message id once, its largest usage) of a
+	// claude stream, or of the turn.completed events of a codex stream.
+	Tokens TokenUsage
+}
+
+// statsUsage is the usage of a claude assistant message or of a codex turn.completed event.
+type statsUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CachedInputTokens        int64 `json:"cached_input_tokens"` // codex: part of input_tokens
 }
 
 type statsBlock struct {
@@ -55,8 +67,11 @@ type statsEvent struct {
 	NumTurns     int     `json:"num_turns"`
 	TotalCostUSD float64 `json:"total_cost_usd"`
 	Message      *struct {
+		ID      string          `json:"id"`
 		Content json.RawMessage `json:"content"`
+		Usage   *statsUsage     `json:"usage"`
 	} `json:"message"`
+	Usage *statsUsage `json:"usage"` // codex turn.completed
 }
 
 type statsInput struct {
@@ -141,6 +156,10 @@ func resultText(raw json.RawMessage) string {
 func ParseStreamStats(r io.Reader) (StreamStats, error) {
 	st := StreamStats{ToolCalls: map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}}
 	subagentCalls := map[string]bool{}
+	// A claude message arrives as several assistant events (one per content block) carrying the same
+	// id; its usage grows while it streams, so each id counts once with the largest value of each field.
+	byID := map[string]TokenUsage{}
+	var anon TokenUsage
 	_, err := readLines(r, MaxStreamLineBytes, func(line []byte) {
 		var ev statsEvent
 		if json.Unmarshal(line, &ev) != nil {
@@ -149,6 +168,24 @@ func ParseStreamStats(r io.Reader) (StreamStats, error) {
 		if ev.Type == "result" {
 			st.Found, st.ResultSubtype, st.Turns, st.CostUSD = true, ev.Subtype, ev.NumTurns, ev.TotalCostUSD
 			return
+		}
+		if ev.Type == "turn.completed" && ev.Usage != nil {
+			u := ev.Usage
+			anon = anon.Add(TokenUsage{Input: max(u.InputTokens-u.CachedInputTokens, 0), Output: u.OutputTokens,
+				CacheRead: u.CachedInputTokens})
+			return
+		}
+		if ev.Type == "assistant" && ev.Message != nil && ev.Message.Usage != nil {
+			u := ev.Message.Usage
+			t := TokenUsage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens,
+				CacheWrite: u.CacheCreationInputTokens}
+			if id := ev.Message.ID; id != "" {
+				o := byID[id]
+				byID[id] = TokenUsage{max(o.Input, t.Input), max(o.Output, t.Output), max(o.CacheRead, t.CacheRead),
+					max(o.CacheWrite, t.CacheWrite)}
+			} else {
+				anon = anon.Add(t)
+			}
 		}
 		if ev.Message == nil || (ev.Type != "assistant" && ev.Type != "user") {
 			return
@@ -203,6 +240,10 @@ func ParseStreamStats(r io.Reader) (StreamStats, error) {
 			}
 		}
 	})
+	st.Tokens = anon
+	for _, t := range byID {
+		st.Tokens = st.Tokens.Add(t)
+	}
 	return st, err
 }
 
@@ -318,6 +359,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		st.Repo = filepath.Base(j.RepoPath)
 	}
 	st.SkillsDelivered = slices.Clone(j.SkillsDelivered)
+	st.Outcome, st.OutcomeNote = j.Outcome, j.OutcomeNote
 	earlier, err := m.Store.Attempts(j.ID)
 	if err != nil {
 		return nil, err
@@ -333,6 +375,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if len(earlier) > 0 && earlier[0].StartedAt != nil {
 		st.StartedAt = earlier[0].StartedAt
 	}
+	parsed := map[string]*StreamStats{} // by attempt ("" = the current one)
 	add := func(attempt string) error {
 		rc, src, err := m.openStream(j, attempt)
 		if err != nil {
@@ -349,6 +392,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		if err != nil {
 			return fmt.Errorf("parse stream of %s: %w", j.ID, err)
 		}
+		parsed[attempt] = &ss
 		for k, v := range ss.ToolCalls {
 			st.ToolCalls[k] += v
 		}
@@ -360,6 +404,10 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		}
 		st.GuardRefusals += ss.GuardRefusals
 		st.Subagents += ss.Subagents
+		st.InputTokens += ss.Tokens.Input
+		st.OutputTokens += ss.Tokens.Output
+		st.CacheReadTokens += ss.Tokens.CacheRead
+		st.CacheWriteTokens += ss.Tokens.CacheWrite
 		if attempt == "" {
 			st.ResultSubtype = ss.ResultSubtype
 		}
@@ -375,6 +423,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 			return nil, err
 		}
 	}
+	m.estimateCost(st, j, earlier, parsed)
 	// The store's counter is what the guard allowed; it outlives the stream.
 	if n, err := m.Store.SubagentCount(j.ID); err == nil && n > st.Subagents {
 		st.Subagents = n
@@ -384,6 +433,45 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// estimateCost prices, from their streams' token usage at list prices (Config.PriceFor), the attempts
+// that ended without a reported cost, and sets the row's CostEstimatedUSD and CostSource: "result" when
+// every attempt reported its cost, "estimated" when all the others could be priced, else "unknown" (no
+// stream or no token usage left, or a model with no price row). A killed attempt's stream lies in the job dir, which the
+// job could write: the estimate is a floor for people, never a billed figure.
+func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store.Attempt, parsed map[string]*StreamStats) {
+	unknown, priced := 0, 0
+	var est float64
+	price := func(model string, ss *StreamStats) {
+		unknown++
+		// No stream, or no usage in it (killed before its first message, a codex turn that never
+		// completed): nothing to price, the cost stays unknown rather than a "$0.00 est.".
+		if ss == nil || ss.Tokens == (TokenUsage{}) {
+			return
+		}
+		if p, ok := m.Cfg.PriceFor(model); ok {
+			est += p.Cost(ss.Tokens)
+			priced++
+		}
+	}
+	for _, a := range earlier {
+		if a.CostUnknown {
+			price(a.Model, parsed[strconv.Itoa(a.N)])
+		}
+	}
+	if j.CostIsUnknown() {
+		price(j.Model, parsed[""])
+	}
+	st.CostEstimatedUSD = math.Round(est*1e4) / 1e4
+	switch {
+	case unknown == 0:
+		st.CostSource = store.CostSourceResult
+	case priced == unknown:
+		st.CostSource = store.CostSourceEstimated
+	default:
+		st.CostSource = store.CostSourceUnknown
+	}
 }
 
 func finished(status string) bool {
@@ -440,7 +528,62 @@ func (m *Manager) BackfillStats(all bool) (BackfillReport, error) {
 }
 
 // Stats grouping keys.
-var StatsGroupBy = []string{"kind", "model", "skill"}
+var StatsGroupBy = []string{"kind", "model", "skill", "repo"}
+
+// Outcomes job_outcome records: what the orchestrator did with a job's result.
+const (
+	OutcomeAccepted  = "accepted"  // used as delivered
+	OutcomeExtended  = "extended"  // used, and more work was added on top
+	OutcomeReworked  = "reworked"  // the job's own work had to be fixed first
+	OutcomeRerun     = "rerun"     // run again, on another model or with another brief
+	OutcomeDiscarded = "discarded" // thrown away
+)
+
+// Outcomes lists the outcomes in their reporting order.
+var Outcomes = []string{OutcomeAccepted, OutcomeExtended, OutcomeReworked, OutcomeRerun, OutcomeDiscarded}
+
+// OutcomeUnrecorded is the key of the outcome shares for jobs that have a report and no outcome.
+const OutcomeUnrecorded = "unrecorded"
+
+// MaxOutcomeNoteRunes caps the note of job_outcome.
+const MaxOutcomeNoteRunes = 300
+
+// SetOutcome records what the orchestrator did with the result of a finished job of this agent
+// (job_outcome); a later call overwrites it. Unknown ids, other agents' jobs and jobs that are still
+// queued, running or stopped are refused.
+func (m *Manager) SetOutcome(id, outcome, note string) error {
+	id, outcome, note = strings.TrimSpace(id), strings.TrimSpace(outcome), strings.TrimSpace(note)
+	if id == "" {
+		return errors.New("id is required")
+	}
+	if !slices.Contains(Outcomes, outcome) {
+		return fmt.Errorf("outcome %q must be one of %s", outcome, strings.Join(Outcomes, "|"))
+	}
+	if n := len([]rune(note)); n > MaxOutcomeNoteRunes {
+		return fmt.Errorf("note is %d characters, at most %d", n, MaxOutcomeNoteRunes)
+	}
+	j, err := m.Store.Get(id)
+	if errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("job %q not found", id)
+	}
+	if err != nil {
+		return err
+	}
+	if j.Agent != m.Agent {
+		return fmt.Errorf("job %s belongs to agent %s, not %s", id, j.Agent, m.Agent)
+	}
+	switch j.Status {
+	case store.StatusQueued, store.StatusRunning, store.StatusStopped:
+		return fmt.Errorf("job %s is %s: an outcome is recorded once the job has finished", id, j.Status)
+	}
+	if err := m.Store.SetOutcome(id, m.Agent, outcome, note, m.Now()); err != nil {
+		if errors.Is(err, store.ErrImmutable) {
+			return fmt.Errorf("job %s changed meanwhile and is not finished: %w", id, err)
+		}
+		return err
+	}
+	return nil
+}
 
 // StatsSummary aggregates a set of finished jobs. Percentiles are nearest-rank.
 type StatsSummary struct {
@@ -458,6 +601,17 @@ type StatsSummary struct {
 	WithoutReport     int            `json:"without_report"`
 	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
+	// CostEstimatedUSD is the part of CostTotalUSD estimated from token usage at list prices (attempts
+	// without a reported cost); EstimatedJobs counts the jobs that carry such an estimate.
+	CostEstimatedUSD float64 `json:"cost_estimated_usd"`
+	EstimatedJobs    int     `json:"estimated_jobs"`
+	// Outcomes counts the recorded outcomes (job_outcome); Unrecorded the jobs with a report and none.
+	Outcomes   map[string]int `json:"outcomes"`
+	Unrecorded int            `json:"unrecorded"`
+	// OutcomeShares is each outcome's and "unrecorded"'s share of the jobs.
+	OutcomeShares map[string]float64 `json:"outcome_shares"`
+	// CostPerUsableResultUSD is the total cost / (accepted + extended); 0 when there is no usable result.
+	CostPerUsableResultUSD float64 `json:"cost_per_usable_result_usd"`
 }
 
 // StatsGroup is the summary of one group (a kind, a model or a skill).
@@ -538,8 +692,9 @@ func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) 
 	return rep, err
 }
 
-// Summarize aggregates stats rows (pure: no I/O). by is kind, model or skill (default kind); with
-// skill a job counts in every skill it used, and jobs without one under "(none)".
+// Summarize aggregates stats rows (pure: no I/O). by is kind, model, skill or repo (default kind); with
+// skill a job counts in every skill it used, and jobs without one under "(none)" (repo: jobs without a
+// repository).
 func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 	if by == "" {
 		by = "kind"
@@ -559,6 +714,11 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 			keys = []string{r.Kind}
 		case "model":
 			keys = []string{r.Model}
+		case "repo":
+			keys = []string{r.Repo}
+			if r.Repo == "" {
+				keys = []string{"(none)"}
+			}
 		case "skill":
 			for s := range r.Skills {
 				keys = append(keys, s)
@@ -663,16 +823,32 @@ func percentile[T int | float64](sorted []T, p float64) T {
 }
 
 func summarize(rows []*store.JobStats) StatsSummary {
-	s := StatsSummary{Jobs: len(rows), ByStatus: map[string]int{}}
+	s := StatsSummary{Jobs: len(rows), ByStatus: map[string]int{}, Outcomes: map[string]int{},
+		OutcomeShares: map[string]float64{}}
 	costs := make([]float64, 0, len(rows))
 	durs := make([]int, 0, len(rows))
 	for _, r := range rows {
 		s.ByStatus[r.Status]++
-		if r.CostUnknown {
+		// A job whose unreported attempts were all priced counts at billed + estimated cost.
+		estimated := r.CostSource == store.CostSourceEstimated
+		switch {
+		case r.CostUnknown && !estimated:
 			s.CostUnknownJobs++
-		} else {
-			s.CostTotalUSD += r.CostUSD
-			costs = append(costs, r.CostUSD)
+		default:
+			c := r.CostUSD
+			if estimated {
+				c += r.CostEstimatedUSD
+				s.CostEstimatedUSD += r.CostEstimatedUSD
+				s.EstimatedJobs++
+			}
+			s.CostTotalUSD += c
+			costs = append(costs, c)
+		}
+		switch {
+		case r.Outcome != "":
+			s.Outcomes[r.Outcome]++
+		case r.HasReport:
+			s.Unrecorded++
 		}
 		s.Turns += r.Turns
 		s.GuardRefusals += r.GuardRefusals
@@ -686,6 +862,14 @@ func summarize(rows []*store.JobStats) StatsSummary {
 	slices.Sort(durs)
 	s.SuccessRate = ratio(s.ByStatus[store.StatusSucceeded], s.Jobs)
 	s.CostTotalUSD = math.Round(s.CostTotalUSD*1e4) / 1e4
+	s.CostEstimatedUSD = math.Round(s.CostEstimatedUSD*1e4) / 1e4
+	for _, o := range Outcomes {
+		s.OutcomeShares[o] = ratio(s.Outcomes[o], s.Jobs)
+	}
+	s.OutcomeShares[OutcomeUnrecorded] = ratio(s.Unrecorded, s.Jobs)
+	if usable := s.Outcomes[OutcomeAccepted] + s.Outcomes[OutcomeExtended]; usable > 0 {
+		s.CostPerUsableResultUSD = math.Round(s.CostTotalUSD/float64(usable)*1e4) / 1e4
+	}
 	s.CostMedianUSD, s.CostP90USD = percentile(costs, 0.5), percentile(costs, 0.9)
 	s.DurationMedianSec, s.DurationP90Sec = percentile(durs, 0.5), percentile(durs, 0.9)
 	return s
