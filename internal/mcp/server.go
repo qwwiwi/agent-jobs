@@ -37,6 +37,9 @@ type Deps struct {
 	JobNotifier JobNotifier
 	// JobMarker serves check_mark in the job role (the daemon's proxy); nil in the orchestrator role.
 	JobMarker JobMarker
+	// Watch (orchestrator role) reloads a changed config.json before each call and warns when the
+	// binary on disk or the daemon is not what this server runs; nil = no watch.
+	Watch *ServerWatch
 }
 
 // toolDef binds a tool name to the function that registers it on a server.
@@ -150,6 +153,9 @@ func newServer(role Role, d Deps, registerHidden bool) (*sdk.Server, error) {
 	}
 	s := sdk.NewServer(&sdk.Implementation{Name: ServerName, Version: Version}, &sdk.ServerOptions{Instructions: instr})
 	s.AddReceivingMiddleware(enforceRole(role))
+	if role == RoleOrchestrator && d.Watch != nil {
+		s.AddReceivingMiddleware(d.Watch.middleware())
+	}
 	for _, t := range definitions() {
 		if _, err := audienceOf(t.name); err != nil {
 			return nil, err
@@ -210,6 +216,7 @@ func Serve(ctx context.Context, role Role, agent string) error {
 		}
 		d.Manager = m
 		d.Brain, d.MinScore = m.Brain, m.Cfg.Brain.MinScore()
+		d.Watch = NewServerWatch(m)
 	} else {
 		// The job role runs only inside a job: its notes carry the job's id.
 		if d.JobID = os.Getenv(jobs.JobEnvVar); d.JobID == "" {

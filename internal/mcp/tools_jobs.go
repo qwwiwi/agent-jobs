@@ -78,6 +78,9 @@ type JobView struct {
 	BaseBranch string `json:"base_branch,omitempty"`
 	// MergeNote is that check, made when the job-done line was sent.
 	MergeNote string `json:"merge_note,omitempty"`
+	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
+	// config.json did not load, or the daemon runs another version (restart the session).
+	Warnings []string `json:"warnings,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -184,6 +187,9 @@ func addJobStart(s *sdk.Server, d Deps) {
 		v := view(d.Manager, j)
 		v.SizeWarning = d.Manager.Cfg.BriefSizeWarning(in.Brief)
 		v.SameRepoJobs = d.Manager.SameRepoNote(j)
+		if d.Watch != nil {
+			v.Warnings = d.Watch.Warnings("job_start")
+		}
 		return nil, v, nil
 	})
 }

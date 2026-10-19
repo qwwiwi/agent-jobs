@@ -125,6 +125,7 @@ const usage = `usage: agent-jobs <command> [flags]
 var version = "dev"
 
 func main() {
+	jobs.Version = version
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -1148,6 +1149,10 @@ func cmdDaemon(args []string) error {
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
 	m.Log.Printf("daemon started, interval %s, state %s", jobs.TickInterval, m.StateDir)
+	// What the daemon runs: the orchestrator's MCP server compares itself with it (job_start, system_doctor).
+	if err := m.WriteDaemonInfo(); err != nil {
+		m.Log.Printf("%v (MCP servers cannot compare their version with the daemon's)", err)
+	}
 	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
 	go func() {
 		if err := m.ServeBrain(ctx); err != nil {
