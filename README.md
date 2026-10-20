@@ -37,25 +37,32 @@ That is what a job avoids:
 - **Load can be spread.** Subagents draw on the usage window at the same moment as their parent. Jobs queue (at most `max_running` run per agent, default two) and, with schedules (Wave B), can run when the window is quiet.
 - **A job is a full session.** A subagent starts with only its prompt and is often routed to a cheaper model. A job is a full top-level Claude Code run with its own model choice and the full tool set, inside the limits above.
 
-We do not publish an "N× cheaper" or "N× faster" figure yet, because we have not measured one per task. The benchmark below is how we will.
+Measured per task (benchmark below, 2026-10-19): on small tasks a job is **not** cheaper than a subagent – it used about 30% more limit-weighted tokens and took two to three times longer, while keeping the parent nearly as free as a background subagent. The case for jobs is the list above (hard caps, survival, isolation, queueing), not a lower per-task price.
 
-### Benchmark (in progress)
+### Benchmark (2026-10-19)
 
-**Method.** The same task is run three ways: as a foreground subagent, as a background subagent, and as a job.
+**Method.** The same task is run three ways: as a foreground subagent, as a background subagent, and as a job. Full method, raw numbers, scripts and the real-usage numbers of one agent: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
-- **Tokens:** report `input`, `cache_creation`, `cache_read` and `output` (the usage fields `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`) separately, and their sum. Sources: the parent session's JSONL plus the subagent sidechain, against the job's own JSONL (`stream.jsonl`) plus the parent's tokens for the job-done line and the report read.
-- **Priced total (primary comparison):** the four fields times the list price of the model that ran them, each at its own rate (they are billed differently), in $ per run. For subscription runs it is an equivalent cost, not money spent.
-- **Acceptance:** the same acceptance check for all three modes; a run counts only if the task's check passes, so cost is compared on equal results.
-- **Wall time:** from start to a usable result.
-- **Parent busy:** minutes during which the parent session could not take another request.
+- **Limits (primary):** the 5-hour and weekly subscription windows (`utilization` from Claude Code's `rate_limit_event`), read before and after every run. Anthropic does not publish how the windows weigh token classes, and the windows report whole percent, so per-run deltas are within noise; the token classes and the priced total below are the limit proxy.
+- **Tokens:** `input`, `cache_creation`, `cache_read` and `output` (usage fields `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`), shown as non-cache-read tokens (input + cache creation + output) and cache-read tokens. Sources: the parent session's transcript plus the subagent sidechain, against the job's own session transcript plus the parent's tokens for the job-done line, the report read and taking the commit over.
+- **Priced total (secondary):** the four fields times the list price of the model that ran them, each at its own rate, in $ per run (cache writes at the 1-hour rate Claude Code uses). For subscription runs it is an equivalent cost, not money spent.
+- **Acceptance:** the same objective check for all three modes (hidden tests, a fixed answer key, required report sections and values); a run counts only if it passes, so cost is compared on equal results.
+- **Wall time:** from start to a usable result on the repository's branch. **Parent busy:** minutes the parent's turns were open (it could not take another request).
+- **Setup:** Opus 5.5 for parent, subagent and job; the parent is padded with about 28k tokens of earlier-session context; 3 tasks × 3 modes × 2 runs, all 18 runs passed; macOS, Claude Code 2.1.301, agent-jobs v0.4.0.
 
-| Run | Task | Input | Cache creation | Cache read | Output | Token sum | Priced total ($) | Acceptance passed | Wall time | Parent busy (min) | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Foreground subagent | | | | | | | | | | | |
-| Background subagent | | | | | | | | | | | |
-| Job | | | | | | | | | | | |
+| Run | Task | 5h limit (pts, ±1) | Non-cache-read tokens | Cache read | Priced total ($) | Input | Cache creation | Output | Token sum | Acceptance passed | Wall time (min) | Parent busy (min) | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Foreground subagent | bug fix (Python, hidden tests) | 0.0 | 76.0k | 179.8k | 0.65 | 14 | 71.7k | 4.2k | 255.8k | 2/2 | 0.8 | 0.8 | parent 0.50 $ + worker 0.15 $; n=2 |
+| Background subagent | bug fix (Python, hidden tests) | 1.0 | 75.1k | 233.5k | 0.65 | 17 | 71.0k | 4.0k | 308.6k | 2/2 | 0.8 | 0.4 | parent 0.51 $ + worker 0.14 $; n=2 |
+| Job | bug fix (Python, hidden tests) | 0.5 | 79.4k | 541.1k | 0.81 | 25 | 73.6k | 5.7k | 620.4k | 2/2 | 3.3 | 0.7 | parent 0.63 $ + worker 0.18 $; n=2 |
+| Foreground subagent | DM lead sweep (12 threads, CRM, drafts) | 0.0 | 83.7k | 248.0k | 0.76 | 18 | 76.1k | 7.6k | 331.7k | 2/2 | 1.5 | 1.5 | parent 0.55 $ + worker 0.21 $; n=2 |
+| Background subagent | DM lead sweep (12 threads, CRM, drafts) | 0.5 | 82.2k | 325.8k | 0.76 | 21 | 75.5k | 6.7k | 408.0k | 2/2 | 1.2 | 0.4 | parent 0.57 $ + worker 0.18 $; n=2 |
+| Job | DM lead sweep (12 threads, CRM, drafts) | 0.5 | 93.9k | 675.1k | 1.00 | 34 | 84.5k | 9.3k | 769.0k | 2/2 | 3.8 | 0.8 | parent 0.67 $ + worker 0.33 $; n=2 |
+| Foreground subagent | research report from docs (RU) | 0.5 | 128.5k | 613.7k | 1.15 | 32 | 116.1k | 12.4k | 742.2k | 2/2 | 2.7 | 2.7 | parent 0.66 $ + worker 0.49 $; n=2 |
+| Background subagent | research report from docs (RU) | 0.5 | 112.4k | 511.7k | 1.02 | 34 | 101.5k | 10.8k | 624.0k | 2/2 | 2.0 | 0.6 | parent 0.61 $ + worker 0.41 $; n=2 |
+| Job | research report from docs (RU) | 1.0 | 143.4k | 929.5k | 1.44 | 36 | 134.1k | 9.2k | 1.07M | 2/2 | 4.3 | 0.7 | parent 0.67 $ + worker 0.77 $; n=2 |
 
-Results will be filled in here when the runs are done.
+**All 18 runs:** foreground subagent $5.10, 576k non-cache-read and 2.08M cache-read tokens, 1.7 min per run, parent busy 1.65 min; background subagent $4.84, 539k and 2.14M, 1.3 min, parent busy 0.47 min; job $6.51, 633k and 4.29M, 3.8 min, parent busy 0.73 min. The job costs +28% against the foreground and +35% against the background subagent: the job's own session is a full top-level Claude Code run (bigger system prompt and tool set, the preamble and the checklist), and its parent spends two turns and about twice as many calls (start, then job_result, diff check and cherry-pick). The extra wall time is the daemon's one-minute tick, at the start and again for the job-done line. The 5-hour window moved 1 / 4 / 4 points for the three modes (9 points for about $16.5 of measured work, with other sessions of the same account running): too coarse to rank them.
 
 ---
 
@@ -551,6 +558,7 @@ agent-jobs version                      # also --version
 - [docs/DEVIATIONS.md](docs/DEVIATIONS.md): every approved deviation from the reference
 - [docs/DECISIONS.md](docs/DECISIONS.md): owner decisions that shape scope
 - [docs/PLAN.md](docs/PLAN.md): roadmap
+- [docs/BENCHMARK.md](docs/BENCHMARK.md): subagent vs background subagent vs job benchmark and real-usage numbers
 - [CHANGELOG.md](CHANGELOG.md)
 
 ## Release checklist
