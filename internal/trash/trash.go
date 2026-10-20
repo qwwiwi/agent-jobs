@@ -41,6 +41,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/qwwiwi/agent-jobs/internal/casefold"
 )
 
 // Trash is one agent's trash.
@@ -139,7 +141,7 @@ func hasGitComponent(p string) bool {
 // Allowed roots are not folded: a case mismatch there only refuses.
 func fold(p string) string {
 	if foldCase {
-		return strings.ToLower(p)
+		return casefold.Fold(p)
 	}
 	return p
 }

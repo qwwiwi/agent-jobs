@@ -47,6 +47,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+
+	"github.com/qwwiwi/agent-jobs/internal/casefold"
 )
 
 // Config tells the guard who the owner is and which git identity is allowed.
@@ -214,12 +216,23 @@ func inGitDir(p string) bool {
 // simulate a case-insensitive file system on Linux.
 var foldCase = runtime.GOOS == "darwin" || runtime.GOOS == "windows"
 
-// fold returns a path or text as the file system compares names: lower-cased under foldCase.
+// fold returns a path or text as the file system compares names: Unicode case-folded under
+// foldCase (`JOBſ.DB` names `jobs.db`, see casefold.Fold).
 func fold(p string) string {
 	if foldCase {
-		return strings.ToLower(p)
+		return casefold.Fold(p)
 	}
 	return p
+}
+
+// progName is the name a command's rules are looked up by: the base name of argv[0], Unicode
+// case-folded (`rſync` runs rsync from a case-insensitive volume) and mapped through toolAliases.
+func progName(argv0 string) string {
+	n := casefold.Fold(base(argv0))
+	if a, ok := toolAliases[n]; ok {
+		return a
+	}
+	return n
 }
 
 // within reports whether p is d or lies inside it (both absolute and clean), case-folded under
@@ -451,7 +464,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				if len(argv) == 0 {
 					continue
 				}
-				name := strings.ToLower(base(argv[0]))
+				name := progName(argv[0])
 				if gitFileReaders[name] {
 					continue
 				}
@@ -473,7 +486,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						}
 						continue
 					}
-					if d, ok := attachedDir(name, a); ok {
+					for _, d := range attachedDirs(name, a) {
 						if p, ok := s.hit(d, true); ok {
 							if _, in := s.hit(d, false); !in {
 								return ancestorBlocked(a, p)
@@ -593,7 +606,7 @@ func parseGit(argv []string) (gitCall, bool) {
 	if len(argv) == 0 {
 		return g, false
 	}
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	if !isGitName(name) {
 		return g, false
 	}
@@ -789,7 +802,7 @@ func dataOnly(name string, args []string, dyn []bool) bool {
 	switch {
 	case copiers[name]:
 		for k, a := range args {
-			if !strings.HasPrefix(a, "-") && (execName(strings.ToLower(base(a))) || (dyn[k] && mentionsExec(a))) {
+			if !strings.HasPrefix(a, "-") && (execName(progName(a)) || (dyn[k] && mentionsExec(a))) {
 				return false
 			}
 		}
@@ -898,7 +911,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 		return ""
 	}
 	argv, dyn := c.words[v.start:], c.dyn[v.start:]
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	if dyn[0] {
 		return cannot("command name from a variable or substitution")
 	}
@@ -992,7 +1005,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
 	// arguments is rejected.
 	for k, a := range argv[1:] {
-		if b := strings.ToLower(base(a)); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
+		if b := progName(a); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
 			(dyn[k+1] && mentionsExec(a)) {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
 		}
@@ -1030,7 +1043,7 @@ var execOpts = map[string]bool{
 func scopeToolArg(name string, args []string, dyn []bool) string {
 	for k, a := range args {
 		v := optValue(a)
-		b := strings.ToLower(base(v))
+		b := progName(v)
 		opt, _, _ := strings.Cut(a, "=")
 		switch {
 		case dyn[k] && reScopeMention.MatchString(a):
@@ -1063,7 +1076,7 @@ func checkPackageRunners(scripts []*script, _ string, _ Config) string {
 		if len(argv) == 0 {
 			return ""
 		}
-		name := strings.ToLower(base(argv[0]))
+		name := progName(argv[0])
 		subs, ok := packageRunners[name]
 		if !ok {
 			return ""
@@ -1090,7 +1103,7 @@ func checkPackageRunners(scripts []*script, _ string, _ Config) string {
 // indirect scan in unverifiable.
 func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
-		if len(argv) > 0 && isAgent(strings.ToLower(base(argv[0]))) {
+		if len(argv) > 0 && isAgent(progName(argv[0])) {
 			return "blocked by guard: `" + base(argv[0]) + "` starts a nested agent. A job is a leaf: it does the work itself " +
 				"and reports; only the orchestrator starts jobs."
 		}
@@ -1285,7 +1298,7 @@ func (v *cdView) tilde(w string) (string, bool) {
 // cdTarget returns the directory argument of a cd/pushd/popd argv; ok is false when it cannot be
 // resolved statically.
 func (v *cdView) cdTarget(argv []string, dyn []bool, cdpath bool) (string, bool) {
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	if name == "popd" {
 		return "", false
 	}
@@ -1334,7 +1347,7 @@ func newCdView(scripts []*script, cmd string, cfg Config) cdView {
 				if len(argv) == 0 {
 					continue
 				}
-				switch strings.ToLower(base(argv[0])) {
+				switch progName(argv[0]) {
 				case "cd", "pushd", "popd", "chdir":
 					v.sawCD = true
 					if c == trailing {
@@ -1385,7 +1398,7 @@ func trailingPopd(scripts []*script) *simpleCmd {
 		return nil
 	}
 	if eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
-		if len(argv) > 0 && strings.ToLower(base(argv[0])) == "trap" {
+		if len(argv) > 0 && progName(argv[0]) == "trap" {
 			return "trap"
 		}
 		return ""
@@ -1395,7 +1408,7 @@ func trailingPopd(scripts []*script) *simpleCmd {
 	pls := scripts[0].pipelines
 	cmds := pls[len(pls)-1].cmds
 	c := cmds[len(cmds)-1]
-	if argv := argvOf(c.words); len(argv) > 0 && strings.ToLower(base(argv[0])) == "popd" {
+	if argv := argvOf(c.words); len(argv) > 0 && progName(argv[0]) == "popd" {
 		return c
 	}
 	return nil
@@ -1451,7 +1464,7 @@ func localVars(scripts []*script, cmd string, sawCD bool) (names map[string]bool
 					continue
 				}
 				add(argv[0]) // `a[0]=x`, `a+=x` are not split off as assignments
-				switch name := strings.ToLower(base(argv[0])); {
+				switch name := progName(argv[0]); {
 				case name == "." || name == "source":
 					all = true
 				case name == "for" || name == "select":
@@ -1508,7 +1521,7 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				st := split(c.words).start
-				if st < len(c.words) && strings.ToLower(base(c.words[st])) == "ln" && slices.Contains(c.dyn[st+1:], true) {
+				if st < len(c.words) && progName(c.words[st]) == "ln" && slices.Contains(c.dyn[st+1:], true) {
 					out[c] = true
 				}
 			}
@@ -1529,7 +1542,7 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 		if len(argv) == 0 {
 			return ""
 		}
-		name := strings.ToLower(base(argv[0]))
+		name := progName(argv[0])
 		if outOfScopeTools[name] {
 			return "blocked by guard: `" + name + "` starts processes outside the job's cgroup scope (service manager, " +
 				"session bus, scheduler, terminal multiplexer, process manager, container, ssh or namespace); a job runs " +
@@ -1629,7 +1642,7 @@ func checkCgroupWrites(scripts []*script, cmd string, cfg Config) string {
 				if len(argv) == 0 {
 					continue
 				}
-				name := strings.ToLower(base(argv[0]))
+				name := progName(argv[0])
 				if gitFileReaders[name] {
 					continue
 				}
@@ -1735,7 +1748,7 @@ func sedScriptArgs(argv []string) map[int]bool {
 // as an argument of another program it is caught by the indirect scan in unverifiable.
 func checkSelf(scripts []*script, _ string, _ Config) string {
 	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
-		if len(argv) > 0 && isSelf(strings.ToLower(base(argv[0]))) && !jobRoleMCP(argv[1:]) {
+		if len(argv) > 0 && isSelf(progName(argv[0])) && !jobRoleMCP(argv[1:]) {
 			return "blocked by guard: `" + base(argv[0]) + "` controls jobs. A job never starts, cancels or manages jobs " +
 				"(no nested jobs); only the orchestrator does."
 		}
@@ -1798,7 +1811,7 @@ func checkJobEnv(scripts []*script, _ string, _ Config) string {
 				}
 				name := ""
 				if v.start < len(c.words) {
-					name = strings.ToLower(base(c.words[v.start]))
+					name = progName(c.words[v.start])
 				}
 				if name == "printf" {
 					if t := printfTarget(c.words[v.start+1:]); strings.HasPrefix(t, "AGENT_JOBS_") {
@@ -1845,7 +1858,7 @@ func envBlocked(what string) string {
 func checkGitEnv(scripts []*script, _ string, _ Config) string {
 	runsGit := false
 	_ = eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
-		runsGit = runsGit || (len(argv) > 0 && isGitName(strings.ToLower(base(argv[0]))))
+		runsGit = runsGit || (len(argv) > 0 && isGitName(progName(argv[0])))
 		return ""
 	})
 	for _, sc := range scripts {
@@ -1861,7 +1874,7 @@ func checkGitEnv(scripts []*script, _ string, _ Config) string {
 					}
 				}
 				argv := c.words[v.start:]
-				if len(argv) > 0 && strings.ToLower(base(argv[0])) == "unset" {
+				if len(argv) > 0 && progName(argv[0]) == "unset" {
 					for _, a := range argv[1:] {
 						if reScrubVar.MatchString(a) {
 							return envBlocked("unset " + a)
@@ -1946,7 +1959,7 @@ func dotGlobOn(c *simpleCmd, argv []string) bool {
 	if len(argv) == 0 {
 		return false
 	}
-	switch strings.ToLower(base(argv[0])) {
+	switch progName(argv[0]) {
 	case "shopt", "setopt", "unsetopt", "set":
 		for _, a := range argv[1:] {
 			n := strings.ReplaceAll(strings.ToLower(a), "_", "")
@@ -1987,7 +2000,7 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				if len(argv) == 0 {
 					continue
 				}
-				name := strings.ToLower(base(argv[0]))
+				name := progName(argv[0])
 				if isGitName(name) || gitFileReaders[name] {
 					continue
 				}

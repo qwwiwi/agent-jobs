@@ -92,7 +92,7 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 	if len(argv) == 0 {
 		return
 	}
-	switch strings.ToLower(base(argv[0])) {
+	switch progName(argv[0]) {
 	case "cd", "pushd":
 		s.cd(argv, c.dyn[len(c.words)-len(argv):], cdpathEnv)
 	case "ln", "link":
@@ -623,13 +623,22 @@ func pathTokens(w string) []string {
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
 // argument: with an ancestor of a protected path as an argument they reach it (`rm -r <state>`,
-// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`). Looked
-// up by the lower-cased base name of the program.
+// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`,
+// `unrar x a.rar <home>`). Looked up by progName, so the other names of a tool (toolAliases) count
+// too.
 var treeWriters = map[string]bool{
 	"rm": true, "rmdir": true, "unlink": true, "mv": true, "cp": true, "install": true, "ln": true,
 	"rsync": true, "chmod": true, "chown": true, "chgrp": true, "tar": true, "shred": true,
-	"bsdtar": true, "gtar": true, "unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true,
-	"7za": true, "7zz": true,
+	"unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true, "p7zip": true, "unar": true,
+	"unrar": true, "rar": true, "cabextract": true, "aunpack": true, "atool": true, "dtrx": true,
+	"xar": true, "jar": true, "lha": true, "lhasa": true, "arj": true, "unarj": true,
+}
+
+// toolAliases map the other names of a tool to the one its rules are kept under: GNU and BSD
+// builds and the p7zip and 7-Zip front ends take the same options and write the same way.
+var toolAliases = map[string]string{
+	"gtar": "tar", "gnutar": "tar", "bsdtar": "tar", "bsdcpio": "cpio", "bsdunzip": "unzip",
+	"7za": "7z", "7zz": "7z", "7zzs": "7z", "7zr": "7z", "7zg": "7z",
 }
 
 // clusterDirOpts are the archive tools whose short options cluster like getopt: the directory
@@ -641,44 +650,73 @@ var treeWriters = map[string]bool{
 // word, which is checked whole as an ancestor already. unzip has no value option in `vals`: its `-P`
 // takes the rest of the word only for the first password, a repeated `-P` is skipped and the scan
 // goes on (`-Pdummy -Pd<dir>`), so any `d` in the word counts; a `-` inside a cluster negates the
-// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too.
+// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too. atool and aunpack
+// parse with Getopt::Long bundling (`-fX<dir>`, case-sensitive: `-x` is --extract); their numeric
+// `-V` hands the rest of the word back as a new cluster (`-V1X<dir>`), so it is not in `vals`.
 var clusterDirOpts = map[string]struct {
 	dir  byte
 	vals string
 }{
-	"tar": {'C', "bITXf"}, "bsdtar": {'C', "bITXf"}, "gtar": {'C', "bITXf"},
-	"unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
+	"tar": {'C', "bITXf"}, "unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"}, "cabextract": {'d', "eF"},
+	"xar": {'C', "fnsb"}, "atool": {'X', "FOo"}, "aunpack": {'X', "FOo"},
 }
 
-// sevenZips take switches case-insensitively, one per word: `-o<dir>` and `-O<dir>` both set the
-// output directory.
-var sevenZips = map[string]bool{"7z": true, "7za": true, "7zz": true}
+// dirSwitches are the directory switches that other extractors take with the directory in the same
+// word, one switch per word, compared case-insensitively (`7z x -o<dir>`, `unrar x -op<dir>`): a
+// word starting with one names the directory after it. ARJ is not here: see arjTargets.
+var dirSwitches = map[string][]string{
+	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"},
+}
 
-// attachedDir returns the directory attached to an archive tool's directory option in the same
-// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
-func attachedDir(name, a string) (string, bool) {
-	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
-		return "", false
+// attachedDirs returns the directories attached to an archive tool's directory option in the same
+// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`, `-op<dir>`, `-yht<dir>`).
+func attachedDirs(name, a string) []string {
+	if name == "arj" {
+		return arjTargets(a)
 	}
-	if sevenZips[name] {
-		if a[1] != 'o' && a[1] != 'O' {
-			return "", false
+	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
+		return nil
+	}
+	if sw, ok := dirSwitches[name]; ok {
+		for _, p := range sw {
+			if len(a) > len(p) && strings.EqualFold(a[:len(p)], p) {
+				return []string{a[len(p):]}
+			}
 		}
-		return a[2:], true
+		return nil
 	}
 	opt, ok := clusterDirOpts[name]
 	if !ok {
-		return "", false
+		return nil
 	}
 	for j := 1; j < len(a)-1; j++ {
 		switch c := a[j]; {
 		case c == opt.dir:
-			return a[j+1:], true
+			return []string{a[j+1:]}
 		case strings.IndexByte(opt.vals, c) >= 0:
-			return "", false
+			return nil
 		}
 	}
-	return "", false
+	return nil
+}
+
+// arjTargets returns the candidate extraction targets in an ARJ switch word. ARJ reads the switch
+// characters of a word one after another, `h` shifting to a two-letter switch, and `-ht` takes the
+// rest of the word as the target, so it may follow other switches (`-yht<dir>`, `-jyvht<dir>`),
+// in any case. Which switches before it take a value is not modelled: every `ht` after the switch
+// character of a word starting with `-` or `/` starts a candidate (fail closed; a candidate inside
+// a value is a false refusal only when it names an ancestor).
+func arjTargets(a string) []string {
+	if len(a) < 4 || (a[0] != '-' && a[0] != '/') {
+		return nil
+	}
+	var dirs []string
+	for j := 1; j+2 < len(a); j++ {
+		if (a[j] == 'h' || a[j] == 'H') && (a[j+1] == 't' || a[j+1] == 'T') {
+			dirs = append(dirs, a[j+2:])
+		}
+	}
+	return dirs
 }
 
 // findActs reports a find with an action that writes or runs something (-delete, -exec, -fprint, …).
