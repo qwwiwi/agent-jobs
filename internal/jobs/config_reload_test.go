@@ -261,8 +261,16 @@ func TestWrapperAcceptanceRequiresLaunchAndDiskPermission(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := acceptanceManager(t, "")
 			j := enqueue(t, m, "work", withAcceptance("true"))
+			if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if tc.authorized {
+				if err := m.Store.SetLaunchAuthorization(j.ID, "tok", 1, store.LaunchAuthorization{AcceptanceAllowed: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			writeReloadConfig(t, m, tc.disk)
-			a, err := openAcceptance(m.JobDir(j.ID), tc.authorized)
+			a, err := openAcceptance(m.JobDir(j.ID), "tok")
 			if a != nil {
 				defer a.st.Close()
 			}

@@ -34,6 +34,7 @@ type Manager struct {
 	runtimeConfig        atomic.Pointer[Config]
 	configWatch          *ConfigReloader
 	configPublishPending bool
+	daemonLockHeld       bool
 	Store                *store.Store
 	// SelfBin is the agent-jobs binary used for run-wrapper and the guard hook.
 	SelfBin string
@@ -392,6 +393,13 @@ func (m *Manager) tickLocked() error {
 		return err
 	}
 	defer unlock()
+	if !m.daemonLockHeld {
+		unlockLauncher, err := m.lockLauncher()
+		if err != nil {
+			return err
+		}
+		defer unlockLauncher()
+	}
 	var errs []error
 	if err := m.collect(); err != nil {
 		errs = append(errs, fmt.Errorf("collect: %w", err))
@@ -590,9 +598,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 				wrapper: []string{"--runner", store.RunnerCodex}}
 		}
 	}
-	if j.AcceptanceCmd != "" {
-		// Only the launching daemon can grant this permission; the wrapper still checks disk revocation.
-		plan.wrapper = append(plan.wrapper, "--acceptance-allowed", strconv.FormatBool(launchCfg.AcceptanceAllowed))
+	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
+		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
+		AcceptanceAllowed: j.AcceptanceCmd != "" && launchCfg.AcceptanceAllowed,
+	}); err != nil {
+		return fmt.Errorf("record launch authorization: %w", err)
 	}
 	if unit != "" || j.ScopeUnit != "" {
 		// Recorded before the spawn: a daemon that dies right after it still stops the scope later. A

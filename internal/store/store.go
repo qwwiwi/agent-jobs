@@ -223,6 +223,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 	launch_token    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+CREATE TABLE IF NOT EXISTS launch_authorizations (
+	job_id TEXT PRIMARY KEY,
+	attempt INTEGER NOT NULL,
+	launch_token TEXT NOT NULL,
+	codex_write_allowed INTEGER NOT NULL DEFAULT 0,
+	acceptance_allowed INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS attempts (
 	job_id          TEXT NOT NULL,
 	n               INTEGER NOT NULL,

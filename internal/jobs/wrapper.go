@@ -175,6 +175,12 @@ func admitted(jobDir, token string) error {
 	if j.Status != store.StatusRunning || j.LaunchToken != token {
 		return fmt.Errorf("job is %s under another launch or no longer running", j.Status)
 	}
+	if j.Runner == store.RunnerCodex && CodexSandbox(j.Kind) == CodexSandboxWrite {
+		a, err := st.ReadLaunchAuthorization(j.ID, token)
+		if err != nil || !a.CodexWriteAllowed {
+			return errors.New("codex_write_allowed was not authorized by the launching daemon")
+		}
+	}
 	return nil
 }
 
@@ -285,7 +291,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	// The acceptance command (if the job has one) runs only after a clean claude run: exit 0, a report,
 	// a complete sweep. Its result goes into the job row before exit_code says the job is over.
 	if code == 0 && !sw.Incomplete() && hasReport(jobDir) {
-		if rc := runAcceptanceStep(jobDir, token, stderrLog, opts.AcceptanceAllowed); rc != 0 {
+		if rc := runAcceptanceStep(jobDir, token, stderrLog); rc != 0 {
 			return rc
 		}
 	}
@@ -298,11 +304,10 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 
 // WrapperOptions are the run-wrapper options of a resume launch (see RunWrapper).
 type WrapperOptions struct {
-	Prompt            string // stdin file name in the job dir; empty = prompt.md
-	FallbackPrompt    string // stdin file name for the fresh-session fallback; empty = no fallback
-	FallbackSession   string // the fallback's session id
-	Runner            string // the program argv runs: claude (default) or codex
-	AcceptanceAllowed bool   // effective permission from the launching daemon; absent denies acceptance
+	Prompt          string // stdin file name in the job dir; empty = prompt.md
+	FallbackPrompt  string // stdin file name for the fresh-session fallback; empty = no fallback
+	FallbackSession string // the fallback's session id
+	Runner          string // the program argv runs: claude (default) or codex
 }
 
 func (o WrapperOptions) prompt() string {
