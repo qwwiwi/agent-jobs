@@ -265,8 +265,10 @@ func sigRecorder(t *testing.T) *[]string {
 
 // #55 (macOS): the wrapper's identity comes from kern.procargs2 before every group signal. A live
 // group led by a process that is not the job's wrapper is never signalled; a proven wrapper's group
-// gets SIGTERM and, still proven, SIGKILL; once the wrapper is gone no member is signalled by pid (even
-// a marked one: nothing pins it between the check and the kill) and the ones left are reported.
+// gets SIGTERM and, still proven, SIGKILL; once the wrapper is gone no member is signalled by pid
+// (nothing pins it between the check and the kill), but the group still gets SIGKILL while a live
+// member carries the job's marker (fix loop 2: a marked child that ignores SIGTERM must not survive),
+// and none when no member does; the ones left are reported.
 func TestKillGroupBySysctl(t *testing.T) {
 	leader := exec.Command("sleep", "30")
 	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -311,7 +313,7 @@ func TestKillGroupBySysctl(t *testing.T) {
 				return marked, nil
 			}
 			return sysctlInfo{}, errNoSysctlIdentity // 778 gone
-		}, []string{fmt.Sprintf("-%d:15", g)}, false, groupSurvived},
+		}, []string{fmt.Sprintf("-%d:15", g), fmt.Sprintf("-%d:9", g)}, false, groupSurvived},
 		{"wrapper gone, a member unmarked", func(calls, pid int) (sysctlInfo, error) {
 			switch {
 			case pid == g && calls == 1:
@@ -322,6 +324,30 @@ func TestKillGroupBySysctl(t *testing.T) {
 				return marked, nil
 			}
 			return unmarked, nil
+		}, []string{fmt.Sprintf("-%d:15", g), fmt.Sprintf("-%d:9", g)}, false, groupSurvived},
+		{"wrapper gone, no member marked", func(calls, pid int) (sysctlInfo, error) {
+			switch {
+			case pid == g && calls == 1:
+				return wrapper, nil
+			case pid == g:
+				return sysctlInfo{}, errNoSysctlIdentity
+			}
+			return unmarked, nil
+		}, []string{fmt.Sprintf("-%d:15", g)}, false, groupSurvived},
+		{"wrapper gone, marked member is a zombie or elsewhere", func(calls, pid int) (sysctlInfo, error) {
+			switch {
+			case pid == g && calls == 1:
+				return wrapper, nil
+			case pid == g:
+				return sysctlInfo{}, errNoSysctlIdentity
+			case pid == 777:
+				z := marked
+				z.zombie = true
+				return z, nil
+			}
+			moved := marked
+			moved.pgid = g + 1
+			return moved, nil
 		}, []string{fmt.Sprintf("-%d:15", g)}, false, groupSurvived},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -557,5 +583,50 @@ func TestEndLedGroupTwoGenerationHandoff(t *testing.T) {
 		if !slices.Contains(*sent, want) {
 			t.Fatalf("sent %v lacks %s (%v %q)", *sent, want, res, why)
 		}
+	}
+}
+
+// #55 fix loop 2: members that survive the kill are not dropped silently. The cancelled row names
+// them with ReasonSurvivors, and the group recorded at the spawn stays recorded while it lives (its
+// cleanup, prune and resume are held up).
+func TestCancelRecordsSurvivingGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux only")
+	}
+	m := newManager(t)
+	m.KillGrace = 100 * time.Millisecond
+	j := enqueue(t, m, "FAKE_SLEEP=60", nil)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "fake claude", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
+		return err == nil
+	})
+	j = get(t, m, j.ID)
+	g := j.PGID
+	t.Cleanup(func() {
+		_ = syscall.Kill(-g, syscall.SIGKILL)
+		waitFor(t, "group gone", 5*time.Second, func() bool { return !groupAlive(g) })
+	})
+	// The signals are not delivered: every member survives.
+	realSend := pidfdSend
+	pidfdSend = func(fd int, sig syscall.Signal) error {
+		if sig == 0 {
+			return realSend(fd, 0)
+		}
+		return nil
+	}
+	t.Cleanup(func() { pidfdSend = realSend })
+	if err := m.Cancel(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusCancelled || !strings.Contains(got.Error, ReasonSurvivors) ||
+		!strings.Contains(got.Error, fmt.Sprintf("process group %d survived", g)) {
+		t.Fatalf("status %s error %q", got.Status, got.Error)
+	}
+	if !m.spawnedGroupAlive(got) || !got.PGIDSpawned {
+		t.Fatal("the surviving group is no longer recorded")
 	}
 }

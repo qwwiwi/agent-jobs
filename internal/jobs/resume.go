@@ -422,13 +422,16 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		}
 		return nil, fmt.Errorf("job %s ended before the stop (%s): %w", id, cur.Status, store.ErrImmutable)
 	}
-	m.killRunning(j)
+	survivors := m.killRunning(j)
 	m.removeSkills(j)
 	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
 	// resume counts this attempt at its whole budget), whatever result line the stream holds.
 	res, killed := killedResult(j.Runner, dir)
 	if killed {
 		msg += " (cost so far unknown: ended by the stop)"
+	}
+	if survivors != "" {
+		msg += "; " + survivors
 	}
 	m.noteFallback(j)
 	// The scope is ended like a cancel's: nothing of the attempt may outlive it. A failed stop stays
