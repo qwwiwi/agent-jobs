@@ -275,6 +275,8 @@ func mcpServerStatus(d Deps) MCPServerStatus {
 	}
 	if d.Watch != nil {
 		st.Warnings = d.Watch.Warnings("system_doctor")
+	} else if warning := m.DaemonConfigWarning(); warning != "" {
+		st.Warnings = append(st.Warnings, warning)
 	}
 	procs, _, err := m.StaleMCPProcs()
 	if err != nil {

@@ -385,19 +385,25 @@ func StateDir(agent string) (string, error) {
 
 // LoadConfig reads <state>/config.json; a missing file yields defaults.
 func LoadConfig(stateDir string) (Config, error) {
-	var c Config
 	b, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return c, fmt.Errorf("read config: %w", err)
-	default:
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Config{}, fmt.Errorf("read config: %w", err)
+	}
+	return parseConfig(stateDir, b)
+}
+
+func parseConfig(stateDir string, b []byte) (Config, error) {
+	var c Config
+	if b != nil {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
 		}
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(b, &raw); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
+		}
+		if raw == nil {
+			return c, errors.New("config.json must be a JSON object, not null")
 		}
 		for k, why := range removedConfigKeys {
 			if _, ok := raw[k]; ok {

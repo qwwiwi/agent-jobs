@@ -290,7 +290,7 @@ const (
 // host, a failing probe requeues the job (errScopeRetry) for up to ScopeRetryWindow instead of
 // downgrading it (auto) or refusing it (required) on a transient failure.
 func (m *Manager) scopeFor(id string) (string, error) {
-	switch mode := m.Cfg.scopeMode(); mode {
+	switch mode := m.Config().scopeMode(); mode {
 	case ScopeOff:
 		return "", nil
 	case ScopeAuto, ScopeRequired:

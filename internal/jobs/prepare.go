@@ -167,14 +167,14 @@ func (m *Manager) SubagentLogPath(id string) string {
 // guardCommand builds the hook command line; readOnly is the worktree of a review job ("" = none).
 func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
-	for _, n := range m.Cfg.OwnerNames {
+	for _, n := range m.Config().OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
 	}
-	if m.Cfg.GitName != "" {
-		parts = append(parts, "--git-name", shellQuote(m.Cfg.GitName))
+	if m.Config().GitName != "" {
+		parts = append(parts, "--git-name", shellQuote(m.Config().GitName))
 	}
-	if m.Cfg.GitEmail != "" {
-		parts = append(parts, "--git-email", shellQuote(m.Cfg.GitEmail))
+	if m.Config().GitEmail != "" {
+		parts = append(parts, "--git-email", shellQuote(m.Config().GitEmail))
 	}
 	for _, d := range gitDirs {
 		parts = append(parts, "--git-dir", shellQuote(d))
@@ -247,7 +247,7 @@ func template(name string) (string, error) {
 
 // readOwnerRules returns the owner rules or an error that stops the job from starting.
 func (m *Manager) readOwnerRules() (string, error) {
-	p := m.Cfg.OwnerRulesPath
+	p := m.Config().OwnerRulesPath
 	fi, err := os.Stat(p)
 	if err != nil {
 		return "", fmt.Errorf("owner rules %s unreadable: %w", p, err)
@@ -437,7 +437,7 @@ func (m *Manager) writeGitFiles(dir string) error {
 	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
 		return fmt.Errorf("write gitconfig: %w", err)
 	}
-	for _, kv := range [][2]string{{"user.name", m.Cfg.GitName}, {"user.email", m.Cfg.GitEmail}} {
+	for _, kv := range [][2]string{{"user.name", m.Config().GitName}, {"user.email", m.Config().GitEmail}} {
 		if kv[1] == "" {
 			continue
 		}

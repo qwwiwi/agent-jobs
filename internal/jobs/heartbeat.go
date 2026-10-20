@@ -182,7 +182,7 @@ func localMidnight(t time.Time, loc *time.Location) time.Time {
 // staleHeartbeatAfter is how long a pending decision may stay pending before it is taken as
 // abandoned: the call's time limit, the delivery's and a margin.
 func (m *Manager) staleHeartbeatAfter() time.Duration {
-	return m.Cfg.Heartbeat.Timeout() + TmuxDeliveryTimeout + 2*time.Minute
+	return m.Config().Heartbeat.Timeout() + TmuxDeliveryTimeout + 2*time.Minute
 }
 
 // HeartbeatGateResult is the outcome of the Go gate.
@@ -222,7 +222,7 @@ func (m *Manager) heartbeatFacts(now time.Time) (heartbeatFacts, error) {
 
 // goalsState reports whether the goals file has content: "" when it does, else why not.
 func (m *Manager) goalsState() string {
-	fi, err := os.Stat(m.Cfg.Heartbeat.GoalsFile)
+	fi, err := os.Stat(m.Config().Heartbeat.GoalsFile)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return "idle: goals file missing"
@@ -254,7 +254,7 @@ func (m *Manager) HeartbeatGateDry(now time.Time) (daemon, runNow HeartbeatGateR
 }
 
 func (m *Manager) heartbeatGate(now time.Time, ignoreInterval, markStale bool) (HeartbeatGateResult, error) {
-	hc := m.Cfg.Heartbeat
+	hc := m.Config().Heartbeat
 	if !hc.Enabled {
 		return HeartbeatGateResult{Reason: "off (heartbeat.enabled is false)"}, nil
 	}
@@ -309,7 +309,7 @@ func (m *Manager) sessionBusy(now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(pn) > 0 && m.Cfg.NotifyTmuxTarget != "" {
+	if len(pn) > 0 && m.Config().NotifyTmuxTarget != "" {
 		return fmt.Sprintf("delivery pending: %d job-done lines", len(pn)), nil
 	}
 	alerts, err := m.Store.CountPendingCheckAlerts()
@@ -332,7 +332,7 @@ func (m *Manager) sessionBusy(now time.Time) (string, error) {
 // nextHeartbeatEligible is the earliest time the interval, the daily cap and the night window allow
 // a decision (it may be now).
 func (m *Manager) nextHeartbeatEligible(now time.Time, f heartbeatFacts, ignoreInterval bool) time.Time {
-	hc, loc := m.Cfg.Heartbeat, m.loc()
+	hc, loc := m.Config().Heartbeat, m.loc()
 	t := now
 	if !ignoreInterval {
 		for _, h := range []*store.Heartbeat{f.lastWake, f.last} {
@@ -358,7 +358,7 @@ func (m *Manager) nextHeartbeatEligible(now time.Time, f heartbeatFacts, ignoreI
 // readGoals returns the goals text, at most MaxHeartbeatGoalsBytes (cut on a UTF-8 boundary),
 // redacted; truncated reports a cut.
 func (m *Manager) readGoals() (text string, truncated bool, err error) {
-	f, err := os.OpenFile(m.Cfg.Heartbeat.GoalsFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(m.Config().Heartbeat.GoalsFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", false, err
 	}
@@ -515,7 +515,7 @@ type heartbeatResult struct {
 // scope when cgroup_scope allows one; the call is killed (group and scope) at the time limit. It
 // returns the model's result text and the reported cost.
 func (m *Manager) heartbeatCall(ctx context.Context, id int64, prompt string) (string, float64, error) {
-	hc := m.Cfg.Heartbeat
+	hc := m.Config().Heartbeat
 	dir := filepath.Join(m.StateDir, "heartbeat")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", 0, err
@@ -530,7 +530,7 @@ func (m *Manager) heartbeatCall(ctx context.Context, id int64, prompt string) (s
 	if err != nil {
 		return "", 0, fmt.Errorf("containment: %w", err)
 	}
-	argv := append([]string{m.Cfg.claudeBin()}, HeartbeatArgs(hc, dir)...)
+	argv := append([]string{m.Config().claudeBin()}, HeartbeatArgs(hc, dir)...)
 	if unit != "" {
 		argv = append(scopeArgv(unit, fmt.Sprintf("agent-jobs heartbeat %d (agent %s)", id, m.Agent), m.KillGrace), argv...)
 	}
@@ -610,7 +610,7 @@ func (m *Manager) RunHeartbeat(ctx context.Context, trigger string) (*store.Hear
 	runNow := trigger == HeartbeatTriggerRunNow
 	unlock, err := m.heartbeatLock()
 	if err != nil {
-		if trigger == HeartbeatTriggerDaemon && m.Cfg.Heartbeat.Enabled && errors.Is(err, errHeartbeatGate) {
+		if trigger == HeartbeatTriggerDaemon && m.Config().Heartbeat.Enabled && errors.Is(err, errHeartbeatGate) {
 			if serr := m.Store.SetHeartbeatGate("another heartbeat holds heartbeat.lock", m.Now()); serr != nil {
 				m.Log.Printf("heartbeat: %v", serr)
 			}
@@ -623,7 +623,7 @@ func (m *Manager) RunHeartbeat(ctx context.Context, trigger string) (*store.Hear
 	if err != nil {
 		return nil, err
 	}
-	if trigger == HeartbeatTriggerDaemon && m.Cfg.Heartbeat.Enabled {
+	if trigger == HeartbeatTriggerDaemon && m.Config().Heartbeat.Enabled {
 		if err := m.Store.SetHeartbeatGate(gate.Reason, now); err != nil {
 			m.Log.Printf("heartbeat: %v", err)
 		}
@@ -632,7 +632,7 @@ func (m *Manager) RunHeartbeat(ctx context.Context, trigger string) (*store.Hear
 		return nil, fmt.Errorf("%w: %s", errHeartbeatGate, gate.Reason)
 	}
 	afterHeartbeatGate()
-	lim := store.HeartbeatClaimLimits{MinGap: m.Cfg.Heartbeat.Interval(), MaxWakes: m.Cfg.Heartbeat.MaxWakes(),
+	lim := store.HeartbeatClaimLimits{MinGap: m.Config().Heartbeat.Interval(), MaxWakes: m.Config().Heartbeat.MaxWakes(),
 		DayStart: localMidnight(now, m.loc())}
 	if runNow {
 		lim.MinGap = 0
@@ -668,7 +668,7 @@ func (m *Manager) heartbeatLock() (func(), error) {
 // since the gate: the heartbeat still on, outside the night window, nothing queued for the session.
 // It returns why a wake may no longer be delivered, or "".
 func (m *Manager) heartbeatDeliveryClosed(now time.Time) (string, error) {
-	hc := m.Cfg.Heartbeat
+	hc := m.Config().Heartbeat
 	if !hc.Enabled {
 		return "off (heartbeat.enabled is false)", nil
 	}
@@ -717,7 +717,7 @@ func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error
 	}
 	// deliver runs under tmux.lock (when a target is set), right before typing: the re-check, the
 	// stored outcome and the line. stored is the outcome, "" when deliver never ran.
-	target := m.Cfg.NotifyTmuxTarget
+	target := m.Config().NotifyTmuxTarget
 	var stored string
 	var storeErr error
 	deliver := func(ctx context.Context) error {
@@ -769,7 +769,7 @@ func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error
 // StartHeartbeat runs one heartbeat in its own goroutine when the gate is open and none runs in this
 // process; it returns at once, so the daemon's next ticks are never delayed. Errors are logged.
 func (m *Manager) StartHeartbeat(ctx context.Context) bool {
-	if !m.Cfg.Heartbeat.Enabled || ctx.Err() != nil {
+	if !m.Config().Heartbeat.Enabled || ctx.Err() != nil {
 		return false
 	}
 	if !m.hbMu.TryLock() {
@@ -822,7 +822,7 @@ type HeartbeatStatus struct {
 
 // Heartbeat returns the heartbeat state. It reads only (no stale decision is marked here).
 func (m *Manager) Heartbeat() (HeartbeatStatus, error) {
-	hc := m.Cfg.Heartbeat
+	hc := m.Config().Heartbeat
 	st := HeartbeatStatus{Enabled: hc.Enabled}
 	now := m.Now()
 	f, err := m.heartbeatFacts(now)

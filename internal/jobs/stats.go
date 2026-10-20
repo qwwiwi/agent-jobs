@@ -470,7 +470,7 @@ func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store
 		if ss == nil || ss.TokensInvalid || ss.Tokens == (TokenUsage{}) {
 			return
 		}
-		if p, ok := m.Cfg.PriceFor(model); ok {
+		if p, ok := m.Config().PriceFor(model); ok {
 			est += p.Cost(ss.Tokens)
 			priced++
 		}

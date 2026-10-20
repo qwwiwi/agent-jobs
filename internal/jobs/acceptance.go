@@ -194,7 +194,7 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	switch {
 	case note == "":
 		return status, msg
-	case m.Cfg.ReportContract == ReportContractFail:
+	case m.Config().ReportContract == ReportContractFail:
 		return store.StatusFailed, note
 	case msg != "":
 		return status, msg + "; " + note
