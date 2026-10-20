@@ -486,7 +486,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						}
 						continue
 					}
-					if d, ok := attachedDir(name, a); ok {
+					for _, d := range attachedDirs(name, a) {
 						if p, ok := s.hit(d, true); ok {
 							if _, in := s.hit(d, false); !in {
 								return ancestorBlocked(a, p)

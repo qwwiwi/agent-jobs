@@ -662,40 +662,61 @@ var clusterDirOpts = map[string]struct {
 }
 
 // dirSwitches are the directory switches that other extractors take with the directory in the same
-// word, one switch per word (their parsers do not bundle), compared case-insensitively
-// (`7z x -o<dir>`, `unrar x -op<dir>`, `arj x -ht<dir>`): a word starting with one names the
-// directory after it.
+// word, one switch per word, compared case-insensitively (`7z x -o<dir>`, `unrar x -op<dir>`): a
+// word starting with one names the directory after it. ARJ is not here: see arjTargets.
 var dirSwitches = map[string][]string{
-	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"}, "arj": {"-ht"},
+	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"},
 }
 
-// attachedDir returns the directory attached to an archive tool's directory option in the same
-// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`, `-op<dir>`).
-func attachedDir(name, a string) (string, bool) {
+// attachedDirs returns the directories attached to an archive tool's directory option in the same
+// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`, `-op<dir>`, `-yht<dir>`).
+func attachedDirs(name, a string) []string {
+	if name == "arj" {
+		return arjTargets(a)
+	}
 	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
-		return "", false
+		return nil
 	}
 	if sw, ok := dirSwitches[name]; ok {
 		for _, p := range sw {
 			if len(a) > len(p) && strings.EqualFold(a[:len(p)], p) {
-				return a[len(p):], true
+				return []string{a[len(p):]}
 			}
 		}
-		return "", false
+		return nil
 	}
 	opt, ok := clusterDirOpts[name]
 	if !ok {
-		return "", false
+		return nil
 	}
 	for j := 1; j < len(a)-1; j++ {
 		switch c := a[j]; {
 		case c == opt.dir:
-			return a[j+1:], true
+			return []string{a[j+1:]}
 		case strings.IndexByte(opt.vals, c) >= 0:
-			return "", false
+			return nil
 		}
 	}
-	return "", false
+	return nil
+}
+
+// arjTargets returns the candidate extraction targets in an ARJ switch word. ARJ reads the switch
+// characters of a word one after another, `h` shifting to a two-letter switch, and `-ht` takes the
+// rest of the word as the target, so it may follow other switches (`-yht<dir>`, `-jyvht<dir>`),
+// in any case. Which switches before it take a value is not modelled: every `ht` after the switch
+// character of a word starting with `-` or `/` starts a candidate (fail closed; a candidate inside
+// a value is a false refusal only when it names an ancestor).
+func arjTargets(a string) []string {
+	if len(a) < 4 || (a[0] != '-' && a[0] != '/') {
+		return nil
+	}
+	var dirs []string
+	for j := 1; j+2 < len(a); j++ {
+		if (a[j] == 'h' || a[j] == 'H') && (a[j+1] == 't' || a[j+1] == 'T') {
+			dirs = append(dirs, a[j+2:])
+		}
+	}
+	return dirs
 }
 
 // findActs reports a find with an action that writes or runs something (-delete, -exec, -fprint, …).
