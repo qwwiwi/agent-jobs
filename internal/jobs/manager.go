@@ -63,6 +63,8 @@ type Manager struct {
 
 	hbMu sync.Mutex     // held while a heartbeat started by StartHeartbeat runs
 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
+
+	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -330,10 +332,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if ref == "" {
 			ref = "HEAD"
 		}
+		// The base is resolved in the worktree that was given (its HEAD, its branch).
 		if base, err = git(repo, "rev-parse", "--verify", ref+"^{commit}"); err != nil {
 			return nil, fmt.Errorf("base %q: %w", ref, err)
 		}
 		branch = baseBranch(repo, ref)
+		// The job stores the main worktree: a linked one (e.g. an earlier job's) may be removed
+		// before this job's cleanup, which then could not reach the repository (#57).
+		repo = mainWorktree(repo)
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}

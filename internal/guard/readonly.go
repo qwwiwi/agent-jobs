@@ -146,7 +146,7 @@ func (s *pathScope) readOnlyScripts(scripts []*script) string {
 // readOnlyCmd checks one command (program and args). piped: it reads a pipe; xargs: it runs under
 // xargs (more operands come from stdin).
 func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, xargs bool) string {
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	args, adyn := argv[1:], dyn[1:]
 	if g, ok := parseGit(argv); ok {
 		if gitWorktreeWriters[strings.ToLower(g.sub)] {
@@ -275,7 +275,7 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		}
 		k := ops[len(ops)-1]
 		return check(args[k], adyn[k], false)
-	case name == "tar" || name == "bsdtar":
+	case name == "tar":
 		return s.readOnlyTar(args, adyn, check)
 	case name == "unzip":
 		if slices.ContainsFunc(args, func(a string) bool { return a == "-l" || a == "-t" || a == "-p" || a == "-v" || a == "-Z" }) {

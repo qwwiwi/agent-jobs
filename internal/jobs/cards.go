@@ -356,7 +356,47 @@ func RepoTopLevel(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("repo %s is not a git repository: %w", path, err)
 	}
-	return top, nil
+	return mainWorktree(top), nil
+}
+
+// mainWorktree returns the main worktree of the repository when top is the top level of one of its
+// linked worktrees; otherwise (top is the main worktree, the repository is bare, or the main
+// worktree cannot be confirmed) top itself.
+func mainWorktree(top string) string {
+	gitDir, err := git(top, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return top
+	}
+	common, err := git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || samePath(gitDir, common) {
+		return top
+	}
+	list, err := git(top, "worktree", "list", "--porcelain")
+	if err != nil {
+		return top
+	}
+	// The first record is the main worktree; a bare repository has none ("bare" in that record).
+	first, _, _ := strings.Cut(list, "\n\n")
+	main := ""
+	for _, line := range strings.Split(first, "\n") {
+		if line == "bare" {
+			return top
+		}
+		if p, ok := strings.CutPrefix(line, "worktree "); ok {
+			main = p
+		}
+	}
+	if main == "" {
+		return top
+	}
+	// Confirmed from the main worktree itself: its top level and common dir.
+	if mt, err := git(main, "rev-parse", "--show-toplevel"); err != nil || !samePath(mt, main) {
+		return top
+	}
+	if mc, err := git(main, "rev-parse", "--path-format=absolute", "--git-common-dir"); err != nil || !samePath(mc, common) {
+		return top
+	}
+	return main
 }
 
 // NewCard writes a card for the repository at repoPath from the shipped template: front matter with

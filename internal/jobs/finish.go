@@ -352,12 +352,35 @@ func (m *Manager) runTmuxOutput(ctx context.Context, args ...string) (string, er
 	return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()+stdout.String()))
 }
 
+// After cleanupBackoffAfter consecutive failed cleanups of a job, the next tries wait twice as long
+// each time (one tick first), at most cleanupBackoffMax, and only the back-off itself is logged.
+const (
+	cleanupBackoffAfter = 3
+	cleanupBackoffMax   = time.Hour
+)
+
+// errRepoGone is a cleanup refused because the job's repo_path no longer exists. Only the daemon's
+// row names the repository (job-writable files are never used to find another one, #57), so such a
+// cleanup cannot succeed: once the back-off reaches its cap the row is marked skipped for good.
+var errRepoGone = errors.New("repo_path is gone")
+
+// cleanupFail is a job's run of failed cleanups (in memory: a daemon restart retries at once).
+type cleanupFail struct {
+	n    int
+	next time.Time // no retry before this
+}
+
 func (m *Manager) cleanupDue() error {
 	jobs, err := m.Store.PendingCleanup()
 	if err != nil {
 		return err
 	}
 	now := m.Now()
+	for id := range m.cleanupFails {
+		if !slices.ContainsFunc(jobs, func(j *store.Job) bool { return j.ID == id }) {
+			delete(m.cleanupFails, id) // cleaned, skipped, resumed or pruned meanwhile
+		}
+	}
 	for _, j := range jobs {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
@@ -365,14 +388,65 @@ func (m *Manager) cleanupDue() error {
 		if j.ScopePending {
 			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
+		f := m.cleanupFails[j.ID]
+		if now.Before(f.next) {
+			continue // backing off
+		}
 		if err := m.Cleanup(j); err != nil {
-			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", j.ID, RedactText(err.Error()))
+			if err := m.cleanupFailed(j, f, now, err); err != nil {
+				return err
+			}
 			continue
+		}
+		if f.n > 0 {
+			delete(m.cleanupFails, j.ID)
+			if f.n >= cleanupBackoffAfter {
+				m.Log.Printf("job %s: cleanup succeeded after %d failed attempts", j.ID, f.n)
+			}
 		}
 		if err := m.Store.MarkCleaned(j.ID, now); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// cleanupFailed records one more failed cleanup of job j (f is its run so far). The first
+// cleanupBackoffAfter failures are logged and retried on the next tick; at that count the back-off
+// is logged once, and later tries wait 2, 4, 8 … ticks (at most cleanupBackoffMax) and log nothing.
+// A cleanup refused with errRepoGone whose wait has reached the cap is marked skipped (one log line):
+// it is never retried and the job's folder is kept (prune leaves an uncleaned repo job alone).
+func (m *Manager) cleanupFailed(j *store.Job, f cleanupFail, now time.Time, err error) error {
+	f.n++
+	msg := RedactText(err.Error())
+	wait := time.Duration(0)
+	if f.n >= cleanupBackoffAfter {
+		wait = cleanupBackoffMax
+		if k := f.n - cleanupBackoffAfter + 1; k < 16 {
+			wait = min(TickInterval<<k, cleanupBackoffMax)
+		}
+		f.next = now.Add(wait)
+	}
+	if errors.Is(err, errRepoGone) && wait >= cleanupBackoffMax {
+		if err := m.Store.MarkCleanupSkipped(j.ID, now); err != nil {
+			return err
+		}
+		delete(m.cleanupFails, j.ID)
+		m.Log.Printf("job %s: repo_path gone; cleanup skipped, remove manually (failed %d times, not retried, "+
+			"worktree and job folder kept): %s", j.ID, f.n, msg)
+		return nil
+	}
+	switch {
+	case f.n < cleanupBackoffAfter:
+		m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", j.ID, msg)
+	case f.n == cleanupBackoffAfter:
+		m.Log.Printf("job %s: cleanup failed (worktree kept): %s; failed %d times in a row, backing off "+
+			"(retries up to every %s, not logged until it succeeds)", j.ID, msg, f.n, cleanupBackoffMax)
+	}
+	if m.cleanupFails == nil {
+		m.cleanupFails = make(map[string]cleanupFail)
+	}
+	m.cleanupFails[j.ID] = f
 	return nil
 }
 
@@ -469,6 +543,10 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	}
 	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing to touch %s: not a real directory (%s)", work, fi.Mode().Type())
+	}
+	// Fail closed: the repository comes only from the row, never from a job-writable file (#57).
+	if _, err := os.Lstat(j.RepoPath); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("refusing to touch %s: repo %s: %w", work, j.RepoPath, errRepoGone)
 	}
 	if err := m.verifyWorktree(j, work); err != nil {
 		return fmt.Errorf("refusing to touch %s: %w", work, err)
