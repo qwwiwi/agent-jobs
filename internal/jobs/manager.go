@@ -28,12 +28,13 @@ import (
 
 // Manager runs the job lifecycle for one agent.
 type Manager struct {
-	Agent         string
-	StateDir      string
-	Cfg           Config
-	runtimeConfig atomic.Pointer[Config]
-	configWatch   *ConfigReloader
-	Store         *store.Store
+	Agent                string
+	StateDir             string
+	Cfg                  Config
+	runtimeConfig        atomic.Pointer[Config]
+	configWatch          *ConfigReloader
+	configPublishPending bool
+	Store                *store.Store
 	// SelfBin is the agent-jobs binary used for run-wrapper and the guard hook.
 	SelfBin string
 	// Now is the clock (overridable in tests).
@@ -541,17 +542,21 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return err
 	}
 	var plan launchPlan
-	var codexCfg Config
+	launchCfg := m.Config()
+	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" {
+		launchCfg, err = m.authorizedLaunchConfig()
+		if err != nil {
+			return err
+		}
+	}
+	if j.AcceptanceCmd != "" && !launchCfg.AcceptanceAllowed {
+		return errors.New("acceptance_allowed is off in active daemon config or config.json; acceptance job not launched")
+	}
 	if j.Runner == store.RunnerCodex {
 		if j.Attempt > 1 {
 			return errCodexResume
 		}
-		// The launch is authorized by config.json as it is now, not by the daemon's startup snapshot:
-		// codex_write_allowed may have been turned off while the job was queued.
-		if codexCfg, err = reloadCodexConfig(m.StateDir); err != nil {
-			return err
-		}
-		if err := codexCfg.checkCodexJob(j.Kind); err != nil {
+		if err := launchCfg.checkCodexJob(j.Kind); err != nil {
 			return err
 		}
 	}
@@ -578,12 +583,16 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			if err := checkCodexSystemConfig(codexSystemConfigDir); err != nil {
 				return err
 			}
-			if err := checkCodexMCP(codexCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
+			if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
 				return err
 			}
-			plan = launchPlan{bin: codexCfg.codexBin(), args: CodexArgs(j, codexCfg.reasoningEffort(j.ReasoningEffort)),
+			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort)),
 				wrapper: []string{"--runner", store.RunnerCodex}}
 		}
+	}
+	if j.AcceptanceCmd != "" {
+		// Only the launching daemon can grant this permission; the wrapper still checks disk revocation.
+		plan.wrapper = append(plan.wrapper, "--acceptance-allowed", strconv.FormatBool(launchCfg.AcceptanceAllowed))
 	}
 	if unit != "" || j.ScopeUnit != "" {
 		// Recorded before the spawn: a daemon that dies right after it still stops the scope later. A
