@@ -250,8 +250,8 @@ func sigRecorder(t *testing.T) *[]string {
 
 // #55 (macOS): the wrapper's identity comes from kern.procargs2 before every group signal. A live
 // group led by a process that is not the job's wrapper is never signalled; a proven wrapper's group
-// gets SIGTERM and, still proven, SIGKILL; once the wrapper is gone SIGKILL goes only to marked members,
-// and to none when one member carries no marker.
+// gets SIGTERM and, still proven, SIGKILL; once the wrapper is gone no member is signalled by pid (even
+// a marked one: nothing pins it between the check and the kill) and the ones left are reported.
 func TestKillGroupBySysctl(t *testing.T) {
 	leader := exec.Command("sleep", "30")
 	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -274,17 +274,18 @@ func TestKillGroupBySysctl(t *testing.T) {
 		proc        func(calls int, pid int) (sysctlInfo, error)
 		want        []string
 		wantRefused bool
+		wantRes     groupEnd
 	}{
-		{"not the wrapper", func(_, pid int) (sysctlInfo, error) { return unmarked, nil }, nil, true},
+		{"not the wrapper", func(_, pid int) (sysctlInfo, error) { return unmarked, nil }, nil, true, groupRefused},
 		{"other token", func(_, pid int) (sysctlInfo, error) {
 			w := wrapper
 			w.argv = slices.Clone(w.argv)
 			w.argv[4] = "other"
 			return w, nil
-		}, nil, true},
-		{"zombie wrapper", func(_, pid int) (sysctlInfo, error) { w := wrapper; w.zombie = true; return w, nil }, nil, true},
-		{"unreadable", func(_, pid int) (sysctlInfo, error) { return sysctlInfo{}, errNoSysctlIdentity }, nil, true},
-		{"wrapper stays", func(_, pid int) (sysctlInfo, error) { return wrapper, nil }, []string{fmt.Sprintf("-%d:15", g), fmt.Sprintf("-%d:9", g)}, false},
+		}, nil, true, groupRefused},
+		{"zombie wrapper", func(_, pid int) (sysctlInfo, error) { w := wrapper; w.zombie = true; return w, nil }, nil, true, groupRefused},
+		{"unreadable", func(_, pid int) (sysctlInfo, error) { return sysctlInfo{}, errNoSysctlIdentity }, nil, true, groupRefused},
+		{"wrapper stays", func(_, pid int) (sysctlInfo, error) { return wrapper, nil }, []string{fmt.Sprintf("-%d:15", g), fmt.Sprintf("-%d:9", g)}, false, groupSurvived},
 		{"wrapper gone, members marked", func(calls, pid int) (sysctlInfo, error) {
 			switch {
 			case pid == g && calls == 1:
@@ -295,7 +296,7 @@ func TestKillGroupBySysctl(t *testing.T) {
 				return marked, nil
 			}
 			return sysctlInfo{}, errNoSysctlIdentity // 778 gone
-		}, []string{fmt.Sprintf("-%d:15", g), "777:9"}, false},
+		}, []string{fmt.Sprintf("-%d:15", g)}, false, groupSurvived},
 		{"wrapper gone, a member unmarked", func(calls, pid int) (sysctlInfo, error) {
 			switch {
 			case pid == g && calls == 1:
@@ -306,7 +307,7 @@ func TestKillGroupBySysctl(t *testing.T) {
 				return marked, nil
 			}
 			return unmarked, nil
-		}, []string{fmt.Sprintf("-%d:15", g)}, false},
+		}, []string{fmt.Sprintf("-%d:15", g)}, false, groupSurvived},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := map[int]int{}
@@ -314,12 +315,19 @@ func TestKillGroupBySysctl(t *testing.T) {
 			sent := sigRecorder(t)
 			var logBuf bytes.Buffer
 			m.Log = log.New(&logBuf, "", 0)
-			m.killGroupBySysctl(j, g, g)
-			if !slices.Equal(*sent, tc.want) {
+			res, why := m.killGroupBySysctl(j, g, g)
+			// SIGKILL is resent each round while the wrapper stays proven (the fake group never ends).
+			if got := slices.Compact(slices.Clone(*sent)); !slices.Equal(got, tc.want) {
 				t.Fatalf("sent %v, want %v (log %q)", *sent, tc.want, logBuf.String())
 			}
 			if tc.wantRefused != strings.Contains(logBuf.String(), "refusing to kill process group") {
 				t.Fatalf("refusal logged %v, want %v: %q", !tc.wantRefused, tc.wantRefused, logBuf.String())
+			}
+			if res != tc.wantRes {
+				t.Fatalf("result %v %q, want %v", res, why, tc.wantRes)
+			}
+			if res == groupSurvived && !strings.Contains(logBuf.String(), "members survived: [") {
+				t.Fatalf("survivors not reported: %q", logBuf.String())
 			}
 		})
 	}
