@@ -349,8 +349,9 @@ func TestCancelEndsGenuineWrapperGroup(t *testing.T) {
 }
 
 // Merge of #52 with auto-continue (#38): a timed-out attempt whose wrapper died and whose spawned group
-// survived every signal is not continued automatically (the resume check refuses a live group), and
-// the job says why; nothing is requeued while the group lives.
+// survived every signal is not continued automatically, and the job says why (fix loop 2 of #55: the
+// survivors are recorded with ReasonSurvivors, which auto-continue never resumes; the resume check
+// refuses a live group as well); nothing is requeued while the group lives.
 func TestAutoContinueRefusedWhileSpawnedGroupAlive(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, true)
@@ -371,7 +372,7 @@ func TestAutoContinueRefusedWhileSpawnedGroupAlive(t *testing.T) {
 	if got.Status != store.StatusTimeout || got.Attempt != 1 {
 		t.Fatalf("after the timeout: %s attempt %d %q", got.Status, got.Attempt, got.Error)
 	}
-	if !strings.Contains(got.Error, "not auto-continued") || !strings.Contains(got.Error, "still alive") {
+	if !strings.Contains(got.Error, fmt.Sprintf("leftover process group %d survived SIGKILL", g)) || !strings.Contains(got.Error, ReasonSurvivors) {
 		t.Fatalf("error %q does not say the live group blocked the continuation", got.Error)
 	}
 	if !groupAlive(g) || !got.PGIDSpawned {

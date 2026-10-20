@@ -134,7 +134,12 @@ func procMarker(pid int) string {
 	if err != nil {
 		return ""
 	}
-	for _, kv := range strings.Split(string(b), "\x00") {
+	return envMarker(strings.Split(string(b), "\x00"))
+}
+
+// envMarker returns the job marker in an environment ("" when absent).
+func envMarker(env []string) string {
+	for _, kv := range env {
 		if v, ok := strings.CutPrefix(kv, JobEnvVar+"="); ok {
 			return v
 		}
