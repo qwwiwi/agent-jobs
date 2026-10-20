@@ -33,7 +33,7 @@ var readTools = map[string]bool{"Read": true, "Grep": true, "Glob": true, "LS": 
 // recursiveReaders read (or list) every file under a directory argument (`rg x ~`, `tar c ~`,
 // `rsync -a ~ x`, `tree ~`), so an ancestor of the state dir reaches it.
 var recursiveReaders = map[string]bool{
-	"rg": true, "ag": true, "ack": true, "zip": true, "tar": true, "bsdtar": true, "rsync": true, "tree": true,
+	"rg": true, "ag": true, "ack": true, "zip": true, "tar": true, "rsync": true, "tree": true,
 }
 
 // where is the working directory a command may run in: every directory it may resolve a relative
@@ -106,7 +106,7 @@ func (r *stateReadScope) sequence(scripts []*script) {
 					return
 				}
 				if argv := argvOf(c.words); len(argv) > 0 {
-					switch strings.ToLower(base(argv[0])) {
+					switch progName(argv[0]) {
 					case "eval", "source", ".", "trap", "alias":
 						return
 					}
@@ -398,7 +398,7 @@ func recursive(name string, args []string) bool {
 
 // chdirShort are programs that run in a directory given by `-C dir` (git: a global option).
 var chdirShort = map[string]bool{
-	"git": true, "make": true, "gmake": true, "tar": true, "bsdtar": true, "go": true, "ninja": true,
+	"git": true, "make": true, "gmake": true, "tar": true, "go": true, "ninja": true,
 	"samu": true, "meson": true, "pnpm": true,
 }
 
@@ -435,7 +435,7 @@ func chdirs(c *simpleCmd) (vals []string, idx []int, unmodeled string) {
 	}
 	v := split(words)
 	for i := v.lead; i < v.start; {
-		name := strings.ToLower(base(words[i]))
+		name := progName(words[i])
 		vf := wrapperValueFlags[name]
 		target := map[string]byte{"env": 'C', "sudo": 'D'}[name]
 		for i++; i < v.start; i++ {
@@ -479,7 +479,7 @@ func chdirs(c *simpleCmd) (vals []string, idx []int, unmodeled string) {
 	if len(argv) == 0 {
 		return vals, idx, unmodeled
 	}
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	if name == "chroot" {
 		return vals, idx, "chroot"
 	}
@@ -560,7 +560,7 @@ func (r *stateReadScope) whereOf(c *simpleCmd) (where, string) {
 // against them) and speculative (the last operand when it does not exist yet: a directory the call
 // may create).
 func symlinkOps(argv []string, dirExists func(string) bool) (targets []int, definite, speculative []string) {
-	name := strings.ToLower(base(argv[0]))
+	name := progName(argv[0])
 	if name != "ln" && name != "cp" {
 		return nil, nil, nil
 	}
@@ -764,7 +764,7 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				argv := c.words[v.start:]
 				name := ""
 				if len(argv) > 0 {
-					name = strings.ToLower(base(argv[0]))
+					name = progName(argv[0])
 				}
 				tree := recursive(name, argv)
 				if tree { // `cd ~ && rg x`, `grep -r x` with no path: the working directory is read
