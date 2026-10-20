@@ -723,10 +723,10 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) {
 
 // killAcceptance ends the acceptance command's process group recorded in the job row (read now: it is
 // recorded after the caller's row was read). The row is written by the wrapper, not the job. While the
-// group's leader is alive and leads it, the whole group is signalled only if the leader carries this
-// job's marker. Once the leader is gone (the shell died on SIGTERM while a child that ignores it keeps
-// running, and the wrapper was killed before its own grace ended the group), the surviving members are
-// ended one by one (killLeaderlessGroup). Either way a recycled pid or pgid is never hit.
+// group's leader is alive and leads it, the group is ended only if the leader carries this job's
+// marker (killLedAcceptance). Once the leader is gone (the shell died on SIGTERM while a child that
+// ignores it keeps running, and the wrapper was killed before its own grace ended the group), the
+// surviving members are ended one by one (killLeaderlessGroup). Either way a recycled pid or pgid is never hit.
 func (m *Manager) killAcceptance(id string) {
 	j, err := m.Store.Get(id)
 	if err != nil || j.AcceptancePGID == 0 {
@@ -738,14 +738,35 @@ func (m *Manager) killAcceptance(id string) {
 		return
 	}
 	if p, err := procStatFull(g); err == nil && p.state != "Z" && p.pgid == g {
-		if procMarker(g) != id {
-			m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
-			return
-		}
-		m.signalGroup(g)
+		m.killLedAcceptance(id, g)
 		return
 	}
 	m.killLeaderlessGroup(id, g)
+}
+
+// killLedAcceptance ends acceptance process group g of job id while its leader looks alive: the leader
+// is pinned by a pidfd, its marker and group are checked after that, and the group is ended through
+// pidfds (endLedGroup). A leader that died in between leaves a leaderless group (killLeaderlessGroup).
+func (m *Manager) killLedAcceptance(id string, g int) {
+	fd, err := pidfdOpen(g)
+	if errors.Is(err, unix.ESRCH) {
+		m.killLeaderlessGroup(id, g)
+		return
+	}
+	if err != nil {
+		m.Log.Printf("job %s: refusing to kill acceptance process group %d: pidfd_open %d: %v", id, g, g, err)
+		return
+	}
+	defer unix.Close(fd)
+	if p, err := procStatFull(g); err != nil || p.state == "Z" || p.pgid != g || pidfdSend(fd, 0) != nil {
+		m.killLeaderlessGroup(id, g)
+		return
+	}
+	if procMarker(g) != id {
+		m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
+		return
+	}
+	m.endLedGroup(id, fmt.Sprintf("acceptance process group %d", g), g, fd, acceptanceMember(id, g))
 }
 
 // acceptanceMember reports whether pid is a live (non-zombie) member of process group g carrying the
@@ -904,20 +925,24 @@ func (m *Manager) retryScopeStops() error {
 	return nil
 }
 
-// killGroup sends SIGTERM to the wrapper's process group, waits up to KillGrace, then SIGKILL.
-// It refuses (and logs) unless pgid is plausible, is the live wrapper pid's group and that pid is
-// shown to be this job's wrapper (jobWrapper), since a live pid alone proves nothing: the wrapper may
-// have died and its pid and group id been reused by an unrelated group. On Linux the leader is pinned
-// by a pidfd while it is checked, and the group is signalled only while that same leader is alive (a
-// group id cannot be reused while its leader lives). Without /proc (macOS) the identity cannot be read
-// and only the group check applies, as before.
+// killGroup ends the wrapper's process group: SIGTERM, up to KillGrace, then SIGKILL. It refuses (and
+// logs) unless pgid is plausible, is the live wrapper pid's group and that pid is shown to be this
+// job's wrapper (jobWrapper), since a live pid alone proves nothing: the wrapper may have died and its
+// pid and group id been reused by an unrelated group. The path is chosen by OS, never by whether /proc
+// happens to be readable. On Linux the leader is pinned by a pidfd while it is checked, an unreadable
+// /proc refuses, and the group is ended member by member through pidfds (endLedGroup), never by a
+// numeric kill(-pgid). Elsewhere (macOS) the identity is read through sysctl (killGroupBySysctl).
 func (m *Manager) killGroup(j *store.Job, pid, pgid int) {
 	if err := verifyGroup(pid, pgid); err != nil {
 		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
 		return
 	}
+	if runtime.GOOS != "linux" {
+		m.killGroupBySysctl(j, pid, pgid)
+		return
+	}
 	if !procAvailable() {
-		m.signalGroup(pgid)
+		m.Log.Printf("job %s: refusing to kill process group %d: /proc (%s) is unreadable, the wrapper's identity cannot be checked", j.ID, pgid, procRoot)
 		return
 	}
 	fd, err := pidfdOpen(pid)
@@ -940,7 +965,201 @@ func (m *Manager) killGroup(j *store.Job, pid, pgid int) {
 		m.Log.Printf("job %s: refusing to kill process group %d: wrapper pid %d: %v", j.ID, pgid, pid, err)
 		return
 	}
-	m.signalGroup(pgid)
+	m.endLedGroup(j.ID, fmt.Sprintf("process group %d", pgid), pgid, fd, jobGroupMember(j, pgid))
+}
+
+// heldProc is a process shown to be the job's while a pidfd held it; later signals go through fd.
+// sent is the last signal it got (0: none yet).
+type heldProc struct {
+	pid, fd int
+	sent    syscall.Signal
+}
+
+// endLedGroup ends process group g of job id (named what in the log) whose leader is held by the pidfd
+// leaderFD and was shown to be the job's: SIGTERM, KillGrace, then SIGKILL, every signal through a
+// pidfd and none by number. Only the process with pid g can create a group g, so while the held leader
+// still exists (its pid is not free, even as a zombie) the id cannot be a stranger's group. A member is
+// therefore the job's when its pidfd is open, /proc then shows it in g, and the leader still exists
+// after that read; once the leader is gone a new member must pass isMember (the job's marker, its
+// scope) instead, and one that does not is never signalled. A member proven once stays held by its
+// descriptor and gets each later signal through it, wherever it moved. Unproven members count as
+// survivors. why says what kept the group from being ended.
+func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(int) bool) (res groupEnd, why string) {
+	var held []heldProc
+	isHeld := map[int]bool{}
+	defer func() {
+		for _, p := range held {
+			if p.fd >= 0 {
+				_ = unix.Close(p.fd)
+			}
+		}
+	}()
+	leaderAlive := func() bool { return pidfdSend(leaderFD, 0) == nil }
+	// heldAlive reads the stat first and confirms the descriptor after it, so the stat was of the held
+	// process (a reaped pid may already belong to another).
+	heldAlive := func(p heldProc) bool {
+		st, err := procStatFull(p.pid)
+		return pidfdSend(p.fd, 0) == nil && err == nil && st.state != "Z"
+	}
+	// round first holds every new member of g shown to be the job's (all of them before any signal, so
+	// the leader is not yet signalled while they are proven), then sends sig to every live held process
+	// that has not had it yet (a member found during the grace still gets SIGTERM, one found after the
+	// SIGKILL round still gets SIGKILL). It returns how many processes of the group are left (unproven
+	// ones included).
+	round := func(sig syscall.Signal) int {
+		unproven := 0
+		members, err := groupMembers(g)
+		if err != nil {
+			why = "members not checked: " + err.Error()
+			m.Log.Printf("job %s: %s: %s", id, what, why)
+			unproven++ // not enumerable: never taken for an ended group
+		}
+		for _, pid := range members {
+			if isHeld[pid] {
+				continue
+			}
+			fd, err := pidfdOpen(pid)
+			if errors.Is(err, unix.ESRCH) {
+				continue
+			}
+			if err != nil {
+				why = fmt.Sprintf("pidfd_open %d: %v", pid, err)
+				m.Log.Printf("job %s: %s: %s", id, what, why)
+				unproven++
+				continue
+			}
+			// Read only now that the descriptor pins the process; the leader is checked after the read.
+			st, err := procStatFull(pid)
+			if err != nil || st.state == "Z" || st.pgid != g {
+				_ = unix.Close(fd)
+				continue
+			}
+			if !leaderAlive() && !isMember(pid) {
+				_ = unix.Close(fd)
+				why = fmt.Sprintf("member %d is not proven to be the job's (leader gone, no marker of the job, or outside its scope)", pid)
+				m.Log.Printf("job %s: not signalling a member of %s: %s", id, what, why)
+				unproven++
+				continue
+			}
+			held = append(held, heldProc{pid: pid, fd: fd})
+			isHeld[pid] = true
+		}
+		left := unproven
+		for i := range held {
+			p := &held[i]
+			if p.fd < 0 {
+				continue
+			}
+			if !heldAlive(*p) {
+				// Retire it and forget the pid: a new member that reuses it must be proven afresh.
+				_ = unix.Close(p.fd)
+				p.fd = -1
+				delete(isHeld, p.pid)
+				continue
+			}
+			left++
+			if p.sent == sig {
+				continue
+			}
+			p.sent = sig
+			if err := pidfdSend(p.fd, sig); err != nil && !errors.Is(err, unix.ESRCH) {
+				why = fmt.Sprintf("pidfd_send_signal %d: %v", p.pid, err)
+				m.Log.Printf("job %s: %s: %s", id, what, why)
+			}
+		}
+		return left
+	}
+	round(syscall.SIGTERM)
+	deadline := time.Now().Add(m.KillGrace)
+	for time.Now().Before(deadline) {
+		if round(syscall.SIGTERM) == 0 {
+			return groupEnded, ""
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	round(syscall.SIGKILL)
+	for i := 0; i < 20; i++ {
+		if round(syscall.SIGKILL) == 0 {
+			return groupEnded, ""
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	m.Log.Printf("job %s: %s: members survived SIGKILL", id, what)
+	return groupSurvived, why
+}
+
+// killGroupBySysctl is killGroup where there are no pidfds and no /proc (macOS). The wrapper's
+// identity (argv `run-wrapper <jobDir> --token <the job's token>`, not a zombie, leading pgid) is read
+// through sysctl (kern.procargs2) right before each group signal, and the group is signalled by number
+// only while that holds: a group id is not reused while its leader lives. Once the wrapper is gone
+// (it exits on SIGTERM), SIGKILL goes member by member and only if every member carries the job's
+// marker (killMarkedBySysctl). Residual: without a descriptor to pin a process, one that exits and
+// whose id is reused between the check and the kill (a few syscalls) could still be hit.
+func (m *Manager) killGroupBySysctl(j *store.Job, pid, pgid int) {
+	proven := func() error {
+		if err := verifyGroup(pid, pgid); err != nil {
+			return err
+		}
+		if j.ScopeUnit != "" {
+			return fmt.Errorf("scope %s cannot be checked here", j.ScopeUnit)
+		}
+		info, err := sysctlProc(pid)
+		if err != nil {
+			return fmt.Errorf("wrapper pid %d: %w", pid, err)
+		}
+		if info.zombie || info.pgid != pgid || !wrapperArgv(j, m.JobDir(j.ID), info.argv) {
+			return fmt.Errorf("pid %d is not proven to be the job's wrapper (a recycled pid?)", pid)
+		}
+		return nil
+	}
+	if err := proven(); err != nil {
+		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
+		return
+	}
+	_ = killFn(-pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(m.KillGrace)
+	for time.Now().Before(deadline) {
+		if !groupAlive(pgid) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := proven(); err == nil {
+		_ = killFn(-pgid, syscall.SIGKILL)
+		return
+	}
+	m.killMarkedBySysctl(j.ID, pgid)
+}
+
+// killMarkedBySysctl sends SIGKILL to each live member of process group g once the group's leader is
+// gone, only if every member carries the marker of job id; each one is re-checked right before its kill.
+func (m *Manager) killMarkedBySysctl(id string, g int) {
+	marked := func(pid int) (bool, error) {
+		info, err := sysctlProc(pid)
+		if err != nil || info.zombie || info.pgid != g {
+			return false, nil // gone, or no longer in the group
+		}
+		if envMarker(info.env) != id {
+			return false, fmt.Errorf("member %d carries no marker of the job", pid)
+		}
+		return true, nil
+	}
+	pids, err := sysctlGroup(g)
+	if err != nil {
+		m.Log.Printf("job %s: process group %d: members not checked: %v (no SIGKILL)", id, g, err)
+		return
+	}
+	for _, pid := range pids {
+		if _, err := marked(pid); err != nil {
+			m.Log.Printf("job %s: refusing to SIGKILL the rest of process group %d: %v", id, g, err)
+			return
+		}
+	}
+	for _, pid := range pids {
+		if ok, _ := marked(pid); ok {
+			_ = killFn(pid, syscall.SIGKILL)
+		}
+	}
 }
 
 // procAvailable reports whether process identities can be read from /proc (Linux).
@@ -964,11 +1183,7 @@ func jobWrapper(j *store.Job, jobDir string) func(int) bool {
 			return false
 		}
 		argv, err := procCmdline(pid)
-		if err != nil || !IsWrapperCmdline(argv) {
-			return false
-		}
-		i := slices.Index(argv, "run-wrapper")
-		if i < 0 || len(argv) < i+4 || argv[i+1] != jobDir || argv[i+3] != j.LaunchToken {
+		if err != nil || !wrapperArgv(j, jobDir, argv) {
 			return false
 		}
 		if j.ScopeUnit == "" {
@@ -977,6 +1192,16 @@ func jobWrapper(j *store.Job, jobDir string) func(int) bool {
 		b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
 		return err == nil && jobScopeIn(string(b)) == j.ScopeUnit
 	}
+}
+
+// wrapperArgv reports whether argv is that of job j's wrapper: `run-wrapper <jobDir> --token <the
+// job's launch token>`.
+func wrapperArgv(j *store.Job, jobDir string, argv []string) bool {
+	if j.LaunchToken == "" || !IsWrapperCmdline(argv) {
+		return false
+	}
+	i := slices.Index(argv, "run-wrapper")
+	return i >= 0 && len(argv) >= i+4 && argv[i+1] == jobDir && argv[i+3] == j.LaunchToken
 }
 
 // endOrphanedGroup ends what is left of a job whose wrapper died without writing exit_code: its
@@ -1013,19 +1238,6 @@ func (m *Manager) endSpawnedGroup(j *store.Job) string {
 		return fmt.Sprintf("leftover process group %d killed", g)
 	}
 	return ""
-}
-
-// signalGroup sends SIGTERM to the process group, waits up to KillGrace, then SIGKILL.
-func (m *Manager) signalGroup(pgid int) {
-	_ = killFn(-pgid, syscall.SIGTERM)
-	deadline := time.Now().Add(m.KillGrace)
-	for time.Now().Before(deadline) {
-		if !groupAlive(pgid) {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	_ = killFn(-pgid, syscall.SIGKILL)
 }
 
 func readExitCode(dir string) (int, bool) {
