@@ -153,3 +153,36 @@ func TestFoldUnicode(t *testing.T) {
 		t.Error("fold changes a name on a case-sensitive file system")
 	}
 }
+
+// #54: ARJ reads the switch characters of a word one after another, so `-ht<dir>` may follow other
+// switches in the same word (`-yht<dir>`); any `ht` in a switch word counts as the target switch.
+func TestProtectedAncestorARJCluster(t *testing.T) {
+	state, _, _, cfg := protectedSetup(t)
+	up := "../../../.."
+	for _, c := range []string{
+		"arj x payload.arj -yht" + up,
+		"arj x payload.arj -yht" + state,
+		"arj x payload.arj -YHT" + state,
+		"arj x payload.arj -yHt" + up,
+		"arj x payload.arj -y -i -hT" + up,
+		"arj e -jyvht" + up + " payload.arj",
+		"arj x payload.arj /yht" + up,
+		"arj x payload.arj /ht" + state,
+		"arj x payload.arj --yht" + up,
+		// a value switch before `ht` is not modelled: fail closed
+		"arj x payload.arj -gsecretht" + up,
+	} {
+		if Check(c, cfg) == "" {
+			t.Errorf("%q allowed", c)
+		}
+	}
+	for _, c := range []string{
+		"arj x ht.arj", "arj x a.arj -yhtbuild", "arj x a.arj -YHTbuild", "arj x a.arj -htbuild/htdocs",
+		"arj x a.arj -yht/tmp/htdocs", "arj x htdocs/a.arj -ht../..", "arj l a.arj", "arj x -y a.arj build/",
+		"arj x a.arj /tmp/htdocs", "arj x -ht../ht.. a.arj",
+	} {
+		if r := Check(c, cfg); r != "" {
+			t.Errorf("%q refused: %s", c, r)
+		}
+	}
+}
