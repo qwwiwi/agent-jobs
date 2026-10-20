@@ -15,7 +15,7 @@ func TestFold(t *testing.T) {
 		{"cafÉ", "café"},
 		{"Å", "å"},           // Angstrom sign
 		{"STRAẞE", "straße"}, // capital sharp s
-		{"Σς", "σσ"},
+		{"Σσς", "ςςς"},       // the smallest lower-case member of the orbit
 	} {
 		if got := Fold(c.in); got != c.want {
 			t.Errorf("Fold(%q) = %q, want %q", c.in, got, c.want)
@@ -27,8 +27,11 @@ func TestFold(t *testing.T) {
 			t.Errorf("%q and %q fold apart", p[0], p[1])
 		}
 	}
-	// Characters outside the orbits stay as written: dotless i is not i.
-	if Fold("ı") == "i" {
-		t.Error("dotless i folded to i")
+	// Characters outside the orbits stay as written: neither dotless i nor dotted capital I is i
+	// (strings.EqualFold agrees).
+	for _, r := range []string{"ı", "İ"} {
+		if Fold(r) != r || strings.EqualFold(r, "i") {
+			t.Errorf("Fold(%q) = %q", r, Fold(r))
+		}
 	}
 }

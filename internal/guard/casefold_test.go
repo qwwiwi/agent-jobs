@@ -32,6 +32,18 @@ func TestProtectedAncestorArchiverAliases(t *testing.T) {
 		"dtrx ../../../..",
 		"xar -xf a.xar -C ../../../..",
 		"jar xf a.jar ../../../..",
+		// a directory attached to the extractor's own switch
+		"unrar x a.rar -op../../../..",
+		"unrar x a.rar -OP../../../..",
+		"rar x -op../../../.. a.rar",
+		"cabextract -d../../../.. a.cab",
+		"cabextract -qd../../../.. a.cab",
+		"unar -o../../../.. a.zip",
+		"aunpack -X../../../.. a.zip",
+		"atool -x -X../../../.. a.zip",
+		"arj x a.arj -ht../../../..",
+		"xar -xf a.xar -C../../../..",
+		"xar -xC../../../.. -f a.xar",
 		// program names with a character that folds to an ASCII letter (U+017F long s, U+212A Kelvin)
 		"rſync -a src/ ../../../..",
 		"bſdtar -xC../../../.. -f a.tar",
@@ -48,6 +60,9 @@ func TestProtectedAncestorArchiverAliases(t *testing.T) {
 		"bsdunzip -o a.zip -d build", "bsdunzip -qdbuild a.zip", "gnutar -tf a.tar",
 		"unar -o build a.zip", "unar a.zip", "lsar a.zip", "unrar l a.rar", "unrar x a.rar build/",
 		"cabextract -d build a.cab", "aunpack a.zip", "xar -xf a.xar -C build", "jar tf a.jar",
+		"unrar x a.rar -opbuild", "unrar x -o+ a.rar build/", "cabextract -dbuild a.cab", "cabextract -qd.. a.cab",
+		"unar -obuild a.zip", "aunpack -Xbuild a.zip", "arj x a.arj -htbuild", "xar -xf a.xar -Cbuild",
+		"xar -xfC../../../..", "7z x a.7z -obuild",
 		"rsync -a src/ dst/", "rſync -a src/ dst/", "ls ../../../..", "du -sh ../..",
 		"grep -r foo .", "cat README.md", "git status", "go test ./...",
 	} {
