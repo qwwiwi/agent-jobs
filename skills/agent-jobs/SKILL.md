@@ -27,7 +27,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `model` **or** `complexity` | mandatory, one of them. `complexity` is `light`, `normal` or `hard` and picks the model by kind. With neither, job_start is rejected: there is no default and no classifier |
 | `repo`, `base` | optional: the job gets a git worktree of `repo` at `base` (default HEAD). Without a repo it works in an empty directory |
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
-| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list` |
+| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults |
 
 job_start returns the id at once; the daemon starts the job within a minute, at most `max_running` at a time per agent (config.json, default two). Do not poll it in a loop: wait for the job-done line.
 

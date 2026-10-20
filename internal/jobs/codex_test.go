@@ -242,7 +242,7 @@ func TestCodexWriteJobRefusedByDefault(t *testing.T) {
 		}
 	}
 	// A queued write job is refused at launch when the config on disk no longer allows it: the launch
-	// reloads config.json, the daemon's startup snapshot does not authorize it.
+	// requires both the active daemon opt-in and config.json's current opt-in.
 	writeCodexConfig(t, m, `{"codex_write_allowed":true}`)
 	m.Cfg.CodexWriteAllowed = true
 	j := enqueue(t, m, "fix it", func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" })

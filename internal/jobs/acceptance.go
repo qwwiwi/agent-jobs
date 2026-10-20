@@ -194,7 +194,7 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	switch {
 	case note == "":
 		return status, msg
-	case m.Cfg.ReportContract == ReportContractFail:
+	case m.Config().ReportContract == ReportContractFail:
 		return store.StatusFailed, note
 	case msg != "":
 		return status, msg + "; " + note
@@ -211,8 +211,9 @@ type wrapperAcceptance struct {
 }
 
 // openAcceptance reads the job's acceptance command from <state>/jobs.db (jobDir = <state>/jobs/<id>)
-// and the acceptance timeout from config.json. The returned store stays open for the result; close it.
-func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
+// and the acceptance timeout from config.json. Permission requires both the launching daemon's
+// authorization and the current disk opt-in. The returned store stays open for the result; close it.
+func openAcceptance(jobDir, token string) (*wrapperAcceptance, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return nil, err
@@ -230,6 +231,11 @@ func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
 	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID}
 	if a.cmd == "" {
 		return a, nil
+	}
+	auth, authErr := st.ReadLaunchAuthorization(j.ID, token)
+	if authErr != nil || !auth.AcceptanceAllowed {
+		_ = st.Close()
+		return nil, errors.New("acceptance_allowed was not authorized by the launching daemon; the acceptance command is not run")
 	}
 	c, err := LoadConfig(state)
 	if err != nil {
@@ -254,7 +260,7 @@ func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
 // group (TERM, then KILL after acceptanceKillGrace) and the wrapper returns 128+SIGTERM without a
 // result or exit_code: the daemon is ending the job anyway.
 func runAcceptanceStep(jobDir, token string, log *os.File) int {
-	a, err := openAcceptance(jobDir)
+	a, err := openAcceptance(jobDir, token)
 	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance:", err)
 		return 0

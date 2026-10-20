@@ -32,6 +32,9 @@ func skillCatalog(t *testing.T, entries ...map[string]any) string {
 			t.Fatal(err)
 		}
 		body := "---\nname: " + name + "\ndescription: The " + name + " skill. Details.\n---\n\nUse " + name + ".\n"
+		if risk, ok := e["risk"].([]string); ok {
+			body = strings.Replace(body, "\n---\n", "\nrisk: ["+strings.Join(risk, ", ")+"]\n---\n", 1)
+		}
 		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -79,6 +82,81 @@ func TestStartSelectsSkills(t *testing.T) {
 	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "fix", Brief: "b", Model: "sonnet", Skills: []string{"extra"}}); err == nil ||
 		!strings.Contains(err.Error(), "skills_max_per_job") {
 		t.Fatalf("over count: %v", err)
+	}
+}
+
+// Risk labels describe a skill; they do not authorize secret access or exclude delivery (E7).
+func TestSecretsPathDefaultSkills(t *testing.T) {
+	for _, kind := range []string{"general", "research"} {
+		t.Run(kind, func(t *testing.T) {
+			m := newManager(t)
+			m.Cfg.SkillRoots = []string{skillCatalog(t, map[string]any{
+				"name": "secrets-aware", "status": "core", "kinds": []string{kind},
+				"risk": []string{"network", "secrets-path"},
+			})}
+			listed, err := m.SkillList(context.Background(), "", skills.Filter{Kind: kind})
+			if err != nil || len(listed.Skills) != 1 || listed.Skills[0].Name != "secrets-aware" {
+				t.Fatalf("offer: %+v %v", listed, err)
+			}
+			for _, edits := range [][]string{nil, {"+secrets-aware"}} {
+				j := enqueue(t, m, "run with the selected skill", func(r *StartRequest) { r.Kind, r.Skills = kind, edits })
+				if !slices.Equal(j.Skills, []string{"secrets-aware"}) {
+					t.Fatalf("selection: %v", j.Skills)
+				}
+				j = runToEnd(t, m, j.ID)
+				if j.Status != store.StatusSucceeded || !slices.Equal(j.SkillsDelivered, j.Skills) {
+					t.Fatalf("delivery: status %s, selected %v, delivered %v, error %q", j.Status, j.Skills, j.SkillsDelivered, j.Error)
+				}
+			}
+		})
+	}
+}
+
+func TestStartNoSkills(t *testing.T) {
+	m, _ := skillsManager(t)
+	for _, tc := range []struct {
+		name, brief string
+		edits       []string
+		want        []string
+	}{
+		{"omitted", "work", nil, []string{"git-workflows", "golang"}},
+		{"empty list", "work", []string{}, []string{"git-workflows", "golang"}},
+		{"brief none", "work\nskills: none\ncontinue", nil, nil},
+		{"brief whitespace", "work\n  Skills:  NONE  \n", nil, nil},
+		{"prose", "Discuss skills: none of these fit", nil, []string{"git-workflows", "golang"}},
+		{"remove defaults", "work", []string{"-git-workflows", "-golang"}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := enqueue(t, m, tc.brief, func(r *StartRequest) { r.Kind, r.Skills = "general", tc.edits })
+			if got := get(t, m, j.ID).Skills; !slices.Equal(got, tc.want) {
+				t.Fatalf("skills %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSkillLaunchReportsCatalogRejection(t *testing.T) {
+	m := newManager(t)
+	root := skillCatalog(t, map[string]any{
+		"name": "secrets-aware", "status": "core", "kinds": []string{"general"},
+		"risk": []string{"secrets-path"},
+	})
+	m.Cfg.SkillRoots = []string{root}
+	j := enqueue(t, m, "work", func(r *StartRequest) { r.Skills = []string{"secrets-aware"} })
+	// A file link added after selection makes this entry invalid at delivery, regardless of risk.
+	outside := filepath.Join(t.TempDir(), "reference.txt")
+	if err := os.WriteFile(outside, []byte("public fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "skills", "secrets-aware", "reference")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "symlink reference leaves the skill directory") {
+		t.Fatalf("launch must report the catalog's real rejection: status %s, error %q", j.Status, j.Error)
 	}
 }
 

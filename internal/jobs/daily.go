@@ -50,7 +50,7 @@ type DailyStatus struct {
 
 // Daily returns the last daily run and the current settings.
 func (m *Manager) Daily() (DailyStatus, error) {
-	st := DailyStatus{Enabled: !m.Cfg.DailyOff, Hour: m.Cfg.DailyAt()}
+	st := DailyStatus{Enabled: !m.Config().DailyOff, Hour: m.Config().DailyAt()}
 	d, err := m.Store.GetDaily()
 	if err != nil || d == nil {
 		return st, err
@@ -71,7 +71,7 @@ func (m *Manager) Daily() (DailyStatus, error) {
 // hour). The day is the local calendar date, so DST changes never make a day run twice.
 func (m *Manager) dailyDay(now time.Time) string {
 	now = now.Local()
-	if now.Hour() < m.Cfg.DailyAt() {
+	if now.Hour() < m.Config().DailyAt() {
 		return ""
 	}
 	return now.Format(time.DateOnly)
@@ -82,7 +82,7 @@ func (m *Manager) dailyDay(now time.Time) string {
 // claimed yet in the store. It returns at once (true when a run was started), so it never delays
 // launching queued jobs; WaitDaily waits for the run. Errors are logged, never returned.
 func (m *Manager) StartDaily(ctx context.Context) bool {
-	if m.Cfg.DailyOff || ctx.Err() != nil {
+	if m.Config().DailyOff || ctx.Err() != nil {
 		return false
 	}
 	day := m.dailyDay(m.Now())

@@ -259,7 +259,13 @@ func TestAcceptanceOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	m = acceptanceManager(t, "")
-	j := enqueue(t, m, "do it", withAcceptance(`touch ../acc-ran`))
+	// Launch while opted in, then revoke before the runner finishes: the wrapper must still
+	// recheck disk even though it received authorization from the daemon at launch.
+	// The fake runner sleeps to keep the edit ahead of the acceptance step.
+	j := enqueue(t, m, "FAKE_SLEEP=1", withAcceptance(`touch ../acc-ran`))
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{"acceptance_allowed": false}`), 0o600); err != nil {
 		t.Fatal(err)
 	}

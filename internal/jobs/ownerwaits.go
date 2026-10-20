@@ -172,23 +172,23 @@ func StopHookDecision(in StopHookInput, pending []*store.OwnerPending) *StopHook
 // refused bind keeps the old one. A process the orchestrator starts itself in that pane and
 // directory is inside its trust domain and is not told apart.
 func (m *Manager) BindHookSession(in SessionStartInput, pane string) error {
-	if m.Cfg.NotifyTmuxTarget == "" {
+	if m.Config().NotifyTmuxTarget == "" {
 		return errors.New("bind refused: no notify_tmux_target configured (the Stop hook never blocks)")
 	}
-	if m.Cfg.OrchestratorDir == "" {
+	if m.Config().OrchestratorDir == "" {
 		return errors.New("bind refused: no orchestrator_dir configured (the Stop hook never blocks)")
 	}
 	if pane == "" {
 		return errors.New("bind refused: not inside tmux ($TMUX_PANE is not set)")
 	}
-	want, err := m.tmuxPaneID(m.Cfg.NotifyTmuxTarget)
+	want, err := m.tmuxPaneID(m.Config().NotifyTmuxTarget)
 	if err != nil {
 		return fmt.Errorf("bind refused: %w", err)
 	}
 	if pane != want {
 		return fmt.Errorf("bind refused: pane %s is not the notify pane %s of notify_tmux_target", Printable(pane, 32), want)
 	}
-	if err := checkInsideDir(in.Cwd, m.Cfg.OrchestratorDir); err != nil {
+	if err := checkInsideDir(in.Cwd, m.Config().OrchestratorDir); err != nil {
 		return fmt.Errorf("bind refused: %w", err)
 	}
 	return m.Store.BindHookSession(in.SessionID, m.Now())
@@ -246,7 +246,7 @@ func (m *Manager) StopHookHolds(sessionID string) (bool, error) {
 // OwnerPending returns the «owner reply pending» records after dropping the expired ones, and how
 // many expired now.
 func (m *Manager) OwnerPending() ([]*store.OwnerPending, int, error) {
-	return m.Store.OwnerPendingList(m.Now(), m.Cfg.OwnerWaitsMaxAge())
+	return m.Store.OwnerPendingList(m.Now(), m.Config().OwnerWaitsMaxAge())
 }
 
 // OwnerReplied acknowledges every attempt of job id (delivered or not) and pre-acknowledges its

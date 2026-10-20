@@ -97,7 +97,7 @@ func (m *Manager) WriteProfile(sources []string, force bool) (string, int, error
 	if err != nil {
 		return "", 0, err
 	}
-	p := m.Cfg.OwnerRulesPath
+	p := m.Config().OwnerRulesPath
 	if !force {
 		cur, err := os.ReadFile(p)
 		switch {

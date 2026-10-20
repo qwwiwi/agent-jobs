@@ -145,8 +145,8 @@ type Config struct {
 	// 0 = DefaultAcceptanceTimeoutMinutes (15); at most CeilingAcceptanceTimeoutMinutes (60).
 	AcceptanceTimeoutMinutes int `json:"acceptance_timeout_minutes"`
 	// AcceptanceAllowed opts in to acceptance_cmd (default false: job_start and schedule_add refuse it,
-	// and the wrapper, which reloads config.json, does not run it). The command runs the job's code
-	// outside the guard.
+	// and the daemon and wrapper do not run it). Enabling requires a daemon restart; disabling on
+	// disk revokes it immediately. The command runs the job's code outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
 	// SkillRoots are absolute directories of skill catalogs (E7), each holding index.json; earlier roots
 	// win a duplicate name. A missing or invalid root is a warning (status, system_doctor), never fatal.
@@ -385,19 +385,25 @@ func StateDir(agent string) (string, error) {
 
 // LoadConfig reads <state>/config.json; a missing file yields defaults.
 func LoadConfig(stateDir string) (Config, error) {
-	var c Config
 	b, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return c, fmt.Errorf("read config: %w", err)
-	default:
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Config{}, fmt.Errorf("read config: %w", err)
+	}
+	return parseConfig(stateDir, b)
+}
+
+func parseConfig(stateDir string, b []byte) (Config, error) {
+	var c Config
+	if b != nil {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
 		}
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(b, &raw); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
+		}
+		if raw == nil {
+			return c, errors.New("config.json must be a JSON object, not null")
 		}
 		for k, why := range removedConfigKeys {
 			if _, ok := raw[k]; ok {

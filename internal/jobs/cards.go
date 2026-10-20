@@ -42,7 +42,7 @@ type Card struct {
 var reCardName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // CardsDir returns the agent's cards directory.
-func (m *Manager) CardsDir() string { return m.Cfg.CardsDir }
+func (m *Manager) CardsDir() string { return m.Config().CardsDir }
 
 // ParseCard parses a card: a front matter block between `---` lines with `repo:` and/or `remote:`
 // keys (each repeatable, at least one), then a non-empty Markdown body.

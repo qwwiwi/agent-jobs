@@ -1150,6 +1150,11 @@ func cmdDaemon(args []string) error {
 		return err
 	}
 	defer m.Close()
+	unlockDaemon, err := m.LockDaemon()
+	if err != nil {
+		return err
+	}
+	defer unlockDaemon()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.
@@ -1158,6 +1163,7 @@ func cmdDaemon(args []string) error {
 	if err := m.WriteDaemonInfo(); err != nil {
 		m.Log.Printf("%v (MCP servers cannot compare their version with the daemon's)", err)
 	}
+	m.WatchDaemonConfig()
 	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
 	go func() {
 		if err := m.ServeBrain(ctx); err != nil {
@@ -1168,7 +1174,7 @@ func cmdDaemon(args []string) error {
 	httpDone := make(chan struct{})
 	go func() {
 		defer close(httpDone)
-		if !m.Cfg.HTTPAPI.Enabled {
+		if !m.Config().HTTPAPI.Enabled {
 			return
 		}
 		if err := httpapi.Serve(ctx, m, version); err != nil {
@@ -1839,7 +1845,7 @@ func cmdHTTPAPI(args []string) error {
 		return err
 	}
 	fmt.Println(tok)
-	if !m.Cfg.HTTPAPI.Enabled {
+	if !m.Config().HTTPAPI.Enabled {
 		fmt.Fprintln(os.Stderr, "note: http_api.enabled is false in config.json; the daemon does not serve the API")
 	}
 	return nil

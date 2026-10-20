@@ -222,7 +222,7 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
 		}
 	}
-	return doneLine(j, m.Cfg.JobDirNoteBytes(), cost)
+	return doneLine(j, m.Config().JobDirNoteBytes(), cost)
 }
 
 // checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
@@ -250,7 +250,7 @@ func (m *Manager) notifyPending() error {
 	if err != nil || len(jobs) == 0 {
 		return err
 	}
-	t := m.Cfg.NotifyTmuxTarget
+	t := m.Config().NotifyTmuxTarget
 	if t == "" {
 		for _, j := range jobs {
 			m.checkMerge(j)
@@ -336,7 +336,7 @@ func (m *Manager) runTmux(ctx context.Context, args ...string) error {
 
 // runTmuxOutput is runTmux that returns the command's stdout.
 func (m *Manager) runTmuxOutput(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, m.Cfg.tmuxBin(), m.Cfg.tmuxArgs(args...)...)
+	cmd := exec.CommandContext(ctx, m.Config().tmuxBin(), m.Config().tmuxArgs(args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
