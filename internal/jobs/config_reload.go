@@ -119,7 +119,8 @@ func (m *Manager) Config() Config {
 	return m.Cfg
 }
 
-// authorizedLaunchConfig uses the daemon's active settings. Disk edits can revoke permissions
+// authorizedLaunchConfig uses the launcher's active settings (manual ticks are excluded while a
+// daemon is active). Disk edits can revoke permissions
 // immediately, but granting restart-only permissions requires a daemon restart. Invalid edits deny
 // the launch even while the daemon retains its last good config for other work.
 func (m *Manager) authorizedLaunchConfig() (Config, error) {

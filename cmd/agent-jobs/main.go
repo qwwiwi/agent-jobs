@@ -112,7 +112,7 @@ const usage = `usage: agent-jobs <command> [flags]
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--acceptance-allowed BOOL] -- <claude|codex> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -244,7 +244,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--acceptance-allowed BOOL] -- <claude|codex> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -261,13 +261,6 @@ func runWrapper(args []string) int {
 			opts.FallbackSession = rest[1]
 		case "--runner":
 			opts.Runner = rest[1]
-		case "--acceptance-allowed":
-			allowed, err := strconv.ParseBool(rest[1])
-			if err != nil {
-				fmt.Fprintln(os.Stderr, u)
-				return 2
-			}
-			opts.AcceptanceAllowed = allowed
 		default:
 			fmt.Fprintln(os.Stderr, u)
 			return 2
@@ -1157,6 +1150,11 @@ func cmdDaemon(args []string) error {
 		return err
 	}
 	defer m.Close()
+	unlockDaemon, err := m.LockDaemon()
+	if err != nil {
+		return err
+	}
+	defer unlockDaemon()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// The reference interval is fixed («раз в минуту»); it is not configurable.

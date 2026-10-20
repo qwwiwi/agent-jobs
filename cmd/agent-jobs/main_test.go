@@ -40,12 +40,13 @@ func TestVersion(t *testing.T) {
 }
 
 // run-wrapper accepts only known options with values before "--"; unknown flags and invalid
-// acceptance authorization values fail before the wrapper touches the job dir.
+// the removed acceptance authorization flag fail before the wrapper touches the job dir.
 func TestRunWrapperUsage(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
 	for _, args := range [][]string{
 		{dir, "--token", "t", "--bogus", "x", "--", "prog"},
 		{dir, "--token", "t", "--acceptance-allowed", "invalid", "--", "prog"},
+		{dir, "--token", "t", "--acceptance-allowed", "true", "--", "prog"},
 		{dir, "--token", "t", "--prompt", "p.md", "prog", "x"},
 		{dir, "--token", "t", "--prompt", "--", "prog"},
 		{dir, "--token"},
