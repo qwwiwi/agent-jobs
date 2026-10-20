@@ -655,20 +655,31 @@ var clusterDirOpts = map[string]struct {
 	dir  byte
 	vals string
 }{
-	"tar": {'C', "bITXf"}, "unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
+	"tar": {'C', "bITXf"}, "unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"}, "cabextract": {'d', "eF"},
+	"xar": {'C', "fnsb"},
+}
+
+// dirSwitches are the directory switches that other extractors take with the directory in the same
+// word, one switch per word, compared case-insensitively (`7z x -o<dir>`, `unrar x -op<dir>`,
+// `arj x -ht<dir>`): a word starting with one names the directory after it.
+var dirSwitches = map[string][]string{
+	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"}, "aunpack": {"-X"}, "atool": {"-X"},
+	"arj": {"-ht"},
 }
 
 // attachedDir returns the directory attached to an archive tool's directory option in the same
-// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
+// word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`, `-op<dir>`).
 func attachedDir(name, a string) (string, bool) {
 	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
 		return "", false
 	}
-	if name == "7z" { // switches are case-insensitive, one per word: -o<dir> and -O<dir>
-		if a[1] != 'o' && a[1] != 'O' {
-			return "", false
+	if sw, ok := dirSwitches[name]; ok {
+		for _, p := range sw {
+			if len(a) > len(p) && strings.EqualFold(a[:len(p)], p) {
+				return a[len(p):], true
+			}
 		}
-		return a[2:], true
+		return "", false
 	}
 	opt, ok := clusterDirOpts[name]
 	if !ok {
