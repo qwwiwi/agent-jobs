@@ -17,7 +17,7 @@ Two questions: does a job burn the subscription limits more or less economically
 | Parent busy per run, mean | 1.65 min | 0.47 min | 0.73 min |
 | Acceptance | 6/6 | 6/6 | 6/6 |
 
-- **Limits:** on these tasks a job is **not** more economical. It spent about 30% more limit-weighted tokens than a subagent for the same accepted result. Two causes, both structural: the job is a full top-level Claude Code session (system prompt, full tool set, preamble and kind checklist; its worker side cost $2.58 against $1.71 and $1.45), and its parent spends two turns and about twice as many model calls (8.5 against 4.0 and 4.7 per run: start, then `job_result`, the diff check and the cherry-pick from the job's worktree).
+- **Limits:** on these tasks a job is **not** more economical. It spent about 30% more limit-weighted tokens than a subagent for the same accepted result. Two causes, both structural: the job is a full top-level Claude Code session (system prompt, full tool set, preamble and kind checklist; its worker side cost $2.57 against $1.71 and $1.46), and its parent spends two turns and about twice as many model calls (8.5 against 4.0 and 4.7 per run: start, then `job_result`, the diff check and the cherry-pick from the job's worktree).
 - **Speed:** a job is two to three times slower on short tasks: the daemon ticks once a minute, so a job waits up to a minute to start and its job-done line waits for the next tick (the harness waits 65 s, the worst case).
 - **Parent freed:** yes against a foreground subagent (0.73 against 1.65 min busy per task), but a background subagent frees the parent at least as well (0.47 min).
 - **Carry cost (addendum below):** in the coordinator's real main session a subagent's result is re-read until the next compaction – median 2.6k tokens × 139 later calls ≈ $0.10 per hand-off, ≈ $8 a day. It does not flip the result: the job's extra parent calls at the real 288k context cost more ($0.18), and per hand-off the job stays ≈ $0.34 (+38%) more expensive; a job wins in 2.6% of the real hand-offs.
@@ -144,7 +144,7 @@ The agent did roughly ten times as many delegated tasks a day with jobs, at abou
 
 **Question.** The controlled benchmark prices a hand-off up to the parent's answer. In a long-lived main session a subagent's result does not leave: the `Agent` tool result (and, for a background subagent, its `<task-notification>`) stays in the context and is re-read from cache on every later main-session call until the next compaction. A job hands back about one line. Does this carry cost flip the result?
 
-**Data.** The coordinator's main session on macOS (Opus 5 / 5.5, the `jarvis-channel/plugin` project folder), every hand-off from 2026-10-12 00:00 to 2026-10-19 ≈ 19:00 UTC: 7 session files, **497 hand-offs** (468 background, 29 foreground), 8,962 main-session API calls, 35 compactions, 2.75B cache-read tokens in the main session. Script: `scripts/bench/carry_cost.py` (usage fields, tool ids and text lengths only; prints aggregates).
+**Data.** The coordinator's main session on macOS (Opus 5 / 5.5, its main project folder), every hand-off from 2026-10-12 00:00 to 2026-10-19 ≈ 19:00 UTC: 7 session files, **497 hand-offs** (468 background, 29 foreground), 8,962 main-session API calls, 35 compactions, 2.75B cache-read tokens in the main session. Script: `scripts/bench/carry_cost.py` (usage fields, tool ids and text lengths only; prints aggregates).
 
 **Method.**
 
@@ -188,7 +188,7 @@ The agent did roughly ten times as many delegated tasks a day with jobs, at abou
 **Sensitivity.**
 
 - **Honest job follow-up content.** A job's parent does not read only one line: in the benchmark the job-done line itself is ≈ 185 tokens and the follow-up (`job_result`, the diff check, the cherry-pick output) adds 2.9k–5.7k tokens, which then carries exactly like a subagent result. With the benchmark's median 4.8k tokens as the job's carry, the job is $1.37 per hand-off (+$0.51) and cheaper in 2 of 497 hand-offs (0.4%). The subagent side here counts only the result, not the parent's own verification output, so this variant is biased against jobs; the truth is between the two.
-- **Lean job** (no extra parent calls at all – the parent trusts the one-line result and never reads `job_result` or the diff): $1.09 per hand-off, still +$0.17 at the median, cheaper in 8.5% of hand-offs. The job's structural overhead (a full top-level session on the worker side, $2.58 against $1.45–1.71 in the benchmark) remains.
+- **Lean job** (no extra parent calls at all – the parent trusts the one-line result and never reads `job_result` or the diff): $1.09 per hand-off, still +$0.17 at the median, cheaper in 8.5% of hand-offs. The job's structural overhead (a full top-level session on the worker side, $2.57 against $1.46–1.71 in the benchmark) remains.
 
 **Caveats.**
 
