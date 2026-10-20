@@ -702,27 +702,40 @@ var beforeTimeoutClaim = func(string) {}
 
 // killJob ends a running job (timeout, cancel, stop): its whole scope when it has one, else (or when
 // the stop fails) its wrapper's process group, then the process group of a running acceptance command
-// (a group of its own, which neither a session-only job's group kill nor a dead wrapper ends).
-func (m *Manager) killJob(j *store.Job, pid, pgid int) {
+// (a group of its own, which neither a session-only job's group kill nor a dead wrapper ends). It
+// returns a note for the row when members of the group survived (with ReasonSurvivors: the job is not
+// auto-continued, and while the recorded group lives its cleanup, prune and resume stay held up), ""
+// otherwise.
+func (m *Manager) killJob(j *store.Job, pid, pgid int) string {
 	defer m.killAcceptance(j.ID)
 	if j.ScopeUnit != "" {
 		err := m.stopScope(j.ID)
 		if err == nil {
-			return
+			return ""
 		}
 		m.Log.Printf("job %s: stop scope: %v; falling back to the process group", j.ID, err)
 	}
 	if pgid == 0 {
-		return
+		return ""
 	}
 	if j.PGIDSpawned && pgid == j.PGID && !alive(pid) {
 		// The wrapper is gone: the recorded group is ended only member by member, each shown to be the job's.
-		if note := m.endSpawnedGroup(j); note != "" {
+		note := m.endSpawnedGroup(j)
+		if note != "" {
 			m.Log.Printf("job %s: %s", j.ID, note)
 		}
-		return
+		if !strings.Contains(note, ReasonSurvivors) {
+			return ""
+		}
+		return note
 	}
-	m.killGroup(j, pid, pgid)
+	if res, why := m.killGroup(j, pid, pgid); res == groupSurvived {
+		if why != "" {
+			why = " (" + why + ")"
+		}
+		return fmt.Sprintf("process group %d survived SIGKILL%s; %s", pgid, why, ReasonSurvivors)
+	}
+	return ""
 }
 
 // killAcceptance ends the acceptance command's process group recorded in the job row (read now: it is
@@ -936,40 +949,37 @@ func (m *Manager) retryScopeStops() error {
 // happens to be readable. On Linux the leader is pinned by a pidfd while it is checked, an unreadable
 // /proc refuses, and the group is ended member by member through pidfds (endLedGroup), never by a
 // numeric kill(-pgid). Elsewhere (macOS) the identity is read through sysctl (killGroupBySysctl).
-func (m *Manager) killGroup(j *store.Job, pid, pgid int) {
+func (m *Manager) killGroup(j *store.Job, pid, pgid int) (res groupEnd, why string) {
+	refuse := func(why string) (groupEnd, string) {
+		m.Log.Printf("job %s: refusing to kill process group %d: %s", j.ID, pgid, why)
+		return groupRefused, why
+	}
 	if err := verifyGroup(pid, pgid); err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
-		return
+		return refuse(err.Error())
 	}
 	if runtime.GOOS != "linux" {
-		m.killGroupBySysctl(j, pid, pgid)
-		return
+		return m.killGroupBySysctl(j, pid, pgid)
 	}
 	if !procAvailable() {
-		m.Log.Printf("job %s: refusing to kill process group %d: /proc (%s) is unreadable, the wrapper's identity cannot be checked", j.ID, pgid, procRoot)
-		return
+		return refuse(fmt.Sprintf("/proc (%s) is unreadable, the wrapper's identity cannot be checked", procRoot))
 	}
 	fd, err := pidfdOpen(pid)
 	if err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: pidfd_open %d: %v", j.ID, pgid, pid, err)
-		return
+		return refuse(fmt.Sprintf("pidfd_open %d: %v", pid, err))
 	}
 	defer unix.Close(fd)
 	// Checked only now: the descriptor pins one process, so these reads are of that process (or, if it
 	// died meanwhile, of a stranger, and then the liveness check below fails).
 	if err := verifyGroup(pid, pgid); err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
-		return
+		return refuse(err.Error())
 	}
 	if !jobWrapper(j, m.JobDir(j.ID))(pid) {
-		m.Log.Printf("job %s: refusing to kill process group %d: pid %d is not proven to be the job's wrapper (a recycled pid?)", j.ID, pgid, pid)
-		return
+		return refuse(fmt.Sprintf("pid %d is not proven to be the job's wrapper (a recycled pid?)", pid))
 	}
 	if err := pidfdSend(fd, 0); err != nil {
-		m.Log.Printf("job %s: refusing to kill process group %d: wrapper pid %d: %v", j.ID, pgid, pid, err)
-		return
+		return refuse(fmt.Sprintf("wrapper pid %d: %v", pid, err))
 	}
-	m.endLedGroup(j.ID, fmt.Sprintf("process group %d", pgid), pgid, fd, jobGroupMember(j, pgid))
+	return m.endLedGroup(j.ID, fmt.Sprintf("process group %d", pgid), pgid, fd, jobGroupMember(j, pgid))
 }
 
 // heldProc is a process shown to be the job's while a pidfd held it; later signals go through fd.
@@ -1119,8 +1129,12 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 // through sysctl (kern.procargs2) right before each group signal, and the group is signalled by number
 // only while that holds: a group id is not reused while its leader lives. Without a descriptor to pin
 // a process, nothing is ever signalled by pid: one checked and then reused before the kill would be
-// hit. So once the wrapper is gone (it exits on SIGTERM) the members left get no signal at all; the
-// group is watched up to a bounded deadline and the ones still there are reported as survivors.
+// hit. Once the wrapper is gone (it exits on SIGTERM) the group is still signalled as a whole, but only
+// right after a live member of it is shown, through sysctl, to carry the job's marker (owned): a group
+// id is not reused while the group has a process, and a process can join only a group of its own
+// session, so a group holding a marked member is the job's. A group without one gets no signal; the
+// ones still there at the deadline are reported as survivors. Residual: the marked member and every
+// other one exiting, and the id going to a new group, between that read and the kill (a few syscalls).
 func (m *Manager) killGroupBySysctl(j *store.Job, pid, pgid int) (res groupEnd, why string) {
 	proven := func() error {
 		if err := verifyGroup(pid, pgid); err != nil {
@@ -1138,6 +1152,23 @@ func (m *Manager) killGroupBySysctl(j *store.Job, pid, pgid int) (res groupEnd, 
 		}
 		return nil
 	}
+	owned := func() error {
+		werr := proven()
+		if werr == nil {
+			return nil
+		}
+		pids, err := sysctlGroup(pgid)
+		if err != nil {
+			return fmt.Errorf("wrapper not proven (%v), members not listed: %w", werr, err)
+		}
+		for _, p := range pids {
+			info, err := sysctlProc(p)
+			if err == nil && !info.zombie && info.pgid == pgid && envMarker(info.env) == j.ID {
+				return nil
+			}
+		}
+		return fmt.Errorf("wrapper not proven (%v) and no live member carries the job's marker", werr)
+	}
 	if err := proven(); err != nil {
 		m.Log.Printf("job %s: refusing to kill process group %d: %v", j.ID, pgid, err)
 		return groupRefused, err.Error()
@@ -1150,16 +1181,17 @@ func (m *Manager) killGroupBySysctl(j *store.Job, pid, pgid int) (res groupEnd, 
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// SIGKILL goes to the group, again each round while the wrapper is still proven (so a member that
-	// joined since gets it too), and never once it is not.
+	// SIGKILL goes to the group, again each round while it is still shown to be the job's (so a member
+	// that joined since gets it too), and never once it is not.
 	for i := 0; i < 20; i++ {
 		if !groupAlive(pgid) {
 			return groupEnded, ""
 		}
-		if err := proven(); err == nil {
+		if err := owned(); err == nil {
+			why = ""
 			_ = killFn(-pgid, syscall.SIGKILL)
 		} else {
-			why = fmt.Sprintf("members not signalled once the wrapper was gone (%v): without a descriptor no process is signalled by pid", err)
+			why = fmt.Sprintf("group not signalled: %v", err)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -1338,7 +1370,7 @@ func (m *Manager) collect() error {
 			if !claimed {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
-			m.killJob(j, j.PID, j.PGID)
+			survivors := m.killJob(j, j.PID, j.PGID)
 			res, killed := killedResult(j.Runner, dir)
 			if !killed {
 				// The wrapper wrote exit_code since the check above: the attempt ended by itself, so its
@@ -1352,6 +1384,9 @@ func (m *Manager) collect() error {
 				m.writeStopReport(j, dir, stopTimeout, res.Turns)
 			}
 			msg := fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes)
+			if survivors != "" {
+				msg += "; " + survivors
+			}
 			if st, got, ok := m.finish(j, store.StatusTimeout, res, killed, dur, msg, now); ok && st == store.StatusTimeout && got == msg {
 				m.autoContinue(j.ID, stopTimeout)
 			}
@@ -1525,14 +1560,15 @@ func (m *Manager) sweepEscaped(id string) string {
 
 // killRunning ends a running job (cancel, stop): its whole scope when it has one, else its wrapper's
 // process group (SIGTERM, KillGrace, SIGKILL). Callers hold the lifecycle lock and the job's admit lock.
-func (m *Manager) killRunning(j *store.Job) {
+// It returns killJob's note on survivors ("" when none).
+func (m *Manager) killRunning(j *store.Job) string {
 	pid, pgid := j.PID, j.PGID
 	if pgid == 0 { // claimed, pid not recorded: the wrapper may still have registered
 		if w, err := ReadWrapperInfo(m.JobDir(j.ID)); err == nil && w.Token == j.LaunchToken {
 			pid, pgid = w.PID, w.PGID
 		}
 	}
-	m.killJob(j, pid, pgid)
+	return m.killJob(j, pid, pgid)
 }
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
@@ -1591,6 +1627,7 @@ func (m *Manager) Cancel(id string) error {
 		return err
 	}
 	defer unlockAdmit()
+	survivors := ""
 	switch j.Status {
 	case store.StatusQueued:
 	case store.StatusStopped:
@@ -1601,7 +1638,7 @@ func (m *Manager) Cancel(id string) error {
 		m.settled(id) // the job's stats row turns from stopped into cancelled
 		return nil
 	case store.StatusRunning:
-		m.killRunning(j)
+		survivors = m.killRunning(j)
 		m.removeSkills(j)
 	default:
 		return fmt.Errorf("job %s is %s: %w", id, j.Status, store.ErrImmutable)
@@ -1622,9 +1659,12 @@ func (m *Manager) Cancel(id string) error {
 	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
 	res, killed := killedResult(j.Runner, m.JobDir(id))
 	msg := "cancelled"
+	if survivors != "" {
+		msg = RedactPrintable(msg+"; "+survivors, 300)
+	}
 	if err := m.endScope(j); err != nil {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
-		msg = RedactPrintable("cancelled; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
+		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
 	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {
 		return err
