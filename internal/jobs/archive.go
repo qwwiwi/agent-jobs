@@ -64,8 +64,8 @@ type ArchiveReport struct {
 
 // ArchiveDir returns the configured archive root (default <state>/archive).
 func (m *Manager) ArchiveDir() string {
-	if m.Cfg.LogArchiveDir != "" {
-		return m.Cfg.LogArchiveDir
+	if m.Config().LogArchiveDir != "" {
+		return m.Config().LogArchiveDir
 	}
 	return m.defaultArchiveDir()
 }
@@ -182,7 +182,7 @@ func (m *Manager) Archive(dryRun bool) (ArchiveReport, error) {
 		return ArchiveReport{}, err
 	}
 	defer unlock()
-	rep := ArchiveReport{DryRun: dryRun, Dir: m.ArchiveDir(), Days: m.Cfg.ArchiveDays(), Jobs: []ArchiveJob{}}
+	rep := ArchiveReport{DryRun: dryRun, Dir: m.ArchiveDir(), Days: m.Config().ArchiveDays(), Jobs: []ArchiveJob{}}
 	var errs []error
 	err = m.eachPrunable(func(j *store.Job, dir string) {
 		aj := m.archiveJob(j, dir, dryRun)
@@ -521,7 +521,7 @@ func archiveFile(src, dst string, gz bool) error {
 // A root without the marker (not created by the archive) is never expired; off then says so.
 func (m *Manager) expireArchive(dryRun bool) (out []PruneEntry, off string, err error) {
 	out = []PruneEntry{}
-	days := m.Cfg.ArchiveDays()
+	days := m.Config().ArchiveDays()
 	if days == 0 {
 		return out, "", nil
 	}

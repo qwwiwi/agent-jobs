@@ -22,15 +22,18 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
+	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // Manager runs the job lifecycle for one agent.
 type Manager struct {
-	Agent    string
-	StateDir string
-	Cfg      Config
-	Store    *store.Store
+	Agent         string
+	StateDir      string
+	Cfg           Config
+	runtimeConfig atomic.Pointer[Config]
+	configWatch   *ConfigReloader
+	Store         *store.Store
 	// SelfBin is the agent-jobs binary used for run-wrapper and the guard hook.
 	SelfBin string
 	// Now is the clock (overridable in tests).
@@ -195,7 +198,7 @@ func daemonGitEnv() []string {
 // reaches the brain only through the daemon's proxy and never holds the credential.
 func (m *Manager) jobSpawnEnv() []string {
 	env := os.Environ()
-	if name := m.Cfg.Brain.TokenEnv; name != "" {
+	if name := m.Config().Brain.TokenEnv; name != "" {
 		env = slices.DeleteFunc(env, func(kv string) bool {
 			k, _, _ := strings.Cut(kv, "=")
 			return k == name
@@ -237,7 +240,7 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	if limit := m.Cfg.CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
+	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
 		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
 		if err != nil {
 			return nil, err
@@ -265,7 +268,7 @@ func (m *Manager) CodexJobsToday() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if limit := m.Cfg.CodexDailyCap(); limit > 0 {
+	if limit := m.Config().CodexDailyCap(); limit > 0 {
 		return fmt.Sprintf("%d/%d", n, limit), nil
 	}
 	return fmt.Sprintf("%d (cap off)", n), nil
@@ -280,7 +283,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if strings.TrimSpace(r.Brief) == "" {
 		return nil, errors.New("brief is required")
 	}
-	if err := m.Cfg.checkBriefSize(r.Brief); err != nil {
+	if err := m.Config().checkBriefSize(r.Brief); err != nil {
 		return nil, err
 	}
 	if !slices.Contains(Kinds, r.Kind) {
@@ -290,7 +293,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	model, err := resolveModel(m.Cfg.Models, r.Kind, strings.TrimSpace(r.Model), r.Complexity)
+	model, err := resolveModel(m.Config().Models, r.Kind, strings.TrimSpace(r.Model), r.Complexity)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +301,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Cfg.AcceptanceAllowed)
+	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
 		return nil, err
 	}
@@ -311,14 +314,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 			return nil, errors.New("max_turns and max_budget_usd do not apply to a codex job " +
 				"(codex has no turn or budget caps; the timeout is the limit)")
 		}
-		if err := m.Cfg.checkCodexJob(r.Kind); err != nil {
+		if err := m.Config().checkCodexJob(r.Kind); err != nil {
 			return nil, err
 		}
-		effort = m.Cfg.reasoningEffort(effort)
+		effort = m.Config().reasoningEffort(effort)
 		turns, budget = 0, 0 // not enforced on codex: stored as 0, shown as n/a (codex)
 	} else {
 		// Passed as --effort, so a project effortLevel in the worktree cannot change it.
-		effort = m.Cfg.claudeEffort(r.Kind, effort)
+		effort = m.Config().claudeEffort(r.Kind, effort)
 	}
 	var repo, base, branch string
 	if r.RepoPath != "" {
@@ -343,9 +346,16 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
-	selected, err := m.selectSkills(r.Kind, repo, r.Skills)
-	if err != nil {
-		return nil, err
+	var selected []string
+	if skills.BriefDeclinesSkills(r.Brief) {
+		if len(r.Skills) > 0 {
+			return nil, errors.New("skills: none conflicts with skills edits; omit the edits or remove the no-skills line")
+		}
+	} else {
+		selected, err = m.selectSkills(r.Kind, repo, r.Skills)
+		if err != nil {
+			return nil, err
+		}
 	}
 	now := m.Now()
 	j := &store.Job{
@@ -364,6 +374,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 // ones (at most max_running running, default 2), send job-done lines, and clean up worktrees whose
 // notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
+	m.RefreshDaemonConfig()
 	err := m.tickLocked()
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
@@ -450,7 +461,7 @@ func (m *Manager) launchQueued() error {
 	if err != nil {
 		return err
 	}
-	limit := m.Cfg.MaxRunningJobs()
+	limit := m.Config().MaxRunningJobs()
 	for _, j := range queued {
 		if running >= limit {
 			return nil
@@ -607,7 +618,7 @@ func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int,
 	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
 	bin := plan.bin
 	if bin == "" {
-		bin = m.Cfg.claudeBin()
+		bin = m.Config().claudeBin()
 	}
 	argv = append(append(argv, "--", bin), plan.args...)
 	if unit != "" {

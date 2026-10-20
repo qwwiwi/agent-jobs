@@ -39,7 +39,7 @@ func (m *Manager) RecordHTTPAPI(st HTTPAPIStatus) {
 // HTTPAPICheck is the "http api" check of status and system_doctor; ok is false when http_api is off
 // (then there is nothing to check).
 func (m *Manager) HTTPAPICheck() (Check, bool) {
-	if !m.Cfg.HTTPAPI.Enabled {
+	if !m.Config().HTTPAPI.Enabled {
 		return Check{}, false
 	}
 	c := Check{Name: "http api"}

@@ -207,7 +207,7 @@ func turnLimitStop(j *store.Job, res StreamResult) bool {
 // (already continued once, the resume checks or the ceilings refuse) the reason is logged and added
 // to the job's error; with auto_continue off nothing happens. The caller holds the lifecycle lock.
 func (m *Manager) autoContinue(id, why string) {
-	if !m.Cfg.AutoContinueOn() {
+	if !m.Config().AutoContinueOn() {
 		return
 	}
 	j, err := m.Store.Get(id)
@@ -236,7 +236,7 @@ func (m *Manager) autoContinue(id, why string) {
 		skip("it was auto-continued once already (job_resume continues it)")
 		return
 	}
-	l, err := autoContinueLimits(j, earlier, m.Cfg.AutoContinueShare())
+	l, err := autoContinueLimits(j, earlier, m.Config().AutoContinueShare())
 	if err != nil {
 		skip(err.Error())
 		return

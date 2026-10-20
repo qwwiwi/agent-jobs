@@ -167,7 +167,7 @@ func NewServer(h http.Handler) *http.Server {
 // 700 and the agent user's, the token file is missing or open to others, or the bind fails. Whether
 // it serves (and why not) is recorded in <state>/http-api.status for status and system_doctor.
 func Serve(ctx context.Context, m *jobs.Manager, version string) error {
-	if !m.Cfg.HTTPAPI.Enabled {
+	if !m.Config().HTTPAPI.Enabled {
 		return ErrDisabled
 	}
 	err := serve(ctx, m, version)
@@ -180,7 +180,7 @@ func Serve(ctx context.Context, m *jobs.Manager, version string) error {
 }
 
 func serve(ctx context.Context, m *jobs.Manager, version string) error {
-	listen := m.Cfg.HTTPAPIListen(m.StateDir)
+	listen := m.Config().HTTPAPIListen(m.StateDir)
 	if err := jobs.ValidateHTTPListen(listen); err != nil {
 		return fmt.Errorf("http api: %w", err)
 	}
@@ -562,7 +562,7 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, HealthOutput{Version: capField(a.version), StartedAt: a.started.UTC().Format(time.RFC3339),
-		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued, MaxRunning: a.m.Cfg.MaxRunningJobs(),
+		UptimeSec: int64(a.m.Now().Sub(a.started) / time.Second), Running: running, Queued: queued, MaxRunning: a.m.Config().MaxRunningJobs(),
 		Heartbeat: heartbeatView(hb)})
 }
 

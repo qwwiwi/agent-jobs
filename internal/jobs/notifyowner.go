@@ -112,7 +112,7 @@ func (m *Manager) NotifyOwner(jobID, text, urgency string) (*store.Notification,
 		return nil, err
 	}
 	var derr error
-	if target := m.Cfg.NotifyTmuxTarget; target == "" {
+	if target := m.Config().NotifyTmuxTarget; target == "" {
 		derr = errors.New("notify off: notify_tmux_target is not configured")
 	} else {
 		derr = m.sendTmuxLocked(target, NotifyLine(n))

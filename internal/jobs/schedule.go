@@ -109,7 +109,7 @@ func (m *Manager) AddSchedule(r ScheduleRequest) (*store.Schedule, error) {
 			return nil, errors.New("job fields (title, model, complexity, limits, repo, base, runner, reasoning_effort, skills, acceptance_cmd) " +
 				"need a kind; without a kind the prompt goes into the session")
 		}
-		if m.Cfg.NotifyTmuxTarget == "" {
+		if m.Config().NotifyTmuxTarget == "" {
 			return nil, errors.New("a session schedule needs notify_tmux_target in config.json " +
 				"(there is no session to deliver to); give a kind to run it as a job")
 		}
@@ -330,7 +330,7 @@ func (m *Manager) fireSchedules() error {
 	if len(session) > 0 {
 		ferr := ""
 		line := ScheduleLine(session)
-		if t := m.Cfg.NotifyTmuxTarget; t == "" {
+		if t := m.Config().NotifyTmuxTarget; t == "" {
 			ferr = "notify off (notify_tmux_target not configured)"
 			m.Log.Printf("schedule: %s, firing lost: %s", ferr, line)
 		} else if err := m.sendTmuxLocked(t, line); err != nil {
