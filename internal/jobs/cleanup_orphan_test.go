@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -116,9 +117,10 @@ func TestCleanupChildAfterParentCleaned(t *testing.T) {
 	}
 }
 
-// A row stored before #57 still names the parent's (now removed) worktree: cleanup resolves the
-// main repository from the job's own worktree admin dir and verifies ownership there.
-func TestCleanupFallbackWhenRepoPathGone(t *testing.T) {
+// A row stored before #57 still names the parent's (now removed) worktree. Only the row names the
+// repository, so cleanup refuses and keeps everything; after the back-off cap the row is marked
+// skipped with one log line and never retried, and prune still keeps the folder.
+func TestCleanupRepoPathGoneSkipped(t *testing.T) {
 	m := newManager(t)
 	notifyTo(t, m)
 	repo := newRepo(t)
@@ -128,67 +130,116 @@ func TestCleanupFallbackWhenRepoPathGone(t *testing.T) {
 	if err := m.Cleanup(parent); err != nil {
 		t.Fatal(err)
 	}
-	child = get(t, m, child.ID)
-	if child.RepoPath != parentWork {
-		t.Fatalf("precondition: repo_path %s", child.RepoPath)
+	if err := m.Store.MarkCleaned(parent.ID, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	childWork := filepath.Join(m.JobDir(child.ID), "work")
-	childHead := gitT(t, childWork, "rev-parse", "HEAD")
-	if err := m.Cleanup(child); err != nil {
+	err := m.Cleanup(get(t, m, child.ID))
+	if !errors.Is(err, errRepoGone) || !strings.Contains(err.Error(), "refusing to touch") {
 		t.Fatalf("cleanup with a missing repo path: %v", err)
 	}
-	if _, err := os.Stat(childWork); !os.IsNotExist(err) {
-		t.Fatal("child worktree still exists")
+	if _, err := os.Stat(filepath.Join(childWork, "tracked.txt")); err != nil {
+		t.Fatal("child worktree touched")
 	}
-	if ref := gitT(t, repo, "rev-parse", "refs/agent-jobs/jobs/"+child.ID); ref != childHead {
-		t.Fatalf("child ref %s, want %s", ref, childHead)
+	var logBuf bytes.Buffer
+	m.Log = log.New(&logBuf, "", 0)
+	now := time.Now().Add(31 * time.Minute)
+	m.Now = func() time.Time { return now }
+	for i := 0; i < 6*60; i++ {
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
 	}
-	if out := gitT(t, repo, "worktree", "list", "--porcelain"); strings.Contains(out, childWork) {
-		t.Fatalf("child worktree still registered: %s", out)
+	out := logBuf.String()
+	if n := strings.Count(out, "repo_path gone; cleanup skipped, remove manually"); n != 1 {
+		t.Fatalf("skip logged %d times, want once:\n%s", n, out)
+	}
+	if n := strings.Count(out, "job "+child.ID+": "); n > cleanupBackoffAfter+1 {
+		t.Fatalf("%d log lines for the job, want at most %d:\n%s", n, cleanupBackoffAfter+1, out)
+	}
+	if c := get(t, m, child.ID); c.CleanedAt != nil {
+		t.Fatal("skipped cleanup marked cleaned")
+	}
+	pending, err := m.Store.PendingCleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range pending {
+		if j.ID == child.ID {
+			t.Fatal("skipped job still pending cleanup")
+		}
+	}
+	if _, ok := m.cleanupFails[child.ID]; ok {
+		t.Fatal("failure state kept after skip")
+	}
+	if _, err := os.Stat(filepath.Join(childWork, "tracked.txt")); err != nil {
+		t.Fatal("child worktree removed")
+	}
+	// Prune leaves the uncleaned job's folder alone.
+	now = now.Add(PruneAge + time.Hour)
+	if _, err := m.Prune(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(childWork, "tracked.txt")); err != nil {
+		t.Fatal("prune removed the skipped job's worktree")
 	}
 }
 
-// The fallback does not weaken the ownership check: a missing repo path with a foreign worktree at
-// the job's work path, or a worktree.json whose gitdir is not <common>/worktrees/<name>, is refused.
-func TestCleanupFallbackRefusesForeign(t *testing.T) {
-	t.Run("foreign worktree", func(t *testing.T) {
-		m := newManager(t)
-		repo := newRepo(t)
-		j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
-		work := filepath.Join(m.JobDir(j.ID), "work")
-		setRepoPath(t, m, j.ID, filepath.Join(t.TempDir(), "gone"))
-		gitT(t, repo, "worktree", "remove", "--force", work)
-		gitT(t, repo, "worktree", "add", "-q", "--detach", work, "HEAD")
-		if err := os.WriteFile(filepath.Join(work, "precious.txt"), []byte("keep"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		err := m.Cleanup(get(t, m, j.ID))
-		if err == nil || !strings.Contains(err.Error(), "refusing to touch") {
-			t.Fatalf("foreign worktree not refused: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(work, "precious.txt")); err != nil {
-			t.Fatal("foreign worktree content removed")
-		}
-	})
-	t.Run("gitdir outside worktrees", func(t *testing.T) {
-		m := newManager(t)
-		repo := newRepo(t)
-		j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
-		dir := m.JobDir(j.ID)
-		work := filepath.Join(dir, "work")
-		setRepoPath(t, m, j.ID, filepath.Join(t.TempDir(), "gone"))
-		b, _ := json.Marshal(WorktreeInfo{Path: work, GitDir: filepath.Join(t.TempDir(), "x", "y"), Head: j.BaseCommit})
-		if err := os.WriteFile(filepath.Join(dir, "worktree.json"), b, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		err := m.Cleanup(get(t, m, j.ID))
-		if err == nil || !strings.Contains(err.Error(), "refusing to touch") {
-			t.Fatalf("bad gitdir not refused: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(work, "tracked.txt")); err != nil {
-			t.Fatal("work removed")
-		}
-	})
+// Regression for the #57 fix review: a job forges a common git dir inside its own folder, registers
+// its work dir there with its owner mark, points worktree.json at that admin dir and symlinks
+// refs/agent-jobs/jobs to a foreign repository's refs/heads. With repo_path gone, cleanup must refuse:
+// no ref is written into the foreign repository and nothing is removed.
+func TestCleanupRepoPathGoneIgnoresForgedCommonDir(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	foreign := newRepo(t)
+	foreignBefore := gitT(t, foreign, "for-each-ref")
+	j := runToEnd(t, m, enqueue(t, m, "x", func(r *StartRequest) { r.RepoPath = repo }).ID)
+	dir := m.JobDir(j.ID)
+	work := filepath.Join(dir, "work")
+	gitT(t, repo, "worktree", "remove", "--force", work)
+	forged := filepath.Join(dir, "forged")
+	gitT(t, repo, "clone", "-q", repo, forged)
+	gitT(t, forged, "worktree", "add", "-q", "--detach", work, "HEAD")
+	gitDir := gitT(t, work, "rev-parse", "--absolute-git-dir")
+	if err := os.WriteFile(filepath.Join(gitDir, worktreeOwnerFile), []byte(j.ID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(WorktreeInfo{Path: work, GitDir: gitDir, Head: j.BaseCommit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "worktree.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refs := filepath.Join(forged, ".git", "refs", "agent-jobs")
+	if err := os.MkdirAll(refs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(foreign, ".git", "refs", "heads"), filepath.Join(refs, "jobs")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work, "precious.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setRepoPath(t, m, j.ID, filepath.Join(t.TempDir(), "gone"))
+	err = m.Cleanup(get(t, m, j.ID))
+	if !errors.Is(err, errRepoGone) {
+		t.Fatalf("forged common dir not refused: %v", err)
+	}
+	if got := gitT(t, foreign, "for-each-ref"); got != foreignBefore {
+		t.Fatalf("foreign refs changed:\n%s\nwant:\n%s", got, foreignBefore)
+	}
+	if _, err := os.Lstat(filepath.Join(foreign, ".git", "refs", "heads", j.ID)); !os.IsNotExist(err) {
+		t.Fatalf("ref written into the foreign repository: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "precious.txt")); err != nil {
+		t.Fatal("work removed")
+	}
+	if out := gitT(t, forged, "worktree", "list", "--porcelain"); !strings.Contains(out, work) {
+		t.Fatalf("forged worktree unregistered: %s", out)
+	}
 }
 
 // After cleanupBackoffAfter consecutive failures cleanup logs the back-off once and retries less
