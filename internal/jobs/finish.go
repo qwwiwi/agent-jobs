@@ -352,12 +352,30 @@ func (m *Manager) runTmuxOutput(ctx context.Context, args ...string) (string, er
 	return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()+stdout.String()))
 }
 
+// After cleanupBackoffAfter consecutive failed cleanups of a job, the next tries wait twice as long
+// each time (one tick first), at most cleanupBackoffMax, and only the back-off itself is logged.
+const (
+	cleanupBackoffAfter = 3
+	cleanupBackoffMax   = time.Hour
+)
+
+// cleanupFail is a job's run of failed cleanups (in memory: a daemon restart retries at once).
+type cleanupFail struct {
+	n    int
+	next time.Time // no retry before this
+}
+
 func (m *Manager) cleanupDue() error {
 	jobs, err := m.Store.PendingCleanup()
 	if err != nil {
 		return err
 	}
 	now := m.Now()
+	for id := range m.cleanupFails {
+		if !slices.ContainsFunc(jobs, func(j *store.Job) bool { return j.ID == id }) {
+			delete(m.cleanupFails, id) // cleaned, resumed or pruned meanwhile
+		}
+	}
 	for _, j := range jobs {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
@@ -365,15 +383,51 @@ func (m *Manager) cleanupDue() error {
 		if j.ScopePending {
 			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
+		f := m.cleanupFails[j.ID]
+		if now.Before(f.next) {
+			continue // backing off
+		}
 		if err := m.Cleanup(j); err != nil {
-			m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", j.ID, RedactText(err.Error()))
+			m.cleanupFailed(j.ID, f, now, err)
 			continue
+		}
+		if f.n > 0 {
+			delete(m.cleanupFails, j.ID)
+			if f.n >= cleanupBackoffAfter {
+				m.Log.Printf("job %s: cleanup succeeded after %d failed attempts", j.ID, f.n)
+			}
 		}
 		if err := m.Store.MarkCleaned(j.ID, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// cleanupFailed records one more failed cleanup of job id (f is its run so far). The first
+// cleanupBackoffAfter failures are logged and retried on the next tick; at that count the back-off
+// is logged once, and later tries wait 2, 4, 8 … ticks (at most cleanupBackoffMax) and log nothing.
+func (m *Manager) cleanupFailed(id string, f cleanupFail, now time.Time, err error) {
+	f.n++
+	msg := RedactText(err.Error())
+	switch {
+	case f.n < cleanupBackoffAfter:
+		m.Log.Printf("job %s: cleanup failed (will retry, worktree kept): %s", id, msg)
+	case f.n == cleanupBackoffAfter:
+		m.Log.Printf("job %s: cleanup failed (worktree kept): %s; failed %d times in a row, backing off "+
+			"(retries up to every %s, not logged until it succeeds)", id, msg, f.n, cleanupBackoffMax)
+	}
+	if f.n >= cleanupBackoffAfter {
+		wait := cleanupBackoffMax
+		if k := f.n - cleanupBackoffAfter + 1; k < 16 {
+			wait = min(TickInterval<<k, cleanupBackoffMax)
+		}
+		f.next = now.Add(wait)
+	}
+	if m.cleanupFails == nil {
+		m.cleanupFails = make(map[string]cleanupFail)
+	}
+	m.cleanupFails[id] = f
 }
 
 func samePath(a, b string) bool {
@@ -396,22 +450,36 @@ func under(path, dir string) bool {
 	return err == nil && rel != "." && !filepath.IsAbs(rel) && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// verifyWorktree proves that <jobdir>/work is the worktree this job created: registered in the
-// source repo at that path, with its admin dir under <repo's common git dir>/worktrees/ and equal to
-// the one recorded at creation, carrying this job's owner mark.
+// verifyWorktree proves that <jobdir>/work is the worktree this job created in its repository.
 func (m *Manager) verifyWorktree(j *store.Job, work string) error {
+	return m.verifyWorktreeIn(j, j.RepoPath, work)
+}
+
+// readWorktreeInfo reads the job's worktree.json.
+func (m *Manager) readWorktreeInfo(j *store.Job) (WorktreeInfo, error) {
 	var info WorktreeInfo
 	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "worktree.json"))
 	if err != nil {
-		return fmt.Errorf("worktree.json: %w", err)
+		return info, fmt.Errorf("worktree.json: %w", err)
 	}
 	if err := json.Unmarshal(b, &info); err != nil {
-		return fmt.Errorf("worktree.json: %w", err)
+		return info, fmt.Errorf("worktree.json: %w", err)
+	}
+	return info, nil
+}
+
+// verifyWorktreeIn proves that <jobdir>/work is the worktree this job created: registered in repo
+// at that path, with its admin dir under <repo's common git dir>/worktrees/ and equal to the one
+// recorded at creation, carrying this job's owner mark.
+func (m *Manager) verifyWorktreeIn(j *store.Job, repo, work string) error {
+	info, err := m.readWorktreeInfo(j)
+	if err != nil {
+		return err
 	}
 	if !samePath(info.Path, work) {
 		return fmt.Errorf("worktree.json path %s is not %s", info.Path, work)
 	}
-	list, err := git(j.RepoPath, "worktree", "list", "--porcelain")
+	list, err := git(repo, "worktree", "list", "--porcelain")
 	if err != nil {
 		return err
 	}
@@ -422,13 +490,13 @@ func (m *Manager) verifyWorktree(j *store.Job, work string) error {
 		}
 	}
 	if !registered {
-		return fmt.Errorf("%s is not a registered worktree of %s", work, j.RepoPath)
+		return fmt.Errorf("%s is not a registered worktree of %s", work, repo)
 	}
 	gitDir, err := git(work, "rev-parse", "--absolute-git-dir")
 	if err != nil {
 		return err
 	}
-	common, err := git(j.RepoPath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	common, err := git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return err
 	}
@@ -443,6 +511,34 @@ func (m *Manager) verifyWorktree(j *store.Job, work string) error {
 		return fmt.Errorf("worktree %s does not carry this job's owner mark", work)
 	}
 	return nil
+}
+
+// cleanupRepo is the repository Cleanup works in: the job's repo path or, when that path is gone (a
+// row stored before #57 whose repo was another job's worktree, cleaned up since), the common git dir
+// that holds the job's worktree admin dir recorded at creation (<common dir>/worktrees/<name>). It is
+// only a candidate: verifyWorktreeIn then proves ownership there exactly as in the repo path.
+func (m *Manager) cleanupRepo(j *store.Job) (string, error) {
+	if _, err := os.Lstat(j.RepoPath); !errors.Is(err, os.ErrNotExist) {
+		return j.RepoPath, nil
+	}
+	info, err := m.readWorktreeInfo(j)
+	if err != nil {
+		return "", fmt.Errorf("repo %s is gone: %w", j.RepoPath, err)
+	}
+	admins := filepath.Dir(filepath.Clean(info.GitDir))
+	if !filepath.IsAbs(info.GitDir) || filepath.Base(admins) != "worktrees" {
+		return "", fmt.Errorf("repo %s is gone and the recorded admin dir %s is not <common dir>/worktrees/<name>",
+			j.RepoPath, info.GitDir)
+	}
+	common := filepath.Dir(admins)
+	got, err := git(common, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("repo %s is gone: %w", j.RepoPath, err)
+	}
+	if !samePath(got, common) {
+		return "", fmt.Errorf("repo %s is gone and %s is not a common git dir (%s)", j.RepoPath, common, got)
+	}
+	return common, nil
 }
 
 // Cleanup verifies that <jobdir>/work is this job's own worktree, then saves (without touching
@@ -470,7 +566,11 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing to touch %s: not a real directory (%s)", work, fi.Mode().Type())
 	}
-	if err := m.verifyWorktree(j, work); err != nil {
+	repo, err := m.cleanupRepo(j)
+	if err != nil {
+		return fmt.Errorf("refusing to touch %s: %w", work, err)
+	}
+	if err := m.verifyWorktreeIn(j, repo, work); err != nil {
 		return fmt.Errorf("refusing to touch %s: %w", work, err)
 	}
 	m.removeSkills(j) // removed when the attempt ended; again here, so no link reaches a patch
@@ -479,7 +579,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 		return err
 	}
 	if len(drivers) > 0 {
-		return m.keepWithDrivers(j, dir, work, drivers)
+		return m.keepWithDrivers(j, repo, dir, work, drivers)
 	}
 	untracked, err := gitRaw(work, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
@@ -525,11 +625,14 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if err != nil {
 		return err
 	}
-	if _, err := git(j.RepoPath, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
+	if _, err := git(repo, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
 		return err
 	}
-	if _, err := git(j.RepoPath, "worktree", "remove", "--force", work); err != nil {
+	if _, err := git(repo, "worktree", "remove", "--force", work); err != nil {
 		return err
+	}
+	if repo != j.RepoPath {
+		m.Log.Printf("job %s: repo %s is gone; cleaned up in the repository of the job's worktree, %s", j.ID, j.RepoPath, repo)
 	}
 	m.Log.Printf("job %s: worktree removed, patches saved, ref refs/agent-jobs/jobs/%s -> %s", j.ID, j.ID, head)
 	return nil
@@ -567,7 +670,7 @@ func repoDrivers(work string) ([]string, error) {
 // diff, format-patch or status would run them in the daemon, so no patch is made and the worktree is
 // kept for a human to inspect. The job's last commit is still saved under refs/agent-jobs/jobs/<id>
 // and the cleanup counts as done (it is not retried).
-func (m *Manager) keepWithDrivers(j *store.Job, dir, work string, drivers []string) error {
+func (m *Manager) keepWithDrivers(j *store.Job, repo, dir, work string, drivers []string) error {
 	note := "cleanup skipped: the repository config names filter/diff drivers (" + strings.Join(drivers, ", ") +
 		"); no patches were made, the worktree is kept: " + work
 	if err := writeAtomic(filepath.Join(dir, "diffstat.txt"), []byte(note+"\n")); err != nil {
@@ -577,7 +680,7 @@ func (m *Manager) keepWithDrivers(j *store.Job, dir, work string, drivers []stri
 	if err != nil {
 		return err
 	}
-	if _, err := git(j.RepoPath, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
+	if _, err := git(repo, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
 		return err
 	}
 	m.Log.Printf("job %s: %s; ref refs/agent-jobs/jobs/%s -> %s", j.ID, note, j.ID, head)
