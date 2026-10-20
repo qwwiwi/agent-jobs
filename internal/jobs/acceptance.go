@@ -211,8 +211,9 @@ type wrapperAcceptance struct {
 }
 
 // openAcceptance reads the job's acceptance command from <state>/jobs.db (jobDir = <state>/jobs/<id>)
-// and the acceptance timeout from config.json. The returned store stays open for the result; close it.
-func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
+// and the acceptance timeout from config.json. Permission requires both the launching daemon's
+// authorization and the current disk opt-in. The returned store stays open for the result; close it.
+func openAcceptance(jobDir string, allowedAtLaunch bool) (*wrapperAcceptance, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return nil, err
@@ -230,6 +231,10 @@ func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
 	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID}
 	if a.cmd == "" {
 		return a, nil
+	}
+	if !allowedAtLaunch {
+		_ = st.Close()
+		return nil, errors.New("acceptance_allowed was not authorized by the launching daemon; the acceptance command is not run")
 	}
 	c, err := LoadConfig(state)
 	if err != nil {
@@ -253,8 +258,8 @@ func openAcceptance(jobDir string) (*wrapperAcceptance, error) {
 // SIGTERM, SIGINT or SIGHUP while it runs (cancel, stop, the daemon's timeout) end the command's process
 // group (TERM, then KILL after acceptanceKillGrace) and the wrapper returns 128+SIGTERM without a
 // result or exit_code: the daemon is ending the job anyway.
-func runAcceptanceStep(jobDir, token string, log *os.File) int {
-	a, err := openAcceptance(jobDir)
+func runAcceptanceStep(jobDir, token string, log *os.File, allowedAtLaunch bool) int {
+	a, err := openAcceptance(jobDir, allowedAtLaunch)
 	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance:", err)
 		return 0

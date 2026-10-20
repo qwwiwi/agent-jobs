@@ -25,10 +25,11 @@ type ConfigReloader struct {
 	exists   bool
 	lastErr  string
 	restart  []string
+	readFile func(string) ([]byte, error) // per-loader seam for concurrent-write tests
 }
 
 func NewConfigReloader(stateDir string, initial Config) *ConfigReloader {
-	return &ConfigReloader{stateDir: stateDir, current: initial}
+	return &ConfigReloader{stateDir: stateDir, current: initial, readFile: os.ReadFile}
 }
 
 // Hot keys affect future selections or runtime limits. All other keys are restart-only, including
@@ -78,7 +79,7 @@ func (w *ConfigReloader) Reload() (cfg Config, changed bool, reloadErr string, r
 		}
 	default:
 		var b []byte
-		b, err = os.ReadFile(path)
+		b, err = w.readFile(path)
 		if err == nil {
 			after, e := StatIdentity(path)
 			if e != nil || !id.Same(after) {
@@ -118,6 +119,20 @@ func (m *Manager) Config() Config {
 	return m.Cfg
 }
 
+// authorizedLaunchConfig uses the daemon's active settings. Disk edits can revoke permissions
+// immediately, but granting restart-only permissions requires a daemon restart. Invalid edits deny
+// the launch even while the daemon retains its last good config for other work.
+func (m *Manager) authorizedLaunchConfig() (Config, error) {
+	disk, err := LoadConfig(m.StateDir)
+	if err != nil {
+		return Config{}, fmt.Errorf("job not launched: config reload failed: %w", err)
+	}
+	active := m.Config()
+	active.CodexWriteAllowed = active.CodexWriteAllowed && disk.CodexWriteAllowed
+	active.AcceptanceAllowed = active.AcceptanceAllowed && disk.AcceptanceAllowed
+	return active, nil
+}
+
 // WatchDaemonConfig enables reloads at the start of every tick, before schedules and launches.
 func (m *Manager) WatchDaemonConfig() {
 	m.configWatch = NewConfigReloader(m.StateDir, m.Cfg)
@@ -129,12 +144,12 @@ func (m *Manager) RefreshDaemonConfig() {
 		return
 	}
 	cfg, changed, errText, restart := m.configWatch.Reload()
-	if !changed {
+	if !changed && !m.configPublishPending {
 		return
 	}
-	if errText != "" {
+	if changed && errText != "" {
 		m.Log.Printf("config.json reload rejected; keeping last good config: %s", errText)
-	} else {
+	} else if changed {
 		m.runtimeConfig.Store(&cfg)
 		m.Log.Printf("config.json reloaded")
 		for _, key := range restart {
@@ -142,8 +157,11 @@ func (m *Manager) RefreshDaemonConfig() {
 		}
 	}
 	status := DaemonConfigStatus{PID: os.Getpid(), CheckedAt: m.Now().UTC(), Fingerprint: configFingerprint(m.Config()), Error: errText, RestartKeys: restart}
+	m.configPublishPending = true
 	if err := writeJSON(filepath.Join(m.StateDir, "daemon-config.json"), status); err != nil {
 		m.Log.Printf("record daemon config: %v", err)
+	} else {
+		m.configPublishPending = false
 	}
 }
 

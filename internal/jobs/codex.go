@@ -88,16 +88,6 @@ func (c Config) checkCodexJob(kind string) error {
 	return nil
 }
 
-// reloadCodexConfig reads and validates config.json for the launch of a codex job; a config that does
-// not load refuses the launch (fail closed).
-func reloadCodexConfig(stateDir string) (Config, error) {
-	cfg, err := LoadConfig(stateDir)
-	if err != nil {
-		return Config{}, fmt.Errorf("codex job not launched: config reload failed: %w", err)
-	}
-	return cfg, nil
-}
-
 // reasoningEffort returns the effort of a codex job: the job's own, else the config's, else the default.
 func (c Config) reasoningEffort(job string) string {
 	if job != "" {

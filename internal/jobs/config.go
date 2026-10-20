@@ -145,8 +145,8 @@ type Config struct {
 	// 0 = DefaultAcceptanceTimeoutMinutes (15); at most CeilingAcceptanceTimeoutMinutes (60).
 	AcceptanceTimeoutMinutes int `json:"acceptance_timeout_minutes"`
 	// AcceptanceAllowed opts in to acceptance_cmd (default false: job_start and schedule_add refuse it,
-	// and the wrapper, which reloads config.json, does not run it). The command runs the job's code
-	// outside the guard.
+	// and the daemon and wrapper do not run it). Enabling requires a daemon restart; disabling on
+	// disk revokes it immediately. The command runs the job's code outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
 	// SkillRoots are absolute directories of skill catalogs (E7), each holding index.json; earlier roots
 	// win a duplicate name. A missing or invalid root is a warning (status, system_doctor), never fatal.
