@@ -421,6 +421,7 @@ var migrations = []string{
 	`ALTER TABLE job_stats ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN merge_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN cleanup_skipped_at INTEGER`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -734,9 +735,10 @@ func (s *Store) ListActivity(since time.Time, limit int) ([]*Job, error) {
 		ORDER BY created_at DESC, rowid DESC LIMIT ?`, since.Unix(), since.Unix(), limit)
 }
 
-// PendingCleanup returns finished, notified, not yet cleaned jobs (a stopped job keeps its work dir).
+// PendingCleanup returns finished, notified, not yet cleaned jobs (a stopped job keeps its work dir)
+// whose cleanup was not given up (MarkCleanupSkipped).
 func (s *Store) PendingCleanup() ([]*Job, error) {
-	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NOT NULL AND cleaned_at IS NULL ORDER BY finished_at`)
+	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NOT NULL AND cleaned_at IS NULL AND cleanup_skipped_at IS NULL ORDER BY finished_at`)
 }
 
 // PendingNotify returns finished jobs whose notification was not sent yet. A stopped job is not
@@ -885,7 +887,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		merge_note='', cleaned_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
+		merge_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
 		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
@@ -1050,6 +1052,13 @@ func (s *Store) Finish(id, token, status string, turns int, cost float64, durati
 		args = append(args, token)
 	}
 	return affected(s.db.Exec(q, args...))
+}
+
+// MarkCleanupSkipped records that the worktree cleanup was given up (its repository is gone): the
+// job leaves PendingCleanup, and its folder stays (cleaned_at stays NULL, so prune keeps it).
+func (s *Store) MarkCleanupSkipped(id string, now time.Time) error {
+	_, err := s.db.Exec(`UPDATE jobs SET cleanup_skipped_at=? WHERE id=?`, now.Unix(), id)
+	return err
 }
 
 // MarkCleaned records that the worktree cleanup ran.
