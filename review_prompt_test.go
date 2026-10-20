@@ -19,7 +19,7 @@ func TestReviewPromptRiskyFirst(t *testing.T) {
 		"Delivered", "Requirement by requirement", "Design", "Code",
 		"`### Blocking`", "`### Non-blocking`", "file:line",
 		"`Verdict: SHIP`", "`Verdict: SHIP WITH FIXES`", "`Verdict: BLOCK`",
-		"BLOCK if and only if Blocking is not empty",
+		"BLOCK if and only if Blocking is not empty", "read-only", "shell heredoc",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("kind-review.md lacks %q", want)

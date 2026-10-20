@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -31,12 +33,57 @@ type DiskStatus struct {
 	PrunableBytes int64 `json:"prunable_bytes"`
 	// PruneError is a failure of the prune dry run behind PrunableBytes (then the number may be low).
 	PruneError string `json:"prune_error,omitempty"`
-	Error      string `json:"error,omitempty"`
+	// LargestJobDirs are the MaxLargestJobDirs biggest job folders (worktrees of repo jobs left out).
+	LargestJobDirs []JobDirUsage `json:"largest_job_dirs"`
+	// JobTmpBytes is what all job temp dirs (<jobdir>/tmp, the jobs' TMPDIR) hold together.
+	JobTmpBytes int64  `json:"job_tmp_bytes"`
+	Error       string `json:"error,omitempty"`
+}
+
+// MaxLargestJobDirs is how many job folders DiskStatus lists.
+const MaxLargestJobDirs = 5
+
+// JobDirUsage is the size of one job folder; TmpBytes is the part in its temp dir (JobTmpDir).
+// Partial: the walk that measured it stopped at its bound, both are lower bounds.
+type JobDirUsage struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Bytes    int64  `json:"bytes"`
+	TmpBytes int64  `json:"tmp_bytes"`
+	Partial  bool   `json:"partial,omitempty"`
+}
+
+// largestJobDirs returns the largest job folders, biggest first, and the total of their temp dirs,
+// from the sizes recorded on the rows (recordDirSize: when an attempt ended, after a prune); nothing
+// is walked here. A job that is still running has no recorded size yet.
+func (m *Manager) largestJobDirs() ([]JobDirUsage, int64, error) {
+	all, err := m.Store.List(-1) // negative: no limit
+	if err != nil {
+		return nil, 0, err
+	}
+	var out []JobDirUsage
+	var tmp int64
+	for _, j := range all {
+		tmp += j.DirTmpBytes
+		if j.DirBytes > 0 {
+			out = append(out, JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial})
+		}
+	}
+	slices.SortStableFunc(out, func(a, b JobDirUsage) int { return cmp.Compare(b.Bytes, a.Bytes) })
+	if len(out) > MaxLargestJobDirs {
+		out = out[:MaxLargestJobDirs]
+	}
+	return out, tmp, nil
 }
 
 // Disk reports the state dir's filesystem.
 func (m *Manager) Disk() DiskStatus {
-	d := DiskStatus{Path: m.StateDir}
+	d := DiskStatus{Path: m.StateDir, LargestJobDirs: []JobDirUsage{}}
+	if dirs, tmp, err := m.largestJobDirs(); err != nil {
+		d.Error = "job folders: " + err.Error()
+	} else {
+		d.LargestJobDirs, d.JobTmpBytes = dirs, tmp
+	}
 	var st unix.Statfs_t
 	if err := unix.Statfs(m.StateDir, &st); err != nil {
 		d.Error = err.Error()

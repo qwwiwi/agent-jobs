@@ -39,7 +39,8 @@ type JobView struct {
 	Model      string `json:"model"`
 	Complexity string `json:"complexity,omitempty"`
 	Runner     string `json:"runner"`
-	// ReasoningEffort is the codex reasoning effort of a codex job.
+	// ReasoningEffort is the job's reasoning effort (codex model_reasoning_effort or claude --effort);
+	// empty for a claude job from before it was recorded.
 	ReasoningEffort string  `json:"reasoning_effort,omitempty"`
 	Billing         string  `json:"billing"`
 	MaxTurns        int     `json:"max_turns"`
@@ -71,6 +72,19 @@ type JobView struct {
 	// SizeWarning (job_start only): the brief names many files or has many "## " headings, so it may
 	// be more than one job.
 	SizeWarning string `json:"size_warning,omitempty"`
+	// SameRepoJobs (job_start only): the other queued or running jobs on the same repository, an
+	// advisory (the job is queued anyway).
+	SameRepoJobs string `json:"same_repo_jobs,omitempty"`
+	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
+	BaseBranch string `json:"base_branch,omitempty"`
+	// MergeNote is that check, made when the job-done line was sent.
+	MergeNote string `json:"merge_note,omitempty"`
+	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
+	// config.json did not load, or the daemon runs another version (restart the session).
+	Warnings []string `json:"warnings,omitempty"`
+	// CodexJobsToday (job_start of a codex job only): codex jobs of this agent in the last 24 hours
+	// against the daily cap, "n/limit".
+	CodexJobsToday string `json:"codex_jobs_today,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -81,6 +95,9 @@ type JobView struct {
 	Skills          []string `json:"skills,omitempty"`
 	SkillsDelivered []string `json:"skills_delivered,omitempty"`
 	SkillsNote      string   `json:"skills_note,omitempty"`
+	// Outcome is what the orchestrator recorded with job_outcome ("" = none yet).
+	Outcome     string `json:"outcome,omitempty"`
+	OutcomeNote string `json:"outcome_note,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -102,6 +119,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		ScheduleID: j.ScheduleID, Error: j.Error, JobDir: m.JobDir(j.ID), Containment: jobs.Containment(j),
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
+		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
 	}
 }
 
@@ -145,7 +163,7 @@ type JobStartInput struct {
 	Repo            string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
 	Base            string   `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
 	Runner          string   `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
-	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"codex jobs only: low | medium | high; default from config, else high"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. See skill_list"`
@@ -157,7 +175,11 @@ func addJobStart(s *sdk.Server, d Deps) {
 		Description: "Queue a background claude -p job (or codex exec: a gpt-* model or runner codex) and return its id immediately. The daemon starts it within a minute " +
 			"(at most max_running per agent run at once: config.json key max_running, default 2). The job commits locally only; it never pushes or messages anyone. " +
 			"State an explicit model or a complexity (light|normal|hard); with neither the call is rejected. " +
-			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped.",
+			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped. " +
+			"A codex job counts against the agent's codex daily cap (config codex_jobs_per_day, default 3 in 24 h, 0 = off; " +
+			"past it job_start is refused); its reply shows codex_jobs_today n/limit. " +
+			"same_repo_jobs names other queued or running jobs on the same repository (advisory). A repo job records its " +
+			"base_branch; its job-done line says whether its commits still merge onto that branch (git merge-tree).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
@@ -170,6 +192,15 @@ func addJobStart(s *sdk.Server, d Deps) {
 		}
 		v := view(d.Manager, j)
 		v.SizeWarning = d.Manager.Cfg.BriefSizeWarning(in.Brief)
+		v.SameRepoJobs = d.Manager.SameRepoNote(j)
+		if d.Watch != nil {
+			v.Warnings = d.Watch.Warnings("job_start")
+		}
+		if j.Runner == store.RunnerCodex {
+			if v.CodexJobsToday, err = d.Manager.CodexJobsToday(); err != nil {
+				v.CodexJobsToday = "unknown: " + err.Error()
+			}
+		}
 		return nil, v, nil
 	})
 }
@@ -218,6 +249,11 @@ type JobResultOutput struct {
 	Attempts []AttemptView `json:"attempts,omitempty"`
 	// Acceptance is the acceptance command's outcome (jobs with acceptance_cmd only).
 	Acceptance *AcceptanceView `json:"acceptance,omitempty"`
+	// JobDirBytes is the size of the job folder last measured (when the job ended, after a prune; the
+	// worktree of a repo job left out); JobDirPartial: the measurement stopped at its bound, the size
+	// is a lower bound.
+	JobDirBytes   int64 `json:"job_dir_bytes"`
+	JobDirPartial bool  `json:"job_dir_partial,omitempty"`
 }
 
 // MaxAcceptanceTailBytes caps the acceptance log tail job_result returns; the log keeps 64 KB.
@@ -273,7 +309,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 			out.Note = "job is " + j.Status + "; the session gets a [jobs:job-done] line when it ends"
 			return nil, out, nil
 		}
-		out.DoneLine = jobs.DoneLine(j)
+		out.DoneLine = m.DoneLineFor(j)
+		out.JobDirBytes, out.JobDirPartial = j.DirBytes, j.DirPartial
 		out.Acceptance = acceptanceView(m, j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {

@@ -108,7 +108,7 @@ func TestAcceptanceNoteRedacted(t *testing.T) {
 	if n := acceptanceNote(j); leaksTok(n) || !strings.HasPrefix(n, "acceptance did not run") {
 		t.Fatalf("note %q", n)
 	}
-	if line := DoneLine(j); leaksTok(line) {
+	if line := DoneLine(j, 0); leaksTok(line) {
 		t.Fatalf("done line: %s", line)
 	}
 }

@@ -79,3 +79,36 @@ func TestCodexJobViewCostUnknownWhileActive(t *testing.T) {
 		t.Fatalf("job_list: %+v", list)
 	}
 }
+
+// A codex job_start shows codex_jobs_today n/limit; past the cap it is refused, claude jobs still
+// start, and system_doctor shows the count.
+func TestJobStartCodexDailyCap(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin // the doctor's guard probe runs the real binary
+	two := 2
+	m.Cfg.CodexJobsPerDay = &two
+	cs := connect(t, mustServer(t, m))
+	codex := startArgs(func(a map[string]any) { a["kind"] = "review"; a["model"] = "gpt-5.5" })
+	var v JobView
+	call(t, cs, "job_start", codex, &v)
+	if v.CodexJobsToday != "1/2" {
+		t.Fatalf("first: %q", v.CodexJobsToday)
+	}
+	call(t, cs, "job_start", codex, &v)
+	if v.CodexJobsToday != "2/2" {
+		t.Fatalf("second: %q", v.CodexJobsToday)
+	}
+	if msg := callErr(t, cs, "job_start", codex); !strings.Contains(msg, "codex daily cap reached: 2 codex jobs") {
+		t.Fatalf("third: %q", msg)
+	}
+	var c JobView
+	call(t, cs, "job_start", startArgs(nil), &c)
+	if c.Runner != "claude" || c.CodexJobsToday != "" {
+		t.Fatalf("claude job: %+v", c)
+	}
+	var doc SystemDoctorOutput
+	call(t, cs, "system_doctor", map[string]any{}, &doc)
+	if doc.CodexJobsToday != "2/2" {
+		t.Fatalf("doctor: %q", doc.CodexJobsToday)
+	}
+}

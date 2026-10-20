@@ -50,6 +50,7 @@ Inside a job:
 | `job_amend` | add context to a job that is still queued (it keeps its place) |
 | `job_stop` | stop a queued or running job but keep its worktree, uncommitted work and session (status `stopped`) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
+| `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
 
 ## Change a job's course
@@ -84,7 +85,7 @@ A job gets `memory_search` and `memory_write` only, through the daemon, and neve
 
 ## When a job is done
 
-You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. The report is not pushed into the session.
+You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m · model <m> · effort <e>`. The report is not pushed into the session.
 
 1. Read it with `job_result` when you are ready. Read the section **«Not done / uncertain» first**: it names what the job did not do or could not verify.
 2. The report is a claim, not a result. Check the diff yourself against `base_commit`: in the worktree while it exists, afterwards `commits.patch`, `staged.patch`, `uncommitted.patch`, `untracked.tar`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`. Run the checks yourself.

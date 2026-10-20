@@ -17,6 +17,7 @@ import (
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/skills"
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // Limits: defaults and hard ceilings. A request above a ceiling is rejected, never clamped.
@@ -75,6 +76,14 @@ type Config struct {
 	CodexWriteAllowed bool `json:"codex_write_allowed"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`
+	// CodexJobsPerDay caps the codex jobs of this agent created in the last 24 hours, whatever became of
+	// them (job_start, agent-jobs start and schedule firings past it are refused). Nil (absent) =
+	// DefaultCodexJobsPerDay (3); 0 turns the cap off. The count is per agent (each agent has its own
+	// state dir); a host-wide cap would need a counter shared by all agents.
+	CodexJobsPerDay *int `json:"codex_jobs_per_day"`
+	// EffortByKind overrides the default reasoning effort of claude jobs per kind
+	// (low|medium|high|xhigh|max), e.g. {"general": "low"}. Unset kinds keep DefaultEffortByKind.
+	EffortByKind map[string]string `json:"effort_by_kind"`
 	// Models overrides cells of the kind × complexity model table (DEVIATIONS #6), e.g.
 	// {"review": {"hard": "gpt-6.1-sol"}}. A gpt-* model runs the job on codex. Unset cells keep the defaults.
 	Models map[string]map[string]string `json:"models"`
@@ -104,6 +113,9 @@ type Config struct {
 	// DailyHour is the local hour (0..23) after which the daemon runs the daily automation (prune and
 	// doctor procs in report mode) once per local day. Nil = DefaultDailyHour (4).
 	DailyHour *int `json:"daily_hour"`
+	// JobDirNoteMB is the job folder size (MB, worktree of a repo job left out) from which the
+	// job-done line says how big the folder is. Nil = DefaultJobDirNoteMB (100), 0 = never.
+	JobDirNoteMB *int `json:"job_dir_note_mb"`
 	// MaxRunning is how many jobs of this agent run at once; the rest wait in the queue.
 	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8); explicit null is refused.
 	MaxRunning *int `json:"max_running"`
@@ -148,6 +160,53 @@ type Config struct {
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
+	// ModelPrices adds or overrides list prices (USD per million tokens) by model name, used to estimate
+	// the cost of attempts that ended without a reported one (killed, timed out, codex). A model with no
+	// price here or in the built-in table keeps an unknown cost.
+	ModelPrices map[string]ModelPrice `json:"model_prices"`
+	// ReportContract is what happens to a claude job that ends succeeded with a report missing the
+	// "## Summary" or "## Not done / uncertain" section: "warn" (default; it stays succeeded with a
+	// note in its error, on the job-done line and in the stats) or "fail" (it fails with that note).
+	ReportContract string `json:"report_contract"`
+	// AutoContinue continues a claude attempt stopped at its turn limit or its timeout once, in the same
+	// session, with a fresh allowance (AutoContinueFraction). Nil (absent) = on; false turns it off.
+	AutoContinue *bool `json:"auto_continue"`
+	// AutoContinueFraction is the automatic continuation's allowance as a fraction of the job's original
+	// limits (turns, budget, minutes), each capped by what the across-attempt ceilings leave.
+	// 0 = DefaultAutoContinueFraction (0.5); at most 1.
+	AutoContinueFraction float64 `json:"auto_continue_fraction"`
+}
+
+// Report contract modes (config report_contract).
+const (
+	ReportContractWarn = "warn"
+	ReportContractFail = "fail"
+)
+
+// DefaultAutoContinueFraction is the automatic continuation's share of the original limits when
+// auto_continue_fraction is not set.
+const DefaultAutoContinueFraction = 0.5
+
+// AutoContinueOn reports whether a stopped attempt is continued automatically (auto_continue, default on).
+func (c Config) AutoContinueOn() bool { return c.AutoContinue == nil || *c.AutoContinue }
+
+// AutoContinueShare returns the automatic continuation's fraction of the original limits.
+func (c Config) AutoContinueShare() float64 {
+	if c.AutoContinueFraction > 0 {
+		return c.AutoContinueFraction
+	}
+	return DefaultAutoContinueFraction
+}
+
+// DefaultCodexJobsPerDay is the codex daily cap when codex_jobs_per_day is not set.
+const DefaultCodexJobsPerDay = 3
+
+// CodexDailyCap returns the codex daily cap (0 = off).
+func (c Config) CodexDailyCap() int {
+	if c.CodexJobsPerDay == nil {
+		return DefaultCodexJobsPerDay
+	}
+	return *c.CodexJobsPerDay
 }
 
 // DefaultOwnerWaitsMaxHours is the max age of an «owner reply pending» record when
@@ -214,6 +273,46 @@ func (c Config) MaxRunningJobs() int {
 		return DefaultMaxRunningPerAgent
 	}
 	return *c.MaxRunning
+}
+
+// DefaultJobDirNoteMB is job_dir_note_mb when it is not set.
+const DefaultJobDirNoteMB = 100
+
+// JobDirNoteBytes returns the job folder size from which the job-done line shows it (0 = never).
+func (c Config) JobDirNoteBytes() int64 {
+	mb := DefaultJobDirNoteMB
+	if c.JobDirNoteMB != nil {
+		mb = *c.JobDirNoteMB
+	}
+	return int64(mb) << 20
+}
+
+// DefaultEffortByKind is the reasoning effort of a claude job of each kind when neither the job nor
+// effort_by_kind names one.
+var DefaultEffortByKind = map[string]string{"review": "high", "research": "high", "fix": "high", "general": "medium"}
+
+// claudeEffort returns the effort of a claude job: the job's own, else the config's for its kind,
+// else the kind's default.
+func (c Config) claudeEffort(kind, job string) string {
+	if job != "" {
+		return job
+	}
+	if e := c.EffortByKind[kind]; e != "" {
+		return e
+	}
+	return DefaultEffortByKind[kind]
+}
+
+func (c Config) validateEffortByKind() error {
+	for kind, e := range c.EffortByKind {
+		if !slices.Contains(Kinds, kind) {
+			return fmt.Errorf("effort_by_kind: unknown kind %q (want %s)", kind, strings.Join(Kinds, "|"))
+		}
+		if err := ValidateReasoningEffort(store.RunnerClaude, e); err != nil {
+			return fmt.Errorf("effort_by_kind.%s: %w", kind, err)
+		}
+	}
+	return nil
 }
 
 // DefaultDailyHour is the local hour of the daily automation when daily_hour is not set.
@@ -306,9 +405,16 @@ func LoadConfig(stateDir string) (Config, error) {
 			}
 		}
 		// null decodes to a nil pointer, which reads as absent; an explicit null is a mistake.
+		if v, ok := raw["codex_jobs_per_day"]; ok && strings.TrimSpace(string(v)) == "null" {
+			return c, fmt.Errorf("config.json: codex_jobs_per_day must be an integer (0 = off), not null (omit the key for default %d)",
+				DefaultCodexJobsPerDay)
+		}
 		if v, ok := raw["max_running"]; ok && strings.TrimSpace(string(v)) == "null" {
 			return c, fmt.Errorf("config.json: max_running must be an integer 1..%d, not null (omit the key for default %d)",
 				CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
+		}
+		if v, ok := raw["auto_continue"]; ok && strings.TrimSpace(string(v)) == "null" {
+			return c, errors.New("config.json: auto_continue must be true or false, not null (omit the key for default true)")
 		}
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
@@ -319,6 +425,9 @@ func LoadConfig(stateDir string) (Config, error) {
 	}
 	if !slices.Contains(CgroupScopeModes, c.CgroupScope) {
 		return c, fmt.Errorf("config.json: cgroup_scope %q must be one of auto|required|off", c.CgroupScope)
+	}
+	if c.JobDirNoteMB != nil && *c.JobDirNoteMB < 0 {
+		return c, fmt.Errorf("config.json: job_dir_note_mb %d must be 0 (never) or positive", *c.JobDirNoteMB)
 	}
 	if c.IdleAfterResultSeconds < IdleAfterResultOff {
 		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
@@ -351,8 +460,19 @@ func LoadConfig(stateDir string) (Config, error) {
 		return c, fmt.Errorf("config.json: max_running %d must be 1..%d (absent = default %d)", *c.MaxRunning,
 			CeilingMaxRunningPerAgent, DefaultMaxRunningPerAgent)
 	}
+	if c.CodexJobsPerDay != nil && *c.CodexJobsPerDay < 0 {
+		return c, fmt.Errorf("config.json: codex_jobs_per_day %d must be 0 (off) or more (absent = default %d)",
+			*c.CodexJobsPerDay, DefaultCodexJobsPerDay)
+	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)
+	}
+	if c.ReportContract != "" && c.ReportContract != ReportContractWarn && c.ReportContract != ReportContractFail {
+		return c, fmt.Errorf("config.json: report_contract %q must be warn (default) or fail", c.ReportContract)
+	}
+	if c.AutoContinueFraction < 0 || c.AutoContinueFraction > 1 {
+		return c, fmt.Errorf("config.json: auto_continue_fraction %g must be 0 (default %g) .. 1", c.AutoContinueFraction,
+			DefaultAutoContinueFraction)
 	}
 	if err := c.validateAcceptance(); err != nil {
 		return c, err
@@ -361,6 +481,12 @@ func LoadConfig(stateDir string) (Config, error) {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.validateEffortByKind(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := validatePrices(c.ModelPrices); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {
