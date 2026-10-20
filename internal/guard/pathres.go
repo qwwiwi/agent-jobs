@@ -92,7 +92,7 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 	if len(argv) == 0 {
 		return
 	}
-	switch strings.ToLower(base(argv[0])) {
+	switch progName(argv[0]) {
 	case "cd", "pushd":
 		s.cd(argv, c.dyn[len(c.words)-len(argv):], cdpathEnv)
 	case "ln", "link":
@@ -623,13 +623,22 @@ func pathTokens(w string) []string {
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
 // argument: with an ancestor of a protected path as an argument they reach it (`rm -r <state>`,
-// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`). Looked
-// up by the lower-cased base name of the program.
+// `mv <state> x`, `ln -s <state> S; rm S/…`, `tar -C <state> -x`, `unzip a.zip -d <home>`,
+// `unrar x a.rar <home>`). Looked up by progName, so the other names of a tool (toolAliases) count
+// too.
 var treeWriters = map[string]bool{
 	"rm": true, "rmdir": true, "unlink": true, "mv": true, "cp": true, "install": true, "ln": true,
 	"rsync": true, "chmod": true, "chown": true, "chgrp": true, "tar": true, "shred": true,
-	"bsdtar": true, "gtar": true, "unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true,
-	"7za": true, "7zz": true,
+	"unzip": true, "ditto": true, "cpio": true, "pax": true, "7z": true, "p7zip": true, "unar": true,
+	"unrar": true, "rar": true, "cabextract": true, "aunpack": true, "atool": true, "dtrx": true,
+	"xar": true, "jar": true, "lha": true, "lhasa": true, "arj": true, "unarj": true,
+}
+
+// toolAliases map the other names of a tool to the one its rules are kept under: GNU and BSD
+// builds and the p7zip and 7-Zip front ends take the same options and write the same way.
+var toolAliases = map[string]string{
+	"gtar": "tar", "gnutar": "tar", "bsdtar": "tar", "bsdcpio": "cpio", "bsdunzip": "unzip",
+	"7za": "7z", "7zz": "7z", "7zzs": "7z", "7zr": "7z", "7zg": "7z",
 }
 
 // clusterDirOpts are the archive tools whose short options cluster like getopt: the directory
@@ -646,13 +655,8 @@ var clusterDirOpts = map[string]struct {
 	dir  byte
 	vals string
 }{
-	"tar": {'C', "bITXf"}, "bsdtar": {'C', "bITXf"}, "gtar": {'C', "bITXf"},
-	"unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
+	"tar": {'C', "bITXf"}, "unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"},
 }
-
-// sevenZips take switches case-insensitively, one per word: `-o<dir>` and `-O<dir>` both set the
-// output directory.
-var sevenZips = map[string]bool{"7z": true, "7za": true, "7zz": true}
 
 // attachedDir returns the directory attached to an archive tool's directory option in the same
 // word (`-C<dir>`, `-xvC<dir>`, `-od<dir>`, `-O<dir>`).
@@ -660,7 +664,7 @@ func attachedDir(name, a string) (string, bool) {
 	if len(a) < 3 || a[0] != '-' || (a[1] == '-' && name != "unzip") {
 		return "", false
 	}
-	if sevenZips[name] {
+	if name == "7z" { // switches are case-insensitive, one per word: -o<dir> and -O<dir>
 		if a[1] != 'o' && a[1] != 'O' {
 			return "", false
 		}

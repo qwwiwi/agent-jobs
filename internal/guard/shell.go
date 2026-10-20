@@ -488,7 +488,7 @@ func parseAll(src string) []*script {
 				if len(argv) == 0 {
 					continue
 				}
-				switch name := strings.ToLower(base(argv[0])); {
+				switch name := progName(argv[0]); {
 				case name == "eval":
 					rest := argv[1:]
 					if len(rest) > 0 && rest[0] == "--" {
@@ -564,7 +564,7 @@ func split(words []string) cmdView {
 	}
 	v.lead = i
 	for i < len(words) {
-		name := strings.ToLower(base(words[i]))
+		name := progName(words[i])
 		vf, ok := wrapperValueFlags[name]
 		if !ok {
 			break
