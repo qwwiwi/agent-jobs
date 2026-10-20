@@ -323,6 +323,15 @@ func onlySkillLinks(work string, names []string) bool {
 // spawn), so every process with the job's marker is such a process; doctor procs also finds the
 // markerless ones left in the session of the job's last wrapper.
 func (m *Manager) checkEscaped(id string) error {
+	// On every platform: the group recorded at the last spawn may outlive a wrapper that died.
+	j, err := m.Store.Get(id)
+	if err != nil {
+		return err
+	}
+	if m.spawnedGroupAlive(j) {
+		return fmt.Errorf("the process group %d of the job's last attempt is still alive; end it (job_cancel, or kill the group) "+
+			"before resuming", j.PGID)
+	}
 	if runtime.GOOS != "linux" || !procExists(os.Getpid()) {
 		return nil // no process scan (needs Linux /proc); the sweep cannot run there either
 	}
@@ -405,6 +414,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		// The job ended before the stop: collect it as the tick would.
 		res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
 		status, verdict := Verdict(code, res, dir)
+		status, verdict = m.reportContract(j, status, verdict, dir)
 		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
 		if gerr != nil {
@@ -530,6 +540,21 @@ func chargedCost(cost float64, unknown bool, budget float64) float64 {
 	return cost
 }
 
+// cents rounds a dollar amount down to whole cents.
+func cents(v float64) float64 { return math.Floor(v*100+1e-6) / 100 }
+
+// attemptsUsage sums what all attempts of a job used so far (the archived ones and the row j): turns,
+// counted cost (chargedCost) and minutes (each attempt rounded up).
+func attemptsUsage(j *store.Job, earlier []store.Attempt) (turns int, cost float64, minutes int) {
+	turns, cost, minutes = j.Turns, chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD), (j.DurationSec+59)/60
+	for _, a := range earlier {
+		turns += a.Turns
+		cost += chargedCost(a.CostUSD, a.CostUnknown, a.MaxBudgetUSD)
+		minutes += (a.DurationSec + 59) / 60
+	}
+	return turns, cost, minutes
+}
+
 // resumeLimits returns the next attempt's limits: each field given explicitly (within the
 // ceilings, never clamped), else what the previous attempt (the job row j) left of its own limit.
 // All attempts together (earlier ones archived, j, the next one) stay within the ceilings; an
@@ -537,14 +562,8 @@ func chargedCost(cost float64, unknown bool, budget float64) float64 {
 // error that names the field to pass.
 func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.ResumeLimits, error) {
 	var errs []string
-	cents := func(v float64) float64 { return math.Floor(v*100+1e-6) / 100 }
 	prevCost := chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD)
-	usedTurns, usedCost, usedMin := j.Turns, prevCost, (j.DurationSec+59)/60
-	for _, a := range earlier {
-		usedTurns += a.Turns
-		usedCost += chargedCost(a.CostUSD, a.CostUnknown, a.MaxBudgetUSD)
-		usedMin += (a.DurationSec + 59) / 60
-	}
+	usedTurns, usedCost, usedMin := attemptsUsage(j, earlier)
 	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
 	out := store.ResumeLimits{
 		MaxTurns:       min(j.MaxTurns-j.Turns, leftTurns),
@@ -639,31 +658,43 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		}
 		return m.Store.Get(id)
 	}
+	if err := m.queueResume(j, context, l); err != nil {
+		return nil, err
+	}
+	m.Log.Printf("job %s: resume queued (attempt %d)", id, j.Attempt+1)
+	return m.Store.Get(id)
+}
+
+// queueResume checks that the attempt of j (stopped, timed out or failed, after it ran) can be
+// resumed and queues the next attempt with the update; limits: see resumeLimits. The caller holds
+// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it.
+func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
+	id := j.ID
 	if j.Runner == store.RunnerCodex {
-		return nil, fmt.Errorf("job %s: %w", id, errCodexResume)
+		return fmt.Errorf("job %s: %w", id, errCodexResume)
 	}
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
-		return nil, fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
+		return fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
 	if err := m.errArchived(j); err != nil {
-		return nil, err
+		return err
 	}
 	if j.ScopePending {
-		return nil, fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
+		return fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
 	}
 	if err := m.checkEscaped(id); err != nil {
-		return nil, err
+		return err
 	}
 	if err := m.checkProjectClaude(j, filepath.Join(m.JobDir(id), "work")); err != nil {
-		return nil, err
+		return err
 	}
 	earlier, err := m.Store.Attempts(id)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	lim, err := resumeLimits(j, earlier, l)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	update := strings.TrimSpace(context)
 	if (j.StartedAt == nil || neverRan(j.Turns, j.Error)) && strings.TrimSpace(j.PendingContext) != "" {
@@ -671,11 +702,7 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		// kept, this one follows.
 		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
 	}
-	if err := m.Store.Requeue(id, lim, update, ""); err != nil {
-		return nil, err
-	}
-	m.Log.Printf("job %s: resume queued (attempt %d)", id, j.Attempt+1)
-	return m.Store.Get(id)
+	return m.Store.Requeue(id, lim, update, "")
 }
 
 // neverRan reports whether an attempt ended without claude ever running: its launch was refused or
@@ -879,7 +906,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{}, err
 	}
 	update := m.resumeMessage(j)
-	if err := os.WriteFile(filepath.Join(dir, resumePromptFile), []byte(update), 0o600); err != nil {
+	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
 		return launchPlan{}, err
 	}
 	brief, err := m.BuildPrompt(j, rules, cards, m.LookupMemoryNotes(j))
@@ -889,7 +916,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	fallback := brief + "\n" + m.previousAttempt(j, dir) + "\n" + update +
 		"\nNote: the previous claude session could not be resumed, so this is a fresh session in the same work " +
 		"directory. Say so in the \"Not done / uncertain\" section of your report.\n"
-	if err := os.WriteFile(filepath.Join(dir, fallbackPromptFile), []byte(fallback), 0o600); err != nil {
+	if err := writeFileReplace(filepath.Join(dir, fallbackPromptFile), []byte(fallback)); err != nil {
 		return launchPlan{}, err
 	}
 	fresh := NewSessionID()

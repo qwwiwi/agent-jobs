@@ -58,6 +58,9 @@ func newCodexManager(t *testing.T) *Manager {
 	prevDir := codexSystemConfigDir
 	codexSystemConfigDir = filepath.Join(t.TempDir(), "no-etc-codex")
 	t.Cleanup(func() { codexSystemConfigDir = prevDir })
+	// These tests start more codex jobs than the default daily cap; the cap has its own tests.
+	off := 0
+	m.Cfg.CodexJobsPerDay = &off
 	return m
 }
 
@@ -123,7 +126,7 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		t.Fatalf("usage not logged: %s", log)
 	}
 	// Unknown cost and the absent turn/budget caps are said as such, never as $0.00 or a number.
-	if line := DoneLine(j); !strings.Contains(line, "· cost unknown ·") || strings.Contains(line, "$0.00") {
+	if line := DoneLine(j, 0); !strings.Contains(line, "· cost unknown ·") || strings.Contains(line, "$0.00") {
 		t.Fatalf("done line %q", line)
 	}
 	if c := CostText(j.CostUSD, j.CostUnknown); c != "unknown" {
@@ -391,9 +394,9 @@ func TestRunnerRouting(t *testing.T) {
 		}
 	}
 	m := newCodexManager(t)
-	// Defaults are unchanged: review/hard stays on claude.
+	// Defaults are unchanged: review/hard stays on claude, at the kind's claude effort.
 	j := enqueue(t, m, "x", func(r *StartRequest) { r.Kind, r.Model, r.Complexity = "review", "", "hard" })
-	if j.Runner != store.RunnerClaude || j.Model != "fable" || j.ReasoningEffort != "" {
+	if j.Runner != store.RunnerClaude || j.Model != "fable" || j.ReasoningEffort != "high" {
 		t.Fatalf("default review/hard: %s %s %q", j.Runner, j.Model, j.ReasoningEffort)
 	}
 	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "review", Brief: "b", Complexity: "hard", Runner: "codex"}); err == nil {
@@ -411,10 +414,10 @@ func TestRunnerRouting(t *testing.T) {
 		t.Fatalf("job effort %q", j.ReasoningEffort)
 	}
 	for name, r := range map[string]StartRequest{
-		"effort on claude": {Model: "opus", ReasoningEffort: "high"},
-		"bad effort":       {Model: "gpt-6.1-sol", ReasoningEffort: "max"},
-		"turn cap":         {Model: "gpt-6.1-sol", MaxTurns: 10},
-		"budget cap":       {Model: "gpt-6.1-sol", MaxBudgetUSD: 5},
+		"bad claude effort": {Model: "opus", ReasoningEffort: "turbo"},
+		"bad effort":        {Model: "gpt-6.1-sol", ReasoningEffort: "max"},
+		"turn cap":          {Model: "gpt-6.1-sol", MaxTurns: 10},
+		"budget cap":        {Model: "gpt-6.1-sol", MaxBudgetUSD: 5},
 	} {
 		r.Title, r.Kind, r.Brief = "t", "review", "b"
 		if _, err := m.Enqueue(r); err == nil {

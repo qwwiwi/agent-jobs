@@ -37,6 +37,9 @@ type Deps struct {
 	JobNotifier JobNotifier
 	// JobMarker serves check_mark in the job role (the daemon's proxy); nil in the orchestrator role.
 	JobMarker JobMarker
+	// Watch (orchestrator role) reloads a changed config.json before each call and warns when the
+	// binary on disk or the daemon is not what this server runs; nil = no watch.
+	Watch *ServerWatch
 }
 
 // toolDef binds a tool name to the function that registers it on a server.
@@ -56,6 +59,7 @@ var toolDefs = []toolDef{
 	{"job_resume", addJobResume},
 	{"job_amend", addJobAmend},
 	{"job_stats", addJobStats},
+	{"job_outcome", addJobOutcome},
 	{"skill_list", addSkillList},
 	{"memory_search", addMemorySearch},
 	{"memory_write", addMemoryWrite},
@@ -108,6 +112,7 @@ job_start queues a job and returns its id at once; the daemon starts it within a
 State an explicit model or a complexity (light|normal|hard, mapped to a model by kind); with neither job_start is rejected: there is no default and no classifier.
 When a job ends this session receives one line "[jobs:job-done] job <id> ..."; the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
+Once you have acted on a result, record what you did with it: job_outcome(id, accepted|extended|reworked|rerun|discarded, note?); job_stats reports the outcome shares and the cost per usable result.
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.
 system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
@@ -148,6 +153,9 @@ func newServer(role Role, d Deps, registerHidden bool) (*sdk.Server, error) {
 	}
 	s := sdk.NewServer(&sdk.Implementation{Name: ServerName, Version: Version}, &sdk.ServerOptions{Instructions: instr})
 	s.AddReceivingMiddleware(enforceRole(role))
+	if role == RoleOrchestrator && d.Watch != nil {
+		s.AddReceivingMiddleware(d.Watch.middleware())
+	}
 	for _, t := range definitions() {
 		if _, err := audienceOf(t.name); err != nil {
 			return nil, err
@@ -208,6 +216,7 @@ func Serve(ctx context.Context, role Role, agent string) error {
 		}
 		d.Manager = m
 		d.Brain, d.MinScore = m.Brain, m.Cfg.Brain.MinScore()
+		d.Watch = NewServerWatch(m)
 	} else {
 		// The job role runs only inside a job: its notes carry the job's id.
 		if d.JobID = os.Getenv(jobs.JobEnvVar); d.JobID == "" {
