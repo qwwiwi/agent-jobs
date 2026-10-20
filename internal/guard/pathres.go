@@ -650,21 +650,23 @@ var toolAliases = map[string]string{
 // word, which is checked whole as an ancestor already. unzip has no value option in `vals`: its `-P`
 // takes the rest of the word only for the first password, a repeated `-P` is skipped and the scan
 // goes on (`-Pdummy -Pd<dir>`), so any `d` in the word counts; a `-` inside a cluster negates the
-// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too.
+// next option (`--qd<dir>`), so unzip clusters starting with `--` are scanned too. atool and aunpack
+// parse with Getopt::Long bundling (`-fX<dir>`, case-sensitive: `-x` is --extract); their numeric
+// `-V` hands the rest of the word back as a new cluster (`-V1X<dir>`), so it is not in `vals`.
 var clusterDirOpts = map[string]struct {
 	dir  byte
 	vals string
 }{
 	"tar": {'C', "bITXf"}, "unzip": {'d', ""}, "cpio": {'D', "CEFHIMOR"}, "cabextract": {'d', "eF"},
-	"xar": {'C', "fnsb"},
+	"xar": {'C', "fnsb"}, "atool": {'X', "FOo"}, "aunpack": {'X', "FOo"},
 }
 
 // dirSwitches are the directory switches that other extractors take with the directory in the same
-// word, one switch per word, compared case-insensitively (`7z x -o<dir>`, `unrar x -op<dir>`,
-// `arj x -ht<dir>`): a word starting with one names the directory after it.
+// word, one switch per word (their parsers do not bundle), compared case-insensitively
+// (`7z x -o<dir>`, `unrar x -op<dir>`, `arj x -ht<dir>`): a word starting with one names the
+// directory after it.
 var dirSwitches = map[string][]string{
-	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"}, "aunpack": {"-X"}, "atool": {"-X"},
-	"arj": {"-ht"},
+	"7z": {"-o"}, "unrar": {"-op"}, "rar": {"-op"}, "unar": {"-o"}, "arj": {"-ht"},
 }
 
 // attachedDir returns the directory attached to an archive tool's directory option in the same
