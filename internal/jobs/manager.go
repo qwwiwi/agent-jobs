@@ -1006,7 +1006,7 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 	// that has not had it yet (a member found during the grace still gets SIGTERM, one found after the
 	// SIGKILL round still gets SIGKILL). It returns how many processes of the group are left (unproven
 	// ones included).
-	round := func(sig syscall.Signal) int {
+	scan := func(sig syscall.Signal) (left int, retired bool) {
 		unproven := 0
 		members, err := groupMembers(g)
 		if err != nil {
@@ -1044,7 +1044,7 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 			held = append(held, heldProc{pid: pid, fd: fd})
 			isHeld[pid] = true
 		}
-		left := unproven
+		left = unproven
 		for i := range held {
 			p := &held[i]
 			if p.fd < 0 {
@@ -1055,6 +1055,7 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 				_ = unix.Close(p.fd)
 				p.fd = -1
 				delete(isHeld, p.pid)
+				retired = true
 				continue
 			}
 			left++
@@ -1067,7 +1068,21 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 				m.Log.Printf("job %s: %s: %s", id, what, why)
 			}
 		}
-		return left
+		return left, retired
+	}
+	// round is scan until a scan finds the group empty with no process retired in it: the members are
+	// listed before the held processes are checked, so one that exits after the listing may have forked
+	// a child the listing missed, and only a listing made after its exit shows that child. A group that
+	// keeps retiring processes past maxRescans is not taken for an ended one.
+	const maxRescans = 10
+	round := func(sig syscall.Signal) int {
+		for range maxRescans {
+			left, retired := scan(sig)
+			if left > 0 || !retired {
+				return left
+			}
+		}
+		return 1
 	}
 	round(syscall.SIGTERM)
 	deadline := time.Now().Add(m.KillGrace)
