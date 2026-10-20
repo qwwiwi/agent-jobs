@@ -629,6 +629,10 @@ func alive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// groupExists is groupAlive for the kill paths: the kernel's word that process group pgid has a
+// process (kill(-pgid, 0) not ESRCH); a variable so tests with a fake /proc can stand in for it.
+var groupExists = groupAlive
+
 func groupAlive(pgid int) bool {
 	if pgid <= 0 {
 		return false
@@ -1070,18 +1074,25 @@ func (m *Manager) endLedGroup(id, what string, g, leaderFD int, isMember func(in
 		}
 		return left, retired
 	}
-	// round is scan until a scan finds the group empty with no process retired in it: the members are
-	// listed before the held processes are checked, so one that exits after the listing may have forked
-	// a child the listing missed, and only a listing made after its exit shows that child. A group that
-	// keeps retiring processes past maxRescans is not taken for an ended one.
+	// round is scan until a scan finds the group empty with no process retired in it and the kernel
+	// then has no process in g (groupExists). A listing alone proves nothing: a member can fork a child
+	// after it was listed (or after the listing passed the child's pid) and exit before it is checked,
+	// two generations deep as well, so the child appears in no listing of this scan. Only kill(-g, 0)
+	// failing with ESRCH shows no process is left in g; while one is, g is listed again. A group that
+	// is still there after maxRescans (a missed member that keeps forking, or members not yet reaped)
+	// is not taken for an ended one.
 	const maxRescans = 10
 	round := func(sig syscall.Signal) int {
 		for range maxRescans {
 			left, retired := scan(sig)
-			if left > 0 || !retired {
+			if left > 0 {
 				return left
 			}
+			if !retired && !groupExists(g) {
+				return 0
+			}
 		}
+		why = fmt.Sprintf("process group %d still exists though no member of it was listed (not reaped yet, or a member forking faster than the listing)", g)
 		return 1
 	}
 	round(syscall.SIGTERM)

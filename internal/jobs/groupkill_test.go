@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -97,13 +98,27 @@ func TestCancelOnLinuxNeverSignalsGroupByNumber(t *testing.T) {
 
 // fakeGroupPidfd stands in for the kernel calls with per-process liveness: a send to a pid in dead
 // fails with ESRCH, any other is recorded as "pid:sig" (signal 0 too) and delivers nothing; onSend
-// runs after each recorded send.
+// runs after each recorded send. The kernel's group check (groupExists) sees every process of the fake
+// /proc that is not dead, whether or not a listing saw it.
 func fakeGroupPidfd(t *testing.T, dead map[int]bool, onSend func(pid int, sig syscall.Signal)) *[]string {
 	t.Helper()
 	var sent []string
 	byFD := map[int]int{}
-	oldOpen, oldSend := pidfdOpen, pidfdSend
-	t.Cleanup(func() { pidfdOpen, pidfdSend = oldOpen, oldSend })
+	oldOpen, oldSend, oldExists := pidfdOpen, pidfdSend, groupExists
+	t.Cleanup(func() { pidfdOpen, pidfdSend, groupExists = oldOpen, oldSend, oldExists })
+	groupExists = func(g int) bool {
+		ents, _ := os.ReadDir(procRoot)
+		for _, e := range ents {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || dead[pid] {
+				continue
+			}
+			if st, err := procStatFull(pid); err == nil && st.pgid == g {
+				return true
+			}
+		}
+		return false
+	}
 	pidfdOpen = func(pid int) (int, error) {
 		if dead[pid] {
 			return -1, unix.ESRCH
@@ -475,6 +490,70 @@ func TestEndLedGroupRescansAfterLastHeldExits(t *testing.T) {
 		t.Fatalf("reported ended while child 92 lives (sent %v)", *sent)
 	}
 	for _, want := range []string{"92:15", "92:9"} {
+		if !slices.Contains(*sent, want) {
+			t.Fatalf("sent %v lacks %s (%v %q)", *sent, want, res, why)
+		}
+	}
+}
+
+// #55 fix loop 2: two generations hand off between the listings. Held 91 forks 92 and retires; the
+// rescan lists 92, which forks 93 and exits before it is opened, so no listing of that scan shows 93
+// and no held process retired in it. The group must not be reported ended while the kernel still has
+// a process in it: 93 is found by a later listing and signalled.
+func TestEndLedGroupTwoGenerationHandoff(t *testing.T) {
+	root := t.TempDir()
+	old := procRoot
+	procRoot = root
+	t.Cleanup(func() { procRoot = old })
+	const id = "261020-000000-abcd"
+	const g = 95
+	writeFakeProc(t, root, g, g, id, "")
+	writeFakeProc(t, root, 91, g, id, "")
+	dead := map[int]bool{}
+	sent := fakeGroupPidfd(t, dead, func(pid int, sig syscall.Signal) {
+		if pid == g && sig == syscall.SIGTERM { // the leader exits on SIGTERM
+			dead[g] = true
+			_ = os.RemoveAll(filepath.Join(root, fmt.Sprint(g)))
+		}
+	})
+	exitProc := func(pid int) {
+		dead[pid] = true
+		_ = os.RemoveAll(filepath.Join(root, fmt.Sprint(pid)))
+	}
+	byFD := map[int]int{}
+	open, send := pidfdOpen, pidfdSend
+	pidfdOpen = func(pid int) (int, error) {
+		if pid == 92 && !dead[92] {
+			// Listed, then forks 93 and exits before it is opened.
+			writeFakeProc(t, root, 93, g, id, "")
+			exitProc(92)
+		}
+		fd, err := open(pid)
+		if err == nil {
+			byFD[fd] = pid
+		}
+		return fd, err
+	}
+	pidfdSend = func(fd int, sig syscall.Signal) error {
+		// After its SIGTERM, between a listing and its check: 91 forks 92 and exits.
+		if byFD[fd] == 91 && sig == 0 && slices.Contains(*sent, "91:15") && !dead[91] {
+			writeFakeProc(t, root, 92, g, id, "")
+			exitProc(91)
+		}
+		return send(fd, sig)
+	}
+	leader, err := pidfdOpen(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(leader)
+	m := newManager(t)
+	m.KillGrace = 200 * time.Millisecond
+	res, why := m.endLedGroup(id, "process group 95", g, leader, func(pid int) bool { return procMarker(pid) == id })
+	if res == groupEnded {
+		t.Fatalf("reported ended while grandchild 93 lives (sent %v)", *sent)
+	}
+	for _, want := range []string{"93:15", "93:9"} {
 		if !slices.Contains(*sent, want) {
 			t.Fatalf("sent %v lacks %s (%v %q)", *sent, want, res, why)
 		}
