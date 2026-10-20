@@ -295,10 +295,72 @@ func TestConfigBrainChangeWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.refreshConfig()
-	if m.Cfg.Brain.RecallURL == "" {
-		t.Fatalf("config not reloaded: %+v", m.Cfg.Brain)
+	if m.Cfg.Brain.RecallURL != "" {
+		t.Fatalf("restart-only brain config was applied: %+v", m.Cfg.Brain)
 	}
 	if s := w.ConfigWarning(); !strings.Contains(s, "brain block") || !strings.Contains(s, "/mcp reconnect") {
 		t.Fatalf("brain change: %q", s)
+	}
+}
+
+// Doctor compares the daemon's effective config with the file, independently of the MCP config.
+func TestDoctorDaemonConfigDiffersFromFile(t *testing.T) {
+	daemon := newManager(t)
+	if err := daemon.WriteDaemonInfo(); err != nil {
+		t.Fatal(err)
+	}
+	daemon.WatchDaemonConfig()
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	m.SelfBin = selfBin
+	cs := connect(t, mustServer(t, m))
+	check := func(want string) {
+		t.Helper()
+		var out SystemDoctorOutput
+		call(t, cs, "system_doctor", map[string]any{}, &out)
+		found := strings.Join(out.Problems, "\n")
+		if want == "" {
+			if strings.Contains(found, "daemon config") {
+				t.Fatalf("unexpected daemon warning: %s", found)
+			}
+		} else if !strings.Contains(found, want) || out.OK {
+			t.Fatalf("missing warning %q: %+v", want, out)
+		}
+	}
+	check("")
+	path := filepath.Join(m.StateDir, "config.json")
+	for _, tc := range []struct{ content, before, after string }{
+		{`{"max_running": 5}`, "daemon config differs from file", ""},
+		{`{"max_running":`, "daemon config differs from file", "daemon config differs from file"},
+		{`{"http_api": {"enabled": true}}`, "daemon config differs from file", "changed keys require daemon restart: http_api"},
+		{`{}`, "", ""},
+	} {
+		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		check(tc.before)
+		daemon.RefreshDaemonConfig()
+		check(tc.after)
+	}
+}
+
+func TestDoctorLegacyDaemonConfigOlderThanFile(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin
+	m.Now = func() time.Time { return time.Now().Add(-time.Minute) }
+	if err := m.WriteDaemonInfo(); err != nil {
+		t.Fatal(err)
+	}
+	m.Now = time.Now
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out SystemDoctorOutput
+	call(t, connect(t, mustServer(t, m)), "system_doctor", map[string]any{}, &out)
+	if !strings.Contains(strings.Join(out.Problems, "\n"), "daemon config older than config.json") || out.OK {
+		t.Fatalf("legacy daemon: %+v", out)
 	}
 }

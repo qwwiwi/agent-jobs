@@ -355,9 +355,14 @@ func TestDaemonUnitRestartLeavesJobScope(t *testing.T) {
 		_, ok := readExitCode(m.JobDir(j.ID))
 		return ok
 	})
-	if out, err := exec.Command(selfBin, "tick", "--agent", "test").CombinedOutput(); err != nil {
-		t.Fatalf("tick: %v %s", err, out)
+	if out, err := exec.Command(selfBin, "tick", "--agent", "test").CombinedOutput(); err == nil || !strings.Contains(string(out), "manual tick refused") {
+		t.Fatalf("manual tick while daemon is active: %v %s", err, out)
 	}
+	// Collection belongs to the restarted daemon; a fresh CLI manager must not launch or collect
+	// with its independently loaded config. Wait for the daemon's next scheduled tick.
+	waitFor(t, "restarted daemon collected the job", TickInterval+15*time.Second, func() bool {
+		return get(t, m, j.ID).Status == store.StatusSucceeded
+	})
 	if got := get(t, m, j.ID); got.Status != store.StatusSucceeded || got.Turns != 3 {
 		t.Fatalf("after the restart: %s %q", got.Status, got.Error)
 	}

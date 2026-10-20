@@ -154,13 +154,13 @@ func (m *Manager) Hooks() []Check {
 	if rules, err := m.readOwnerRules(); err != nil {
 		r.Detail = "jobs refuse to start: " + err.Error()
 	} else {
-		r.OK, r.Detail = true, fmt.Sprintf("%s (%d bytes)", m.Cfg.OwnerRulesPath, len(rules))
+		r.OK, r.Detail = true, fmt.Sprintf("%s (%d bytes)", m.Config().OwnerRulesPath, len(rules))
 	}
 	out = append(out, r)
 	n := Check{Name: "notify target"}
-	if t := m.Cfg.NotifyTmuxTarget; t == "" {
+	if t := m.Config().NotifyTmuxTarget; t == "" {
 		n.OK, n.Detail = true, "notify off (notify_tmux_target not configured): job-done lines go to the daemon log"
-	} else if b, err := exec.Command(m.Cfg.tmuxBin(), m.Cfg.tmuxArgs("has-session", "-t", t)...).CombinedOutput(); err != nil {
+	} else if b, err := exec.Command(m.Config().tmuxBin(), m.Config().tmuxArgs("has-session", "-t", t)...).CombinedOutput(); err != nil {
 		n.Detail = fmt.Sprintf("tmux has-session -t %s: %v %s", t, err, strings.TrimSpace(string(b)))
 	} else {
 		n.OK, n.Detail = true, "tmux session "+t+" exists"
@@ -186,7 +186,7 @@ type QueueStatus struct {
 
 // Queue reports the queue.
 func (m *Manager) Queue() (QueueStatus, error) {
-	q := QueueStatus{ConfiguredMaxRunning: m.Cfg.MaxRunningJobs()}
+	q := QueueStatus{ConfiguredMaxRunning: m.Config().MaxRunningJobs()}
 	for _, c := range []struct {
 		n *int
 		f func() ([]*store.Job, error)

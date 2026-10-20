@@ -728,7 +728,7 @@ func (m *Manager) claimCheckAlerts() (string, error) {
 // (failed after MaxCheckAlertAttempts); one that could not take tmux.lock typed nothing and counts
 // as failed the same way.
 func (m *Manager) sendCheckAlerts(token string) error {
-	target := m.Cfg.NotifyTmuxTarget
+	target := m.Config().NotifyTmuxTarget
 	if target == "" {
 		ferr := "notify off (notify_tmux_target not configured)"
 		if rows, err := m.Store.TokenCheckAlerts(token); err == nil && len(rows) > 0 {

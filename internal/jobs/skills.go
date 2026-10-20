@@ -34,7 +34,7 @@ func (c Config) SkillBudget() skills.Budget {
 // guard protects every skill root against writes.
 func (m *Manager) skillRoots() ([]string, []string) {
 	var roots, warns []string
-	for _, r := range m.Cfg.SkillRoots {
+	for _, r := range m.Config().SkillRoots {
 		c := filepath.Clean(r)
 		if c == "/" || samePath(c, m.StateDir) || under(m.StateDir, c) || under(c, m.StateDir) {
 			warns = append(warns, fmt.Sprintf("skill root %s: is /, holds or lies inside the agent-jobs state, skipped", r))
@@ -56,7 +56,7 @@ func (m *Manager) Catalog() *skills.Catalog {
 
 // SkillWarnings are the catalog's warnings (missing or invalid roots and entries) for status and doctor.
 func (m *Manager) SkillWarnings() []string {
-	if len(m.Cfg.SkillRoots) == 0 {
+	if len(m.Config().SkillRoots) == 0 {
 		return nil
 	}
 	return m.Catalog().Warnings
@@ -65,14 +65,14 @@ func (m *Manager) SkillWarnings() []string {
 // selectSkills resolves a job's skills at job_start: the defaults for its kind and repository plus
 // the edits; an unknown or deprecated name, or a selection over budget, refuses the start.
 func (m *Manager) selectSkills(kind, repo string, edits []string) ([]string, error) {
-	if len(m.Cfg.SkillRoots) == 0 && len(edits) == 0 {
+	if len(m.Config().SkillRoots) == 0 && len(edits) == 0 {
 		return nil, nil
 	}
 	base := ""
 	if repo != "" {
 		base = filepath.Base(repo)
 	}
-	sel, err := m.Catalog().Select(kind, base, edits, m.Cfg.SkillBudget())
+	sel, err := m.Catalog().Select(kind, base, edits, m.Config().SkillBudget())
 	if err != nil {
 		return nil, err
 	}
@@ -244,12 +244,27 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 	for _, n := range j.Skills {
 		e, ok := cat.Lookup(n)
 		if !ok || e.Status == skills.StatusDeprecated {
-			return fmt.Errorf("skill %q is no longer in the catalog (or deprecated); start the job again", n)
+			cause := "skill missing from all daemon skill roots"
+			if len(m.Config().SkillRoots) == 0 {
+				cause = "daemon catalog has no skill roots (config skill_roots)"
+			} else if ok {
+				cause = "skill is deprecated in the daemon catalog"
+			}
+			detail := ""
+			if cfg, err := LoadConfig(m.StateDir); err != nil {
+				detail = "; config.json does not load; daemon keeps the last good config"
+			} else if !slices.Equal(cfg.SkillRoots, m.Config().SkillRoots) {
+				detail = "; daemon config differs from the file (skill_roots)"
+			}
+			if len(cat.Warnings) > 0 {
+				detail += "; catalog warnings: " + strings.Join(cat.Warnings, "; ")
+			}
+			return fmt.Errorf("skill %q: %s%s; check config.json and catalog warnings before starting again", n, cause, detail)
 		}
 		entries = append(entries, e)
 	}
 	adopt := m.leftSkillLinks(j, work)
-	d, err := skills.Link(work, entries, m.Cfg.SkillBudget().MaxKB, adopt)
+	d, err := skills.Link(work, entries, m.Config().SkillBudget().MaxKB, adopt)
 	if err != nil {
 		return fmt.Errorf("skills: %w", err)
 	}

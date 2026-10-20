@@ -175,6 +175,12 @@ func admitted(jobDir, token string) error {
 	if j.Status != store.StatusRunning || j.LaunchToken != token {
 		return fmt.Errorf("job is %s under another launch or no longer running", j.Status)
 	}
+	if j.Runner == store.RunnerCodex && CodexSandbox(j.Kind) == CodexSandboxWrite {
+		a, err := st.ReadLaunchAuthorization(j.ID, token)
+		if err != nil || !a.CodexWriteAllowed {
+			return errors.New("codex_write_allowed was not authorized by the launching daemon")
+		}
+	}
 	return nil
 }
 

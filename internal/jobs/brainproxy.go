@@ -30,8 +30,8 @@ func BrainSocketPath(stateDir string) string { return filepath.Join(stateDir, Br
 
 // brainAgent is the author name of the agent's notes (brain.agent, else the agent name).
 func (m *Manager) brainAgent() string {
-	if m.Cfg.Brain.Agent != "" {
-		return m.Cfg.Brain.Agent
+	if m.Config().Brain.Agent != "" {
+		return m.Config().Brain.Agent
 	}
 	return m.Agent
 }

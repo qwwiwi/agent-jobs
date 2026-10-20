@@ -184,3 +184,15 @@ func levenshtein(a, b string) int {
 	}
 	return prev[len(rb)]
 }
+
+// BriefDeclinesSkills is the explicit no-skills signal accepted by orchestrator PreToolUse hooks.
+// A whole line is required so prose mentioning the phrase cannot silently disable defaults.
+func BriefDeclinesSkills(brief string) bool {
+	for _, line := range strings.Split(brief, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "skills") && strings.EqualFold(strings.TrimSpace(parts[1]), "none") {
+			return true
+		}
+	}
+	return false
+}

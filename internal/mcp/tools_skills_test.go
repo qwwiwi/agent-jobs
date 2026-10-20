@@ -92,6 +92,30 @@ func TestSkillListNotForJobs(t *testing.T) {
 	}
 }
 
+func TestJobStartNoSkills(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.SkillRoots = []string{catalogRoot(t, map[string][3]string{
+		"introspection": {"core", "code", "Inspect the agent."},
+	})}
+	cs := connect(t, mustServer(t, m))
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"remove defaults", func(a map[string]any) { a["skills"] = []string{"-introspection"} }},
+		{"brief none", func(a map[string]any) { a["brief"] = "Do the work.\nskills: none" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var v JobView
+			call(t, cs, "job_start", startArgs(tc.change), &v)
+			j, err := m.Store.Get(v.ID)
+			if err != nil || len(j.Skills) != 0 {
+				t.Fatalf("job_start: %+v %v", j, err)
+			}
+		})
+	}
+}
+
 func mustCall(t *testing.T, cs *sdk.ClientSession, name string, args map[string]any) *sdk.CallToolResult {
 	t.Helper()
 	res, err := cs.CallTool(context.Background(), &sdk.CallToolParams{Name: name, Arguments: args})

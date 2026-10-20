@@ -492,7 +492,7 @@ func (m *Manager) redactReport(id string) error {
 	if err != nil || n == 0 {
 		return err
 	}
-	if m.Cfg.KeepRawReports {
+	if m.Config().KeepRawReports {
 		// The whole original, streamed (not held in memory).
 		err := replaceFile(dir, RawReportName, func(w io.Writer) error {
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
