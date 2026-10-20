@@ -417,3 +417,58 @@ func TestEndLedGroupSignalsLateMembers(t *testing.T) {
 		t.Fatalf("81 got SIGTERM %d times: %v", n, *sent)
 	}
 }
+
+// #55 fix loop: a round enumerates the group before it checks the held processes, so the last live
+// member can fork a child after the enumeration and exit before its check. The round that retires it
+// must scan the group afresh rather than report it ended while the child lives.
+func TestEndLedGroupRescansAfterLastHeldExits(t *testing.T) {
+	root := t.TempDir()
+	old := procRoot
+	procRoot = root
+	t.Cleanup(func() { procRoot = old })
+	const id = "261020-000000-abcd"
+	const g = 90
+	writeFakeProc(t, root, g, g, id, "")
+	writeFakeProc(t, root, 91, g, id, "")
+	dead := map[int]bool{}
+	sent := fakeGroupPidfd(t, dead, func(pid int, sig syscall.Signal) {
+		if pid == g && sig == syscall.SIGTERM { // the leader exits on SIGTERM
+			dead[g] = true
+			_ = os.RemoveAll(filepath.Join(root, fmt.Sprint(g)))
+		}
+	})
+	// Between the enumeration and the check of 91 in a round after the first: 91 forks 92 and exits.
+	byFD := map[int]int{}
+	open, send := pidfdOpen, pidfdSend
+	pidfdOpen = func(pid int) (int, error) {
+		fd, err := open(pid)
+		if err == nil {
+			byFD[fd] = pid
+		}
+		return fd, err
+	}
+	pidfdSend = func(fd int, sig syscall.Signal) error {
+		if byFD[fd] == 91 && sig == 0 && slices.Contains(*sent, "91:15") && !dead[91] {
+			writeFakeProc(t, root, 92, g, id, "")
+			dead[91] = true
+			_ = os.RemoveAll(filepath.Join(root, "91"))
+		}
+		return send(fd, sig)
+	}
+	leader, err := pidfdOpen(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(leader)
+	m := newManager(t)
+	m.KillGrace = 200 * time.Millisecond
+	res, why := m.endLedGroup(id, "process group 90", g, leader, func(pid int) bool { return procMarker(pid) == id })
+	if res == groupEnded {
+		t.Fatalf("reported ended while child 92 lives (sent %v)", *sent)
+	}
+	for _, want := range []string{"92:15", "92:9"} {
+		if !slices.Contains(*sent, want) {
+			t.Fatalf("sent %v lacks %s (%v %q)", *sent, want, res, why)
+		}
+	}
+}
