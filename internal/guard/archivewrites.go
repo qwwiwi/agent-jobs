@@ -101,19 +101,22 @@ func (s *pathScope) commandWrites(c *simpleCmd) {
 			}
 		}
 		return
-	case "curl", "wget":
+	case "curl":
+		s.curlWrites(args)
+		return
+	case "wget":
 		// Scan explicit output paths, including attached short options and long
 		// values. Remote filenames and output-directory policy are not predictable.
 		for i, a := range args {
-			if a == "-o" && name == "curl" || a == "-O" && name == "wget" || a == "--output" || a == "--output-document" {
+			if a == "-O" || a == "--output" || a == "--output-document" {
 				if i+1 < len(args) {
 					s.noteWrite(args[i+1], false)
 				}
 			} else if strings.HasPrefix(a, "--output=") || strings.HasPrefix(a, "--output-document=") {
 				s.noteWrite(a, false)
-			} else if name == "curl" && strings.HasPrefix(a, "-o") && len(a) > 2 || name == "wget" && strings.HasPrefix(a, "-O") && len(a) > 2 {
+			} else if strings.HasPrefix(a, "-O") && len(a) > 2 {
 				s.noteWrite(a[2:], false)
-			} else if name == "wget" || strings.HasPrefix(a, "-") {
+			} else {
 				s.writeUnknown = true
 			}
 		}
@@ -130,6 +133,45 @@ func (s *pathScope) commandWrites(c *simpleCmd) {
 		}
 		for _, token := range pathTokens(a) {
 			s.noteWrite(token, true)
+		}
+	}
+}
+
+// curlWrites distinguishes explicit output files from flags that only affect
+// requests or diagnostics. Unknown options retain global write uncertainty.
+func (s *pathScope) curlWrites(args []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--output":
+			if i+1 < len(args) {
+				i++
+				s.noteWrite(args[i], false)
+			} else {
+				s.writeUnknown = true
+			}
+		case strings.HasPrefix(a, "--output="):
+			s.noteWrite(a, false)
+		case a == "--fail" || a == "--silent" || a == "--show-error" || a == "--location":
+		case strings.HasPrefix(a, "--"):
+			s.writeUnknown = true
+		case strings.HasPrefix(a, "-"):
+			for j := 1; j < len(a); j++ {
+				if a[j] == 'o' {
+					if j+1 < len(a) {
+						s.noteWrite(a[j+1:], false)
+					} else if i+1 < len(args) {
+						i++
+						s.noteWrite(args[i], false)
+					} else {
+						s.writeUnknown = true
+					}
+					break
+				}
+				if !strings.ContainsRune("fsSL", rune(a[j])) {
+					s.writeUnknown = true
+				}
+			}
 		}
 	}
 }
