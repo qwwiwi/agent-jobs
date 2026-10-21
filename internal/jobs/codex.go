@@ -285,41 +285,45 @@ func ParseCodexStream(path string) StreamResult {
 	}
 	defer f.Close()
 	skipped, err := readLines(f, codexMaxLineBytes, func(line []byte) {
-		var ev codexEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			return
-		}
-		switch ev.Type {
-		case "turn.started":
-			out.Found, out.IsError, out.Subtype = false, false, ""
-		case "item.completed":
-			// "error" items are warnings (e.g. unrecognized config settings), not work done.
-			if ev.Item.Type == "reasoning" || ev.Item.Type == "error" || ev.Item.Type == "" {
-				return
-			}
-			out.Turns++
-			if ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
-				out.Text = ev.Item.Text
-			}
-		case "turn.completed":
-			out.Found, out.IsError, out.Subtype = true, false, "success"
-			if ev.Usage != nil {
-				out.InputTokens += ev.Usage.InputTokens
-				out.CachedInputTokens += ev.Usage.CachedInputTokens
-				out.OutputTokens += ev.Usage.OutputTokens
-			}
-		case "turn.failed":
-			out.Found, out.IsError, out.Subtype = true, true, "turn_failed"
-			if msg := RedactPrintable(ev.Error.Message, 200); msg != "" {
-				out.Subtype += ": " + msg
-			}
-		}
+		applyCodexLine(&out, line)
 	})
 	out.Skipped = skipped
 	if err != nil {
 		out.Err = err.Error()
 	}
 	return out
+}
+
+func applyCodexLine(out *StreamResult, line []byte) {
+	var ev codexEvent
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return
+	}
+	switch ev.Type {
+	case "turn.started":
+		out.Found, out.IsError, out.Subtype = false, false, ""
+	case "item.completed":
+		// "error" items are warnings (e.g. unrecognized config settings), not work done.
+		if ev.Item.Type == "reasoning" || ev.Item.Type == "error" || ev.Item.Type == "" {
+			return
+		}
+		out.Turns++
+		if ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
+			out.Text = ev.Item.Text
+		}
+	case "turn.completed":
+		out.Found, out.IsError, out.Subtype = true, false, "success"
+		if ev.Usage != nil {
+			out.InputTokens += ev.Usage.InputTokens
+			out.CachedInputTokens += ev.Usage.CachedInputTokens
+			out.OutputTokens += ev.Usage.OutputTokens
+		}
+	case "turn.failed":
+		out.Found, out.IsError, out.Subtype = true, true, "turn_failed"
+		if msg := RedactPrintable(ev.Error.Message, 200); msg != "" {
+			out.Subtype += ": " + msg
+		}
+	}
 }
 
 // codexStreamFailure is why a codex stream does not count as a success whatever codex's exit code: it
@@ -338,11 +342,9 @@ func codexStreamFailure(res StreamResult) string {
 var errCodexResume = errors.New("resume of a codex job is not supported: start a new job " +
 	"(codex exec has a resume subcommand, but it is not verified to work under the job's containment yet)")
 
-// writeCodexReport writes the last agent message of a codex stream as report.md when the stream ended
-// in a completed turn and the job did not write report.md itself, and logs the token usage to
-// stderr.log.
-func writeCodexReport(jobDir string, log io.Writer) {
-	res := ParseCodexStream(filepath.Join(jobDir, "stream.jsonl"))
+// writeCodexResultReport writes the final message from the trusted stdout result when the runner
+// ended in a completed turn and the job did not write report.md itself, and logs token usage.
+func writeCodexResultReport(jobDir string, res StreamResult, log io.Writer) {
 	fmt.Fprintf(log, "run-wrapper: codex usage: input %d (cached %d), output %d tokens; %d items\n",
 		res.InputTokens, res.CachedInputTokens, res.OutputTokens, res.Turns)
 	if res.Skipped > 0 {

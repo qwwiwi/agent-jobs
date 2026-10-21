@@ -125,3 +125,44 @@ func validatePrices(prices map[string]ModelPrice) error {
 
 // EstimatedCostText is an estimated cost for people: "$0.42 est.".
 func EstimatedCostText(cost float64) string { return fmt.Sprintf("$%.2f est.", cost) }
+
+// streamTokenCounter counts only usage received from runner stdout. Repeated Claude message IDs
+// contribute their largest usage; Codex turn usage is additive.
+type streamTokenCounter struct {
+	byID    map[string]TokenUsage
+	total   TokenUsage
+	invalid bool
+}
+
+func (c *streamTokenCounter) apply(ev statsEvent) {
+	var usage TokenUsage
+	if ev.Type == "turn.completed" && ev.Usage != nil {
+		u := ev.Usage
+		if u.CachedInputTokens < 0 || u.CachedInputTokens > u.InputTokens {
+			c.invalid = true
+			return
+		}
+		usage = TokenUsage{Input: u.InputTokens - u.CachedInputTokens, Output: u.OutputTokens, CacheRead: u.CachedInputTokens}
+	} else if ev.Type == "assistant" && ev.Message != nil && ev.Message.Usage != nil {
+		u := ev.Message.Usage
+		usage = TokenUsage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens, CacheWrite: u.CacheCreationInputTokens}
+		if !usage.Valid() {
+			c.invalid = true
+			return
+		}
+		if id := ev.Message.ID; id != "" {
+			if c.byID == nil {
+				c.byID = map[string]TokenUsage{}
+			}
+			old := c.byID[id]
+			next := TokenUsage{max(old.Input, usage.Input), max(old.Output, usage.Output), max(old.CacheRead, usage.CacheRead), max(old.CacheWrite, usage.CacheWrite)}
+			c.byID[id] = next
+			usage = TokenUsage{next.Input - old.Input, next.Output - old.Output, next.CacheRead - old.CacheRead, next.CacheWrite - old.CacheWrite}
+		}
+	} else {
+		return
+	}
+	var ok bool
+	c.total, ok = c.total.Add(usage)
+	c.invalid = c.invalid || !ok
+}

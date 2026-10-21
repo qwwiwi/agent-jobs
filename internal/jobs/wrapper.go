@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +23,19 @@ import (
 // StreamResult is the final `result` event of claude's stream-json output (or, for a codex job, what
 // ParseCodexStream reads from codex's JSON events).
 type StreamResult struct {
+	// Completion and provenance are written only by the wrapper into the token-bound DB record.
+	Completed          bool
+	ExitCode           int
+	IdleReason         string
+	SweepFailure       string
+	FallbackSession    string
+	Progressed         bool
+	Tokens             TokenUsage
+	TokensInvalid      bool
+	ReportPresent      bool
+	ReportContractNote string
+	ReportText         string `json:"-"` // last report from trusted assistant stdout
+
 	Found   bool
 	Subtype string
 	IsError bool
@@ -45,14 +60,6 @@ func (r StreamResult) program() string {
 	return r.Runner
 }
 
-// parseRunnerStream parses a job's stream.jsonl with the parser of its runner.
-func parseRunnerStream(runner, path string) StreamResult {
-	if runner == store.RunnerCodex {
-		return ParseCodexStream(path)
-	}
-	return parseStream(path)
-}
-
 type resultEvent struct {
 	Type         string  `json:"type"`
 	Subtype      string  `json:"subtype"`
@@ -71,20 +78,187 @@ func ParseStream(path string) StreamResult {
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	sc.Buffer(make([]byte, 0, 1<<20), maxStreamLine)
 	for sc.Scan() {
-		line := sc.Bytes()
-		if !json.Valid(line) {
-			continue
+		if r, ok := parseResultLine(sc.Bytes()); ok {
+			out = r
 		}
-		var ev resultEvent
-		if err := json.Unmarshal(line, &ev); err != nil || ev.Type != "result" {
-			continue
-		}
-		out = StreamResult{Found: true, Subtype: ev.Subtype, IsError: ev.IsError,
-			Turns: ev.NumTurns, CostUSD: ev.TotalCostUSD, Text: ev.Result}
 	}
 	return out
+}
+
+// maxStreamLine is the longest stream line read; a longer one is skipped.
+const maxStreamLine = 64 << 20
+
+// parseResultLine parses one stream line; ok when it is a `result` event.
+func parseResultLine(line []byte) (StreamResult, bool) {
+	if !bytes.Contains(line, []byte(`"result"`)) || !json.Valid(line) {
+		return StreamResult{}, false
+	}
+	var ev resultEvent
+	if err := json.Unmarshal(line, &ev); err != nil || ev.Type != "result" {
+		return StreamResult{}, false
+	}
+	return StreamResult{Found: true, Subtype: ev.Subtype, IsError: ev.IsError,
+		Turns: ev.NumTurns, CostUSD: ev.TotalCostUSD, Text: ev.Result}, true
+}
+
+// resultTee passes the runner's stdout through to stream.jsonl and keeps the last result event it saw
+// on the way. stream.jsonl lies in the job dir, which the job can write (a result line appended there
+// is the job's own); the pipe from the runner is the wrapper's, so only what the tee saw is trusted.
+type resultTee struct {
+	runner  string
+	w       io.Writer
+	line    []byte
+	skip    bool // the current line is longer than maxStreamLine: dropped
+	res     StreamResult
+	mu      sync.Mutex // stdout copy and idle watcher run concurrently
+	watch   streamWatch
+	seen    map[string]bool
+	observe func(StreamResult)
+	tokens  streamTokenCounter
+}
+
+func (t *resultTee) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n, err := t.w.Write(p)
+	if n > 0 {
+		t.watch.active = time.Now()
+	}
+	t.scan(p[:n])
+	return n, err
+}
+
+func (t *resultTee) scan(p []byte) {
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		chunk := p
+		if i >= 0 {
+			chunk = p[:i]
+		}
+		if !t.skip {
+			limit := maxStreamLine
+			if t.runner == store.RunnerCodex {
+				limit = codexMaxLineBytes
+			}
+			if len(t.line)+len(chunk) > limit {
+				t.skip, t.line = true, nil
+				t.res.Progressed = true // unreadable output cannot prove a pre-model resume failure
+			} else {
+				t.line = append(t.line, chunk...)
+			}
+		}
+		if i < 0 {
+			return
+		}
+		t.end()
+		p = p[i+1:]
+	}
+}
+
+// end parses the line read so far (also a last line without a newline) and starts the next one.
+func (t *resultTee) end() {
+	if t.skip {
+		t.tokens.invalid = true
+		t.watch.lastResult = false
+	} else {
+		t.watch.line(t.line)
+	}
+	if t.runner == store.RunnerCodex {
+		if t.skip {
+			t.res.Skipped++
+		} else {
+			applyCodexLine(&t.res, t.line)
+		}
+	} else if !t.skip {
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(t.line, &kind) == nil && (kind.Type == "assistant" || kind.Type == "result") {
+			t.res.Progressed = true
+		}
+		var ev struct {
+			Type    string          `json:"type"`
+			Parent  json.RawMessage `json:"parent_tool_use_id"`
+			Message struct {
+				ID      string `json:"id"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(t.line, &ev) == nil {
+			if ev.Type == "assistant" {
+				if t.seen == nil {
+					t.seen = map[string]bool{}
+				}
+				if !t.res.Found && (ev.Message.ID == "" || !t.seen[ev.Message.ID]) {
+					t.res.Turns++
+				}
+				t.seen[ev.Message.ID] = true
+				if parent := strings.TrimSpace(string(ev.Parent)); parent == "" || parent == "null" {
+					for _, c := range ev.Message.Content {
+						if c.Type == "text" && isReport(c.Text) {
+							t.res.ReportText = c.Text
+						}
+					}
+				}
+			}
+		}
+		if r, ok := parseResultLine(t.line); ok {
+			r.Progressed, r.ReportText = true, t.res.ReportText
+			t.res = r
+		}
+	}
+	if !t.skip && bytes.Contains(t.line, []byte(`"usage"`)) {
+		var ev statsEvent
+		if json.Unmarshal(t.line, &ev) == nil {
+			t.tokens.apply(ev)
+		}
+	}
+	t.res.Tokens, t.res.TokensInvalid = t.tokens.total, t.tokens.invalid
+	if t.observe != nil {
+		t.observe(t.res)
+	}
+	t.line, t.skip = t.line[:0], false
+}
+
+// idleState reads only bytes received from runner stdout, never the diagnostic file.
+func (t *resultTee) idleState() (bool, time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.watch.lastResult && len(t.line) == 0 && !t.skip && t.watch.bgTasks == 0, t.watch.active
+}
+
+// openWrapperStore opens the protected state database for a job directory.
+func openWrapperStore(jobDir string) (*store.Store, string, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return nil, "", err
+	}
+	st, err := store.Open(filepath.Join(filepath.Dir(filepath.Dir(abs)), "jobs.db"))
+	return st, filepath.Base(abs), err
+}
+
+func storeResult(st *store.Store, id, token string, res StreamResult) error {
+	res.Text = "" // reports stay out of the verdict record
+	b, err := json.Marshal(res)
+	if err != nil {
+		return err
+	}
+	return st.SetWrapperResult(id, token, string(b))
+}
+
+// recordResult persists a token-bound progress or completion snapshot (also used by lifecycle tests).
+func recordResult(jobDir, token string, res StreamResult) error {
+	st, id, err := openWrapperStore(jobDir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return storeResult(st, id, token, res)
 }
 
 func writeAtomic(path string, data []byte) error {
@@ -175,6 +349,14 @@ func admitted(jobDir, token string) error {
 	if j.Status != store.StatusRunning || j.LaunchToken != token {
 		return fmt.Errorf("job is %s under another launch or no longer running", j.Status)
 	}
+	if raw, ok, err := st.WrapperResult(j.ID, token); err != nil {
+		return err
+	} else if ok {
+		var res StreamResult
+		if json.Unmarshal([]byte(raw), &res) != nil || res.Completed {
+			return errors.New("job already completed this launch")
+		}
+	}
 	if j.Runner == store.RunnerCodex && CodexSandbox(j.Kind) == CodexSandboxWrite {
 		a, err := st.ReadLaunchAuthorization(j.ID, token)
 		if err != nil || !a.CodexWriteAllowed {
@@ -186,7 +368,7 @@ func admitted(jobDir, token string) error {
 
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,
 // cwd=<jobdir>/work; then extracts the final result text into report.md and writes exit_code.
-// exit_code is written last, so its presence means the job's files are complete.
+// The token-bound DB completion is authoritative; exit_code is diagnostic only.
 // It holds an exclusive lock on <jobdir>/wrapper.lock for its whole life: a second wrapper
 // for the same job refuses to run, so a job is never executed twice. Before registering it checks
 // (under admit.lock) that the row is still running under its token; a late wrapper whose job was
@@ -214,10 +396,6 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	defer lock.Close()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		fmt.Fprintln(os.Stderr, "run-wrapper: another wrapper already runs this job:", err)
-		return 3
-	}
-	if _, err := os.Stat(filepath.Join(jobDir, "exit_code")); err == nil {
-		fmt.Fprintln(os.Stderr, "run-wrapper: job already ran (exit_code exists)")
 		return 3
 	}
 	unlockAdmit, err := admitLock(jobDir)
@@ -252,35 +430,46 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if opts.Runner != store.RunnerCodex {
 		idle = idleGrace(jobDir, stderrLog)
 	}
-	code, idleClosed := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog)
-	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !streamProgressed(filepath.Join(jobDir, "stream.jsonl")) {
-		code, idleClosed = runFallback(jobDir, argv, opts, idle, stderrLog, code)
+	st, id, err := openWrapperStore(jobDir)
+	if err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: result database:", err)
+		return 2
+	}
+	defer st.Close()
+	record := func(res StreamResult) error { return storeResult(st, id, token, res) }
+	observe := func(res StreamResult) {
+		if err := record(res); err != nil {
+			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
+		}
+	}
+	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
+	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
+		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record)
 	}
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
-	// before exit_code says the job is over (a markerless orphan could otherwise start a nested job
+	// before trusted completion says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
 	sw := sweepJob(jobDir, stderrLog)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
 	}
 	if sw.Incomplete() {
-		// Fail closed: exit_code is still written (the job is over for the daemon), but the marker makes
-		// the daemon fail the job instead of reporting a clean success.
+		// Persist the actual sweep failure with completion; the marker is diagnostic.
 		fmt.Fprintf(stderrLog, "run-wrapper: sweep incomplete: survivors %v, error: %v\n", sw.Survivors, sw.Err)
 		if err := writeSweepMarker(jobDir, sw); err != nil {
 			fmt.Fprintln(stderrLog, "run-wrapper: write sweep marker:", err)
-			return 2 // no exit_code: the daemon fails the job as a dead wrapper
+			return 2 // no completion: the daemon fails the job as a dead wrapper
 		}
 	}
 	if opts.Runner == store.RunnerCodex {
-		writeCodexReport(jobDir, stderrLog)
-	} else if res := ParseStream(filepath.Join(jobDir, "stream.jsonl")); idleClosed {
-		code = finishIdleClosed(jobDir, res, stderrLog)
+		writeCodexResultReport(jobDir, res, stderrLog)
+	} else if idleClosed {
+		code, res.IdleReason = finishIdleClosed(jobDir, res, stderrLog)
 	} else if text := res.Text; text != "" || !hasReport(jobDir) {
 		if text == "" && res.Found && !res.IsError && res.Subtype == "success" {
 			// A successful result without text and no report.md of the job's own: the last top-level
 			// assistant text that is a report is the report.
-			text = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
+			text = res.ReportText
 		}
 		if text != "" {
 			if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(text+"\n")); err != nil {
@@ -290,10 +479,26 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	}
 	// The acceptance command (if the job has one) runs only after a clean claude run: exit 0, a report,
 	// a complete sweep. Its result goes into the job row before exit_code says the job is over.
-	if code == 0 && !sw.Incomplete() && hasReport(jobDir) {
-		if rc := runAcceptanceStep(jobDir, token, stderrLog); rc != 0 {
+	terminalOK := res.Found && !res.IsError && res.Subtype == "success"
+	if opts.Runner == store.RunnerCodex {
+		terminalOK = codexStreamFailure(res) == ""
+	}
+	if code == 0 && terminalOK && !sw.Incomplete() && hasReport(jobDir) {
+		if rc := runAcceptanceStep(jobDir, token, stderrLog, &res); rc != 0 {
 			return rc
 		}
+	}
+	if sw.Incomplete() {
+		res.SweepFailure = sweepResultFailure(sw)
+	}
+	res.Completed, res.ExitCode = true, code
+	res.ReportPresent = hasReport(jobDir)
+	if report, err := readSmall(filepath.Join(jobDir, "report.md"), maxContractReportBytes+1); err == nil && len(report) <= maxContractReportBytes {
+		res.ReportContractNote = reportContractNote(report)
+	}
+	if err := record(res); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: record completion:", err)
+		return 2
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)
@@ -346,7 +551,8 @@ func (o WrapperOptions) validate() error {
 const FallbackMarker = "fallback_session"
 
 // runFallback reruns claude in a fresh session after a failed resume (see RunWrapper).
-func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Duration, stderrLog *os.File, code int) (int, bool) {
+func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Duration, stderrLog *os.File, code int,
+	res StreamResult, record func(StreamResult) error) (int, bool, StreamResult) {
 	fresh := make([]string, 0, len(argv))
 	replaced := false
 	for i := 0; i < len(argv); i++ {
@@ -359,7 +565,7 @@ func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Du
 		fresh = append(fresh, argv[i])
 	}
 	if !replaced {
-		return code, false
+		return code, false, res
 	}
 	fmt.Fprintf(stderrLog, "run-wrapper: resume failed (exit %d, no progress); falling back to a fresh session %s\n",
 		code, opts.FallbackSession)
@@ -368,30 +574,22 @@ func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Du
 	}
 	if err := writeAtomic(filepath.Join(jobDir, FallbackMarker), []byte(opts.FallbackSession+"\n")); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write fallback marker:", err)
-		return code, false
 	}
-	return runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog)
-}
-
-// streamProgressed reports whether stream.jsonl holds an assistant or result event: claude got as
-// far as the model. A resume that fails before that never ran a turn.
-func streamProgressed(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
+	// Persist actual fallback use before starting the fresh runner, including a later killed attempt.
+	res = StreamResult{FallbackSession: opts.FallbackSession}
+	if err := record(res); err != nil {
+		fmt.Fprintln(stderrLog, "run-wrapper: record fallback:", err)
+		return code, false, res
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	for sc.Scan() {
-		var ev struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(sc.Bytes(), &ev) == nil && (ev.Type == "assistant" || ev.Type == "result") {
-			return true
+	observe := func(r StreamResult) {
+		r.FallbackSession = opts.FallbackSession
+		if err := record(r); err != nil {
+			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
-	return false
+	code, closed, res := runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog, observe)
+	res.FallbackSession = opts.FallbackSession
+	return code, closed, res
 }
 
 // idleGrace is the idle-after-result grace from the agent's config.json (<state>/jobs/<id> = jobDir);
@@ -408,36 +606,39 @@ func idleGrace(jobDir string, log io.Writer) time.Duration {
 	return DefaultIdleAfterResult
 }
 
+// teeWaitDelay bounds the wait for descendants that inherited runner stdout.
+var teeWaitDelay = 10 * time.Second
+
 // runClaude runs the job's runner (claude, or codex when runner is codex) and returns its exit code,
-// and whether the idle-after-result rule ended it.
-func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File) (int, bool) {
+// whether the idle-after-result rule ended it, and the result parsed from its stdout.
+func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File, observe ...func(StreamResult)) (int, bool, StreamResult) {
 	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127, false
+		return 127, false, StreamResult{}
 	}
 	defer stdin.Close()
-	stdout, err := os.Create(filepath.Join(jobDir, "stream.jsonl"))
+	stdout, err := os.OpenFile(filepath.Join(jobDir, "stream.jsonl"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
-		return 127, false
+		return 127, false, StreamResult{}
 	}
 	defer stdout.Close()
 	env, err := GitEnv(jobDir, os.Environ())
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
-		return 127, false
+		return 127, false, StreamResult{}
 	}
 	env, err = JobEnv(jobDir, env)
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
-		return 127, false
+		return 127, false, StreamResult{}
 	}
 	// Created by prepare; again here for an attempt prepared by an older build.
 	tmp, err := ensureJobTmp(jobDir)
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: job temp dir:", err)
-		return 127, false
+		return 127, false, StreamResult{}
 	}
 	env = TempEnv(env, tmp)
 	if runner != store.RunnerCodex {
@@ -447,19 +648,34 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 	cmd.Dir = filepath.Join(jobDir, "work")
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderrLog
-	closed, err := runIdleWatched(cmd, filepath.Join(jobDir, "stream.jsonl"), idle, stderrLog)
+	tee := &resultTee{w: stdout, runner: runner}
+	tee.watch.active = time.Now()
+	if len(observe) > 0 {
+		tee.observe = observe[0]
+	}
+	if runner == store.RunnerCodex {
+		tee.res.Runner = runner
+	}
+	cmd.Stdout, cmd.WaitDelay = tee, teeWaitDelay
+	closed, err := runIdleWatched(cmd, tee, idle, stderrLog)
+	tee.end()
+	res := tee.res
+	if errors.Is(err, exec.ErrWaitDelay) {
+		fmt.Fprintf(stderrLog, "run-wrapper: runner stdout still open %s after exit; stopped reading\n", teeWaitDelay)
+		err = nil // runner exited 0; sweep handles descendants holding the pipe
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-				return 128 + int(ws.Signal()), closed
+				return 128 + int(ws.Signal()), closed, res
 			}
-			return ee.ExitCode(), closed
+			return ee.ExitCode(), closed, res
 		}
-		fmt.Fprintln(stderrLog, "run-wrapper: start claude:", err)
-		return 127, false
+		fmt.Fprintln(stderrLog, "run-wrapper: run claude:", err)
+		return 127, closed, res
 	}
-	return 0, closed
+	return 0, closed, res
 }
 
 // JobTmpDir is the job's own temp dir inside its folder (<jobDir>/tmp): what the job's tools leave in

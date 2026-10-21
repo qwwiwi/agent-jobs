@@ -429,6 +429,10 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN merge_note TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN cleanup_skipped_at INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN fallback_session TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN wrapper_token TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -789,7 +793,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
 	// report of the ended attempt has been redacted (ClearRedactionPending).
 	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-		attempt=attempt+1, redaction_pending=1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+		attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`, token, now.Unix(), id))
 }
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
@@ -820,9 +824,59 @@ func (s *Store) ClearRedactionPending(id string) error {
 }
 
 // SetSession records the claude session id and run mode of the running launch that owns the job.
+// It clears the launch's fallback session (SetFallbackSession sets it again for a resume launch).
 func (s *Store) SetSession(id, token, sessionID, mode string) error {
-	return affected(s.db.Exec(`UPDATE jobs SET session_id=?, run_mode=? WHERE id=? AND status='running' AND launch_token=?`,
-		sessionID, mode, id, token))
+	return affected(s.db.Exec(`UPDATE jobs SET session_id=?, run_mode=?, fallback_session='' WHERE id=? AND status='running'
+		AND launch_token=?`, sessionID, mode, id, token))
+}
+
+// SetFallbackSession records the fresh session id the daemon generated for a resume launch's
+// fallback: the only one the wrapper's fallback marker may name.
+func (s *Store) SetFallbackSession(id, token, sessionID string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET fallback_session=? WHERE id=? AND status='running' AND run_mode='resume'
+		AND launch_token=? AND launch_token!=''`,
+		sessionID, id, token))
+}
+
+// FallbackSession returns the fallback session id recorded for the launch with token ("" if none).
+func (s *Store) FallbackSession(id, token string) (string, error) {
+	var sid string
+	err := s.db.QueryRow(`SELECT fallback_session FROM jobs WHERE id=? AND launch_token=?`, id, token).Scan(&sid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return sid, err
+}
+
+// SetWrapperResult records, for the running launch with token, the result the wrapper read from
+// the runner's stdout itself (an opaque JSON text): the daemon trusts it, not stream.jsonl in the job dir.
+func (s *Store) SetWrapperResult(id, token, result string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET wrapper_result=?, wrapper_token=? WHERE id=? AND status='running'
+		AND launch_token=? AND launch_token!=''`, result, token, id, token))
+}
+
+// WrapperResult returns the result the wrapper of the launch with token recorded; ok is false when
+// that wrapper recorded none.
+func (s *Store) WrapperResult(id, token string) (result string, ok bool, err error) {
+	var tok, current string
+	err = s.db.QueryRow(`SELECT wrapper_result, wrapper_token, launch_token FROM jobs WHERE id=?`, id).Scan(&result, &tok, &current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	}
+	if err != nil || token == "" || tok != token || current != token {
+		return "", false, err
+	}
+	return result, true, nil
+}
+
+// AttemptWrapperResult is the trusted wrapper snapshot archived transactionally at requeue.
+func (s *Store) AttemptWrapperResult(id string, n int) (string, error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT wrapper_result FROM attempts WHERE job_id=? AND n=?`, id, n).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return raw, err
 }
 
 // Amend appends text to the brief of a queued job. The queue position (created_at, rowid) is kept.
@@ -887,10 +941,10 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	defer func() { _ = tx.Rollback() }()
 	const resumable = `status IN ('stopped','timeout','failed')`
 	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
-		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at)
+		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at, wrapper_result)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
 		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, pending_context, session_id,
-		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
+		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,

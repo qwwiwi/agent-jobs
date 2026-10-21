@@ -167,7 +167,7 @@ func acceptanceNote(j *store.Job) string {
 func (m *Manager) verdict(j *store.Job, code int, res StreamResult, dir string) (string, string) {
 	status, msg := Verdict(code, res, dir)
 	if status != store.StatusSucceeded || j.AcceptanceCmd == "" {
-		return m.reportContract(j, status, msg, dir)
+		return m.completedReportContract(j, status, msg, res, dir)
 	}
 	fresh, err := m.Store.Get(j.ID)
 	if err != nil {
@@ -176,7 +176,15 @@ func (m *Manager) verdict(j *store.Job, code int, res StreamResult, dir string) 
 	if reason := AcceptanceFailure(fresh); reason != "" {
 		return store.StatusFailed, reason
 	}
-	return m.reportContract(j, status, msg, dir)
+	return m.completedReportContract(j, status, msg, res, dir)
+}
+
+// completedReportContract uses the report validation captured before trusted completion.
+func (m *Manager) completedReportContract(j *store.Job, status, msg string, res StreamResult, dir string) (string, string) {
+	if !res.Completed {
+		return m.reportContract(j, status, msg, dir)
+	}
+	return m.applyReportContract(j, status, msg, res.ReportContractNote)
 }
 
 // reportContract checks the report of a succeeded claude job against the report contract: one
@@ -190,7 +198,13 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	if err != nil || len(report) > maxContractReportBytes {
 		return status, msg // Verdict saw a report; one unreadable now, or longer than the limit, is not judged here
 	}
-	note := reportContractNote(report)
+	return m.applyReportContract(j, status, msg, reportContractNote(report))
+}
+
+func (m *Manager) applyReportContract(j *store.Job, status, msg, note string) (string, string) {
+	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
+		return status, msg
+	}
 	switch {
 	case note == "":
 		return status, msg
@@ -259,7 +273,7 @@ func openAcceptance(jobDir, token string) (*wrapperAcceptance, error) {
 // SIGTERM, SIGINT or SIGHUP while it runs (cancel, stop, the daemon's timeout) end the command's process
 // group (TERM, then KILL after acceptanceKillGrace) and the wrapper returns 128+SIGTERM without a
 // result or exit_code: the daemon is ending the job anyway.
-func runAcceptanceStep(jobDir, token string, log *os.File) int {
+func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResult) int {
 	a, err := openAcceptance(jobDir, token)
 	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance:", err)
@@ -293,6 +307,9 @@ func runAcceptanceStep(jobDir, token string, log *os.File) int {
 		fmt.Fprintf(log, "run-wrapper: ended %d leftover process(es) of the acceptance command\n", sw.Signalled)
 	}
 	if sw.Incomplete() {
+		if len(result) > 0 {
+			result[0].SweepFailure = sweepResultFailure(sw)
+		}
 		fmt.Fprintf(log, "run-wrapper: sweep after acceptance incomplete: survivors %v, error: %v\n", sw.Survivors, sw.Err)
 		if err := writeSweepMarker(jobDir, sw); err != nil {
 			fmt.Fprintln(log, "run-wrapper: write sweep marker:", err)

@@ -146,6 +146,37 @@ func (m *Manager) transcriptPath(j *store.Job) string {
 	return ""
 }
 
+// sessionProtected are the claude project dirs of the job's work dir, as written and with symlinks
+// resolved (claude names the project after the physical cwd): they hold the transcript and the session
+// dir of every session the job runs in, its own and a resume's fallback. A job never writes there: a
+// transcript the job wrote during the run would be digested at its end as its own and resumed later.
+// A project dir name claude cuts (longer than maxProjectDirName, with a hash suffix) cannot be named
+// in advance, so then the whole <config>/projects is protected.
+func (m *Manager) sessionProtected(j *store.Job) []string {
+	cfg, err := ClaudeConfigDir()
+	if err != nil {
+		return nil
+	}
+	projects := filepath.Join(cfg, "projects")
+	dir := m.JobDir(j.ID)
+	works := []string{filepath.Join(dir, "work")}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		works = append(works, filepath.Join(r, "work"))
+	}
+	if r, err := filepath.EvalSymlinks(works[0]); err == nil && r != works[0] && !slices.Contains(works, r) {
+		works = append(works, r)
+	}
+	var out []string
+	for _, w := range works {
+		name := ProjectDirName(w)
+		if len(name) > maxProjectDirName {
+			return []string{projects}
+		}
+		out = append(out, filepath.Join(projects, name))
+	}
+	return out
+}
+
 // sessionDigest is the SHA-256 of a session's transcript and of the <id>/ directory next to it (tool
 // results, subagent transcripts): names, types, symlink targets and regular files' contents.
 func sessionDigest(transcript, sessionID string) (string, error) {
@@ -323,10 +354,17 @@ func onlySkillLinks(work string, names []string) bool {
 // spawn), so every process with the job's marker is such a process; doctor procs also finds the
 // markerless ones left in the session of the job's last wrapper.
 func (m *Manager) checkEscaped(id string) error {
+	return m.checkEscapedOn(id, runtime.GOOS)
+}
+
+func (m *Manager) checkEscapedOn(id, platform string) error {
 	// On every platform: the group recorded at the last spawn may outlive a wrapper that died.
 	j, err := m.Store.Get(id)
 	if err != nil {
 		return err
+	}
+	if platform != "linux" {
+		return checkEscapedWithoutProc(j, platform)
 	}
 	if m.spawnedGroupAlive(j) {
 		return fmt.Errorf("the process group %d of the job's last attempt is still alive; end it (job_cancel, or kill the group) "+
@@ -335,8 +373,8 @@ func (m *Manager) checkEscaped(id string) error {
 	if m.acceptanceGroupAlive(j) {
 		return fmt.Errorf("the acceptance process group %d of the job's last attempt is still alive; end it before resuming", j.AcceptancePGID)
 	}
-	if runtime.GOOS != "linux" || !procExists(os.Getpid()) {
-		return nil // no process scan (needs Linux /proc); the sweep cannot run there either
+	if !procExists(os.Getpid()) {
+		return errors.New("processes of the job outside its process group not checked: Linux /proc is unavailable; cannot resume")
 	}
 	refuse := func(err error) error {
 		return fmt.Errorf("processes of the job outside its process group not checked, so it cannot be resumed: %w", err)
@@ -367,6 +405,37 @@ func (m *Manager) checkEscaped(id string) error {
 	if len(live) > 0 {
 		return fmt.Errorf("process(es) of the job still run outside its process group: %s; end them (see doctor procs) "+
 			"before resuming", strings.Join(live, ", "))
+	}
+	return nil
+}
+
+// checkEscapedWithoutProc fails closed except on Darwin when the kernel proves both recorded
+// groups absent. This preserves macOS resume after a completed group; it does not claim to scan
+// processes that escaped those groups. Only ESRCH proves absence; permission and other errors refuse.
+func checkEscapedWithoutProc(j *store.Job, platform string) error {
+	refuse := func(why string) error {
+		return fmt.Errorf("processes of the job outside its process group not checked on %s: %s; cannot resume", platform, why)
+	}
+	if platform != "darwin" {
+		return refuse("escaped-process verification requires Linux /proc")
+	}
+	if j.ScopeUnit != "" || (j.PID > 0 && j.PGID <= 1) {
+		return refuse("the previous attempt has no verifiable process group")
+	}
+	for i, g := range []int{j.PGID, j.AcceptancePGID} {
+		if g == 0 {
+			continue // no group was launched
+		}
+		if err := plausibleGroup(g); err != nil {
+			return refuse(err.Error())
+		}
+		if err := killFn(-g, 0); !errors.Is(err, syscall.ESRCH) {
+			what := "process group"
+			if i == 1 {
+				what = "acceptance process group"
+			}
+			return refuse(fmt.Sprintf("the %s %d is still alive or its absence cannot be verified (%v)", what, g, err))
+		}
 	}
 	return nil
 }
@@ -413,11 +482,10 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
-	if code, ok := readExitCode(dir); ok {
+	if code, ok := m.completedCode(j); ok {
 		// The job ended before the stop: collect it as the tick would.
-		res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
-		status, verdict := Verdict(code, res, dir)
-		status, verdict = m.reportContract(j, status, verdict, dir)
+		res := m.endedResult(j)
+		status, verdict := m.verdict(j, code, res, dir)
 		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
 		if gerr != nil {
@@ -429,7 +497,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	m.removeSkills(j)
 	// Killed: the assistant turns written so far count; the cost is unknown (recorded as such: a
 	// resume counts this attempt at its whole budget), whatever result line the stream holds.
-	res, killed := killedResult(j.Runner, dir)
+	res, killed := m.killedResult(j)
 	if killed {
 		msg += " (cost so far unknown: ended by the stop)"
 	}
@@ -457,37 +525,6 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	}
 	m.Log.Printf("job %s stopped (%s)", id, RedactText(msg)) // the stop reason and the sweep note
 	return m.Store.Get(id)
-}
-
-// streamTurns counts the assistant messages (distinct message ids) in a stream.
-func streamTurns(path string) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	seen := map[string]bool{}
-	n := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	for sc.Scan() {
-		var ev struct {
-			Type    string `json:"type"`
-			Message struct {
-				ID string `json:"id"`
-			} `json:"message"`
-		}
-		if json.Unmarshal(sc.Bytes(), &ev) != nil || ev.Type != "assistant" {
-			continue
-		}
-		if ev.Message.ID == "" {
-			n++
-		} else if !seen[ev.Message.ID] {
-			seen[ev.Message.ID] = true
-			n++
-		}
-	}
-	return n
 }
 
 // lastAssistantText returns the text of the last assistant messages in a stream (newest last),
@@ -763,15 +800,19 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 }
 
 // noteFallback records the fresh session a resume fell back to (FallbackMarker, written by the
-// wrapper) on the running row, so the next resume continues that session.
+// wrapper) on the running row, so the next resume continues that session. Both actual use and the
+// daemon-generated session ID come from the token-bound DB state; the marker is diagnostic.
 func (m *Manager) noteFallback(j *store.Job) {
-	b, err := readSmall(filepath.Join(m.JobDir(j.ID), FallbackMarker), 128)
-	if err != nil {
+	if j.RunMode != store.RunResume {
 		return
 	}
-	sid := strings.TrimSpace(b)
-	if !ValidSessionID(sid) {
-		m.Log.Printf("job %s: ignoring invalid %s", j.ID, FallbackMarker)
+	sid := m.endedResult(j).FallbackSession
+	if sid == "" {
+		return
+	}
+	want, err := m.Store.FallbackSession(j.ID, j.LaunchToken)
+	if err != nil || !ValidSessionID(sid) || sid != want {
+		m.Log.Printf("job %s: ignoring fallback: not the fallback session generated for this launch", j.ID)
 		return
 	}
 	if err := m.Store.SetSession(j.ID, j.LaunchToken, sid, store.RunFallback); err != nil {
@@ -803,7 +844,7 @@ func readSmall(path string, max int64) (string, error) {
 func AttemptReportName(n int) string { return fmt.Sprintf("report.attempt-%d.md", n) }
 
 // archiveAttempt moves attempt n's run files to attempts/<n>/ and its report to report.attempt-<n>.md,
-// so the next attempt starts clean (the wrapper refuses to run while exit_code exists).
+// so the next attempt starts with fresh diagnostic files.
 func archiveAttempt(dir string, n int) error {
 	ad := filepath.Join(dir, attemptsDir)
 	if fi, err := os.Lstat(ad); err == nil && (!fi.IsDir() || fi.Mode()&os.ModeSymlink != 0) {
@@ -929,6 +970,9 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	intact, why := m.sessionIntact(j)
 	if intact {
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunResume); err != nil {
+			return launchPlan{}, err
+		}
+		if err := m.Store.SetFallbackSession(j.ID, token, fresh); err != nil {
 			return launchPlan{}, err
 		}
 		j.RunMode = store.RunResume

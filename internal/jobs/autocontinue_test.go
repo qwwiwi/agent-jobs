@@ -407,6 +407,9 @@ func TestTimeoutLateExitCodeCollectsVerdict(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(res), 0o600); err != nil {
 			t.Error(err)
 		}
+		if err := recordResult(dir, j.LaunchToken, StreamResult{Completed: true, ExitCode: 1, Found: true, Subtype: "error_max_budget_usd", IsError: true, Turns: 4, CostUSD: 1.02}); err != nil {
+			t.Error(err)
+		}
 		if err := os.WriteFile(filepath.Join(dir, "exit_code"), []byte("1\n"), 0o600); err != nil {
 			t.Error(err)
 		}
