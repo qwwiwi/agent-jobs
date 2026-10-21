@@ -94,10 +94,22 @@ func TestParserGapsLinkProducers(t *testing.T) {
 	}
 	for _, cmd := range []string{"cp -a old/safe copy", "mv old/safe copy", "rsync -a src/ build/",
 		"tar xf a.tar -C build; echo x > ../out.txt", "unzip a.zip -d build",
+		"tar -xvC build -f a.tar; echo x > L/jobs.db",
+		"unzip -qd build a.zip; echo x > L/jobs.db",
+		"cpio -idmD build < a.cpio; echo x > L/jobs.db",
 		"install old/safe regular; echo x > regular.txt", "cp -aL old/L regular; echo x > regular.txt"} {
 		cmd = strings.ReplaceAll(cmd, "old/", source+"/")
 		if reason := Check(cmd, cfg); reason != "" {
 			t.Errorf("%s: %s", cmd, reason)
+		}
+	}
+	for _, cmd := range []string{
+		"tar -xvC build -f a.tar; printf x > build/L/jobs.db",
+		"unzip -qd build a.zip; printf x > build/L/jobs.db",
+		"cpio -idmD build < a.cpio; printf x > build/L/jobs.db",
+	} {
+		if Check(cmd, cfg) == "" {
+			t.Errorf("extraction link traversal allowed: %s", cmd)
 		}
 	}
 }
