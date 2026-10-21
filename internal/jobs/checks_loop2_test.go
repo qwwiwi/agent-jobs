@@ -32,7 +32,7 @@ func TestCheckRestartJudgesEveryExpectedTime(t *testing.T) {
 	*now = time.Date(2026, 10, 19, 12, 0, 1, 0, time.UTC)
 	watch(t, m)
 	got := missedLines(t, logf)
-	want := "[jobs:check-missed] hourly expected 2026-10-19 11:00 UTC (no mark within 60m)"
+	want := `[jobs:check-missed] hourly expected 2026-10-19 11:00 UTC (no mark within 60m); last_mark_job="owner"`
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("lines %q, want [%q]", got, want)
 	}
@@ -150,7 +150,7 @@ func TestCheckReArmIgnoresPreArmMarks(t *testing.T) {
 	*now = time.Date(2026, 10, 19, 13, 0, 1, 0, time.UTC)
 	watch(t, m)
 	got := missedLines(t, logf)
-	want := "[jobs:check-missed] hourly expected 2026-10-19 11:00 UTC (no mark within 120m)"
+	want := `[jobs:check-missed] hourly expected 2026-10-19 11:00 UTC (no mark within 120m); last_mark_job="owner"`
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("lines %q, want [%q]", got, want)
 	}

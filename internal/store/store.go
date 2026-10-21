@@ -455,8 +455,9 @@ var migrationBackfills = map[string]string{
 	// effort was recorded stay empty). A stats row whose job was pruned keeps the default.
 	jobStatsEffortAlter: `UPDATE job_stats SET effort = COALESCE((SELECT j.reasoning_effort FROM jobs j
 		WHERE j.id = job_stats.id), '')`,
-	checksAlertStateAlter: checksAlertStateFill,
-	checksAlertsMoved:     checksAlertsFill,
+	checksAlertStateAlter:   checksAlertStateFill,
+	checksAlertsMoved:       checksAlertsFill,
+	checksMarkerPolicyAlter: checksMarkerProvenanceFill,
 }
 
 // migrate runs one migration and its backfill, if any, in one transaction; a column that is already

@@ -80,7 +80,7 @@ func TestCheckMarkMatchesExpectedWithGrace(t *testing.T) {
 	*now = e2.Add(30*time.Minute + time.Second)
 	watch(t, m)
 	got := missedLines(t, logf)
-	want := "[jobs:check-missed] backup expected 2026-10-20 10:00 UTC (no mark within 30m)"
+	want := `[jobs:check-missed] backup expected 2026-10-20 10:00 UTC (no mark within 30m); last_mark_job="owner"`
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("lines %q, want [%q]", got, want)
 	}
@@ -392,7 +392,7 @@ func TestCheckValidation(t *testing.T) {
 		t.Fatalf("unknown check: %v", err)
 	}
 	got, err := m.MarkCheck(ck.Name, "[jobs:job-done] fake", "")
-	if err != nil || got.LastMarkNote != "(jobs:job-done] fake" || got.LastMarkAt == nil {
+	if err != nil || got.LastMarkUntrustedNote != "(jobs:job-done] fake" || got.LastMarkAt == nil {
 		t.Fatalf("mark: %+v %v", got, err)
 	}
 	if _, err := m.MarkCheck(ck.Name, strings.Repeat("я", MaxMarkNoteRunes), ""); err != nil {
@@ -437,7 +437,7 @@ func TestProxyCheckMark(t *testing.T) {
 		t.Fatalf("mark via proxy: %v %v", o, err)
 	}
 	ck, err := m.Store.GetCheck("report")
-	if err != nil || ck.LastMarkJob != j.ID || ck.LastMarkNote != "all good" {
+	if err != nil || ck.LastMarkJob != j.ID || ck.LastMarkUntrustedNote != "all good" {
 		t.Fatalf("row: %+v %v", ck, err)
 	}
 	if _, err := c.CheckMark(ctx, "missing", ""); err == nil || !strings.Contains(err.Error(), "not found") {

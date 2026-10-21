@@ -50,6 +50,9 @@ import (
 // CheckMissedTag starts the watchdog's line in the session.
 const CheckMissedTag = "[jobs:check-missed]"
 
+// maxCheckNotificationBytes leaves headroom for tmux's command framing below its 16 KiB limit.
+const maxCheckNotificationBytes = 8 * 1024
+
 // Grace bounds of a check, in minutes.
 const (
 	DefaultCheckGrace = 60
@@ -96,7 +99,40 @@ func MarkNote(s string) (string, error) {
 	if n := utf8.RuneCountInString(s); n > MaxMarkNoteRunes {
 		return "", fmt.Errorf("note has %d characters, at most %d", n, MaxMarkNoteRunes)
 	}
-	return defangTags(RedactPrintable(s, 0)), nil
+	return safeMarkNote(s), nil
+}
+
+// safeMarkNote also protects views of notes written by older versions. Redact before cutting.
+func safeMarkNote(s string) string {
+	return defangTags(RedactPrintable(s, MaxMarkNoteRunes))
+}
+
+func safeCheck(ck *store.Check) *store.Check {
+	c := *ck
+	c.LastMarkUntrustedNote = safeMarkNote(c.LastMarkUntrustedNote)
+	if c.LastMarkAt != nil && c.LastMarkJob == "" {
+		c.LastMarkJob = "owner"
+	}
+	return &c
+}
+
+// validateCheckMarkers bounds the policy and rejects invalid schedule identifiers.
+func validateCheckMarkers(policies ...[]int64) error {
+	if len(policies) > 1 {
+		return errors.New("give one allowed_schedule_ids list")
+	}
+	if len(policies) == 0 {
+		return nil
+	}
+	if len(policies[0]) > 100 {
+		return errors.New("allowed_schedule_ids: at most 100 schedule ids")
+	}
+	for _, id := range policies[0] {
+		if id <= 0 {
+			return errors.New("allowed_schedule_ids must contain positive schedule ids")
+		}
+	}
+	return nil
 }
 
 func checkGrace(g int, def bool) (int, error) {
@@ -212,7 +248,11 @@ func nextExpected(c *Cron, t time.Time) (time.Time, bool) {
 }
 
 // AddCheck validates and stores a check, enabled and armed now (grace 0 = DefaultCheckGrace).
-func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
+// An optional schedule allow-list restricts job markers; omitted or empty permits all jobs.
+func (m *Manager) AddCheck(name, cron string, grace int, allowedScheduleIDs ...[]int64) (*store.Check, error) {
+	if err := validateCheckMarkers(allowedScheduleIDs...); err != nil {
+		return nil, err
+	}
 	name, err := CheckName(name)
 	if err != nil {
 		return nil, err
@@ -223,9 +263,12 @@ func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
 	if grace, err = checkGrace(grace, true); err != nil {
 		return nil, err
 	}
-	c, err := m.Store.AddCheck(name, cron, grace, m.Now())
+	c, err := m.Store.AddCheck(name, cron, grace, m.Now(), allowedScheduleIDs...)
 	if errors.Is(err, store.ErrCheckExists) {
 		return nil, fmt.Errorf("check %q already exists (check_set edits it)", name)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -233,13 +276,17 @@ func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
 // SetCheck edits a check in place: its cron, its grace, enabled, or several (at least one). A new
 // cron or grace, or enabling it, re-arms the check: expected times before now never alert. Every
 // edit bumps the check's revision, so a watchdog judgement read before it is not stored.
-func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool) (*store.Check, error) {
+// An omitted allow-list preserves the policy; an empty one removes restrictions.
+func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool, allowedScheduleIDs ...[]int64) (*store.Check, error) {
+	if err := validateCheckMarkers(allowedScheduleIDs...); err != nil {
+		return nil, err
+	}
 	name, err := CheckName(name)
 	if err != nil {
 		return nil, err
 	}
-	if cron == "" && grace == 0 && enabled == nil {
-		return nil, errors.New("give a cron, grace_minutes, enabled or several of them")
+	if cron == "" && grace == 0 && enabled == nil && len(allowedScheduleIDs) == 0 {
+		return nil, errors.New("give a cron, grace_minutes, enabled, allowed_schedule_ids or several of them")
 	}
 	if cron != "" {
 		if cron, err = m.parseScheduleCron(cron); err != nil {
@@ -251,9 +298,12 @@ func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool) (*store.
 			return nil, err
 		}
 	}
-	c, err := m.Store.SetCheck(name, cron, grace, enabled, m.Now())
+	c, err := m.Store.SetCheck(name, cron, grace, enabled, m.Now(), allowedScheduleIDs...)
 	if errors.Is(err, store.ErrCheckNotFound) {
 		return nil, fmt.Errorf("check %q not found", name)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -298,6 +348,12 @@ func (m *Manager) MarkCheck(name, note, jobID string) (*store.Check, error) {
 	})
 	if errors.Is(err, store.ErrCheckNotFound) {
 		return nil, fmt.Errorf("check %q not found (check_add creates it)", name)
+	}
+	if errors.Is(err, store.ErrCheckMarkForbidden) {
+		m.Log.Printf("WARN check_mark refused: check=%s job=%s: %v", name, RedactPrintable(jobID, 80), err)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -440,6 +496,7 @@ func hasMarkIn(marks []time.Time, lo, hi time.Time) bool {
 
 // CheckViewOf is the view of a check now.
 func (m *Manager) CheckViewOf(ck *store.Check) (CheckView, error) {
+	ck = safeCheck(ck)
 	v := CheckView{Check: ck, State: CheckDisabled, loc: m.loc()}
 	s, err := m.specOf(ck)
 	if err != nil {
@@ -568,7 +625,21 @@ func CheckViewText(v CheckView) string {
 	if v.AlertsFailed > 0 {
 		b.WriteString(" (check_set acknowledges failed alerts)")
 	}
+	b.WriteString(checkMarkText(v.Check))
 	return b.String()
+}
+
+// checkMarkText quotes job-written text as untrusted data in human/session views.
+func checkMarkText(c *store.Check) string {
+	if c == nil || c.LastMarkAt == nil {
+		return ""
+	}
+	c = safeCheck(c)
+	text := fmt.Sprintf("; last_mark_job=%q", c.LastMarkJob)
+	if c.LastMarkUntrustedNote != "" {
+		text += fmt.Sprintf(" last_mark_untrusted_note=%q", c.LastMarkUntrustedNote)
+	}
+	return text
 }
 
 // missedItem is one check's part of the alert line: count missed expected times, the latest one.
@@ -577,6 +648,8 @@ type missedItem struct {
 	expected time.Time
 	grace    int
 	count    int
+	mark     *store.Check
+	alertIDs []int64
 }
 
 // CheckMissedText is how one missed expected time reads in the alert line.
@@ -587,14 +660,66 @@ func CheckMissedText(name string, expected time.Time, grace int) string {
 func checkMissedLine(items []missedItem) string {
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
-		if it.count > 1 {
-			parts = append(parts, fmt.Sprintf("%s: %d missed, latest %s (no mark within %dm)",
-				it.name, it.count, it.expected.Format(checkShownLayout), it.grace))
-			continue
-		}
-		parts = append(parts, CheckMissedText(it.name, it.expected, it.grace))
+		parts = append(parts, it.text(maxCheckNotificationBytes-len(CheckMissedTag)-1))
 	}
 	return CheckMissedTag + " " + strings.Join(parts, "; ")
+}
+
+// text preserves the alert itself, shortening optional note text before marker provenance.
+// Redact before shortening and measure the quoted bytes, including any quote/backslash escapes.
+func (it missedItem) text(maxBytes int) string {
+	base := CheckMissedText(it.name, it.expected, it.grace)
+	if it.count > 1 {
+		base = fmt.Sprintf("%s: %d missed, latest %s (no mark within %dm)",
+			it.name, it.count, it.expected.Format(checkShownLayout), it.grace)
+	}
+	if it.mark == nil || it.mark.LastMarkAt == nil {
+		return base
+	}
+	c := safeCheck(it.mark)
+	for _, field := range []*string{&c.LastMarkUntrustedNote, &c.LastMarkJob} {
+		excess := len(base) + len(checkMarkText(c)) - maxBytes
+		if excess > 0 && *field != "" {
+			budget := len(fmt.Sprintf("%q", *field)) - excess
+			runes := []rune(*field)
+			for len(runes) > 0 && len(fmt.Sprintf("%q", string(runes)+"…")) > budget {
+				runes = runes[:len(runes)-1]
+			}
+			*field = string(runes) + "…"
+		}
+	}
+	if text := base + checkMarkText(c); len(text) <= maxBytes {
+		return text
+	}
+	return base // optional metadata can never displace an alert
+}
+
+type checkAlertBatch struct {
+	line string
+	ids  []int64
+}
+
+// checkMissedBatches keeps every check's grouped alert rows together, with exact delivery IDs.
+func checkMissedBatches(items []missedItem) []checkAlertBatch {
+	var batches []checkAlertBatch
+	batch := checkAlertBatch{line: CheckMissedTag + " "}
+	for _, it := range items {
+		part := it.text(maxCheckNotificationBytes - len(CheckMissedTag) - 1)
+		if len(batch.ids) > 0 {
+			if len(batch.line)+2+len(part) > maxCheckNotificationBytes {
+				batches = append(batches, batch)
+				batch = checkAlertBatch{line: CheckMissedTag + " "}
+			} else {
+				batch.line += "; "
+			}
+		}
+		batch.line += part
+		batch.ids = append(batch.ids, it.alertIDs...)
+	}
+	if len(batch.ids) > 0 {
+		batches = append(batches, batch)
+	}
+	return batches
 }
 
 // missedItems groups alert rows (ordered by check) into one item per check.
@@ -604,12 +729,14 @@ func (m *Manager) missedItems(rows []*store.CheckAlert) []missedItem {
 		e := a.Expected.In(m.loc())
 		if n := len(out); n > 0 && out[n-1].name == a.Name {
 			out[n-1].count += 1 + a.Merged
+			out[n-1].alertIDs = append(out[n-1].alertIDs, a.ID)
 			if e.After(out[n-1].expected) {
 				out[n-1].expected = e
 			}
 			continue
 		}
-		out = append(out, missedItem{name: a.Name, expected: e, grace: a.Grace, count: 1 + a.Merged})
+		c := &store.Check{LastMarkAt: a.LastMarkAt, LastMarkJob: a.LastMarkJob, LastMarkUntrustedNote: a.LastMarkUntrustedNote}
+		out = append(out, missedItem{name: a.Name, expected: e, grace: a.Grace, count: 1 + a.Merged, mark: c, alertIDs: []int64{a.ID}})
 	}
 	return out
 }
@@ -672,7 +799,7 @@ func (m *Manager) judgeCheck(ck *store.Check, now time.Time) (bool, error) {
 	return true, nil
 }
 
-// deliverCheckAlerts types the pending alert rows whose next attempt is due as one line. It must
+// deliverCheckAlerts types the pending alert rows whose next attempt is due in bounded lines. It must
 // run without the lifecycle lock: claimCheckAlerts takes the attempts under a fresh token,
 // sendCheckAlerts types the rows still holding it under tmux.lock.
 func (m *Manager) deliverCheckAlerts() error {
@@ -747,17 +874,17 @@ func (m *Manager) sendCheckAlerts(token string) error {
 			m.Log.Printf("check watchdog: a stale delivery attempt typed nothing (its alerts were claimed again or delivered)")
 			return nil
 		}
-		line := checkMissedLine(m.missedItems(rows))
-		if serr := m.sendTmux(ctx, target, line); serr != nil {
-			m.Log.Printf("check watchdog: alert not delivered: %v: %s", serr, line)
-			return m.Store.FailCheckAlertAttempt(token, serr.Error(), MaxCheckAlertAttempts)
+		var errs []error
+		for _, batch := range checkMissedBatches(m.missedItems(rows)) {
+			if serr := m.sendTmux(ctx, target, batch.line); serr != nil {
+				m.Log.Printf("check watchdog: alert not delivered: %v: %s", serr, batch.line)
+				errs = append(errs, m.Store.FailCheckAlertBatchAttempt(token, batch.ids, serr.Error(), MaxCheckAlertAttempts))
+				continue
+			}
+			m.Log.Printf("check watchdog: %s", batch.line)
+			errs = append(errs, m.Store.DeliverCheckAlerts(batch.ids))
 		}
-		m.Log.Printf("check watchdog: %s", line)
-		ids := make([]int64, len(rows))
-		for i, a := range rows {
-			ids[i] = a.ID
-		}
-		return m.Store.DeliverCheckAlerts(ids)
+		return errors.Join(errs...)
 	})
 	if done {
 		return err
