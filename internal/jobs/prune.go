@@ -190,6 +190,10 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Skipped = fmt.Sprintf("process group %d of the job is still alive, not touched", j.PGID)
 		return pj
 	}
+	if m.acceptanceGroupAlive(j) {
+		pj.Skipped = fmt.Sprintf("acceptance process group %d of the job is still alive, not touched", j.AcceptancePGID)
+		return pj
+	}
 	if j.RepoPath != "" && j.CleanedAt == nil {
 		pj.Skipped = "worktree cleanup has not run yet (patches not saved), not touched"
 		return pj

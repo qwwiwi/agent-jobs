@@ -144,13 +144,68 @@ func TestKillAcceptanceGroupBySysctl(t *testing.T) {
 				live = false
 				return nil
 			}
-			m.killAcceptanceGroupBySysctl(id, g)
+			res, why := m.killAcceptanceGroupBySysctl(id, g)
+			if leader == "unmarked" {
+				if res != groupRefused || !strings.Contains(acceptanceGroupNote(g, res, why), "not signalled: its leader carries no marker") {
+					t.Fatalf("missing leader refusal: %v %q", res, why)
+				}
+			} else if res != groupEnded || acceptanceGroupNote(g, res, why) != "" {
+				t.Fatalf("unexpected result: %v %q", res, why)
+			}
 			want := []string{fmt.Sprintf("-%d:15", g)}
 			if leader == "unmarked" {
 				want = nil
 			}
 			if !slices.Equal(sent, want) {
 				t.Fatalf("signals %v, want %v", sent, want)
+			}
+		})
+	}
+}
+
+// Exercise Darwin's refusal/survival reporting on Linux, including marker loss after SIGTERM.
+func TestAcceptanceSysctlFailureNotes(t *testing.T) {
+	const g, child = 1 << 22, 1<<22 + 1
+	const id = "261021-000000-test"
+	for _, mode := range []string{"signal failure", "marker lost after TERM"} {
+		t.Run(mode, func(t *testing.T) {
+			m := newManager(t)
+			m.KillGrace = 0
+			oldExists, oldKill := groupExists, killFn
+			t.Cleanup(func() { groupExists, killFn = oldExists, oldKill })
+			groupExists = func(int) bool { return true }
+			termSent := false
+			fakeSysctl(t, func(pid int) (sysctlInfo, error) {
+				if pid == g {
+					return sysctlInfo{}, syscall.ESRCH
+				}
+				p := sysctlInfo{pgid: g, env: []string{JobEnvVar + "=" + id}}
+				if mode == "marker lost after TERM" && termSent {
+					p.env = nil
+				}
+				return p, nil
+			}, func(int) ([]int, error) { return []int{child}, nil })
+			killFn = func(_ int, sig syscall.Signal) error {
+				termSent = true
+				if mode == "signal failure" {
+					return syscall.EPERM
+				}
+				if sig == syscall.SIGKILL {
+					t.Fatal("signalled after marker loss")
+				}
+				return nil
+			}
+			res, why := m.killAcceptanceGroupBySysctl(id, g)
+			note := acceptanceGroupNote(g, res, why)
+			if res != groupSurvived || !strings.Contains(note, ReasonSurvivors) || !strings.Contains(note, "acceptance process group") {
+				t.Fatalf("missing survivor note: %v %q", res, note)
+			}
+			want := "operation not permitted"
+			if mode == "marker lost after TERM" {
+				want = "no live member carries the job's marker"
+			}
+			if !strings.Contains(note, want) {
+				t.Fatalf("note %q lacks %q", note, want)
 			}
 		})
 	}

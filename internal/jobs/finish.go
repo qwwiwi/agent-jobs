@@ -534,6 +534,9 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if m.spawnedGroupAlive(j) {
 		return fmt.Errorf("refusing to touch %s: process group %d of the job is still alive", work, j.PGID)
 	}
+	if m.acceptanceGroupAlive(j) {
+		return fmt.Errorf("refusing to touch %s: acceptance process group %d of the job is still alive", work, j.AcceptancePGID)
+	}
 	fi, err := os.Lstat(work)
 	if os.IsNotExist(err) {
 		return nil // already removed

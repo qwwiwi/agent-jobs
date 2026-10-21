@@ -15,12 +15,11 @@ import (
 )
 
 // killAcceptanceGroup uses Linux process identities and pidfds, failing closed elsewhere.
-func (m *Manager) killAcceptanceGroup(id string, g int) {
+func (m *Manager) killAcceptanceGroup(id string, g int) (groupEnd, string) {
 	if p, err := procStatFull(g); err == nil && p.state != "Z" && p.pgid == g {
-		m.killLedAcceptance(id, g)
-		return
+		return m.killLedAcceptance(id, g)
 	}
-	m.killLeaderlessGroup(id, g)
+	return m.killLeaderlessGroup(id, g)
 }
 
 // acceptanceMember reports whether pid is a live (non-zombie) member of process group g carrying the

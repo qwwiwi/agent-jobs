@@ -702,6 +702,25 @@ func (m *Manager) spawnedGroupAlive(j *store.Job) bool {
 	return false
 }
 
+// acceptanceGroupAlive holds lifecycle operations even if every survivor dropped the marker.
+// Once a terminal attempt's group is gone, forget it before its id can be reused.
+func (m *Manager) acceptanceGroupAlive(j *store.Job) bool {
+	if j.AcceptancePGID == 0 || plausibleGroup(j.AcceptancePGID) != nil {
+		return false
+	}
+	if groupExists(j.AcceptancePGID) {
+		return true
+	}
+	if finished(j.Status) {
+		if err := m.Store.ClearAcceptancePGID(j.ID, j.LaunchToken, j.AcceptancePGID); err != nil {
+			m.Log.Printf("job %s: forget acceptance process group: %v", j.ID, err)
+		} else {
+			j.AcceptancePGID = 0
+		}
+	}
+	return false
+}
+
 // killFn sends a signal (syscall.Kill); a variable so tests can see every kill without risking one.
 var killFn = syscall.Kill
 
@@ -742,8 +761,8 @@ var beforeTimeoutClaim = func(string) {}
 // returns a note for the row when a dead wrapper's group was not signalled or members survived.
 // Survivors carry ReasonSurvivors: the job is not auto-continued, and while the recorded group lives
 // its cleanup, prune and resume stay held up. Otherwise it returns "".
-func (m *Manager) killJob(j *store.Job, pid, pgid int) string {
-	defer m.killAcceptance(j.ID)
+func (m *Manager) killJob(j *store.Job, pid, pgid int) (note string) {
+	defer func() { note = joinGroupNotes(note, m.killAcceptance(j.ID)) }()
 	if j.ScopeUnit != "" {
 		err := m.stopScope(j.ID)
 		if err == nil {
@@ -781,48 +800,76 @@ func (m *Manager) killJob(j *store.Job, pid, pgid int) string {
 // ignores it keeps running, and the wrapper was killed before its own grace ended the group), the
 // surviving members are checked by killLeaderlessGroup. Linux pins each process with a pidfd; Darwin
 // signals the group only while a live member carries the job marker (endMarkedGroupBySysctl).
-func (m *Manager) killAcceptance(id string) {
+func (m *Manager) killAcceptance(id string) string {
 	j, err := m.Store.Get(id)
 	if err != nil || j.AcceptancePGID == 0 {
-		return
+		return ""
 	}
 	g := j.AcceptancePGID
 	if err := plausibleGroup(g); err != nil {
 		m.Log.Printf("job %s: refusing to kill acceptance process group %d: %v", id, g, err)
-		return
+		return acceptanceGroupNote(g, groupRefused, err.Error())
 	}
-	m.killAcceptanceGroup(id, g)
+	res, why := m.killAcceptanceGroup(id, g)
+	// Linux's leaderless path tracks marked members; their disappearance can mean marker loss.
+	// Preserve its signal decisions, but never report a live group as ended.
+	if (res == groupGone || res == groupEnded) && groupExists(g) {
+		res, why = groupSurvived, "group still exists after termination"
+	}
+	return acceptanceGroupNote(g, res, why)
+}
+
+// acceptanceGroupNote uses the same refusal and survival wording as the main process group.
+func acceptanceGroupNote(g int, res groupEnd, why string) string {
+	switch res {
+	case groupRefused:
+		return fmt.Sprintf("acceptance process group %d not signalled: %s", g, why)
+	case groupSurvived:
+		if why != "" {
+			why = " (" + why + ")"
+		}
+		return fmt.Sprintf("acceptance process group %d survived SIGKILL%s; %s", g, why, ReasonSurvivors)
+	}
+	return ""
+}
+
+func joinGroupNotes(main, acceptance string) string {
+	if main == "" {
+		return acceptance
+	}
+	if acceptance == "" {
+		return main
+	}
+	return main + "; " + acceptance
 }
 
 // killLedAcceptance ends acceptance process group g of job id while its leader looks alive: the leader
 // is pinned by a pidfd, its marker and group are checked after that, and the group is ended through
 // pidfds (endLedGroup). A leader that died in between leaves a leaderless group (killLeaderlessGroup).
-func (m *Manager) killLedAcceptance(id string, g int) {
+func (m *Manager) killLedAcceptance(id string, g int) (groupEnd, string) {
 	fd, err := pidfdOpen(g)
 	if errors.Is(err, unix.ESRCH) {
-		m.killLeaderlessGroup(id, g)
-		return
+		return m.killLeaderlessGroup(id, g)
 	}
 	if err != nil {
 		m.Log.Printf("job %s: refusing to kill acceptance process group %d: pidfd_open %d: %v", id, g, g, err)
-		return
+		return groupRefused, fmt.Sprintf("pidfd_open %d: %v", g, err)
 	}
 	defer unix.Close(fd)
 	if p, err := procStatFull(g); err != nil || p.state == "Z" || p.pgid != g || pidfdSend(fd, 0) != nil {
-		m.killLeaderlessGroup(id, g)
-		return
+		return m.killLeaderlessGroup(id, g)
 	}
 	if procMarker(g) != id {
 		m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
-		return
+		return groupRefused, "its leader carries no marker of the job"
 	}
-	m.endLedGroup(id, fmt.Sprintf("acceptance process group %d", g), g, fd, acceptanceMember(id, g))
+	return m.endLedGroup(id, fmt.Sprintf("acceptance process group %d", g), g, fd, acceptanceMember(id, g))
 }
 
 // killLeaderlessGroup ends acceptance process group g whose leader is gone, after proving current
 // ownership with the job marker (endMarkedGroup).
-func (m *Manager) killLeaderlessGroup(id string, g int) {
-	m.endMarkedGroup(id, fmt.Sprintf("acceptance process group %d", g), g, acceptanceMember(id, g))
+func (m *Manager) killLeaderlessGroup(id string, g int) (groupEnd, string) {
+	return m.endMarkedGroup(id, fmt.Sprintf("acceptance process group %d", g), g, acceptanceMember(id, g))
 }
 
 // groupEnd is what endMarkedGroup did.
@@ -1184,8 +1231,8 @@ func wrapperArgv(j *store.Job, jobDir string, argv []string) bool {
 // endOrphanedGroup ends what is left of a job whose wrapper died without writing exit_code: its
 // process group as recorded at the spawn (liveSpawnedGroup; a group adopted from wrapper.json is never
 // signalled here) and its acceptance command. It returns a note for the row, "" when no group was left.
-func (m *Manager) endOrphanedGroup(j *store.Job) string {
-	defer m.killAcceptance(j.ID)
+func (m *Manager) endOrphanedGroup(j *store.Job) (note string) {
+	defer func() { note = joinGroupNotes(note, m.killAcceptance(j.ID)) }()
 	if !liveSpawnedGroup(j) {
 		return ""
 	}

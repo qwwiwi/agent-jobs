@@ -89,12 +89,12 @@ func (m *Manager) endMarkedGroupBySysctl(id, what string, g int, isMember func(i
 
 // killAcceptanceGroupBySysctl requires the leader's marker while it leads the group. Once it is gone, a
 // live marked member proves the group's ownership, as in the dead-wrapper path.
-func (m *Manager) killAcceptanceGroupBySysctl(id string, g int) {
+func (m *Manager) killAcceptanceGroupBySysctl(id string, g int) (groupEnd, string) {
 	if info, err := sysctlProc(g); err == nil && !info.zombie && info.pgid == g {
 		if envMarker(info.env) != id {
 			m.Log.Printf("job %s: refusing to kill acceptance process group %d: its leader carries no marker of the job", id, g)
-			return
+			return groupRefused, "its leader carries no marker of the job"
 		}
 	}
-	m.endMarkedGroupBySysctl(id, fmt.Sprintf("acceptance process group %d", g), g, sysctlMarkedMember(id, g))
+	return m.endMarkedGroupBySysctl(id, fmt.Sprintf("acceptance process group %d", g), g, sysctlMarkedMember(id, g))
 }
