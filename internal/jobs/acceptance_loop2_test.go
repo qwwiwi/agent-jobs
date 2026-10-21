@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -21,7 +22,8 @@ import (
 func TestCancelAcceptanceGroupAfterLeaderExit(t *testing.T) {
 	m := acceptanceManager(t, "")
 	m.KillGrace = time.Second
-	j := enqueue(t, m, "do it", withAcceptance(`(trap '' TERM; exec sleep 60) & echo $! > ../child.pid; wait`))
+	j := enqueue(t, m, "do it", withAcceptance(`AGENT_JOBS_TEST_SLEEP_IGNORE_TERM=1 AGENT_JOBS_TEST_SLEEP_READY=../child.ready `+
+		shellQuote(testSleep)+` 60 & echo $! > ../child.pid; wait`))
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
 	}
@@ -35,12 +37,53 @@ func TestCancelAcceptanceGroupAfterLeaderExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	waitFor(t, "acceptance child ignoring TERM", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "child.ready"))
+		return err == nil
+	})
 	waitFor(t, "acceptance pgid recorded", 5*time.Second, func() bool { return get(t, m, j.ID).AcceptancePGID > 1 })
 	pgid := get(t, m, j.ID).AcceptancePGID
-	time.Sleep(200 * time.Millisecond) // let the shell reach its wait
+	var signals []syscall.Signal
+	recordSignal := func(sig syscall.Signal) {
+		signals = append(signals, sig)
+		if sig == syscall.SIGKILL && !exited(pgid) {
+			t.Error("acceptance leader still alive at SIGKILL; leaderless escalation not exercised")
+		}
+	}
+	if runtime.GOOS == "linux" {
+		// Linux signals members through pidfds, never kill(-pgid). Record only this child.
+		realOpen, realSend := pidfdOpen, pidfdSend
+		pids := map[int]int{}
+		pidfdOpen = func(pid int) (int, error) {
+			fd, err := realOpen(pid)
+			if err == nil {
+				pids[fd] = pid
+			}
+			return fd, err
+		}
+		pidfdSend = func(fd int, sig syscall.Signal) error {
+			if pids[fd] == child && sig != 0 {
+				recordSignal(sig)
+			}
+			return realSend(fd, sig)
+		}
+		t.Cleanup(func() { pidfdOpen, pidfdSend = realOpen, realSend })
+	} else {
+		realKill := killFn
+		killFn = func(pid int, sig syscall.Signal) error {
+			if pid == -pgid {
+				recordSignal(sig)
+			}
+			return realKill(pid, sig)
+		}
+		t.Cleanup(func() { killFn = realKill })
+	}
 	// The daemon's kill alone (Cancel also sweeps marked leftovers afterwards, which would hide a gap).
 	start := time.Now()
 	m.killRunning(get(t, m, j.ID))
+	if !slices.Contains(signals, syscall.SIGTERM) || !slices.Contains(signals, syscall.SIGKILL) {
+		t.Fatalf("acceptance group %d did not escalate from SIGTERM to SIGKILL: %v", pgid, signals)
+	}
 	if !exited(child) {
 		t.Fatalf("acceptance child %d (group %d) still running after the kill", child, pgid)
 	}

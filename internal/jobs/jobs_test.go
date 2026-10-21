@@ -314,14 +314,12 @@ func TestMain(m *testing.M) {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	fakeHelpr = dir
-	if runtime.GOOS == "darwin" {
-		// SIP hides the environment of Apple's restricted /bin/sleep (and /bin/bash).
-		// A Go child models a job executable whose inherited marker sysctl can read.
-		testSleep = filepath.Join(dir, "sleep")
-		out, err := exec.Command("go", "build", "-o", testSleep, "testdata/sleep.go").CombinedOutput()
-		if err != nil {
-			log.Fatalf("build sleep fixture: %v\n%s", err, out)
-		}
+	// A Go child has explicit TERM-ignore readiness on every platform and an inherited
+	// marker Darwin sysctl can read (SIP hides Apple's restricted /bin/sleep).
+	testSleep = filepath.Join(dir, "sleep")
+	out, err = exec.Command("go", "build", "-o", testSleep, "testdata/sleep.go").CombinedOutput()
+	if err != nil {
+		log.Fatalf("build sleep fixture: %v\n%s", err, out)
 	}
 	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux, "codex": fakeCodex} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
