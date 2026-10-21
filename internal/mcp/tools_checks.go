@@ -20,17 +20,19 @@ type JobMarker interface {
 
 // CheckAddInput is check_add's input.
 type CheckAddInput struct {
-	Name         string `json:"name" jsonschema:"slug: a-z, 0-9, '-', '_'; at most 64 characters"`
-	Cron         string `json:"cron" jsonschema:"5-field cron expression in the host's local time: when the check must have reported (same syntax as schedule_add)"`
-	GraceMinutes int    `json:"grace_minutes,omitempty" jsonschema:"minutes after each expected time a mark may still arrive; default 60, 1..10080"`
+	AllowedScheduleIDs []int64 `json:"allowed_schedule_ids,omitempty" jsonschema:"only jobs started by these schedule ids may mark; omitted or empty permits every job; owner always permitted"`
+	Name               string  `json:"name" jsonschema:"slug: a-z, 0-9, '-', '_'; at most 64 characters"`
+	Cron               string  `json:"cron" jsonschema:"5-field cron expression in the host's local time: when the check must have reported (same syntax as schedule_add)"`
+	GraceMinutes       int     `json:"grace_minutes,omitempty" jsonschema:"minutes after each expected time a mark may still arrive; default 60, 1..10080"`
 }
 
 // CheckSetInput is check_set's input.
 type CheckSetInput struct {
-	Name         string `json:"name" jsonschema:"check name"`
-	Cron         string `json:"cron,omitempty" jsonschema:"new cron expression (local time)"`
-	GraceMinutes int    `json:"grace_minutes,omitempty" jsonschema:"new grace in minutes, 1..10080"`
-	Enabled      *bool  `json:"enabled,omitempty" jsonschema:"false pauses the check, true resumes it"`
+	AllowedScheduleIDs []int64 `json:"allowed_schedule_ids,omitempty" jsonschema:"replace permitted schedule ids; omitted keeps current policy; empty permits every job; owner always permitted"`
+	Name               string  `json:"name" jsonschema:"check name"`
+	Cron               string  `json:"cron,omitempty" jsonschema:"new cron expression (local time)"`
+	GraceMinutes       int     `json:"grace_minutes,omitempty" jsonschema:"new grace in minutes, 1..10080"`
+	Enabled            *bool   `json:"enabled,omitempty" jsonschema:"false pauses the check, true resumes it"`
 }
 
 // CheckNameInput is check_remove's input.
@@ -75,9 +77,9 @@ func addCheckAdd(s *sdk.Server, d Deps) {
 			"or `agent-jobs check mark NAME`. A mark belongs to one expected time: the earliest whose time plus grace is not " +
 			"before the mark. When an expected time plus its grace passes and no mark belongs to it, this session gets " +
 			"\"[jobs:check-missed] ...\" (once per expected time, several in one line; a failed delivery is retried up to 5 times). " +
-			"Expected times before the check was added never alert. Checks never expire.",
+			"Use allowed_schedule_ids to restrict job markers. Owner marks remain permitted. Expected times before the check was added never alert. Checks never expire.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in CheckAddInput) (*sdk.CallToolResult, CheckOutput, error) {
-		c, err := d.Manager.AddCheck(in.Name, in.Cron, in.GraceMinutes)
+		c, err := d.Manager.AddCheck(in.Name, in.Cron, in.GraceMinutes, in.AllowedScheduleIDs)
 		if err != nil {
 			return nil, CheckOutput{}, err
 		}
@@ -89,11 +91,15 @@ func addCheckAdd(s *sdk.Server, d Deps) {
 func addCheckSet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "check_set",
-		Description: "Edit a check in place: its cron, its grace, enabled (false pauses it), or several. A new cron or grace, " +
+		Description: "Edit a check in place: cron, grace, enabled (false pauses it), or allowed_schedule_ids (empty clears restrictions). A new cron or grace, " +
 			"or enabling it, re-arms the check: expected times before now never alert and marks before now never count. " +
 			"Any check_set acknowledges the check's failed alerts (they leave system_doctor); pending ones are still delivered.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in CheckSetInput) (*sdk.CallToolResult, CheckOutput, error) {
-		c, err := d.Manager.SetCheck(in.Name, in.Cron, in.GraceMinutes, in.Enabled)
+		var policy [][]int64
+		if in.AllowedScheduleIDs != nil {
+			policy = append(policy, in.AllowedScheduleIDs)
+		}
+		c, err := d.Manager.SetCheck(in.Name, in.Cron, in.GraceMinutes, in.Enabled, policy...)
 		if err != nil {
 			return nil, CheckOutput{}, err
 		}
@@ -135,7 +141,7 @@ func addCheckMark(s *sdk.Server, d Deps) {
 	sdk.AddTool(s, &sdk.Tool{
 		Name: "check_mark",
 		Description: "Leave a completion mark for a check (dead-man's switch): call it when the watched work finished well. " +
-			"An optional one-line note (at most 300 characters) is stored with it. The check must exist (check_add). " +
+			"An optional one-line note (at most 300 characters) is stored as redacted untrusted data with marker provenance. A job must match the check allowed_schedule_ids when restricted. The check must exist (check_add). " +
 			"mark \"ok, already marked\" means the mark was accepted but not stored (its window already holds 20).",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in CheckMarkInput) (*sdk.CallToolResult, CheckMarkOutput, error) {
 		if d.JobID != "" {

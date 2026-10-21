@@ -92,6 +92,8 @@ const usage = `usage: agent-jobs <command> [flags]
                                            time, delivery (session or job kind), next and last firing
   checks     --agent A [--json]            the agent's dead-man's switch checks (check_* MCP tools):
                                            cron, grace, state (ok/late/missed/waiting), last mark
+  check add --agent A NAME --cron C [--allowed-schedule-ids 1,2]
+  check set --agent A NAME [--allowed-schedule-ids 1,2] [--cron C] [--grace-minutes N] [--enabled=false]
   check mark --agent A NAME [--note T]     leave a completion mark for the check NAME
   notify-owner --agent A --text T [--urgency normal|high]
                                            one "[jobs:notify-owner] T" line into the notify target
@@ -1429,7 +1431,7 @@ func cmdChecks(args []string) error {
 		return printJSON(mcp.ChecksOutput{Checks: list})
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tSTATE\tCRON\tGRACE\tEXPECTED\tNEXT\tLAST MARK\tNOTE")
+	fmt.Fprintln(w, "NAME\tSTATE\tCRON\tGRACE\tEXPECTED\tNEXT\tLAST MARK\tMARKER\tALLOWED SCHEDULE IDS\tUNTRUSTED_NOTE")
 	for _, v := range list {
 		exp, next := v.LastExpectedAt, v.NextExpectedAt
 		if exp == "" {
@@ -1438,15 +1440,76 @@ func cmdChecks(args []string) error {
 		if next == "" {
 			next = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\n", v.Name, jobs.CheckStateText(v), v.Cron, v.GraceMinutes, exp, next,
-			fmtTime(v.LastMarkAt), jobs.RedactPrintable(v.LastMarkNote, 60))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%dm\t%s\t%s\t%s\t%s\t%v\t%q\n", v.Name, jobs.CheckStateText(v), v.Cron, v.GraceMinutes, exp, next,
+			fmtTime(v.LastMarkAt), v.LastMarkJob, v.AllowedScheduleIDs, jobs.RedactPrintable(v.LastMarkUntrustedNote, 60))
 	}
 	return w.Flush()
 }
 
+// cmdCheckEdit configures checks through the same owner-only manager API as MCP.
+func cmdCheckEdit(op string, args []string) error {
+	fs := flag.NewFlagSet("check "+op, flag.ContinueOnError)
+	agent := agentFlag(fs)
+	cron := fs.String("cron", "", "cron expression in local time")
+	grace := fs.Int("grace-minutes", 0, "grace in minutes (default 60 on add)")
+	enabled := fs.Bool("enabled", true, "enable or pause the check (set only)")
+	allowed := fs.String("allowed-schedule-ids", "", "comma-separated permitted schedule ids; empty permits every job")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("exactly one check name expected")
+	}
+	var policies [][]int64
+	var en *bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "allowed-schedule-ids" {
+			policies = append(policies, []int64{})
+		}
+		if f.Name == "enabled" {
+			en = enabled
+		}
+	})
+	if len(policies) > 0 && *allowed != "" {
+		for _, part := range strings.Split(*allowed, ",") {
+			id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if err != nil || id <= 0 {
+				return errors.New("allowed-schedule-ids must be comma-separated positive schedule ids")
+			}
+			policies[0] = append(policies[0], id)
+		}
+	}
+	if op == "add" && en != nil {
+		return errors.New("--enabled is supported by check set only")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	var c *store.Check
+	if op == "add" {
+		c, err = m.AddCheck(pos[0], *cron, *grace, policies...)
+	} else {
+		c, err = m.SetCheck(pos[0], *cron, *grace, en, policies...)
+	}
+	if err != nil {
+		return err
+	}
+	v, err := m.CheckViewOf(c)
+	if err != nil {
+		return err
+	}
+	return printJSON(mcp.CheckOutput{Check: v})
+}
+
 func cmdCheck(args []string) error {
+	if len(args) > 0 && (args[0] == "add" || args[0] == "set") {
+		return cmdCheckEdit(args[0], args[1:])
+	}
 	if len(args) == 0 || args[0] != "mark" {
-		return errors.New("usage: agent-jobs check mark --agent A NAME [--note T]")
+		return errors.New("usage: agent-jobs check {add|set|mark} --agent A NAME [options]")
 	}
 	fs := flag.NewFlagSet("check mark", flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -1472,7 +1535,7 @@ func cmdCheck(args []string) error {
 			c.Name, store.MarkNotStored, store.MaxMarksPerWindow)
 		return nil
 	}
-	fmt.Printf("check %s marked at %s\n", c.Name, fmtTime(c.LastMarkAt))
+	fmt.Printf("check %s marked at %s by %s\n", c.Name, fmtTime(c.LastMarkAt), c.LastMarkJob)
 	return nil
 }
 
