@@ -212,9 +212,12 @@ func (m *Manager) peerJob(pid int) (*store.Job, error) {
 
 // checkObject is a check as the proxy's JSON answer (what a job may see of it).
 func checkObject(c *store.Check) brain.Object {
-	o := brain.Object{"name": c.Name, "cron": c.Cron, "grace_minutes": c.GraceMinutes, "enabled": c.Enabled}
+	c = safeCheck(c)
+	o := brain.Object{"name": c.Name, "cron": c.Cron, "grace_minutes": c.GraceMinutes, "enabled": c.Enabled, "allowed_schedule_ids": c.AllowedScheduleIDs}
 	if c.LastMarkAt != nil {
 		o["last_mark_at"] = c.LastMarkAt.Format(time.RFC3339)
+		o["last_mark_job"] = c.LastMarkJob
+		o["last_mark_untrusted_note"] = c.LastMarkUntrustedNote
 	}
 	return o
 }

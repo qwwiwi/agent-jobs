@@ -92,7 +92,7 @@ func TestChecksRoundTripClaimAndMarks(t *testing.T) {
 	}
 	// An older mark arriving later does not move the last mark back; a mark without owner is not stored.
 	if c, err = s.AddMark("backup", "old", "j1", t0, func(*Check) (MarkWindow, error) { return MarkWindow{}, nil }); err != nil ||
-		!c.LastMarkAt.Equal(at2) || c.LastMarkNote != "w2" || c.MarkResult != MarkNotStored {
+		!c.LastMarkAt.Equal(at2) || c.LastMarkUntrustedNote != "w2" || c.MarkResult != MarkNotStored {
 		t.Fatalf("last mark: %+v %v", c, err)
 	}
 	if got, err := s.MarkTimes(c.ID, w2.Lo, w2.Hi); err != nil || len(got) != 1 || !got[0].Equal(at2) {
@@ -401,6 +401,43 @@ func TestChecksMigrationFromLoop1(t *testing.T) {
 		}
 		if b, _ := s.GetCheck("b"); b.AlertState != "" { // no alert state in this fixture: nothing to move
 			t.Fatalf("b: %+v", b)
+		}
+		_ = s.Close()
+	}
+}
+
+// The appended migration keeps legacy policies open and backfills owner provenance only once.
+func TestChecksMarkerMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(stage1Schema + checksSchemaV1 + checksSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE checks SET last_mark_at = created_at, last_mark_job = '' WHERE name = 'a';
+ INSERT INTO check_marks (check_id, at, note, job_id) SELECT id, created_at, 'old', '' FROM checks WHERE name = 'a'`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	for i := 0; i < 2; i++ {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := s.GetCheck("a")
+		if err != nil || c.LastMarkJob != "owner" || len(c.AllowedScheduleIDs) != i {
+			t.Fatalf("migration pass %d: %+v %v", i, c, err)
+		}
+		var marker string
+		if err := s.db.QueryRow(`SELECT job_id FROM check_marks WHERE check_id = ?`, c.ID).Scan(&marker); err != nil || marker != "owner" {
+			t.Fatalf("mark provenance: %q %v", marker, err)
+		}
+		if i == 0 {
+			if _, err := s.SetCheck("a", "", 0, nil, time.Now(), []int64{7}); err != nil {
+				t.Fatal(err)
+			}
 		}
 		_ = s.Close()
 	}

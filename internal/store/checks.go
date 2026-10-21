@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,6 +17,9 @@ var ErrCheckNotFound = errors.New("check not found")
 
 // ErrCheckExists is returned when a check with the same name already exists.
 var ErrCheckExists = errors.New("check already exists")
+
+// ErrCheckMarkForbidden means the job is not a permitted marker of this check.
+var ErrCheckMarkForbidden = errors.New("job is not permitted to mark check")
 
 // MaxMarksPerWindow is how many marks one owner window (the marks of one expected time) stores;
 // later marks of that window are accepted but not stored (one is enough to satisfy it).
@@ -64,10 +70,12 @@ type Check struct {
 	// cron, the grace or enabling): expected times before it are never judged and marks before it
 	// never count (the configuration epoch).
 	ArmedAt time.Time `json:"armed_at"`
-	// LastMarkAt and LastMarkNote are the latest mark (nil when never marked), stored or not.
-	LastMarkAt   *time.Time `json:"last_mark_at,omitempty"`
-	LastMarkNote string     `json:"last_mark_note,omitempty"`
-	LastMarkJob  string     `json:"last_mark_job,omitempty"`
+	// AllowedScheduleIDs restricts job markers to these schedules; empty permits every job.
+	AllowedScheduleIDs []int64 `json:"allowed_schedule_ids"`
+	// LastMarkAt and LastMarkUntrustedNote are the latest mark (nil when never marked), stored or not.
+	LastMarkAt            *time.Time `json:"last_mark_at,omitempty"`
+	LastMarkUntrustedNote string     `json:"last_mark_untrusted_note,omitempty"`
+	LastMarkJob           string     `json:"last_mark_job,omitempty"`
 	// Revision counts the edits (check_set): the watchdog's claim holds only for the revision it read.
 	Revision int64 `json:"revision"`
 	// EvaluatedAt is the latest expected time the watchdog judged (the evaluation watermark: every
@@ -109,6 +117,10 @@ type CheckAlert struct {
 	Token    string
 	Error    string
 	Merged   int
+	// Latest mark context is joined when reading alerts, for the session notification.
+	LastMarkAt            *time.Time
+	LastMarkJob           string
+	LastMarkUntrustedNote string
 }
 
 // EvalOutcome is the watchdog's judgement of one expected time (Local its wall-clock minute).
@@ -180,7 +192,15 @@ var checksMigrations = []string{
 	`ALTER TABLE checks ADD COLUMN alert_next_at INTEGER NOT NULL DEFAULT 0`,
 	checksAlertStateAlter,
 	checksAlertsMoved,
+	checksMarkerPolicyAlter,
 }
+
+const checksMarkerPolicyAlter = `ALTER TABLE checks ADD COLUMN allowed_schedule_ids TEXT NOT NULL DEFAULT '[]'`
+
+// Prior empty job ids meant the owner/CLI. Backfill once with the policy migration.
+const checksMarkerProvenanceFill = `UPDATE checks SET last_mark_job = 'owner'
+ WHERE last_mark_at IS NOT NULL AND last_mark_job = '';
+ UPDATE check_marks SET job_id = 'owner' WHERE job_id = ''`
 
 // checksAlertStateAlter adds the alert state; its backfill (checksAlertStateFill, in
 // migrationBackfills) turns a missed time claimed before the column existed into the evaluation
@@ -205,7 +225,7 @@ const checksAlertsFill = `INSERT INTO check_alerts (check_id, expected, expected
 
 // checkCols reads a check with its newest alert row (alias a) and the alert counts.
 const checkCols = `c.id, c.name, c.cron, c.grace_minutes, c.enabled, c.created_at, c.updated_at, c.armed_at,
-	c.last_mark_at, c.last_mark_note, c.last_mark_job, c.revision, c.eval_at, c.eval_local, c.eval_result,
+	c.last_mark_at, c.last_mark_note, c.last_mark_job, c.allowed_schedule_ids, c.revision, c.eval_at, c.eval_local, c.eval_result,
 	a.expected, COALESCE(a.state, ''), COALESCE(a.attempts, 0), COALESCE(a.error, ''), COALESCE(a.merged, 0),
 	COALESCE(a.acked, 0),
 	(SELECT COALESCE(SUM(1 + p.merged), 0) FROM check_alerts p WHERE p.check_id = c.id AND p.state = 'pending'),
@@ -216,11 +236,15 @@ func scanCheck(r scanner) (*Check, error) {
 	var c Check
 	var created, updated, armed int64
 	var mark, eval, missed sql.NullInt64
+	var allowed string
 	if err := r.Scan(&c.ID, &c.Name, &c.Cron, &c.GraceMinutes, &c.Enabled, &created, &updated, &armed,
-		&mark, &c.LastMarkNote, &c.LastMarkJob, &c.Revision, &eval, &c.EvaluatedLocal, &c.EvaluatedResult,
+		&mark, &c.LastMarkUntrustedNote, &c.LastMarkJob, &allowed, &c.Revision, &eval, &c.EvaluatedLocal, &c.EvaluatedResult,
 		&missed, &c.AlertState, &c.AlertAttempts, &c.LastAlertError, &c.AlertMerged, &c.AlertAcknowledged,
 		&c.AlertsPending, &c.AlertsFailed); err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal([]byte(allowed), &c.AllowedScheduleIDs); err != nil {
+		return nil, fmt.Errorf("check marker policy: %w", err)
 	}
 	c.CreatedAt, c.UpdatedAt, c.ArmedAt = time.Unix(created, 0), time.Unix(updated, 0), time.Unix(armed, 0)
 	c.LastMarkAt, c.LastMissedAt, c.EvaluatedAt = convTS(mark), convTS(missed), convTS(eval)
@@ -260,9 +284,17 @@ func (s *Store) immediate(fn func(q querier) error) error {
 
 // AddCheck inserts an enabled check armed at now (ErrCheckExists when the name is taken).
 // Validation is the caller's.
-func (s *Store) AddCheck(name, cron string, grace int, now time.Time) (*Check, error) {
-	_, err := s.db.Exec(`INSERT INTO checks (name, cron, grace_minutes, created_at, updated_at, armed_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, name, cron, grace, now.Unix(), now.Unix(), now.Unix())
+func (s *Store) AddCheck(name, cron string, grace int, now time.Time, allowedScheduleIDs ...[]int64) (*Check, error) {
+	allowed := "[]"
+	if len(allowedScheduleIDs) > 0 && len(allowedScheduleIDs[0]) > 0 {
+		b, err := json.Marshal(allowedScheduleIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		allowed = string(b)
+	}
+	_, err := s.db.Exec(`INSERT INTO checks (name, cron, grace_minutes, created_at, updated_at, armed_at, allowed_schedule_ids)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, name, cron, grace, now.Unix(), now.Unix(), now.Unix(), allowed)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return nil, ErrCheckExists
@@ -316,7 +348,19 @@ func (s *Store) ListChecks(enabledOnly bool) ([]*Check, error) {
 // that read the check before it cannot claim an expected time of the old configuration, and
 // acknowledges the check's failed alerts (they leave status and system_doctor). Pending alerts are
 // still delivered.
-func (s *Store) SetCheck(name, cron string, grace int, enabled *bool, now time.Time) (*Check, error) {
+func (s *Store) SetCheck(name, cron string, grace int, enabled *bool, now time.Time, allowedScheduleIDs ...[]int64) (*Check, error) {
+	var allowed any
+	if len(allowedScheduleIDs) > 0 {
+		ids := allowedScheduleIDs[0]
+		if ids == nil {
+			ids = []int64{}
+		}
+		b, err := json.Marshal(ids)
+		if err != nil {
+			return nil, err
+		}
+		allowed = string(b)
+	}
 	en := sql.NullBool{}
 	if enabled != nil {
 		en = sql.NullBool{Bool: *enabled, Valid: true}
@@ -330,9 +374,10 @@ func (s *Store) SetCheck(name, cron string, grace int, enabled *bool, now time.T
 			cron          = CASE WHEN ?1 = '' THEN cron ELSE ?1 END,
 			grace_minutes = CASE WHEN ?2 = 0 THEN grace_minutes ELSE ?2 END,
 			enabled       = COALESCE(?3, enabled),
+			allowed_schedule_ids = COALESCE(?6, allowed_schedule_ids),
 			revision      = revision + 1,
 			updated_at    = ?4
-			WHERE name = ?5`, cron, grace, en, now.Unix(), name)
+			WHERE name = ?5`, cron, grace, en, now.Unix(), name, allowed)
 		if err != nil {
 			return fmt.Errorf("set check: %w", err)
 		}
@@ -398,6 +443,22 @@ func (s *Store) AddMark(name, note, jobID string, at time.Time, window func(*Che
 		if err != nil {
 			return err
 		}
+		// Authorize under the same write lock as the mark, so check_set cannot race it.
+		if jobID != "" && len(c.AllowedScheduleIDs) > 0 {
+			var schedule string
+			err := q.QueryRowContext(ctx, `SELECT schedule_id FROM jobs WHERE id = ? AND status = ?`, jobID, StatusRunning).Scan(&schedule)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("mark authorization: %w", err)
+			}
+			id, parseErr := strconv.ParseInt(schedule, 10, 64)
+			if err != nil || parseErr != nil || id <= 0 || !slices.Contains(c.AllowedScheduleIDs, id) {
+				return fmt.Errorf("%w %q: job %q must be running and started by an allowed schedule", ErrCheckMarkForbidden, name, jobID)
+			}
+		}
+		marker := jobID
+		if marker == "" {
+			marker = "owner"
+		}
 		w, err := window(c)
 		if err != nil {
 			return err
@@ -411,14 +472,14 @@ func (s *Store) AddMark(name, note, jobID string, at time.Time, window func(*Che
 			}
 			if n < MaxMarksPerWindow {
 				if _, err := q.ExecContext(ctx, `INSERT INTO check_marks (check_id, at, note, job_id) VALUES (?, ?, ?, ?)`,
-					c.ID, at.Unix(), note, jobID); err != nil {
+					c.ID, at.Unix(), note, marker); err != nil {
 					return fmt.Errorf("add mark: %w", err)
 				}
 				stored = true
 			}
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE checks SET last_mark_at = ?, last_mark_note = ?, last_mark_job = ?
-			WHERE id = ? AND (last_mark_at IS NULL OR last_mark_at <= ?)`, at.Unix(), note, jobID, c.ID, at.Unix()); err != nil {
+			WHERE id = ? AND (last_mark_at IS NULL OR last_mark_at <= ?)`, at.Unix(), note, marker, c.ID, at.Unix()); err != nil {
 			return fmt.Errorf("add mark: %w", err)
 		}
 		if err := pruneMarks(ctx, q, c.ID); err != nil {
@@ -539,7 +600,7 @@ func evalResult(ok bool) string {
 	return EvalMissed
 }
 
-const alertCols = `a.id, a.check_id, c.name, c.grace_minutes, a.expected, a.state, a.attempts, a.token, a.error, a.merged
+const alertCols = `a.id, a.check_id, c.name, c.grace_minutes, a.expected, a.state, a.attempts, a.token, a.error, a.merged, c.last_mark_at, c.last_mark_job, c.last_mark_note
 	FROM check_alerts a JOIN checks c ON c.id = a.check_id`
 
 func queryAlerts(ctx context.Context, q querier, where string, args ...any) ([]*CheckAlert, error) {
@@ -552,11 +613,13 @@ func queryAlerts(ctx context.Context, q querier, where string, args ...any) ([]*
 	for rows.Next() {
 		var a CheckAlert
 		var exp int64
+		var mark sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.CheckID, &a.Name, &a.Grace, &exp, &a.State, &a.Attempts, &a.Token,
-			&a.Error, &a.Merged); err != nil {
+			&a.Error, &a.Merged, &mark, &a.LastMarkJob, &a.LastMarkUntrustedNote); err != nil {
 			return nil, fmt.Errorf("check alerts: %w", err)
 		}
 		a.Expected = time.Unix(exp, 0)
+		a.LastMarkAt = convTS(mark)
 		out = append(out, &a)
 	}
 	return out, rows.Err()
@@ -632,6 +695,19 @@ func (s *Store) DeliverCheckAlerts(ids []int64) error {
 // FailCheckAlertAttempt records a failed delivery attempt of the alert rows still held by token:
 // the error is kept and a row stays pending, or becomes failed once it made maxAttempts attempts.
 func (s *Store) FailCheckAlertAttempt(token, errText string, maxAttempts int) error {
+	return s.failCheckAlertAttempt(token, nil, errText, maxAttempts)
+}
+
+// FailCheckAlertBatchAttempt fails only the given batch's rows still held by token.
+func (s *Store) FailCheckAlertBatchAttempt(token string, ids []int64, errText string, maxAttempts int) error {
+	batch := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		batch[id] = true
+	}
+	return s.failCheckAlertAttempt(token, batch, errText, maxAttempts)
+}
+
+func (s *Store) failCheckAlertAttempt(token string, batch map[int64]bool, errText string, maxAttempts int) error {
 	return s.immediate(func(q querier) error {
 		ctx := context.Background()
 		rows, err := queryAlerts(ctx, q, `a.state = ? AND a.token = ?`, AlertPending, token)
@@ -640,6 +716,9 @@ func (s *Store) FailCheckAlertAttempt(token, errText string, maxAttempts int) er
 		}
 		checks := map[int64]bool{}
 		for _, a := range rows {
+			if batch != nil && !batch[a.ID] {
+				continue
+			}
 			state := AlertPending
 			if a.Attempts >= maxAttempts {
 				state, checks[a.CheckID] = AlertFailed, true
