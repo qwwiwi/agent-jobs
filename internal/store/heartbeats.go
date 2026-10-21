@@ -267,3 +267,15 @@ func (s *Store) CountFailedSince(since time.Time) (int, error) {
 	}
 	return n, nil
 }
+
+// CountUnprocessedFailedSince counts jobs that ended failed or timed out at or after since
+// without a recorded job_outcome. A non-empty outcome means the failure has been handled.
+func (s *Store) CountUnprocessedFailedSince(since time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE status IN (?, ?) AND finished_at >= ? AND outcome = ''`,
+		StatusFailed, StatusTimeout, since.Unix()).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count unprocessed failed jobs: %w", err)
+	}
+	return n, nil
+}
