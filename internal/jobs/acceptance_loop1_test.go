@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,7 +31,7 @@ func envHas(env, key, value string) bool {
 // the test ends it.
 func liveChild(t *testing.T, env ...string) *exec.Cmd {
 	t.Helper()
-	c := exec.Command("sleep", "30")
+	c := exec.Command(testSleep, "30")
 	c.Env = append(os.Environ(), env...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := c.Start(); err != nil {
@@ -47,6 +48,13 @@ func liveChild(t *testing.T, env ...string) *exec.Cmd {
 
 // exited reports whether the child started by liveChild is gone (reaped or a zombie).
 func exited(pid int) bool {
+	if runtime.GOOS != "linux" {
+		if !alive(pid) {
+			return true
+		}
+		info, err := sysctlProc(pid)
+		return err == nil && info.zombie
+	}
 	st, _, err := procStat(pid)
 	return err != nil || st == "Z"
 }
