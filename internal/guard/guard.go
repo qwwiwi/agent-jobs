@@ -477,6 +477,9 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				if s.over() {
+					return ""
+				}
 				s.useLinks(c)
 				for _, t := range c.outRedirs {
 					if p, ok := s.hit(t, false); ok {
@@ -539,10 +542,17 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
 				// -i`): its feeder gets the strict scan, ancestors included (`ls ~ | python3 x.py` is
 				// refused, a known false refusal).
-				words, fed := commandInputWords(c, pl.cmds[:i])
+				xargs := slices.Contains(v.wrappers, "xargs")
+				if !xargs && !stdinInterpreter(name) {
+					continue
+				}
+				words, fed := commandInputWords(c, pl.cmds[:i], s.over)
+				if s.over() {
+					return ""
+				}
 				feeder := ""
 				switch {
-				case slices.Contains(v.wrappers, "xargs"):
+				case xargs:
 					feeder = "`xargs " + name + "`"
 				case stdinInterpreter(name) && fed:
 					feeder = "`" + name + "` (its program may come from the pipe)"
@@ -937,6 +947,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	v := split(c.words)
 	if v.splitString {
 		return cannot("env -S")
+	}
+	if v.wrapperUnknown != "" {
+		return cannot("unknown or ambiguous wrapper option " + v.wrapperUnknown)
 	}
 	if v.envUnknown != "" {
 		return cannot("abbreviated or unknown env option " + v.envUnknown)

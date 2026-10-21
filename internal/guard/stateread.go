@@ -767,6 +767,9 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				if r.over() {
+					return cannot("state read check exceeded the guard time budget")
+				}
 				r.useLinks(c)
 				at, reason := r.whereOf(c)
 				if reason != "" {
@@ -812,7 +815,7 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				// xargs runs its command on what earlier stages print: a stage naming an ancestor of the
 				// state dir (`find ~ | xargs cat`, `echo ~/.agent-jobs | xargs ls`) feeds it state paths.
 				if slices.Contains(v.wrappers, "xargs") {
-					inputs, _ := commandInputWords(c, nil)
+					inputs, _ := commandInputWords(c, nil, r.over)
 					for _, w := range inputs {
 						if strings.HasPrefix(w, "-") {
 							continue
@@ -823,7 +826,7 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 					}
 					for _, prev := range append(slices.Clone(pl.cmds[:i]), c.incoming...) {
 						pat, _ := r.whereOf(prev)
-						for _, w := range feederWords(prev) {
+						for _, w := range feederWords(prev, r.over) {
 							if strings.HasPrefix(w, "-") {
 								continue
 							}
@@ -835,6 +838,9 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				}
 			}
 		}
+	}
+	if r.over() {
+		return cannot("state read check exceeded the guard time budget")
 	}
 	return ""
 }

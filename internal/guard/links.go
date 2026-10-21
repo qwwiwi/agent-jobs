@@ -175,18 +175,28 @@ func (s *pathScope) linkOperations(argv []string) {
 			}
 		}
 		archive, ok := s.expandHome(spec.archive)
-		if !ok || spec.unknown || spec.archive == "" || !s.archiveLinks(name, absoluteAt(archive, cwd), dest, spec.absolute) {
+		if !ok || spec.unknown || archiveStdin(spec.archive) || s.archiveWritten(archive, cwd) || !s.archiveLinks(name, absoluteAt(archive, cwd), dest, spec.absolute) {
 			s.linkRoots = append(s.linkRoots, dest)
 		}
 	}
 }
 
+// These names refer to the command's run-time stdin, not a check-time archive.
+func archiveStdin(path string) bool {
+	switch path {
+	case "", "-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "/proc/thread-self/fd/0":
+		return true
+	}
+	return false
+}
+
 type extraction struct {
-	extract  bool
-	unknown  bool // member renaming is not modelled as an exact link destination
-	absolute bool // tar -P/--absolute-names preserves leading slashes
-	dirs     []string
-	archive  string
+	extract      bool
+	writeArchive bool // create/append/update changes the archive itself
+	unknown      bool // archive semantics or member paths cannot be modelled exactly
+	absolute     bool // tar -P/--absolute-names preserves leading slashes
+	dirs         []string
+	archive      string
 }
 
 func archiveExtraction(name string, args []string) (spec extraction) {
@@ -201,7 +211,24 @@ func archiveExtraction(name string, args []string) (spec extraction) {
 	if name == "cpio" {
 		vals = "CEFHIMORD"
 	}
+	nonExtract := false
 	apply := func(opt utilityOption) {
+		if name == "tar" {
+			// Only options whose effects on member paths and archive decoding are
+			// understood may clear unknown-link provenance. In particular -i and
+			// --ignore-zeros can expose members after Go's tar reader stops.
+			switch opt.name {
+			case "x", "--extract", "--get", "f", "--file", "C", "--directory",
+				"P", "--absolute-names", "v", "--verbose", "z", "--gzip", "--gunzip", "--ungzip",
+				"j", "--bzip2", "J", "--xz", "a", "--auto-compress", "p", "--same-permissions",
+				"--preserve-permissions", "m", "--touch", "k", "--keep-old-files", "--no-same-owner",
+				"--same-owner", "--numeric-owner", "--overwrite", "--exclude", "--exclude-from",
+				"X", "t", "--list", "c", "--create", "r", "--append",
+				"u", "--update", "A", "--concatenate", "--catenate":
+			default:
+				spec.unknown = true
+			}
+		}
 		switch opt.name {
 		case "P", "--absolute-names":
 			if name == "tar" {
@@ -217,13 +244,22 @@ func archiveExtraction(name string, args []string) (spec extraction) {
 			if name == "unzip" {
 				spec.unknown = true
 			}
-		case "x", "--extract":
+		case "x", "--extract", "--get":
 			if name == "tar" {
 				spec.extract = true
 			}
 		case "i", "p", "--pass-through":
 			if name == "cpio" {
 				spec.extract = true
+			}
+		case "t", "--list":
+			if name == "tar" {
+				nonExtract = true
+			}
+		case "c", "--create", "r", "--append", "u", "--update", "A", "--concatenate", "--catenate":
+			if name == "tar" {
+				nonExtract = true
+				spec.writeArchive = true
 			}
 		case "f", "--file":
 			if name == "tar" {
@@ -278,6 +314,9 @@ func archiveExtraction(name string, args []string) (spec extraction) {
 			}
 			apply(opt)
 		}
+	}
+	if name == "tar" && spec.unknown && !nonExtract {
+		spec.extract = true
 	}
 	return
 }
@@ -343,6 +382,11 @@ func (s *pathScope) archiveLinks(name, archive, dest string, absoluteNames bool)
 			return limited.N > 0
 		}
 		if err != nil {
+			return false
+		}
+		if h.Typeflag == tar.TypeLink {
+			// Hard-link targets are relative to the archive root, not the member
+			// directory. Retain unknown provenance rather than model them as symlinks.
 			return false
 		}
 		if h.Typeflag == tar.TypeSymlink {

@@ -29,6 +29,9 @@ type simpleCmd struct {
 	inputSources []string
 	incoming     []*simpleCmd // pipeline stages supplying an enclosing compound command
 	inputGroups  []*simpleCmd // enclosing stages carrying trailing input redirections
+	subSources   []string     // substitutions executed while expanding this command
+	subScripts   []*script
+	nested       []*script // shell/eval/runner bodies executed by this command
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -213,6 +216,7 @@ func (p *parser) substitution() string {
 		}
 		inner := p.src[start+1 : min(end, len(p.src))]
 		p.subs = append(p.subs, inner)
+		p.cmd.subSources = append(p.cmd.subSources, inner)
 		p.i = min(end+1, len(p.src))
 		return p.src[start:p.i]
 	}
@@ -223,6 +227,7 @@ func (p *parser) substitution() string {
 	}
 	inner := p.src[p.i+2 : min(innerEnd, len(p.src))]
 	p.subs = append(p.subs, inner)
+	p.cmd.subSources = append(p.cmd.subSources, inner)
 	if p.src[start] == '<' {
 		p.cmd.inputSources = append(p.cmd.inputSources, inner)
 	}
@@ -255,7 +260,9 @@ func (p *parser) readHeredocs() {
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
 		if !h.quoted { // `$(…)` and backticks in an unquoted here-doc body are executed
-			p.subs = append(p.subs, bodySubstitutions(body.String())...)
+			subs := bodySubstitutions(body.String())
+			p.subs = append(p.subs, subs...)
+			h.cmd.subSources = append(h.cmd.subSources, subs...)
 		}
 	}
 	p.heredocs = nil
@@ -263,7 +270,7 @@ func (p *parser) readHeredocs() {
 
 // bodySubstitutions returns the command substitutions of an unquoted here-doc body.
 func bodySubstitutions(body string) []string {
-	q := &parser{src: body}
+	q := &parser{src: body, cmd: &simpleCmd{}}
 	for q.i < len(body) {
 		switch {
 		case body[q.i] == '\\':
@@ -421,17 +428,25 @@ func (p *parser) closeGroup(sep string) {
 
 // commandInputWords keeps input relationships through compound consumers. Only
 // redirections of enclosing stages are read, avoiding cycles through their bodies.
-func commandInputWords(c *simpleCmd, previous []*simpleCmd) (words []string, fed bool) {
-	for _, prev := range append(append([]*simpleCmd{}, previous...), c.incoming...) {
-		words = append(words, feederWords(prev)...)
-		fed = true
+func commandInputWords(c *simpleCmd, previous []*simpleCmd, over func() bool) (words []string, fed bool) {
+	for _, stages := range [][]*simpleCmd{previous, c.incoming} {
+		for _, prev := range stages {
+			if over() {
+				return words, fed
+			}
+			words = append(words, feederWords(prev, over)...)
+			fed = true
+		}
 	}
 	for _, input := range append([]*simpleCmd{c}, c.inputGroups...) {
+		if over() {
+			return words, fed
+		}
 		fed = fed || input.stdin || len(input.inputSources) > 0
 		words = append(words, input.heredoc)
 		words = append(words, input.inRedirs...)
 		for _, src := range input.inputSources {
-			words = append(words, sourceFeederWords(src)...)
+			words = append(words, sourceFeederWords(src, over)...)
 		}
 	}
 	return words, fed
@@ -439,24 +454,40 @@ func commandInputWords(c *simpleCmd, previous []*simpleCmd) (words []string, fed
 
 // feederWords includes every command of a compound stage and input substitution,
 // rather than just the final command before `|`.
-func feederWords(c *simpleCmd) []string {
-	words := append([]string{}, c.words...)
-	words = append(words, c.heredoc)
-	for _, src := range c.inputSources {
-		words = append(words, sourceFeederWords(src)...)
+func feederWords(c *simpleCmd, over func() bool) (words []string) {
+	var walk func(*simpleCmd)
+	walk = func(c *simpleCmd) {
+		if over() {
+			return
+		}
+		words = append(words, c.words...)
+		words = append(words, c.heredoc)
+		for _, src := range c.inputSources {
+			words = append(words, sourceFeederWords(src, over)...)
+		}
+		for _, prev := range c.feeds {
+			if over() {
+				return
+			}
+			walk(prev)
+		}
 	}
-	for _, prev := range c.feeds {
-		words = append(words, feederWords(prev)...)
-	}
+	walk(c)
 	return words
 }
 
-func sourceFeederWords(src string) (words []string) {
+func sourceFeederWords(src string, over func() bool) (words []string) {
+	if over() {
+		return nil
+	}
 	// parseAll already includes nested substitutions and compound bodies. Do not
 	// recursively expand their feeder metadata and duplicate those commands.
 	for _, sc := range parseAll(src) {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
+				if over() {
+					return words
+				}
 				words = append(words, c.words...)
 				words = append(words, c.heredoc)
 			}
@@ -943,19 +974,26 @@ func stringEnd(s string, start int) int {
 // parseAll returns src and every script nested in it (substitutions, `sh -c`, `eval`).
 func parseAll(src string) []*script {
 	var out []*script
-	var walk func(s string, depth int)
-	walk = func(s string, depth int) {
+	var walk func(s string, depth int) *script
+	walk = func(s string, depth int) *script {
 		if depth > maxNesting {
-			return
+			return nil
 		}
-		sc, subs := parseScript(s)
+		sc, _ := parseScript(s)
 		sc.depth = depth
 		out = append(out, sc)
-		for _, sub := range subs {
-			walk(sub, depth+1)
-		}
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
+				for _, sub := range c.subSources {
+					if child := walk(sub, depth+1); child != nil {
+						c.subScripts = append(c.subScripts, child)
+					}
+				}
+				add := func(code string) {
+					if child := walk(code, depth+1); child != nil {
+						c.nested = append(c.nested, child)
+					}
+				}
 				argv := argvOf(c.words)
 				if len(argv) == 0 {
 					continue
@@ -966,26 +1004,27 @@ func parseAll(src string) []*script {
 					if len(rest) > 0 && rest[0] == "--" {
 						rest = rest[1:] // `eval -- 'git push'`
 					}
-					walk(strings.Join(rest, " "), depth+1)
+					add(strings.Join(rest, " "))
 				case shells[name]:
 					if code, ok := shellCode(argv); ok {
-						walk(code, depth+1)
+						add(code)
 					}
 				case name == "trap":
 					// `trap 'code' SIG…`: the code runs later in this shell (also after the last command).
 					for _, a := range argv[1:] {
 						if !strings.HasPrefix(a, "-") {
-							walk(a, depth+1)
+							add(a)
 							break
 						}
 					}
 				default:
 					for _, code := range runnerCode(name, argv) {
-						walk(code, depth+1)
+						add(code)
 					}
 				}
 			}
 		}
+		return sc
 	}
 	walk(src, 0)
 	return out
@@ -1008,21 +1047,64 @@ var wrapperValueFlags = map[string]string{
 	"busybox": "", // `busybox sh -c …`, `busybox git …`: the applet is the real program
 }
 
+// Values are required unless listed separately as optional GNU long arguments.
 var wrapperLongValues = map[string]map[string]bool{
 	"nice": {"--adjustment": true}, "timeout": {"--signal": true, "--kill-after": true},
-	"xargs":  {"--max-args": true, "--max-procs": true, "--delimiter": true, "--arg-file": true, "--max-chars": true},
+	"xargs": {"--max-args": true, "--max-procs": true, "--delimiter": true, "--arg-file": true,
+		"--max-chars": true, "--max-lines": true, "--process-slot-var": true},
 	"stdbuf": {"--input": true, "--output": true, "--error": true},
+	"sudo": {"--user": true, "--group": true, "--chdir": true, "--close-from": true, "--host": true,
+		"--prompt": true, "--chroot": true, "--role": true, "--type": true, "--command-timeout": true,
+		"--other-user": true},
+}
+
+var wrapperLongFlags = map[string][]string{
+	"nice":    {"--help", "--version"},
+	"timeout": {"--foreground", "--preserve-status", "--verbose", "--help", "--version"},
+	"xargs": {"--null", "--no-run-if-empty", "--interactive", "--verbose", "--exit", "--show-limits",
+		"--open-tty", "--help", "--version", "--replace", "--eof"},
+	"stdbuf": {"--help", "--version"},
+	"sudo": {"--askpass", "--background", "--bell", "--edit", "--help", "--login", "--list",
+		"--non-interactive", "--preserve-env", "--remove-timestamp", "--reset-timestamp", "--set-home",
+		"--shell", "--stdin", "--validate", "--version"},
+	"command": {}, "builtin": {}, "exec": {}, "nohup": {"--help", "--version"},
+	"doas": {}, "busybox": {"--help"},
+}
+
+// resolveWrapperLong follows getopt_long: exact spellings win, otherwise only
+// one matching prefix is accepted. Optional values consume only an attached '='.
+func resolveWrapperLong(name, key string) (full string, required bool) {
+	options := map[string]bool{}
+	for opt := range wrapperLongValues[name] {
+		options[opt] = true
+	}
+	for _, opt := range wrapperLongFlags[name] {
+		options[opt] = false
+	}
+	if required, ok := options[key]; ok {
+		return key, required
+	}
+	for opt, value := range options {
+		if strings.HasPrefix(opt, key) {
+			if full != "" {
+				return "", false
+			}
+			full, required = opt, value
+		}
+	}
+	return
 }
 
 // cmdView is a simple command with keywords, assignments and wrapper programs stripped.
 type cmdView struct {
-	start       int      // index of the real program in words
-	wrappers    []string // wrapper programs stripped (env, xargs, sudo, …)
-	splitString bool     // `env -S` / `--split-string`: the program comes from a string the guard cannot see
-	envClear    bool     // `env -i` / `env -` / `--ignore-environment` / `exec -c`: the program runs with an emptied environment
-	envUnset    []string // variables removed by `env -u NAME` / `-uNAME` / `--unset[=]NAME`
-	envUnknown  string   // first env long option that is not a full known spelling (abbreviation, unknown)
-	lead        int      // number of leading keywords and shell assignments (before any program word)
+	start          int      // index of the real program in words
+	wrappers       []string // wrapper programs stripped (env, xargs, sudo, …)
+	splitString    bool     // `env -S` / `--split-string`: the program comes from a string the guard cannot see
+	envClear       bool     // `env -i` / `env -` / `--ignore-environment` / `exec -c`: the program runs with an emptied environment
+	envUnset       []string // variables removed by `env -u NAME` / `-uNAME` / `--unset[=]NAME`
+	wrapperUnknown string   // first unknown or ambiguous wrapper long option
+	envUnknown     string   // first env long option that is not a full known spelling (abbreviation, unknown)
+	lead           int      // number of leading keywords and shell assignments (before any program word)
 }
 
 // split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
@@ -1065,6 +1147,18 @@ func split(words []string) cmdView {
 				continue
 			}
 			if strings.HasPrefix(w, "-") && len(w) > 1 {
+				if name != "env" && strings.HasPrefix(w, "--") {
+					key, _, eq := strings.Cut(w, "=")
+					full, required := resolveWrapperLong(name, key)
+					if full == "" && v.wrapperUnknown == "" {
+						v.wrapperUnknown = name + " " + w
+					}
+					i++
+					if required && !eq && i < len(words) {
+						i++
+					}
+					continue
+				}
 				longs := wrapperLongValues[name]
 				if name == "env" {
 					longs = map[string]bool{"--unset": true, "--chdir": true, "--split-string": true}

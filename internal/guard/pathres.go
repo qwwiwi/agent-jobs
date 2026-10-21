@@ -37,12 +37,14 @@ type pathScope struct {
 	protected []string // protected paths, as configured and with symlinks resolved
 	// makesLinks: a command of the call may create a symlink (ln, link, cp -s, a word naming
 	// symlink), so a `..` after a path that does not exist yet may go through one.
-	makesLinks  bool
-	futureLinks map[string]string        // symlinks preserved at a new location by cp/mv/rsync
-	linksAt     map[*simpleCmd]linkState // link state before each command opens its paths
-	linkRoots   []string                 // extraction destinations that may acquire links
-	deadline    time.Time                // end of the time budget, zero = none
-	expired     bool                     // the budget ran out: every further check reports a hit
+	makesLinks   bool
+	futureLinks  map[string]string        // symlinks preserved at a new location by cp/mv/rsync
+	linksAt      map[*simpleCmd]linkState // link state before each command opens its paths
+	linkRoots    []string                 // extraction destinations that may acquire links
+	deadline     time.Time                // end of the time budget, zero = none
+	writes       map[string]bool          // earlier possible writes; bool marks an entire subtree
+	writeUnknown bool                     // an earlier write target cannot be resolved
+	expired      bool                     // the budget ran out: every further check reports a hit
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and
@@ -63,15 +65,35 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 		}
 	}
 	cdpathEnv := os.Getenv("CDPATH") != ""
-	for _, sc := range scripts {
+	s.linksAt = map[*simpleCmd]linkState{}
+	var walk func(*script)
+	walk = func(sc *script) {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
-				if s.linksAt == nil {
-					s.linksAt = map[*simpleCmd]linkState{}
+				if s.over() {
+					return
+				}
+				for _, sub := range c.subScripts {
+					walk(sub)
 				}
 				s.linksAt[c] = linkState{maps.Clone(s.futureLinks), slices.Clone(s.linkRoots)}
+				// Redirections open before the command (and its nested shell) runs.
+				for _, target := range c.outRedirs {
+					s.noteWrite(target, false)
+				}
 				s.step(c, cdpathEnv)
+				s.commandWrites(c)
+				for _, child := range c.nested {
+					walk(child)
+				}
 			}
+		}
+	}
+	// parseAll retains a flat list for independent rules; nested scripts are
+	// visited here at the invoking command so their effects reach its successors.
+	for _, sc := range scripts {
+		if sc.depth == 0 {
+			walk(sc)
 		}
 	}
 	return s
