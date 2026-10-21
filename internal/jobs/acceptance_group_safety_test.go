@@ -101,10 +101,14 @@ func TestAcceptanceGroupFailuresRecordedOnRow(t *testing.T) {
 }
 
 // The lifecycle gate is shared by Linux and Darwin and uses group liveness, not job markers or
-// /proc. It releases a gone group and forgets its id so a reused pgid does not block later calls.
+// /proc. A gone group releases the group gate; resume still requires escaped-process verification.
 func TestLiveAcceptanceGroupBlocksResumeCleanupAndPrune(t *testing.T) {
 	m := newManager(t)
 	j := runningRow(t, m, "261021-000000-test", time.Now())
+	// This fixture has no actual wrapper launch; runningRow's placeholder child is unrelated.
+	if err := m.Store.SetPID(j.ID, "tok", 0, 0); err != nil {
+		t.Fatal(err)
+	}
 	const g = 1 << 22
 	if err := m.Store.SetAcceptancePGID(j.ID, "tok", g); err != nil {
 		t.Fatal(err)
@@ -115,11 +119,22 @@ func TestLiveAcceptanceGroupBlocksResumeCleanupAndPrune(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldRoot, oldExists := procRoot, groupExists
+	oldRoot, oldExists, oldKill := procRoot, groupExists, killFn
 	procRoot = filepath.Join(t.TempDir(), "no-proc")
 	live := true
 	groupExists = func(got int) bool { return got == g && live }
-	t.Cleanup(func() { procRoot, groupExists = oldRoot, oldExists })
+	if runtime.GOOS == "darwin" {
+		killFn = func(pid int, sig syscall.Signal) error {
+			if pid == -g && sig == 0 {
+				if live {
+					return nil
+				}
+				return syscall.ESRCH
+			}
+			return oldKill(pid, sig)
+		}
+	}
+	t.Cleanup(func() { procRoot, groupExists, killFn = oldRoot, oldExists, oldKill })
 	got := get(t, m, j.ID)
 	got.RepoPath = t.TempDir() // Cleanup must refuse before inspecting a worktree.
 	if _, err := m.Resume(j.ID, "more", Limits{}); err == nil || !strings.Contains(err.Error(), "acceptance process group") || !strings.Contains(err.Error(), "still alive") {
@@ -132,8 +147,18 @@ func TestLiveAcceptanceGroupBlocksResumeCleanupAndPrune(t *testing.T) {
 		t.Fatalf("prune with a live acceptance group: %+v", pj)
 	}
 	live = false
-	if err := m.checkEscaped(j.ID); err != nil {
-		t.Fatalf("resume gate after group exits: %v", err)
+	if runtime.GOOS == "linux" {
+		if err := m.checkEscaped(j.ID); err == nil || !strings.Contains(err.Error(), "Linux /proc is unavailable") {
+			t.Fatalf("missing /proc allowed resume: %v", err)
+		}
+		procRoot = oldRoot
+		if err := m.checkEscaped(j.ID); err != nil {
+			t.Fatalf("resume gate after group exits: %v", err)
+		}
+	} else if runtime.GOOS == "darwin" {
+		if err := m.checkEscaped(j.ID); err != nil {
+			t.Fatalf("Darwin gone groups: %v", err)
+		}
 	}
 	got = get(t, m, j.ID)
 	got.RepoPath = t.TempDir()

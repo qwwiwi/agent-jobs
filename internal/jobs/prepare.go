@@ -203,9 +203,10 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // run inside the job's process, under these settings and this hook, within the job's limits.
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
 // the guard): a job reads its skills but never changes the catalog through them. A review job's
-// worktree is read-only (--read-only for the guard).
+// worktree is read-only (--read-only for the guard). The job's session transcript directories are
+// protected through the same deny rules and --protect flags as skills.
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
-	protected := m.skillProtected(j)
+	protected := append(m.skillProtected(j), m.sessionProtected(j)...)
 	readOnly := ""
 	if j.Kind == "review" {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")

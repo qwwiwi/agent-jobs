@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -1277,9 +1278,6 @@ func readExitCode(dir string) (int, bool) {
 	return code, true
 }
 
-// parseStream is ParseStream; a variable so tests can interleave the wrapper's writes.
-var parseStream = ParseStream
-
 // adopt fills in the pid of a claimed job from wrapper.json. It returns false when the job
 // must be skipped this tick (wrapper not registered yet) or was failed (never registered).
 func (m *Manager) adopt(j *store.Job, now time.Time) bool {
@@ -1329,7 +1327,7 @@ func (m *Manager) collect() error {
 		if j.StartedAt != nil {
 			dur = int(now.Sub(*j.StartedAt).Seconds())
 		}
-		// exit_code is written last: the stream is read only after it is seen, so it is complete.
+		// exit_code is written last: the wrapper has stored its trusted result before this marker.
 		if code, ok := readExitCode(dir); ok {
 			m.collectExited(j, code, dur, now)
 			continue
@@ -1348,7 +1346,7 @@ func (m *Manager) collect() error {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
 			survivors := m.killJob(j, j.PID, j.PGID)
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			if !killed {
 				// The wrapper wrote exit_code since the check above: the attempt ended by itself, so its
 				// own verdict is recorded (and auto-continued only as such), not a timeout.
@@ -1381,7 +1379,7 @@ func (m *Manager) collect() error {
 			if note := m.endOrphanedGroup(j); note != "" {
 				msg += "; " + note
 			}
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			m.finish(j, store.StatusFailed, res, killed, dur, msg, now)
 		}
 	}
@@ -1392,7 +1390,7 @@ func (m *Manager) collect() error {
 // limit gets a stop report when it wrote none and is then continued once (autoContinue).
 func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	dir := m.JobDir(j.ID)
-	res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+	res := m.endedResult(j)
 	status, msg := m.verdict(j, code, res, dir)
 	// Written after the verdict: the stop report must never make the attempt count as reported.
 	turnLimit := turnLimitStop(j, res) && status == store.StatusFailed
@@ -1409,15 +1407,34 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 // Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
 // stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
 // the assistant turns are counted and the cost is unknown (killed is true).
-func killedResult(runner, dir string) (res StreamResult, killed bool) {
+func (m *Manager) killedResult(j *store.Job) (res StreamResult, killed bool) {
+	dir := m.JobDir(j.ID)
 	p := filepath.Join(dir, "stream.jsonl")
 	if _, ok := readExitCode(dir); ok {
-		return parseRunnerStream(runner, p), false
+		return m.endedResult(j), false
 	}
-	if runner == store.RunnerCodex {
-		return StreamResult{Runner: runner, Turns: ParseCodexStream(p).Turns}, true
+	if j.Runner == store.RunnerCodex {
+		return StreamResult{Runner: j.Runner, Turns: ParseCodexStream(p).Turns}, true
 	}
 	return StreamResult{Turns: streamTurns(p)}, true
+}
+
+// endedResult reads only the wrapper's DB record for this launch, for either runner. A missing
+// record (including attempts run by an older wrapper) is no trusted result; stream.jsonl is diagnostic.
+func (m *Manager) endedResult(j *store.Job) StreamResult {
+	raw, ok, err := m.Store.WrapperResult(j.ID, j.LaunchToken)
+	if err != nil {
+		m.Log.Printf("job %s: read the wrapper's result: %v", j.ID, err)
+	}
+	if !ok {
+		return StreamResult{Runner: j.Runner}
+	}
+	var res StreamResult
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
+		m.Log.Printf("job %s: the wrapper's result is unreadable: %v", j.ID, err)
+		return StreamResult{Runner: j.Runner}
+	}
+	return res
 }
 
 // finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
@@ -1485,7 +1502,7 @@ func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) 
 	dir := m.JobDir(j.ID)
 	// Codex reports no price: a codex attempt's cost is always unknown.
 	fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl"))
-	if killed || j.Runner == store.RunnerCodex || (!res.Found && err == nil && fi.Size() > 0) {
+	if killed || j.Runner == store.RunnerCodex || (!res.Found && (j.PID > 0 || (err == nil && fi.Size() > 0))) {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
 		}
@@ -1634,7 +1651,7 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
-	res, killed := killedResult(j.Runner, m.JobDir(id))
+	res, killed := m.killedResult(j)
 	msg := "cancelled"
 	if survivors != "" {
 		msg = RedactPrintable(msg+"; "+survivors, 300)

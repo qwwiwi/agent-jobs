@@ -429,6 +429,9 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN merge_note TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN cleanup_skipped_at INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN fallback_session TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN wrapper_token TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -789,7 +792,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
 	// report of the ended attempt has been redacted (ClearRedactionPending).
 	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-		attempt=attempt+1, redaction_pending=1 WHERE id=? AND status='queued'`, token, now.Unix(), id))
+		attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`, token, now.Unix(), id))
 }
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
@@ -820,9 +823,49 @@ func (s *Store) ClearRedactionPending(id string) error {
 }
 
 // SetSession records the claude session id and run mode of the running launch that owns the job.
+// It clears the launch's fallback session (SetFallbackSession sets it again for a resume launch).
 func (s *Store) SetSession(id, token, sessionID, mode string) error {
-	return affected(s.db.Exec(`UPDATE jobs SET session_id=?, run_mode=? WHERE id=? AND status='running' AND launch_token=?`,
-		sessionID, mode, id, token))
+	return affected(s.db.Exec(`UPDATE jobs SET session_id=?, run_mode=?, fallback_session='' WHERE id=? AND status='running'
+		AND launch_token=?`, sessionID, mode, id, token))
+}
+
+// SetFallbackSession records the fresh session id the daemon generated for a resume launch's
+// fallback: the only one the wrapper's fallback marker may name.
+func (s *Store) SetFallbackSession(id, token, sessionID string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET fallback_session=? WHERE id=? AND status='running' AND run_mode='resume'
+		AND launch_token=? AND launch_token!=''`,
+		sessionID, id, token))
+}
+
+// FallbackSession returns the fallback session id recorded for the launch with token ("" if none).
+func (s *Store) FallbackSession(id, token string) (string, error) {
+	var sid string
+	err := s.db.QueryRow(`SELECT fallback_session FROM jobs WHERE id=? AND launch_token=?`, id, token).Scan(&sid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return sid, err
+}
+
+// SetWrapperResult records, for the running launch with token, the result the wrapper read from
+// the runner's stdout itself (an opaque JSON text): the daemon trusts it, not stream.jsonl in the job dir.
+func (s *Store) SetWrapperResult(id, token, result string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET wrapper_result=?, wrapper_token=? WHERE id=? AND status='running'
+		AND launch_token=? AND launch_token!=''`, result, token, id, token))
+}
+
+// WrapperResult returns the result the wrapper of the launch with token recorded; ok is false when
+// that wrapper recorded none.
+func (s *Store) WrapperResult(id, token string) (result string, ok bool, err error) {
+	var tok, current string
+	err = s.db.QueryRow(`SELECT wrapper_result, wrapper_token, launch_token FROM jobs WHERE id=?`, id).Scan(&result, &tok, &current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	}
+	if err != nil || token == "" || tok != token || current != token {
+		return "", false, err
+	}
+	return result, true, nil
 }
 
 // Amend appends text to the brief of a queued job. The queue position (created_at, rowid) is kept.
