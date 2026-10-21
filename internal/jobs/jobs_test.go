@@ -81,6 +81,9 @@ if [[ $prompt == *FAKE_SKILLS* ]]; then
   git add -A
   git -c user.name=T -c user.email=t@example.com commit -qm "skills job"
 fi
+if [[ $prompt == *FAKE_PLANT_FALLBACK* ]]; then
+  echo 11111111-1111-4111-8111-111111111111 > ../fallback_session
+fi
 if [[ $prompt == *FAKE_FORGE* ]]; then
   # The job appends a result line of its own to the stream (it lies in the job dir).
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
@@ -1201,54 +1204,40 @@ func TestSecondWrapperRefuses(t *testing.T) {
 	}
 }
 
-// B5: the stream is read after exit_code is seen, never before.
-func TestCollectReadsStreamAfterExitCode(t *testing.T) {
+// B5: collection waits for exit_code even when the trusted DB result is already present.
+func TestCollectReadsTrustedResultAfterExitCode(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := enqueue(t, m, "x", nil)
 	dir := m.JobDir(j.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	ok := `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.1,"result":"r"}` + "\n"
-	bad := `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":9,"total_cost_usd":0.9,"result":"r"}` + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("r\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeFile(t, filepath.Join(dir, "stream.jsonl"), []byte(`{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.1}`+"\n"), 0o600)
+	writeFile(t, filepath.Join(dir, "report.md"), []byte("r\n"), 0o600)
 	if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Store.SetPID(j.ID, "tok", os.Getpid(), os.Getpid()); err != nil {
+	if err := m.Store.SetPID(j.ID, "tok", os.Getpid(), 0); err != nil {
 		t.Fatal(err)
 	}
-	// The wrapper finishes right after the daemon's first look at the stream.
-	finished := false
-	orig := parseStream
-	t.Cleanup(func() { parseStream = orig })
-	parseStream = func(p string) StreamResult {
-		r := orig(p)
-		if !finished {
-			finished = true
-			_ = os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok+bad), 0o600)
-			_ = os.WriteFile(filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)
-		}
-		return r
+	if err := recordResult(dir, "tok", StreamResult{Found: true, Subtype: "success", Turns: 1, CostUSD: 0.1}); err != nil {
+		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		if !finished && i == 1 { // fixed order never peeked: let the wrapper finish now
-			finished = true
-			_ = os.WriteFile(filepath.Join(dir, "stream.jsonl"), []byte(ok+bad), 0o600)
-			_ = os.WriteFile(filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)
-		}
-		if err := m.collect(); err != nil {
-			t.Fatal(err)
-		}
+	if err := m.collect(); err != nil {
+		t.Fatal(err)
 	}
-	g := get(t, m, j.ID)
-	if g.Status != store.StatusFailed || g.Turns != 9 || !strings.Contains(g.Error, "error_max_turns") {
-		t.Fatalf("got %s turns=%d %q (stale stream used)", g.Status, g.Turns, g.Error)
+	if got := get(t, m, j.ID); got.Status != store.StatusRunning || got.Turns != 0 {
+		t.Fatalf("collected before exit_code: %+v", got)
+	}
+	// The runner finishes with an error while the job-writable stream still says success.
+	if err := recordResult(dir, "tok", StreamResult{Found: true, Subtype: "error_max_turns", IsError: true, Turns: 9, CostUSD: 0.9}); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)
+	if err := m.collect(); err != nil {
+		t.Fatal(err)
+	}
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusFailed || got.Turns != 9 || got.CostUSD != 0.9 || !strings.Contains(got.Error, "error_max_turns") {
+		t.Fatalf("trusted result not collected: %+v", got)
 	}
 }
 
