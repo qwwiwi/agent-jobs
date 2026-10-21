@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -20,7 +22,8 @@ import (
 func TestCancelAcceptanceGroupAfterLeaderExit(t *testing.T) {
 	m := acceptanceManager(t, "")
 	m.KillGrace = time.Second
-	j := enqueue(t, m, "do it", withAcceptance(`(trap '' TERM; exec sleep 60) & echo $! > ../child.pid; wait`))
+	j := enqueue(t, m, "do it", withAcceptance(`AGENT_JOBS_TEST_SLEEP_IGNORE_TERM=1 AGENT_JOBS_TEST_SLEEP_READY=../child.ready `+
+		shellQuote(testSleep)+` 60 & echo $! > ../child.pid; wait`))
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
 	}
@@ -34,12 +37,53 @@ func TestCancelAcceptanceGroupAfterLeaderExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	waitFor(t, "acceptance child ignoring TERM", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "child.ready"))
+		return err == nil
+	})
 	waitFor(t, "acceptance pgid recorded", 5*time.Second, func() bool { return get(t, m, j.ID).AcceptancePGID > 1 })
 	pgid := get(t, m, j.ID).AcceptancePGID
-	time.Sleep(200 * time.Millisecond) // let the shell reach its wait
+	var signals []syscall.Signal
+	recordSignal := func(sig syscall.Signal) {
+		signals = append(signals, sig)
+		if sig == syscall.SIGKILL && !exited(pgid) {
+			t.Error("acceptance leader still alive at SIGKILL; leaderless escalation not exercised")
+		}
+	}
+	if runtime.GOOS == "linux" {
+		// Linux signals members through pidfds, never kill(-pgid). Record only this child.
+		realOpen, realSend := pidfdOpen, pidfdSend
+		pids := map[int]int{}
+		pidfdOpen = func(pid int) (int, error) {
+			fd, err := realOpen(pid)
+			if err == nil {
+				pids[fd] = pid
+			}
+			return fd, err
+		}
+		pidfdSend = func(fd int, sig syscall.Signal) error {
+			if pids[fd] == child && sig != 0 {
+				recordSignal(sig)
+			}
+			return realSend(fd, sig)
+		}
+		t.Cleanup(func() { pidfdOpen, pidfdSend = realOpen, realSend })
+	} else {
+		realKill := killFn
+		killFn = func(pid int, sig syscall.Signal) error {
+			if pid == -pgid {
+				recordSignal(sig)
+			}
+			return realKill(pid, sig)
+		}
+		t.Cleanup(func() { killFn = realKill })
+	}
 	// The daemon's kill alone (Cancel also sweeps marked leftovers afterwards, which would hide a gap).
 	start := time.Now()
 	m.killRunning(get(t, m, j.ID))
+	if !slices.Contains(signals, syscall.SIGTERM) || !slices.Contains(signals, syscall.SIGKILL) {
+		t.Fatalf("acceptance group %d did not escalate from SIGTERM to SIGKILL: %v", pgid, signals)
+	}
 	if !exited(child) {
 		t.Fatalf("acceptance child %d (group %d) still running after the kill", child, pgid)
 	}
@@ -77,11 +121,19 @@ func startOrphanGroupScript(t *testing.T, script string, env ...string) (pgid, m
 	}
 	pgid = c.Process.Pid
 	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	if runtime.GOOS == "darwin" {
+		// $! can be printed before exec finishes; the transient shell has no readable
+		// environment under SIP. Wait for the child whose identity the test needs.
+		waitFor(t, "orphan sleep identity", 3*time.Second, func() bool {
+			info, err := sysctlProc(member)
+			return err == nil && !info.zombie && info.pgid == pgid && len(info.argv) == 2 && filepath.Base(info.argv[0]) == "sleep"
+		})
+	}
 	return pgid, member
 }
 
-// A leaderless acceptance group is cleaned up only when every member carries the job's marker: a
-// group with a member lacking it (a foreign process, e.g. in a reused pgid) is never signalled.
+// A leaderless group with no marker of this job is never signalled. Linux requires every member's
+// marker; Darwin proves group ownership through a live marked member, then signals the whole group.
 func TestKillAcceptanceLeaderlessGroup(t *testing.T) {
 	m := acceptanceManager(t, "")
 	m.KillGrace = 500 * time.Millisecond
@@ -114,13 +166,17 @@ func TestKillAcceptanceLeaderlessGroup(t *testing.T) {
 		t.Fatal("killed a leaderless group of another job")
 	}
 
-	// Mixed: a marked member next to one without the marker; neither is signalled.
+	// Mixed: Linux refuses per-member kills; Darwin's group proof covers the unmarked sibling too.
 	g, member = startOrphanGroupScript(t, `env -u `+JobEnvVar+` sleep 30 >/dev/null 2>&1 & sleep 30 >/dev/null 2>&1 & echo $!`,
 		JobEnvVar+"="+j.ID)
 	if err := m.Store.SetAcceptancePGID(j.ID, "tok", g); err != nil {
 		t.Fatal(err)
 	}
 	m.killAcceptance(j.ID)
+	if runtime.GOOS == "darwin" {
+		waitFor(t, "mixed group gone", 3*time.Second, func() bool { return !groupAlive(g) })
+		return
+	}
 	time.Sleep(300 * time.Millisecond)
 	if exited(member) {
 		t.Fatal("killed a leaderless group that also holds a member without the job's marker")
