@@ -349,6 +349,46 @@ func TestParseHeartbeatAnswerStrict(t *testing.T) {
 	}
 }
 
+// Recording an outcome handles a failed or timed-out job for the heartbeat, even when there is
+// no stats row. Only failures since local midnight without an outcome remain in the prompt.
+func TestHeartbeatPromptUnprocessedFailures(t *testing.T) {
+	e := newHeartbeat(t)
+	m := e.m
+	m.Loc = time.FixedZone("UTC+3", 3*60*60)
+	midnight := localMidnight(*e.now, m.Loc)
+	yesterday := midnight.Add(-time.Second)
+	for _, j := range []store.Job{
+		{ID: "failed", Status: store.StatusFailed, FinishedAt: &midnight},
+		{ID: "timeout", Status: store.StatusTimeout, FinishedAt: e.now},
+		{ID: "yesterday", Status: store.StatusFailed, FinishedAt: &yesterday},
+	} {
+		j.Agent, j.Kind, j.CreatedAt = m.Agent, "fix", midnight.Add(-time.Hour)
+		if err := m.Store.Insert(&j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want int) {
+		t.Helper()
+		prompt, err := m.HeartbeatPrompt(*e.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := fmt.Sprintf("State: 0 jobs running, 0 queued, %d failed today without a recorded outcome, 0 owner replies pending, 0 missed checks.", want)
+		if !strings.Contains(prompt, state) {
+			t.Fatalf("prompt lacks %q:\n%s", state, prompt)
+		}
+	}
+	check(2)
+	if err := m.SetOutcome("failed", OutcomeRerun, ""); err != nil {
+		t.Fatal(err)
+	}
+	check(1)
+	if err := m.SetOutcome("timeout", OutcomeDiscarded, ""); err != nil {
+		t.Fatal(err)
+	}
+	check(0)
+}
+
 // A wake: the decision is stored, then the fixed line "[jobs:heartbeat] wake <id>" goes through
 // the job-done tmux path; the call itself is read-only (no tools, one turn, the configured model,
 // the scrubbed environment) and gets the goals, the time and the state summary.
@@ -394,7 +434,7 @@ func TestHeartbeatWakeDelivered(t *testing.T) {
 	}
 	stdin, _ := os.ReadFile(filepath.Join(e.dir, "stdin"))
 	for _, s := range []string{"GOAL_MARKER", "Now: 2026-10-18T12:00:00Z", "Last wake: never",
-		"State: 0 jobs running, 0 queued, 0 failed today, 0 owner replies pending, 0 missed checks.", `{"wake": true or false`} {
+		"State: 0 jobs running, 0 queued, 0 failed today without a recorded outcome, 0 owner replies pending, 0 missed checks.", `{"wake": true or false`} {
 		if !strings.Contains(string(stdin), s) {
 			t.Fatalf("prompt lacks %q:\n%s", s, stdin)
 		}
