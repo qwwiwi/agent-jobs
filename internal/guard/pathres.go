@@ -36,9 +36,11 @@ type pathScope struct {
 	protected []string // protected paths, as configured and with symlinks resolved
 	// makesLinks: a command of the call may create a symlink (ln, link, cp -s, a word naming
 	// symlink), so a `..` after a path that does not exist yet may go through one.
-	makesLinks bool
-	deadline   time.Time // end of the time budget, zero = none
-	expired    bool      // the budget ran out: every further check reports a hit
+	makesLinks  bool
+	futureLinks map[string]string // symlinks preserved at a new location by cp/mv/rsync
+	linkRoots   []string          // extraction destinations that may acquire links
+	deadline    time.Time         // end of the time budget, zero = none
+	expired     bool              // the budget ran out: every further check reports a hit
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and
@@ -101,6 +103,9 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 		s.makesLinks = s.makesLinks || slices.ContainsFunc(argv[1:], func(a string) bool {
 			return a == "--symbolic-link" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 's'))
 		})
+	}
+	if len(s.protected) > 0 {
+		s.linkOperations(argv)
 	}
 }
 
@@ -287,6 +292,9 @@ func (s *pathScope) hitPath(w string, tree bool) (string, bool) {
 	if s.makesLinks && s.linkDotDot(exp) {
 		return w + " (`..` after a path a symlink made in this call may be)", true
 	}
+	if s.extractedLinkPath(exp) {
+		return w + " (through a link the extraction may create)", true
+	}
 	if q, ok := s.match(s.candidates(exp), tree); ok {
 		return q, true
 	}
@@ -309,6 +317,9 @@ func (s *pathScope) candidates(exp string) []string {
 	var out []string
 	for _, b := range bases {
 		out = append(out, filepath.Clean(b), resolvePath(b, "/"))
+		if len(s.futureLinks) > 0 {
+			out = append(out, s.futurePath(b))
+		}
 		if hasDotDot(b) {
 			out = append(out, resolvePath(physical(b), "/"))
 		}
@@ -618,7 +629,46 @@ func onlyDotDot(rel string) bool {
 // pathTokens splits a word into the pieces a program may open as paths: on white space, quotes,
 // brackets and `=`, `:`, `,`, `;`, `<`, `>`, `|`, `&`, `?` (`of=…`, `file:…?mode=rw`, `open('…')`).
 func pathTokens(w string) []string {
-	return strings.FieldsFunc(w, func(r rune) bool { return strings.ContainsRune(" \t\r\n'\"`=:,;()[]{}<>|&?", r) })
+	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&?")
+}
+
+// literalTokens keeps quoted literals intact, including spaces and commas. A URI
+// prefix belongs to the syntax, not the filesystem path; keep its quoted payload.
+func literalTokens(w, separators string) []string {
+	var out []string
+	start := 0
+	flush := func(end int) {
+		out = append(out, strings.FieldsFunc(w[start:end], func(r rune) bool {
+			return strings.ContainsRune(separators, r)
+		})...)
+	}
+	for i := 0; i < len(w); i++ {
+		if w[i] != '\'' && w[i] != '"' {
+			continue
+		}
+		quote, end := w[i], i+1
+		for end < len(w) && w[end] != quote {
+			if w[end] == '\\' && end+1 < len(w) {
+				end++
+			}
+			end++
+		}
+		if end == len(w) {
+			continue
+		}
+		flush(i)
+		lit := w[i+1 : end]
+		if strings.HasPrefix(strings.ToLower(lit), "file:") {
+			lit = lit[len("file:"):]
+			lit, _, _ = strings.Cut(lit, "?")
+		}
+		if lit != "" {
+			out = append(out, lit)
+		}
+		i, start = end, end+1
+	}
+	flush(len(w))
+	return out
 }
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an

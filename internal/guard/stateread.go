@@ -131,6 +131,13 @@ func (r *stateReadScope) sequence(scripts []*script) {
 // (`link/..` is the parent of the link's target).
 func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 	cands := []string{filepath.Clean(abs), resolvePath(abs, "/")}
+	if len(r.futureLinks) > 0 {
+		path := raw
+		if path == "" {
+			path = abs
+		}
+		cands = append(cands, r.futurePath(path))
+	}
 	if raw != "" && hasDotDot(raw) {
 		if q, ok := kernelPath(raw); ok {
 			cands = append(cands, q, resolvePath(q, "/"))
@@ -300,9 +307,7 @@ func globComp(p, name string) bool {
 // tokens splits a word into the path-like pieces of its text: an option value (`if=…`), inline code
 // (`python3 -c "open('…')"`), an assignment (`F=…`), a here-document body.
 func tokens(w string) []string {
-	return strings.FieldsFunc(w, func(c rune) bool {
-		return c <= ' ' || strings.ContainsRune("'\"`=:,;()[]{}<>|&", c)
-	})
+	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&")
 }
 
 // text returns a refusal when a path-like piece of a text names the state.
@@ -743,6 +748,9 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 		return ""
 	}
 	r := newStateReadScope(scripts, cfg)
+	if r.expired {
+		return cannot("symlink preservation is too complex to verify within the guard's time budget")
+	}
 	// A cd/pushd target is checked as the directory it leads to (pathScope.dirs), not as a word
 	// resolved against the directories later cds lead to (`cd .. && cat prompt.md`).
 	for _, d := range r.dirs[1:] {
@@ -802,7 +810,7 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				if slices.Contains(v.wrappers, "xargs") {
 					for _, prev := range pl.cmds[:i] {
 						pat, _ := r.whereOf(prev)
-						for _, w := range prev.words {
+						for _, w := range feederWords(prev) {
 							if strings.HasPrefix(w, "-") {
 								continue
 							}

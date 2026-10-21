@@ -23,6 +23,10 @@ type simpleCmd struct {
 	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
 	// inRedirs are the sources of input redirections and here-strings (`<f`, `<>f`, `<<<w`).
 	inRedirs []string
+	// feeds retain the commands of a compound pipeline stage; inputSources retain
+	// process substitutions supplying an argument or redirected stdin.
+	feeds        []*simpleCmd
+	inputSources []string
 }
 
 // pipeline is one or more commands joined by `|` / `|&`.
@@ -83,6 +87,7 @@ type parser struct {
 	heredocs []pendingHeredoc
 	paren    int    // current `( … )` depth
 	sep      string // separator that ended the previous pipeline
+	groups   []int  // first pipeline belonging to each open compound command
 }
 
 // parseScript reads src into a script plus the sources of its substitutions.
@@ -125,7 +130,7 @@ func (p *parser) endWord() {
 func (p *parser) endCmd() {
 	p.endWord()
 	// A bare redirection is a command too: `> f` truncates f, `< f` opens it.
-	if len(p.cmd.words) > 0 || p.cmd.heredoc != "" || len(p.heredocs) > 0 || len(p.cmd.outRedirs) > 0 || len(p.cmd.inRedirs) > 0 {
+	if len(p.cmd.words) > 0 || p.cmd.heredoc != "" || len(p.heredocs) > 0 || len(p.cmd.outRedirs) > 0 || len(p.cmd.inRedirs) > 0 || len(p.cmd.feeds) > 0 {
 		p.pipe.cmds = append(p.pipe.cmds, p.cmd)
 	}
 	p.cmd = &simpleCmd{}
@@ -153,21 +158,34 @@ func (p *parser) peek(off int) byte {
 
 // matchParen returns the index just past the `)` that closes the `(` at open.
 func matchParen(s string, open int) int {
-	depth := 0
+	var quotes []bool
+	double := false
 	for i := open; i < len(s); i++ {
 		switch s[i] {
 		case '\\':
 			i++
 		case '\'':
-			if j := strings.IndexByte(s[i+1:], '\''); j >= 0 {
-				i += j + 1
+			if !double {
+				if j := strings.IndexByte(s[i+1:], '\''); j >= 0 {
+					i += j + 1
+				}
 			}
+		case '"':
+			double = !double
+		case '`':
+			i = stringEnd(s, i) - 1
 		case '(':
-			depth++
+			if !double || i > 0 && s[i-1] == '$' {
+				quotes = append(quotes, double)
+				double = false
+			}
 		case ')':
-			depth--
-			if depth == 0 {
-				return i + 1
+			if !double && len(quotes) > 0 {
+				double = quotes[len(quotes)-1]
+				quotes = quotes[:len(quotes)-1]
+				if len(quotes) == 0 {
+					return i + 1
+				}
 			}
 		}
 	}
@@ -196,7 +214,11 @@ func (p *parser) substitution() string {
 	if innerEnd < p.i+2 {
 		innerEnd = p.i + 2
 	}
-	p.subs = append(p.subs, p.src[p.i+2:min(innerEnd, len(p.src))])
+	inner := p.src[p.i+2 : min(innerEnd, len(p.src))]
+	p.subs = append(p.subs, inner)
+	if p.src[start] == '<' {
+		p.cmd.inputSources = append(p.cmd.inputSources, inner)
+	}
 	p.i = end
 	return p.src[start:end]
 }
@@ -333,11 +355,22 @@ func (p *parser) run() {
 			}
 		case c == '(':
 			p.endPipeline("(")
+			p.groups = append(p.groups, len(p.out.pipelines))
 			p.paren++
 			p.i++
 		case c == ')':
-			p.endPipeline(")")
+			p.closeGroup(")")
 			p.paren--
+			p.i++
+		case (c == '{' || c == '}') && !p.started && (p.peek(1) == 0 || strings.ContainsRune(" \t\r\n;|&", rune(p.peek(1)))):
+			if c == '{' {
+				p.endPipeline("{")
+				p.groups = append(p.groups, len(p.out.pipelines))
+				p.paren++
+			} else {
+				p.closeGroup("}")
+				p.paren--
+			}
 			p.i++
 		case c == '<' || c == '>':
 			p.redirect()
@@ -351,6 +384,52 @@ func (p *parser) run() {
 			p.i++
 		}
 	}
+}
+
+func (p *parser) closeGroup(sep string) {
+	p.endPipeline(sep)
+	if len(p.groups) == 0 {
+		return
+	}
+	start := p.groups[len(p.groups)-1]
+	p.groups = p.groups[:len(p.groups)-1]
+	for _, pl := range p.out.pipelines[start:] {
+		for _, c := range pl.cmds {
+			// Nested bodies are already in out.pipelines. Their synthetic stage
+			// would duplicate those commands, exponentially for nested groups.
+			if len(c.feeds) == 0 {
+				p.cmd.feeds = append(p.cmd.feeds, c)
+			}
+		}
+	}
+}
+
+// feederWords includes every command of a compound stage and input substitution,
+// rather than just the final command before `|`.
+func feederWords(c *simpleCmd) []string {
+	words := append([]string{}, c.words...)
+	words = append(words, c.heredoc)
+	for _, src := range c.inputSources {
+		words = append(words, sourceFeederWords(src)...)
+	}
+	for _, prev := range c.feeds {
+		words = append(words, feederWords(prev)...)
+	}
+	return words
+}
+
+func sourceFeederWords(src string) (words []string) {
+	// parseAll already includes nested substitutions and compound bodies. Do not
+	// recursively expand their feeder metadata and duplicate those commands.
+	for _, sc := range parseAll(src) {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				words = append(words, c.words...)
+				words = append(words, c.heredoc)
+			}
+		}
+	}
+	return words
 }
 
 func (p *parser) redirect() {
@@ -451,6 +530,65 @@ func shellCode(argv []string) (string, bool) {
 // runnerCode returns the command strings of runners that take a shell command as an option value
 // (`nix-shell --run 'git push'`, `nix-shell --command …`), so they are parsed like `sh -c`.
 func runnerCode(name string, argv []string) []string {
+	if name == "script" {
+		if code, ok := shellCode(argv); ok {
+			return []string{code}
+		}
+	}
+	if name == "watch" {
+		for i := 1; i < len(argv); i++ {
+			a := argv[i]
+			if a == "-n" || a == "--interval" {
+				i++
+				continue
+			}
+			if a == "--" {
+				return []string{strings.Join(argv[i+1:], " ")}
+			}
+			if !strings.HasPrefix(a, "-") {
+				return []string{strings.Join(argv[i:], " ")}
+			}
+		}
+	}
+	if name == "vim" || name == "vi" || name == "nvim" || name == "ex" {
+		var out []string
+		for i := 1; i < len(argv); i++ {
+			a := argv[i]
+			switch {
+			case (a == "-c" || a == "--cmd" || a == "-cmd") && i+1 < len(argv):
+				i++
+				a = argv[i]
+			case strings.HasPrefix(a, "+"):
+				a = a[1:]
+			case strings.HasPrefix(a, "-c") && len(a) > 2:
+				a = a[2:]
+			case strings.HasPrefix(a, "--cmd="):
+				a = strings.TrimPrefix(a, "--cmd=")
+			default:
+				continue
+			}
+			for _, loc := range reExShell.FindAllStringIndex(a, -1) {
+				out = append(out, a[loc[1]:])
+			}
+		}
+		return out
+	}
+	if name == "perl" || awks[name] {
+		var out, programs []string
+		if name == "perl" {
+			programs = perlPrograms(argv[1:])
+		} else {
+			for k := 1; k < len(argv); k++ {
+				if inlineCode(name, argv, k) {
+					programs = append(programs, argv[k])
+				}
+			}
+		}
+		for _, code := range programs {
+			out = append(out, systemCommands(code, name == "perl")...)
+		}
+		return out
+	}
 	if name != "nix-shell" && name != "nix" {
 		return nil
 	}
@@ -466,6 +604,106 @@ func runnerCode(name string, argv []string) []string {
 		}
 	}
 	return out
+}
+
+// Only command positions count: printing a word such as "screen" stays data.
+var reExShell = regexp.MustCompile(`(?m)(^|[|:])\s*(silent!?\s+)?[0-9,$%]*!`)
+
+func perlPrograms(args []string) (out []string) {
+	spec := interpSpecs["perl"]
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "--" || a == "-" {
+			break
+		}
+		for j := 1; j < len(a); j++ {
+			c := a[j]
+			if c == 'e' || c == 'E' {
+				if j+1 < len(a) {
+					out = append(out, a[j+1:])
+				} else if i+1 < len(args) {
+					i++
+					out = append(out, args[i])
+				}
+				break
+			}
+			if strings.IndexByte(spec.valueShort, c) >= 0 {
+				if j+1 == len(a) {
+					i++
+				}
+				break
+			}
+			if strings.IndexByte(spec.attachShort, c) >= 0 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// systemCommands extracts literal command arguments, skipping strings and
+// comments so printing "system('screen')" is still ordinary data.
+func systemCommands(code string, bare bool) (out []string) {
+	for i := 0; i < len(code); {
+		if code[i] == '#' {
+			if end := strings.IndexByte(code[i:], '\n'); end >= 0 {
+				i += end + 1
+				continue
+			}
+			break
+		}
+		if code[i] == '\'' || code[i] == '"' {
+			i = stringEnd(code, i)
+			continue
+		}
+		if !identifierByte(code[i]) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(code) && identifierByte(code[i]) {
+			i++
+		}
+		word := code[start:i]
+		if word != "system" && word != "exec" {
+			continue
+		}
+		for i < len(code) && strings.ContainsRune(" \t\r\n", rune(code[i])) {
+			i++
+		}
+		if i < len(code) && code[i] == '(' {
+			i++
+		} else if !bare {
+			continue
+		}
+		for i < len(code) && strings.ContainsRune(" \t\r\n", rune(code[i])) {
+			i++
+		}
+		if i < len(code) && (code[i] == '\'' || code[i] == '"') {
+			end := stringEnd(code, i)
+			if end > i+1 && code[end-1] == code[i] {
+				out = append(out, code[i+1:end-1])
+			}
+			i = end
+		}
+	}
+	return out
+}
+
+func identifierByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+// stringEnd returns the byte after a quoted literal, keeping escapes as written.
+func stringEnd(s string, start int) int {
+	for i := start + 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+		} else if s[i] == s[start] {
+			return i + 1
+		}
+	}
+	return len(s)
 }
 
 // parseAll returns src and every script nested in it (substitutions, `sh -c`, `eval`).
