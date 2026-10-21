@@ -2,10 +2,14 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
 )
@@ -96,7 +100,7 @@ func TestCheckToolsOrchestrator(t *testing.T) {
 	}
 	var mk CheckMarkOutput
 	call(t, cs, "check_mark", map[string]any{"name": "backup", "note": "done"}, &mk)
-	if mk.Check["name"] != "backup" || mk.Check["last_mark_note"] != "done" {
+	if mk.Check["name"] != "backup" || mk.Check["last_mark_untrusted_note"] != "done" {
 		t.Fatalf("check_mark: %v", mk.Check)
 	}
 	var list ChecksOutput
@@ -112,5 +116,78 @@ func TestCheckToolsOrchestrator(t *testing.T) {
 	}
 	if msg := callErr(t, cs, "check_mark", map[string]any{"name": "backup"}); !strings.Contains(msg, "not found") {
 		t.Fatalf("mark removed: %q", msg)
+	}
+}
+
+func TestCheckToolsSchedulePolicy(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	var result CheckOutput
+	call(t, cs, "check_add", map[string]any{"name": "restricted", "cron": "@daily", "allowed_schedule_ids": []int{7, 9}}, &result)
+	if !slices.Equal(result.Check.AllowedScheduleIDs, []int64{7, 9}) {
+		t.Fatalf("add policy: %+v", result.Check)
+	}
+	call(t, cs, "check_set", map[string]any{"name": "restricted", "grace_minutes": 30}, &result)
+	if !slices.Equal(result.Check.AllowedScheduleIDs, []int64{7, 9}) {
+		t.Fatal("omitted list cleared policy")
+	}
+	call(t, cs, "check_set", map[string]any{"name": "restricted", "allowed_schedule_ids": []int{9}}, &result)
+	if !slices.Equal(result.Check.AllowedScheduleIDs, []int64{9}) {
+		t.Fatal("policy edit failed")
+	}
+	var marked CheckMarkOutput
+	call(t, cs, "check_mark", map[string]any{"name": "restricted", "note": "owner done"}, &marked)
+	if marked.Check["last_mark_job"] != "owner" || marked.Check["last_mark_untrusted_note"] != "owner done" {
+		t.Fatalf("owner provenance: %v", marked.Check)
+	}
+	call(t, cs, "check_set", map[string]any{"name": "restricted", "allowed_schedule_ids": []int{}}, &result)
+	if len(result.Check.AllowedScheduleIDs) != 0 {
+		t.Fatal("empty list did not clear policy")
+	}
+	if msg := callErr(t, cs, "check_set", map[string]any{"name": "restricted", "allowed_schedule_ids": []int{-1}}); !strings.Contains(msg, "positive") {
+		t.Fatalf("invalid policy: %s", msg)
+	}
+}
+
+func TestCheckToolsLegacyNoteProtection(t *testing.T) {
+	m := newManager(t)
+	if _, err := m.AddCheck("legacy", "@daily", 0); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(m.StateDir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	secret := "ghp_" + strings.Repeat("D", 36)
+	if _, err := db.Exec(`UPDATE checks SET last_mark_at = created_at, last_mark_note = ?, last_mark_job = 'old-job' WHERE name = 'legacy'`, "old "+secret+" "+strings.Repeat("x", 500)); err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, mustServer(t, m))
+	// Both list and edit return the old mark and must sanitize it.
+	for _, tool := range []string{"check_list", "check_set"} {
+		args := map[string]any{}
+		if tool == "check_set" {
+			args = map[string]any{"name": "legacy", "enabled": false}
+		}
+		var out map[string]any
+		call(t, cs, tool, args, &out)
+		b, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), secret) || strings.Contains(string(b), `"last_mark_note"`) {
+			t.Fatalf("unsafe MCP: %s", b)
+		}
+		var check map[string]any
+		if tool == "check_list" {
+			check = out["checks"].([]any)[0].(map[string]any)
+		} else {
+			check = out["check"].(map[string]any)
+		}
+		note, _ := check["last_mark_untrusted_note"].(string)
+		if !strings.Contains(note, "redacted:github") || utf8.RuneCountInString(note) != 300 || check["last_mark_job"] != "old-job" {
+			t.Fatalf("legacy view: %v", check)
+		}
 	}
 }

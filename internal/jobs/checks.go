@@ -96,7 +96,40 @@ func MarkNote(s string) (string, error) {
 	if n := utf8.RuneCountInString(s); n > MaxMarkNoteRunes {
 		return "", fmt.Errorf("note has %d characters, at most %d", n, MaxMarkNoteRunes)
 	}
-	return defangTags(RedactPrintable(s, 0)), nil
+	return safeMarkNote(s), nil
+}
+
+// safeMarkNote also protects views of notes written by older versions. Redact before cutting.
+func safeMarkNote(s string) string {
+	return defangTags(RedactPrintable(s, MaxMarkNoteRunes))
+}
+
+func safeCheck(ck *store.Check) *store.Check {
+	c := *ck
+	c.LastMarkUntrustedNote = safeMarkNote(c.LastMarkUntrustedNote)
+	if c.LastMarkAt != nil && c.LastMarkJob == "" {
+		c.LastMarkJob = "owner"
+	}
+	return &c
+}
+
+// validateCheckMarkers bounds the policy and rejects invalid schedule identifiers.
+func validateCheckMarkers(policies ...[]int64) error {
+	if len(policies) > 1 {
+		return errors.New("give one allowed_schedule_ids list")
+	}
+	if len(policies) == 0 {
+		return nil
+	}
+	if len(policies[0]) > 100 {
+		return errors.New("allowed_schedule_ids: at most 100 schedule ids")
+	}
+	for _, id := range policies[0] {
+		if id <= 0 {
+			return errors.New("allowed_schedule_ids must contain positive schedule ids")
+		}
+	}
+	return nil
 }
 
 func checkGrace(g int, def bool) (int, error) {
@@ -212,7 +245,11 @@ func nextExpected(c *Cron, t time.Time) (time.Time, bool) {
 }
 
 // AddCheck validates and stores a check, enabled and armed now (grace 0 = DefaultCheckGrace).
-func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
+// An optional schedule allow-list restricts job markers; omitted or empty permits all jobs.
+func (m *Manager) AddCheck(name, cron string, grace int, allowedScheduleIDs ...[]int64) (*store.Check, error) {
+	if err := validateCheckMarkers(allowedScheduleIDs...); err != nil {
+		return nil, err
+	}
 	name, err := CheckName(name)
 	if err != nil {
 		return nil, err
@@ -223,9 +260,12 @@ func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
 	if grace, err = checkGrace(grace, true); err != nil {
 		return nil, err
 	}
-	c, err := m.Store.AddCheck(name, cron, grace, m.Now())
+	c, err := m.Store.AddCheck(name, cron, grace, m.Now(), allowedScheduleIDs...)
 	if errors.Is(err, store.ErrCheckExists) {
 		return nil, fmt.Errorf("check %q already exists (check_set edits it)", name)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -233,13 +273,17 @@ func (m *Manager) AddCheck(name, cron string, grace int) (*store.Check, error) {
 // SetCheck edits a check in place: its cron, its grace, enabled, or several (at least one). A new
 // cron or grace, or enabling it, re-arms the check: expected times before now never alert. Every
 // edit bumps the check's revision, so a watchdog judgement read before it is not stored.
-func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool) (*store.Check, error) {
+// An omitted allow-list preserves the policy; an empty one removes restrictions.
+func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool, allowedScheduleIDs ...[]int64) (*store.Check, error) {
+	if err := validateCheckMarkers(allowedScheduleIDs...); err != nil {
+		return nil, err
+	}
 	name, err := CheckName(name)
 	if err != nil {
 		return nil, err
 	}
-	if cron == "" && grace == 0 && enabled == nil {
-		return nil, errors.New("give a cron, grace_minutes, enabled or several of them")
+	if cron == "" && grace == 0 && enabled == nil && len(allowedScheduleIDs) == 0 {
+		return nil, errors.New("give a cron, grace_minutes, enabled, allowed_schedule_ids or several of them")
 	}
 	if cron != "" {
 		if cron, err = m.parseScheduleCron(cron); err != nil {
@@ -251,9 +295,12 @@ func (m *Manager) SetCheck(name, cron string, grace int, enabled *bool) (*store.
 			return nil, err
 		}
 	}
-	c, err := m.Store.SetCheck(name, cron, grace, enabled, m.Now())
+	c, err := m.Store.SetCheck(name, cron, grace, enabled, m.Now(), allowedScheduleIDs...)
 	if errors.Is(err, store.ErrCheckNotFound) {
 		return nil, fmt.Errorf("check %q not found", name)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -298,6 +345,12 @@ func (m *Manager) MarkCheck(name, note, jobID string) (*store.Check, error) {
 	})
 	if errors.Is(err, store.ErrCheckNotFound) {
 		return nil, fmt.Errorf("check %q not found (check_add creates it)", name)
+	}
+	if errors.Is(err, store.ErrCheckMarkForbidden) {
+		m.Log.Printf("WARN check_mark refused: check=%s job=%s: %v", name, RedactPrintable(jobID, 80), err)
+	}
+	if c != nil {
+		c = safeCheck(c)
 	}
 	return c, err
 }
@@ -440,6 +493,7 @@ func hasMarkIn(marks []time.Time, lo, hi time.Time) bool {
 
 // CheckViewOf is the view of a check now.
 func (m *Manager) CheckViewOf(ck *store.Check) (CheckView, error) {
+	ck = safeCheck(ck)
 	v := CheckView{Check: ck, State: CheckDisabled, loc: m.loc()}
 	s, err := m.specOf(ck)
 	if err != nil {
@@ -568,7 +622,21 @@ func CheckViewText(v CheckView) string {
 	if v.AlertsFailed > 0 {
 		b.WriteString(" (check_set acknowledges failed alerts)")
 	}
+	b.WriteString(checkMarkText(v.Check))
 	return b.String()
+}
+
+// checkMarkText quotes job-written text as untrusted data in human/session views.
+func checkMarkText(c *store.Check) string {
+	if c == nil || c.LastMarkAt == nil {
+		return ""
+	}
+	c = safeCheck(c)
+	text := fmt.Sprintf("; last_mark_job=%q", c.LastMarkJob)
+	if c.LastMarkUntrustedNote != "" {
+		text += fmt.Sprintf(" last_mark_untrusted_note=%q", c.LastMarkUntrustedNote)
+	}
+	return text
 }
 
 // missedItem is one check's part of the alert line: count missed expected times, the latest one.
@@ -577,6 +645,7 @@ type missedItem struct {
 	expected time.Time
 	grace    int
 	count    int
+	markText string
 }
 
 // CheckMissedText is how one missed expected time reads in the alert line.
@@ -589,10 +658,10 @@ func checkMissedLine(items []missedItem) string {
 	for _, it := range items {
 		if it.count > 1 {
 			parts = append(parts, fmt.Sprintf("%s: %d missed, latest %s (no mark within %dm)",
-				it.name, it.count, it.expected.Format(checkShownLayout), it.grace))
+				it.name, it.count, it.expected.Format(checkShownLayout), it.grace)+it.markText)
 			continue
 		}
-		parts = append(parts, CheckMissedText(it.name, it.expected, it.grace))
+		parts = append(parts, CheckMissedText(it.name, it.expected, it.grace)+it.markText)
 	}
 	return CheckMissedTag + " " + strings.Join(parts, "; ")
 }
@@ -609,7 +678,8 @@ func (m *Manager) missedItems(rows []*store.CheckAlert) []missedItem {
 			}
 			continue
 		}
-		out = append(out, missedItem{name: a.Name, expected: e, grace: a.Grace, count: 1 + a.Merged})
+		c := &store.Check{LastMarkAt: a.LastMarkAt, LastMarkJob: a.LastMarkJob, LastMarkUntrustedNote: a.LastMarkUntrustedNote}
+		out = append(out, missedItem{name: a.Name, expected: e, grace: a.Grace, count: 1 + a.Merged, markText: checkMarkText(c)})
 	}
 	return out
 }
