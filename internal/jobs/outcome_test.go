@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -312,6 +313,12 @@ func TestInvalidTokenUsageCostUnknown(t *testing.T) {
 		ss, err := ParseStreamStats(strings.NewReader(c.stream))
 		if err != nil {
 			t.Fatal(err)
+		}
+		tee := &resultTee{w: io.Discard}
+		_, _ = tee.Write([]byte(c.stream))
+		tee.end()
+		if tee.res.Tokens != ss.Tokens || tee.res.TokensInvalid != ss.TokensInvalid {
+			t.Fatalf("%s: trusted token counter differs: %+v vs %+v", c.name, tee.res, ss)
 		}
 		st := &store.JobStats{}
 		m.estimateCost(st, &store.Job{Model: "sonnet", CostUnknown: true}, nil, map[string]*StreamStats{"": &ss})

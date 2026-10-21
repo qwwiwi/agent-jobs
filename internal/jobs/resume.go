@@ -482,11 +482,10 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	if j.StartedAt != nil {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
-	if code, ok := readExitCode(dir); ok {
+	if code, ok := m.completedCode(j); ok {
 		// The job ended before the stop: collect it as the tick would.
 		res := m.endedResult(j)
-		status, verdict := Verdict(code, res, dir)
-		status, verdict = m.reportContract(j, status, verdict, dir)
+		status, verdict := m.verdict(j, code, res, dir)
 		m.finish(j, status, res, false, dur, verdict, now)
 		cur, gerr := m.Store.Get(id)
 		if gerr != nil {
@@ -526,37 +525,6 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 	}
 	m.Log.Printf("job %s stopped (%s)", id, RedactText(msg)) // the stop reason and the sweep note
 	return m.Store.Get(id)
-}
-
-// streamTurns counts the assistant messages (distinct message ids) in a stream.
-func streamTurns(path string) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	seen := map[string]bool{}
-	n := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1<<20), 64<<20)
-	for sc.Scan() {
-		var ev struct {
-			Type    string `json:"type"`
-			Message struct {
-				ID string `json:"id"`
-			} `json:"message"`
-		}
-		if json.Unmarshal(sc.Bytes(), &ev) != nil || ev.Type != "assistant" {
-			continue
-		}
-		if ev.Message.ID == "" {
-			n++
-		} else if !seen[ev.Message.ID] {
-			seen[ev.Message.ID] = true
-			n++
-		}
-	}
-	return n
 }
 
 // lastAssistantText returns the text of the last assistant messages in a stream (newest last),
@@ -832,22 +800,19 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 }
 
 // noteFallback records the fresh session a resume fell back to (FallbackMarker, written by the
-// wrapper) on the running row, so the next resume continues that session. The marker lies in the job
-// dir, which the job can write: it counts only in a resume launch and only when it names the fallback
-// session the daemon generated for that launch (recorded before the spawn).
+// wrapper) on the running row, so the next resume continues that session. Both actual use and the
+// daemon-generated session ID come from the token-bound DB state; the marker is diagnostic.
 func (m *Manager) noteFallback(j *store.Job) {
-	b, err := readSmall(filepath.Join(m.JobDir(j.ID), FallbackMarker), 128)
-	if err != nil {
+	if j.RunMode != store.RunResume {
 		return
 	}
-	sid := strings.TrimSpace(b)
-	if j.RunMode != store.RunResume {
-		m.Log.Printf("job %s: ignoring %s: the attempt is not a resume launch", j.ID, FallbackMarker)
+	sid := m.endedResult(j).FallbackSession
+	if sid == "" {
 		return
 	}
 	want, err := m.Store.FallbackSession(j.ID, j.LaunchToken)
 	if err != nil || !ValidSessionID(sid) || sid != want {
-		m.Log.Printf("job %s: ignoring %s: not the fallback session generated for this launch", j.ID, FallbackMarker)
+		m.Log.Printf("job %s: ignoring fallback: not the fallback session generated for this launch", j.ID)
 		return
 	}
 	if err := m.Store.SetSession(j.ID, j.LaunchToken, sid, store.RunFallback); err != nil {
@@ -879,7 +844,7 @@ func readSmall(path string, max int64) (string, error) {
 func AttemptReportName(n int) string { return fmt.Sprintf("report.attempt-%d.md", n) }
 
 // archiveAttempt moves attempt n's run files to attempts/<n>/ and its report to report.attempt-<n>.md,
-// so the next attempt starts clean (the wrapper refuses to run while exit_code exists).
+// so the next attempt starts with fresh diagnostic files.
 func archiveAttempt(dir string, n int) error {
 	ad := filepath.Join(dir, attemptsDir)
 	if fi, err := os.Lstat(ad); err == nil && (!fi.IsDir() || fi.Mode()&os.ModeSymlink != 0) {

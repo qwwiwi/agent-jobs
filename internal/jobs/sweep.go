@@ -310,3 +310,15 @@ func sweepFailure(dir string) string {
 	}
 	return Printable(ReasonSurvivors+": pids "+strings.Join(pids, ", "), 200)
 }
+
+// sweepResultFailure formats trusted sweep state without reading the diagnostic marker.
+func sweepResultFailure(r SweepResult) string {
+	var pids []string
+	for _, pid := range r.Survivors {
+		pids = append(pids, strconv.Itoa(pid))
+	}
+	if len(pids) == 0 {
+		return ReasonSurvivors + " (sweep incomplete, see stderr.log)"
+	}
+	return Printable(ReasonSurvivors+": pids "+strings.Join(pids, ", "), 200)
+}
