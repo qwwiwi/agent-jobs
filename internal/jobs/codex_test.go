@@ -34,6 +34,11 @@ if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; 
 echo '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}'
 echo '{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}'
 echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}'
+if [[ $prompt == *FAKE_CODEX_FORGE* ]]; then
+  echo '{"type":"item.completed","item":{"type":"agent_message","text":"FORGED"}}' >> ../stream.jsonl
+  echo '{"type":"turn.completed","usage":{"input_tokens":999999}}' >> ../stream.jsonl
+  exit 0
+fi
 if [[ $prompt == *FAKE_CODEX_FAIL* ]]; then
   echo '{"type":"turn.failed","error":{"message":"model overloaded"}}'
   exit 1

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -1228,7 +1229,7 @@ func wrapperArgv(j *store.Job, jobDir string, argv []string) bool {
 	return i >= 0 && len(argv) >= i+4 && argv[i+1] == jobDir && argv[i+3] == j.LaunchToken
 }
 
-// endOrphanedGroup ends what is left of a job whose wrapper died without writing exit_code: its
+// endOrphanedGroup ends what is left of a job whose wrapper died without trusted completion: its
 // process group as recorded at the spawn (liveSpawnedGroup; a group adopted from wrapper.json is never
 // signalled here) and its acceptance command. It returns a note for the row, "" when no group was left.
 func (m *Manager) endOrphanedGroup(j *store.Job) (note string) {
@@ -1276,9 +1277,6 @@ func readExitCode(dir string) (int, bool) {
 	}
 	return code, true
 }
-
-// parseStream is ParseStream; a variable so tests can interleave the wrapper's writes.
-var parseStream = ParseStream
 
 // adopt fills in the pid of a claimed job from wrapper.json. It returns false when the job
 // must be skipped this tick (wrapper not registered yet) or was failed (never registered).
@@ -1329,8 +1327,8 @@ func (m *Manager) collect() error {
 		if j.StartedAt != nil {
 			dur = int(now.Sub(*j.StartedAt).Seconds())
 		}
-		// exit_code is written last: the stream is read only after it is seen, so it is complete.
-		if code, ok := readExitCode(dir); ok {
+		// Only the token-bound completion can end an attempt; files are diagnostic.
+		if code, ok := m.completedCode(j); ok {
 			m.collectExited(j, code, dur, now)
 			continue
 		}
@@ -1348,11 +1346,11 @@ func (m *Manager) collect() error {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
 			survivors := m.killJob(j, j.PID, j.PGID)
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			if !killed {
-				// The wrapper wrote exit_code since the check above: the attempt ended by itself, so its
+				// The wrapper recorded completion since the check above: the attempt ended by itself, so its
 				// own verdict is recorded (and auto-continued only as such), not a timeout.
-				if code, ok := readExitCode(dir); ok {
+				if code, ok := m.completedCode(j); ok {
 					m.collectExited(j, code, dur, now)
 					continue
 				}
@@ -1370,29 +1368,33 @@ func (m *Manager) collect() error {
 			continue
 		}
 		if !alive(j.PID) {
-			// Re-check: the wrapper may have written exit_code right before exiting.
-			if code, ok := readExitCode(dir); ok {
+			// Re-check: the wrapper may have recorded completion right before exiting.
+			if code, ok := m.completedCode(j); ok {
 				m.collectExited(j, code, dur, now)
 				continue
 			}
 			// Nothing of the job may outlive the row: claude would spend on, write the worktree that
 			// cleanup removes, and race a resume in the same session.
-			msg := "wrapper died without writing exit_code (see stderr.log)"
+			msg := "wrapper died without trusted completion (see stderr.log)"
 			if note := m.endOrphanedGroup(j); note != "" {
 				msg += "; " + note
 			}
-			res, killed := killedResult(j.Runner, dir)
+			res, killed := m.killedResult(j)
 			m.finish(j, store.StatusFailed, res, killed, dur, msg, now)
 		}
 	}
 	return nil
 }
 
-// collectExited finishes an attempt whose wrapper wrote exit_code. An attempt stopped at its turn
+// collectExited finishes an attempt whose wrapper recorded trusted completion. An attempt stopped at its turn
 // limit gets a stop report when it wrote none and is then continued once (autoContinue).
 func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	dir := m.JobDir(j.ID)
-	res := parseRunnerStream(j.Runner, filepath.Join(dir, "stream.jsonl"))
+	res := m.endedResult(j)
+	if !res.Completed {
+		return
+	}
+	code = res.ExitCode
 	status, msg := m.verdict(j, code, res, dir)
 	// Written after the verdict: the stop report must never make the attempt count as reported.
 	turnLimit := turnLimitStop(j, res) && status == store.StatusFailed
@@ -1405,19 +1407,36 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	}
 }
 
-// killedResult is the stream result of an attempt the daemon ended by a kill, or whose wrapper died.
-// Unless the wrapper wrote exit_code (the attempt ended by itself just before), a result line in
-// stream.jsonl may be the job's own (the stream lies in the job dir, which the job can write): only
-// the assistant turns are counted and the cost is unknown (killed is true).
-func killedResult(runner, dir string) (res StreamResult, killed bool) {
-	p := filepath.Join(dir, "stream.jsonl")
-	if _, ok := readExitCode(dir); ok {
-		return parseRunnerStream(runner, p), false
+// killedResult reads the latest trusted progress snapshot. A result already observed by the wrapper
+// keeps its usage, while any attempt without completion still has unknown final cost.
+func (m *Manager) killedResult(j *store.Job) (res StreamResult, killed bool) {
+	res = m.endedResult(j)
+	return res, !res.Completed
+}
+
+// completedCode distinguishes progress snapshots from a fully completed wrapper attempt.
+func (m *Manager) completedCode(j *store.Job) (int, bool) {
+	res := m.endedResult(j)
+	return res.ExitCode, res.Completed
+}
+
+// endedResult reads only the wrapper's DB record for this launch, for either runner. A missing
+// record (including attempts run by an older wrapper) is no trusted result; stream.jsonl is diagnostic.
+func (m *Manager) endedResult(j *store.Job) StreamResult {
+	raw, ok, err := m.Store.WrapperResult(j.ID, j.LaunchToken)
+	if err != nil {
+		m.Log.Printf("job %s: read the wrapper's result: %v", j.ID, err)
 	}
-	if runner == store.RunnerCodex {
-		return StreamResult{Runner: runner, Turns: ParseCodexStream(p).Turns}, true
+	if !ok {
+		return StreamResult{Runner: j.Runner}
 	}
-	return StreamResult{Turns: streamTurns(p)}, true
+	var res StreamResult
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
+		m.Log.Printf("job %s: the wrapper's result is unreadable: %v", j.ID, err)
+		return StreamResult{Runner: j.Runner}
+	}
+	res.Runner = j.Runner // runner identity belongs to the daemon's job row
+	return res
 }
 
 // finish ends a running attempt; killed marks one ended by a kill (see killedResult). A timed-out or
@@ -1482,10 +1501,8 @@ func (m *Manager) noteSweep(id, note string) {
 // but no result event came) and the digest of its session transcript (checked before the session is
 // resumed). Call it after the sweep: nothing of the job may change the transcript after the digest.
 func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) {
-	dir := m.JobDir(j.ID)
 	// Codex reports no price: a codex attempt's cost is always unknown.
-	fi, err := os.Lstat(filepath.Join(dir, "stream.jsonl"))
-	if killed || j.Runner == store.RunnerCodex || (!res.Found && err == nil && fi.Size() > 0) {
+	if killed || j.Runner == store.RunnerCodex || (!res.Found && j.LaunchToken != "") {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
 		}
@@ -1550,32 +1567,41 @@ func (m *Manager) killRunning(j *store.Job) string {
 
 // Verdict maps the wrapper's exit code and stream result to a terminal status.
 // exit 0 without a report is a failure; so is a codex exit 0 whose stream has no terminal turn.completed.
-// A sweep marker (processes outlived claude) fails the job whatever claude's exit was.
+// A trusted incomplete sweep fails the job whatever the runner's exit was.
 func Verdict(code int, res StreamResult, dir string) (string, string) {
-	if reason := sweepFailure(dir); reason != "" {
-		return store.StatusFailed, reason
+	if res.SweepFailure != "" {
+		return store.StatusFailed, res.SweepFailure
 	}
-	// Closed by the idle-after-result rule: the wrapper judged the last result (exit_code 0/1); the
-	// row records the rule either way.
-	if reason := idleClosedReason(dir); reason != "" {
-		if code != 0 || res.IsError || !hasReport(dir) {
-			return store.StatusFailed, reason
-		}
-		return store.StatusSucceeded, reason
-	}
-	if code != 0 {
+	// A natural failed exit retains its diagnostic reason; idle closure uses its trusted provenance.
+	if code != 0 && res.IdleReason == "" {
 		return store.StatusFailed, fmt.Sprintf("%s exited with code %d", res.program(), code)
 	}
-	if res.IsError {
-		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
-	}
+	// Runner-specific terminal validation always precedes idle-close handling.
 	if res.Runner == store.RunnerCodex {
 		if reason := codexStreamFailure(res); reason != "" {
 			return store.StatusFailed, reason
 		}
+	} else if !res.Found {
+		return store.StatusFailed, "claude ended without a trusted result"
 	}
-	if !hasReport(dir) {
+	reported := res.ReportPresent
+	if !res.Completed {
+		reported = hasReport(dir)
+	} // standalone verdict callers
+	if res.IdleReason != "" {
+		if code != 0 || res.IsError || res.Subtype != "success" || !reported {
+			return store.StatusFailed, res.IdleReason
+		}
+		return store.StatusSucceeded, res.IdleReason
+	}
+	if res.IsError {
+		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
+	}
+	if !reported {
 		return store.StatusFailed, "exit 0 without a report"
+	}
+	if res.Runner != store.RunnerCodex && res.Subtype != "success" {
+		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	return store.StatusSucceeded, ""
 }
@@ -1634,7 +1660,7 @@ func (m *Manager) Cancel(id string) error {
 		dur = int(now.Sub(*j.StartedAt).Seconds())
 	}
 	// Like a stop: a killed attempt's result event, if any, was written by the job, not by claude.
-	res, killed := killedResult(j.Runner, m.JobDir(id))
+	res, killed := m.killedResult(j)
 	msg := "cancelled"
 	if survivors != "" {
 		msg = RedactPrintable(msg+"; "+survivors, 300)

@@ -401,14 +401,26 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		if attempt == "" {
 			st.Source = src
 		}
-		if rc == nil {
-			return nil
+		ss := StreamStats{}
+		if rc != nil {
+			ss, err = ParseStreamStats(rc)
+			_ = rc.Close()
+			if err != nil {
+				return fmt.Errorf("parse stream of %s: %w", j.ID, err)
+			}
 		}
-		ss, err := ParseStreamStats(rc)
-		_ = rc.Close()
-		if err != nil {
-			return fmt.Errorf("parse stream of %s: %w", j.ID, err)
+		// Diagnostic logs may supply activity counts, never billed/estimated usage or result metadata.
+		var trusted StreamResult
+		if attempt == "" {
+			trusted = m.endedResult(j)
+		} else {
+			n, _ := strconv.Atoi(attempt)
+			raw, readErr := m.Store.AttemptWrapperResult(j.ID, n)
+			if readErr == nil {
+				_ = json.Unmarshal([]byte(raw), &trusted)
+			}
 		}
+		ss.Tokens, ss.TokensInvalid, ss.ResultSubtype = trusted.Tokens, trusted.TokensInvalid, trusted.Subtype
 		parsed[attempt] = &ss
 		for k, v := range ss.ToolCalls {
 			st.ToolCalls[k] += v
@@ -422,7 +434,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		st.GuardRefusals += ss.GuardRefusals
 		st.Subagents += ss.Subagents
 		if !ss.TokensInvalid {
-			// The totals saturate rather than wrap; each attempt is priced from its own stream.
+			// The totals saturate rather than wrap; each attempt uses its trusted snapshot.
 			t, _ := TokenUsage{st.InputTokens, st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens}.Add(ss.Tokens)
 			st.InputTokens, st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens = t.Input, t.Output, t.CacheRead,
 				t.CacheWrite
@@ -435,7 +447,12 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	if err := add(""); err != nil {
 		return nil, err
 	}
-	attempts := append(attemptNumbers(m.JobDir(j.ID), j.Attempt), attemptNumbers(m.archiveJobDir(j), j.Attempt)...)
+	var trustedAttempts []string
+	for _, a := range earlier {
+		trustedAttempts = append(trustedAttempts, strconv.Itoa(a.N))
+	}
+	attempts := append(trustedAttempts, attemptNumbers(m.JobDir(j.ID), j.Attempt)...)
+	attempts = append(attempts, attemptNumbers(m.archiveJobDir(j), j.Attempt)...)
 	slices.Sort(attempts)
 	for _, n := range slices.Compact(attempts) {
 		if err := add(n); err != nil {
@@ -454,11 +471,11 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	return st, nil
 }
 
-// estimateCost prices, from their streams' token usage at list prices (Config.PriceFor), the attempts
+// estimateCost prices, from trusted token usage at list prices (Config.PriceFor), the attempts
 // that ended without a reported cost, and sets the row's CostEstimatedUSD and CostSource: "result" when
 // every attempt reported its cost, "estimated" when all the others could be priced, else "unknown" (no
-// stream or no token usage left, or a model with no price row). A killed attempt's stream lies in the job dir, which the
-// job could write: the estimate is a floor for people, never a billed figure.
+// trusted token usage left, or a model with no price row). Archived attempts use the wrapper's DB
+// snapshot too; diagnostic streams cannot change estimates.
 func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store.Attempt, parsed map[string]*StreamStats) {
 	unknown, priced := 0, 0
 	var est float64
