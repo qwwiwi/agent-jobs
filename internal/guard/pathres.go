@@ -632,16 +632,13 @@ func pathTokens(w string) []string {
 	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&?")
 }
 
-// literalTokens keeps quoted literals intact, including spaces and commas. A URI
-// prefix belongs to the syntax, not the filesystem path; keep its quoted payload.
+// literalTokens also checks quoted literals intact, including spaces and commas.
+// Keep the original pieces too: a quoted string may itself contain code, such as
+// os.system('rm /path/./jobs.db'). A URI prefix is syntax, not part of the path.
 func literalTokens(w, separators string) []string {
-	var out []string
-	start := 0
-	flush := func(end int) {
-		out = append(out, strings.FieldsFunc(w[start:end], func(r rune) bool {
-			return strings.ContainsRune(separators, r)
-		})...)
-	}
+	out := strings.FieldsFunc(w, func(r rune) bool {
+		return strings.ContainsRune(separators, r) || r == '\'' || r == '"'
+	})
 	for i := 0; i < len(w); i++ {
 		if w[i] != '\'' && w[i] != '"' {
 			continue
@@ -656,7 +653,6 @@ func literalTokens(w, separators string) []string {
 		if end == len(w) {
 			continue
 		}
-		flush(i)
 		lit := w[i+1 : end]
 		if strings.HasPrefix(strings.ToLower(lit), "file:") {
 			lit = lit[len("file:"):]
@@ -665,9 +661,8 @@ func literalTokens(w, separators string) []string {
 		if lit != "" {
 			out = append(out, lit)
 		}
-		i, start = end, end+1
+		i = end
 	}
-	flush(len(w))
 	return out
 }
 
