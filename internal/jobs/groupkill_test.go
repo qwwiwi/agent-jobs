@@ -147,6 +147,9 @@ func fakeGroupPidfd(t *testing.T, dead map[int]bool, onSend func(pid int, sig sy
 // and the id may be reused, a new member without the job's marker is never signalled (not even its
 // SIGKILL), while a member proven earlier still gets SIGKILL through the descriptor that held it.
 func TestEndLedGroupLeaderGoneNeverSignalsStranger(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
@@ -190,6 +193,9 @@ func TestEndLedGroupLeaderGoneNeverSignalsStranger(t *testing.T) {
 
 // #55: a group whose members exit on SIGTERM is reported ended, and every signal went through a pidfd.
 func TestEndLedGroupEndsGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
@@ -222,6 +228,9 @@ func TestEndLedGroupEndsGroup(t *testing.T) {
 
 // #55: an unreadable /proc mid-way is never taken for an ended group.
 func TestEndLedGroupUnreadableProcIsNotEnded(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	old := procRoot
 	procRoot = filepath.Join(t.TempDir(), "missing")
 	t.Cleanup(func() { procRoot = old })
@@ -431,6 +440,9 @@ func TestParseProcArgs2(t *testing.T) {
 // #55 review: a member forked during the grace still gets SIGTERM, one forked after the SIGKILL round
 // still gets SIGKILL (a numeric kill(-pgid) reached both atomically; the per-member rounds must too).
 func TestEndLedGroupSignalsLateMembers(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
@@ -471,6 +483,9 @@ func TestEndLedGroupSignalsLateMembers(t *testing.T) {
 // member can fork a child after the enumeration and exit before its check. The round that retires it
 // must scan the group afresh rather than report it ended while the child lives.
 func TestEndLedGroupRescansAfterLastHeldExits(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
@@ -527,6 +542,9 @@ func TestEndLedGroupRescansAfterLastHeldExits(t *testing.T) {
 // and no held process retired in it. The group must not be reported ended while the kernel still has
 // a process in it: 93 is found by a later listing and signalled.
 func TestEndLedGroupTwoGenerationHandoff(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux pidfd algorithm with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
