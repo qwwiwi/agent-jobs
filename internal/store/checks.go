@@ -695,6 +695,19 @@ func (s *Store) DeliverCheckAlerts(ids []int64) error {
 // FailCheckAlertAttempt records a failed delivery attempt of the alert rows still held by token:
 // the error is kept and a row stays pending, or becomes failed once it made maxAttempts attempts.
 func (s *Store) FailCheckAlertAttempt(token, errText string, maxAttempts int) error {
+	return s.failCheckAlertAttempt(token, nil, errText, maxAttempts)
+}
+
+// FailCheckAlertBatchAttempt fails only the given batch's rows still held by token.
+func (s *Store) FailCheckAlertBatchAttempt(token string, ids []int64, errText string, maxAttempts int) error {
+	batch := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		batch[id] = true
+	}
+	return s.failCheckAlertAttempt(token, batch, errText, maxAttempts)
+}
+
+func (s *Store) failCheckAlertAttempt(token string, batch map[int64]bool, errText string, maxAttempts int) error {
 	return s.immediate(func(q querier) error {
 		ctx := context.Background()
 		rows, err := queryAlerts(ctx, q, `a.state = ? AND a.token = ?`, AlertPending, token)
@@ -703,6 +716,9 @@ func (s *Store) FailCheckAlertAttempt(token, errText string, maxAttempts int) er
 		}
 		checks := map[int64]bool{}
 		for _, a := range rows {
+			if batch != nil && !batch[a.ID] {
+				continue
+			}
 			state := AlertPending
 			if a.Attempts >= maxAttempts {
 				state, checks[a.CheckID] = AlertFailed, true
