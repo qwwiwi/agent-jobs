@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,51 @@ func names(dir string) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+func TestPruneOneKeepsSessionsWhileAcceptanceGroupAlive(t *testing.T) {
+	for _, kind := range []string{"session-only", "cleaned-repo"} {
+		t.Run(kind, func(t *testing.T) {
+			m := newManager(t)
+			cfg := sessionsHome(t, false)
+			old := m.Now().Add(-PruneAge - time.Hour)
+			const pgid = 1 << 22
+			j := insertJob(t, m, "acceptance", store.StatusFailed, &old, func(j *store.Job) {
+				j.SessionID = NewSessionID()
+				j.AcceptancePGID = pgid
+				if kind == "cleaned-repo" {
+					j.RepoPath = t.TempDir()
+					j.CleanedAt = &old
+				}
+			})
+			writeFile(t, filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("test"), 0o600)
+			transcript := filepath.Join(cfg, "projects", "-test", j.SessionID+".jsonl")
+			writeFile(t, transcript, []byte("{}\n"), 0o600)
+			live := true
+			oldExists := groupExists
+			groupExists = func(got int) bool { return got == pgid && live }
+			t.Cleanup(func() { groupExists = oldExists })
+			cutoff := m.Now().Add(-PruneAge)
+			pj, ok, err := m.pruneOne(j.ID, cutoff, false)
+			if err != nil || !ok || pj.Error != "" || !strings.Contains(pj.Skipped, "acceptance process group") || len(pj.Removed) != 0 {
+				t.Fatalf("prune with live acceptance group: %+v, ok %v, err %v", pj, ok, err)
+			}
+			if got := readFile(t, transcript); got != "{}\n" {
+				t.Fatalf("live acceptance group lost transcript contents: %q", got)
+			}
+			live = false
+			pj, ok, err = m.pruneOne(j.ID, cutoff, false)
+			if err != nil || !ok || pj.Error != "" || pj.Skipped != "" {
+				t.Fatalf("prune after acceptance group exits: %+v, ok %v, err %v", pj, ok, err)
+			}
+			if _, err := os.Stat(transcript); !os.IsNotExist(err) {
+				t.Fatalf("transcript not pruned after acceptance group exits: %v", err)
+			}
+			if !slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Path == transcript }) {
+				t.Fatalf("pruned transcript missing from report: %+v", pj)
+			}
+		})
+	}
 }
 
 // Reference, «Как мы убираем»: prune cleans folders of jobs finished more than 48 h ago; records
