@@ -25,6 +25,6 @@ func (m *Manager) endMarkedGroup(id, what string, g int, isMember func(int) bool
 	return m.endMarkedGroupBySysctl(id, what, g, isMember)
 }
 
-func (m *Manager) killAcceptanceGroup(id string, g int) {
-	m.killAcceptanceGroupBySysctl(id, g)
+func (m *Manager) killAcceptanceGroup(id string, g int) (groupEnd, string) {
+	return m.killAcceptanceGroupBySysctl(id, g)
 }

@@ -36,7 +36,7 @@ func TestDarwinGroupIdentityWithoutProc(t *testing.T) {
 
 // Use kernel group liveness here: /proc-based test helpers cannot tell whether a Mac child exited.
 func TestDarwinKillJobEndsAcceptanceGroup(t *testing.T) {
-	for _, mode := range []string{"leader", "leaderless", "unmarked"} {
+	for _, mode := range []string{"leader", "leaderless", "leaderless ignores TERM", "unmarked"} {
 		t.Run(mode, func(t *testing.T) {
 			m := newManager(t)
 			m.KillGrace = 100 * time.Millisecond
@@ -47,6 +47,8 @@ func TestDarwinKillJobEndsAcceptanceGroup(t *testing.T) {
 				g = liveChild(t, JobEnvVar+"="+j.ID).Process.Pid
 			case "leaderless":
 				g, _ = startOrphanGroup(t, JobEnvVar+"="+j.ID)
+			case "leaderless ignores TERM":
+				g, _ = startOrphanGroupScript(t, `trap '' TERM; sleep 30 >/dev/null 2>&1 & echo $!`, JobEnvVar+"="+j.ID)
 			case "unmarked":
 				g, _ = startOrphanGroup(t)
 			}

@@ -332,6 +332,9 @@ func (m *Manager) checkEscaped(id string) error {
 		return fmt.Errorf("the process group %d of the job's last attempt is still alive; end it (job_cancel, or kill the group) "+
 			"before resuming", j.PGID)
 	}
+	if m.acceptanceGroupAlive(j) {
+		return fmt.Errorf("the acceptance process group %d of the job's last attempt is still alive; end it before resuming", j.AcceptancePGID)
+	}
 	if runtime.GOOS != "linux" || !procExists(os.Getpid()) {
 		return nil // no process scan (needs Linux /proc); the sweep cannot run there either
 	}
