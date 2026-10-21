@@ -24,6 +24,7 @@ import (
 var (
 	selfBin   string // built agent-jobs binary
 	fakeHelpr string // dir with fake claude / tmux
+	testSleep = "sleep"
 )
 
 const fakeClaude = `#!/bin/bash
@@ -316,6 +317,13 @@ func TestMain(m *testing.M) {
 		log.Fatalf("build: %v\n%s", err, out)
 	}
 	fakeHelpr = dir
+	// A Go child has explicit TERM-ignore readiness on every platform and an inherited
+	// marker Darwin sysctl can read (SIP hides Apple's restricted /bin/sleep).
+	testSleep = filepath.Join(dir, "sleep")
+	out, err = exec.Command("go", "build", "-o", testSleep, "testdata/sleep.go").CombinedOutput()
+	if err != nil {
+		log.Fatalf("build sleep fixture: %v\n%s", err, out)
+	}
 	for name, body := range map[string]string{"claude": fakeClaude, "tmux": fakeTmux, "codex": fakeCodex} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
 			log.Fatal(err)
@@ -345,6 +353,9 @@ const outerWrapperEnv = "AGENT_JOBS_TEST_OUTER_WRAPPER"
 
 func newManager(t *testing.T) *Manager {
 	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Setenv("PATH", fakeHelpr+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	home := t.TempDir()
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("AGENT_JOBS_CLAUDE_BIN", filepath.Join(fakeHelpr, "claude"))

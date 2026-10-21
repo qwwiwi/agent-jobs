@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -85,7 +86,11 @@ func TestAcceptanceFail(t *testing.T) {
 	m := acceptanceManager(t, "")
 	j := enqueue(t, m, "do it", withAcceptance(`echo ACC_BAD >&2; exit 3`))
 	j = runToEnd(t, m, j.ID)
-	if j.Status != store.StatusFailed || j.Error != "acceptance failed (exit 3)" {
+	wantError := "acceptance failed (exit 3)"
+	if runtime.GOOS != "linux" {
+		wantError += "; processes outside the job's process group not checked (needs Linux /proc)"
+	}
+	if j.Status != store.StatusFailed || j.Error != wantError {
 		t.Fatalf("got %s err=%q", j.Status, j.Error)
 	}
 	if j.AcceptanceExit == nil || *j.AcceptanceExit != 3 {
