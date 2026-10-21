@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -147,8 +146,6 @@ func TestFallbackMarkerIgnoredOutsideResume(t *testing.T) {
 // In a resume launch the marker counts only when it names the fallback session the daemon generated.
 func TestNoteFallbackOnlyDaemonSession(t *testing.T) {
 	m := newManager(t)
-	var logs bytes.Buffer
-	m.Log = log.New(&logs, "", 0)
 	orig := NewSessionID()
 	j := insertJob(t, m, "fb", store.StatusRunning, nil, func(j *store.Job) {
 		j.LaunchToken, j.SessionID, j.RunMode = "tok", orig, store.RunResume
@@ -163,10 +160,14 @@ func TestNoteFallbackOnlyDaemonSession(t *testing.T) {
 	if g := get(t, m, j.ID); g.SessionID != orig || g.RunMode != store.RunResume || j.SessionID != orig {
 		t.Fatalf("planted session taken: %+v", g)
 	}
-	if !strings.Contains(logs.String(), "not the fallback session generated for this launch") {
-		t.Fatalf("log: %s", logs.String())
-	}
 	writeFile(t, marker, []byte(daemon+"\n"), 0o600)
+	m.noteFallback(j)
+	if g := get(t, m, j.ID); g.SessionID != orig {
+		t.Fatalf("planted authorized ID changed session: %+v", g)
+	}
+	if err := recordResult(m.JobDir(j.ID), "tok", StreamResult{FallbackSession: daemon}); err != nil {
+		t.Fatal(err)
+	}
 	m.noteFallback(j)
 	if g := get(t, m, j.ID); g.SessionID != daemon || g.RunMode != store.RunFallback {
 		t.Fatalf("daemon's fallback session not taken: %+v", g)

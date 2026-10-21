@@ -44,42 +44,17 @@ const ReasonIdleClosed = "closed by the idle-after-result rule"
 // reportHeading marks a final message that follows the report contract.
 const reportHeading = "## Summary"
 
-// streamWatch follows stream.jsonl from a reader of its own and keeps the state the rule needs.
+// streamWatch tracks idle state from complete lines delivered by the stdout tee.
 type streamWatch struct {
-	f          *os.File
-	partial    []byte    // an incomplete last line
-	lastResult bool      // the last complete event is a `result`
-	bgTasks    int       // tasks in the last background_tasks_changed event
-	active     time.Time // when new bytes last arrived or a busy descendant was last seen
+	lastResult bool
+	bgTasks    int
+	active     time.Time
 }
 
 type watchEvent struct {
 	Type    string            `json:"type"`
 	Subtype string            `json:"subtype"`
 	Tasks   []json.RawMessage `json:"tasks"`
-}
-
-// poll reads what was appended since the last call.
-func (w *streamWatch) poll(now time.Time) {
-	buf := make([]byte, 64<<10)
-	for {
-		n, err := w.f.Read(buf)
-		if n > 0 {
-			w.active = now
-			w.partial = append(w.partial, buf[:n]...)
-			for {
-				i := bytes.IndexByte(w.partial, '\n')
-				if i < 0 {
-					break
-				}
-				w.line(w.partial[:i])
-				w.partial = w.partial[i+1:]
-			}
-		}
-		if err != nil || n == 0 {
-			return
-		}
-	}
 }
 
 func (w *streamWatch) line(b []byte) {
@@ -97,28 +72,15 @@ func (w *streamWatch) line(b []byte) {
 	}
 }
 
-// done reports whether the stream says the job is done: the last event is a result and no
-// background task is listed.
-func (w *streamWatch) done() bool {
-	return w.lastResult && len(w.partial) == 0 && w.bgTasks == 0
-}
-
 // watchIdle runs until done is closed; it ends claude (proc) when the rule applies and reports
 // whether it did. Errors are logged; the rule then simply does not fire.
-func watchIdle(proc *os.Process, streamPath string, grace time.Duration, done <-chan struct{}, log io.Writer) bool {
+func watchIdle(proc *os.Process, tee *resultTee, grace time.Duration, done <-chan struct{}, log io.Writer) bool {
 	if runtime.GOOS != "linux" || grace <= 0 {
 		<-done
 		return false
 	}
-	f, err := os.Open(streamPath)
-	if err != nil {
-		fmt.Fprintln(log, "run-wrapper: idle watch:", err)
-		<-done
-		return false
-	}
-	defer f.Close()
 	self, _ := os.Executable()
-	w := &streamWatch{f: f, active: time.Now()}
+	var busyAt time.Time
 	tick := min(max(grace/10, 20*time.Millisecond), time.Second)
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -129,18 +91,18 @@ func watchIdle(proc *os.Process, streamPath string, grace time.Duration, done <-
 		case <-t.C:
 		}
 		now := time.Now()
-		w.poll(now)
-		if !w.done() {
+		ready, active := tee.idleState()
+		if !ready {
 			continue
 		}
 		// A busy descendant counts as activity: the grace must pass with no output AND no live child
 		// (claude may react to a background child that just exited).
 		busy, mcp, err := liveDescendants(proc.Pid, self)
 		if err != nil || len(busy) > 0 {
-			w.active = now
+			busyAt = now
 			continue
 		}
-		if now.Sub(w.active) < grace {
+		if now.Sub(maxTime(active, busyAt)) < grace {
 			continue
 		}
 		fmt.Fprintf(log, "run-wrapper: %s: no output for %s after the last result, ending claude (pid %d; job MCP server %v)\n",
@@ -215,13 +177,13 @@ func mcpRoleJob(args []string) bool {
 
 // runIdleWatched starts cmd, watches it under the rule and waits for it. It reports whether the rule
 // ended claude, and cmd.Wait's error.
-func runIdleWatched(cmd *exec.Cmd, streamPath string, grace time.Duration, log io.Writer) (bool, error) {
+func runIdleWatched(cmd *exec.Cmd, tee *resultTee, grace time.Duration, log io.Writer) (bool, error) {
 	if err := cmd.Start(); err != nil {
 		return false, err
 	}
 	done := make(chan struct{})
 	closed := make(chan bool, 1)
-	go func() { closed <- watchIdle(cmd.Process, streamPath, grace, done, log) }()
+	go func() { closed <- watchIdle(cmd.Process, tee, grace, done, log) }()
 	err := cmd.Wait()
 	close(done)
 	return <-closed, err
@@ -231,7 +193,7 @@ func runIdleWatched(cmd *exec.Cmd, streamPath string, grace time.Duration, log i
 // else a report.md the job wrote itself, left untouched; else the last top-level assistant text that is
 // a report; else a short note), the marker with the reason, and the exit code the daemon judges: 0 for
 // a successful last result with a report, 1 otherwise.
-func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) int {
+func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) (int, string) {
 	reportPath := filepath.Join(jobDir, "report.md")
 	report, keep := "", false
 	switch {
@@ -240,7 +202,7 @@ func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) int {
 	case hasReport(jobDir):
 		keep = true
 	default:
-		report = lastReportText(filepath.Join(jobDir, "stream.jsonl"))
+		report = res.ReportText
 	}
 	found := keep || report != ""
 	code, reason := 0, ReasonIdleClosed+" (result "+res.Subtype+")"
@@ -265,7 +227,7 @@ func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) int {
 	if err := writeAtomic(filepath.Join(jobDir, IdleClosedMarker), []byte(reason+"\n")); err != nil {
 		fmt.Fprintln(log, "run-wrapper: write idle marker:", err)
 	}
-	return code
+	return code, reason
 }
 
 // isReport reports whether text follows the report contract: it starts with the report heading.
@@ -312,26 +274,9 @@ func lastReportText(path string) string {
 	return out
 }
 
-// idleClosedReason returns the reason the wrapper recorded when it closed claude by the rule, or "".
-// The job dir is writable by the job, so the marker is read like the sweep marker: no links, no
-// blocking, regular files only, capped. It only adds a message; the status comes from exit_code.
-func idleClosedReason(dir string) string {
-	f, err := os.OpenFile(filepath.Join(dir, IdleClosedMarker), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return ""
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
 	}
-	defer f.Close()
-	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return ""
-	}
-	const max = 512
-	b, _ := io.ReadAll(io.LimitReader(f, max+1))
-	truncated := len(b) > max
-	if truncated {
-		b = b[:max]
-	}
-	if s := RedactPrintable(RedactRead(string(b), truncated), 200); strings.HasPrefix(s, ReasonIdleClosed) {
-		return s
-	}
-	return ""
+	return b
 }

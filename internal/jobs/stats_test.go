@@ -100,7 +100,8 @@ func TestSkillFromPath(t *testing.T) {
 }
 
 // Backfill writes the missing rows from job folders and from the archive (stream.jsonl.gz), keeps
-// present rows, and fills in the store fields for a job whose stream is gone.
+// present rows, and fills in the store fields for a job whose stream is gone. Legacy streams
+// without trusted wrapper snapshots supply activity counts, but cannot supply result metadata.
 func TestBackfillStats(t *testing.T) {
 	m := newManager(t)
 	fin := time.Now().Add(-100 * time.Hour)
@@ -131,7 +132,7 @@ func TestBackfillStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	if d.Source != "job_dir" || d.Repo != "agent-jobs" || d.Kind != "fix" || d.Turns != 9 || d.CostUSD != 1.5 ||
-		d.DurationSec != 300 || !d.HasReport || d.GuardRefusals != 2 || d.Skills["deploy"] != 1 || d.ResultSubtype != "success" ||
+		d.DurationSec != 300 || !d.HasReport || d.GuardRefusals != 2 || d.Skills["deploy"] != 1 || d.ResultSubtype != "" ||
 		d.FinishedAt == nil || d.FinishedAt.Unix() != fin.Unix() {
 		t.Fatalf("dir row: %+v", d)
 	}

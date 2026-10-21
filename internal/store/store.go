@@ -432,6 +432,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN fallback_session TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN wrapper_token TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -868,6 +869,16 @@ func (s *Store) WrapperResult(id, token string) (result string, ok bool, err err
 	return result, true, nil
 }
 
+// AttemptWrapperResult is the trusted wrapper snapshot archived transactionally at requeue.
+func (s *Store) AttemptWrapperResult(id string, n int) (string, error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT wrapper_result FROM attempts WHERE job_id=? AND n=?`, id, n).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return raw, err
+}
+
 // Amend appends text to the brief of a queued job. The queue position (created_at, rowid) is kept.
 func (s *Store) Amend(id, text string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET brief = brief || ? WHERE id=? AND status='queued'`, text, id))
@@ -930,10 +941,10 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	defer func() { _ = tx.Rollback() }()
 	const resumable = `status IN ('stopped','timeout','failed')`
 	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
-		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at)
+		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at, wrapper_result)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
 		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, pending_context, session_id,
-		started_at, finished_at FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
+		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,

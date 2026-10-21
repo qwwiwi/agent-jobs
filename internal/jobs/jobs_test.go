@@ -1204,8 +1204,8 @@ func TestSecondWrapperRefuses(t *testing.T) {
 	}
 }
 
-// B5: collection waits for exit_code even when the trusted DB result is already present.
-func TestCollectReadsTrustedResultAfterExitCode(t *testing.T) {
+// B5: progress snapshots do not complete an attempt; the final DB record does.
+func TestCollectRequiresCompletedResult(t *testing.T) {
 	m := newManager(t)
 	noAutoContinue(m)
 	j := enqueue(t, m, "x", nil)
@@ -1228,7 +1228,7 @@ func TestCollectReadsTrustedResultAfterExitCode(t *testing.T) {
 		t.Fatalf("collected before exit_code: %+v", got)
 	}
 	// The runner finishes with an error while the job-writable stream still says success.
-	if err := recordResult(dir, "tok", StreamResult{Found: true, Subtype: "error_max_turns", IsError: true, Turns: 9, CostUSD: 0.9}); err != nil {
+	if err := recordResult(dir, "tok", StreamResult{Completed: true, Found: true, Subtype: "error_max_turns", IsError: true, Turns: 9, CostUSD: 0.9}); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(dir, "exit_code"), []byte("0\n"), 0o600)

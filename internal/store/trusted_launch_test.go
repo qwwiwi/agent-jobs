@@ -56,6 +56,9 @@ func TestTrustedLaunchStateCannotCrossAttempts(t *testing.T) {
 	if err := s.Requeue(j.ID, ResumeLimits{MaxTurns: 10, MaxBudgetUSD: 1, TimeoutMinutes: 5}, "continue", ""); err != nil {
 		t.Fatal(err)
 	}
+	if raw, err := s.AttemptWrapperResult(j.ID, 1); err != nil || raw != `{"Found":true}` {
+		t.Fatalf("trusted attempt snapshot lost: %q %v", raw, err)
+	}
 	if err := s.Claim(j.ID, "second", now); err != nil {
 		t.Fatal(err)
 	}
