@@ -2,10 +2,53 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCountUnprocessedFailedSince(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	since := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	insert := func(id, status string, finished *time.Time) {
+		t.Helper()
+		if err := s.Insert(&Job{ID: id, Agent: "agent1", Kind: "fix", Status: status,
+			CreatedAt: since.Add(-time.Hour), FinishedAt: finished}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Include both failure statuses at the boundary and every valid recorded outcome. No stats
+	// rows are needed: the job row is the source of truth for whether a failure was handled.
+	for _, status := range []string{StatusFailed, StatusTimeout} {
+		for i, outcome := range []string{"", "accepted", "extended", "reworked", "rerun", "discarded"} {
+			id := fmt.Sprintf("%s-%d", status, i)
+			insert(id, status, &since)
+			if outcome != "" {
+				if err := s.SetOutcome(id, "agent1", outcome, "", since.Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	before := since.Add(-time.Second)
+	insert("earlier", StatusFailed, &before)
+	insert("no-finish", StatusFailed, nil)
+	for _, status := range []string{StatusSucceeded, StatusCancelled, StatusStopped, StatusRunning, StatusQueued} {
+		insert(status, status, &since)
+	}
+	if n, err := s.CountUnprocessedFailedSince(since); err != nil || n != 2 {
+		t.Fatalf("unprocessed failures: %d %v, want 2", n, err)
+	}
+	// The existing count retains its meaning, including failures with recorded outcomes.
+	if n, err := s.CountFailedSince(since); err != nil || n != 12 {
+		t.Fatalf("all failures: %d %v, want 12", n, err)
+	}
+}
 
 // A claim is refused while another decision is pending or within the minimum gap; a stale pending
 // claim is abandoned and then never finished; the gate row keeps only the last reason; the table
