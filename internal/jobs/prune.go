@@ -163,7 +163,7 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 		return PruneJob{}, false, nil
 	}
 	pj := m.pruneJob(j, dryRun)
-	if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
+	if pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
 	}
 	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
