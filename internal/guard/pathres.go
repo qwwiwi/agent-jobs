@@ -77,9 +77,12 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 					walk(sub)
 				}
 				s.linksAt[c] = linkState{maps.Clone(s.futureLinks), slices.Clone(s.linkRoots)}
-				// Redirections open before the command (and its nested shell) runs.
-				for _, target := range c.outRedirs {
-					s.noteWrite(target, false)
+				// Redirections of enclosing compound stages also open before the
+				// body, even though the parser stores those stages after the body.
+				for _, input := range append([]*simpleCmd{c}, c.inputGroups...) {
+					for _, target := range input.outRedirs {
+						s.noteWrite(target, false)
+					}
 				}
 				s.step(c, cdpathEnv)
 				s.commandWrites(c)

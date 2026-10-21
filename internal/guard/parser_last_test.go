@@ -107,6 +107,8 @@ func TestParserFixArchiveEarlierWrites(t *testing.T) {
 		`tar xf /dev/fd/0 < safe.tar; cat hard/jobs.db`,
 		`tar x; printf x > hard/jobs.db`,
 		`tar xf safe.tar > safe.tar; printf x > hard/jobs.db`,
+		`{ tar xf safe.tar; } > safe.tar; printf x > hard/jobs.db`,
+		`(tar xf safe.tar) > safe.tar; cat hard/jobs.db`,
 		`tar xf payload.tar; tar xf safe.tar; printf x > hard/jobs.db`,
 	} {
 		if Check(command, cfg) == "" {
