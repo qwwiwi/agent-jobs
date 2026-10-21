@@ -21,6 +21,13 @@ var (
 		if int(before.Proc.P_pid) != pid {
 			return sysctlInfo{}, fmt.Errorf("pid %d: no such process", pid)
 		}
+		if before.Proc.P_stat == sZomb {
+			// Exited processes have no readable argument stack. Preserve their state so
+			// callers can distinguish a zombie from an unreadable live identity.
+			return sysctlInfo{pgid: int(before.Eproc.Pgid), zombie: true}, nil
+		}
+		// SIP may return argv alone for restricted executables. An omitted env is
+		// not proof of ownership: marker checks must continue to fail closed.
 		raw, err := unix.SysctlRaw("kern.procargs2", pid)
 		if err != nil {
 			return sysctlInfo{}, fmt.Errorf("kern.procargs2 %d: %w", pid, err)

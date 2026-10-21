@@ -32,6 +32,14 @@ func startAndKillWrapper(t *testing.T, m *Manager, id string) int {
 	}
 	g := j.PGID
 	t.Cleanup(func() { _ = syscall.Kill(-g, syscall.SIGKILL) })
+	if runtime.GOOS == "darwin" {
+		// argv.txt precedes the sleep fixture's exec. Apple's bash cannot prove
+		// ownership under SIP; wait for the readable child this test intends to leave.
+		waitFor(t, "marked child", 5*time.Second, func() bool {
+			members, err := groupMembers(g)
+			return err == nil && slices.ContainsFunc(members, jobGroupMember(j, g))
+		})
+	}
 	if err := syscall.Kill(j.PID, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +353,12 @@ func TestCancelEndsGenuineWrapperGroup(t *testing.T) {
 		return err == nil
 	})
 	j = get(t, m, j.ID)
-	if !jobWrapper(j, m.JobDir(j.ID))(j.PID) {
+	owned := jobWrapper(j, m.JobDir(j.ID))(j.PID)
+	if runtime.GOOS == "darwin" {
+		info, err := sysctlProc(j.PID)
+		owned = err == nil && !info.zombie && info.pgid == j.PGID && wrapperArgv(j, m.JobDir(j.ID), info.argv)
+	}
+	if !owned {
 		t.Fatalf("the job's own wrapper pid %d is not recognised", j.PID)
 	}
 	if err := m.Cancel(j.ID); err != nil {
