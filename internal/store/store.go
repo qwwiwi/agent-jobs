@@ -956,6 +956,13 @@ func (s *Store) SetAcceptancePGID(id, token string, pgid int) error {
 		pgid, id, token))
 }
 
+// ClearAcceptancePGID forgets a finished attempt's acceptance group once it is gone. Match the
+// launch and group so a stale row cannot clear a later attempt's group.
+func (s *Store) ClearAcceptancePGID(id, token string, pgid int) error {
+	return affected(s.db.Exec(`UPDATE jobs SET acceptance_pgid=0 WHERE id=? AND launch_token=? AND acceptance_pgid=?
+		AND status NOT IN ('queued','running')`, id, token, pgid))
+}
+
 // SetAcceptanceResult records the acceptance command's exit code (AcceptanceTimedOut for a timeout)
 // and duration for the running launch that owns the job; the command's process group is gone by then.
 func (s *Store) SetAcceptanceResult(id, token string, exit, durationSec int) error {

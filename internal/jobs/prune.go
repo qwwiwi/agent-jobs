@@ -163,7 +163,7 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 		return PruneJob{}, false, nil
 	}
 	pj := m.pruneJob(j, dryRun)
-	if pj.Error == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
+	if pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
 	}
 	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
@@ -188,6 +188,10 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 	}
 	if m.spawnedGroupAlive(j) {
 		pj.Skipped = fmt.Sprintf("process group %d of the job is still alive, not touched", j.PGID)
+		return pj
+	}
+	if m.acceptanceGroupAlive(j) {
+		pj.Skipped = fmt.Sprintf("acceptance process group %d of the job is still alive, not touched", j.AcceptancePGID)
 		return pj
 	}
 	if j.RepoPath != "" && j.CleanedAt == nil {

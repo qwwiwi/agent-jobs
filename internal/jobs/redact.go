@@ -550,6 +550,7 @@ func (m *Manager) settled(id string) {
 	m.redactAndClear(id)
 	if j, err := m.Store.Get(id); err == nil {
 		m.spawnedGroupAlive(j) // a group that ended with the job is forgotten right away
+		m.acceptanceGroupAlive(j)
 	}
 	m.recordDirSize(id)
 	m.recordStatsOf(id)
