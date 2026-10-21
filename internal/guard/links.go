@@ -92,7 +92,7 @@ func (s *pathScope) linkOperations(argv []string) {
 		if ds := attachedDirs(name, a); len(ds) > 0 {
 			dests = ds
 		}
-		if (a == "-C" || a == "-d" && name == "unzip" || a == "-D" && name == "cpio" || a == "--directory") && i+1 < len(args) {
+		if (separateExtractionDir(name, a) || a == "--directory") && i+1 < len(args) {
 			dests = []string{args[i+1]}
 		}
 		if strings.HasPrefix(a, "--directory=") {
@@ -106,6 +106,25 @@ func (s *pathScope) linkOperations(argv []string) {
 			}
 		}
 	}
+}
+
+// separateExtractionDir mirrors attachedDirs when the directory option ends a
+// cluster and consumes the next word. An earlier value option ends the scan:
+// tar -xfC names archive C, whereas tar -xvC build extracts into build.
+func separateExtractionDir(name, a string) bool {
+	opt, ok := clusterDirOpts[name]
+	if !ok || len(a) < 2 || a[0] != '-' || a[1] == '-' {
+		return false
+	}
+	for j := 1; j < len(a); j++ {
+		if a[j] == opt.dir {
+			return j == len(a)-1
+		}
+		if strings.IndexByte(opt.vals, a[j]) >= 0 {
+			return false
+		}
+	}
+	return false
 }
 
 func absoluteAt(p, cwd string) string {
