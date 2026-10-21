@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,10 +38,11 @@ type pathScope struct {
 	// makesLinks: a command of the call may create a symlink (ln, link, cp -s, a word naming
 	// symlink), so a `..` after a path that does not exist yet may go through one.
 	makesLinks  bool
-	futureLinks map[string]string // symlinks preserved at a new location by cp/mv/rsync
-	linkRoots   []string          // extraction destinations that may acquire links
-	deadline    time.Time         // end of the time budget, zero = none
-	expired     bool              // the budget ran out: every further check reports a hit
+	futureLinks map[string]string        // symlinks preserved at a new location by cp/mv/rsync
+	linksAt     map[*simpleCmd]linkState // link state before each command opens its paths
+	linkRoots   []string                 // extraction destinations that may acquire links
+	deadline    time.Time                // end of the time budget, zero = none
+	expired     bool                     // the budget ran out: every further check reports a hit
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and
@@ -64,6 +66,10 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
+				if s.linksAt == nil {
+					s.linksAt = map[*simpleCmd]linkState{}
+				}
+				s.linksAt[c] = linkState{maps.Clone(s.futureLinks), slices.Clone(s.linkRoots)}
 				s.step(c, cdpathEnv)
 			}
 		}
@@ -600,6 +606,15 @@ func inlineCode(name string, argv []string, k int) bool {
 			switch a := argv[i]; {
 			case a == "--":
 				return i+1 == k
+			case a == "-e" || a == "--source":
+				if i+1 == k {
+					return true
+				}
+				i++
+			case strings.HasPrefix(a, "--source=") || strings.HasPrefix(a, "-e") && len(a) > 2:
+				if i == k {
+					return true
+				}
 			case a == "-F" || a == "-v":
 				i++
 			case strings.HasPrefix(a, "-F") || strings.HasPrefix(a, "-v"):
@@ -636,6 +651,10 @@ func pathTokens(w string) []string {
 // Keep the original pieces too: a quoted string may itself contain code, such as
 // os.system('rm /path/./jobs.db'). A URI prefix is syntax, not part of the path.
 func literalTokens(w, separators string) []string {
+	return nestedLiteralTokens(w, separators, 0)
+}
+
+func nestedLiteralTokens(w, separators string, depth int) []string {
 	out := strings.FieldsFunc(w, func(r rune) bool {
 		return strings.ContainsRune(separators, r) || r == '\'' || r == '"'
 	})
@@ -653,7 +672,10 @@ func literalTokens(w, separators string) []string {
 		if end == len(w) {
 			continue
 		}
-		lit := w[i+1 : end]
+		lit := decodeLiteral(w[i+1 : end])
+		if depth < maxNesting {
+			out = append(out, nestedLiteralTokens(lit, separators, depth+1)...)
+		}
 		if strings.HasPrefix(strings.ToLower(lit), "file:") {
 			lit = lit[len("file:"):]
 			lit, _, _ = strings.Cut(lit, "?")
@@ -664,6 +686,36 @@ func literalTokens(w, separators string) []string {
 		i = end
 	}
 	return out
+}
+
+// decodeLiteral handles ordinary quoted-language escapes before inspecting a
+// literal containing another command. Unknown escapes stay intact.
+func decodeLiteral(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '\\', '\'', '"':
+				i++
+				out.WriteByte(s[i])
+				continue
+			case 'n':
+				i++
+				out.WriteByte('\n')
+				continue
+			case 'r':
+				i++
+				out.WriteByte('\r')
+				continue
+			case 't':
+				i++
+				out.WriteByte('\t')
+				continue
+			}
+		}
+		out.WriteByte(s[i])
+	}
+	return out.String()
 }
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
@@ -794,6 +846,9 @@ var copyLongVals = map[string]bool{
 // directory to create, so a destination.
 func parseCopyArgs(name string, args []string) copyArgs {
 	valOpts := "tS"
+	if name == "rsync" {
+		valOpts = "eBfMT"
+	}
 	if name == "install" {
 		valOpts = "tSmog"
 	}
@@ -825,7 +880,7 @@ func parseCopyArgs(name string, args []string) copyArgs {
 				ca.parents = true
 			case name == "install" && len(key) > 2 && strings.HasPrefix("--directory", key):
 				dirs = true
-			case !hasV && copyLongVals[key]:
+			case !hasV && (copyLongVals[key] || name == "rsync" && rsyncLongValues[key]):
 				i++
 			}
 		case strings.HasPrefix(a, "-") && len(a) > 1:

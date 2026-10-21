@@ -229,10 +229,29 @@ func fold(p string) string {
 // case-folded (`rſync` runs rsync from a case-insensitive volume) and mapped through toolAliases.
 func progName(argv0 string) string {
 	n := casefold.Fold(base(argv0))
+	for _, interp := range []string{"python", "pypy", "perl", "ruby", "php", "lua", "luajit"} {
+		if suffix := strings.TrimPrefix(n, interp); suffix != n && versionSuffix(suffix) {
+			n = interp
+			break
+		}
+	}
 	if a, ok := toolAliases[n]; ok {
 		return a
 	}
 	return n
+}
+
+// versionSuffix accepts numeric executable versions without normalizing unrelated names.
+func versionSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if !isDigits(part) {
+			return false
+		}
+	}
+	return true
 }
 
 // within reports whether p is d or lies inside it (both absolute and clean), case-folded under
@@ -458,6 +477,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				s.useLinks(c)
 				for _, t := range c.outRedirs {
 					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
@@ -519,25 +539,16 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
 				// -i`): its feeder gets the strict scan, ancestors included (`ls ~ | python3 x.py` is
 				// refused, a known false refusal).
+				words, fed := commandInputWords(c, pl.cmds[:i])
 				feeder := ""
 				switch {
 				case slices.Contains(v.wrappers, "xargs"):
 					feeder = "`xargs " + name + "`"
-				case stdinInterpreter(name) && (i > 0 || c.stdin || len(c.inputSources) > 0):
+				case stdinInterpreter(name) && fed:
 					feeder = "`" + name + "` (its program may come from the pipe)"
 				}
 				if feeder == "" {
 					continue
-				}
-				var words []string
-				for _, prev := range pl.cmds[:i] {
-					words = append(words, feederWords(prev)...)
-				}
-				for _, src := range c.inputSources {
-					words = append(words, sourceFeederWords(src)...)
-				}
-				if c.stdin {
-					words = append(words, c.heredoc)
 				}
 				for _, w := range words {
 					if s.feederHit(w) {
@@ -1072,7 +1083,11 @@ var execOpts = map[string]bool{
 // argument with spaces, quotes or parentheses). A package, directory, make target or test name such as
 // `./internal/ssh/...`, `make -C docker` or `-run Tmux` is data.
 func scopeToolArg(name string, args []string, dyn []bool) string {
+	data := runnerDataValues(name, args)
 	for k, a := range args {
+		if data[k] {
+			continue
+		}
 		v := optValue(a)
 		b := progName(v)
 		opt, _, _ := strings.Cut(a, "=")
