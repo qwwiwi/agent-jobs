@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -77,11 +78,19 @@ func startOrphanGroupScript(t *testing.T, script string, env ...string) (pgid, m
 	}
 	pgid = c.Process.Pid
 	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	if runtime.GOOS == "darwin" {
+		// $! can be printed before exec finishes; the transient shell has no readable
+		// environment under SIP. Wait for the child whose identity the test needs.
+		waitFor(t, "orphan sleep identity", 3*time.Second, func() bool {
+			info, err := sysctlProc(member)
+			return err == nil && !info.zombie && info.pgid == pgid && len(info.argv) == 2 && filepath.Base(info.argv[0]) == "sleep"
+		})
+	}
 	return pgid, member
 }
 
-// A leaderless acceptance group is cleaned up only when every member carries the job's marker: a
-// group with a member lacking it (a foreign process, e.g. in a reused pgid) is never signalled.
+// A leaderless group with no marker of this job is never signalled. Linux requires every member's
+// marker; Darwin proves group ownership through a live marked member, then signals the whole group.
 func TestKillAcceptanceLeaderlessGroup(t *testing.T) {
 	m := acceptanceManager(t, "")
 	m.KillGrace = 500 * time.Millisecond
@@ -114,13 +123,17 @@ func TestKillAcceptanceLeaderlessGroup(t *testing.T) {
 		t.Fatal("killed a leaderless group of another job")
 	}
 
-	// Mixed: a marked member next to one without the marker; neither is signalled.
+	// Mixed: Linux refuses per-member kills; Darwin's group proof covers the unmarked sibling too.
 	g, member = startOrphanGroupScript(t, `env -u `+JobEnvVar+` sleep 30 >/dev/null 2>&1 & sleep 30 >/dev/null 2>&1 & echo $!`,
 		JobEnvVar+"="+j.ID)
 	if err := m.Store.SetAcceptancePGID(j.ID, "tok", g); err != nil {
 		t.Fatal(err)
 	}
 	m.killAcceptance(j.ID)
+	if runtime.GOOS == "darwin" {
+		waitFor(t, "mixed group gone", 3*time.Second, func() bool { return !groupAlive(g) })
+		return
+	}
 	time.Sleep(300 * time.Millisecond)
 	if exited(member) {
 		t.Fatal("killed a leaderless group that also holds a member without the job's marker")
