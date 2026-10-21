@@ -69,6 +69,22 @@ func TestParserGapsQuotedPaths(t *testing.T) {
 	}
 }
 
+func TestParserGapsQuotedCommandStrings(t *testing.T) {
+	root := t.TempDir()
+	db := filepath.Join(root, "private", "jobs.db")
+	path := root + "/private/./jobs.db"
+	cfg := Config{Dir: root, Protected: []string{db}}
+	cmd := fmt.Sprintf(`python3 -c "import os; os.system('rm %s')"`, path)
+	if Check(cmd, cfg) == "" {
+		t.Error("quoted command lost its path tokens")
+	}
+	cfg.Protected, cfg.StateDir = nil, filepath.Dir(db)
+	cmd = fmt.Sprintf(`python3 -c "import os; os.system('cat %s')"`, path)
+	if Check(cmd, cfg) == "" {
+		t.Error("state-read lost paths inside a quoted command")
+	}
+}
+
 func TestParserGapsLinkProducers(t *testing.T) {
 	_, _, cfg := stateReadSetup(t)
 	source := t.TempDir()
