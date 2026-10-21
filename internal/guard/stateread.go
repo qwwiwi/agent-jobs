@@ -192,6 +192,9 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 		}
 	}
 	for _, raw := range raws {
+		if r.extractedLinkPath(raw) {
+			return stateBlocked("`"+w+"`", w+" (through a link the extraction may create)")
+		}
 		if hasGlob(exp) {
 			if reason := r.glob("`"+w+"`", raw, m.tree); reason != "" {
 				return reason
@@ -764,6 +767,7 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				r.useLinks(c)
 				at, reason := r.whereOf(c)
 				if reason != "" {
 					return reason
@@ -808,7 +812,16 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				// xargs runs its command on what earlier stages print: a stage naming an ancestor of the
 				// state dir (`find ~ | xargs cat`, `echo ~/.agent-jobs | xargs ls`) feeds it state paths.
 				if slices.Contains(v.wrappers, "xargs") {
-					for _, prev := range pl.cmds[:i] {
+					inputs, _ := commandInputWords(c, nil)
+					for _, w := range inputs {
+						if strings.HasPrefix(w, "-") {
+							continue
+						}
+						if reason := r.word(strings.TrimSpace(w), at, wordMode{tree: true, dynamic: true}); reason != "" {
+							return reason
+						}
+					}
+					for _, prev := range append(slices.Clone(pl.cmds[:i]), c.incoming...) {
 						pat, _ := r.whereOf(prev)
 						for _, w := range feederWords(prev) {
 							if strings.HasPrefix(w, "-") {
