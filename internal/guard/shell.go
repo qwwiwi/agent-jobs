@@ -37,6 +37,7 @@ type simpleCmd struct {
 // pipeline is one or more commands joined by `|` / `|&`.
 type pipeline struct {
 	cmds   []*simpleCmd
+	piped  bool   // a pipe operator occurred, including before a continuation newline
 	nest   int    // subshell `( … )` depth
 	before string // separator before it: "" (start), ";", "\n", "&&", "||", "&", "(", ")"
 	after  string // separator after it
@@ -363,6 +364,7 @@ func (p *parser) run() {
 			p.i += 2
 		case c == '|':
 			p.endCmd()
+			p.pipe.piped = true
 			p.i++
 			if p.peek(0) == '&' {
 				p.i++
