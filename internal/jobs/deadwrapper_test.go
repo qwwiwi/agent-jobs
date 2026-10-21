@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -187,37 +188,42 @@ func strangerGroup(t *testing.T) (pgid, member int) {
 
 // #42 review: a pgid recorded at the spawn proves past ownership only. When the job's group emptied
 // and the id now belongs to an unrelated group (no marker of the job), neither the dead-wrapper
-// collect nor a timeout signals it; the row says so.
+// collect, timeout or cancel signals it; the row says so.
 func TestDeadWrapperNeverSignalsRecycledGroup(t *testing.T) {
 	m := newManager(t)
 	m.KillGrace = 200 * time.Millisecond
-	for _, timeout := range []bool{false, true} {
+	for _, mode := range []string{"collect", "timeout", "cancel"} {
+		m.Now = time.Now
 		g, member := strangerGroup(t)
 		j := enqueue(t, m, "x", nil)
-		tok := fmt.Sprintf("tok-%v", timeout)
+		tok := "tok-" + mode
 		if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
 			t.Fatal(err)
 		}
 		if err := m.Store.SetSpawnedPID(j.ID, tok, g); err != nil {
 			t.Fatal(err)
 		}
-		if timeout {
+		if mode == "timeout" {
 			real := time.Now
 			m.Now = func() time.Time { return real().Add(time.Duration(DefaultTimeoutMinutes+1) * time.Minute) }
 		}
-		if err := m.Tick(); err != nil {
+		end := m.Tick
+		if mode == "cancel" {
+			end = func() error { return m.Cancel(j.ID) }
+		}
+		if err := end(); err != nil {
 			t.Fatal(err)
 		}
 		got := get(t, m, j.ID)
 		if got.Status == store.StatusRunning {
-			t.Fatalf("timeout=%v: still running", timeout)
+			t.Fatalf("%s: still running", mode)
 		}
-		if !timeout && !strings.Contains(got.Error, fmt.Sprintf("leftover process group %d not signalled", g)) {
-			t.Fatalf("error %q lacks the refusal", got.Error)
+		if !strings.Contains(got.Error, fmt.Sprintf("leftover process group %d not signalled", g)) {
+			t.Fatalf("%s: error %q lacks the refusal", mode, got.Error)
 		}
 		time.Sleep(300 * time.Millisecond)
 		if !alive(member) {
-			t.Fatalf("timeout=%v: member %d of the unrelated group %d was killed", timeout, member, g)
+			t.Fatalf("%s: member %d of the unrelated group %d was killed", mode, member, g)
 		}
 	}
 }
@@ -244,6 +250,9 @@ func writeFakeProc(t *testing.T, root string, pid, pgid int, marker, cgroup stri
 
 // #42 review: a member of a scoped job's group must carry the job's marker and live in its scope.
 func TestJobGroupMemberNeedsMarkerAndScope(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux cgroup membership with fake /proc")
+	}
 	root := t.TempDir()
 	old := procRoot
 	procRoot = root
