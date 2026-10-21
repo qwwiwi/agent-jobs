@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -36,9 +37,14 @@ type pathScope struct {
 	protected []string // protected paths, as configured and with symlinks resolved
 	// makesLinks: a command of the call may create a symlink (ln, link, cp -s, a word naming
 	// symlink), so a `..` after a path that does not exist yet may go through one.
-	makesLinks bool
-	deadline   time.Time // end of the time budget, zero = none
-	expired    bool      // the budget ran out: every further check reports a hit
+	makesLinks   bool
+	futureLinks  map[string]string        // symlinks preserved at a new location by cp/mv/rsync
+	linksAt      map[*simpleCmd]linkState // link state before each command opens its paths
+	linkRoots    []string                 // extraction destinations that may acquire links
+	deadline     time.Time                // end of the time budget, zero = none
+	writes       map[string]bool          // earlier possible writes; bool marks an entire subtree
+	writeUnknown bool                     // an earlier write target cannot be resolved
+	expired      bool                     // the budget ran out: every further check reports a hit
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and
@@ -59,11 +65,38 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 		}
 	}
 	cdpathEnv := os.Getenv("CDPATH") != ""
-	for _, sc := range scripts {
+	s.linksAt = map[*simpleCmd]linkState{}
+	var walk func(*script)
+	walk = func(sc *script) {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
+				if s.over() {
+					return
+				}
+				for _, sub := range c.subScripts {
+					walk(sub)
+				}
+				s.linksAt[c] = linkState{maps.Clone(s.futureLinks), slices.Clone(s.linkRoots)}
+				// Redirections of enclosing compound stages also open before the
+				// body, even though the parser stores those stages after the body.
+				for _, input := range append([]*simpleCmd{c}, c.inputGroups...) {
+					for _, target := range input.outRedirs {
+						s.noteWrite(target, false)
+					}
+				}
 				s.step(c, cdpathEnv)
+				s.commandWrites(c)
+				for _, child := range c.nested {
+					walk(child)
+				}
 			}
+		}
+	}
+	// parseAll retains a flat list for independent rules; nested scripts are
+	// visited here at the invoking command so their effects reach its successors.
+	for _, sc := range scripts {
+		if sc.depth == 0 {
+			walk(sc)
 		}
 	}
 	return s
@@ -101,6 +134,9 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 		s.makesLinks = s.makesLinks || slices.ContainsFunc(argv[1:], func(a string) bool {
 			return a == "--symbolic-link" || (strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.ContainsRune(a, 's'))
 		})
+	}
+	if len(s.protected) > 0 {
+		s.linkOperations(argv)
 	}
 }
 
@@ -287,6 +323,9 @@ func (s *pathScope) hitPath(w string, tree bool) (string, bool) {
 	if s.makesLinks && s.linkDotDot(exp) {
 		return w + " (`..` after a path a symlink made in this call may be)", true
 	}
+	if s.extractedLinkPath(exp) {
+		return w + " (through a link the extraction may create)", true
+	}
 	if q, ok := s.match(s.candidates(exp), tree); ok {
 		return q, true
 	}
@@ -309,6 +348,9 @@ func (s *pathScope) candidates(exp string) []string {
 	var out []string
 	for _, b := range bases {
 		out = append(out, filepath.Clean(b), resolvePath(b, "/"))
+		if len(s.futureLinks) > 0 {
+			out = append(out, s.futurePath(b))
+		}
 		if hasDotDot(b) {
 			out = append(out, resolvePath(physical(b), "/"))
 		}
@@ -589,6 +631,15 @@ func inlineCode(name string, argv []string, k int) bool {
 			switch a := argv[i]; {
 			case a == "--":
 				return i+1 == k
+			case a == "-e" || a == "--source":
+				if i+1 == k {
+					return true
+				}
+				i++
+			case strings.HasPrefix(a, "--source=") || strings.HasPrefix(a, "-e") && len(a) > 2:
+				if i == k {
+					return true
+				}
 			case a == "-F" || a == "-v":
 				i++
 			case strings.HasPrefix(a, "-F") || strings.HasPrefix(a, "-v"):
@@ -618,7 +669,78 @@ func onlyDotDot(rel string) bool {
 // pathTokens splits a word into the pieces a program may open as paths: on white space, quotes,
 // brackets and `=`, `:`, `,`, `;`, `<`, `>`, `|`, `&`, `?` (`of=…`, `file:…?mode=rw`, `open('…')`).
 func pathTokens(w string) []string {
-	return strings.FieldsFunc(w, func(r rune) bool { return strings.ContainsRune(" \t\r\n'\"`=:,;()[]{}<>|&?", r) })
+	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&?")
+}
+
+// literalTokens also checks quoted literals intact, including spaces and commas.
+// Keep the original pieces too: a quoted string may itself contain code, such as
+// os.system('rm /path/./jobs.db'). A URI prefix is syntax, not part of the path.
+func literalTokens(w, separators string) []string {
+	return nestedLiteralTokens(w, separators, 0)
+}
+
+func nestedLiteralTokens(w, separators string, depth int) []string {
+	out := strings.FieldsFunc(w, func(r rune) bool {
+		return strings.ContainsRune(separators, r) || r == '\'' || r == '"'
+	})
+	for i := 0; i < len(w); i++ {
+		if w[i] != '\'' && w[i] != '"' {
+			continue
+		}
+		quote, end := w[i], i+1
+		for end < len(w) && w[end] != quote {
+			if w[end] == '\\' && end+1 < len(w) {
+				end++
+			}
+			end++
+		}
+		if end == len(w) {
+			continue
+		}
+		lit := decodeLiteral(w[i+1 : end])
+		if depth < maxNesting {
+			out = append(out, nestedLiteralTokens(lit, separators, depth+1)...)
+		}
+		if strings.HasPrefix(strings.ToLower(lit), "file:") {
+			lit = lit[len("file:"):]
+			lit, _, _ = strings.Cut(lit, "?")
+		}
+		if lit != "" {
+			out = append(out, lit)
+		}
+		i = end
+	}
+	return out
+}
+
+// decodeLiteral handles ordinary quoted-language escapes before inspecting a
+// literal containing another command. Unknown escapes stay intact.
+func decodeLiteral(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '\\', '\'', '"':
+				i++
+				out.WriteByte(s[i])
+				continue
+			case 'n':
+				i++
+				out.WriteByte('\n')
+				continue
+			case 'r':
+				i++
+				out.WriteByte('\r')
+				continue
+			case 't':
+				i++
+				out.WriteByte('\t')
+				continue
+			}
+		}
+		out.WriteByte(s[i])
+	}
+	return out.String()
 }
 
 // treeWriters change or remove a whole directory tree, or place files into a directory, named by an
@@ -749,6 +871,9 @@ var copyLongVals = map[string]bool{
 // directory to create, so a destination.
 func parseCopyArgs(name string, args []string) copyArgs {
 	valOpts := "tS"
+	if name == "rsync" {
+		valOpts = "eBfMT"
+	}
 	if name == "install" {
 		valOpts = "tSmog"
 	}
@@ -780,7 +905,7 @@ func parseCopyArgs(name string, args []string) copyArgs {
 				ca.parents = true
 			case name == "install" && len(key) > 2 && strings.HasPrefix("--directory", key):
 				dirs = true
-			case !hasV && copyLongVals[key]:
+			case !hasV && (copyLongVals[key] || name == "rsync" && rsyncLongValues[key]):
 				i++
 			}
 		case strings.HasPrefix(a, "-") && len(a) > 1:

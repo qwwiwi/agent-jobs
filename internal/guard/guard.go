@@ -229,10 +229,29 @@ func fold(p string) string {
 // case-folded (`rſync` runs rsync from a case-insensitive volume) and mapped through toolAliases.
 func progName(argv0 string) string {
 	n := casefold.Fold(base(argv0))
+	for _, interp := range []string{"python", "pypy", "perl", "ruby", "php", "lua", "luajit"} {
+		if suffix := strings.TrimPrefix(n, interp); suffix != n && versionSuffix(suffix) {
+			n = interp
+			break
+		}
+	}
 	if a, ok := toolAliases[n]; ok {
 		return a
 	}
 	return n
+}
+
+// versionSuffix accepts numeric executable versions without normalizing unrelated names.
+func versionSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if !isDigits(part) {
+			return false
+		}
+	}
+	return true
 }
 
 // within reports whether p is d or lies inside it (both absolute and clean), case-folded under
@@ -357,11 +376,15 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 // stdinInterpreters may run a program they read from stdin. Options taking a value (`python3 -W
 // ignore`, `sqlite3 -separator , x.db`, `node -r fs`) make their arguments ambiguous, so as a later
 // pipe stage one is treated as reading its program from the pipe whatever its arguments.
-var stdinInterpreters = map[string]bool{"python": true, "sqlite3": true, "perl": true, "node": true, "ruby": true, "php": true}
+var stdinInterpreters = map[string]bool{
+	"python": true, "sqlite3": true, "perl": true, "node": true, "nodejs": true,
+	"deno": true, "bun": true, "ruby": true, "php": true, "lua": true, "luajit": true,
+	"osascript": true, "rscript": true,
+}
 
 // stdinInterpreter reports a program that may read its program from stdin.
 func stdinInterpreter(name string) bool {
-	return strings.HasPrefix(name, "python") || stdinInterpreters[name]
+	return strings.HasPrefix(name, "python") || strings.HasPrefix(name, "pypy") || stdinInterpreters[name]
 }
 
 // interpSpec describes how an interpreter takes its program on the command line: short options
@@ -390,7 +413,7 @@ var interpSpecs = map[string]interpSpec{
 // may take the next word). It does not tell whether the interpreter also runs stdin (`node -e 0
 // -i`, `node -p`): a pipe feeder into an interpreter is always scanned strictly.
 func interpCode(name string, args []string) int {
-	if strings.HasPrefix(name, "python") {
+	if strings.HasPrefix(name, "python") || strings.HasPrefix(name, "pypy") {
 		name = "python"
 	}
 	spec, ok := interpSpecs[name]
@@ -454,6 +477,10 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				if s.over() {
+					return ""
+				}
+				s.useLinks(c)
 				for _, t := range c.outRedirs {
 					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
@@ -515,27 +542,28 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
 				// -i`): its feeder gets the strict scan, ancestors included (`ls ~ | python3 x.py` is
 				// refused, a known false refusal).
+				xargs := slices.Contains(v.wrappers, "xargs")
+				if !xargs && !stdinInterpreter(name) {
+					continue
+				}
+				words, fed := commandInputWords(c, pl.cmds[:i], s.over)
+				if s.over() {
+					return ""
+				}
 				feeder := ""
 				switch {
-				case slices.Contains(v.wrappers, "xargs"):
+				case xargs:
 					feeder = "`xargs " + name + "`"
-				case i > 0 && stdinInterpreter(name):
+				case stdinInterpreter(name) && fed:
 					feeder = "`" + name + "` (its program may come from the pipe)"
 				}
 				if feeder == "" {
 					continue
 				}
-				for _, prev := range pl.cmds[:i] {
-					for j, w := range append(slices.Clone(prev.words), prev.heredoc) {
-						h := false
-						if j < len(prev.words) || !bigText(w) {
-							_, h = s.hit(w, true)
-						}
-						_, m := s.contains(w, true)
-						if w != "" && (h || m) {
-							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
-								"state (the subagent log or the job database); the guard cannot verify what it is fed."
-						}
+				for _, w := range words {
+					if s.feederHit(w) {
+						return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
+							"state (the subagent log or the job database); the guard cannot verify what it is fed."
 					}
 				}
 			}
@@ -544,11 +572,35 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 	return ""
 }
 
+func (s *pathScope) feederHit(w string) bool {
+	w = strings.TrimSpace(w)
+	if w == "" {
+		return false
+	}
+	if !bigText(w) {
+		if _, ok := s.hit(w, true); ok {
+			return true
+		}
+	}
+	if _, ok := s.contains(w, true); ok {
+		return true
+	}
+	for _, t := range pathTokens(w) {
+		if clean := filepath.Clean(t); clean == "/" || clean == "." {
+			continue // division or punctuation inside code, rather than a path operand
+		}
+		if _, ok := s.hit(t, true); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Check returns a non-empty reason when the shell command must be blocked.
 func Check(cmd string, cfg Config) string {
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -896,6 +948,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if v.splitString {
 		return cannot("env -S")
 	}
+	if v.wrapperUnknown != "" {
+		return cannot("unknown or ambiguous wrapper option " + v.wrapperUnknown)
+	}
 	if v.envUnknown != "" {
 		return cannot("abbreviated or unknown env option " + v.envUnknown)
 	}
@@ -1041,7 +1096,11 @@ var execOpts = map[string]bool{
 // argument with spaces, quotes or parentheses). A package, directory, make target or test name such as
 // `./internal/ssh/...`, `make -C docker` or `-run Tmux` is data.
 func scopeToolArg(name string, args []string, dyn []bool) string {
+	data := runnerDataValues(name, args)
 	for k, a := range args {
+		if data[k] {
+			continue
+		}
 		v := optValue(a)
 		b := progName(v)
 		opt, _, _ := strings.Cut(a, "=")
