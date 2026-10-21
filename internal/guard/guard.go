@@ -357,11 +357,15 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 // stdinInterpreters may run a program they read from stdin. Options taking a value (`python3 -W
 // ignore`, `sqlite3 -separator , x.db`, `node -r fs`) make their arguments ambiguous, so as a later
 // pipe stage one is treated as reading its program from the pipe whatever its arguments.
-var stdinInterpreters = map[string]bool{"python": true, "sqlite3": true, "perl": true, "node": true, "ruby": true, "php": true}
+var stdinInterpreters = map[string]bool{
+	"python": true, "sqlite3": true, "perl": true, "node": true, "nodejs": true,
+	"deno": true, "bun": true, "ruby": true, "php": true, "lua": true, "luajit": true,
+	"osascript": true, "rscript": true,
+}
 
 // stdinInterpreter reports a program that may read its program from stdin.
 func stdinInterpreter(name string) bool {
-	return strings.HasPrefix(name, "python") || stdinInterpreters[name]
+	return strings.HasPrefix(name, "python") || strings.HasPrefix(name, "pypy") || stdinInterpreters[name]
 }
 
 // interpSpec describes how an interpreter takes its program on the command line: short options
@@ -390,7 +394,7 @@ var interpSpecs = map[string]interpSpec{
 // may take the next word). It does not tell whether the interpreter also runs stdin (`node -e 0
 // -i`, `node -p`): a pipe feeder into an interpreter is always scanned strictly.
 func interpCode(name string, args []string) int {
-	if strings.HasPrefix(name, "python") {
+	if strings.HasPrefix(name, "python") || strings.HasPrefix(name, "pypy") {
 		name = "python"
 	}
 	spec, ok := interpSpecs[name]
@@ -519,29 +523,56 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				switch {
 				case slices.Contains(v.wrappers, "xargs"):
 					feeder = "`xargs " + name + "`"
-				case i > 0 && stdinInterpreter(name):
+				case stdinInterpreter(name) && (i > 0 || c.stdin || len(c.inputSources) > 0):
 					feeder = "`" + name + "` (its program may come from the pipe)"
 				}
 				if feeder == "" {
 					continue
 				}
+				var words []string
 				for _, prev := range pl.cmds[:i] {
-					for j, w := range append(slices.Clone(prev.words), prev.heredoc) {
-						h := false
-						if j < len(prev.words) || !bigText(w) {
-							_, h = s.hit(w, true)
-						}
-						_, m := s.contains(w, true)
-						if w != "" && (h || m) {
-							return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
-								"state (the subagent log or the job database); the guard cannot verify what it is fed."
-						}
+					words = append(words, feederWords(prev)...)
+				}
+				for _, src := range c.inputSources {
+					words = append(words, sourceFeederWords(src)...)
+				}
+				if c.stdin {
+					words = append(words, c.heredoc)
+				}
+				for _, w := range words {
+					if s.feederHit(w) {
+						return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
+							"state (the subagent log or the job database); the guard cannot verify what it is fed."
 					}
 				}
 			}
 		}
 	}
 	return ""
+}
+
+func (s *pathScope) feederHit(w string) bool {
+	w = strings.TrimSpace(w)
+	if w == "" {
+		return false
+	}
+	if !bigText(w) {
+		if _, ok := s.hit(w, true); ok {
+			return true
+		}
+	}
+	if _, ok := s.contains(w, true); ok {
+		return true
+	}
+	for _, t := range pathTokens(w) {
+		if clean := filepath.Clean(t); clean == "/" || clean == "." {
+			continue // division or punctuation inside code, rather than a path operand
+		}
+		if _, ok := s.hit(t, true); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Check returns a non-empty reason when the shell command must be blocked.
