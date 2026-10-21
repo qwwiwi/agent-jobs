@@ -131,6 +131,13 @@ func (r *stateReadScope) sequence(scripts []*script) {
 // (`link/..` is the parent of the link's target).
 func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 	cands := []string{filepath.Clean(abs), resolvePath(abs, "/")}
+	if len(r.futureLinks) > 0 {
+		path := raw
+		if path == "" {
+			path = abs
+		}
+		cands = append(cands, r.futurePath(path))
+	}
 	if raw != "" && hasDotDot(raw) {
 		if q, ok := kernelPath(raw); ok {
 			cands = append(cands, q, resolvePath(q, "/"))
@@ -185,6 +192,9 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 		}
 	}
 	for _, raw := range raws {
+		if r.extractedLinkPath(raw) {
+			return stateBlocked("`"+w+"`", w+" (through a link the extraction may create)")
+		}
 		if hasGlob(exp) {
 			if reason := r.glob("`"+w+"`", raw, m.tree); reason != "" {
 				return reason
@@ -300,9 +310,7 @@ func globComp(p, name string) bool {
 // tokens splits a word into the path-like pieces of its text: an option value (`if=…`), inline code
 // (`python3 -c "open('…')"`), an assignment (`F=…`), a here-document body.
 func tokens(w string) []string {
-	return strings.FieldsFunc(w, func(c rune) bool {
-		return c <= ' ' || strings.ContainsRune("'\"`=:,;()[]{}<>|&", c)
-	})
+	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&")
 }
 
 // text returns a refusal when a path-like piece of a text names the state.
@@ -743,6 +751,9 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 		return ""
 	}
 	r := newStateReadScope(scripts, cfg)
+	if r.expired {
+		return cannot("symlink preservation is too complex to verify within the guard's time budget")
+	}
 	// A cd/pushd target is checked as the directory it leads to (pathScope.dirs), not as a word
 	// resolved against the directories later cds lead to (`cd .. && cat prompt.md`).
 	for _, d := range r.dirs[1:] {
@@ -756,6 +767,10 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
+				if r.over() {
+					return cannot("state read check exceeded the guard time budget")
+				}
+				r.useLinks(c)
 				at, reason := r.whereOf(c)
 				if reason != "" {
 					return reason
@@ -800,9 +815,18 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				// xargs runs its command on what earlier stages print: a stage naming an ancestor of the
 				// state dir (`find ~ | xargs cat`, `echo ~/.agent-jobs | xargs ls`) feeds it state paths.
 				if slices.Contains(v.wrappers, "xargs") {
-					for _, prev := range pl.cmds[:i] {
+					inputs, _ := commandInputWords(c, nil, r.over)
+					for _, w := range inputs {
+						if strings.HasPrefix(w, "-") {
+							continue
+						}
+						if reason := r.word(strings.TrimSpace(w), at, wordMode{tree: true, dynamic: true}); reason != "" {
+							return reason
+						}
+					}
+					for _, prev := range append(slices.Clone(pl.cmds[:i]), c.incoming...) {
 						pat, _ := r.whereOf(prev)
-						for _, w := range prev.words {
+						for _, w := range feederWords(prev, r.over) {
 							if strings.HasPrefix(w, "-") {
 								continue
 							}
@@ -814,6 +838,9 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 				}
 			}
 		}
+	}
+	if r.over() {
+		return cannot("state read check exceeded the guard time budget")
 	}
 	return ""
 }
