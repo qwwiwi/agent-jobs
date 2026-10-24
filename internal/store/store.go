@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -160,6 +161,9 @@ type Job struct {
 	// CoverContract is the snapshot of the covered rows taken at job_start, which the daemon puts into
 	// the job's prompt (nil for a job without covers).
 	CoverContract *CoverContract
+	// Size is the size the caller gave at job_start (Wave F, F9 (a)): small, large, or "" when none was
+	// given.
+	Size string
 	// Gate is the input the daemon assembled for a gate job (Wave F: kind slicing, F3, or judge, F5);
 	// nil for every other kind. The job's prompt is built from it, never from an orchestrator brief.
 	Gate *GateInput
@@ -284,6 +288,27 @@ CREATE TABLE IF NOT EXISTS job_notes (
 	created_at INTEGER NOT NULL
 );
 `
+
+// OpenReadOnly opens the existing database at path for reads only: it never creates the file, runs no
+// migration, does not change the journal mode and never waits for a lock (a locked database fails at
+// once with SQLITE_BUSY). For callers that must not change the state or block on it (the brief reminder
+// hook); a database from an older version may then lack a table the caller reads.
+func OpenReadOnly(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(0)&_pragma=query_only(1)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	return &Store{db: db}, nil
+}
 
 // Open opens (and migrates) the database at path.
 func Open(path string) (*Store, error) {
@@ -513,6 +538,7 @@ var migrations = []string{
 	`ALTER TABLE job_stats ADD COLUMN requirements_claimed INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN cover_contract TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN gate_input TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN size TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -645,7 +671,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input`
+	base_branch, merge_note, covers, cover_contract, gate_input, size`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -709,7 +735,7 @@ func insertArgs(j *Job) []any {
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
-		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate)}
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -739,7 +765,7 @@ func scanJob(r scanner) (*Job, error) {
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
-		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate)
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size)
 	if err != nil {
 		return nil, err
 	}

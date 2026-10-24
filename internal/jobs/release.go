@@ -54,7 +54,7 @@ type ReleaseRequirement struct {
 }
 
 // ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository whose
-// covers name the checklist id (F9 (a)'s size: large is not built; DEVIATIONS).
+// covers name the checklist id (F9 (a)'s size is not read yet; DEVIATIONS #34).
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
