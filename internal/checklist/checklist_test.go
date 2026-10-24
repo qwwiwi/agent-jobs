@@ -432,3 +432,51 @@ func TestCellEscapesBackslash(t *testing.T) {
 		}
 	}
 }
+
+// An unclosed ``` fence in the owner's words must not hide the «## Additions» heading: the prefix
+// stays the owner's words after an addition, and a second addition reuses the heading.
+func TestBriefPrefixUnclosedFence(t *testing.T) {
+	b := InitBrief("I want a login page.\n\n```\nsome code without a closing fence")
+	once := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "also dark mode"}})
+	if BriefPrefixSHA256([]byte(b)) != BriefPrefixSHA256([]byte(once)) {
+		t.Fatalf("an addition after an unclosed fence changed the prefix: %q / %q", BriefPrefix([]byte(b)), BriefPrefix([]byte(once)))
+	}
+	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "and export"}})
+	if strings.Count(twice, AdditionsHeading+"\n") != 1 || BriefPrefixSHA256([]byte(twice)) != BriefPrefixSHA256([]byte(b)) {
+		t.Fatalf("second addition:\n%s", twice)
+	}
+	// A heading found outside a fence before an unclosed one (in an addition's quote) is kept.
+	quoted := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "```\nunclosed in the quote"}})
+	if BriefPrefix([]byte(quoted)) != BriefPrefix([]byte(b)) {
+		t.Fatalf("an unclosed fence in an addition moved the prefix: %q", BriefPrefix([]byte(quoted)))
+	}
+}
+
+// A quote that leaves a fence open is closed after it: a later heading or addition is not swallowed.
+func TestAppendAdditionsClosesQuoteFence(t *testing.T) {
+	b := InitBrief("I want a login page.")
+	once := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "```\nunclosed"}})
+	if !strings.HasSuffix(once, "unclosed\n```\n") || strings.Count(once, "```")%2 != 0 {
+		t.Fatalf("quote fence left open:\n%s", once)
+	}
+	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "and export"}})
+	if strings.Count(twice, AdditionsHeading+"\n") != 1 || BriefPrefix([]byte(twice)) != BriefPrefix([]byte(b)) {
+		t.Fatalf("second addition:\n%s", twice)
+	}
+}
+
+// After an approval of a brief with an unclosed fence, additions keep the stored prefix: the next call
+// is not refused as an edit of the owner's words.
+func TestApplyUnclosedFenceAdditions(t *testing.T) {
+	brief := []byte(InitBrief("I want a login page.\n\n```\nunclosed"))
+	text, rec := approvedSample(t, brief)
+	f := &Files{Brief: brief, Checklist: []byte(text)}
+	res, err := Apply(f, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Brief, f.Checklist = res.BriefAfter, res.Checklist
+	if _, err := Apply(f, Change{Additions: []Addition{{Quote: "and dark mode"}}}, time.Now(), noRedact, rec); err != nil {
+		t.Fatalf("second addition refused: %v", err)
+	}
+}
