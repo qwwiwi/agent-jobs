@@ -98,6 +98,9 @@ type JobView struct {
 	// Outcome is what the orchestrator recorded with job_outcome ("" = none yet).
 	Outcome     string `json:"outcome,omitempty"`
 	OutcomeNote string `json:"outcome_note,omitempty"`
+	// Covers are the checklist requirement IDs the job works on (Wave F, F4); its report must carry a
+	// "### Requirements" block in Findings / Changes.
+	Covers []string `json:"covers,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -120,6 +123,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
+		Covers: j.Covers,
 	}
 }
 
@@ -166,6 +170,7 @@ type JobStartInput struct {
 	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
+	Covers          []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>) plus a REDPROOF line per new test naming the ID (REDPROOF R01 · <test> failed before the change); without the block, or with no line for any covered ID, it is off contract; a done line without ran: or a red proof naming its ID counts as claimed. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. See skill_list"`
 }
 
@@ -185,7 +190,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
-			OwnerWaits: in.OwnerWaits, Skills: in.Skills,
+			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -254,6 +259,19 @@ type JobResultOutput struct {
 	// is a lower bound.
 	JobDirBytes   int64 `json:"job_dir_bytes"`
 	JobDirPartial bool  `json:"job_dir_partial,omitempty"`
+	// Covers and Requirements (jobs started with covers only, Wave F, F4): the report's
+	// "### Requirements" block read against the covers; claimed lists the done lines without ran: or REDPROOF.
+	Covers       []string          `json:"covers,omitempty"`
+	Requirements *RequirementsView `json:"requirements,omitempty"`
+}
+
+// RequirementsView is the Requirements block of a covered job's report and its commit trailers.
+type RequirementsView struct {
+	jobs.Requirements
+	// Trailer are the IDs of the "Requirements: R01, R03i" trailers of the job's commits (report only,
+	// not enforced); TrailerNote says why they could not be read.
+	Trailer     []string `json:"trailer,omitempty"`
+	TrailerNote string   `json:"trailer_note,omitempty"`
 }
 
 // MaxAcceptanceTailBytes caps the acceptance log tail job_result returns; the log keeps 64 KB.
@@ -334,9 +352,19 @@ func addJobResult(s *sdk.Server, d Deps) {
 			out.Report, out.ReportTruncated = jobs.RedactRead(report, truncated), truncated
 			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress)
 			out.NotDone, out.Progress = secs[0], secs[1]
+			if len(j.Covers) > 0 {
+				out.Requirements = &RequirementsView{Requirements: jobs.ParseRequirements(out.Report, j.Covers)}
+			}
 			if truncated {
 				out.Note = fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md"))
 			}
+		}
+		if len(j.Covers) > 0 {
+			out.Covers = j.Covers
+			if out.Requirements == nil {
+				out.Requirements = &RequirementsView{Requirements: jobs.Requirements{Lines: []jobs.RequirementLine{}, MissingLines: j.Covers}}
+			}
+			out.Requirements.Trailer, out.Requirements.TrailerNote = m.JobRequirementsTrailers(j)
 		}
 		if j.Status == store.StatusStopped {
 			out.Note = strings.TrimSpace("stopped: work dir and session kept; job_resume continues it, job_cancel gives it up. " + out.Note)

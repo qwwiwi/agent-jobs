@@ -65,14 +65,19 @@ type Config struct {
 	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
 	SubagentReserve func(max int) (prev int, allowed bool, err error)
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
-	// database that holds the counter, skill roots/links, and the job's session transcript directories.
-	// File tools and literal Bash targets into them are refused.
+	// database that holds the counter, skill roots/links, the job's session transcript directories, and
+	// a repository job's brief/BRIEF.md and brief/CHECKLIST.md (Wave F: the orchestrator's checklist
+	// tools are their only writers). File tools and literal Bash targets into them are refused.
 	Protected []string
 	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
 	// reads it, except its own folder OwnDir. Empty = reads are not checked.
 	StateDir string
 	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
 	OwnDir string
+	// NoRead are directories outside StateDir a job never reads or writes, checked like StateDir without
+	// an own folder: the checklist locks every agent of the user shares (a job holding one would block
+	// the orchestrator's checklist tools).
+	NoRead []string
 	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
 	ReadOnly string
 }
@@ -309,6 +314,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		if inJobGitDir(p, cfg.Protected) {
 			return protectedBlocked(p)
 		}
+		if inJobGitDir(p, cfg.NoRead) {
+			return stateBlocked(tool+" into `"+p+"`", p)
+		}
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
@@ -318,7 +326,8 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 
 func protectedBlocked(p string) string {
 	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), a skill catalog " +
-		"(a skill root or a skill link), or a job session transcript directory; a job does not write there."
+		"(a skill root or a skill link), a job session transcript directory, or the brief files (brief/BRIEF.md, " +
+		"brief/CHECKLIST.md: only the orchestrator's checklist tools write them); a job does not write there."
 }
 
 func ancestorBlocked(w, p string) string {

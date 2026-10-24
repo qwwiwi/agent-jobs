@@ -112,8 +112,9 @@ const (
 const maxContractReportBytes = 1 << 20
 
 // reportContractNote returns the note for a report without a "## Summary" or a "## Not done /
-// uncertain" section ("" when both are there).
-func reportContractNote(report string) string {
+// uncertain" section, or, for a job with covers (Wave F, F4), without a "### Requirements" block in
+// Findings / Changes ("" when all are there).
+func reportContractNote(report string, covers []string) string {
 	_, secs := splitReport(report)
 	if _, ok := sectionBody(secs, strings.TrimPrefix(reportHeading, "## ")); !ok {
 		return NoteNoSummary
@@ -121,12 +122,12 @@ func reportContractNote(report string) string {
 	if _, ok := sectionBody(secs, SectionNotDone); !ok {
 		return NoteNoNotDone
 	}
-	return ""
+	return requirementsNote(report, covers)
 }
 
 // OffContractNote returns the report contract note a job's error carries, "" when none.
 func OffContractNote(errMsg string) string {
-	for _, n := range []string{NoteNoSummary, NoteNoNotDone} {
+	for _, n := range []string{NoteNoSummary, NoteNoNotDone, NoteNoRequirements, NoteRequirementsEmpty, NoteJobRowUnread} {
 		if strings.Contains(errMsg, n) {
 			return n
 		}
