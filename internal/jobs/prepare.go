@@ -168,12 +168,15 @@ func (m *Manager) ProtectedPaths() []string {
 	return out
 }
 
-// jobGitProtected are job id's git files: <jobdir>/gitconfig (its GIT_CONFIG_GLOBAL) and
-// <jobdir>/no-hooks (its core.hooksPath). Their 0400/0500 modes do not hold a job back (it owns them
-// and may chmod them), and a changed diff.external or a planted hook makes git run a program.
-func (m *Manager) jobGitProtected(id string) []string {
+// jobOwnProtected are the files of job id's folder that set up how it runs: <jobdir>/gitconfig (its
+// GIT_CONFIG_GLOBAL) and <jobdir>/no-hooks (its core.hooksPath), whose 0400/0500 modes do not hold a
+// job back (it owns them and may chmod them; a changed diff.external or a planted hook makes git run
+// a program), and <jobdir>/settings.json and mcp.json (its guard hook, permissions and MCP servers,
+// read again when the job is resumed).
+func (m *Manager) jobOwnProtected(id string) []string {
 	dir := m.JobDir(id)
-	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir)}
+	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir),
+		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json")}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -200,7 +203,7 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, 
 	if jobID != "" {
 		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
 			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
-		for _, p := range append(append(m.ProtectedPaths(), m.jobGitProtected(jobID)...), extraProtected...) {
+		for _, p := range append(append(m.ProtectedPaths(), m.jobOwnProtected(jobID)...), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
 	}

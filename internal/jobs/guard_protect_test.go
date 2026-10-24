@@ -63,13 +63,14 @@ func assertWritesRefused(t *testing.T, cfg guard.Config, paths []string, cmds []
 }
 
 // bashWrites are the shell writes of p a job could try: redirections, copy/move/link onto it, mode
-// changes, in-place edits and git config --file.
+// changes, in-place edits and git config --file (with an allowlisted key, so only the protected-path
+// rule refuses it: TestBashWritesAllowedElsewhere).
 func bashWrites(p string) []string {
 	q := shellQuote(p)
 	return []string{
 		"echo '{\"max_running\":9}' > " + q, "printf x >> " + q, "tee " + q + " < /dev/null",
 		"cp /etc/hostname " + q, "mv /tmp/x " + q, "ln -sf /tmp/x " + q, "chmod u+w " + q,
-		"sed -i s/a/b/ " + q, "truncate -s0 " + q, "git config --file " + q + " diff.external /tmp/x",
+		"sed -i s/a/b/ " + q, "truncate -s0 " + q, "git config --file " + q + " core.quotepath false",
 	}
 }
 
