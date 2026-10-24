@@ -14,8 +14,11 @@ import (
 type Redactor func(string) (string, int)
 
 // Init is the content of a new brief/ pair: BRIEF.md with the owner's words (redacted) and an empty,
-// unapproved CHECKLIST.md at version 1.
+// unapproved CHECKLIST.md at version 1. The raw inputs are redacted before anything else touches them.
 func Init(id, words string, redact Redactor) (brief, list []byte, redacted int, err error) {
+	id, n := redact(id)
+	words, k := redact(words)
+	redacted = n + k
 	id = NormalizeField(id)
 	if id == "" {
 		return nil, nil, 0, errors.New("checklist id is empty")
@@ -26,7 +29,19 @@ func Init(id, words string, redact Redactor) (brief, list []byte, redacted int, 
 	b, n := redact(InitBrief(words))
 	c := &Checklist{ID: id, Brief: BriefRel, Version: 1}
 	l, k := redact(Render(c))
-	return []byte(b), []byte(l), n + k, nil
+	return []byte(b), []byte(l), redacted + n + k, nil
+}
+
+// redactRaw runs redact over every field of an input row as given, before NormalizeRow collapses its
+// line breaks: a multi-line secret (a PEM block or a fragment of one) is only recognized whole.
+func redactRaw(r Row, redact Redactor) (Row, int) {
+	n := 0
+	for _, f := range []*string{&r.ID, &r.Verbatim, &r.Contract, &r.Basis} {
+		var k int
+		*f, k = redact(*f)
+		n += k
+	}
+	return r, n
 }
 
 // Change is one checklist_set call.
@@ -61,21 +76,25 @@ type Result struct {
 var dateRe = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
 
 // Apply computes checklist_set's new BRIEF.md and CHECKLIST.md from the files on disk: rows upserted,
-// additions appended, everything redacted before the hash is taken; the version goes up when the
+// additions appended, everything redacted before the hash is taken (every raw input and the files as
+// read first, before any normalization, then the results again); the version goes up when the
 // hashed content changes (or a void approval is dropped); an approval is kept only while the hash it
 // names stays the hash, and Approve sets a new one over the result.
 func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error) {
 	if f.Checklist == nil || f.Brief == nil {
 		return nil, ErrNoChecklist
 	}
-	cur, err := Parse(string(f.Checklist))
+	res := &Result{}
+	// The file as read is redacted before it is parsed (a manual edit may have put a secret there).
+	text, n := redact(string(f.Checklist))
+	res.Redacted += n
+	cur, err := Parse(text)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", ChecklistRel, err)
 	}
 	if ch.ExpectVersion > 0 && ch.ExpectVersion != cur.Version {
 		return nil, fmt.Errorf("expect_version %d, the checklist is at version %d (changed meanwhile; read it again)", ch.ExpectVersion, cur.Version)
 	}
-	res := &Result{}
 	_, oldHash, reason := cur.Status(f.Brief)
 	if cur.Approval != nil || cur.ApprovalErr != "" {
 		if strings.HasPrefix(reason, "approval void") {
@@ -84,6 +103,10 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 	}
 	// BRIEF: additions appended; the whole file redacted (a secret must never reach it).
 	for i, a := range ch.Additions {
+		var k int
+		a.Quote, k = redact(a.Quote)
+		ch.Additions[i].Quote = a.Quote
+		res.Redacted += k
 		if strings.TrimSpace(a.Quote) == "" {
 			return nil, fmt.Errorf("addition %d: the quote is empty", i+1)
 		}
@@ -93,8 +116,8 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 			return nil, fmt.Errorf("addition %d: date %q must be YYYY-MM-DD", i+1, a.Date)
 		}
 	}
-	brief, n := redact(AppendAdditions(string(f.Brief), ch.Additions))
-	res.Redacted += n
+	brief, k := redact(AppendAdditions(string(f.Brief), ch.Additions))
+	res.Redacted += k
 	res.BriefAfter = []byte(brief)
 	if brief != string(f.Brief) {
 		res.Brief = res.BriefAfter
@@ -103,11 +126,12 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 	next := &Checklist{ID: cur.ID, Brief: BriefRel, Version: cur.Version, Approval: cur.Approval, Rows: slices.Clone(cur.Rows)}
 	newG := false
 	for _, in := range ch.Rows {
+		in, k := redactRaw(in, redact)
+		res.Redacted += k
 		r, err := NormalizeRow(in)
 		if err != nil {
 			return nil, err
 		}
-		var k int
 		r.Verbatim, k = redactField(r.Verbatim, redact)
 		res.Redacted += k
 		r.Basis, k = redactField(r.Basis, redact)
