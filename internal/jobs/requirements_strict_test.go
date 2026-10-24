@@ -193,3 +193,54 @@ func TestRedProofStrictIDsAndNegatives(t *testing.T) {
 		t.Fatalf("idsIn: %v", ids)
 	}
 }
+
+// A proof or ran: value is normalized (white space incl. no-break space, Markdown wrappers, brackets,
+// quotes, angle brackets, «>», «/», trailing punctuation) before it is judged: wrapped negatives are
+// refused, and an honest sentence that merely starts with «no» / «not» is a proof.
+func TestNegativeProofNormalized(t *testing.T) {
+	for _, s := range []string{
+		"", "  ", "**none**.", "`TBD`.", "_skipped_.", "[none]", `"none"`, "'n/a'", "<none>", "> none", "/none",
+		"TODO", "to be done", "To be done.", "…", "...", " none", "none ", "n.a.", "?", "-", "—", "nothing",
+		"no", "No.", "na", "pending", "missing", "(none)", "{none}", "«none»", "“none”", "**[none]**", "`n/a`;",
+		"none yet", "skipped, no time", "nothing failed", "not run, the test is new", "not-run", "no-test", "TODO: later",
+	} {
+		if !negativeProof(s) {
+			t.Errorf("%q: not negative", s)
+		}
+	}
+	for _, s := range []string{
+		"no failures before the fix, TestLogin red at 902bf59", "no failures …", "not cached; TestLogin failed before",
+		"TestLogin failed before the change", "nonce_test failed before", "login-form test failed before",
+		"`go test ./...` → FAIL", "notable: TestX failed before", "nobody saw it pass: TestX failed before",
+	} {
+		if negativeProof(s) {
+			t.Errorf("%q: negative", s)
+		}
+	}
+	verified := func(report string) bool {
+		t.Helper()
+		for _, l := range ParseRequirements(report, []string{"R01"}).Lines {
+			if l.ID == "R01" {
+				return l.Verified
+			}
+		}
+		t.Fatalf("no R01 line in %q", report)
+		return false
+	}
+	const red = "REDPROOF R01: TestLogin failed before"
+	for _, neg := range []string{"**none**.", "`TBD`.", "_skipped_.", "[none]", `"none"`, "'n/a'", "<none>", "> none",
+		"/none", "TODO", "to be done", "…", " none"} {
+		if verified(reqBlock(doneR01, "REDPROOF R01: "+neg)) {
+			t.Errorf("REDPROOF %q: verified", neg)
+		}
+		if verified(reqBlock("- R01 · done · a.go:1 · ran: "+neg, red)) {
+			t.Errorf("ran: %q: verified", neg)
+		}
+	}
+	if !verified(reqBlock("- R01 · done · a.go:1 · ran: no failures …", red)) {
+		t.Error("ran: no failures …: not verified")
+	}
+	if !verified(reqBlock(doneR01, "REDPROOF R01: not cached; TestLogin failed before")) {
+		t.Error("REDPROOF R01: not cached; …: not verified")
+	}
+}
