@@ -90,6 +90,9 @@ var toolDefs = []toolDef{
 	{"check_mark", addCheckMark},
 	{"owner_replied", addOwnerReplied},
 	{"heartbeat_get", addHeartbeatGet},
+	{"checklist_init", addChecklistInit},
+	{"checklist_get", addChecklistGet},
+	{"checklist_set", addChecklistSet},
 }
 
 func definitions() []toolDef { return toolDefs }
