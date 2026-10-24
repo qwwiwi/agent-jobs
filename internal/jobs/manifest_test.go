@@ -316,6 +316,36 @@ func manifestScript(t *testing.T, repo, script string) string {
 	return gitT(t, repo, "rev-parse", "HEAD")
 }
 
+// A script committed without the executable bit (100644) is run through /bin/sh: its shebang names no
+// interpreter that exists, so only sh reading it as a script passes, and the copy is not executable.
+func TestManifestScriptWithoutExecBitRunsThroughSh(t *testing.T) {
+	m := acceptanceManager(t, "")
+	repo, _ := gateRepo(t)
+	path := filepath.Join(repo, "scripts", "manifest-check.sh")
+	if err := os.WriteFile(path, []byte("#!/nonexistent/interpreter\necho RAN_BY_SH\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", "scripts/manifest-check.sh")
+	gitT(t, repo, "update-index", "--chmod=-x", "scripts/manifest-check.sh")
+	gitT(t, repo, "commit", "-qm", "manifest-check without the executable bit")
+	sha := gitT(t, repo, "rev-parse", "HEAD")
+	if mode := gitT(t, repo, "ls-tree", sha, "scripts/manifest-check.sh"); !strings.HasPrefix(mode, "100644 ") {
+		t.Fatalf("committed as %q", mode)
+	}
+	approveBrief(t, m, repo)
+	j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s: %s", j.Status, j.Error)
+	}
+	mc, err := m.Store.ManifestCheckByJob(j.ID, j.Attempt)
+	if err != nil || mc == nil || mc.ExitCode != 0 || !strings.Contains(mc.Output, "RAN_BY_SH") {
+		t.Fatalf("record: %+v %v", mc, err)
+	}
+}
+
 // The checkout is the tree at the sha read raw, not a work tree of the repository: a smudge filter of
 // the repository's config never runs, and the script finds no .git leading back to the repository.
 func TestManifestCheckoutRunsNoFilterAndHasNoGit(t *testing.T) {
