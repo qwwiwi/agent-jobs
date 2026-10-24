@@ -110,3 +110,21 @@ func TestChecklistOtherAgentStoreNoVoid(t *testing.T) {
 		t.Fatalf("change from another store: %q", msg)
 	}
 }
+
+// checklist_get redacts the file before parsing it: a secret put into a row by hand never reaches the
+// rows it returns.
+func TestChecklistGetRedactsRows(t *testing.T) {
+	m := newManager(t)
+	repo, _ := gitRepo(t)
+	cs := connect(t, mustServer(t, m))
+	approvedChecklist(t, cs, repo, "demo", "I want a login page.")
+	secret := "ghp_" + strings.Repeat("a1B2", 9)
+	path := checklist.ChecklistPath(repo)
+	text, _ := os.ReadFile(path)
+	writeFile(t, path, strings.Replace(string(text), "| a login page |", "| a login page "+secret+" |", 1))
+	var v ChecklistView
+	call(t, cs, "checklist_get", map[string]any{"repo": repo}, &v)
+	if len(v.Rows) != 1 || strings.Contains(v.Rows[0].Verbatim, secret) || !strings.Contains(v.Rows[0].Verbatim, "[redacted") {
+		t.Fatalf("rows: %+v", v.Rows)
+	}
+}
