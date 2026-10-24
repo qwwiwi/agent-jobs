@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,6 +209,49 @@ func TestJudgeToReleaseCheckEndToEnd(t *testing.T) {
 	r, err = m.ReleaseCheck(repo, sha)
 	if err != nil || r.Pass || !strings.HasPrefix(r.OwnerLine, "Acceptance: 0 of 3, mismatch: approval — ") {
 		t.Fatalf("after the edit: %+v %v", r, err)
+	}
+}
+
+// The wrapper stores a judge's verdict only with the manifest-check record of the same attempt at the
+// judged sha: none, one of an earlier attempt or one of another sha fails the job (fail closed).
+func TestGateStepNeedsManifestRecord(t *testing.T) {
+	m := acceptanceManager(t, "")
+	repo, sha := gateRepo(t)
+	approveBrief(t, m, repo)
+	j := judgeJob(t, m, repo, sha)
+	tok := "tok-" + j.ID
+	if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	b, err := json.Marshal(judgeBlock(j.Gate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := StreamResult{Text: "## Findings / Changes\n```json\n" + string(b) + "\n```\n", Results: 1}
+	if msg := gateStep(m.Store, j.ID, tok, res, m.ChecklistLockDir(), time.Now()); !strings.Contains(msg, "no manifest-check record") {
+		t.Fatalf("without a record: %q", msg)
+	}
+	rec := store.ManifestCheck{JobID: j.ID, Repo: j.Gate.Repo, SHA: strings.Repeat("f", 40), ChecklistID: j.Gate.ChecklistID,
+		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Script: ManifestScript, CreatedAt: time.Now()}
+	if _, err := m.Store.PutManifestCheck(tok, rec); err != nil {
+		t.Fatal(err)
+	}
+	if msg := gateStep(m.Store, j.ID, tok, res, m.ChecklistLockDir(), time.Now()); !strings.Contains(msg, "no manifest-check record") {
+		t.Fatalf("with a record of another sha: %q", msg)
+	}
+	if v, _ := m.Store.VerdictByJob(j.ID, j.Attempt); v != nil {
+		t.Fatalf("verdict stored: %+v", v)
+	}
+	rec.SHA = sha
+	if _, err := m.Store.PutManifestCheck(tok, rec); err != nil {
+		t.Fatal(err)
+	}
+	if msg := gateStep(m.Store, j.ID, tok, res, m.ChecklistLockDir(), time.Now()); msg != "" {
+		t.Fatalf("with the record: %q", msg)
+	}
+	if v, _ := m.Store.VerdictByJob(j.ID, j.Attempt); v == nil || v.ManifestCheck == nil || v.ManifestCheck.SHA != sha {
+		t.Fatalf("verdict: %+v", v)
 	}
 }
 
