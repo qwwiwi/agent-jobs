@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -102,34 +103,57 @@ func idTokens(s string) (ids []string, rest string) {
 	return ids, b.String()
 }
 
-// negativeProofs are first words of a proof or a ran: value that say there is none (dashes split
-// words, so «-», «— none» and «not-run» are negative too; Markdown wrappers are stripped first, so
-// «**none**», «_n/a_» and «`tbd`» are negative too).
-var negativeProofs = []string{"none", "n/a", "na", "n.a", "no", "not", "nothing", "tbd", "skipped", "pending", "missing"}
+// negativeWords are first words of a proof or a ran: value that say there is none («none yet»,
+// «skipped, no time», «TODO: later»).
+var negativeWords = []string{"none", "n/a", "na", "n.a", "nothing", "tbd", "todo", "skipped", "pending", "missing"}
+
+// negativePhrases are first clauses that say there is none, on their own or followed by more words
+// («not run yet»). «no» and «not» alone are negative, a longer clause starting with them is not
+// («no failures before the fix», «not cached»).
+var negativePhrases = []string{"no", "not", "to be done", "not run", "not tested", "not applicable", "not available",
+	"no test", "no tests", "no proof"}
+
+// proofTrim is what is stripped from both ends of a proof and of its first clause: white space (also
+// no-break), Markdown wrappers, brackets, quotes, angle brackets, «>», «/», dashes and punctuation.
+func proofTrim(r rune) bool {
+	return unicode.IsSpace(r) || strings.ContainsRune("*_`~()[]{}<>\"'«»“”„‘’/-–—·.,;:!?…", r)
+}
+
+// proofClauseEnd is a character that ends the first clause of a proof.
+func proofClauseEnd(r rune) bool { return strings.ContainsRune(",;:·()[]–—!?…", r) }
 
 // negativeProof reports a proof content s (the IDs left out) that is empty or says there is none: its
-// first word, Markdown wrappers (*, _, `, ~) and trailing dots stripped, is a negative word or only
-// question marks (any case).
+// first clause, normalized (proofTrim from both ends, hyphens as spaces, any case), is empty, starts
+// with a negative word or is (or starts with) a negative phrase. A longer sentence that merely starts
+// with «no» or «not» is a proof.
 func negativeProof(s string) bool {
-	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
-		switch r {
-		case ' ', '\t', ':', '·', ',', ';', '(', ')', '-', '–', '—', '!':
+	s = strings.TrimFunc(strings.ToLower(s), proofTrim)
+	if i := strings.IndexFunc(s, proofClauseEnd); i >= 0 {
+		s = s[:i]
+	}
+	words := strings.FieldsFunc(strings.ReplaceAll(s, "-", " "), unicode.IsSpace)
+	for i, w := range words {
+		words[i] = strings.TrimFunc(w, proofTrim)
+	}
+	words = slices.DeleteFunc(words, func(w string) bool { return w == "" })
+	if len(words) == 0 {
+		return true
+	}
+	if slices.Contains(negativeWords, words[0]) {
+		return true
+	}
+	clause := strings.Join(words, " ")
+	for _, p := range negativePhrases {
+		if clause == p || p != "no" && p != "not" && strings.HasPrefix(clause, p+" ") {
 			return true
 		}
-		return false
-	}) {
-		w = strings.TrimRight(strings.Trim(w, "*_`~"), ".")
-		if w == "" {
-			continue // only wrappers or dots
-		}
-		return slices.Contains(negativeProofs, w) || strings.Trim(w, "?") == ""
 	}
-	return true
+	return false
 }
 
 // redProof reads a REDPROOF line or field s: the IDs it names and whether it is a proof. It is one only
 // with the exact marker and real content: what is left without the IDs is not a negative proof
-// (negativeProof: empty, none, n/a, tbd, skipped, ?, only dashes, also in Markdown wrappers).
+// (negativeProof: empty, none, n/a, tbd, todo, skipped, ?, only dashes, also wrapped or quoted).
 func redProof(s string) (ids []string, ok bool) {
 	if !redProofRe.MatchString(s) {
 		return nil, false
