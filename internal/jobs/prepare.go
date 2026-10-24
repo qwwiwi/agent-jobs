@@ -343,8 +343,14 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 		if j.Gate == nil {
 			return "", fmt.Errorf("job %s (kind %s) has no gate input", j.ID, j.Kind)
 		}
+		var withheld []string
+		if j.Kind == KindJudge {
+			if _, _, withheld, err = judgeTree(j.Gate.Repo, j.Gate.SHA, skipInJudgeTree); err != nil {
+				return "", fmt.Errorf("judge: list the files at %s: %w", j.Gate.SHA, err)
+			}
+		}
 		fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s%s\n\n%s\n",
-			j.Title, j.ID, j.Kind, gateWorkLine(j), RenderGateInput(j), check, contract)
+			j.Title, j.ID, j.Kind, gateWorkLine(j, withheld), RenderGateInput(j), check, contract)
 		return b.String(), nil
 	}
 	b.WriteString(RenderCards(cards))
