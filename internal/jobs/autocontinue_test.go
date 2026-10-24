@@ -66,7 +66,7 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 	}
 	dir := m.JobDir(j.ID)
 	if r := readFile(t, filepath.Join(dir, AttemptReportName(1))); !strings.Contains(r, "Attempt 1 stopped at its turn limit after 7 turns") ||
-		!strings.Contains(r, "- next: step two") || reportContractNote(r) != "" {
+		!strings.Contains(r, "- next: step two") || reportContractNote(r, nil) != "" {
 		t.Fatalf("stop report of attempt 1:\n%s", r)
 	}
 	tick(t, m)
@@ -276,7 +276,7 @@ func TestReportContractNoteSections(t *testing.T) {
 		"## Summary\nok\n\n## Not done / uncertain\nnothing\n":     "",
 		"intro\n\n## summary\nok\n\n## not done / uncertain\nnone": "",
 	} {
-		if got := reportContractNote(report); got != want {
+		if got := reportContractNote(report, nil); got != want {
 			t.Errorf("%q: %q, want %q", report, got, want)
 		}
 	}

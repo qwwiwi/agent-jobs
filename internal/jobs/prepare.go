@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -185,6 +186,8 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, 
 		for _, p := range append(m.ProtectedPaths(), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
+		// The checklist locks are shared by every agent: a job neither reads nor writes there.
+		parts = append(parts, "--no-read", shellQuote(m.ChecklistLockDir()))
 	}
 	if readOnly != "" {
 		parts = append(parts, "--read-only", shellQuote(readOnly))
@@ -204,9 +207,11 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
 // the guard): a job reads its skills but never changes the catalog through them. A review job's
 // worktree is read-only (--read-only for the guard). The job's session transcript directories are
-// protected through the same deny rules and --protect flags as skills.
+// protected through the same deny rules and --protect flags as skills, and so are a repository job's
+// brief/BRIEF.md and brief/CHECKLIST.md (briefProtected).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
-	protected := append(m.skillProtected(j), m.sessionProtected(j)...)
+	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
+	protected = append(protected, m.ChecklistLockDir())
 	readOnly := ""
 	if j.Kind == "review" {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
@@ -238,6 +243,27 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 	}
 }
 
+// briefProtected are brief/BRIEF.md and brief/CHECKLIST.md in a repository job's worktree (as written
+// and with the job dir's symlinks resolved), Wave F: the orchestrator's checklist tools are their only
+// writers, so a job never creates, edits or removes them. Reads stay allowed.
+func (m *Manager) briefProtected(j *store.Job) []string {
+	if j.RepoPath == "" {
+		return nil
+	}
+	dir := m.JobDir(j.ID)
+	works := []string{filepath.Join(dir, "work")}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		works = append(works, filepath.Join(r, "work"))
+	}
+	var out []string
+	for _, w := range works {
+		for _, rel := range []string{checklist.BriefRel, checklist.ChecklistRel} {
+			out = append(out, filepath.Join(w, filepath.FromSlash(rel)))
+		}
+	}
+	return out
+}
+
 func template(name string) (string, error) {
 	b, err := agentjobs.Templates.ReadFile(name)
 	if err != nil {
@@ -267,7 +293,8 @@ func (m *Manager) readOwnerRules() (string, error) {
 }
 
 // BuildPrompt assembles prompt.md: preamble, subagent rules, owner rules (the job profile), the
-// project cards that match the job's repository, the memory notes, task, kind checklist, report contract.
+// project cards that match the job's repository, the memory notes, task, the covered requirements (a
+// job with covers, F4), kind checklist, report contract.
 func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes) (string, error) {
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
@@ -285,6 +312,14 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if err != nil {
 		return "", err
 	}
+	cover := ""
+	if j.CoverContract != nil {
+		rules, err := template("prompts/requirements.md")
+		if err != nil {
+			return "", err
+		}
+		cover = RenderCoverContract(j.CoverContract, rules)
+	}
 	work := "Your working directory is an empty directory."
 	if j.RepoPath != "" {
 		work = fmt.Sprintf("Your working directory is a git worktree of the repository at base commit %s (detached HEAD). "+
@@ -294,8 +329,8 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
-	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
+	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s\n\n%s\n",
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), cover, check, contract)
 	return b.String(), nil
 }
 
