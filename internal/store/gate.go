@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// GateInput is what the daemon assembled for a gate job (Wave F: the slicing check, F3, and the blind
-// judge, F5): read from the repository's brief/ files when the job was queued, never from the
+// GateInput is what the daemon assembled for a gate job (Wave F: the slicing check, F3, the blind
+// judge, F5, and the briefing, F8): read from the repository's brief/ files when the job was queued, never from the
 // orchestrator. The job's prompt is built from it; the wrapper validates the job's JSON result against it.
 type GateInput struct {
 	// Repo is the repository's main worktree (the key results are stored under); Top the work tree
@@ -200,6 +200,21 @@ CREATE TABLE IF NOT EXISTS gate_verdicts (
 	enforced_blind   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS gate_verdicts_key ON gate_verdicts(repo, sha, checklist_id, version, seq);
+CREATE TABLE IF NOT EXISTS gate_briefing (
+	seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id           TEXT NOT NULL,
+	attempt          INTEGER NOT NULL,
+	repo             TEXT NOT NULL,
+	checklist_id     TEXT NOT NULL,
+	version          INTEGER NOT NULL,
+	checklist_sha256 TEXT NOT NULL,
+	model            TEXT NOT NULL,
+	runner           TEXT NOT NULL,
+	enforced_blind   INTEGER NOT NULL,
+	result           TEXT NOT NULL,
+	created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gate_briefing_key ON gate_briefing(repo, checklist_id, version, checklist_sha256, seq);
 `
 
 // gateColumns are the columns a gate table created by an earlier build of this branch lacks; added on

@@ -53,7 +53,7 @@ const (
 )
 
 // AcceptanceRefusedKinds are the kinds that change no code; acceptance_cmd is refused for them.
-var AcceptanceRefusedKinds = []string{"review", "research", KindSlicing, KindJudge}
+var AcceptanceRefusedKinds = []string{"review", "research", KindSlicing, KindJudge, KindBriefing}
 
 // ValidateAcceptanceCmd checks an acceptance command for a job of kind and returns it trimmed ("" =
 // none): one line (no newline, carriage return or NUL anywhere in the input, also not at either end),

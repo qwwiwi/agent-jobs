@@ -45,7 +45,7 @@ const (
 )
 
 // Kinds of work.
-var Kinds = []string{"review", "fix", "research", "general", KindSlicing, KindJudge}
+var Kinds = []string{"review", "fix", "research", "general", KindSlicing, KindJudge, KindBriefing}
 
 // Config is the per-agent configuration, read from <state>/config.json (all fields optional).
 type Config struct {
@@ -290,7 +290,7 @@ func (c Config) JobDirNoteBytes() int64 {
 // DefaultEffortByKind is the reasoning effort of a claude job of each kind when neither the job nor
 // effort_by_kind names one.
 var DefaultEffortByKind = map[string]string{"review": "high", "research": "high", "fix": "high", "general": "medium",
-	KindSlicing: "high", KindJudge: "high"}
+	KindSlicing: "high", KindJudge: "high", KindBriefing: "high"}
 
 // claudeEffort returns the effort of a claude job: the job's own, else the config's for its kind,
 // else the kind's default.
@@ -581,8 +581,9 @@ var defaultModels = map[string]map[string]string{
 	// The gate kinds (Wave F): a judge for claude coders runs on codex (an explicit gpt-* model). The
 	// default judge model is a claude one, so a default verdict on claude-coded work is same_family:
 	// judge_start warns (JudgeFamilyWarning).
-	KindSlicing: {"light": "sonnet", "normal": "opus", "hard": "fable"},
-	KindJudge:   {"light": "opus", "normal": "opus", "hard": "fable"},
+	KindSlicing:  {"light": "sonnet", "normal": "opus", "hard": "fable"},
+	KindJudge:    {"light": "opus", "normal": "opus", "hard": "fable"},
+	KindBriefing: {"light": "sonnet", "normal": "opus", "hard": "fable"},
 }
 
 // ModelFor returns the model for kind × complexity. The complexity must be stated: there is no

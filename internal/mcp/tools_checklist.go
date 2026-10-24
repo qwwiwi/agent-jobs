@@ -43,6 +43,10 @@ type ChecklistView struct {
 	// Slicing is the slicing check (F3) for the current version and hash (current true), else the
 	// latest one of the checklist id (current false: it does not count); null when none ran.
 	Slicing *jobs.SlicingSummary `json:"slicing"`
+	// ChangedSinceApproval is what differs from the repository's latest approval of this checklist id
+	// when the hash is not the approved one: the owner re-reads and re-approves only these rows (F8).
+	// Null when the hash is the approved one or the id was never approved.
+	ChangedSinceApproval *ApprovalChanges `json:"changed_since_approval"`
 	// Set by checklist_init / checklist_set only.
 	Written        bool     `json:"written,omitempty"`
 	BriefWritten   bool     `json:"brief_written,omitempty"`
@@ -52,6 +56,47 @@ type ChecklistView struct {
 	WaiversAdded   int      `json:"waivers_added,omitempty"`
 	DecisionsAdded int      `json:"unmapped_decisions_added,omitempty"`
 	Warnings       []string `json:"warnings,omitempty"`
+}
+
+// ApprovalChanges is the difference between the checklist as approved and as it is now.
+type ApprovalChanges struct {
+	ApprovedVersion int `json:"approved_version"`
+	// Known is false for an approval stored before its rows were recorded: then every row is to be
+	// re-read, and Rows and BriefChanged say nothing.
+	Known bool                  `json:"known"`
+	Rows  []checklist.RowChange `json:"rows"`
+	// BriefChanged: BRIEF.md differs from the approved one (an Addition since the approval).
+	BriefChanged bool `json:"brief_changed"`
+}
+
+// approvalChanges compares checklist c with the approval last (nil when last approves the same hash or
+// is of another checklist id).
+func approvalChanges(last *store.ChecklistApproval, c *checklist.Checklist, brief []byte, hash string) *ApprovalChanges {
+	if last == nil || last.ChecklistID != c.ID || last.ChecklistSHA256 == hash {
+		return nil
+	}
+	out := &ApprovalChanges{ApprovedVersion: last.Version, Rows: []checklist.RowChange{}}
+	if last.Rows == nil || last.BriefFileSHA256 == "" {
+		return out
+	}
+	approved := make([]checklist.Row, 0, len(last.Rows))
+	for _, r := range last.Rows {
+		approved = append(approved, checklist.Row{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract,
+			PlaceholderOK: r.PlaceholderOK, Rationale: r.Rationale})
+	}
+	out.Known, out.Rows = true, checklist.ChangedRows(approved, c.Rows)
+	out.BriefChanged = last.BriefFileSHA256 != checklist.SHA256Hex(brief)
+	return out
+}
+
+// approvedRows are rows as an approval records them.
+func approvedRows(rows []checklist.Row) []store.GateRow {
+	out := make([]store.GateRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, store.GateRow{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract, PlaceholderOK: r.PlaceholderOK,
+			Rationale: r.Rationale})
+	}
+	return out
 }
 
 // latestApproval is the repository's latest stored approval, as stored and as a checklist.Record (both
@@ -92,6 +137,7 @@ func checklistView(m *jobs.Manager, top, main string, c *checklist.Checklist, br
 	if last != nil {
 		v.ApprovedAt, v.ApprovedVersion, v.ApprovedSHA256 = last.ApprovedAt.UTC().Format(time.RFC3339), last.Version, last.ChecklistSHA256
 	}
+	v.ChangedSinceApproval = approvalChanges(last, c, brief, hash)
 	sl, err := m.SlicingOf(main, c.ID, c.Version, hash)
 	if err != nil {
 		return ChecklistView{}, err
@@ -233,7 +279,10 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 		Description: "The repo's brief checklist: header, rows, live requirements, the hash of the files as they are now, " +
 			"approved (false with a reason when not approved, or when a hashed field, a Rationale or BRIEF.md was edited " +
 			"after the approval), the owner waivers bound to the current hash and slicing: the slicing check (F3) " +
-			"{version, sha256, current, job_id, unmapped, half, invented, decided, undecided, at} (null when none ran).",
+			"{version, sha256, current, job_id, unmapped, half, invented, decided, undecided, at} (null when none ran), and " +
+			"changed_since_approval: the rows added, changed (which fields) or removed since the latest approval of this id and " +
+			"whether BRIEF.md changed (null when the hash is the approved one or the id was never approved): the owner " +
+			"re-approves only those rows.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)
 		if err != nil {
@@ -280,7 +329,10 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			"the version and drops the approval; approve: true records the owner's approval of the result, refused without a " +
 			"slicing check (slicing_start) of that version and hash held to its input (a codex one does not count) or while one of " +
 			"its unmapped quotes has no owner decision (unmapped_decisions); an approval a later slicing check voided is restored " +
-			"only by a new approve, not by decisions alone. Waivers need the " +
+			"only by a new approve, not by decisions alone. Owner replies to a briefing (F8): new scope is a G<nn> row with the " +
+			"owner's words in additions (dated) in the same call; a choice goes into the Rationale of the row it concerns; a " +
+			"cancellation sets the row to dropped with the owner's words in rationale; each raises the version, and " +
+			"changed_since_approval lists the rows the owner re-approves. Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
 		m := d.Manager
@@ -387,7 +439,8 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		// without a stored approval, so not approved (fail closed).
 		if r := res.Record; r != nil {
 			if err := m.Store.PutApproval(store.ChecklistApproval{Repo: main, ChecklistID: r.ChecklistID, Version: r.Version,
-				ChecklistSHA256: r.SHA256, BriefSHA256: r.BriefSHA256, Quote: quote, ApprovedAt: r.At}); err != nil {
+				ChecklistSHA256: r.SHA256, BriefSHA256: r.BriefSHA256, Quote: quote, ApprovedAt: r.At,
+				Rows: approvedRows(res.List.Rows), BriefFileSHA256: checklist.SHA256Hex(res.BriefAfter)}); err != nil {
 				return nil, ChecklistView{}, fmt.Errorf("files written; the approval was not stored, so the checklist is not approved: %w", err)
 			}
 		}
