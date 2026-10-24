@@ -169,7 +169,7 @@ A job's final message is its report, saved as `report.md`. Exactly four sections
 
 «Not done / uncertain» is mandatory and is read first: it makes the job name what it did not do. Progress lists the job's steps, one timestamped line each (`- HH:MM UTC …`); `job_result` returns both sections as `not_done` and `progress`, and `agent-jobs result` prints them before the rest. A report without Progress is not an error. A job that ends without a report is marked `failed`.
 
-**Off-contract reports.** A claude job that ends `succeeded` with a report that has no `## Summary` section keeps its status, but its error says `report has no Summary section: likely stopped mid-task` (the model most likely ended its turn mid-task: its last message says what it would do next); one without `## Not done / uncertain` says `report has no Not done / uncertain section`. The note is on the job-done line and in `job_status` and `job_result` (`error`), and `job_stats` / `agent-jobs stats` count these jobs as `report_off_contract` (column `OFF-CONTRACT`) per group. With `report_contract: fail` in config.json such a job fails with the note instead (default `warn`).
+**Off-contract reports.** A claude job that ends `succeeded` with a report that has no `## Summary` section keeps its status, but its error says `report has no Summary section: likely stopped mid-task` (the model most likely ended its turn mid-task: its last message says what it would do next); one without `## Not done / uncertain` says `report has no Not done / uncertain section`. The note is on the job-done line and in `job_status` and `job_result` (`error`), and `job_stats` / `agent-jobs stats` count these jobs as `report_off_contract` (column `OFF-CONTRACT`) per group. With `report_contract: fail` in config.json such a job fails with the note instead (default `warn`). A job started with `covers` (Wave F) must also have a `### Requirements` block in Findings / Changes; without it the note is `report has no ### Requirements block in Findings / Changes (the job has covers)`, counted the same way. Jobs without `covers` are judged as before.
 
 **Secret redaction.** When a job ends, secret-looking values in its `report.md` are replaced in place with `[redacted:<kind>]`: Anthropic, OpenAI, GitHub, Slack, AWS, Google and Telegram bot tokens, JWTs, PEM private key blocks, `Bearer <token>`, and `key=value` / `"key": "value"` where the key contains `token`, `secret`, `password`, `passwd` or `api_key` and the value is 16+ characters. The original is gone unless `keep_raw_reports: true` keeps it as `report.raw.md` (0600). Values are replaced whole however long they are. Only the first 4 MiB of a report is read and scanned; the rest is replaced by an «unscanned» note. If the rewrite fails (or the daemon dies before it), the job stays `redaction_pending` and every tick retries; `job_result`, `agent-jobs result` and the HTTP API redact the report on the fly anyway. The job-done line, the daemon log, the stats row and the previous-attempt excerpts in a resumed brief are redacted the same way. Git SHAs, UUIDs and short base64 stay. It is a safety net, not a guarantee: `stream.jsonl` and `stderr.log` are kept raw (and archived raw), so the job folder and the archive stay private.
 
@@ -261,16 +261,16 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*), `skills` (edits to the default skills: `+name`, `-name`); returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*), `skills` (edits to the default skills: `+name`, `-name`), `covers` (checklist requirement IDs the job works on, see *Brief checklist*); returns the queued row |
 | `job_status` | status, turns, cost, time |
-| `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome |
+| `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome; for a job with `covers` also `requirements` (its `### Requirements` block, `claimed` done lines, missing lines, the commits' `Requirements:` trailer) |
 | `job_list` | recent jobs, filterable by status |
 | `job_cancel` | cancel: queued at once, running via SIGTERM, then SIGKILL; a stopped job is given up |
 | `job_stop` | stop a queued or running job, keep its worktree and session: status `stopped` (resumable) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with an «Orchestrator update»; limits default to what is left |
 | `job_amend` | append context to a queued job's brief; it keeps its place in the queue |
 | `skill_list` | the skill catalog (`skill_roots`): name, status, one-line description, kinds, size, risk, last verified, uses and success rate, a `stale` flag; `query` = local content search (best 10, with a score); `kind`, `repo`, `status` filters. Orchestrator only |
-| `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate, outcome shares (`unrecorded` = finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended); `since`, `by` = kind \| model \| skill \| effort \| repo (same as `agent-jobs stats --json`) |
+| `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate, outcome shares (`unrecorded` = finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended), `requirements_claimed` / `claimed_jobs` (covered jobs' `done` lines without `ran:` or REDPROOF, Wave F); `since`, `by` = kind \| model \| skill \| effort \| repo (same as `agent-jobs stats --json`) |
 | `job_outcome` | record what you did with a finished job's result: `accepted`, `extended` (used, more work on top), `reworked` (its own work had to be fixed first), `rerun` (again, on another model or brief) or `discarded`, plus an optional note (≤ 300 characters); stored on the job and its stats row, a second call overwrites. Refused for unknown ids, other agents' jobs and queued, running or stopped jobs. Orchestrator only |
 
 **Memory, task and team tools** keep the reference's names and are backed by the team's shared brain (gbrain) instead of a store of their own ([deviations #2, #3](docs/DEVIATIONS.md)). Without a `brain` block in `config.json` each of them answers «brain not configured» and nothing else changes.
@@ -375,6 +375,34 @@ Register both hooks in the orchestrator's Claude Code settings (the `settings.js
 }
 ```
 
+**Brief checklist** (Wave F, built, not released; orchestrator only, closed to jobs). For a LARGE task the owner's words and the numbered requirements live in two files of the project repo's work tree: `brief/BRIEF.md` (the owner's words verbatim after secret redaction, later additions under `## Additions` with the date and the quote) and `brief/CHECKLIST.md`:
+
+```markdown
+# Checklist
+
+- id: shop
+- brief: brief/BRIEF.md
+- version: 3
+- approved: 2026-10-24T09:00:00Z owner sha256:<hex>
+
+| ID | Brief (verbatim) | Contract | Basis |
+|---|---|---|---|
+| R01 | «a login page» | live | brief |
+| R02i | «sessions survive a restart» | live placeholder-ok | implied by R01, owner ok |
+| G01 | «dark mode» | deferred | owner 2026-10-25: «later» |
+| D01 | builds on Go 1.27 | live | build proof |
+```
+
+IDs: `R<nn>` from the brief, `R<nn>i` implied, `G<nn>` added later by the owner (needs an addition in the same call), `D<nn>` a constraint (never counted). A live requirement is an R, Ri or G row with contract `live`. The hash is sha256 over `ID|verbatim|contract|placeholder-ok|basis` of every row plus the sha256 of `BRIEF.md`; the header and text outside the table are not hashed. The tools write files only; committing them is the orchestrator's step.
+
+| tool | what it does |
+|---|---|
+| `checklist_init` | create `brief/BRIEF.md` (the owner's words) and an empty, unapproved `brief/CHECKLIST.md` (version 1) in `repo`; refused when either exists |
+| `checklist_get` | header, rows, `live`, the current `sha256`, `approved` (false with a `reason` when not approved or when a hashed field, a Basis or `BRIEF.md` changed after the approval) and the owner waivers bound to the current hash |
+| `checklist_set` | the only writer of `version`, `approved` and owner waivers: upsert `rows`, append `additions` to `BRIEF.md`, both files in one operation (both or neither), secrets redacted before writing and hashing; a hashed change raises the version and drops the approval, `approve: true` records the owner's approval of the result, `expect_version` refuses a stale call, `waivers` (`requirement`, full `sha`, the owner's `quote`) are stored bound to the approved hash and the sha; warns on fewer than 10 rows from a brief of 1500+ characters |
+
+A job started with `covers: ["R01", "R03i"]` reports one line per covered ID in a `### Requirements` block inside Findings / Changes: `R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>`, and a `REDPROOF` line per new test naming the requirement (`REDPROOF R01 · TestLogin · failed before, passes after`, or a `REDPROOF: …` field on the line itself). A `done` line without `ran:` or without a REDPROOF for its ID is `claimed`, not done: `job_result` lists it under `requirements.claimed`, `job_stats` counts `requirements_claimed` and `claimed_jobs`. A commit trailer `Requirements: R01, R03i` is read from the job's commits and shown as `requirements.trailer` (not enforced).
+
 **Full planned tool set** (from the reference design; see [docs/PLAN.md](docs/PLAN.md)):
 
 | group | orchestrator tools | job gets | status |
@@ -392,6 +420,7 @@ Register both hooks in the orchestrator's Claude Code settings (the `settings.js
 | Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, released in 0.4.0 (Wave B) |
 | Owner | `owner_replied` («owner waits» Stop hook) | none | built, released in 0.4.0 (Wave D) |
 | Heartbeat | `heartbeat_get` (a stored decision) | none | built, released in 0.4.0 (Wave D) |
+| Brief | `checklist_init`, `checklist_get`, `checklist_set` (Wave F) | none | built, not released (Wave F, F1/F2) |
 | Skills | `skill_list` (catalog, content search) | the selected skills, linked into the worktree | built, released in 0.4.0 (Wave E7, job-side part) |
 | Code | code-graph index (separate server) | read and index | research, Wave C |
 
