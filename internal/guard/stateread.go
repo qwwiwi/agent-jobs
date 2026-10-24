@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -56,10 +57,15 @@ type stateReadScope struct {
 
 func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
 	r := &stateReadScope{}
+	unresolved := false
 	for _, p := range []string{cfg.StateDir, cfg.OwnDir} {
 		p = filepath.Clean(p)
 		forms := []string{p}
-		if q := resolvePath(p, "/"); q != p {
+		q, ok := resolveBounded(p, "/")
+		if !ok {
+			unresolved = true // where the root lies is unknown: the scope counts as expired (fail closed)
+		}
+		if q != p {
 			forms = append(forms, q)
 		}
 		if r.state == nil {
@@ -83,6 +89,7 @@ func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
 		}
 	}
 	r.pathScope = newPathScope(scripts, inner)
+	r.expired = r.expired || unresolved
 	r.sequence(scripts)
 	return r
 }
@@ -894,7 +901,10 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 			pat = raw + "/" + pattern
 		}
 		if hasGlob(pat) {
-			return r.glob(tool+" of `"+pattern+"` in `"+path+"`", pat, false)
+			if reason := r.glob(tool+" of `"+pattern+"` in `"+path+"`", pat, false); reason != "" {
+				return reason
+			}
+			return r.unverified(tool + " of `" + pattern + "` in `" + path + "`")
 		}
 		raw = pat
 	}
@@ -906,5 +916,16 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 	if p, ok := r.blocked(raw, raw, tool == "Grep"); ok {
 		return stateBlocked(tool+" of `"+path+"`", p)
 	}
-	return ""
+	return r.unverified(tool + " of `" + path + "`")
+}
+
+// unverified refuses what when a path of the check (the state dir or a target) took more than the
+// symlink resolution budget to resolve: where it lies is unknown, so the read is not allowed.
+func (r *stateReadScope) unverified(what string) string {
+	if !r.expired {
+		return ""
+	}
+	return "blocked by guard: " + what + " runs through more than " + strconv.Itoa(maxLinks) + " symlinks or " +
+		"symlink targets of more than " + strconv.Itoa(maxResolveSteps) + " path components (the path or a " +
+		"directory the job does not read); the guard cannot verify it. Write the real path."
 }

@@ -284,11 +284,11 @@ func walkPath(abs string) (string, bool) {
 }
 
 // unresolvedRoot returns a configured path (the state dir, the job's folder, the read-only worktree,
-// a git dir, a protected path) whose symlinks take more than the resolution budget to resolve: where
-// it physically lies is unknown, so comparing a target with it as written would leave the real
-// location unprotected (fail open). Every write is refused instead.
+// a git dir, a protected path, a NoRead directory) whose symlinks take more than the resolution
+// budget to resolve: where it physically lies is unknown, so comparing a target with it as written
+// would leave the real location unprotected (fail open). Every write is refused instead.
 func unresolvedRoot(cfg Config) (string, bool) {
-	roots := append(append([]string{cfg.StateDir, cfg.OwnDir, cfg.ReadOnly}, cfg.GitDirs...), cfg.Protected...)
+	roots := append(append(append([]string{cfg.StateDir, cfg.OwnDir, cfg.ReadOnly}, cfg.GitDirs...), cfg.Protected...), cfg.NoRead...)
 	for _, p := range roots {
 		if p == "" {
 			continue
@@ -675,7 +675,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					}
 				}
 				pyAll, pyDirs := pythonTreeTargets(name, argv)
-				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || pyAll
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || fdWrites(name, argv) || pyAll
 				for _, d := range pyDirs {
 					if p, ok := s.hit(d, true); ok {
 						if _, in := s.hit(d, false); !in {

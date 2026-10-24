@@ -386,10 +386,34 @@ var dirReaders = map[string]bool{
 // fdExec are the options with which fd runs a command on what it finds (like find -exec).
 var fdExec = []string{"-x", "--exec", "-X", "--exec-batch"}
 
-// fdActs reports an fd/fdfind call that runs a command: an exec option, also as `--exec=…`.
+// fdValueShorts are fd's short options that take a value: in a cluster, the rest of the word is
+// that value (`-tx` is --type x, `-Ex` excludes x), not more options.
+const fdValueShorts = "tedEcjSo"
+
+// fdActs reports an fd/fdfind call that runs a command: an exec option in any spelling, separate
+// (`-x cmd`), joined (`-xcmd`, `--exec=cmd`), last in or inside a flag cluster (`-Hx cmd`,
+// `-Hxcmd`), or as a long-option prefix (`--exe`). Every word is checked, values too (fail closed).
 func fdActs(args []string) bool {
 	return slices.ContainsFunc(args, func(a string) bool {
-		return slices.Contains(fdExec, a) || strings.HasPrefix(a, "--exec=") || strings.HasPrefix(a, "--exec-batch=")
+		if slices.Contains(fdExec, a) {
+			return true
+		}
+		if long, ok := strings.CutPrefix(a, "--"); ok {
+			long, _, _ = strings.Cut(long, "=")
+			return len(long) >= len("exe") && strings.HasPrefix("exec-batch", long)
+		}
+		if !strings.HasPrefix(a, "-") {
+			return false
+		}
+		for _, c := range a[1:] {
+			if c == 'x' || c == 'X' {
+				return true
+			}
+			if strings.ContainsRune(fdValueShorts, c) {
+				return false
+			}
+		}
+		return false
 	})
 }
 
@@ -464,4 +488,10 @@ func pythonTreeTargets(name string, argv []string) (all bool, dirs []string) {
 		}
 	}
 	return false, dirs
+}
+
+// fdWrites reports an fd/fdfind call that runs a command on what it finds: like find with an
+// action, it writes into the tree it searches, ancestors of protected paths included.
+func fdWrites(name string, argv []string) bool {
+	return (name == "fd" || name == "fdfind") && fdActs(argv[1:])
 }
