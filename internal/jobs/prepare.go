@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -204,9 +205,10 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
 // the guard): a job reads its skills but never changes the catalog through them. A review job's
 // worktree is read-only (--read-only for the guard). The job's session transcript directories are
-// protected through the same deny rules and --protect flags as skills.
+// protected through the same deny rules and --protect flags as skills, and so are a repository job's
+// brief/BRIEF.md and brief/CHECKLIST.md (briefProtected).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
-	protected := append(m.skillProtected(j), m.sessionProtected(j)...)
+	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
 	readOnly := ""
 	if j.Kind == "review" {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
@@ -236,6 +238,27 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 			},
 		},
 	}
+}
+
+// briefProtected are brief/BRIEF.md and brief/CHECKLIST.md in a repository job's worktree (as written
+// and with the job dir's symlinks resolved), Wave F: the orchestrator's checklist tools are their only
+// writers, so a job never creates, edits or removes them. Reads stay allowed.
+func (m *Manager) briefProtected(j *store.Job) []string {
+	if j.RepoPath == "" {
+		return nil
+	}
+	dir := m.JobDir(j.ID)
+	works := []string{filepath.Join(dir, "work")}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		works = append(works, filepath.Join(r, "work"))
+	}
+	var out []string
+	for _, w := range works {
+		for _, rel := range []string{checklist.BriefRel, checklist.ChecklistRel} {
+			out = append(out, filepath.Join(w, filepath.FromSlash(rel)))
+		}
+	}
+	return out
 }
 
 func template(name string) (string, error) {
