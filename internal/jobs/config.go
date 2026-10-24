@@ -451,6 +451,14 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if c.SkillsMaxKB < 0 {
 		return c, fmt.Errorf("config.json: skills_max_kb %g must be 0 (default %d) or positive", c.SkillsMaxKB, skills.DefaultMaxKB)
 	}
+	// The daemon, the MCP server and the guard hook run in different directories: a relative path
+	// would name a different file in each (and the hook would protect the wrong one).
+	if c.OwnerRulesPath != "" && !filepath.IsAbs(c.OwnerRulesPath) {
+		return c, fmt.Errorf("config.json: owner_rules_path %q must be an absolute path", c.OwnerRulesPath)
+	}
+	if c.CardsDir != "" && !filepath.IsAbs(c.CardsDir) {
+		return c, fmt.Errorf("config.json: cards_dir %q must be an absolute path", c.CardsDir)
+	}
 	if c.LogArchiveDir != "" && !filepath.IsAbs(c.LogArchiveDir) {
 		return c, fmt.Errorf("config.json: log_archive_dir %q must be an absolute path", c.LogArchiveDir)
 	}
