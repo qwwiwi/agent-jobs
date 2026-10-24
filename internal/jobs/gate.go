@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +29,9 @@ const (
 	KindSlicing = "slicing"
 	KindJudge   = "judge"
 )
+
+// gateIDRe is the checklist id a gate job accepts: it reaches the job's prompt outside the data fences.
+var gateIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // GateKinds are the kinds started only by slicing_start / judge_start; job_start refuses them.
 var GateKinds = []string{KindSlicing, KindJudge}
@@ -119,6 +123,11 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	c, err := checklist.Parse(text)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", checklist.ChecklistRel, err)
+	}
+	if !gateIDRe.MatchString(c.ID) {
+		// The id is written into the gate job's title and input header, outside the data fences.
+		return nil, fmt.Errorf("checklist id %q: a gate job needs an id of letters, digits, '.', '_' or '-' (at most 64)",
+			RedactPrintable(c.ID, 80))
 	}
 	if id := strings.TrimSpace(r.ChecklistID); id != "" && id != c.ID {
 		return nil, fmt.Errorf("checklist_id %q: the repository's checklist is %q", id, c.ID)
@@ -280,10 +289,10 @@ func gateNoRead(j *store.Job) []string {
 var skipInJudgeTree = []string{checklist.BriefRel, checklist.ChecklistRel}
 
 // materializeTree writes the files of commit sha of repo into dst (an empty directory): regular files
-// and symlinks whose target stays inside dst, read with git ls-tree and git cat-file (no checkout, no
+// and symlinks that resolve inside dst, read with git ls-tree and git cat-file (no checkout, no
 // attributes, filters or hooks); submodules, .git paths and the paths in skip are left out. The total
-// size is capped by MaxJudgeTreeBytes.
-func materializeTree(repo, sha, dst string, skip []string) error {
+// size is capped by MaxJudgeTreeBytes. On any error git is killed, never left blocked on a full pipe.
+func materializeTree(repo, sha, dst string, skip []string) (err error) {
 	list, err := gitRaw(repo, "ls-tree", "-r", "-z", "--full-tree", sha)
 	if err != nil {
 		return err
@@ -323,6 +332,10 @@ func materializeTree(repo, sha, dst string, skip []string) error {
 		return fmt.Errorf("git cat-file: %w", err)
 	}
 	defer func() {
+		if err != nil {
+			// git may be blocked writing the rest of a blob nobody reads: end it before waiting.
+			_ = cmd.Process.Kill()
+		}
 		_ = in.Close()
 		_ = cmd.Wait()
 	}()
@@ -375,6 +388,7 @@ func materializeTree(repo, sha, dst string, skip []string) error {
 		}
 	}
 	// Symlinks last (no file is written through one), only those that stay inside dst.
+	var made []string
 	for _, e := range links {
 		var target bytes.Buffer
 		if err := blob(e.obj, &target); err != nil {
@@ -389,6 +403,29 @@ func materializeTree(repo, sha, dst string, skip []string) error {
 			return err
 		}
 		if err := os.Symlink(t, p); err != nil {
+			return err
+		}
+		made = append(made, p)
+	}
+	return dropEscapingLinks(dst, made)
+}
+
+// dropEscapingLinks removes every link in links that, with all links in place, does not resolve inside
+// dst (a chain such as x/l1 -> .. and l2 -> x/l1/../.. passes the lexical check one link at a time) or
+// does not resolve at all.
+func dropEscapingLinks(dst string, links []string) error {
+	root, err := filepath.EvalSymlinks(dst)
+	if err != nil {
+		return err
+	}
+	var drop []string
+	for _, p := range links {
+		if r, err := filepath.EvalSymlinks(p); err != nil || !insideDir(root, r) {
+			drop = append(drop, p)
+		}
+	}
+	for _, p := range drop {
+		if err := os.Remove(p); err != nil {
 			return err
 		}
 	}
@@ -762,6 +799,17 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 		if err != nil {
 			return fail(err)
 		}
+		// Stored under the repository's checklist lock, which checklist_set holds from its slicing check to
+		// the stored approval: a result never lands in between.
+		abs, err := filepath.Abs(jobDir)
+		if err != nil {
+			return fail(err)
+		}
+		unlock, err := lockChecklistAt(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(abs))), checklistLockDirName), j.Gate.GitCommonDir)
+		if err != nil {
+			return fail(err)
+		}
+		defer unlock()
 		if _, err := st.PutSlicing(token, store.SlicingResult{JobID: j.ID, Repo: j.Gate.Repo, ChecklistID: j.Gate.ChecklistID,
 			Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Model: j.Model, Runner: j.Runner,
 			Unmapped: o.Unmapped, Half: o.Half, Invented: o.Invented, CreatedAt: now}); err != nil {

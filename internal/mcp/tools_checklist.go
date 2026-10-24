@@ -353,6 +353,11 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		}
 		decisions, n, err := m.SlicingGate(main, res.List.ID, res.List.Version, res.Hash, in.Approve, given, now)
 		if err != nil {
+			if res.VersionBumped {
+				// The slicing check reads the files as written: the new version must be on disk first.
+				err = fmt.Errorf("%w; this call raises the version (a change or a void approval line): call checklist_set "+
+					"without approve and unmapped_decisions first, then slicing_start on the version it writes", err)
+			}
 			return nil, ChecklistView{}, err
 		}
 		res.Redacted += n
