@@ -48,7 +48,7 @@ func Init(id, words string, redact Redactor) (brief, list []byte, redacted int, 
 // line breaks: a multi-line secret (a PEM block or a fragment of one) is only recognized whole.
 func redactRaw(r Row, redact Redactor) (Row, int) {
 	n := 0
-	for _, f := range []*string{&r.ID, &r.Verbatim, &r.Contract, &r.Basis} {
+	for _, f := range []*string{&r.ID, &r.Verbatim, &r.Contract, &r.Rationale} {
 		var k int
 		*f, k = redact(*f)
 		n += k
@@ -199,7 +199,7 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor, last *Record, bi
 		}
 		r.Verbatim, k = redactField(r.Verbatim, redact)
 		res.Redacted += k
-		r.Basis, k = redactField(r.Basis, redact)
+		r.Rationale, k = redactField(r.Rationale, redact)
 		res.Redacted += k
 		if i := slices.IndexFunc(next.Rows, func(x Row) bool { return x.ID == r.ID }); i >= 0 {
 			next.Rows[i] = r
@@ -218,7 +218,7 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor, last *Record, bi
 		var k int
 		next.Rows[i].Verbatim, k = redactField(next.Rows[i].Verbatim, redact)
 		res.Redacted += k
-		next.Rows[i].Basis, k = redactField(next.Rows[i].Basis, redact)
+		next.Rows[i].Rationale, k = redactField(next.Rows[i].Rationale, redact)
 		res.Redacted += k
 	}
 	res.Hash = Hash(next.Rows, res.BriefAfter)
