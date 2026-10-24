@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // encodeFirstSep percent-encodes the separator after the first component of the absolute path p
@@ -114,5 +115,28 @@ func TestGateRefusesBackgroundBash(t *testing.T) {
 	open.ReadAllow = nil
 	if r := decide(open, map[string]any{"command": "go test ./...", "run_in_background": true}); r != "" {
 		t.Errorf("other kinds, background Bash: %s", r)
+	}
+}
+
+// A word encoded many times over (`%252525…41`) decodes one level per round: the check stays linear and
+// within the guard's time budget, never one recursion per level and form.
+func TestPercentDecodingBounded(t *testing.T) {
+	l := newReadAllowLayout(t)
+	state := l.cfg
+	state.ReadAllow = nil
+	word := "%25" + strings.Repeat("25", 40) + "41"
+	for _, cfg := range []Config{l.cfg, state} {
+		done := make(chan string, 1)
+		go func() { done <- Check("cat "+word+" main.go", cfg) }()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+			t.Fatal("the guard did not decide within 20s")
+		}
+	}
+	// Decoded to the end, the encoded path is checked as written plainly.
+	enc := strings.ReplaceAll(l.otherReport, "/", "%252F")
+	if r := Check("curl -s file://"+enc, l.cfg); r == "" {
+		t.Errorf("allowed: curl -s file://%s", enc)
 	}
 }
