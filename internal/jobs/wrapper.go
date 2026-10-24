@@ -475,7 +475,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before trusted completion says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
-	sw := sweepJob(jobDir, stderrLog)
+	sw := sweepJob(jobDir, stderrLog, false)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
 	}

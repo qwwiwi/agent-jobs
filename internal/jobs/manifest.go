@@ -205,7 +205,7 @@ func manifestStep(ctx context.Context, jobDir, token string, st *store.Store, id
 	}
 	fmt.Fprintf(log, "run-wrapper: manifest-check exit %d after %s\n", exit, dur.Round(time.Second))
 	// The runner has not started: every other process of the session is the script's.
-	if sw := sweepJob(jobDir, log); sw.Incomplete() {
+	if sw := sweepJob(jobDir, log, true); sw.Incomplete() {
 		if err := writeSweepMarker(jobDir, sw); err != nil {
 			fmt.Fprintln(log, "run-wrapper: write sweep marker:", err)
 		}

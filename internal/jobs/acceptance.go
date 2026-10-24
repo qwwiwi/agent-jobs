@@ -303,7 +303,7 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 		fmt.Fprintln(log, "run-wrapper: stopped by a signal during the acceptance command; its process group is ended")
 		return 128 + int(syscall.SIGTERM)
 	}
-	sw := sweepJob(jobDir, log)
+	sw := sweepJob(jobDir, log, false)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(log, "run-wrapper: ended %d leftover process(es) of the acceptance command\n", sw.Signalled)
 	}
