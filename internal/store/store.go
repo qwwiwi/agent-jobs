@@ -163,11 +163,12 @@ type Job struct {
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
-// repository's brief/CHECKLIST.md as they were at job_start (never the other rows, never BRIEF.md).
+// repository's latest approved brief/CHECKLIST.md as they were at job_start (never the other rows,
+// never BRIEF.md).
 type CoverContract struct {
 	ChecklistID string `json:"checklist_id"`
 	Version     int    `json:"version"`
-	// Source says where the checklist was read: "<base>" (committed there) or "work tree".
+	// Source says where the checklist was read: "work tree <path>" (preferred) or "committed at <base>".
 	Source string     `json:"source"`
 	Rows   []CoverRow `json:"rows"`
 }

@@ -68,6 +68,7 @@ func TestReportContractNoteCovers(t *testing.T) {
 func TestEnqueueCovers(t *testing.T) {
 	m := newManager(t)
 	repo := briefRepo(t)
+	approveBrief(t, m, repo)
 	j := enqueue(t, m, "do it", func(r *StartRequest) { r.RepoPath = repo; r.Covers = []string{" R02", "R01", "R02"} })
 	got, err := m.Store.Get(j.ID)
 	if err != nil || !slices.Equal(got.Covers, []string{"R02", "R01"}) {
@@ -88,6 +89,7 @@ func TestEnqueueCovers(t *testing.T) {
 func TestCoversReportContract(t *testing.T) {
 	m := newManager(t)
 	repo := briefRepo(t)
+	approveBrief(t, m, repo)
 	j := runToEnd(t, m, enqueue(t, m, "do the thing", func(r *StartRequest) { r.RepoPath = repo; r.Covers = []string{"R01"} }).ID)
 	if j.Status != store.StatusSucceeded || j.Error != NoteNoRequirements {
 		t.Fatalf("no block: %s %q", j.Status, j.Error)
