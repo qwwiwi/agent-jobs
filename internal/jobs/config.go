@@ -570,7 +570,9 @@ var defaultModels = map[string]map[string]string{
 	"fix":      {"light": "sonnet", "normal": "opus", "hard": "fable"},
 	"research": {"light": "sonnet", "normal": "sonnet", "hard": "opus"},
 	"general":  {"light": "sonnet", "normal": "opus", "hard": "fable"},
-	// The gate kinds (Wave F): a judge for claude coders runs on codex (an explicit gpt-* model).
+	// The gate kinds (Wave F): a judge for claude coders runs on codex (an explicit gpt-* model). The
+	// default judge model is a claude one, so a default verdict on claude-coded work is same_family:
+	// judge_start warns (JudgeFamilyWarning).
 	KindSlicing: {"light": "sonnet", "normal": "opus", "hard": "fable"},
 	KindJudge:   {"light": "opus", "normal": "opus", "hard": "fable"},
 }

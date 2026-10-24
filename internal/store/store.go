@@ -371,6 +371,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: gate results: %w", err)
 	}
+	for _, alter := range gateColumns {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: gate results: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 

@@ -57,18 +57,24 @@ func gateInputJSON(g *GateInput) string {
 // agent-jobs/slicing/v1 block, bound to the checklist id, version and hash it was run on. Written only
 // by the job's wrapper under its launch token.
 type SlicingResult struct {
-	Seq             int64     `json:"seq"`
-	JobID           string    `json:"job_id"`
-	Repo            string    `json:"repo"`
-	ChecklistID     string    `json:"checklist_id"`
-	Version         int       `json:"version"`
-	ChecklistSHA256 string    `json:"checklist_sha256"`
-	Model           string    `json:"model"`
-	Runner          string    `json:"runner"`
-	Unmapped        []Quote   `json:"unmapped"`
-	Half            []Half    `json:"half"`
-	Invented        []Invent  `json:"invented"`
-	CreatedAt       time.Time `json:"created_at"`
+	Seq   int64  `json:"seq"`
+	JobID string `json:"job_id"`
+	// Attempt is the job's attempt that stored the result (read from the job row under the launch
+	// token, never given by the caller): a later attempt of the same job needs its own result.
+	Attempt         int    `json:"attempt"`
+	Repo            string `json:"repo"`
+	ChecklistID     string `json:"checklist_id"`
+	Version         int    `json:"version"`
+	ChecklistSHA256 string `json:"checklist_sha256"`
+	Model           string `json:"model"`
+	Runner          string `json:"runner"`
+	// EnforcedBlind is true when the job ran under the guard's read allowlist (claude); a codex job
+	// has no OS confinement of its reads (ticket 684), so its result is stored with false.
+	EnforcedBlind bool      `json:"enforced_blind"`
+	Unmapped      []Quote   `json:"unmapped"`
+	Half          []Half    `json:"half"`
+	Invented      []Invent  `json:"invented"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // Quote is a brief quote that no row maps (slicing unmapped).
@@ -106,8 +112,10 @@ type SlicingDecision struct {
 // keyed by repo, sha, checklist id and version, judge model and family. Written only by the job's
 // wrapper under its launch token.
 type JudgeVerdict struct {
-	Seq             int64  `json:"seq"`
-	JobID           string `json:"job_id"`
+	Seq   int64  `json:"seq"`
+	JobID string `json:"job_id"`
+	// Attempt is the job's attempt that stored the verdict (as SlicingResult.Attempt).
+	Attempt         int    `json:"attempt"`
 	Repo            string `json:"repo"`
 	SHA             string `json:"sha"`
 	ChecklistID     string `json:"checklist_id"`
@@ -116,9 +124,13 @@ type JudgeVerdict struct {
 	JudgeModel      string `json:"judge_model"`
 	JudgeRunner     string `json:"judge_runner"`
 	JudgeFamily     string `json:"judge_family"`
+	// EnforcedBlind: as SlicingResult.EnforcedBlind (false for a codex judge).
+	EnforcedBlind bool `json:"enforced_blind"`
 	// CoderFamilies are the model families of the feature jobs (fix, general) whose covers name this
 	// checklist id, CoderJobs those jobs; FamilyDiffers is true only when there is at least one and none
 	// shares the judge's family; SameFamily when one does (stored, flagged: it cannot pass release_check).
+	// Both are a snapshot of the cover jobs when the verdict was stored: a later coder job does not
+	// change them, so release_check (F7) recomputes them.
 	CoderFamilies []string `json:"coder_families"`
 	CoderJobs     []string `json:"coder_jobs"`
 	FamilyDiffers bool     `json:"family_differs"`
@@ -145,7 +157,9 @@ CREATE TABLE IF NOT EXISTS gate_slicing (
 	model            TEXT NOT NULL,
 	runner           TEXT NOT NULL,
 	result           TEXT NOT NULL,
-	created_at       INTEGER NOT NULL
+	created_at       INTEGER NOT NULL,
+	attempt          INTEGER NOT NULL DEFAULT 0,
+	enforced_blind   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS gate_slicing_key ON gate_slicing(repo, checklist_id, version, checklist_sha256, seq);
 CREATE TABLE IF NOT EXISTS slicing_decisions (
@@ -176,10 +190,21 @@ CREATE TABLE IF NOT EXISTS gate_verdicts (
 	manifest_check   TEXT,
 	counts           TEXT NOT NULL,
 	verdict          TEXT NOT NULL,
-	created_at       INTEGER NOT NULL
+	created_at       INTEGER NOT NULL,
+	attempt          INTEGER NOT NULL DEFAULT 0,
+	enforced_blind   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS gate_verdicts_key ON gate_verdicts(repo, sha, checklist_id, version, seq);
 `
+
+// gateColumns are the columns a gate table created by an earlier build of this branch lacks; added on
+// every Open (a column already there is no error).
+var gateColumns = []string{
+	`ALTER TABLE gate_slicing ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE gate_slicing ADD COLUMN enforced_blind INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE gate_verdicts ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE gate_verdicts ADD COLUMN enforced_blind INTEGER NOT NULL DEFAULT 0`,
+}
 
 // ErrGateIncomplete is a gate record without its key fields.
 var ErrGateIncomplete = errors.New("gate record needs job, repo, checklist id, version and hash")
@@ -187,14 +212,14 @@ var ErrGateIncomplete = errors.New("gate record needs job, repo, checklist id, v
 // ErrNotRunningLaunch is a gate write whose job is not running under the launch token given.
 var ErrNotRunningLaunch = errors.New("the job is not running under this launch token")
 
-// runningUnder checks, inside tx, that job id runs under token.
-func runningUnder(tx *sql.Tx, id, token string) error {
-	var one int
-	err := tx.QueryRow(`SELECT 1 FROM jobs WHERE id=? AND status='running' AND launch_token=? AND launch_token<>''`, id, token).Scan(&one)
+// runningUnder checks, inside tx, that job id runs under token, and returns the attempt it runs.
+func runningUnder(tx *sql.Tx, id, token string) (int, error) {
+	var attempt int
+	err := tx.QueryRow(`SELECT attempt FROM jobs WHERE id=? AND status='running' AND launch_token=? AND launch_token<>''`, id, token).Scan(&attempt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotRunningLaunch
+		return 0, ErrNotRunningLaunch
 	}
-	return err
+	return attempt, err
 }
 
 // PutSlicing stores a slicing result for the running launch token of its job (the wrapper's write).
@@ -215,12 +240,13 @@ func (s *Store) PutSlicing(token string, r SlicingResult) (int64, error) {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := runningUnder(tx, r.JobID, token); err != nil {
+	attempt, err := runningUnder(tx, r.JobID, token)
+	if err != nil {
 		return 0, fmt.Errorf("put slicing result: %w", err)
 	}
-	res, err := tx.Exec(`INSERT INTO gate_slicing (job_id, repo, checklist_id, version, checklist_sha256, model, runner, result,
-		created_at) VALUES (?,?,?,?,?,?,?,?,?)`, r.JobID, r.Repo, r.ChecklistID, r.Version, r.ChecklistSHA256, r.Model, r.Runner,
-		string(lists), r.CreatedAt.Unix())
+	res, err := tx.Exec(`INSERT INTO gate_slicing (job_id, attempt, repo, checklist_id, version, checklist_sha256, model, runner,
+		enforced_blind, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, r.JobID, attempt, r.Repo, r.ChecklistID, r.Version,
+		r.ChecklistSHA256, r.Model, r.Runner, r.EnforcedBlind, string(lists), r.CreatedAt.Unix())
 	if err != nil {
 		return 0, fmt.Errorf("put slicing result: %w", err)
 	}
@@ -238,14 +264,15 @@ func nonNil[T any](s []T) []T {
 	return s
 }
 
-const slicingCols = `seq, job_id, repo, checklist_id, version, checklist_sha256, model, runner, result, created_at`
+const slicingCols = `seq, job_id, attempt, repo, checklist_id, version, checklist_sha256, model, runner, enforced_blind, result,
+	created_at`
 
 func scanSlicing(r scanner) (*SlicingResult, error) {
 	var out SlicingResult
 	var lists string
 	var at int64
-	if err := r.Scan(&out.Seq, &out.JobID, &out.Repo, &out.ChecklistID, &out.Version, &out.ChecklistSHA256, &out.Model,
-		&out.Runner, &lists, &at); err != nil {
+	if err := r.Scan(&out.Seq, &out.JobID, &out.Attempt, &out.Repo, &out.ChecklistID, &out.Version, &out.ChecklistSHA256,
+		&out.Model, &out.Runner, &out.EnforcedBlind, &lists, &at); err != nil {
 		return nil, err
 	}
 	var l struct {
@@ -288,9 +315,31 @@ func (s *Store) SlicingFor(repo, id string, version int, sha256 string) (*Slicin
 	return r, nil
 }
 
-// SlicingByJob is the slicing result a job stored (nil = none).
-func (s *Store) SlicingByJob(jobID string) (*SlicingResult, error) {
-	r, err := scanSlicing(s.db.QueryRow(`SELECT `+slicingCols+` FROM gate_slicing WHERE job_id=? ORDER BY seq DESC LIMIT 1`, jobID))
+// SlicingResultsFor are all slicing results of checklist id in repo run on that version and hash,
+// oldest first: the approval rule takes the unmapped quotes of every one of them.
+func (s *Store) SlicingResultsFor(repo, id string, version int, sha256 string) ([]*SlicingResult, error) {
+	rows, err := s.db.Query(`SELECT `+slicingCols+` FROM gate_slicing WHERE repo=? AND checklist_id=? AND version=?
+		AND checklist_sha256=? ORDER BY seq`, repo, id, version, sha256)
+	if err != nil {
+		return nil, fmt.Errorf("slicing results: %w", err)
+	}
+	defer rows.Close()
+	var out []*SlicingResult
+	for rows.Next() {
+		r, err := scanSlicing(rows)
+		if err != nil {
+			return nil, fmt.Errorf("slicing results: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SlicingByJob is the slicing result attempt of a job stored (nil = none): a result of an earlier
+// attempt is not this attempt's.
+func (s *Store) SlicingByJob(jobID string, attempt int) (*SlicingResult, error) {
+	r, err := scanSlicing(s.db.QueryRow(`SELECT `+slicingCols+` FROM gate_slicing WHERE job_id=? AND attempt=? ORDER BY seq DESC
+		LIMIT 1`, jobID, attempt))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -360,14 +409,15 @@ func (s *Store) PutVerdict(token string, v JudgeVerdict) (int64, error) {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := runningUnder(tx, v.JobID, token); err != nil {
+	attempt, err := runningUnder(tx, v.JobID, token)
+	if err != nil {
 		return 0, fmt.Errorf("put verdict: %w", err)
 	}
-	res, err := tx.Exec(`INSERT INTO gate_verdicts (job_id, repo, sha, checklist_id, version, checklist_sha256, judge_model,
-		judge_runner, judge_family, coder_families, coder_jobs, family_differs, same_family, manifest_check, counts, verdict,
-		created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.JobID, v.Repo, v.SHA, v.ChecklistID, v.Version,
-		v.ChecklistSHA256, v.JudgeModel, v.JudgeRunner, v.JudgeFamily, string(families), string(coders), v.FamilyDiffers,
-		v.SameFamily, manifest, string(counts), string(verdict), v.CreatedAt.Unix())
+	res, err := tx.Exec(`INSERT INTO gate_verdicts (job_id, attempt, repo, sha, checklist_id, version, checklist_sha256, judge_model,
+		judge_runner, judge_family, enforced_blind, coder_families, coder_jobs, family_differs, same_family, manifest_check, counts,
+		verdict, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.JobID, attempt, v.Repo, v.SHA, v.ChecklistID,
+		v.Version, v.ChecklistSHA256, v.JudgeModel, v.JudgeRunner, v.JudgeFamily, v.EnforcedBlind, string(families), string(coders),
+		v.FamilyDiffers, v.SameFamily, manifest, string(counts), string(verdict), v.CreatedAt.Unix())
 	if err != nil {
 		return 0, fmt.Errorf("put verdict: %w", err)
 	}
@@ -378,16 +428,16 @@ func (s *Store) PutVerdict(token string, v JudgeVerdict) (int64, error) {
 	return seq, tx.Commit()
 }
 
-const verdictCols = `seq, job_id, repo, sha, checklist_id, version, checklist_sha256, judge_model, judge_runner, judge_family,
-	coder_families, coder_jobs, family_differs, same_family, manifest_check, counts, verdict, created_at`
+const verdictCols = `seq, job_id, attempt, repo, sha, checklist_id, version, checklist_sha256, judge_model, judge_runner,
+	judge_family, enforced_blind, coder_families, coder_jobs, family_differs, same_family, manifest_check, counts, verdict, created_at`
 
 func scanVerdict(r scanner) (*JudgeVerdict, error) {
 	var v JudgeVerdict
 	var families, coders, counts, verdict string
 	var manifest sql.NullString
 	var at int64
-	if err := r.Scan(&v.Seq, &v.JobID, &v.Repo, &v.SHA, &v.ChecklistID, &v.Version, &v.ChecklistSHA256, &v.JudgeModel,
-		&v.JudgeRunner, &v.JudgeFamily, &families, &coders, &v.FamilyDiffers, &v.SameFamily, &manifest, &counts, &verdict, &at); err != nil {
+	if err := r.Scan(&v.Seq, &v.JobID, &v.Attempt, &v.Repo, &v.SHA, &v.ChecklistID, &v.Version, &v.ChecklistSHA256, &v.JudgeModel,
+		&v.JudgeRunner, &v.JudgeFamily, &v.EnforcedBlind, &families, &coders, &v.FamilyDiffers, &v.SameFamily, &manifest, &counts, &verdict, &at); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(families), &v.CoderFamilies); err != nil {
@@ -429,9 +479,10 @@ func (s *Store) LatestVerdict(repo, id, sha string) (*JudgeVerdict, error) {
 	return v, nil
 }
 
-// VerdictByJob is the verdict a job stored (nil = none).
-func (s *Store) VerdictByJob(jobID string) (*JudgeVerdict, error) {
-	v, err := scanVerdict(s.db.QueryRow(`SELECT `+verdictCols+` FROM gate_verdicts WHERE job_id=? ORDER BY seq DESC LIMIT 1`, jobID))
+// VerdictByJob is the verdict attempt of a job stored (nil = none).
+func (s *Store) VerdictByJob(jobID string, attempt int) (*JudgeVerdict, error) {
+	v, err := scanVerdict(s.db.QueryRow(`SELECT `+verdictCols+` FROM gate_verdicts WHERE job_id=? AND attempt=? ORDER BY seq DESC
+		LIMIT 1`, jobID, attempt))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

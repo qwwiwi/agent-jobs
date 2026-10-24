@@ -120,7 +120,7 @@ const usage = `usage: agent-jobs <command> [flags]
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -254,7 +254,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -271,6 +271,8 @@ func runWrapper(args []string) int {
 			opts.FallbackSession = rest[1]
 		case "--runner":
 			opts.Runner = rest[1]
+		case "--checklist-lock-dir":
+			opts.ChecklistLockDir = rest[1]
 		default:
 			fmt.Fprintln(os.Stderr, u)
 			return 2
@@ -305,6 +307,8 @@ func runGuard(args []string, stdin io.Reader) int {
 	var noRead multi
 	fs.Var(&noRead, "no-read", "a directory a job never reads or writes, like the agent state (repeatable)")
 	readOnly := fs.String("read-only", "", "the worktree of a review job: no tool call writes inside it")
+	var readAllow multi
+	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -325,7 +329,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	}
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
-		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly,
+		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
