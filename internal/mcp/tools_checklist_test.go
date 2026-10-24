@@ -84,6 +84,7 @@ func TestChecklistToolsFlow(t *testing.T) {
 		"waivers": []map[string]any{{"requirement": "R01", "sha": head, "quote": "ok"}}}); !strings.Contains(msg, "approved checklist") {
 		t.Fatalf("waiver before approval: %q", msg)
 	}
+	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes " + secret, "expect_version": 2}, &v)
 	if !v.Approved || v.Version != 2 || v.ApprovedSHA256 != v.SHA256 || v.ApprovedAt != "2026-10-24T09:00:00Z" || v.ApprovedVersion != 2 || v.Redacted != 1 {
 		t.Fatalf("approve: %+v", v)
@@ -132,6 +133,7 @@ func TestChecklistToolsFlow(t *testing.T) {
 		t.Fatalf("stored approval: %+v %v", a, err)
 	}
 	// Re-approving version 3 makes it the latest; the waivers of version 2 do not carry over.
+	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "ok"}, &v)
 	if !v.Approved || v.ApprovedVersion != 3 || len(v.Waivers) != 0 {
 		t.Fatalf("approve v3: %+v", v)
@@ -179,6 +181,7 @@ func TestChecklistForgedApprovalRefused(t *testing.T) {
 	}
 	writeFile(t, path, string(text))
 
+	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes, that is it"}, &v)
 	if !v.Approved || v.ApprovedVersion != 2 {
 		t.Fatalf("approve: %+v", v)

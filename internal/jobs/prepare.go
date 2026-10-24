@@ -143,13 +143,13 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 // GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
 // without a subagent log (every subagent refused). Jobs get JobGuardCommand.
 func (m *Manager) GuardCommand(gitDirs ...string) string {
-	return m.guardCommand("", "", nil, gitDirs...)
+	return m.guardCommand("", "", nil, nil, gitDirs...)
 }
 
 // JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
 // guard.MaxSubagentsPerJob subagents per job.
 func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
-	return m.guardCommand(id, "", m.skillProtected(nil), gitDirs...)
+	return m.guardCommand(id, "", m.skillProtected(nil), nil, gitDirs...)
 }
 
 // ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
@@ -165,8 +165,9 @@ func (m *Manager) SubagentLogPath(id string) string {
 	return filepath.Join(m.StateDir, "subagents", id+".log")
 }
 
-// guardCommand builds the hook command line; readOnly is the worktree of a review job ("" = none).
-func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, gitDirs ...string) string {
+// guardCommand builds the hook command line; readOnly is the work dir of a read-only kind ("" = none),
+// extraNoRead are directories the job never reads (a gate job's repository).
+func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRead []string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Config().OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -188,6 +189,9 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, 
 		}
 		// The checklist locks are shared by every agent: a job neither reads nor writes there.
 		parts = append(parts, "--no-read", shellQuote(m.ChecklistLockDir()))
+		for _, p := range extraNoRead {
+			parts = append(parts, "--no-read", shellQuote(p))
+		}
 	}
 	if readOnly != "" {
 		parts = append(parts, "--read-only", shellQuote(readOnly))
@@ -205,18 +209,19 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The subagent tool (Agent, formerly Task) is not denied: a job may use up to three subagents, which
 // run inside the job's process, under these settings and this hook, within the job's limits.
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
-// the guard): a job reads its skills but never changes the catalog through them. A review job's
-// worktree is read-only (--read-only for the guard). The job's session transcript directories are
+// the guard): a job reads its skills but never changes the catalog through them. The work dir of a
+// review job (its worktree) and of a gate job (Wave F) is read-only (--read-only for the guard), and a
+// gate job never reads its repository (--no-read, gateNoRead). The job's session transcript directories are
 // protected through the same deny rules and --protect flags as skills, and so are a repository job's
 // brief/BRIEF.md and brief/CHECKLIST.md (briefProtected).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
 	protected = append(protected, m.ChecklistLockDir())
 	readOnly := ""
-	if j.Kind == "review" {
+	if readOnlyKind(j.Kind) {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
 	}
-	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gitDirs...), skillDenyRules(protected)...)
+	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), gitDirs...), skillDenyRules(protected)...)
 }
 
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
@@ -224,7 +229,7 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 	if kind != "research" {
 		deny = append(deny, webTools...)
 	}
-	if kind == "review" {
+	if readOnlyKind(kind) {
 		deny = append(deny, reviewWriteRules...)
 	}
 	return map[string]any{
@@ -327,6 +332,15 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
+	if IsGateKind(j.Kind) {
+		// A gate job's input is the daemon's (Wave F): never the brief column, cards or memory notes.
+		if j.Gate == nil {
+			return "", fmt.Errorf("job %s (kind %s) has no gate input", j.ID, j.Kind)
+		}
+		fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s%s\n\n%s\n",
+			j.Title, j.ID, j.Kind, gateWorkLine(j), RenderGateInput(j), check, contract)
+		return b.String(), nil
+	}
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s\n\n%s\n",
@@ -372,14 +386,17 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err != nil {
 		return err
 	}
-	cards, err := m.CardsFor(j.RepoPath)
-	if err != nil {
-		return err
-	}
-	// Memory notes never block the job: an unreachable brain is written into the brief instead.
-	notes := m.LookupMemoryNotes(j)
-	if notes.Err != nil {
-		m.Log.Printf("job %s: memory notes unavailable: %v", j.ID, notes.Err)
+	var cards []Card
+	var notes MemoryNotes
+	if !IsGateKind(j.Kind) {
+		if cards, err = m.CardsFor(j.RepoPath); err != nil {
+			return err
+		}
+		// Memory notes never block the job: an unreachable brain is written into the brief instead.
+		notes = m.LookupMemoryNotes(j)
+		if notes.Err != nil {
+			m.Log.Printf("job %s: memory notes unavailable: %v", j.ID, notes.Err)
+		}
 	}
 	prompt, err := m.BuildPrompt(j, rules, cards, notes)
 	if err != nil {
@@ -410,6 +427,15 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if j.RepoPath == "" {
 		if err := os.MkdirAll(work, 0o700); err != nil {
 			return err
+		}
+		if j.Kind == KindJudge {
+			// The judge's code: the files at the sha, nothing of the repository's history or other work.
+			if j.Gate == nil {
+				return fmt.Errorf("judge job %s has no gate input", j.ID)
+			}
+			if err := materializeTree(j.Gate.Repo, j.Gate.SHA, work, skipInJudgeTree); err != nil {
+				return fmt.Errorf("judge: copy the files at %s: %w", j.Gate.SHA, err)
+			}
 		}
 		if err := m.deliverSkills(j, token, work); err != nil {
 			return err

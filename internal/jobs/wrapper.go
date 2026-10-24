@@ -34,7 +34,9 @@ type StreamResult struct {
 	TokensInvalid      bool
 	ReportPresent      bool
 	ReportContractNote string
-	ReportText         string `json:"-"` // last report from trusted assistant stdout
+	// GateFailure is why a gate job's result was rejected and not stored ("" = stored, or not a gate job).
+	GateFailure string
+	ReportText  string `json:"-"` // last report from trusted assistant stdout
 
 	Found   bool
 	Subtype string
@@ -486,6 +488,10 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if code == 0 && terminalOK && !sw.Incomplete() && hasReport(jobDir) {
 		if rc := runAcceptanceStep(jobDir, token, stderrLog, &res); rc != 0 {
 			return rc
+		}
+		// A gate job's result (Wave F) is validated and stored here, by the wrapper, never by the orchestrator.
+		if res.GateFailure = gateStep(st, id, token, jobDir, time.Now()); res.GateFailure != "" {
+			fmt.Fprintln(stderrLog, "run-wrapper:", res.GateFailure)
 		}
 	}
 	if sw.Incomplete() {

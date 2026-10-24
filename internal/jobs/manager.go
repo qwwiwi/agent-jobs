@@ -146,6 +146,8 @@ type StartRequest struct {
 	// Covers are the checklist requirement IDs the job works on (Wave F, F4): its report must then
 	// carry a «### Requirements» block with one line per ID.
 	Covers []string
+	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
+	Gate *store.GateInput
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -296,6 +298,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if !slices.Contains(Kinds, r.Kind) {
 		return nil, fmt.Errorf("kind %q must be one of %s", r.Kind, strings.Join(Kinds, "|"))
 	}
+	if err := checkGateRequest(r); err != nil {
+		return nil, err
+	}
 	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -370,11 +375,12 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 	}
 	var selected []string
+	// A gate job gets nothing but its input: no catalog skills (checkGateRequest refused edits).
 	if skills.BriefDeclinesSkills(r.Brief) {
 		if len(r.Skills) > 0 {
 			return nil, errors.New("skills: none conflicts with skills edits; omit the edits or remove the no-skills line")
 		}
-	} else {
+	} else if r.Gate == nil {
 		selected, err = m.selectSkills(r.Kind, repo, r.Skills)
 		if err != nil {
 			return nil, err
@@ -387,7 +393,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers, CoverContract: cover,
+		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate,
 	}
 	return j, nil
 }
