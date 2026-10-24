@@ -135,19 +135,86 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 - Monitors are experimental and work only in interactive sessions. They are never the only channel.
 - `asyncRewake` hooks are subject to timeouts and may not wake a session in every client; the next-prompt summary stays the floor.
 
+## Wave F: brief-acceptance gate
+
+*Status: approved 2026-10-24, not built.* Owner decisions of 2026-10-24 in [DECISIONS.md](DECISIONS.md); the items that diverge from the reference have a «proposed» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-wave-f). Takes ideas I1 (requirement ledger), I2 (blind acceptance job) and the REDPROOF and placeholder parts of I5 from «Ideas» below.
+
+**Goal.** For large work, the owner's words become a numbered checklist that the owner approves once. Every job reports against that checklist, a blind judge checks the code at a given sha against the brief, and merge or deploy happens only at 100% acceptance. Nothing the owner asked for is lost or reinterpreted on the way. The gate is held by hooks and tools, not by the orchestrator's memory.
+
+**Large vs small.** The orchestrator decides the size. LARGE = a new project, or a feature with more than 5 requirements, several jobs or more than a day of work; it goes through the brief flow below. SMALL (a fix, a single job) keeps the current pipeline. The owner can override («with brief» / «without brief»). A small task that grows is moved to the brief flow, and the owner is told.
+
+**Owner flow.** The owner tells the brief by voice or text; answers one or two rounds of questions (at most 4 per round, each with a recommended answer, so «ok» is a full reply); approves the checklist once; at the end gets one line «Acceptance: N of N» plus a link or a screenshot.
+
+**Files in the project repo.** Only two: `brief/BRIEF.md`, the owner's words verbatim (verbatim after secret redaction, F2), never edited, later additions appended under `## Additions` with the date and the quote; and `brief/CHECKLIST.md`, the numbered requirements. Nothing else goes into the project repo: job reports, verdicts and progress stay in the agent-jobs store. No dashboard for now.
+
+**Merge rule.** A LARGE task is merged or deployed only at 100% acceptance on the approved checklist, or with an explicit owner waiver per requirement (F7: one waiver covers one requirement with any verdict other than `met`, at one checklist hash and one sha).
+
+**Pack 1.**
+
+- **F1. CHECKLIST.md format.** A header (checklist id, brief file, version, and `approved: <time> owner sha256:<hex>`, written only by the tool) and a table `| ID | Brief (verbatim) | Contract | Basis |`.
+  - ID prefixes: `R` (from the brief), `Ri` (implied; the owner approves it), `G` (added later by the owner, also appended to the BRIEF `## Additions`), `D` (a constraint proven by a build; not counted in the 100%). Agent ideas (`A`) never enter the checklist; they live only in job reports, each with a parent `R`.
+  - A **live requirement** is an `R`, `Ri` or `G` row with contract `live`. Only live requirements count in the 100%: `D` rows never do, `deferred` and `dropped` rows neither.
+  - Contract: `live`, `deferred` or `dropped`, plus an optional `placeholder-ok`. Only the owner can drop or defer, with a quote in Basis.
+  - Hash: sha256 over the normalized contract fields of every row (`ID|verbatim|contract|placeholder-ok|basis`) plus the sha256 of `BRIEF.md`. Basis is hashed because it holds the owner's fork decisions and the drop or defer quotes. Progress is not in the file and is not hashed; it is computed in the store.
+  - Rule of thumb: one row = one thing that can be true or false on its own. Fewer than 10 rows from a long brief is a retelling, not a checklist, and `checklist_set` warns.
+- **F2. Checklist tools.** MCP tools `checklist_init`, `checklist_get`, `checklist_set`. `checklist_set` is the only writer of `version` and `approved`, and of owner waivers (F7); a manual edit of a hashed field (F1) voids the approval. It writes the BRIEF `## Additions` and the CHECKLIST in one operation. Secret redaction (Wave D) runs over BRIEF and CHECKLIST before writing and hashing: BRIEF is committed, so a secret must never reach the file; the hash is over the files as written, and «verbatim» means verbatim after redaction. The tools are closed to the job role unless opened on purpose (allowlist rule). DEVIATIONS F2.
+- **F3. Slicing check before the owner approves.** A separate read-only job gets BRIEF and CHECKLIST only and returns three lists: `unmapped` (brief quotes that are in no `R`), `half` (quotes only partly covered), `invented` (rows the brief does not support). The owner approves only with an empty `unmapped`, or with an explicit decision per line.
+- **F4. Requirements in job reports.** `job_start` takes `covers:[R..]`. Findings / Changes must contain a `### Requirements` block, one line per covered requirement: `R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>`, plus a `REDPROOF` line for each new test (it failed before the code). A missing block = `report_off_contract`. `done` without `ran:` or without a REDPROOF counts as `claimed`, not done. Commit trailer `Requirements: R01, R03i`. DEVIATIONS F4.
+- **F5. Kind `acceptance` (blind judge).** Working name; the final name must differ from `acceptance_cmd` (see Risks). Read-only. Gets the full `BRIEF.md` (with Additions), the checklist rows (ID, verbatim, contract, Basis), the manifest-check output and the code at the sha; never job briefs, reports or diffs. A model family different from the coders is required for `release_check` (a codex judge for Claude coders); a same-family verdict is stored but cannot pass F7. DEVIATIONS F5.
+  - Manifest-check step: before the judge starts, the wrapper of the `acceptance` job runs `scripts/manifest-check.sh` (F6) in the job's worktree at the sha, the way it runs `acceptance_cmd` (#18: the job's own containment, a scrubbed environment, no guard), records its exit code and output tail in the store with the job, and passes the output to the judge; F7 reads that record. This is a new wrapper step, not #18 itself: `acceptance_cmd` runs after claude exits, only for fix and general jobs, and is refused for read-only kinds. Like #18 it is off unless config `acceptance_allowed` is true; without it the job fails before the judge starts, so nothing is recorded and `release_check` cannot pass.
+  - Verdict: structured JSON written to the store by the wrapper, not by the orchestrator: `{checklist {id, sha256, version}, repo, sha, ran[], could_not_run, requirements[{id, verdict met|partial|missing|placeholder|cannot_check, how ran|read, evidence}], unmapped_brief[], extra_scope[], suspect_tests[]}`.
+  - The wrapper validates it: every live requirement exactly once, the hash equals the approved one, the sha equals HEAD. An invalid verdict fails the job.
+  - Judge rules: reading code shows intent, running it shows the result; formally present but not working in substance = `partial`; facts only, no opinions on quality; name every brief quote that no requirement covers; stop one step before anything is sent outside.
+
+**Pack 2.**
+
+- **F6. `scripts/manifest-check.sh` in target repos.** A file in the target repo, also wired into the repo's `check.sh` (and usable as a fix or general job's `acceptance_cmd`, #18). The run that counts for the gate is the one the `acceptance` wrapper makes at the sha before the judge (F5). Tests are tagged with the requirement ID (`[Rnn]`: `[R01]`, `[R03i]`, `[G02]`); every live requirement needs at least one tagged test that actually passed in this run; otherwise the script exits non-zero.
+- **F7. `release_check(repo, sha)`.** PASS only if all hold: the checklist is approved and its hash unchanged; the acceptance job's manifest-check record for this sha (F5) has exit 0 and an acceptance verdict exists for this sha; every live requirement is `met` (or `placeholder` where the row is `placeholder-ok`) or has an owner waiver; `unmapped_brief` and `suspect_tests` are empty; the judge's model family differs from the coders'; the trace holds both ways (every live requirement is in some feature job's `covers`, every feature job covers at least one requirement). The owner gets one line: «Acceptance: 22 of 23, mismatch: R03i — …». DEVIATIONS F7.
+  - A **feature job** is a `fix` or `general` job started with `size: large` for the repo (the kinds that change code; F9 (a)).
+  - A **waiver** is the owner's, per requirement, for any verdict other than `met` (`partial`, `missing`, `placeholder` without `placeholder-ok`, `cannot_check`), as the Merge rule allows. It is kept in the agent-jobs store, not in the repo, written only by `checklist_set` with the owner's quote, and bound to the checklist hash and the sha: a new checklist version or another sha voids it.
+
+**Pack 3.**
+
+- **F8. Kind `briefing`.** Read-only. Input: BRIEF and the draft CHECKLIST. Output: JSON rounds of at most 4 questions `{n, closes[R..], kind, q, recommended, why}`, a `decided[]` list marked ASSUMPTION, and for large features an optional adversarial pass (7 questions). DEVIATIONS F8.
+  - Rules: a question without `closes` is dropped; blocking external items (payments, hosting, accounts, data location) go in round 1; facts are looked up by the job, only decisions are asked; never secrets; the owner is asked only about money or vendor lock-in, what the owner sees, rollbacks that need a rebuild, and business rules.
+  - Answers: one that adds → a `G##` row plus a BRIEF Addition; one that decides a fork → the Basis of the existing `R`; one that cancels → `dropped` with the quote. Each change makes a new version; only the changed rows are re-approved.
+
+**Enforcement hooks** (owner decision: hooks, not memory).
+
+- **F9.** (a) A PreToolUse hook on `job_start` in the orchestrator session requires a brief line `size: small|large`; `small` is logged; `large` for a feature job (F7) requires an approved `brief/CHECKLIST.md` in the repo and `covers:[R..]`. Read-only kinds are exempt from both: the `briefing` job (F8) and the slicing check (F3) run before the approval, and the `acceptance` judge (F5) checks requirements instead of covering them; review and research jobs change no code and may carry `covers` without needing it. (b) A merge hook: in a repo with an approved `CHECKLIST.md`, `gh pr merge` is allowed only with `--match-head-commit <sha>` (GitHub then refuses the merge if the head moved) and only once `release_check` passed on that sha; without the flag, or on another sha, it is blocked. The paths it does not cover are in Risks. (c) A `UserPromptSubmit` reminder line in the orchestrator session (soft). (a) needs F1, F2 and F4; (b) needs F7. DEVIATIONS F9.
+
+**Cheap prompt changes** (independent of the packs).
+
+- **F10.** `kind-fix` / `kind-general`: REDPROOF; visible placeholders instead of invented facts; the `Requirements:` commit trailer; out of scope → `BLOCKED`: the job does not do that part and writes a line `BLOCKED: <requirement or item> · <why>` in Not done / uncertain (a covered requirement it blocks is `missing` or `partial` in the `### Requirements` block). `kind-review`: the rule «could the executor have known?»; a repair re-review mode (only the fix diff plus the conditions to close; another bypass of the same condition is «not closed», not a new finding). Orchestrator skill: fix jobs get the Blocking findings verbatim only; a retry only with a changed approach. DEVIATIONS F10.
+
+**Not taken.** A dashboard with a local server; a shared work tree, waves and zones for parallel writers; «done» from closing a ticket; blindness by prompt only (the judge's inputs are fixed by the wrapper); 12 mode × depth combinations (only `strict`); update checks over the network.
+
+**Risks.**
+
+- The owner approves without reading. Mitigated by the slicing check (F3) and by approving diffs of changed rows only.
+- 100% is unreachable for requirements that need accounts or external access. Owner waivers per requirement (F7).
+- `[Rnn]` tags are formal: a tagged test may not test the requirement. REDPROOF and `suspect_tests`.
+- A codex read-only judge cannot run the product. The `how` field (`ran` / `read`), and the acceptance wrapper runs manifest-check at the sha before the judge (F5).
+- Name clash: `acceptance_cmd` vs kind `acceptance`. Pick distinct names before the build.
+- Brief drift between BRIEF and CHECKLIST. The tool writes BRIEF Additions and CHECKLIST in one operation.
+- The merge hook (F9 (b)) sees only `gh pr merge` in the orchestrator session. A `gh api` merge call, a `git push` to the base branch, auto-merge (`gh pr merge --auto`, which merges a later head) and the GitHub web UI pass by it. Accepted for now: the hook catches honest mistakes, it is not a boundary; branch protection in the target repo would close the rest and is not part of Wave F.
+- No deploy gate: the Merge rule covers deploy, but F9 gates only the merge. Until a deploy hook (or a `release_check` call in the project's deploy script) is designed before the build, a deploy of a LARGE task is held only by the orchestrator (soft).
+
+**Attribution.** Ideas adapted from [nick-vels/skills](https://github.com/nick-vels/skills) «autopilot» (MIT, © 2026 Nick Vels). Every prompt adapted from it must carry this attribution line.
+
 ## Ideas (not approved)
 
 Ideas recorded for later; none is approved or scheduled. Each needs an owner go before work starts.
 
-- I1. Requirement ledger: the owner's words kept verbatim and split into numbered requirements R01..Rn in a feature brief; the report gives each a status (done / partial / missing / placeholder); only the owner may drop a requirement; later changes are appended, never rewritten.
+- I1. Requirement ledger: the owner's words kept verbatim and split into numbered requirements R01..Rn in a feature brief; the report gives each a status (done / partial / missing / placeholder); only the owner may drop a requirement; later changes are appended, never rewritten. *Taken into Wave F (F1, F2, F4), approved 2026-10-24.*
   - Why: nothing the owner asked for is silently lost or reinterpreted. Lives in: the orchestrator's brief habit and the report contract. Source: Autopilot, phases/1-manifest.md, 2-briefing.md, 8-final.md.
-- I2. Blind acceptance job: a separate job gets only the original brief and the merged code (not our briefs or spec), installs from a clean clone, runs the product, and reports done / partial / no per requirement with the commands it ran. Only for new products or large features.
+- I2. Blind acceptance job: a separate job gets only the original brief and the merged code (not our briefs or spec), installs from a clean clone, runs the product, and reports done / partial / no per requirement with the commands it ran. Only for new products or large features. *Taken into Wave F (F5, F7), approved 2026-10-24.*
   - Why: checks the result against what was asked, not against what we planned. Lives in: a new job kind or prompt. Source: Autopilot, phases/6-review.md, 8-final.md, prompts/review.md.
 - I3. Per-repo progress file and glossary: PROGRESS.md (settled / not done / known bugs) rewritten when work lands, and CONTEXT.md listing domain terms and synonyms to avoid.
   - Why: a fresh job starts from the real state and uses one vocabulary. Lives in: target repos, linked from project cards. Source: Autopilot, phases/9-memory.md, 4-plan.md.
 - I4. Wide changes in three steps: add the new beside the old, migrate, remove the old, so the project never breaks midway.
   - Why: every intermediate commit still builds and passes checks. Lives in: kind-fix / kind-general prompts. Source: Autopilot, phases/4-plan.md, 5-subagents.md.
-- I5. Executor discipline: show the new test failing before writing the code; visible placeholders instead of invented facts; a one-line STATUS: DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT (overlaps E3).
+- I5. Executor discipline: show the new test failing before writing the code; visible placeholders instead of invented facts; a one-line STATUS: DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT (overlaps E3). *The failing-test-first (REDPROOF) and placeholder parts are taken into Wave F (F4, F10), approved 2026-10-24.*
   - Why: fewer false "done" reports and invented details. Lives in: prompts. Source: Autopilot, prompts/executor.md, phases/5-subagents.md.
 - I6. Retry a failed job once on a stronger model.
   - Why: some failures are capability limits, not bad luck. Lives in: daemon retry policy. Source: Autopilot, phases/5-subagents.md, 6-review.md.
