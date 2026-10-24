@@ -65,7 +65,8 @@ type Config struct {
 	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
 	SubagentReserve func(max int) (prev int, allowed bool, err error)
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
-	// database that holds the counter, skill roots/links, and the job's session transcript directories.
+	// database that holds the counter, the agent's config.json, owner rules and project cards, the
+	// job's gitconfig and no-hooks dir, skill roots/links, and the job's session transcript directories.
 	// File tools and literal Bash targets into them are refused.
 	Protected []string
 	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
@@ -155,10 +156,18 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 
 // resolvePath returns path made absolute (against dir), cleaned, with symlinks resolved on its
 // longest existing prefix (the file itself when it exists, else the nearest existing parent). A
-// dangling symlink on the way is followed by its target text (Write would create that target).
-func resolvePath(path, dir string) string { return resolveDepth(path, dir, 0) }
+// dangling symlink on the way is followed by its target text (Write would create that target), a
+// `..` in that text taken as the kernel takes it (linkTarget).
+func resolvePath(path, dir string) string {
+	links := 0
+	return resolveDepth(path, dir, &links)
+}
 
-func resolveDepth(path, dir string, depth int) string {
+// maxLinks is how many dangling symlinks one resolution follows, all branches together: the kernel
+// gives up a lookup past 40 links (ELOOP), so no file is created there.
+const maxLinks = 40
+
+func resolveDepth(path, dir string, links *int) string {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, path)
 	}
@@ -190,9 +199,10 @@ func resolveDepth(path, dir string, depth int) string {
 		if r, err := filepath.EvalSymlinks(p); err == nil {
 			return filepath.Join(r, rest)
 		}
-		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 && depth < 40 {
+		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 && *links < maxLinks {
 			if target, err := os.Readlink(p); err == nil {
-				return resolveDepth(filepath.Join(target, rest), filepath.Dir(p), depth+1)
+				*links++
+				return resolveDepth(filepath.Join(linkTarget(target, filepath.Dir(p), links), rest), filepath.Dir(p), links)
 			}
 		}
 		if end == 0 {
@@ -200,6 +210,31 @@ func resolveDepth(path, dir string, depth int) string {
 		}
 		end = strings.LastIndexByte(path[:end], filepath.Separator)
 	}
+}
+
+// linkTarget is a symlink's target text, read in the link's directory dir. Without a `..` segment it
+// is returned as is. With one, it is walked like the kernel walks it: each `..` steps up from the
+// directory the part before it resolves to, symlinks followed, not lexically (filepath.Join drops
+// `jump/..` even when jump is a link: `cfg -> jump/../hooks/pre-commit`, `jump -> .git/objects`
+// creates .git/hooks/pre-commit). dir itself may run through a symlink, so a leading `..` is walked
+// the same way.
+func linkTarget(target, dir string, links *int) string {
+	if !hasDotDot(target) {
+		return target
+	}
+	cur, rel := dir, target
+	if filepath.IsAbs(target) {
+		vol := filepath.VolumeName(target)
+		cur, rel = vol+string(filepath.Separator), target[len(vol):]
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg == ".." {
+			cur = filepath.Dir(resolveDepth(cur, "", links))
+		} else {
+			cur = filepath.Join(cur, seg)
+		}
+	}
+	return cur
 }
 
 // inGitDir reports a path with a `.git` segment: the git dir itself, a file in it, or a worktree's
@@ -317,8 +352,10 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 }
 
 func protectedBlocked(p string) string {
-	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), a skill catalog " +
-		"(a skill root or a skill link), or a job session transcript directory; a job does not write there."
+	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), agent-jobs " +
+		"configuration (config.json, the owner rules, the project cards), the job's git files (its gitconfig or " +
+		"no-hooks dir), a skill catalog (a skill root or a skill link), or a job session transcript directory; " +
+		"a job does not write there."
 }
 
 func ancestorBlocked(w, p string) string {
