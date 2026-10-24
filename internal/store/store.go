@@ -355,6 +355,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
 		}
 	}
+	if err := migrateWaiversKey(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 

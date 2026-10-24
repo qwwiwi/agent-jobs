@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -46,11 +47,11 @@ type ChecklistApproval struct {
 	ApprovedAt      time.Time `json:"approved_at"`
 }
 
-// waiversSchema is applied on every Open (CREATE … IF NOT EXISTS). One waiver per requirement, checklist
-// hash and version, and sha; a second one replaces the first (a new quote). Approvals are a log: the
-// latest one of a repository (highest seq) is the one in force.
-const waiversSchema = `
-CREATE TABLE IF NOT EXISTS checklist_waivers (
+// waiversKey is the primary key of checklist_waivers since the version joined it.
+const waiversKey = "PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)"
+
+// waiversColumns is the column list of checklist_waivers (CREATE TABLE <name> waiversColumns).
+const waiversColumns = `(
 	repo              TEXT NOT NULL,
 	checklist_id      TEXT NOT NULL,
 	checklist_sha256  TEXT NOT NULL,
@@ -59,8 +60,14 @@ CREATE TABLE IF NOT EXISTS checklist_waivers (
 	requirement       TEXT NOT NULL,
 	quote             TEXT NOT NULL,
 	created_at        INTEGER NOT NULL,
-	PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)
-);
+	` + waiversKey + `
+)`
+
+// waiversSchema is applied on every Open (CREATE … IF NOT EXISTS). One waiver per requirement, checklist
+// hash and version, and sha; a second one replaces the first (a new quote). Approvals are a log: the
+// latest one of a repository (highest seq) is the one in force.
+const waiversSchema = `
+CREATE TABLE IF NOT EXISTS checklist_waivers ` + waiversColumns + `;
 CREATE TABLE IF NOT EXISTS checklist_approvals (
 	seq              INTEGER PRIMARY KEY AUTOINCREMENT,
 	repo             TEXT NOT NULL,
@@ -77,6 +84,46 @@ CREATE INDEX IF NOT EXISTS checklist_approvals_repo ON checklist_approvals(repo,
 // waiversMigrations add columns to a checklist_waivers table created before them.
 var waiversMigrations = []string{
 	`ALTER TABLE checklist_waivers ADD COLUMN checklist_version INTEGER NOT NULL DEFAULT 0`,
+}
+
+// migrateWaiversKey rebuilds a checklist_waivers table created before checklist_version joined its
+// primary key (the column itself is added by waiversMigrations): the table is recreated with the
+// current key and its rows copied, keeping each row's version (0 for a row from before the column),
+// all in one IMMEDIATE transaction that re-checks the definition (several processes open the database).
+func migrateWaiversKey(db *sql.DB) error {
+	def := func() (string, error) {
+		var q string
+		err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='checklist_waivers'`).Scan(&q)
+		return q, err
+	}
+	q, err := def()
+	if err != nil || strings.Contains(q, waiversKey) {
+		return err
+	}
+	// One connection (SetMaxOpenConns(1)): the statements below run inside this transaction.
+	if _, err := db.Exec(`BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	rollback := func(err error) error {
+		_, _ = db.Exec(`ROLLBACK`)
+		return err
+	}
+	if q, err = def(); err != nil {
+		return rollback(err)
+	}
+	if strings.Contains(q, waiversKey) {
+		return rollback(nil)
+	}
+	const cols = "repo, checklist_id, checklist_sha256, checklist_version, sha, requirement, quote, created_at"
+	for _, stmt := range []string{`CREATE TABLE checklist_waivers_rebuild ` + waiversColumns,
+		`INSERT OR REPLACE INTO checklist_waivers_rebuild (` + cols + `) SELECT ` + cols + ` FROM checklist_waivers`,
+		`DROP TABLE checklist_waivers`, `ALTER TABLE checklist_waivers_rebuild RENAME TO checklist_waivers`} {
+		if _, err := db.Exec(stmt); err != nil {
+			return rollback(fmt.Errorf("rebuild checklist_waivers: %w", err))
+		}
+	}
+	_, err = db.Exec(`COMMIT`)
+	return err
 }
 
 // PutWaiver stores (or replaces) a waiver.
