@@ -33,7 +33,7 @@ func TestJobGuardRefusesChecklistLocksWithProtectedPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := jobHookConfig(t, m, j)
-	hook := m.guardCommand(j.ID, "", nil)
+	hook := m.guardCommand(j.ID, "", nil, nil, nil)
 	for _, g := range reNoRead.FindAllStringSubmatch(hook, -1) {
 		cfg.NoRead = append(cfg.NoRead, g[1])
 	}

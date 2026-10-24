@@ -93,6 +93,10 @@ var toolDefs = []toolDef{
 	{"checklist_init", addChecklistInit},
 	{"checklist_get", addChecklistGet},
 	{"checklist_set", addChecklistSet},
+	{"slicing_start", addSlicingStart},
+	{"slicing_get", addSlicingGet},
+	{"judge_start", addJudgeStart},
+	{"judge_get", addJudgeGet},
 }
 
 func definitions() []toolDef { return toolDefs }
