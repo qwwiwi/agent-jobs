@@ -45,33 +45,42 @@ type where struct {
 }
 
 // stateReadScope is what a job may not read: StateDir minus OwnDir, as configured and with symlinks
-// resolved. The path words of a Bash call resolve as in the protected-path check (pathScope), each
-// command of the top-level script against the directories in effect when it runs (at).
+// resolved; for the ReadAllow scope, everything ("/") minus the allowed paths. The path words of a
+// Bash call resolve as in the protected-path check (pathScope), each command of the top-level script
+// against the directories in effect when it runs (at).
 type stateReadScope struct {
 	*pathScope
 	state, own []string
-	ownRest    []string // the components of OwnDir below StateDir (jobs, <id>)
+	ownRests   [][]string // the components below StateDir of each own folder (jobs, <id>)
+	allow      bool       // the ReadAllow scope: stricter on what the guard cannot resolve
 	at         map[*simpleCmd]where
 }
 
+// cleanForms are p cleaned and, when it differs, with symlinks resolved.
+func cleanForms(p string) []string {
+	p = filepath.Clean(p)
+	forms := []string{p}
+	if q := resolvePath(p, "/"); q != p {
+		forms = append(forms, q)
+	}
+	return forms
+}
+
 func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
-	r := &stateReadScope{}
-	for _, p := range []string{cfg.StateDir, cfg.OwnDir} {
-		p = filepath.Clean(p)
-		forms := []string{p}
-		if q := resolvePath(p, "/"); q != p {
-			forms = append(forms, q)
-		}
-		if r.state == nil {
-			r.state = forms
-		} else {
-			r.own = forms
+	r := &stateReadScope{allow: cfg.readAllowScope, state: cleanForms(cfg.StateDir)}
+	owns := []string{cfg.OwnDir}
+	if r.allow {
+		owns = cfg.ReadAllow
+	}
+	for _, o := range owns {
+		if o != "" {
+			r.own = append(r.own, cleanForms(o)...)
 		}
 	}
-	if cfg.OwnDir == "" {
-		r.own = nil
-	} else if rel, err := filepath.Rel(r.state[0], r.own[0]); err == nil && within(r.own[0], r.state[0]) {
-		r.ownRest = strings.Split(filepath.ToSlash(rel), "/")
+	for _, o := range r.own {
+		if rel, err := filepath.Rel(r.state[0], o); err == nil && within(o, r.state[0]) && rel != "." {
+			r.ownRests = append(r.ownRests, strings.Split(filepath.ToSlash(rel), "/"))
+		}
 	}
 	// The protected set of the scope is the state dir and its entries: after a cd the guard cannot
 	// resolve, a relative word naming one of them (`jobs.db`, `jobs/k`) is refused.
@@ -144,6 +153,9 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 		}
 	}
 	for _, p := range cands {
+		if r.allow && !topExists(p) {
+			continue // nothing to read under a top-level name that does not exist
+		}
 		if inJobGitDir(p, r.state) && !inJobGitDir(p, r.own) {
 			return p, true
 		}
@@ -152,6 +164,25 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// topExists reports whether the first component of the absolute path p exists ("/" does).
+func topExists(p string) bool {
+	c := splitPath(p)
+	if len(c) == 0 {
+		return true
+	}
+	_, err := os.Lstat(string(filepath.Separator) + c[0])
+	return err == nil
+}
+
+// blockedMsg is the refusal of what reaching p: agent-jobs state, or for the ReadAllow scope a path
+// outside what the job may read.
+func (r *stateReadScope) blockedMsg(what, p string) string {
+	if r.allow {
+		return readAllowBlocked(what, p)
+	}
+	return stateBlocked(what, p)
 }
 
 // wordMode says how a path word is checked: tree for an argument of a recursive reader (an ancestor
@@ -170,16 +201,37 @@ func rawOf(w string) string {
 	return w
 }
 
+// attachedPath is the path in a short option with its value attached (`-f/p`, `-T~/p`) or a curl-style
+// `@/p` argument ("" = none): rawOf sees only `--opt=value`.
+func attachedPath(w string) string {
+	switch {
+	case strings.HasPrefix(w, "@"):
+		return w[1:]
+	case strings.HasPrefix(w, "-") && !strings.HasPrefix(w, "--"):
+		if i := strings.IndexAny(w, "/~"); i > 1 {
+			return w[i:]
+		}
+	}
+	return ""
+}
+
 // word returns a refusal when a path word reaches the state from a directory the command may run in.
 func (r *stateReadScope) word(w string, at where, m wordMode) string {
+	if r.allow {
+		if p := attachedPath(w); p != "" && (filepath.IsAbs(p) || strings.HasPrefix(p, "~")) {
+			if reason := r.word(p, at, m); reason != "" {
+				return reason
+			}
+		}
+	}
 	exp, ok := r.expandHome(rawOf(w))
 	if !ok {
 		p, rest := pathOf(w), ""
 		if _, s, found := strings.Cut(p, "/"); found {
 			rest = s
 		}
-		if m.dynamic && r.couldReach(rest, m.tree) {
-			return stateBlocked("`"+w+"`", w)
+		if m.dynamic && (r.allow || r.couldReach(rest, m.tree)) {
+			return r.blockedMsg("`"+w+"`", w+" (a word the guard cannot expand)")
 		}
 		return ""
 	}
@@ -193,7 +245,7 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 	}
 	for _, raw := range raws {
 		if r.extractedLinkPath(raw) {
-			return stateBlocked("`"+w+"`", w+" (through a link the extraction may create)")
+			return r.blockedMsg("`"+w+"`", w+" (through a link the extraction may create)")
 		}
 		if hasGlob(exp) {
 			if reason := r.glob("`"+w+"`", raw, m.tree); reason != "" {
@@ -207,11 +259,11 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 			}
 		}
 		if q, ok := r.blocked(raw, raw, m.tree); ok {
-			return stateBlocked("`"+w+"`", q)
+			return r.blockedMsg("`"+w+"`", q)
 		}
 	}
-	if m.dynamic && at.dynamic != "" && r.couldReach(filepath.Clean(exp), m.tree) {
-		return stateBlocked("`"+w+"`", w+" (after cd "+at.dynamic+")")
+	if m.dynamic && at.dynamic != "" && (r.allow && !filepath.IsAbs(exp) || r.couldReach(filepath.Clean(exp), m.tree)) {
+		return r.blockedMsg("`"+w+"`", w+" (after cd "+at.dynamic+")")
 	}
 	return ""
 }
@@ -249,14 +301,14 @@ func (r *stateReadScope) glob(what, pat string, tree bool) string {
 		full := path.Join(append([]string{filepath.ToSlash(f)}, rest...)...)
 		pc := splitPath(full)
 		for _, s := range r.state {
-			if globReach(pc, splitPath(s), r.ownRest, tree) {
-				return stateBlocked(what, full)
+			if globReach(pc, splitPath(s), r.ownRests, tree) && (!r.allow || topCanMatch(pc)) {
+				return r.blockedMsg(what, full)
 			}
 		}
 		matches, _ := filepath.Glob(full)
 		for _, m := range matches {
 			if q, ok := r.blocked(m, "", tree); ok {
-				return stateBlocked(what, q)
+				return r.blockedMsg(what, q)
 			}
 		}
 	}
@@ -272,10 +324,16 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
+// topCanMatch reports whether the first component of the pattern components pat can stand for an
+// existing top-level name (a wildcard one can).
+func topCanMatch(pat []string) bool {
+	return len(pat) == 0 || hasGlob(pat[0]) || topExists("/"+pat[0])
+}
+
 // globReach reports whether the pattern components pat can match the state dir s, a path inside it
-// that is not inside the own folder (ownRest: its components below s), or, with tree, an ancestor of
-// s. A brace or `**` component can stand for anything.
-func globReach(pat, s, ownRest []string, tree bool) bool {
+// that is not inside an own folder (ownRests: their components below s), or, with tree, an ancestor
+// of s. A brace or `**` component can stand for anything.
+func globReach(pat, s []string, ownRests [][]string, tree bool) bool {
 	for ; len(s) > 0; pat, s = pat[1:], s[1:] {
 		if len(pat) == 0 {
 			return tree
@@ -287,15 +345,21 @@ func globReach(pat, s, ownRest []string, tree bool) bool {
 			return false
 		}
 	}
-	if len(ownRest) == 0 || len(pat) < len(ownRest) {
-		return true
+	return !slices.ContainsFunc(ownRests, func(own []string) bool { return ownCovers(pat, own) })
+}
+
+// ownCovers reports whether the pattern components pat stay inside the own folder whose components are
+// own: its literal first components are own's.
+func ownCovers(pat, own []string) bool {
+	if len(own) == 0 || len(pat) < len(own) {
+		return false
 	}
-	for i, o := range ownRest {
+	for i, o := range own {
 		if hasGlob(pat[i]) || pat[i] != o {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // globComp reports whether one pattern component can match a name (a brace or a malformed pattern can).
@@ -552,7 +616,7 @@ func (r *stateReadScope) whereOf(c *simpleCmd) (where, string) {
 				n = k
 			}
 			if q, bad := r.blocked(n, "", false); bad {
-				return at, stateBlocked("the working directory `"+v+"`", q)
+				return at, r.blockedMsg("the working directory `"+v+"`", q)
 			}
 			if !slices.Contains(dirs, n) && len(dirs) < maxScopeDirs {
 				dirs = append(dirs, n)
@@ -667,7 +731,7 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 					w := argv[ti]
 					t, ok := r.expandHome(w)
 					if !ok {
-						return stateBlocked("the symlink target `"+w+"`", w)
+						return r.blockedMsg("the symlink target `"+w+"`", w)
 					}
 					// under places a link directory (or link) in each working directory; an absolute one
 					// stays as written (`ln -s . ~/L` links to $HOME, not to <cwd>/$HOME).
@@ -698,12 +762,12 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 							}
 						}
 						if q, bad := r.blocked(raw, raw, true); bad {
-							return stateBlocked("the symlink target `"+w+"`", q)
+							return r.blockedMsg("the symlink target `"+w+"`", q)
 						}
 					}
 					for _, raw := range lexical {
 						if q, bad := r.blocked(filepath.Clean(raw), "", true); bad {
-							return stateBlocked("the symlink target `"+w+"`", q)
+							return r.blockedMsg("the symlink target `"+w+"`", q)
 						}
 					}
 				}
@@ -725,6 +789,11 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 		}
 	}
 	return ""
+}
+
+func readAllowBlocked(what, p string) string {
+	return "blocked by guard: " + what + " reaches `" + p + "`, outside what this job may read (its own job folder " +
+		"with its work dir, its session dir and the system dirs programs run from); a gate job gets nothing but its input."
 }
 
 func stateBlocked(what, p string) string {
@@ -756,7 +825,8 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 }
 
 // readScopes are the configurations of the state-read check: cfg (its StateDir and OwnDir) when it
-// has a state dir, then one per NoRead directory, as a state dir without an own folder.
+// has a state dir, then one per NoRead directory, as a state dir without an own folder, then, with
+// ReadAllow, the whole file system ("/") with the allowed paths as its own folders.
 func readScopes(cfg Config) []Config {
 	var out []Config
 	if cfg.StateDir != "" {
@@ -764,7 +834,12 @@ func readScopes(cfg Config) []Config {
 	}
 	for _, d := range cfg.NoRead {
 		c := cfg
-		c.StateDir, c.OwnDir, c.NoRead = d, "", nil
+		c.StateDir, c.OwnDir, c.NoRead, c.ReadAllow = d, "", nil, nil
+		out = append(out, c)
+	}
+	if len(cfg.ReadAllow) > 0 {
+		c := cfg
+		c.StateDir, c.OwnDir, c.NoRead, c.readAllowScope = "/", "", nil, true
 		out = append(out, c)
 	}
 	return out
@@ -779,7 +854,7 @@ func checkStateReadIn(scripts []*script, cfg Config) string {
 	// resolved against the directories later cds lead to (`cd .. && cat prompt.md`).
 	for _, d := range r.dirs[1:] {
 		if p, ok := r.blocked(d, "", false); ok {
-			return stateBlocked("cd", p)
+			return r.blockedMsg("cd", p)
 		}
 	}
 	if reason := r.checkSymlinks(scripts); reason != "" {
@@ -806,13 +881,32 @@ func checkStateReadIn(scripts []*script, cfg Config) string {
 				if tree { // `cd ~ && rg x`, `grep -r x` with no path: the working directory is read
 					for _, d := range at.dirs {
 						if p, ok := r.blocked(d, "", true); ok {
-							return stateBlocked("`"+name+"` in `"+d+"`", p)
+							return r.blockedMsg("`"+name+"` in `"+d+"`", p)
 						}
 					}
 				}
 				for _, w := range append(slices.Clone(c.inRedirs), c.outRedirs...) {
 					if reason := r.word(w, at, wordMode{dynamic: true, strict: true}); reason != "" {
 						return reason
+					}
+				}
+				if r.allow {
+					// An expansion is resolved only when the command runs: under an allowlist, no word of a
+					// command or redirection may come from one.
+					for k, w := range c.words {
+						if k < len(c.dyn) && c.dyn[k] && !((name == "cd" || name == "pushd") && k > v.start) {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
+					}
+					for k, w := range c.outRedirs {
+						if k < len(c.outDyn) && c.outDyn[k] || strings.ContainsAny(w, "$`") {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
+					}
+					for _, w := range c.inRedirs {
+						if strings.ContainsAny(w, "$`") {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
 					}
 				}
 				words := c.words
@@ -904,7 +998,7 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 		}
 	}
 	if p, ok := r.blocked(raw, raw, tool == "Grep"); ok {
-		return stateBlocked(tool+" of `"+path+"`", p)
+		return r.blockedMsg(tool+" of `"+path+"`", p)
 	}
 	return ""
 }
