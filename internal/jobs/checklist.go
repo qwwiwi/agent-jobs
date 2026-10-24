@@ -132,15 +132,11 @@ func (m *Manager) coverContract(top, main, base string, covers []string) (*store
 	if err != nil {
 		return nil, fmt.Errorf("covers: %s (%s): %w", checklist.ChecklistRel, source, err)
 	}
-	a, err := m.Store.LatestApproval(main)
+	ok, _, reason, _, err := m.ChecklistStatus(main, c, []byte(brief))
 	if err != nil {
 		return nil, fmt.Errorf("covers: %w", err)
 	}
-	var rec *checklist.Record
-	if a != nil {
-		rec = &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256, BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}
-	}
-	if ok, _, reason := c.Status([]byte(brief), rec); !ok {
+	if !ok {
 		return nil, fmt.Errorf("covers: %s (%s; checklist %s, version %d) is not the repository's latest approved checklist: %s "+
 			"(the owner approves it with checklist_set first)", checklist.ChecklistRel, source, c.ID, c.Version, reason)
 	}

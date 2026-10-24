@@ -27,4 +27,4 @@ Put exactly one fenced block like this inside Findings / Changes (the daemon val
 }
 ```
 
-Copy `checklist` and `sha` from the input above. You are read-only: edit tools, git writes, rm and mv are denied; build output that a command writes by itself is not your change. The report is your final message.
+Copy `checklist` and `sha` from the input above. You are read-only: edit tools, git writes, rm and mv are denied; build output that a command writes by itself is not your change. The report is your final message: the daemon reads the block only from it, never from a file (a block written into report.md or any other file does not count).

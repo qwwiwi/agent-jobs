@@ -143,13 +143,13 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 // GuardCommand is the PreToolUse hook command line for this agent's config and the job's git dirs,
 // without a subagent log (every subagent refused). Jobs get JobGuardCommand.
 func (m *Manager) GuardCommand(gitDirs ...string) string {
-	return m.guardCommand("", "", nil, nil, gitDirs...)
+	return m.guardCommand("", "", nil, nil, nil, gitDirs...)
 }
 
 // JobGuardCommand is GuardCommand with the job's subagent log, so the guard can hold the cap of
 // guard.MaxSubagentsPerJob subagents per job.
 func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
-	return m.guardCommand(id, "", m.skillProtected(nil), nil, gitDirs...)
+	return m.guardCommand(id, "", m.skillProtected(nil), nil, nil, gitDirs...)
 }
 
 // ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
@@ -166,8 +166,9 @@ func (m *Manager) SubagentLogPath(id string) string {
 }
 
 // guardCommand builds the hook command line; readOnly is the work dir of a read-only kind ("" = none),
-// extraNoRead are directories the job never reads (a gate job's repository).
-func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRead []string, gitDirs ...string) string {
+// extraNoRead are directories the job never reads (a gate job's repository), readAllow the only paths it
+// reads (a gate job, gateReadAllow; none = no allowlist).
+func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRead, readAllow []string, gitDirs ...string) string {
 	parts := []string{shellQuote(m.SelfBin), "guard"}
 	for _, n := range m.Config().OwnerNames {
 		parts = append(parts, "--owner-name", shellQuote(n))
@@ -192,6 +193,9 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRe
 		for _, p := range extraNoRead {
 			parts = append(parts, "--no-read", shellQuote(p))
 		}
+		for _, p := range readAllow {
+			parts = append(parts, "--read-allow", shellQuote(p))
+		}
 	}
 	if readOnly != "" {
 		parts = append(parts, "--read-only", shellQuote(readOnly))
@@ -211,7 +215,8 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // The catalog roots and the job's skill links are protected (deny rules for file tools, --protect for
 // the guard): a job reads its skills but never changes the catalog through them. The work dir of a
 // review job (its worktree) and of a gate job (Wave F) is read-only (--read-only for the guard), and a
-// gate job never reads its repository (--no-read, gateNoRead). The job's session transcript directories are
+// gate job never reads its repository (--no-read, gateNoRead) and reads nothing outside its read
+// allowlist (--read-allow, gateReadAllow). The job's session transcript directories are
 // protected through the same deny rules and --protect flags as skills, and so are a repository job's
 // brief/BRIEF.md and brief/CHECKLIST.md (briefProtected).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
@@ -221,7 +226,8 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	if readOnlyKind(j.Kind) {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
 	}
-	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), gitDirs...), skillDenyRules(protected)...)
+	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), m.gateReadAllow(j), gitDirs...),
+		skillDenyRules(protected)...)
 }
 
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
@@ -368,9 +374,14 @@ func writeFileReplace(path string, data []byte) error {
 // JobMCPServerName is the job-role server's key in the job's mcp.json.
 const JobMCPServerName = "agent-jobs"
 
-// JobMCPConfig is the job's mcp.json: one stdio server, `agent-jobs mcp --role job --agent <agent>`.
-// The job-role server exposes only the tools allow-listed for jobs and refuses every other call.
-func (m *Manager) JobMCPConfig() map[string]any {
+// JobMCPConfig is the mcp.json of a job of kind: one stdio server, `agent-jobs mcp --role job --agent
+// <agent>`, which exposes only the tools allow-listed for jobs and refuses every other call. A gate job
+// (Wave F) gets no server at all: memory notes are not its input, and a read-only judge neither writes
+// notes nor calls the owner (the daemon's proxy refuses a gate job's calls too).
+func (m *Manager) JobMCPConfig(kind string) map[string]any {
+	if IsGateKind(kind) {
+		return map[string]any{"mcpServers": map[string]any{}}
+	}
 	return map[string]any{"mcpServers": map[string]any{
 		JobMCPServerName: map[string]any{
 			"type":    "stdio",
@@ -417,9 +428,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err := m.writeGitFiles(dir); err != nil {
 		return err
 	}
-	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only);
-	// --strict-mcp-config makes this the complete list.
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig()); err != nil {
+	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only), none for a
+	// gate job; --strict-mcp-config makes this the complete list.
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig(j.Kind)); err != nil {
 		return err
 	}
 	work := filepath.Join(dir, "work")
@@ -439,6 +450,14 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 		}
 		if err := m.deliverSkills(j, token, work); err != nil {
 			return err
+		}
+		if IsGateKind(j.Kind) {
+			if len(j.Skills) > 0 {
+				return fmt.Errorf("gate job %s has skills: a gate job gets nothing but its input", j.ID)
+			}
+			if err := checkGateWork(work); err != nil {
+				return err
+			}
 		}
 		return writeJSON(settings, m.JobSettings(j))
 	}

@@ -48,8 +48,10 @@ func addSlicingStart(s *sdk.Server, d Deps) {
 		Description: "Queue the slicing check of the repo's checklist (Wave F, F3): a read-only job of kind slicing that gets only " +
 			"brief/BRIEF.md and the checklist rows (read by the daemon now, no code, no briefs or reports) and returns unmapped " +
 			"(brief quotes in no row), half (partly covered) and invented (rows the brief does not support) in a validated JSON " +
-			"block, stored for the checklist id, version and hash. checklist_set approve needs the result for the current version " +
-			"with no unmapped quote left without an owner decision. There is no brief: the job's input is the daemon's.",
+			"block of its final message, stored for the checklist id, version and hash. checklist_set approve needs a result for " +
+			"the current version and an owner decision on every unmapped quote of every result for it. There is no brief: the " +
+			"job's input is the daemon's. A claude job is held to its input by the guard (enforced_blind true); a codex job is " +
+			"not confined (enforced_blind false).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in SlicingStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.StartGate(gateRequest(jobs.KindSlicing, in.Repo, "", in.ChecklistID, in.GateRunInput))
 		if err != nil {
@@ -62,18 +64,28 @@ func addSlicingStart(s *sdk.Server, d Deps) {
 func addJudgeStart(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "judge_start",
-		Description: "Queue the blind acceptance judge (Wave F, F5; kind judge, not acceptance_cmd) of the code at sha against the repo's " +
+		Description: "Queue the acceptance judge (Wave F, F5; kind judge, not acceptance_cmd) of the code at sha against the repo's " +
 			"approved checklist: a read-only job that gets BRIEF.md in full, the checklist rows (ID, verbatim, contract, Basis) and a " +
-			"copy of the files at sha (no git history, no job briefs, reports or diffs), assembled by the daemon. It returns met | " +
-			"partial | missing | placeholder | cannot_check per live requirement with evidence in a validated JSON block, stored by " +
-			"repo, sha, checklist id and version, judge model and family; a judge of the coders' model family is stored but flagged " +
-			"(same_family). Manifest-check (F6) is not built. There is no brief: the job's input is the daemon's.",
+			"copy of the files at sha (no git history, no agent settings or instructions, no job briefs, reports or diffs), assembled " +
+			"by the daemon. It returns met | partial | missing | placeholder | cannot_check per live requirement with evidence in a " +
+			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
+			"judge of the coders' model family is stored but flagged (same_family; warnings says so at the start). A claude judge " +
+			"is blind by enforcement (the guard's read allowlist, enforced_blind true); a codex judge is not confined " +
+			"(enforced_blind false). Manifest-check (F6) is not built. There is no brief: the job's input is the daemon's.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JudgeStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.StartGate(gateRequest(jobs.KindJudge, in.Repo, in.SHA, in.ChecklistID, in.GateRunInput))
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("judge_start rejected: %w", err)
 		}
-		return nil, view(d.Manager, j), nil
+		v := view(d.Manager, j)
+		w, err := d.Manager.JudgeFamilyWarning(j)
+		if err != nil {
+			w = "the coders' model families could not be read: " + err.Error()
+		}
+		if w != "" {
+			v.Warnings = append(v.Warnings, w)
+		}
+		return nil, v, nil
 	})
 }
 
@@ -143,9 +155,10 @@ func JudgeGet(m *jobs.Manager, repo, id, sha string) (jobs.VerdictView, error) {
 func addSlicingGet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "slicing_get",
-		Description: "The slicing check (F3) of the repo's checklist: the result for its current version and hash (summary.current true) " +
-			"or else the latest one (an older version: it does not count for the approval), its three lists (unmapped, half, invented), " +
-			"the owner's decisions on unmapped quotes and the quotes still undecided.",
+		Description: "The slicing check (F3) of the repo's checklist: the latest result for its current version and hash (summary.current " +
+			"true) or else the latest one (an older version: it does not count for the approval), its three lists (unmapped, half, " +
+			"invented), the union of the unmapped quotes of every result for that version and hash (unmapped; summary.results counts " +
+			"them), the owner's decisions and the quotes still undecided, and enforced_blind (false when a codex job stored it).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, SlicingGetOutput, error) {
 		if in.SHA != "" {
 			return nil, SlicingGetOutput{}, fmt.Errorf("slicing_get: sha does not apply")
@@ -158,10 +171,11 @@ func addSlicingGet(s *sdk.Server, d Deps) {
 func addJudgeGet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "judge_get",
-		Description: "The latest stored verdict of the blind judge (F5) for the repo's checklist (for sha when given): per requirement " +
-			"verdict, how and evidence, the commands run, unmapped_brief, extra_scope, suspect_tests, the judge model and family, the " +
-			"coders' families with family_differs / same_family, and current (the verdict is for the latest approved checklist). " +
-			"manifest_check is null: F6 is not built.",
+		Description: "The latest stored verdict of the judge (F5) for the repo's checklist (for sha when given): per requirement " +
+			"verdict, how and evidence, the commands run, unmapped_brief, extra_scope, suspect_tests, the judge model and family, " +
+			"enforced_blind (true for a claude judge held by the guard, false for a codex one), the coders' families with " +
+			"family_differs / same_family (a snapshot taken when the verdict was stored; release_check, F7, recomputes them), and " +
+			"current (the verdict is for the latest approved checklist). manifest_check is null: F6 is not built.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, jobs.VerdictView, error) {
 		v, err := JudgeGet(d.Manager, in.Repo, in.ChecklistID, in.SHA)
 		return nil, v, err

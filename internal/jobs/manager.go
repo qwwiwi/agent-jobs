@@ -544,12 +544,23 @@ func ResumeClaudeArgs(j *store.Job, jobDir string) []string {
 	return append(claudeBaseArgs(j, jobDir), "--resume", j.SessionID)
 }
 
+// claudeSettingSources is the --setting-sources value of a job: project (the work dir's settings, as a
+// repository has them; the job's own settings.json outranks them), none for a gate job (Wave F), which
+// gets only the daemon-written settings.json: no settings, hooks, skills or CLAUDE.md of the code it
+// checks reach it (the copy at the sha holds none either, checkGateWork).
+func claudeSettingSources(kind string) string {
+	if IsGateKind(kind) {
+		return ""
+	}
+	return "project"
+}
+
 func claudeBaseArgs(j *store.Job, jobDir string) []string {
 	args := []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
 		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
 		"--permission-mode", "bypassPermissions",
-		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", "project",
+		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", claudeSettingSources(j.Kind),
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
 	}
@@ -662,6 +673,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
 	dir := m.JobDir(j.ID)
 	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
+	if IsGateKind(j.Kind) {
+		// The wrapper stores a slicing result under the checklist lock: told where the locks are, never
+		// deriving it from the job dir's layout.
+		argv = append(argv, "--checklist-lock-dir", m.ChecklistLockDir())
+	}
 	bin := plan.bin
 	if bin == "" {
 		bin = m.Config().claudeBin()
@@ -673,6 +689,13 @@ func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int,
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(dir, "work")
 	cmd.Env = m.spawnEnv(unit)
+	if IsGateKind(j.Kind) {
+		// claude loads CLAUDE.md from the --add-dir directories (the job dir) with this set, whatever
+		// --setting-sources says: a gate job gets no instructions but its prompt.
+		cmd.Env = slices.DeleteFunc(cmd.Env, func(kv string) bool {
+			return strings.HasPrefix(kv, "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=")
+		})
+	}
 	// Own session => own process group, detached from the daemon: a daemon restart neither kills nor loses it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {

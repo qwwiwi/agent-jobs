@@ -122,7 +122,7 @@ func TestSlicingJobEndToEnd(t *testing.T) {
 			t.Fatalf("settings.json lacks %q:\n%s", s, settings)
 		}
 	}
-	r, err := m.Store.SlicingByJob(j.ID)
+	r, err := m.Store.SlicingByJob(j.ID, j.Attempt)
 	if err != nil || r == nil {
 		t.Fatalf("no slicing result: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestSlicingInvalidResultFailsJob(t *testing.T) {
 		if j.Status != store.StatusFailed || !strings.Contains(j.Error, "gate result rejected") {
 			t.Fatalf("%s: status %s error %q", name, j.Status, j.Error)
 		}
-		if r, _ := m.Store.SlicingByJob(j.ID); r != nil {
+		if r, _ := m.Store.SlicingByJob(j.ID, j.Attempt); r != nil {
 			t.Fatalf("%s: stored %+v", name, r)
 		}
 	}
@@ -238,7 +238,7 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 			t.Fatalf("settings.json lacks %q:\n%s", s, settings)
 		}
 	}
-	v, err := m.Store.VerdictByJob(j.ID)
+	v, err := m.Store.VerdictByJob(j.ID, j.Attempt)
 	if err != nil || v == nil {
 		t.Fatalf("no verdict: %v", err)
 	}
@@ -439,17 +439,15 @@ func TestSlicingResultWaitsForChecklistLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(slicingBlock(j.Gate))
-	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte("## Findings / Changes\n```json\n"+string(b)+"\n```\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	res := StreamResult{Text: "## Findings / Changes\n```json\n" + string(b) + "\n```\n", Results: 1}
 	unlock, err := m.LockChecklist(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan string, 1)
-	go func() { done <- gateStep(m.Store, j.ID, "tok", dir, time.Now()) }()
+	go func() { done <- gateStep(m.Store, j.ID, "tok", res, m.ChecklistLockDir(), time.Now()) }()
 	time.Sleep(300 * time.Millisecond)
-	if r, _ := m.Store.SlicingByJob(j.ID); r != nil {
+	if r, _ := m.Store.SlicingByJob(j.ID, 1); r != nil {
 		unlock()
 		t.Fatal("a slicing result was stored while the checklist lock was held")
 	}
@@ -457,7 +455,7 @@ func TestSlicingResultWaitsForChecklistLock(t *testing.T) {
 	if msg := <-done; msg != "" {
 		t.Fatalf("gateStep: %s", msg)
 	}
-	if r, _ := m.Store.SlicingByJob(j.ID); r == nil {
+	if r, _ := m.Store.SlicingByJob(j.ID, 1); r == nil {
 		t.Fatal("no slicing result after the lock was released")
 	}
 }

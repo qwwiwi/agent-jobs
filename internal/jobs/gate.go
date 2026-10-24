@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,15 +136,10 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	if len(c.Rows) == 0 {
 		return nil, fmt.Errorf("checklist %s has no rows: add them with checklist_set first", c.ID)
 	}
-	a, err := m.Store.LatestApproval(main)
+	approved, hash, reason, _, err := m.ChecklistStatus(main, c, f.Brief)
 	if err != nil {
 		return nil, err
 	}
-	var rec *checklist.Record
-	if a != nil {
-		rec = &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256, BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}
-	}
-	approved, hash, reason := c.Status(f.Brief, rec)
 	sha := strings.TrimSpace(r.SHA)
 	switch r.Kind {
 	case KindJudge:
@@ -180,6 +176,33 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 		Runner: r.Runner, ReasoningEffort: r.ReasoningEffort, MaxTurns: r.MaxTurns, MaxBudgetUSD: r.MaxBudgetUSD,
 		TimeoutMinutes: r.TimeoutMinutes, Gate: g,
 	})
+}
+
+// JudgeFamilyWarning is judge_start's warning ("" = none) when the queued judge j runs on the model
+// family of every coder job of its checklist (the fix and general jobs whose covers name it, at least
+// one): its verdict will be stored with same_family true, which release_check (F7) does not take. The
+// default judge model is a claude model, so a judge without an explicit gpt-* model of claude-coded work
+// gets it.
+func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
+	if j.Kind != KindJudge || j.Gate == nil {
+		return "", nil
+	}
+	coders, err := m.Store.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
+	if err != nil || len(coders) == 0 {
+		return "", err
+	}
+	family := ModelFamily(j.Runner, j.Model)
+	var ids []string
+	for _, c := range coders {
+		if ModelFamily(c.Runner, c.Model) != family {
+			return "", nil
+		}
+		ids = append(ids, c.ID)
+	}
+	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of every coder job of checklist %s (%s): "+
+		"its verdict will be stored with same_family true; for a cross-family verdict start the judge with a model of another "+
+		"family (a gpt-* model runs on codex, stored with enforced_blind false)", family, j.Model, j.Gate.ChecklistID,
+		strings.Join(ids, ", ")), nil
 }
 
 // gateBriefLine is the brief column of a gate job: a description for job lists, never put in its prompt.
@@ -284,13 +307,85 @@ func gateNoRead(j *store.Job) []string {
 	return out
 }
 
+// GateRuntimeReads are the system paths a gate job's tool calls may name besides its own folder and
+// session dirs (gateReadAllow): the directories programs and test toolchains run from (/usr holds
+// /usr/local/go and /usr/bin, /opt/homebrew is Homebrew's on macOS) and the character devices shells
+// redirect to. Not on the list, so refused: the home dirs (every agent's agent-jobs home, ~/.claude and
+// its transcripts, other worktrees, the repository checkout), /tmp, /etc, /var, /proc, /mnt, /srv.
+var GateRuntimeReads = []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt/homebrew",
+	"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd", "/dev/tty"}
+
+// gateReadAllow is the read allowlist of a gate job (the guard's --read-allow; nil for other kinds):
+// its own job folder (prompt, work dir with the inputs or the tree at the sha, its temp dir) as written
+// and with symlinks resolved, the claude project dirs of its work dir (its session's transcript and
+// tool results, which claude has the model read back; none when claude's name for the dir cannot be
+// known in advance) and GateRuntimeReads. The guard holds a claude job to it; a codex job runs its own
+// tools (enforced_blind false, ticket 684).
+func (m *Manager) gateReadAllow(j *store.Job) []string {
+	if !IsGateKind(j.Kind) {
+		return nil
+	}
+	dir := m.JobDir(j.ID)
+	out := []string{dir}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		out = append(out, r)
+	}
+	projects := ""
+	if cfg, err := ClaudeConfigDir(); err == nil {
+		projects = filepath.Join(cfg, "projects")
+	}
+	for _, p := range m.sessionProtected(j) {
+		if p != projects { // the whole projects dir is every session's: never on the list
+			out = append(out, p)
+		}
+	}
+	return append(out, GateRuntimeReads...)
+}
+
 // skipInJudgeTree are the paths of the tree at the sha not copied for the judge: the brief files are
 // given in the prompt as the approved checklist has them.
 var skipInJudgeTree = []string{checklist.BriefRel, checklist.ChecklistRel}
 
+// gateContextNames are the names a runner loads from its work dir, its parents or subdirs as settings,
+// hooks, skills, agents or instructions: claude's .claude dir (settings.json hooks run outside the
+// guard), CLAUDE.md and CLAUDE.local.md, codex's AGENTS.md / AGENTS.override.md, .codex dir and .agents
+// dir (skills). A gate job's work dir holds none of them at any depth (compared case-insensitively, as a
+// case-insensitive file system opens them): the repository at the sha must not reach the job as
+// anything but data. .git is left out with them.
+var gateContextNames = []string{".git", ".claude", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENTS.override.md", ".codex", ".agents"}
+
+func isGateContextName(name string) bool {
+	return slices.ContainsFunc(gateContextNames, func(n string) bool { return strings.EqualFold(n, name) })
+}
+
+// checkGateWork refuses a gate job's work dir that holds a gateContextNames entry at any depth (a file,
+// a dir or a link of that name): the launch stops before the runner reads it.
+func checkGateWork(work string) error {
+	found := ""
+	err := filepath.WalkDir(work, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != work && isGateContextName(d.Name()) {
+			found, _ = filepath.Rel(work, p)
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("gate work dir: %w", err)
+	}
+	if found != "" {
+		return fmt.Errorf("gate work dir holds %s: a runner would load it as settings, hooks, skills or instructions, "+
+			"outside the job's input, so the gate job is not launched", filepath.ToSlash(filepath.Join("work", found)))
+	}
+	return nil
+}
+
 // materializeTree writes the files of commit sha of repo into dst (an empty directory): regular files
 // and symlinks that resolve inside dst, read with git ls-tree and git cat-file (no checkout, no
-// attributes, filters or hooks); submodules, .git paths and the paths in skip are left out. The total
+// attributes, filters or hooks); submodules, every path with a gateContextNames component (.git,
+// .claude, CLAUDE.md, AGENTS.md, ...) at any depth and the paths in skip are left out. The total
 // size is capped by MaxJudgeTreeBytes. On any error git is killed, never left blocked on a full pipe.
 func materializeTree(repo, sha, dst string, skip []string) (err error) {
 	list, err := gitRaw(repo, "ls-tree", "-r", "-z", "--full-tree", sha)
@@ -432,13 +527,13 @@ func dropEscapingLinks(dst string, links []string) error {
 	return nil
 }
 
-// safeTreePath is a relative slash path with no empty, ".", ".." or .git component.
+// safeTreePath is a relative slash path with no empty, ".", ".." or gateContextNames component.
 func safeTreePath(p string) bool {
 	if p == "" || strings.HasPrefix(p, "/") {
 		return false
 	}
 	for _, c := range strings.Split(p, "/") {
-		if c == "" || c == "." || c == ".." || strings.EqualFold(c, ".git") {
+		if c == "" || c == "." || c == ".." || isGateContextName(c) {
 			return false
 		}
 	}
@@ -775,10 +870,14 @@ const (
 	NoteGateNoResult = "gate result not stored (fail closed)"
 )
 
-// gateStep is the wrapper's step for a gate job after a clean run: it validates the report's JSON block
-// against the job's input and stores the result under the launch token. It returns "" when stored (or
-// for a job of another kind), else why the job fails.
-func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
+// gateStep is the wrapper's step for a gate job after a clean run: it validates the JSON block of the
+// runner's final message (res.Text: claude's result event, codex's final agent message, as the wrapper
+// read them from the runner's stdout pipe) against the job's input and stores the result under the
+// launch token, bound to the attempt the token runs. report.md, stream.jsonl and every other file in
+// the job dir are the job's to write, so none of them is read: a final message without the block fails
+// the job. lockDir is the checklist lock dir (the daemon passes it with --checklist-lock-dir). It
+// returns "" when stored (or for a job of another kind), else why the job fails.
+func gateStep(st *store.Store, id, token string, res StreamResult, lockDir string, now time.Time) string {
 	j, err := st.Get(id)
 	if err != nil {
 		return gateFailPrefix + "job row unreadable: " + RedactPrintable(err.Error(), 160)
@@ -789,11 +888,19 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 	if j.Gate == nil {
 		return gateFailPrefix + "the job has no gate input"
 	}
-	report, err := readSmall(filepath.Join(jobDir, "report.md"), maxContractReportBytes+1)
-	if err != nil || len(report) > maxContractReportBytes {
-		return gateFailPrefix + "report.md unreadable or larger than the limit"
+	report := res.Text
+	switch {
+	case strings.TrimSpace(report) == "":
+		return gateFailPrefix + "the runner's final message is empty (the result is read from it only, never from a file)"
+	case len(report) > maxContractReportBytes:
+		return gateFailPrefix + fmt.Sprintf("the runner's final message is larger than %d bytes", maxContractReportBytes)
+	case res.Runner != store.RunnerCodex && res.Results != 1:
+		// claude prints one result event per run: another one came from a process that wrote into the
+		// pipe (the job's code can reach it through /proc), so no result of this run is trusted.
+		return gateFailPrefix + fmt.Sprintf("the runner's stdout carried %d result events (one expected)", res.Results)
 	}
 	fail := func(err error) string { return gateFailPrefix + RedactPrintable(err.Error(), 300) }
+	blind := enforcedBlind(j.Runner)
 	if j.Kind == KindSlicing {
 		o, err := ValidateSlicing(report, j.Gate)
 		if err != nil {
@@ -801,18 +908,17 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 		}
 		// Stored under the repository's checklist lock, which checklist_set holds from its slicing check to
 		// the stored approval: a result never lands in between.
-		abs, err := filepath.Abs(jobDir)
-		if err != nil {
-			return fail(err)
+		if lockDir == "" {
+			return gateFailPrefix + "no checklist lock dir given (--checklist-lock-dir)"
 		}
-		unlock, err := lockChecklistAt(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(abs))), checklistLockDirName), j.Gate.GitCommonDir)
+		unlock, err := lockChecklistAt(lockDir, j.Gate.GitCommonDir)
 		if err != nil {
 			return fail(err)
 		}
 		defer unlock()
 		if _, err := st.PutSlicing(token, store.SlicingResult{JobID: j.ID, Repo: j.Gate.Repo, ChecklistID: j.Gate.ChecklistID,
 			Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Model: j.Model, Runner: j.Runner,
-			Unmapped: o.Unmapped, Half: o.Half, Invented: o.Invented, CreatedAt: now}); err != nil {
+			EnforcedBlind: blind, Unmapped: o.Unmapped, Half: o.Half, Invented: o.Invented, CreatedAt: now}); err != nil {
 			return fail(err)
 		}
 		return ""
@@ -823,7 +929,7 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 	}
 	v := store.JudgeVerdict{JobID: j.ID, Repo: j.Gate.Repo, SHA: j.Gate.SHA, ChecklistID: j.Gate.ChecklistID,
 		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, JudgeModel: j.Model, JudgeRunner: j.Runner,
-		JudgeFamily: ModelFamily(j.Runner, j.Model), Counts: counts, Verdict: o, CreatedAt: now}
+		JudgeFamily: ModelFamily(j.Runner, j.Model), EnforcedBlind: blind, Counts: counts, Verdict: o, CreatedAt: now}
 	coders, err := st.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return fail(err)
@@ -834,6 +940,8 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 			v.CoderFamilies = append(v.CoderFamilies, f)
 		}
 	}
+	// A snapshot of the cover jobs as they are now: a coder job started later does not change the stored
+	// flags, so release_check (F7) recomputes them from the cover jobs.
 	v.SameFamily = slices.Contains(v.CoderFamilies, v.JudgeFamily)
 	v.FamilyDiffers = len(v.CoderFamilies) > 0 && !v.SameFamily
 	if _, err := st.PutVerdict(token, v); err != nil {
@@ -842,7 +950,13 @@ func gateStep(st *store.Store, id, token, jobDir string, now time.Time) string {
 	return ""
 }
 
-// gateVerdict fails a succeeded gate job whose result was rejected or not stored (fail closed).
+// enforcedBlind reports whether a gate job of runner is held to its input by the guard: claude's tool
+// calls pass the guard's read allowlist; codex runs its own tools with no OS confinement of reads
+// (ticket 684), so its gate results are stored with enforced_blind false.
+func enforcedBlind(runner string) bool { return runner != store.RunnerCodex }
+
+// gateVerdict fails a succeeded gate job whose result was rejected or not stored by this attempt (fail
+// closed): a result an earlier attempt of the job stored does not count for a later one.
 func (m *Manager) gateVerdict(j *store.Job, status, msg string, res StreamResult) (string, string) {
 	if status != store.StatusSucceeded || !IsGateKind(j.Kind) {
 		return status, msg
@@ -852,10 +966,10 @@ func (m *Manager) gateVerdict(j *store.Job, status, msg string, res StreamResult
 	}
 	var stored bool
 	if j.Kind == KindSlicing {
-		r, err := m.Store.SlicingByJob(j.ID)
+		r, err := m.Store.SlicingByJob(j.ID, j.Attempt)
 		stored = err == nil && r != nil
 	} else {
-		v, err := m.Store.VerdictByJob(j.ID)
+		v, err := m.Store.VerdictByJob(j.ID, j.Attempt)
 		stored = err == nil && v != nil
 	}
 	if !stored {
@@ -864,86 +978,125 @@ func (m *Manager) gateVerdict(j *store.Job, status, msg string, res StreamResult
 	return status, msg
 }
 
-// SlicingSummary is the slicing line of checklist_get (F3): the slicing result for the checklist's
-// current version and hash when there is one (Current), else the latest one of the checklist id (an
-// older version or hash: it does not count for the approval).
+// SlicingSummary is the slicing line of checklist_get (F3): the slicing results for the checklist's
+// current version and hash when there are some (Current), else those of the latest result of the
+// checklist id (an older version or hash: they do not count for the approval). Unmapped is the union of
+// the unmapped quotes of all those results (Results of them); JobID, Half and Invented are the latest
+// result's.
 type SlicingSummary struct {
 	Version   int    `json:"version"`
 	SHA256    string `json:"sha256"`
 	Current   bool   `json:"current"`
 	JobID     string `json:"job_id"`
+	Results   int    `json:"results"`
 	Unmapped  int    `json:"unmapped"`
 	Half      int    `json:"half"`
 	Invented  int    `json:"invented"`
 	Decided   int    `json:"decided"`
 	Undecided int    `json:"undecided"`
-	At        string `json:"at"`
+	// EnforcedBlind is false when any of the results was stored by a job the guard did not hold to its
+	// input (a codex job, ticket 684).
+	EnforcedBlind bool   `json:"enforced_blind"`
+	At            string `json:"at"`
 }
 
-// SlicingView is a slicing result with the owner's decisions on its unmapped quotes.
+// SlicingView is the latest slicing result with the union of the unmapped quotes of every result for
+// its version and hash, and the owner's decisions on them.
 type SlicingView struct {
 	Summary   *SlicingSummary         `json:"summary"`
 	Result    *store.SlicingResult    `json:"result"`
+	Unmapped  []string                `json:"unmapped"`
 	Decisions []store.SlicingDecision `json:"decisions"`
 	Undecided []string                `json:"undecided"`
 }
 
-// SlicingOf returns the slicing result of checklist id in repo main for version and hash, else its
-// latest one (nil when there is none), with its decisions.
+// slicingUnion are the slicing results of checklist id in repo main for version and hash (oldest
+// first) and the union of their unmapped quotes, in the order first listed.
+func (m *Manager) slicingUnion(main, id string, version int, hash string) ([]*store.SlicingResult, []string, error) {
+	rs, err := m.Store.SlicingResultsFor(main, id, version, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	unmapped := []string{}
+	for _, r := range rs {
+		for _, u := range r.Unmapped {
+			if !slices.Contains(unmapped, u.Quote) {
+				unmapped = append(unmapped, u.Quote)
+			}
+		}
+	}
+	return rs, unmapped, nil
+}
+
+// SlicingOf returns the slicing results of checklist id in repo main for version and hash, else those
+// of its latest result's version and hash (nil when there is none), with their decisions.
 func (m *Manager) SlicingOf(main, id string, version int, hash string) (*SlicingView, error) {
-	r, err := m.Store.SlicingFor(main, id, version, hash)
+	rs, unmapped, err := m.slicingUnion(main, id, version, hash)
 	if err != nil {
 		return nil, err
 	}
-	if r == nil {
-		if r, err = m.Store.LatestSlicing(main, id); err != nil || r == nil {
+	if len(rs) == 0 {
+		r, err := m.Store.LatestSlicing(main, id)
+		if err != nil || r == nil {
 			return nil, err
 		}
+		if rs, unmapped, err = m.slicingUnion(main, id, r.Version, r.ChecklistSHA256); err != nil {
+			return nil, err
+		}
+		if len(rs) == 0 {
+			return nil, fmt.Errorf("slicing result %d: not found for its own version and hash", r.Seq)
+		}
 	}
+	r := rs[len(rs)-1]
 	d, err := m.Store.SlicingDecisions(main, id, r.Version, r.ChecklistSHA256)
 	if err != nil {
 		return nil, err
 	}
-	v := &SlicingView{Result: r, Decisions: d, Undecided: undecided(r, d, nil)}
+	v := &SlicingView{Result: r, Unmapped: unmapped, Decisions: d, Undecided: undecided(unmapped, d, nil)}
+	blind := true
+	for _, x := range rs {
+		blind = blind && x.EnforcedBlind
+	}
 	v.Summary = &SlicingSummary{Version: r.Version, SHA256: r.ChecklistSHA256, Current: r.Version == version && r.ChecklistSHA256 == hash,
-		JobID: r.JobID, Unmapped: len(r.Unmapped), Half: len(r.Half), Invented: len(r.Invented),
-		Decided: len(r.Unmapped) - len(v.Undecided), Undecided: len(v.Undecided), At: r.CreatedAt.UTC().Format(time.RFC3339)}
+		JobID: r.JobID, Results: len(rs), Unmapped: len(unmapped), Half: len(r.Half), Invented: len(r.Invented),
+		Decided: len(unmapped) - len(v.Undecided), Undecided: len(v.Undecided), EnforcedBlind: blind, At: r.CreatedAt.UTC().Format(time.RFC3339)}
 	return v, nil
 }
 
-// undecided are the unmapped quotes of r without a stored decision (d) or one given now.
-func undecided(r *store.SlicingResult, d []store.SlicingDecision, given []string) []string {
+// undecided are the unmapped quotes without a stored decision (d) or one given now.
+func undecided(unmapped []string, d []store.SlicingDecision, given []string) []string {
 	out := []string{}
-	for _, u := range r.Unmapped {
-		if slices.Contains(given, u.Quote) || slices.ContainsFunc(d, func(x store.SlicingDecision) bool { return x.Unmapped == u.Quote }) {
+	for _, u := range unmapped {
+		if slices.Contains(given, u) || slices.ContainsFunc(d, func(x store.SlicingDecision) bool { return x.Unmapped == u }) {
 			continue
 		}
-		out = append(out, u.Quote)
+		out = append(out, u)
 	}
 	return out
 }
 
-// UnmappedDecision is the owner's decision on one unmapped quote of the current slicing result, as
+// UnmappedDecision is the owner's decision on one unmapped quote of the current slicing results, as
 // checklist_set takes it.
 type UnmappedDecision struct {
-	Unmapped string // the quote as the slicing result lists it
+	Unmapped string // the quote as a slicing result lists it
 	Quote    string // the owner's words deciding it, verbatim
 }
 
 // SlicingGate is checklist_set's slicing rule (F3), checked before anything is written. Decisions are
-// taken only on the unmapped quotes of the slicing result for the checklist's version and hash after
-// the call; an approval needs that result (one for an older version or hash does not count) and a
-// decision, stored or given now, for each of its unmapped quotes. It returns the decisions to store.
+// taken only on the unmapped quotes of the slicing results for the checklist's version and hash after
+// the call (all of them: a re-run does not drop a quote an earlier run listed); an approval needs at
+// least one such result (one for an older version or hash does not count) and a decision, stored or
+// given now, for each unmapped quote of every one of them. It returns the decisions to store.
 func (m *Manager) SlicingGate(main, id string, version int, hash string, approve bool, given []UnmappedDecision,
 	now time.Time) ([]store.SlicingDecision, int, error) {
 	if !approve && len(given) == 0 {
 		return nil, 0, nil
 	}
-	r, err := m.Store.SlicingFor(main, id, version, hash)
+	rs, unmapped, err := m.slicingUnion(main, id, version, hash)
 	if err != nil {
 		return nil, 0, err
 	}
-	if r == nil {
+	if len(rs) == 0 {
 		what := "approve"
 		if !approve {
 			what = "unmapped_decisions"
@@ -951,14 +1104,19 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 		return nil, 0, fmt.Errorf("%s: no slicing check of checklist %s version %d (sha256 %s): run slicing_start on this version "+
 			"and let it finish (a result for an older version or another hash does not count)", what, id, version, hash)
 	}
+	jobs := make([]string, 0, len(rs))
+	for _, r := range rs {
+		jobs = append(jobs, r.JobID)
+	}
 	var out []store.SlicingDecision
 	var quotes []string
 	redacted := 0
 	for i, d := range given {
 		u, n := Redact(d.Unmapped)
 		u = checklist.NormalizeField(u)
-		if !slices.ContainsFunc(r.Unmapped, func(x store.Quote) bool { return x.Quote == u }) {
-			return nil, 0, fmt.Errorf("unmapped_decisions %d: %q is not an unmapped quote of the slicing result (job %s)", i+1, u, r.JobID)
+		if !slices.Contains(unmapped, u) {
+			return nil, 0, fmt.Errorf("unmapped_decisions %d: %q is not an unmapped quote of the slicing results (jobs %s)", i+1, u,
+				strings.Join(jobs, ", "))
 		}
 		q, k := Redact(d.Quote) // raw, before any trimming
 		if q = strings.TrimSpace(q); q == "" {
@@ -974,12 +1132,62 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 		if err != nil {
 			return nil, 0, err
 		}
-		if left := undecided(r, stored, quotes); len(left) > 0 {
-			return nil, 0, fmt.Errorf("approve: the slicing check (job %s) lists %d unmapped brief quote(s) without an owner decision: %s; "+
-				"give the owner's decision on each in unmapped_decisions, or add rows that cover them", r.JobID, len(left), quoteList(left))
+		if left := undecided(unmapped, stored, quotes); len(left) > 0 {
+			return nil, 0, fmt.Errorf("approve: the slicing checks (jobs %s) list %d unmapped brief quote(s) without an owner decision: %s; "+
+				"give the owner's decision on each in unmapped_decisions, or add rows that cover them", strings.Join(jobs, ", "),
+				len(left), quoteList(left))
 		}
 	}
 	return out, redacted, nil
+}
+
+// SlicingVoid is why the approval of checklist id version and hash in repo main no longer holds ("" =
+// it holds): a slicing result stored after it lists an unmapped quote without an owner decision, stored
+// or among given (decisions about to be stored).
+func (m *Manager) SlicingVoid(main, id string, version int, hash string, given ...store.SlicingDecision) (string, error) {
+	rs, unmapped, err := m.slicingUnion(main, id, version, hash)
+	if err != nil || len(rs) == 0 {
+		return "", err
+	}
+	d, err := m.Store.SlicingDecisions(main, id, version, hash)
+	if err != nil {
+		return "", err
+	}
+	left := undecided(unmapped, append(d, given...), nil)
+	if len(left) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("the approval is void: a slicing check of this version (job %s) lists %d unmapped brief quote(s) without an "+
+		"owner decision (%s); decide them with checklist_set unmapped_decisions and approve again", rs[len(rs)-1].JobID, len(left),
+		quoteList(left)), nil
+}
+
+// ChecklistStatus is the approval state of checklist c (with brief) in repo main: checklist.Status
+// against the repository's latest stored approval, then void when SlicingVoid says so. last is that
+// approval (nil = none).
+func (m *Manager) ChecklistStatus(main string, c *checklist.Checklist, brief []byte) (approved bool, hash, reason string,
+	last *store.ChecklistApproval, err error) {
+	last, err = m.Store.LatestApproval(main)
+	if err != nil {
+		return false, "", "", nil, err
+	}
+	var rec *checklist.Record
+	if last != nil {
+		rec = &checklist.Record{ChecklistID: last.ChecklistID, Version: last.Version, SHA256: last.ChecklistSHA256,
+			BriefSHA256: last.BriefSHA256, At: last.ApprovedAt}
+	}
+	approved, hash, reason = c.Status(brief, rec)
+	if !approved {
+		return false, hash, reason, last, nil
+	}
+	void, err := m.SlicingVoid(main, c.ID, c.Version, hash)
+	if err != nil {
+		return false, hash, "", last, err
+	}
+	if void != "" {
+		return false, hash, void, last, nil
+	}
+	return true, hash, reason, last, nil
 }
 
 func quoteList(qs []string) string {
@@ -1014,6 +1222,14 @@ func (m *Manager) LatestVerdictOf(main, id, sha string) (*VerdictView, error) {
 		return nil, err
 	}
 	cur := a != nil && a.ChecklistID == v.ChecklistID && a.Version == v.Version && a.ChecklistSHA256 == v.ChecklistSHA256
+	if cur {
+		// An approval a later slicing result voided is not the latest approved checklist.
+		void, err := m.SlicingVoid(main, v.ChecklistID, v.Version, v.ChecklistSHA256)
+		if err != nil {
+			return nil, err
+		}
+		cur = void == ""
+	}
 	return &VerdictView{Verdict: v, Current: cur, ManifestCheck: ManifestCheckNotBuilt}, nil
 }
 

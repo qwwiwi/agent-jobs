@@ -76,11 +76,10 @@ func binding(st *store.Store, main, id string) (*checklist.Binding, error) {
 
 func checklistView(m *jobs.Manager, top, main string, c *checklist.Checklist, brief []byte) (ChecklistView, error) {
 	st := m.Store
-	last, rec, err := latestApproval(st, main)
+	approved, hash, reason, last, err := m.ChecklistStatus(main, c, brief)
 	if err != nil {
 		return ChecklistView{}, err
 	}
-	approved, hash, reason := c.Status(brief, rec)
 	v := ChecklistView{Repo: top, BriefPath: checklist.BriefPath(top), ChecklistPath: checklist.ChecklistPath(top),
 		ID: c.ID, Version: c.Version, Approved: approved, Reason: reason, SHA256: hash,
 		BriefSHA256: checklist.SHA256Hex(brief), Rows: c.Rows, Live: c.LiveIDs()}
@@ -361,6 +360,16 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			return nil, ChecklistView{}, err
 		}
 		res.Redacted += n
+		if len(waivers) > 0 && !in.Approve {
+			// Waivers bind to the approved version and hash: not to an approval a later slicing result voided.
+			void, err := m.SlicingVoid(main, res.List.ID, res.List.Version, res.Hash, decisions...)
+			if err != nil {
+				return nil, ChecklistView{}, err
+			}
+			if void != "" {
+				return nil, ChecklistView{}, fmt.Errorf("waivers need an approved checklist after this call (%s)", void)
+			}
+		}
 		if res.Brief != nil || res.Checklist != nil {
 			if err := checklist.WriteBoth(top, res.Brief, res.Checklist, f.Brief); err != nil {
 				return nil, ChecklistView{}, err
