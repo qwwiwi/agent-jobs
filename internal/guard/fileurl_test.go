@@ -66,17 +66,25 @@ func TestReadAllowFileURLFailClosed(t *testing.T) {
 			}
 		}
 	}
-	// Kinds without a read allowlist: the state and no-read checks keep their behaviour.
+	// Kinds without a read allowlist: a query or a fragment stays allowed, a dot segment is refused by
+	// the state and no-read checks (file_url_decoding_test.go); a job without read scopes keeps both.
 	state := l.cfg
 	state.ReadAllow = nil
 	state.NoRead = []string{filepath.Dir(l.checkout)}
+	dot := "file://" + l.work + "/./main.go"
 	for _, cfg := range []Config{state, {Dir: l.work}} {
-		for _, u := range []string{"file:///x#y", "file://" + l.work + "/./main.go"} {
-			for _, cmd := range fileURLCmds(u) {
-				if r := Check(cmd, cfg); r != "" {
-					t.Errorf("no read allowlist: refused %s: %s", cmd, r)
-				}
+		for _, cmd := range fileURLCmds("file:///x#y") {
+			if r := Check(cmd, cfg); r != "" {
+				t.Errorf("no read allowlist: refused %s: %s", cmd, r)
 			}
+		}
+	}
+	for _, cmd := range fileURLCmds(dot) {
+		if r := Check(cmd, state); r == "" {
+			t.Errorf("no read allowlist: allowed %s", cmd)
+		}
+		if r := Check(cmd, Config{Dir: l.work}); r != "" {
+			t.Errorf("no read scopes: refused %s: %s", cmd, r)
 		}
 	}
 }

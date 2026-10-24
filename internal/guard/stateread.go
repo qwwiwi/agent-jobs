@@ -54,7 +54,7 @@ type stateReadScope struct {
 	state, own []string
 	ownRests   [][]string // the components below StateDir of each own folder (jobs, <id>)
 	allow      bool       // the ReadAllow scope: stricter on what the guard cannot resolve
-	urls       bool       // the job has a read allowlist: file URLs are checked fail closed (fileURLs)
+	urls       bool       // the job has a read allowlist: a file URL with a query or a fragment is refused (fileURLs)
 	at         map[*simpleCmd]where
 }
 
@@ -242,78 +242,75 @@ func percentDecoded(w string) (string, bool) {
 		return "", false
 	}
 	for rePct.MatchString(w) {
-		w = rePct.ReplaceAllStringFunc(w, func(h string) string {
-			b, _ := strconv.ParseUint(h[1:], 16, 8)
-			return string([]byte{byte(b)})
-		})
+		w = percentDecodedOnce(w)
 	}
 	return w, true
+}
+
+// percentDecodedOnce returns w with each %xx decoded once, as curl, wget and python's urllib decode the
+// path of a file URL (`%252F` decodes to `%2F`).
+func percentDecodedOnce(w string) string {
+	return rePct.ReplaceAllStringFunc(w, func(h string) string {
+		b, _ := strconv.ParseUint(h[1:], 16, 8)
+		return string([]byte{byte(b)})
+	})
 }
 
 // reFileURL is a file URL in a text, in any case, up to a quote, a blank or a shell operator.
 var reFileURL = regexp.MustCompile("(?i)file:([^\\s'\"`<>|&;()]*)")
 
-// fileURLPaths are the paths of the file URLs in s as curl, wget and python's urllib open them: after
-// the scheme and an optional host (`file:///p`, `file://localhost/p`, `file:/p`), percent-decoded.
-func fileURLPaths(s string) []string {
-	if !strings.Contains(strings.ToLower(s), "file:") {
-		return nil
+// fileURLPath returns the path of a file URL u (the text after `file:`) as curl, wget and python's
+// urllib open it: after an optional host (`file:///p`, `file://localhost/p`, `file:/p`), percent-decoded
+// once; ok is false for a host and no path.
+func fileURLPath(u string) (string, bool) {
+	if rest, ok := strings.CutPrefix(u, "//"); ok {
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			return "", false
+		}
+		u = rest[i:]
 	}
-	var out []string
-	for _, m := range reFileURL.FindAllStringSubmatch(s, -1) {
-		p := m[1]
-		if rest, ok := strings.CutPrefix(p, "//"); ok {
-			i := strings.IndexByte(rest, '/')
-			if i < 0 {
-				continue // a host and no path
-			}
-			p = rest[i:]
-		}
-		if d, ok := percentDecoded(p); ok {
-			p = d
-		}
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+	return percentDecodedOnce(u), true
 }
 
 // reDotSegment is a `.` or `..` segment of a URL path.
 var reDotSegment = regexp.MustCompile(`(^|/)\.\.?(/|$)`)
 
-// unsafeFileURL returns the first file URL in s whose text, as written or percent-decoded, has a query
-// or a fragment (`?`, `#`: a URL reader cuts the path there, the guard would check another one) or a
-// `.`/`..` segment ("" = none).
-func unsafeFileURL(s string) string {
-	if !strings.Contains(strings.ToLower(s), "file:") {
-		return ""
-	}
-	for _, m := range reFileURL.FindAllStringSubmatch(s, -1) {
-		forms := []string{m[1]}
-		if d, ok := percentDecoded(m[1]); ok {
-			forms = append(forms, d)
-		}
-		for _, f := range forms {
-			if strings.ContainsAny(f, "?#") || reDotSegment.MatchString(f) {
-				return m[0]
-			}
-		}
+// unsafeFileURL returns why a file URL u (the text after `file:`) is refused without a path check (""
+// = it is not): still percent-encoded after one decode (`%252F`: a URL reader opens a name with `%2F`
+// in it, a full decode would check another path), a `.`/`..` segment as written or decoded once (the
+// reader resolves it against a path the guard may see differently), and, with queries (a job with a
+// read allowlist), a query or a fragment (`?`, `#`: a URL reader cuts the path there).
+func unsafeFileURL(u string, queries bool) string {
+	once := percentDecodedOnce(u)
+	switch {
+	case rePct.MatchString(once):
+		return "a file URL still percent-encoded after one decode"
+	case reDotSegment.MatchString(u) || reDotSegment.MatchString(once):
+		return "a file URL with a dot segment"
+	case queries && strings.ContainsAny(once, "?#"):
+		return "a file URL with a query or a fragment"
 	}
 	return ""
 }
 
-// fileURLs returns a refusal when a file URL in s reaches the state. For a job with a read allowlist
-// it fails closed: a URL with a query, a fragment or a dot segment is refused, and the path of any
-// other is checked strictly; otherwise each path is checked in mode m.
+// fileURLs returns a refusal when a file URL in s reaches the state. It fails closed in every scope: a
+// URL still percent-encoded after one decode or with a dot segment is refused, for a job with a read
+// allowlist also one with a query or a fragment (a sqlite URI `file:x.db?mode=ro` stays usable in
+// other jobs), and the path of any other, decoded once, is checked strictly.
 func (r *stateReadScope) fileURLs(s string, at where, m wordMode) string {
-	if r.urls {
-		if u := unsafeFileURL(s); u != "" {
-			return r.blockedMsg("`"+u+"`", u+" (a file URL with a query, a fragment or a dot segment)")
-		}
-		m.strict = true
+	if !strings.Contains(strings.ToLower(s), "file:") {
+		return ""
 	}
-	for _, p := range fileURLPaths(s) {
+	m.strict = true
+	for _, u := range reFileURL.FindAllStringSubmatch(s, -1) {
+		if why := unsafeFileURL(u[1], r.urls); why != "" {
+			return r.blockedMsg("`"+u[0]+"`", u[0]+" ("+why+")")
+		}
+		p, ok := fileURLPath(u[1])
+		if !ok || p == "" {
+			continue
+		}
 		if reason := r.word(p, at, m); reason != "" {
 			return reason
 		}
