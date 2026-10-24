@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -152,11 +154,32 @@ func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
 	return m.guardCommand(id, "", m.skillProtected(nil), nil, nil, gitDirs...)
 }
 
-// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
-// database (with its WAL files) that holds the monotonic subagent counter.
+// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log, the job
+// database (with its WAL files) that holds the monotonic subagent counter, and the configuration the
+// daemon and the MCP server load: <state>/config.json (hot-reloaded each tick: max_running, models,
+// skill_roots, ...), the owner rules and the project cards glued into every brief (wherever
+// owner_rules_path and cards_dir point).
 func (m *Manager) ProtectedPaths() []string {
 	db := filepath.Join(m.StateDir, "jobs.db")
-	return []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal"}
+	out := []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal",
+		filepath.Join(m.StateDir, "config.json")}
+	for _, p := range []string{m.Config().OwnerRulesPath, m.Config().CardsDir} {
+		if p != "" {
+			out = append(out, filepath.Clean(p))
+		}
+	}
+	return out
+}
+
+// jobOwnProtected are the files of job id's folder that set up how it runs: <jobdir>/gitconfig (its
+// GIT_CONFIG_GLOBAL) and <jobdir>/no-hooks (its core.hooksPath), whose 0400/0500 modes do not hold a
+// job back (it owns them and may chmod them; a changed diff.external or a planted hook makes git run
+// a program), and <jobdir>/settings.json and mcp.json (its guard hook, permissions and MCP servers,
+// read again when the job is resumed).
+func (m *Manager) jobOwnProtected(id string) []string {
+	dir := m.JobDir(id)
+	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir),
+		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json")}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -185,7 +208,7 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRe
 	if jobID != "" {
 		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
 			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
-		for _, p := range append(m.ProtectedPaths(), extraProtected...) {
+		for _, p := range append(append(m.ProtectedPaths(), m.jobOwnProtected(jobID)...), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
 		// The checklist locks are shared by every agent: a job neither reads nor writes there.
@@ -230,6 +253,11 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 		skillDenyRules(protected)...)
 }
 
+// GuardHookTimeout is the guard hook's timeout in seconds. Claude Code lets a tool call run when its
+// PreToolUse hook times out, so it is set well above guard.DecideBudget, the most time the guard
+// takes before it refuses a call as too complex to verify.
+const GuardHookTimeout = int(3 * guard.DecideBudget / time.Second)
+
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
 	deny := append(append([]string{}, denyRules...), extraDeny...)
 	if kind != "research" {
@@ -247,7 +275,7 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 			"PreToolUse": []any{
 				map[string]any{
 					"matcher": "*",
-					"hooks":   []any{map[string]any{"type": "command", "command": guardCmd}},
+					"hooks":   []any{map[string]any{"type": "command", "command": guardCmd, "timeout": GuardHookTimeout}},
 				},
 			},
 		},

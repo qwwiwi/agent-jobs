@@ -1,0 +1,497 @@
+package guard
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"syscall"
+)
+
+// Second names of protected paths: a file descriptor alias (/proc/self/fd/N, /dev/fd/N, /dev/stdin)
+// reopens whatever file the descriptor holds, a hard link is the same inode under another name, and
+// an exported variable ($GIT_CONFIG_GLOBAL) spells a protected path without writing it out. The
+// checks below give the protected-path rule (CheckFileWrite, checkProtected) those names too.
+
+// reFdAlias matches a path that names an open file descriptor or a process's working directory
+// rather than a file: /proc/<pid>/fd/…, /proc/<pid>/task/<tid>/fd/…, /proc/<pid>/cwd, map_files,
+// /dev/fd/…, /dev/stdin, /dev/stdout, /dev/stderr. Opening such a path reopens the file behind the
+// descriptor (with a new access mode), chmod changes that file, `ln -L` links it.
+var reFdAlias = regexp.MustCompile(`^/(proc/[^/]+/(task/[^/]+/)?(fd|fdinfo|cwd|root|map_files)|dev/fd|dev/std(in|out|err))(/|$)`)
+
+// reStdStream matches the aliases of the standard streams a command may write to (`>/dev/stderr`,
+// `tee /dev/stdout`): fds 0-2 are the tool's pipes unless the command redirects them, and opening a
+// protected path for a redirection is refused by itself.
+var reStdStream = regexp.MustCompile(`^/(dev/std(in|out|err)|dev/fd/[012]|proc/(self|thread-self)/fd/[012])$`)
+
+// fdAlias reports a path (as written, cleaned) that is a file descriptor alias, and whether it is
+// one of the standard streams.
+func fdAlias(p string) (alias, std bool) {
+	p = filepath.ToSlash(filepath.Clean(p))
+	if !reFdAlias.MatchString(p) {
+		return false, false
+	}
+	return true, reStdStream.MatchString(p)
+}
+
+// fdMeta are the programs that change a file's metadata or link it: given a descriptor alias they act
+// on the file behind it (`chmod u+w /proc/self/fd/9`, `ln -L /dev/stdin alias`), never on a stream.
+var fdMeta = map[string]bool{
+	"chmod": true, "chown": true, "chgrp": true, "chattr": true, "setfacl": true, "ln": true, "link": true,
+	"touch": true, "truncate": true, "mv": true, "rm": true, "unlink": true, "shred": true, "setfattr": true,
+	"xattr": true,
+}
+
+// linkMakers may create a link (`ln -s /proc p`, `cp -s`, `rsync -l`): one to /proc, /dev or an
+// ancestor of them makes a descriptor alias under a name that is not one (`p/<pid>/fd/3`) in the same
+// call, before the guard can resolve the link.
+var linkMakers = map[string]bool{"ln": true, "link": true, "cp": true, "rsync": true}
+
+// reFdRoot matches a directory a descriptor alias lies below: /, /proc, /dev, /proc/<pid>,
+// /proc/<pid>/task, /proc/<pid>/task/<tid>.
+var reFdRoot = regexp.MustCompile(`^/((proc(/[^/]+(/task(/[^/]+)?)?)?)|dev)?$`)
+
+// fdRootWord reports a word naming, from some directory of the call, a descriptor alias other than
+// a standard stream, or a directory one lies below (as written or with symlinks resolved; an
+// existing file such as /proc/cpuinfo is none).
+func (s *pathScope) fdRootWord(w string) bool {
+	if alias, std := s.fdWord(w); alias {
+		return !std
+	}
+	for _, v := range []string{w, wordValue(w)} {
+		exp, ok := s.expandHome(v)
+		if !ok {
+			continue
+		}
+		for _, c := range s.candidates(exp) {
+			c = filepath.ToSlash(filepath.Clean(c))
+			if !reFdRoot.MatchString(c) {
+				continue
+			}
+			if fi, err := os.Stat(c); err != nil || fi.IsDir() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reSimpleVar is a plain variable reference, $NAME or ${NAME}: a loop variable (`wc -l < "$f"`).
+var reSimpleVar = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`)
+
+// inputRedirBlocked refuses an input redirection (`<t`, `N<t`, `N<>t`) that opens a protected path or
+// a directory holding one: the descriptor is a second name of what it opens, and of every file below
+// a directory (`exec 9<dir` then /proc/self/fd/9/gitconfig). A target the guard cannot resolve is
+// refused too: a substitution, an expansion with an operator (`${V:0}`, `${V#x}`, `${!V}`), and, for
+// a descriptor kept by `exec`, any variable expansion left after the hook's environment.
+func (s *pathScope) inputRedirBlocked(t string, exec bool) string {
+	if p, ok := s.hit(t, true); ok {
+		if _, in := s.hit(t, false); in {
+			return protectedBlocked(p)
+		}
+		return "blocked by guard: the input redirection `<" + t + "` opens a directory holding agent-jobs state (`" + p +
+			"`: " + protectedKinds + "); the descriptor names every file below it (/proc/self/fd/N/…). Name the " +
+			"files you read instead."
+	}
+	rest := expandEnv(t)
+	if !exec {
+		rest = reSimpleVar.ReplaceAllString(rest, "")
+	}
+	if strings.ContainsAny(rest, "$`") {
+		return "blocked by guard: the input redirection `<" + t + "` opens a path computed at run time (a " +
+			"substitution, an expansion with an operator, or a variable for a descriptor kept by exec); it may be " +
+			"agent-jobs state, and the descriptor a second name of it. Write the path out."
+	}
+	return ""
+}
+
+// reFdCode is a descriptor alias inside code: /proc/<pid>/fd, /proc/<pid>/task/<tid>/fd (also cwd,
+// root, map_files) or /dev/fd, with the pid spelled any way (`/proc/{os.getpid()}/fd`, `/proc/$$/fd`).
+var reFdCode = regexp.MustCompile(`/proc/[^/\s'"]+/(task/[^/\s'"]+/)?(fd|cwd|root|map_files)\b|/dev/fd\b`)
+
+// codeRunner reports a program that runs code given in its arguments, its here-docs or here-strings.
+func codeRunner(name string) bool {
+	return stdinInterpreter(name) || shells[name] || awks[name]
+}
+
+// fdInCode refuses inline code, a here-doc program or here-string program that names a descriptor
+// alias: a descriptor the shell opened (`exec 9<…`) is reached through it, and a chmod, link or write
+// there changes the file behind it, which the guard cannot see from the code.
+func fdInCode(name string, argv []string, c *simpleCmd) string {
+	runner := codeRunner(name)
+	for k := 1; k < len(argv); k++ {
+		if !runner && !codeArg(argv, k) {
+			continue
+		}
+		if m := reFdCode.FindString(argv[k]); m != "" {
+			return fdAliasBlocked(m)
+		}
+	}
+	if runner {
+		if m := reFdCode.FindString(c.heredoc); m != "" {
+			return fdAliasBlocked(m)
+		}
+	}
+	return ""
+}
+
+func fdAliasBlocked(w string) string {
+	return "blocked by guard: `" + w + "` names an open file descriptor (/proc/*/fd, /dev/fd, /dev/std*), which can " +
+		"stand for agent-jobs state or configuration; a job does not change, link or write through one. Write the path out."
+}
+
+// protectedForms returns the protected paths cleaned and with symlinks resolved like a write target
+// (resolvePath: the longest existing prefix, a dangling link followed by its target text), both
+// spellings kept: `config.json -> /outside/new.json` protects /outside/new.json before it exists.
+func protectedForms(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		p = filepath.Clean(p)
+		out = append(out, p)
+		if r := resolvePath(p, "/"); r != p {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// maxInodeScan bounds the entries looked at for hard links in one call, once for the protected
+// directories and once for the destination trees of recursive writes; past it a multiply linked
+// target, and a destination tree, is refused (fail closed). A variable for the tests.
+var maxInodeScan = 16384
+
+type inodeKey struct{ dev, ino uint64 }
+
+// inodeSet holds the (device, inode) of every protected regular file that has more than one link,
+// collected once per call and only when a write target has more than one link itself, or a recursive
+// write names a directory.
+type inodeSet struct {
+	forms []string
+	ids   map[inodeKey]string
+	done  bool
+	full  bool // maxInodeScan was reached: an unmatched multiply linked target is refused too
+	// trees caches the destination trees scanned in this call (by the directory's inode); treeLeft is
+	// what is left of their shared maxInodeScan budget.
+	trees    map[inodeKey]string
+	treeLeft int
+}
+
+func statKey(fi fs.FileInfo) (inodeKey, uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return inodeKey{}, 0, false
+	}
+	return inodeKey{uint64(st.Dev), uint64(st.Ino)}, uint64(st.Nlink), true
+}
+
+// walkTree calls f with every regular file at or below root and its stat, following symlinks (as a
+// write into the tree does: `cp -r x/. dir` writes through dir/sub when sub links elsewhere); each
+// directory is walked once, by its (device, inode). It stops when f returns true, and returns false
+// when more than *budget entries would be looked at (the budget is used up in place).
+func walkTree(root string, budget *int, f func(p string, fi fs.FileInfo) bool) (complete bool) {
+	seen := map[inodeKey]bool{}
+	stack := []string{root}
+	for len(stack) > 0 {
+		p := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if *budget--; *budget < 0 {
+			return false
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if fi.Mode().IsRegular() {
+			if f(p, fi) {
+				return true
+			}
+			continue
+		}
+		if !fi.IsDir() {
+			continue
+		}
+		if k, _, ok := statKey(fi); ok {
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			stack = append(stack, filepath.Join(p, e.Name()))
+		}
+	}
+	return true
+}
+
+func (s *inodeSet) load() {
+	s.done, s.ids = true, map[inodeKey]string{}
+	budget := maxInodeScan
+	for _, q := range s.forms {
+		if !walkTree(q, &budget, func(p string, fi fs.FileInfo) bool {
+			if k, n, ok := statKey(fi); ok && n > 1 {
+				s.ids[k] = p
+			}
+			return false
+		}) {
+			s.full = true
+			return
+		}
+	}
+}
+
+// hardlink returns the protected file an existing regular file p is another hard link of (symlinks
+// followed, as a write follows them). A file with one link is no other name of anything.
+func (s *inodeSet) hardlink(p string) (string, bool) {
+	fi, err := os.Stat(p)
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", false
+	}
+	k, n, ok := statKey(fi)
+	if !ok || n < 2 {
+		return "", false
+	}
+	if !s.done {
+		s.load()
+	}
+	if q, ok := s.ids[k]; ok {
+		return q, true
+	}
+	if s.full {
+		return p + " (a hard link the guard cannot rule out among protected files)", true
+	}
+	return "", false
+}
+
+// treeHardlink returns the protected file a recursive write into the existing directory dir may
+// reach under another name: a hard link of it anywhere below dir, symlinks followed (`chmod -R u+w d`,
+// `cp -r x/. d`, `tar -x -C d`). It looks only when some protected file has another link (or the
+// protected scan was cut off), and refuses a tree past the scan bound.
+func (s *inodeSet) treeHardlink(dir string) (string, bool) {
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return "", false
+	}
+	if !s.done {
+		s.load()
+	}
+	if len(s.ids) == 0 && !s.full {
+		return "", false // no protected file has a second name anywhere
+	}
+	dk, _, ok := statKey(fi)
+	if !ok {
+		return "", false
+	}
+	if s.trees == nil {
+		s.trees, s.treeLeft = map[inodeKey]string{}, maxInodeScan
+	}
+	if q, ok := s.trees[dk]; ok {
+		return q, q != ""
+	}
+	q := ""
+	if !walkTree(dir, &s.treeLeft, func(p string, fi fs.FileInfo) bool {
+		k, n, ok := statKey(fi)
+		if !ok || n < 2 {
+			return false
+		}
+		if pq, ok := s.ids[k]; ok {
+			q = pq + " (`" + p + "` is a hard link of it)"
+		} else if s.full {
+			q = p + " (a hard link the guard cannot rule out among protected files)"
+		}
+		return q != ""
+	}) {
+		q = dir + " (a tree larger than the guard's scan bound, which may hold a hard link of a protected file)"
+	}
+	s.trees[dk] = q
+	return q, q != ""
+}
+
+// reEnvRef is a variable reference: $NAME, ${NAME} or ${NAME<op>…} with an operator that keeps the
+// value when it is set (`:-`, `-`, `:=`, `=`, `:?`, `?`).
+var reEnvRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(?::?[-=?])[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+
+// expandEnv replaces the references to variables set in the hook's environment, other than HOME
+// (expandHome handles it), with their values: the job's shell inherits the same environment, so
+// `chmod u+w "$GIT_CONFIG_GLOBAL"` names the job's gitconfig and `$GIT_CONFIG_VALUE_0` its no-hooks
+// dir. A variable that is unset here, or assigned in the call itself, stays as written.
+func expandEnv(w string) string {
+	if !strings.Contains(w, "$") {
+		return w
+	}
+	return reEnvRef.ReplaceAllStringFunc(w, func(ref string) string {
+		m := reEnvRef.FindStringSubmatch(ref)
+		name := m[1] + m[2]
+		if name == "HOME" {
+			return ref
+		}
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			return v
+		}
+		return ref
+	})
+}
+
+// stateWriteBlocked is the refusal of a file tool write into the state dir outside the job's folder.
+func stateWriteBlocked(tool, p string) string {
+	return "blocked by guard: " + tool + " into `" + p + "`: it is agent-jobs state outside this job's folder (other " +
+		"jobs' files, the goals, the archive); a job writes only in its own folder and work tree."
+}
+
+// fdWord reports a word (or its `key=value` value) that names a file descriptor alias from some
+// directory of the call, as written or with symlinks resolved (`p/<pid>/fd/3` with `p -> /proc`), and
+// whether it is a standard stream. A standard stream is judged as written: resolved, /dev/stderr is
+// the hook's own descriptor (/proc/<pid>/fd/2), which says nothing about the job's.
+func (s *pathScope) fdWord(w string) (alias, std bool) {
+	for _, v := range []string{w, wordValue(w)} {
+		exp, ok := s.expandHome(v)
+		if !ok {
+			continue
+		}
+		for _, d := range s.dirs {
+			b := exp
+			if !filepath.IsAbs(b) {
+				b = d + "/" + exp
+			}
+			if a, st := fdAlias(b); a && st {
+				return true, true
+			}
+		}
+		for _, c := range s.candidates(exp) {
+			if a, _ := fdAlias(c); a {
+				alias = true
+			}
+		}
+	}
+	return alias, false
+}
+
+// dirReaders only read the directory named by an argument, or list or measure what is in it: a
+// directory holding a protected path is no destination for them (`find ..`, `du -sh ..`, `tree ..`).
+var dirReaders = map[string]bool{
+	"find": true, "du": true, "tree": true, "ls": true, "stat": true, "file": true, "realpath": true,
+	"readlink": true, "basename": true, "dirname": true, "df": true, "diff": true, "cmp": true, "md5sum": true,
+	"sha1sum": true, "sha256sum": true, "sha512sum": true, "b2sum": true, "cksum": true, "fd": true,
+	"fdfind": true, "exa": true, "eza": true, "lsd": true, "wc": true, "head": true, "tail": true,
+}
+
+// fdExec are the options with which fd runs a command on what it finds (like find -exec).
+var fdExec = []string{"-x", "--exec", "-X", "--exec-batch"}
+
+// fdValueShorts are fd's short options that take a value: in a cluster, the rest of the word is
+// that value (`-tx` is --type x, `-Ex` excludes x), not more options.
+const fdValueShorts = "tedEcjSo"
+
+// fdActs reports an fd/fdfind call that runs a command: an exec option in any spelling, separate
+// (`-x cmd`), joined (`-xcmd`, `--exec=cmd`), last in or inside a flag cluster (`-Hx cmd`,
+// `-Hxcmd`), or as a long-option prefix (`--exe`). Every word is checked, values too (fail closed).
+func fdActs(args []string) bool {
+	return slices.ContainsFunc(args, func(a string) bool {
+		if slices.Contains(fdExec, a) {
+			return true
+		}
+		if long, ok := strings.CutPrefix(a, "--"); ok {
+			long, _, _ = strings.Cut(long, "=")
+			return len(long) >= len("exe") && strings.HasPrefix("exec-batch", long)
+		}
+		if !strings.HasPrefix(a, "-") {
+			return false
+		}
+		for _, c := range a[1:] {
+			if c == 'x' || c == 'X' {
+				return true
+			}
+			if strings.ContainsRune(fdValueShorts, c) {
+				return false
+			}
+		}
+		return false
+	})
+}
+
+// dirReader reports a command for which the rule "the directory holding a protected path is a
+// destination" (parentHit) does not apply: a plain directory reader (find or fd without an action,
+// du, ls, tree, …). Every other program keeps it (fail closed): cp, mv, install, ln, rsync, tar -x,
+// unzip -d, patch -d, and any interpreter, with a script file too: the guard does not see what a
+// script or module does with a directory (`python3 -m zipfile --extract evil.zip ..`).
+func dirReader(name string, argv []string) bool {
+	if !dirReaders[name] {
+		return false
+	}
+	switch name {
+	case "find":
+		return !findActs(argv[1:])
+	case "fd", "fdfind":
+		return !fdActs(argv[1:])
+	}
+	return true
+}
+
+// pythonModule returns the module a python call runs with -m (`-m zipfile`, `-mzipfile`) and the
+// index of the first word after it, or "" when it runs none.
+func pythonModule(name string, argv []string) (string, int) {
+	if !strings.HasPrefix(name, "python") && !strings.HasPrefix(name, "pypy") {
+		return "", 0
+	}
+	for k := 1; k < len(argv); k++ {
+		switch a := argv[k]; {
+		case a == "-m" && k+1 < len(argv):
+			return argv[k+1], k + 2
+		case strings.HasPrefix(a, "-m") && len(a) > 2:
+			return a[2:], k + 1
+		case !strings.HasPrefix(a, "-") || a == "-" || a == "--":
+			return "", 0
+		}
+	}
+	return "", 0
+}
+
+// pipDirOpts are the pip and ensurepip options naming a directory they write a tree into.
+var pipDirOpts = map[string]bool{
+	"--target": true, "-t": true, "--prefix": true, "--root": true, "-d": true, "--dest": true, "--src": true,
+	"-b": true, "--build": true, "--download": true,
+}
+
+// pythonTreeTargets returns how a python call that runs an archive or package module writes trees:
+// `-m zipfile` and `-m tarfile` extract into their operands, so all of them are checked as ancestors
+// (all); `-m pip` and `-m ensurepip` write into the directories of their directory options
+// (`--target <dir>`, `--target=<dir>`, `-t<dir>`, `-d <dir>`, …), returned as dirs, while their
+// other operands (`pip install -e .`) are sources.
+func pythonTreeTargets(name string, argv []string) (all bool, dirs []string) {
+	mod, k := pythonModule(name, argv)
+	switch mod {
+	case "zipfile", "tarfile":
+		return true, nil
+	case "pip", "ensurepip":
+	default:
+		return false, nil
+	}
+	for ; k < len(argv); k++ {
+		a := argv[k]
+		opt, v, eq := strings.Cut(a, "=")
+		switch {
+		case pipDirOpts[a] && k+1 < len(argv):
+			dirs = append(dirs, argv[k+1])
+			k++
+		case eq && strings.HasPrefix(a, "--") && pipDirOpts[opt]:
+			dirs = append(dirs, v)
+		case len(a) > 2 && a[0] == '-' && a[1] != '-' && pipDirOpts[a[:2]]:
+			dirs = append(dirs, a[2:])
+		}
+	}
+	return false, dirs
+}
+
+// fdWrites reports an fd/fdfind call that runs a command on what it finds: like find with an
+// action, it writes into the tree it searches, ancestors of protected paths included.
+func fdWrites(name string, argv []string) bool {
+	return (name == "fd" || name == "fdfind") && fdActs(argv[1:])
+}
