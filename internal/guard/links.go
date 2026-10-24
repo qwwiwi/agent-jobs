@@ -450,7 +450,7 @@ func (s *pathScope) futurePath(raw string) string {
 			}
 			parts = append(strings.Split(target, "/"), parts...)
 		} else {
-			cur = resolvePath(next, "/")
+			cur = s.resolve(next)
 		}
 	}
 	return cur

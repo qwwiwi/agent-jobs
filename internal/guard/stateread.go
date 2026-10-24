@@ -130,7 +130,7 @@ func (r *stateReadScope) sequence(scripts []*script) {
 // directory without cleaning: for a path with `..` it is also resolved the way the kernel does
 // (`link/..` is the parent of the link's target).
 func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
-	cands := []string{filepath.Clean(abs), resolvePath(abs, "/")}
+	cands := []string{filepath.Clean(abs), r.resolve(abs)}
 	if len(r.futureLinks) > 0 {
 		path := raw
 		if path == "" {
@@ -140,7 +140,7 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 	}
 	if raw != "" && hasDotDot(raw) {
 		if q, ok := kernelPath(raw); ok {
-			cands = append(cands, q, resolvePath(q, "/"))
+			cands = append(cands, q, r.resolve(q))
 		}
 	}
 	for _, p := range cands {
@@ -237,13 +237,13 @@ func (r *stateReadScope) glob(what, pat string, tree bool) string {
 		}
 	}
 	lit := "/" + strings.Join(comps[:wi], "/")
-	forms := []string{filepath.Clean(lit), resolvePath(lit, "/")}
+	forms := []string{filepath.Clean(lit), r.resolve(lit)}
 	if hasDotDot(lit) {
 		k, ok := kernelPath(lit)
 		if !ok {
 			return dotDotBlocked(what)
 		}
-		forms = append(forms, k, resolvePath(k, "/"))
+		forms = append(forms, k, r.resolve(k))
 	}
 	for _, f := range forms {
 		full := path.Join(append([]string{filepath.ToSlash(f)}, rest...)...)
@@ -543,7 +543,7 @@ func (r *stateReadScope) whereOf(c *simpleCmd) (where, string) {
 			if !filepath.IsAbs(raw) {
 				raw = d + "/" + p
 			}
-			n := resolvePath(raw, "/")
+			n := r.resolve(raw)
 			if hasDotDot(raw) {
 				k, ok := kernelPath(raw)
 				if !ok {
