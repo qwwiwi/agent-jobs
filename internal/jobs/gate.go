@@ -162,7 +162,7 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	}
 	for _, row := range c.Rows {
 		g.Rows = append(g.Rows, store.GateRow{ID: row.ID, Verbatim: row.Verbatim, Contract: row.Contract,
-			PlaceholderOK: row.PlaceholderOK, Basis: row.Rationale})
+			PlaceholderOK: row.PlaceholderOK, Rationale: row.Rationale})
 	}
 	if r.Kind == KindJudge && len(g.Live) == 0 {
 		return nil, fmt.Errorf("judge: checklist %s has no live requirements", c.ID)
@@ -270,7 +270,7 @@ func RenderGateInput(j *store.Job) string {
 	b.WriteString("### BRIEF.md (in full, with its Additions)\n\n")
 	fence := fenceFor(g.Brief)
 	fmt.Fprintf(&b, "%smarkdown\n%s\n%s\n\n", fence, strings.TrimRight(g.Brief, "\n"), fence)
-	b.WriteString("### Checklist rows (ID, the owner's words verbatim, contract, Basis)\n\n")
+	b.WriteString("### Checklist rows (ID, brief quote, contract, rationale)\n\n")
 	rows, _ := json.MarshalIndent(g.Rows, "", "  ")
 	fence = fenceFor(string(rows))
 	fmt.Fprintf(&b, "%sjson\n%s\n%s\n\n", fence, rows, fence)

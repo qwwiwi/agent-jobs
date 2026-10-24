@@ -91,7 +91,7 @@ func TestSlicingJobEndToEnd(t *testing.T) {
 	}
 	g := j.Gate
 	if j.RepoPath != "" || j.Kind != KindSlicing || g == nil || g.ChecklistID != "demo" || g.Version != 2 || g.SHA != "" ||
-		!strings.Contains(g.Brief, "BRIEF_TEXT_MARKER") || len(g.Rows) != 3 || g.Rows[0].Basis != "BASIS_MARKER" {
+		!strings.Contains(g.Brief, "BRIEF_TEXT_MARKER") || len(g.Rows) != 3 || g.Rows[0].Rationale != "RATIONALE_MARKER" {
 		t.Fatalf("gate job: %+v %+v", j, g)
 	}
 	gateReport(t, slicingBlock(g, "I want a login  page."))
@@ -104,8 +104,10 @@ func TestSlicingJobEndToEnd(t *testing.T) {
 	}
 	dir := m.JobDir(j.ID)
 	prompt, _ := os.ReadFile(filepath.Join(dir, "prompt.md"))
-	for _, s := range []string{"BRIEF_TEXT_MARKER", "BASIS_MARKER", "SECOND_ROW_MARKER", "Checklist (kind: slicing)", SlicingSchema,
-		"OWNER_RULE_MARKER", "## Not done / uncertain", "nick-vels/skills", g.ChecklistSHA256} {
+	for _, s := range []string{"BRIEF_TEXT_MARKER", "RATIONALE_MARKER", "SECOND_ROW_MARKER", "Checklist (kind: slicing)", SlicingSchema,
+		"OWNER_RULE_MARKER", "## Not done / uncertain", g.ChecklistSHA256,
+		"### Checklist rows (ID, brief quote, contract, rationale)", `"rationale": "RATIONALE_MARKER"`,
+		"Go through the brief one sentence at a time", "Report what you found and nothing more"} {
 		if !strings.Contains(string(prompt), s) {
 			t.Fatalf("prompt.md lacks %q:\n%s", s, prompt)
 		}
@@ -224,7 +226,9 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 		t.Fatalf("run.sh lost its executable bit: %v %v", fi, err)
 	}
 	prompt, _ := os.ReadFile(filepath.Join(dir, "prompt.md"))
-	for _, s := range []string{"BRIEF_TEXT_MARKER", "BASIS_MARKER", "Checklist (kind: judge)", JudgeSchema, sha, "R01, R02, R03i"} {
+	for _, s := range []string{"BRIEF_TEXT_MARKER", "RATIONALE_MARKER", "Checklist (kind: judge)", JudgeSchema, sha, "R01, R02, R03i",
+		"### Checklist rows (ID, brief quote, contract, rationale)", "Nothing you do may leave this machine",
+		"Mark each verdict with how you reached it"} {
 		if !strings.Contains(string(prompt), s) {
 			t.Fatalf("prompt.md lacks %q", s)
 		}

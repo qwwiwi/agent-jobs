@@ -32,13 +32,13 @@ type GateInput struct {
 	At    time.Time `json:"at"`
 }
 
-// GateRow is one checklist row as a gate job is given it: ID, the owner's words, contract and Basis.
+// GateRow is one checklist row as a gate job is given it: ID, brief quote, contract and rationale.
 type GateRow struct {
 	ID            string `json:"id"`
 	Verbatim      string `json:"verbatim"`
 	Contract      string `json:"contract"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
-	Basis         string `json:"basis,omitempty"`
+	Rationale     string `json:"rationale,omitempty"`
 }
 
 // gateInputJSON is the gate_input column: "" for none.
