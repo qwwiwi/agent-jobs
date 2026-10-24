@@ -320,6 +320,20 @@ func (g gzReadCloser) Close() error { return errors.Join(g.Reader.Close(), g.f.C
 
 // hasReport reports whether a non-empty report.md exists in the job folder or the archive. A stop
 // report the daemon wrote for an attempt that left none does not count.
+// requirementsClaimed counts the claimed «done» lines of the report's Requirements block (F4); 0 for
+// a job without covers or without a readable report (job folder first, then the log archive).
+func (m *Manager) requirementsClaimed(j *store.Job) int {
+	if len(j.Covers) == 0 {
+		return 0
+	}
+	for _, p := range []string{filepath.Join(m.JobDir(j.ID), "report.md"), filepath.Join(m.archiveJobDir(j), "report.md")} {
+		if report, err := readSmall(p, maxContractReportBytes+1); err == nil && len(report) <= maxContractReportBytes {
+			return len(ParseRequirements(report, j.Covers).Claimed)
+		}
+	}
+	return 0
+}
+
 func (m *Manager) hasReport(j *store.Job) bool {
 	for _, p := range []string{filepath.Join(m.JobDir(j.ID), "report.md"), filepath.Join(m.archiveJobDir(j), "report.md")} {
 		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
@@ -377,6 +391,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 	}
 	st.SkillsDelivered = slices.Clone(j.SkillsDelivered)
 	st.Outcome, st.OutcomeNote = j.Outcome, j.OutcomeNote
+	st.RequirementsClaimed = m.requirementsClaimed(j)
 	earlier, err := m.Store.Attempts(j.ID)
 	if err != nil {
 		return nil, err
@@ -638,6 +653,10 @@ type StatsSummary struct {
 	WithoutReport     int            `json:"without_report"`
 	// ReportOffContract counts the jobs whose report lacks the Summary or the Not done / uncertain section.
 	ReportOffContract int `json:"report_off_contract"`
+	// RequirementsClaimed counts «done» requirement lines without «ran:» or a REDPROOF (F4), over
+	// ClaimedJobs jobs.
+	RequirementsClaimed int `json:"requirements_claimed"`
+	ClaimedJobs         int `json:"claimed_jobs"`
 	// CostUnknownJobs counts the jobs whose cost is unknown; the cost figures leave them out.
 	CostUnknownJobs int `json:"cost_unknown_jobs"`
 	// CostEstimatedUSD is the part of CostTotalUSD estimated from token usage at list prices (attempts
@@ -902,6 +921,10 @@ func summarize(rows []*store.JobStats) StatsSummary {
 		}
 		if r.ReportOffContract {
 			s.ReportOffContract++
+		}
+		if r.RequirementsClaimed > 0 {
+			s.RequirementsClaimed += r.RequirementsClaimed
+			s.ClaimedJobs++
 		}
 		durs = append(durs, r.DurationSec)
 	}

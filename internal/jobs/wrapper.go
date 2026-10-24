@@ -494,7 +494,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	res.Completed, res.ExitCode = true, code
 	res.ReportPresent = hasReport(jobDir)
 	if report, err := readSmall(filepath.Join(jobDir, "report.md"), maxContractReportBytes+1); err == nil && len(report) <= maxContractReportBytes {
-		res.ReportContractNote = reportContractNote(report)
+		var covers []string // the job's covers (F4) from its row; none when it cannot be read
+		if j, err := st.Get(id); err == nil {
+			covers = j.Covers
+		}
+		res.ReportContractNote = reportContractNote(report, covers)
 	}
 	if err := record(res); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: record completion:", err)

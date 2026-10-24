@@ -142,6 +142,9 @@ type StartRequest struct {
 	OwnerWaits bool
 	// Skills are edits to the job's default skills (E7): "name" or "+name" adds, "-name" removes.
 	Skills []string
+	// Covers are the checklist requirement IDs the job works on (Wave F, F4): its report must then
+	// carry a «### Requirements» block with one line per ID.
+	Covers []string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -349,6 +352,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	covers, err := ValidateCovers(r.Covers)
+	if err != nil {
+		return nil, err
+	}
 	var selected []string
 	if skills.BriefDeclinesSkills(r.Brief) {
 		if len(r.Skills) > 0 {
@@ -367,7 +374,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch,
+		BaseBranch: branch, Covers: covers,
 	}
 	return j, nil
 }
