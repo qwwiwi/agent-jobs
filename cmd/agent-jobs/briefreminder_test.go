@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -64,6 +65,44 @@ func TestHookBriefReminder(t *testing.T) {
 		if code != 0 || out != "" || !strings.Contains(errs, "agent-jobs hook brief-reminder:") {
 			t.Errorf("%s: %d %q %q", name, code, out, errs)
 		}
+	}
+}
+
+// Inside a job the job-role refusal ends `hook brief-reminder` with exit 0 and no output, before any
+// state is opened; every other command (hook bind, status) is still refused with exit 1.
+func TestHookBriefReminderInsideJob(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "agent-jobs")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	home := t.TempDir()
+	run := func(args ...string) (int, string, string) {
+		t.Helper()
+		cmd := exec.Command(bin, args...)
+		cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home, jobs.JobEnvVar+"=review-probe")
+		cmd.Stdin = strings.NewReader(`{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":"/"}`)
+		var out, errb bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errb
+		code := 0
+		if err := cmd.Run(); err != nil {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
+				t.Fatal(err)
+			}
+			code = ee.ExitCode()
+		}
+		return code, out.String(), errb.String()
+	}
+	if code, out, errs := run("hook", "brief-reminder", "--agent", "test"); code != 0 || out != "" || errs != "" {
+		t.Errorf("brief-reminder inside a job: exit %d, stdout %q, stderr %q", code, out, errs)
+	}
+	for _, args := range [][]string{{"hook", "bind", "--agent", "test"}, {"status", "--agent", "test"}} {
+		if code, _, errs := run(args...); code != 1 || !strings.Contains(errs, "refused") {
+			t.Errorf("%v inside a job: exit %d, stderr %q", args, code, errs)
+		}
+	}
+	if left, err := os.ReadDir(home); err != nil || len(left) != 0 {
+		t.Errorf("state opened inside a job: %v %v", left, err)
 	}
 }
 

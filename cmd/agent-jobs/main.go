@@ -145,6 +145,10 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if reason := refuseInsideJob(cmd, args); reason != "" {
+		// The brief reminder always exits 0: inside a job it ends here, silently, before any state is opened.
+		if cmd == "hook" && len(args) > 0 && args[0] == "brief-reminder" {
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
 		os.Exit(1)
 	}
@@ -1871,7 +1875,8 @@ func cmdDoctor(args []string) error {
 //
 // Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
 // output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding. The
-// brief reminder is softer still: it always exits 0, an error only goes to stderr.
+// brief reminder is softer still: it always exits 0, an error only goes to stderr, and a job context
+// (main's job-role refusal, a job session) stays silent. It reads the store read-only (openReadOnly).
 func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
 	sub := ""
 	if len(args) > 0 {
