@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -58,6 +59,15 @@ func latestApproval(st *store.Store, main string) (*store.ChecklistApproval, *ch
 	}
 	return a, &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256,
 		BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}, nil
+}
+
+// binding is the store's binding of checklist id in the repository main (nil when it has none).
+func binding(st *store.Store, main, id string) (*checklist.Binding, error) {
+	b, err := st.Binding(main, id)
+	if err != nil || b == nil {
+		return nil, err
+	}
+	return &checklist.Binding{BriefSHA256: b.BriefSHA256, Approved: b.Approved}, nil
 }
 
 func checklistView(st *store.Store, top, main string, c *checklist.Checklist, brief []byte) (ChecklistView, error) {
@@ -172,15 +182,23 @@ func addChecklistInit(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
-		// A checklist id once approved in this repository is bound to its BRIEF: a new brief takes a new id.
-		if last, err := d.Manager.Store.LatestApproval(main); err != nil {
+		// A checklist id is bound to the BRIEF it was created with: an id created (or approved) in this
+		// repository before is never reused, a new brief takes a new id.
+		if b, err := d.Manager.Store.Binding(main, c.ID); err != nil {
 			return nil, ChecklistView{}, err
-		} else if last != nil && last.ChecklistID == c.ID {
-			return nil, ChecklistView{}, fmt.Errorf("checklist %q was approved in this repository before (version %d): "+
-				"a new brief takes a new id", c.ID, last.Version)
+		} else if b != nil {
+			return nil, ChecklistView{}, fmt.Errorf("checklist %q was created in this repository before: a new brief takes a new id", c.ID)
 		}
 		if err := checklist.WriteBoth(top, brief, list, nil); err != nil {
 			return nil, ChecklistView{}, err
+		}
+		// The init record binds the id to the BRIEF prefix; without it the files are removed again (they
+		// did not exist before the call, and the lock is held), so a failed init leaves nothing behind.
+		if err := d.Manager.Store.PutInit(store.ChecklistInit{Repo: main, ChecklistID: c.ID,
+			BriefSHA256: checklist.BriefPrefixSHA256(brief), CreatedAt: d.Manager.Now()}); err != nil {
+			_ = os.Remove(checklist.ChecklistPath(top))
+			_ = os.Remove(checklist.BriefPath(top))
+			return nil, ChecklistView{}, fmt.Errorf("checklist_init: the init record was not stored, nothing written: %w", err)
 		}
 		v, err := checklistView(d.Manager.Store, top, main, c, brief)
 		if err != nil {
@@ -271,7 +289,9 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			return nil, ChecklistView{}, err
 		}
 		now := m.Now()
-		res, err := checklist.Apply(f, ch, now, jobs.Redact, last)
+		res, err := checklist.Apply(f, ch, now, jobs.Redact, last, func(id string) (*checklist.Binding, error) {
+			return binding(m.Store, main, id)
+		})
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
