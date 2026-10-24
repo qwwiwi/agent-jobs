@@ -41,7 +41,7 @@ func storeSlicing(t *testing.T, m *jobs.Manager, repo string, unmapped ...string
 	}
 	id, token := gateJobRow(t, m, jobs.KindSlicing)
 	r := store.SlicingResult{JobID: id, Repo: main, ChecklistID: v.ID, Version: v.Version, ChecklistSHA256: v.SHA256,
-		Model: "opus", Runner: store.RunnerClaude, CreatedAt: time.Now()}
+		Model: "opus", Runner: store.RunnerClaude, EnforcedBlind: true, CreatedAt: time.Now()}
 	for _, q := range unmapped {
 		r.Unmapped = append(r.Unmapped, store.Quote{Quote: q})
 	}

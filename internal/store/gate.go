@@ -70,7 +70,11 @@ type SlicingResult struct {
 	Runner          string `json:"runner"`
 	// EnforcedBlind is true when the job ran under the guard's read allowlist (claude); a codex job
 	// has no OS confinement of its reads (ticket 684), so its result is stored with false.
-	EnforcedBlind bool      `json:"enforced_blind"`
+	EnforcedBlind bool `json:"enforced_blind"`
+	// VoidsApproval is the seq of the repository's approval this result voided when it was stored (0 =
+	// none): the latest approval was of this checklist id, version and hash and the result listed an
+	// unmapped quote without an owner decision. Set by PutSlicing, never by the caller.
+	VoidsApproval int64     `json:"voids_approval,omitempty"`
 	Unmapped      []Quote   `json:"unmapped"`
 	Half          []Half    `json:"half"`
 	Invented      []Invent  `json:"invented"`
@@ -159,7 +163,8 @@ CREATE TABLE IF NOT EXISTS gate_slicing (
 	result           TEXT NOT NULL,
 	created_at       INTEGER NOT NULL,
 	attempt          INTEGER NOT NULL DEFAULT 0,
-	enforced_blind   INTEGER NOT NULL DEFAULT 0
+	enforced_blind   INTEGER NOT NULL DEFAULT 0,
+	voids_approval   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS gate_slicing_key ON gate_slicing(repo, checklist_id, version, checklist_sha256, seq);
 CREATE TABLE IF NOT EXISTS slicing_decisions (
@@ -202,6 +207,7 @@ CREATE INDEX IF NOT EXISTS gate_verdicts_key ON gate_verdicts(repo, sha, checkli
 var gateColumns = []string{
 	`ALTER TABLE gate_slicing ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE gate_slicing ADD COLUMN enforced_blind INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE gate_slicing ADD COLUMN voids_approval INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE gate_verdicts ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE gate_verdicts ADD COLUMN enforced_blind INTEGER NOT NULL DEFAULT 0`,
 }
@@ -244,9 +250,13 @@ func (s *Store) PutSlicing(token string, r SlicingResult) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("put slicing result: %w", err)
 	}
+	voids, err := slicingVoids(tx, r)
+	if err != nil {
+		return 0, fmt.Errorf("put slicing result: %w", err)
+	}
 	res, err := tx.Exec(`INSERT INTO gate_slicing (job_id, attempt, repo, checklist_id, version, checklist_sha256, model, runner,
-		enforced_blind, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, r.JobID, attempt, r.Repo, r.ChecklistID, r.Version,
-		r.ChecklistSHA256, r.Model, r.Runner, r.EnforcedBlind, string(lists), r.CreatedAt.Unix())
+		enforced_blind, voids_approval, result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, r.JobID, attempt, r.Repo, r.ChecklistID,
+		r.Version, r.ChecklistSHA256, r.Model, r.Runner, r.EnforcedBlind, voids, string(lists), r.CreatedAt.Unix())
 	if err != nil {
 		return 0, fmt.Errorf("put slicing result: %w", err)
 	}
@@ -257,6 +267,56 @@ func (s *Store) PutSlicing(token string, r SlicingResult) (int64, error) {
 	return seq, tx.Commit()
 }
 
+// slicingVoids is, inside tx, the seq of the repository's latest approval when r voids it (0 = it does
+// not): the approval is of r's checklist id, version and hash and r lists an unmapped quote without a
+// stored owner decision. The mark stays: decisions stored later do not restore that approval, only a new
+// one (a higher seq) does.
+func slicingVoids(tx *sql.Tx, r SlicingResult) (int64, error) {
+	var seq int64
+	err := tx.QueryRow(`SELECT seq FROM checklist_approvals WHERE repo=? ORDER BY seq DESC LIMIT 1`, r.Repo).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var hit int
+	err = tx.QueryRow(`SELECT COUNT(*) FROM checklist_approvals WHERE seq=? AND checklist_id=? AND version=? AND checklist_sha256=?`,
+		seq, r.ChecklistID, r.Version, r.ChecklistSHA256).Scan(&hit)
+	if err != nil || hit == 0 {
+		return 0, err
+	}
+	for _, q := range r.Unmapped {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM slicing_decisions WHERE repo=? AND checklist_id=? AND version=? AND
+			checklist_sha256=? AND unmapped=?`, r.Repo, r.ChecklistID, r.Version, r.ChecklistSHA256, q.Quote).Scan(&n); err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return seq, nil
+		}
+	}
+	return 0, nil
+}
+
+// ApprovalVoidedBy is the job id of the first slicing result that voided the approval with seq
+// approval of repo ("" = none did).
+func (s *Store) ApprovalVoidedBy(repo string, approval int64) (string, error) {
+	if approval == 0 {
+		return "", nil
+	}
+	var id string
+	err := s.db.QueryRow(`SELECT job_id FROM gate_slicing WHERE repo=? AND voids_approval=? ORDER BY seq LIMIT 1`, repo,
+		approval).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("approval voided by: %w", err)
+	}
+	return id, nil
+}
+
 func nonNil[T any](s []T) []T {
 	if s == nil {
 		return []T{}
@@ -264,15 +324,15 @@ func nonNil[T any](s []T) []T {
 	return s
 }
 
-const slicingCols = `seq, job_id, attempt, repo, checklist_id, version, checklist_sha256, model, runner, enforced_blind, result,
-	created_at`
+const slicingCols = `seq, job_id, attempt, repo, checklist_id, version, checklist_sha256, model, runner, enforced_blind,
+	voids_approval, result, created_at`
 
 func scanSlicing(r scanner) (*SlicingResult, error) {
 	var out SlicingResult
 	var lists string
 	var at int64
 	if err := r.Scan(&out.Seq, &out.JobID, &out.Attempt, &out.Repo, &out.ChecklistID, &out.Version, &out.ChecklistSHA256,
-		&out.Model, &out.Runner, &out.EnforcedBlind, &lists, &at); err != nil {
+		&out.Model, &out.Runner, &out.EnforcedBlind, &out.VoidsApproval, &lists, &at); err != nil {
 		return nil, err
 	}
 	var l struct {

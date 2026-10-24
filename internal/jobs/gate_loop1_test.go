@@ -222,7 +222,7 @@ func putSlicing(t *testing.T, m *Manager, repo string, unmapped ...string) *stor
 		u = append(u, store.Quote{Quote: q})
 	}
 	if _, err := m.Store.PutSlicing("tok-"+j.ID, store.SlicingResult{JobID: j.ID, Repo: j.Gate.Repo, ChecklistID: j.Gate.ChecklistID,
-		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Model: "sonnet", Runner: "claude", Unmapped: u,
+		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Model: "sonnet", Runner: "claude", EnforcedBlind: true, Unmapped: u,
 		CreatedAt: m.Now()}); err != nil {
 		t.Fatal(err)
 	}

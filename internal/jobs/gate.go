@@ -954,10 +954,24 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 		return gateFailPrefix + "the runner's final message is empty (the result is read from it only, never from a file)"
 	case len(report) > maxContractReportBytes:
 		return gateFailPrefix + fmt.Sprintf("the runner's final message is larger than %d bytes", maxContractReportBytes)
-	case res.Runner != store.RunnerCodex && res.Results != 1:
-		// claude prints one result event per run: another one came from a process that wrote into the
-		// pipe (the job's code can reach it through /proc), so no result of this run is trusted.
-		return gateFailPrefix + fmt.Sprintf("the runner's stdout carried %d result events (one expected)", res.Results)
+	case res.Invalid > 0:
+		// Every line of either runner's stdout is a JSON event: a line that is not came from a process
+		// that wrote into the pipe (the job's processes can reach it, through /proc for one), and an
+		// unterminated prefix it wrote would join the runner's own next line into such a line.
+		return gateFailPrefix + fmt.Sprintf("the runner's stdout carried %d line(s) that are not JSON or are over the line limit "+
+			"(every line must be one JSON event)", res.Invalid)
+	case res.Results != 1:
+		// claude prints one result event per run (the guard refuses a gate job's background Bash, whose end
+		// would print another) and codex exec one terminal turn event: another one came from a process that
+		// wrote into the pipe, so no result of this run is trusted.
+		what := "result events"
+		if res.Runner == store.RunnerCodex {
+			what = "terminal turn events"
+		}
+		return gateFailPrefix + fmt.Sprintf("the runner's stdout carried %d %s (one expected)", res.Results, what)
+	case res.AfterEnd > 0:
+		return gateFailPrefix + fmt.Sprintf("the runner's stdout carried %d event(s) after the terminal turn event (none expected)",
+			res.AfterEnd)
 	}
 	fail := func(err error) string { return gateFailPrefix + RedactPrintable(err.Error(), 300) }
 	blind := enforcedBlind(j.Runner)
@@ -1168,6 +1182,13 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 	for _, r := range rs {
 		jobs = append(jobs, r.JobID)
 	}
+	if approve && !slices.ContainsFunc(rs, func(r *store.SlicingResult) bool { return r.EnforcedBlind }) {
+		// A codex result (no OS confinement of its reads, ticket 684) adds its unmapped quotes, but never
+		// stands for the slicing check an approval needs.
+		return nil, 0, fmt.Errorf("approve: no slicing check of checklist %s version %d (sha256 %s) was held to its input by the "+
+			"guard (enforced_blind true; jobs %s are not): a codex result does not count toward the approval; run slicing_start "+
+			"with a claude model", id, version, hash, strings.Join(jobs, ", "))
+	}
 	var out []store.SlicingDecision
 	var quotes []string
 	redacted := 0
@@ -1202,8 +1223,10 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 }
 
 // SlicingVoid is why the approval of checklist id version and hash in repo main no longer holds ("" =
-// it holds): a slicing result stored after it lists an unmapped quote without an owner decision, stored
-// or among given (decisions about to be stored).
+// it holds): a slicing result of the version lists an unmapped quote without an owner decision, stored
+// or among given (decisions about to be stored), or a result stored after the repository's latest
+// approval (of this version and hash) listed one when it was stored. That void stays when the quotes
+// are decided later: only a new approval, given after the voiding result, holds again.
 func (m *Manager) SlicingVoid(main, id string, version int, hash string, given ...store.SlicingDecision) (string, error) {
 	rs, unmapped, err := m.slicingUnion(main, id, version, hash)
 	if err != nil || len(rs) == 0 {
@@ -1213,13 +1236,21 @@ func (m *Manager) SlicingVoid(main, id string, version int, hash string, given .
 	if err != nil {
 		return "", err
 	}
-	left := undecided(unmapped, append(d, given...), nil)
-	if len(left) == 0 {
-		return "", nil
+	if left := undecided(unmapped, append(d, given...), nil); len(left) > 0 {
+		return fmt.Sprintf("the approval is void: a slicing check of this version (job %s) lists %d unmapped brief quote(s) without an "+
+			"owner decision (%s); decide them with checklist_set unmapped_decisions and approve again", rs[len(rs)-1].JobID, len(left),
+			quoteList(left)), nil
 	}
-	return fmt.Sprintf("the approval is void: a slicing check of this version (job %s) lists %d unmapped brief quote(s) without an "+
-		"owner decision (%s); decide them with checklist_set unmapped_decisions and approve again", rs[len(rs)-1].JobID, len(left),
-		quoteList(left)), nil
+	a, err := m.Store.LatestApproval(main)
+	if err != nil || a == nil || a.ChecklistID != id || a.Version != version || a.ChecklistSHA256 != hash {
+		return "", err
+	}
+	job, err := m.Store.ApprovalVoidedBy(main, a.Seq)
+	if err != nil || job == "" {
+		return "", err
+	}
+	return fmt.Sprintf("the approval is void: a slicing check of this version stored after it (job %s) listed unmapped brief "+
+		"quote(s) without an owner decision; the decisions given since do not restore it: approve again with checklist_set approve", job), nil
 }
 
 // ChecklistStatus is the approval state of checklist c (with brief) in repo main: checklist.Status
