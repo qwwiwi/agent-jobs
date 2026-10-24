@@ -147,7 +147,7 @@ func addChecklistInit(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
-		unlock, err := d.Manager.LockChecklist()
+		unlock, err := d.Manager.LockChecklist(top)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
@@ -202,6 +202,12 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
+		// Read under the lock: never half of a checklist_set's two renames.
+		unlock, err := d.Manager.LockChecklist(top)
+		if err != nil {
+			return nil, ChecklistView{}, err
+		}
+		defer unlock()
 		f, err := checklist.Read(top)
 		if err != nil {
 			return nil, ChecklistView{}, err
@@ -235,7 +241,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
-		unlock, err := m.LockChecklist()
+		unlock, err := m.LockChecklist(top)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
