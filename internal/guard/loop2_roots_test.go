@@ -8,6 +8,8 @@ import (
 	"testing"
 )
 
+// Fix loop 2, item 2: a protected path whose symlinks take more than the resolution budget to
+// resolve is not taken lexically (the physical file would be unprotected): every file tool write and
 // every Bash call is refused until the configuration names a path the guard can resolve.
 func TestUnresolvableProtectedRootRefuses(t *testing.T) {
 	root, err := filepath.EvalSymlinks(t.TempDir())
