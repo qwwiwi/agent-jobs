@@ -225,16 +225,21 @@ func attachedPaths(w string) []string {
 // rePct is a percent-encoded byte (`%2F`).
 var rePct = regexp.MustCompile(`%[0-9A-Fa-f]{2}`)
 
-// percentDecoded returns w with every %xx decoded, ok false when it has none: a URL reader (curl,
-// python's urllib) opens `file:///tmp%2Fx` as /tmp/x, so the decoded form is checked as well.
+// percentDecoded returns w with every %xx decoded, round after round until none is left (`%252F`
+// decodes to `%2F`, then to `/`), ok false when it has none: a URL reader (curl, python's urllib) opens
+// `file:///tmp%2Fx` as /tmp/x, so the decoded form is checked as well. Each round shortens the word, so
+// the rounds are at most a third of its length.
 func percentDecoded(w string) (string, bool) {
 	if !rePct.MatchString(w) {
 		return "", false
 	}
-	return rePct.ReplaceAllStringFunc(w, func(h string) string {
-		b, _ := strconv.ParseUint(h[1:], 16, 8)
-		return string([]byte{byte(b)})
-	}), true
+	for rePct.MatchString(w) {
+		w = rePct.ReplaceAllStringFunc(w, func(h string) string {
+			b, _ := strconv.ParseUint(h[1:], 16, 8)
+			return string([]byte{byte(b)})
+		})
+	}
+	return w, true
 }
 
 // reFileURL is a file URL in a text, in any case, up to a quote, a blank or a shell operator.
@@ -269,6 +274,9 @@ func fileURLPaths(s string) []string {
 // word returns a refusal when a path word reaches the state from a directory the command may run in.
 // A path attached to an option, a file URL and the percent-decoded word are checked too.
 func (r *stateReadScope) word(w string, at where, m wordMode) string {
+	if r.over() {
+		return cannot("state read check exceeded the guard time budget")
+	}
 	lenient := wordMode{tree: m.tree, dynamic: m.dynamic}
 	for _, p := range attachedPaths(w) {
 		if reason := r.word(p, at, lenient); reason != "" {
@@ -281,9 +289,8 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 		}
 	}
 	if d, ok := percentDecoded(w); ok {
-		if reason := r.word(d, at, lenient); reason != "" {
-			return reason
-		}
+		// The decoded word as a text: its path-like pieces (the word itself when it has no separator)
+		// and its file URLs; decoded to the end, none of them decodes again.
 		if reason := r.text(d, at); reason != "" {
 			return reason
 		}
