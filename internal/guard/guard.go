@@ -351,9 +351,10 @@ func hasDotDot(path string) bool {
 // CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
 // would write inside a git dir: any `.git` directory, the job's own git dirs (cfg.GitDirs), git
 // config/hooks paths; into a protected path (also through a file descriptor alias or a hard link of
-// a protected file). A path with a `..` segment is rejected outright; otherwise both the path as
-// given and the path with symlinks resolved are checked (a link in the job dir pointing into .git),
-// and a path whose symlinks take more than maxResolveSteps to resolve is refused.
+// a protected file); or into the state dir outside the job's own folder. A path with a `..` segment
+// is rejected outright; otherwise both the path as given and the path with symlinks resolved are
+// checked (a link in the job dir pointing into .git), and a path whose symlinks take more than
+// maxResolveSteps to resolve is refused.
 func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
@@ -374,6 +375,10 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 	if alias, _ := fdAlias(given); alias && len(cfg.Protected) > 0 {
 		return fdAliasBlocked(path)
 	}
+	var state *stateReadScope
+	if cfg.StateDir != "" {
+		state = newStateReadScope(nil, cfg)
+	}
 	for _, p := range []string{given, resolved} {
 		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
@@ -381,6 +386,11 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		}
 		if inJobGitDir(p, cfg.Protected) {
 			return protectedBlocked(p)
+		}
+		if state != nil {
+			if q, in := state.blocked(p, "", false); in {
+				return stateWriteBlocked(tool, q)
+			}
 		}
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
@@ -627,7 +637,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					if h, ok := s.contains(a, code); ok {
 						return h.reason()
 					}
-					if name != "cd" && name != "pushd" {
+					if name != "cd" && name != "pushd" && !dirReader(name, argv, c) {
 						if p, ok := s.parentHit(a); ok {
 							return protectedBlocked(p)
 						}

@@ -167,6 +167,12 @@ func expandEnv(w string) string {
 	})
 }
 
+// stateWriteBlocked is the refusal of a file tool write into the state dir outside the job's folder.
+func stateWriteBlocked(tool, p string) string {
+	return "blocked by guard: " + tool + " into `" + p + "`: it is agent-jobs state outside this job's folder (other " +
+		"jobs' files, the goals, the archive); a job writes only in its own folder and work tree."
+}
+
 // fdWord reports a word (or its `key=value` value) that names a file descriptor alias from some
 // directory of the call, and whether every such name is a standard stream.
 func (s *pathScope) fdWord(w string) (alias, std bool) {
@@ -190,4 +196,36 @@ func (s *pathScope) fdWord(w string) (alias, std bool) {
 		}
 	}
 	return alias, alias && std
+}
+
+// dirReaders only read the directory named by an argument, or list or measure what is in it: a
+// directory holding a protected path is no destination for them (`find ..`, `du -sh ..`, `tree ..`).
+var dirReaders = map[string]bool{
+	"find": true, "du": true, "tree": true, "ls": true, "stat": true, "file": true, "realpath": true,
+	"readlink": true, "basename": true, "dirname": true, "df": true, "diff": true, "cmp": true, "md5sum": true,
+	"sha1sum": true, "sha256sum": true, "sha512sum": true, "b2sum": true, "cksum": true, "ag": true, "fd": true,
+	"fdfind": true, "exa": true, "eza": true, "lsd": true, "wc": true, "head": true, "tail": true, "more": true,
+}
+
+// dirReader reports a command for which the rule "the directory holding a protected path is a
+// destination" (parentHit) does not apply: a directory reader (find without an action), or an
+// interpreter running a script file, which the guard does not see in any case (`python3 x.py ..`).
+// Every other program keeps it (fail closed): cp, mv, install, ln, rsync, tar -x, unzip -d, patch -d,
+// inline code (`python3 -c '…' <dir>`).
+func dirReader(name string, argv []string, c *simpleCmd) bool {
+	if dirReaders[name] {
+		return name != "find" || !findActs(argv[1:])
+	}
+	if !stdinInterpreter(name) && !shells[name] && !awks[name] {
+		return false
+	}
+	if c.stdin || c.heredoc != "" || len(argv) < 2 {
+		return false // the program comes from stdin or a here-doc the guard checks as code
+	}
+	for k := 1; k < len(argv); k++ {
+		if inlineCode(name, argv, k) || codeArg(argv, k) {
+			return false
+		}
+	}
+	return !awks[name] // an awk program is its first operand: inline code
 }

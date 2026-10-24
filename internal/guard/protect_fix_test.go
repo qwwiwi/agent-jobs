@@ -113,3 +113,39 @@ func TestExportedGitVarsNameProtectedPaths(t *testing.T) {
 	)
 	allowed(t, cfg, `cat "$GIT_CONFIG_GLOBAL"`, `echo "$GIT_CONFIG_GLOBAL"`, `echo x > "$UNSET_IN_TEST_ENV/x"`)
 }
+
+// REDPROOF 7: file tools write in the job's own folder only: other jobs' files and the state's own
+// files (goals, archive) are refused, the job's work tree, progress notes and scratch files are not.
+func TestFileToolsStayInOwnFolder(t *testing.T) {
+	_, _, cfg := jobFolderSetup(t)
+	other := filepath.Join(cfg.StateDir, "jobs", "k")
+	if err := os.MkdirAll(other, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, other, filepath.Join(cfg.Dir, "peer"))
+	for _, p := range []string{filepath.Join(other, "report.md"), filepath.Join(other, "prompt.md"),
+		filepath.Join(other, "settings.json"), filepath.Join(cfg.StateDir, "goals.md"),
+		filepath.Join(cfg.StateDir, "archive", "x.md"), filepath.Join(cfg.Dir, "peer", "report.md")} {
+		if r := CheckFileWrite("Write", p, cfg); r == "" {
+			t.Errorf("Write %s allowed", p)
+		}
+	}
+	for _, p := range []string{filepath.Join(cfg.Dir, "main.go"), filepath.Join(cfg.OwnDir, "PROGRESS.md"),
+		filepath.Join(cfg.OwnDir, "report.md"), filepath.Join(cfg.OwnDir, "tmp", "x.py"), "notes/a.md"} {
+		if r := CheckFileWrite("Write", p, cfg); r != "" {
+			t.Errorf("Write %s refused: %s", p, r)
+		}
+	}
+}
+
+// REDPROOF 8: the directory holding a protected path is refused as a destination of programs that
+// write into a directory, not as an argument of programs that read or list it.
+func TestDirHoldingProtectedReadersAllowed(t *testing.T) {
+	_, _, cfg := jobFolderSetup(t)
+	own := "'" + cfg.OwnDir + "'"
+	allowed(t, cfg, "find ..", "find .. -name '*.md'", "du -sh ..", "tree ..", "ls -la ..", "python3 x.py ..",
+		"du -sh "+own, "node scan.js "+own, "bash count.sh ..")
+	refused(t, cfg, "cp f "+own+"/", "cp f ..", "mv f ..", "install f ..", "ln -s /tmp/x ..", "rsync -a d/ ..",
+		"tar -xf a.tar -C ..", "find .. -delete", "python3 -c 'import sys' ..", "python3 - .. <<'EOF'\nx\nEOF",
+		"patch -d .. -p1 < x.diff")
+}
