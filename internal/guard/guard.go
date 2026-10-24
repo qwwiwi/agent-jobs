@@ -80,6 +80,17 @@ type Config struct {
 	NoRead []string
 	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
 	ReadOnly string
+	// ReadAllow, when not empty, are the only paths (directories or files) a job reads, a gate job's
+	// (Wave F: its own folder with its work dir, its session dirs, the system dirs programs run from):
+	// every other path is refused for the read tools and as a Bash word, as agent-jobs state is, with
+	// the same resolution (symlinks, cd, -C, globs, recursive readers, xargs). Two rules are stricter
+	// than the state check: after a cd the guard cannot resolve every relative word is refused, and so is
+	// a command or redirection word it cannot expand ($VAR, a substitution). A path under a top-level
+	// name that does not exist (`/api/v1` in a pattern) cannot be read and is not refused.
+	ReadAllow []string
+	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
+	// paths its own folders).
+	readAllowScope bool
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
