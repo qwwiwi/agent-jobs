@@ -1,0 +1,10 @@
+{"Time":"2026-10-24T20:00:00Z","Action":"start","Package":"example.com/app"}
+{"Time":"2026-10-24T20:00:00Z","Action":"run","Package":"example.com/app","Test":"TestLogin"}
+{"Time":"2026-10-24T20:00:00Z","Action":"run","Package":"example.com/app","Test":"TestLogin/[R01]_login_page_renders"}
+{"Time":"2026-10-24T20:00:00Z","Action":"output","Package":"example.com/app","Test":"TestLogin/[R01]_login_page_renders","Output":"--- PASS: TestLogin/[R01]_login_page_renders (0.00s)\n"}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Test":"TestLogin/[R01]_login_page_renders","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Test":"TestLogin/[R02][R03i]_logout_keeps_the_session","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Test":"TestLogin","Elapsed":0.01}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app/audit","Test":"TestAudit/[G01]_writes_\"quoted\"_lines","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app/report","Test":"TestReport/[R04]_draft","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Elapsed":0.02}
