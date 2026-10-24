@@ -27,6 +27,9 @@ func Init(id, words string, redact Redactor) (brief, list []byte, redacted int, 
 	if strings.TrimSpace(words) == "" {
 		return nil, nil, 0, errors.New("brief is empty: give the owner's words verbatim")
 	}
+	if fenceOpen(words) {
+		return nil, nil, 0, fmt.Errorf("brief has %w", ErrUnclosedFence)
+	}
 	// A «## Additions» line in the owner's words (in a fence or not) would be ambiguous with the heading
 	// additions go under, and the text above it is all that stays bound.
 	for _, l := range strings.Split(words, "\n") {
@@ -145,6 +148,11 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor, last *Record, bi
 		res.List, res.BriefAfter = cur, f.Brief
 		res.Approved, res.Hash, res.Reason = cur.Status(f.Brief, last)
 		return res, nil
+	}
+	// A hand-written BRIEF.md whose owner prefix leaves a fence open is refused: the fence would hide
+	// the «## Additions» heading (checklist_init never writes one).
+	if fenceOpen(BriefPrefix(f.Brief)) {
+		return nil, fmt.Errorf("%s: the text above %s has %w", BriefRel, AdditionsHeading, ErrUnclosedFence)
 	}
 	if BriefPrefixSHA256(f.Brief) != bound.BriefSHA256 {
 		return nil, prefixChanged(cur.ID, bound)
