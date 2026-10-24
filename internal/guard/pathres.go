@@ -377,7 +377,7 @@ func (s *pathScope) resolveAt(p, dir string) string {
 // kernelWalk is walkPath for the checks of this call: an absolute path as written, each `..` taken
 // after the symlinks before it.
 func (s *pathScope) kernelWalk(abs string) string {
-	r, ok := walkPath(abs)
+	r, ok := memoWalk(abs)
 	if !ok {
 		s.expired = true
 	}
