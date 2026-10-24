@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -93,6 +94,9 @@ func TestSlicingJobEndToEnd(t *testing.T) {
 		t.Fatalf("gate job: %+v %+v", j, g)
 	}
 	gateReport(t, slicingBlock(g, "I want a login  page."))
+	// A brain is configured: a gate job still gets no memory notes, and none is looked up for it.
+	f := &brain.Fake{Notes: []brain.Note{{Path: "70-runbooks/n.md", Scope: "runbooks", Score: 0.9, Snippet: "NOTE_MARKER"}}}
+	m.Brain = f
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusSucceeded {
 		t.Fatalf("status %s: %s", j.Status, j.Error)
@@ -105,8 +109,8 @@ func TestSlicingJobEndToEnd(t *testing.T) {
 			t.Fatalf("prompt.md lacks %q:\n%s", s, prompt)
 		}
 	}
-	if strings.Contains(string(prompt), "Gate job (kind") || strings.Contains(string(prompt), "Memory notes") {
-		t.Fatalf("prompt.md carries the brief column or memory notes:\n%s", prompt)
+	if strings.Contains(string(prompt), "Gate job (kind") || strings.Contains(string(prompt), "NOTE_MARKER") || len(f.Queries) != 0 {
+		t.Fatalf("prompt.md carries the brief column or memory notes (queries %q):\n%s", f.Queries, prompt)
 	}
 	if seen, _ := os.ReadFile(filepath.Join(dir, "work-seen.txt")); strings.TrimSpace(string(seen)) != "" {
 		t.Fatalf("slicing work dir is not empty: %q", seen)
@@ -279,6 +283,12 @@ func TestValidateJudgeRules(t *testing.T) {
 		if _, _, err := ValidateJudge(report(b), g); err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("%s: %v", want, err)
 		}
+	}
+	// Another checklist id (version and hash the input's) is not the input either.
+	other := judgeBlock(g)
+	other["checklist"].(map[string]any)["id"] = "other"
+	if _, _, err := ValidateJudge(report(other), g); err == nil || !strings.Contains(err.Error(), "is not the job's input") {
+		t.Fatalf("another checklist id: %v", err)
 	}
 	// Two blocks of the schema are refused; a block in another fence does not count.
 	two := report(judgeBlock(g)) + report(judgeBlock(g))
