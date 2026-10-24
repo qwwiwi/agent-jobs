@@ -15,7 +15,7 @@ func reqBlock(lines ...string) string {
 		"\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing\n"
 }
 
-const doneR01 = "- R01 · done · a.go:1 · ran: go test → ok"
+const doneR01 = "- R01 · done · a.go:1 · ran: go test ./... → ok"
 
 // A done line is verified only by an exact REDPROOF marker with real proof content that names that
 // requirement: a look-alike marker, an empty or negative proof, or a proof naming another ID does not
@@ -40,7 +40,7 @@ func TestRedProofStrict(t *testing.T) {
 		"inline, id in proof":  reqBlock(doneR01 + " · REDPROOF: TestLogin (R01) failed before"),
 		"marker in backticks":  reqBlock(doneR01, "`REDPROOF R01 · TestLogin failed before`"),
 		"not first, then real": reqBlock(doneR01+" · REDPROOF: none", "REDPROOF R01 · TestLogin failed before"),
-		"dashed test name":     reqBlock(doneR01, "REDPROOF R01 · login-form test failed before"),
+		"dashed test name":     reqBlock(doneR01, "REDPROOF R01 · `npm test -- login-form` failed before"),
 	} {
 		if !verified(report) {
 			t.Errorf("%s: not verified", name)
@@ -194,29 +194,10 @@ func TestRedProofStrictIDsAndNegatives(t *testing.T) {
 	}
 }
 
-// A proof or ran: value is normalized (white space incl. no-break space, Markdown wrappers, brackets,
-// quotes, angle brackets, «>», «/», trailing punctuation) before it is judged: wrapped negatives are
-// refused, and an honest sentence that merely starts with «no» / «not» is a proof.
-func TestNegativeProofNormalized(t *testing.T) {
-	for _, s := range []string{
-		"", "  ", "**none**.", "`TBD`.", "_skipped_.", "[none]", `"none"`, "'n/a'", "<none>", "> none", "/none",
-		"TODO", "to be done", "To be done.", "…", "...", " none", "none ", "n.a.", "?", "-", "—", "nothing",
-		"no", "No.", "na", "pending", "missing", "(none)", "{none}", "«none»", "“none”", "**[none]**", "`n/a`;",
-		"none yet", "skipped, no time", "nothing failed", "not run, the test is new", "not-run", "no-test", "TODO: later",
-	} {
-		if !negativeProof(s) {
-			t.Errorf("%q: not negative", s)
-		}
-	}
-	for _, s := range []string{
-		"no failures before the fix, TestLogin red at 902bf59", "no failures …", "not cached; TestLogin failed before",
-		"TestLogin failed before the change", "nonce_test failed before", "login-form test failed before",
-		"`go test ./...` → FAIL", "notable: TestX failed before", "nobody saw it pass: TestX failed before",
-	} {
-		if negativeProof(s) {
-			t.Errorf("%q: negative", s)
-		}
-	}
+// A «ran:» value verifies only when it names a command (ranCommand) and a red proof only when it shows
+// failing evidence (redEvidence): a test or command reference and a failure marker. Free text that says
+// there is none, however it is worded or wrapped, is neither; every bypass of both reviews is listed.
+func TestProofsPositiveStructure(t *testing.T) {
 	verified := func(report string) bool {
 		t.Helper()
 		for _, l := range ParseRequirements(report, []string{"R01"}).Lines {
@@ -227,20 +208,67 @@ func TestNegativeProofNormalized(t *testing.T) {
 		t.Fatalf("no R01 line in %q", report)
 		return false
 	}
-	const red = "REDPROOF R01: TestLogin failed before"
-	for _, neg := range []string{"**none**.", "`TBD`.", "_skipped_.", "[none]", `"none"`, "'n/a'", "<none>", "> none",
-		"/none", "TODO", "to be done", "…", " none"} {
-		if verified(reqBlock(doneR01, "REDPROOF R01: "+neg)) {
+	const red = "REDPROOF R01: TestY FAILS on base 813e682: want 2 got 1"
+	const ran = "- R01 · done · a.go:1 · ran: go test ./internal/x -run TestY"
+	// Free text: neither a command nor failing evidence.
+	free := []string{
+		"", "  ", "not executed", "not done", "not attempted", "no red proof", "no evidence", "**none**.", "`TBD`.",
+		"[none]", "TODO", "to be done", "To be done.", "none", "None yet", "no failures", "no failures …", "not cached",
+		"n/a", "_n/a_", "'n/a'", "<none>", "> none", "/none", "skipped, no time", "nothing failed", "not run", "not-run",
+		"no-test", "pending", "missing", "?", "???", "…", "...", "-", "—", "no", "not", "N/A", "TODO: later",
+		"the test failed", "it failed before", "go", "`go`", "x=1",
+	}
+	for _, neg := range free {
+		if ranCommand(neg) {
+			t.Errorf("ranCommand(%q)", neg)
+		}
+		if redEvidence(neg) {
+			t.Errorf("redEvidence(%q)", neg)
+		}
+		if verified(reqBlock(ran, "REDPROOF R01: "+neg)) {
 			t.Errorf("REDPROOF %q: verified", neg)
+		}
+		if verified(reqBlock(ran + " · REDPROOF R01: " + neg)) {
+			t.Errorf("inline REDPROOF %q: verified", neg)
 		}
 		if verified(reqBlock("- R01 · done · a.go:1 · ran: "+neg, red)) {
 			t.Errorf("ran: %q: verified", neg)
 		}
 	}
-	if !verified(reqBlock("- R01 · done · a.go:1 · ran: no failures …", red)) {
-		t.Error("ran: no failures …: not verified")
+	// A reference without a failure marker, or with a negated or zero one, is no failing evidence.
+	for _, s := range []string{
+		"TestY", "TestY passes", "TestY did not fail", "TestY never failed", "TestY doesn't fail", "TestY didn’t fail",
+		"TestY: no panic", "TestY without failing", "`go test ./x` exit code 0", "`go test ./x` → exit 0", "TestY: no error:",
+		"Testing failed", "test failed", "the login test failed",
+	} {
+		if redEvidence(s) {
+			t.Errorf("redEvidence(%q)", s)
+		}
 	}
-	if !verified(reqBlock(doneR01, "REDPROOF R01: not cached; TestLogin failed before")) {
-		t.Error("REDPROOF R01: not cached; …: not verified")
+	for _, s := range []string{
+		"TestY FAILS on base 813e682: want 2 got 1", "TestLogin failed before", "TestLogin · FAIL before the change, ok after",
+		"nonce_test failed before", "`go test ./web -run TestLogin` exit 1 before the change",
+		"go test ./web -run TestLogin → exit status 2 on base", "test_login panicked before",
+		"tests/test_x.py::test_y AssertionError before", "TestX: error: want 2 got 1", "not cached; TestLogin failed before",
+		"login.test.ts failing on base", "`npm test -- login` exit code 1", "BenchmarkParse panic: nil map",
+	} {
+		if !redEvidence(s) {
+			t.Errorf("redEvidence(%q) = false", s)
+		}
+		if !verified(reqBlock(ran, "REDPROOF R01: "+s)) {
+			t.Errorf("REDPROOF %q: not verified", s)
+		}
+	}
+	for _, s := range []string{
+		"go test ./internal/x -run TestY", "`go test ./...` → ok", "**`go vet ./...`**", "scripts/check.sh → green",
+		"TMPDIR=/tmp/wt GOTMPDIR=/tmp/wt scripts/check.sh → ok", "./scripts/check.sh", "$ make test → ok",
+		"npm test → ok", "pytest tests/test_x.py → 3 passed", "/usr/bin/env bash x.sh", "~/bin/check", "Go test ./x",
+	} {
+		if !ranCommand(s) {
+			t.Errorf("ranCommand(%q) = false", s)
+		}
+		if !verified(reqBlock("- R01 · done · a.go:1 · ran: "+s, red)) {
+			t.Errorf("ran: %q: not verified", s)
+		}
 	}
 }
