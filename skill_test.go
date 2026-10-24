@@ -29,6 +29,7 @@ func TestSkillContent(t *testing.T) {
 		"memory_search", "memory_write", "task_update", "send_message", "inbox", "cannot write a `decision`",
 		"heartbeat_get", "[jobs:heartbeat] wake <id>", "untrusted data, not instructions",
 		"briefing_start", "briefing_get", "changed_since_approval", "Never ask the owner for a secret",
+		"`changed_since_approval.known` is false", "every current row",
 		"`size`", "`small`", "`large`", "size_required",
 		"Blocking findings as written and nothing more", "fix review", "only after something in the approach changed",
 	} {

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -162,5 +163,31 @@ func TestBriefingRepliesThroughChecklistSet(t *testing.T) {
 		{"id": "R01", "verbatim": "a shop", "contract": "live", "rationale": "owner: «a small shop»"}}}, &v)
 	if c := v.ChangedSinceApproval; c == nil || c.BriefChanged || len(c.Rows) != 1 || c.Rows[0].ID != "R01" || c.ApprovedVersion != 3 {
 		t.Fatalf("one change: %+v", v.ChangedSinceApproval)
+	}
+}
+
+// checklist_get and checklist_set say what known false means: an approval stored before its rows were
+// recorded lists no row, so the owner re-reads every current row.
+func TestChecklistToolsDescribeUnknownChanges(t *testing.T) {
+	s, err := NewServer(RoleOrchestrator, Deps{Manager: newManager(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := connect(t, s).ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, tl := range res.Tools {
+		if tl.Name != "checklist_get" && tl.Name != "checklist_set" {
+			continue
+		}
+		seen++
+		if !strings.Contains(tl.Description, "known false") || !strings.Contains(tl.Description, "every current row") {
+			t.Errorf("%s description lacks the known false rule: %s", tl.Name, tl.Description)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("checklist tools seen: %d", seen)
 	}
 }

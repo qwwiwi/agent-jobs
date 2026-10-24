@@ -283,7 +283,8 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 			"{version, sha256, current, job_id, unmapped, half, invented, decided, undecided, at} (null when none ran), and " +
 			"changed_since_approval: the rows added, changed (which fields) or removed since the repository's latest approval and " +
 			"whether BRIEF.md changed (null when the hash is the approved one, or that approval is of another id or absent): the owner " +
-			"re-approves only those rows.",
+			"re-approves only those rows; with known false (an approval stored before its rows were recorded) rows is empty and " +
+			"the owner re-reads every current row.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)
 		if err != nil {
@@ -333,7 +334,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			"only by a new approve, not by decisions alone. Owner replies to a briefing (F8): new scope is a G<nn> row with the " +
 			"owner's words in additions (dated) in the same call; a choice goes into the Rationale of the row it concerns; a " +
 			"cancellation sets the row to dropped with the owner's words in rationale; each raises the version, and " +
-			"changed_since_approval lists the rows the owner re-approves. Waivers need the " +
+			"changed_since_approval lists the rows the owner re-approves (with known false, every current row). Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
 		m := d.Manager

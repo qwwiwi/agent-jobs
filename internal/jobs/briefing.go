@@ -10,9 +10,10 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// Bounds of a briefing block (F8): questions per round put to the owner at once, and questions of the
-// optional adversarial pass for a large feature.
+// Bounds of a briefing block (F8): rounds put to the owner (one or two), questions per round put to
+// the owner at once, and questions of the optional adversarial pass for a large feature.
 const (
+	MaxBriefingRounds         = 2
 	MaxBriefingRoundQuestions = 4
 	MaxBriefingAdversarial    = 7
 )
@@ -26,27 +27,63 @@ var BriefingKinds = []string{"cost_or_vendor", "owner_visible", "costly_to_undo"
 // decision the owner made.
 const AssumptionPrefix = "ASSUMPTION:"
 
-// briefingSecretRe catches a question that asks the owner for a secret: the words password, passphrase,
-// token, secret, credential, key (api key, ssh key, ...) and the Russian nouns пароль, токен, ключ,
-// секрет in their case forms, as whole words (any Unicode letter or digit next to them makes another
-// word: «ключевой», «секретарь», "monkey" pass). A question never needs them: a credential is set up by
-// the owner out of band, never typed into a reply. It is matched on secretText.
+// briefingSecretRe catches a briefing text that asks the owner for a secret or names one: the words
+// password, passphrase, token, secret, credential, key (api key, ssh key, ...) and the Russian nouns
+// пароль, токен, ключ, секрет in their case forms, as whole words (any Unicode letter or digit next to
+// them makes another word: «ключевой», «секретарь», "monkey" pass). A briefing never needs them: a
+// credential is set up by the owner out of band, never typed into a reply. It is matched on secretText,
+// so a word of an identifier counts as a word.
 var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?|passwds?|passphrases?|pass\s*words?|tokens?|` +
 	`secrets?|credentials?|api[\s_-]*keys?|apikeys?|keys?|парол(?:ь|я|ю|ем|е|и|ей|ям|ями|ях)|токен(?:а|у|ом|е|ы|ов|ам|ами|ах)?|` +
 	`ключ(?:а|у|ом|е|и|ей|ам|ами|ах)?|секрет(?:а|у|ом|е|ы|ов|ам|ами|ах)?)(?:$|[^\p{L}\p{N}_])`)
 
 // secretText is s as briefingSecretRe reads it: format characters (zero-width spaces and joiners, soft
-// hyphens) dropped, so they cannot split a word, and every Unicode space made an ASCII space.
+// hyphens) dropped, so they cannot split a word; every Unicode space, connector (_) and dash made an
+// ASCII space; and the words of an identifier split apart: a space goes between a lower-case letter and
+// an upper-case one, between a letter and a digit, and before the last capital of a run followed by a
+// lower-case letter ("clientSecret", "APIKey", "key2" read as "client Secret", "API Key", "key 2"). A
+// word in one case is never split, so "monkey", "tokenizer" and "keyboard" stay whole.
 func secretText(s string) string {
-	return strings.Map(func(r rune) rune {
+	rs := []rune(strings.Map(func(r rune) rune {
 		switch {
 		case unicode.Is(unicode.Cf, r):
 			return -1
-		case unicode.IsSpace(r):
+		case unicode.IsSpace(r), unicode.Is(unicode.Pc, r), unicode.Is(unicode.Pd, r):
 			return ' '
 		}
 		return r
-	}, s)
+	}, s))
+	var b strings.Builder
+	for i, r := range rs {
+		if i > 0 && identifierBreak(rs[i-1], r, i+1 < len(rs) && unicode.IsLower(rs[i+1])) {
+			b.WriteByte(' ')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// identifierBreak reports whether an identifier's words part between rune p and the rune r after it;
+// nextLower says the rune after r is a lower-case letter.
+func identifierBreak(p, r rune, nextLower bool) bool {
+	switch {
+	case unicode.IsUpper(r) && unicode.IsLower(p):
+		return true
+	case unicode.IsUpper(r) && unicode.IsUpper(p) && nextLower:
+		return true
+	case unicode.IsLetter(p) && unicode.IsNumber(r), unicode.IsNumber(p) && unicode.IsLetter(r):
+		return true
+	}
+	return false
+}
+
+// briefingSecret refuses a briefing text that asks for a secret or names one; checked before redaction,
+// so a masked value cannot hide what the text asks for.
+func briefingSecret(what, s string) error {
+	if briefingSecretRe.MatchString(secretText(s)) {
+		return fmt.Errorf("%s asks for a secret or names one (password, token, key and the like are never asked of the owner)", what)
+	}
+	return nil
 }
 
 // BriefingOutput is the agent-jobs/briefing/v1 block of a briefing job's report.
@@ -59,11 +96,12 @@ type BriefingOutput struct {
 }
 
 // ValidateBriefing parses and validates a briefing job's report against its input: exactly one
-// agent-jobs/briefing/v1 block, no unknown fields, the input's checklist, rounds and decided present,
-// every round of 1 to 4 questions, at most 7 adversarial questions, every question numbered once (n
+// agent-jobs/briefing/v1 block, no unknown fields, the input's checklist, rounds and decided present, at
+// most 2 rounds, every round of 1 to 4 questions, at most 7 adversarial questions, every question numbered once (n
 // unique across rounds and adversarial), of a BriefingKinds kind, with q, recommended and why, closing
-// at least one row of the checklist and asking for no secret; every decided entry an ASSUMPTION closing
-// at least one row. It returns the block with its texts redacted.
+// at least one row of the checklist; every decided entry an ASSUMPTION closing at least one row; no
+// text (q, recommended, why, decided) asking for a secret or naming one. It returns the block with its
+// texts redacted.
 func ValidateBriefing(report string, g *store.GateInput) (*BriefingOutput, error) {
 	text, err := schemaBlock(report, BriefingSchema)
 	if err != nil {
@@ -78,6 +116,9 @@ func ValidateBriefing(report string, g *store.GateInput) (*BriefingOutput, error
 	}
 	if err := gateList("rounds", o.Rounds); err != nil {
 		return nil, err
+	}
+	if len(o.Rounds) > MaxBriefingRounds {
+		return nil, fmt.Errorf("rounds has %d entries (at most %d rounds: the owner answers one or two)", len(o.Rounds), MaxBriefingRounds)
 	}
 	if err := gateList("decided", o.Decided); err != nil {
 		return nil, err
@@ -122,9 +163,8 @@ func ValidateBriefing(report string, g *store.GateInput) (*BriefingOutput, error
 			name string
 			v    *string
 		}{{"q", &q.Q}, {"recommended", &q.Recommended}, {"why", &q.Why}} {
-			// Checked before redaction: a masked value must not hide what the question asks for.
-			if f.name != "why" && briefingSecretRe.MatchString(secretText(*f.v)) {
-				return fmt.Errorf("%s: %s asks for a secret (password, token, key and the like are never asked of the owner)", what, f.name)
+			if err := briefingSecret(what+": "+f.name, *f.v); err != nil {
+				return err
 			}
 			if *f.v, err = gateText(what+" "+f.name, *f.v, true); err != nil {
 				return err
@@ -159,6 +199,9 @@ func ValidateBriefing(report string, g *store.GateInput) (*BriefingOutput, error
 	for i := range o.Decided {
 		d := &o.Decided[i]
 		what := fmt.Sprintf("decided %d", i+1)
+		if err := briefingSecret(what+" text", d.Text); err != nil {
+			return nil, err
+		}
 		if d.Text, err = gateText(what+" text", d.Text, true); err != nil {
 			return nil, err
 		}

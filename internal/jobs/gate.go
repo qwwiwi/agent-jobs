@@ -724,16 +724,18 @@ func checkRef(ref GateChecklistRef, g *store.GateInput) error {
 }
 
 // text checks one text field: not longer than maxGateRunes; required ones not empty. It returns the
-// field redacted and on one line.
+// field redacted and on one line: redacted as written first (a PEM block split over lines is caught
+// whole only while its lines are intact), then again once on one line.
 func gateText(what, s string, required bool) (string, error) {
-	s = checklist.NormalizeField(s)
-	if required && s == "" {
+	norm := checklist.NormalizeField(s)
+	if required && norm == "" {
 		return "", fmt.Errorf("%s is empty", what)
 	}
-	if n := utf8.RuneCountInString(s); n > maxGateRunes {
+	if n := utf8.RuneCountInString(norm); n > maxGateRunes {
 		return "", fmt.Errorf("%s is longer than %d characters (%d)", what, maxGateRunes, n)
 	}
 	s, _ = Redact(s)
+	s, _ = Redact(checklist.NormalizeField(s))
 	return s, nil
 }
 

@@ -11,13 +11,13 @@ The owner gave a brief and the checklist above is a draft of it, not approved ye
   A question of any other sort (how to build it, which library, a fact you could look up) is not a question for the owner.
 - Each question names the rows its answer settles in `closes` (row ids from the checklist). A question that settles no row is not asked.
 - Round 1 comes first and holds what can stall the work from outside the project: payments, hosting, accounts with outside services, where data is stored. Then the rest, by how much the answer changes.
-- At most 4 questions per round, one or two rounds in all. Fewer is better.
+- At most 4 questions per round, one or two rounds in all (a third round fails the job). Fewer is better.
 - Each question carries the answer you propose (`recommended`), so the owner can just say yes, and one line on why it matters (`why`). Write `q` as a choice the owner can answer in a few words.
-- Never ask for a secret, and never ask the owner to type one in a reply. Do not use the words password, passphrase, token, secret, credential or key (nor «пароль», «токен», «ключ», «секрет») in `q` or `recommended` at all: the daemon fails the job on them. Write «access to the payment provider is set up by you» instead.
+- Never ask for a secret, and never ask the owner to type one in a reply. Do not use the words password, passphrase, token, secret, credential or key (nor «пароль», «токен», «ключ», «секрет») in any text (`q`, `recommended`, `why`, `decided`) at all, not even inside a name such as `client_secret` or `apiKey`: the daemon fails the job on them. Write «access to the payment provider is set up by you» instead.
 - For a large feature you may add an `adversarial` pass: at most 7 questions that try to break the plan (an edge case, a failure, a misuse), with the same fields. Leave it out otherwise.
 - Number the questions `n` from 1, once each, across all rounds and the adversarial pass.
 
-Put exactly one fenced block like this inside Findings / Changes (the daemon validates it; a report without it, with unknown fields, with more than 4 questions in a round, with a question that closes no row or a row not in the checklist, of another kind, or asking for a secret fails the job):
+Put exactly one fenced block like this inside Findings / Changes (the daemon validates it; a report without it, with unknown fields, with more than 2 rounds or more than 4 questions in a round, with a question that closes no row or a row not in the checklist, of another kind, or asking for a secret fails the job):
 
 ```json
 {
