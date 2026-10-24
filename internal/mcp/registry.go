@@ -84,6 +84,12 @@ var OrchestratorOnly = []string{
 	"checklist_init",
 	"checklist_get",
 	"checklist_set",
+	// The gate jobs (Wave F, F3 / F5): only the session starts the slicing check and the blind judge and
+	// reads their stored results; their input is assembled by the daemon.
+	"slicing_start",
+	"slicing_get",
+	"judge_start",
+	"judge_get",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

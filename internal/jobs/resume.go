@@ -686,6 +686,10 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s is %s: only stopped, timeout or failed jobs can be resumed (start a new job instead): %w",
 			id, j.Status, store.ErrImmutable)
 	}
+	if IsGateKind(j.Kind) {
+		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it; start a new one with %s_start",
+			id, j.Kind, j.Kind)
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -787,6 +791,10 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 	if j.Status != store.StatusQueued {
 		return nil, fmt.Errorf("job %s is %s: only a queued job can be amended (stop and resume a running one): %w",
 			id, j.Status, store.ErrImmutable)
+	}
+	if IsGateKind(j.Kind) {
+		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it (cancel it and start a new one)",
+			id, j.Kind)
 	}
 	if j.Attempt > 0 {
 		err = m.Store.AmendContext(id, "\n\n"+strings.TrimSpace(context))
@@ -956,7 +964,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
 		return launchPlan{}, err
 	}
-	brief, err := m.BuildPrompt(j, rules, cards, m.LookupMemoryNotes(j))
+	var notes MemoryNotes
+	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
+		notes = m.LookupMemoryNotes(j)
+	}
+	brief, err := m.BuildPrompt(j, rules, cards, notes)
 	if err != nil {
 		return launchPlan{}, err
 	}

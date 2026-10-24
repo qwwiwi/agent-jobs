@@ -160,6 +160,9 @@ type Job struct {
 	// CoverContract is the snapshot of the covered rows taken at job_start, which the daemon puts into
 	// the job's prompt (nil for a job without covers).
 	CoverContract *CoverContract
+	// Gate is the input the daemon assembled for a gate job (Wave F: kind slicing, F3, or judge, F5);
+	// nil for every other kind. The job's prompt is built from it, never from an orchestrator brief.
+	Gate *GateInput
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -226,7 +229,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	id              TEXT PRIMARY KEY,
 	agent           TEXT NOT NULL,
 	title           TEXT NOT NULL,
-	kind            TEXT NOT NULL CHECK (kind IN ('review','fix','research','general')),
+	kind            TEXT NOT NULL CHECK (kind IN ('review','fix','research','general','slicing','judge')),
 	brief           TEXT NOT NULL,
 	repo_path       TEXT NOT NULL DEFAULT '',
 	base_commit     TEXT NOT NULL DEFAULT '',
@@ -306,6 +309,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
+	if err := migrateKindCheck(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: %w", err)
+	}
 	if _, err := db.Exec(intentionsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: intentions: %w", err)
@@ -360,6 +367,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
 	}
+	if _, err := db.Exec(gateSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: gate results: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -370,17 +381,32 @@ const (
 	statusCheckNew = "'timeout','cancelled','stopped'))"
 )
 
-// migrateStatusCheck rebuilds a jobs table whose status CHECK predates the stopped status: same
-// definition (all columns, in order) with the new CHECK, rows copied, index recreated, all in one
-// IMMEDIATE transaction that re-checks the definition (several processes open the database).
+// migrateStatusCheck rebuilds a jobs table whose status CHECK predates the stopped status (rebuildCheck).
 func migrateStatusCheck(db *sql.DB) error {
+	return rebuildCheck(db, "status", statusCheckOld, statusCheckNew)
+}
+
+// kindCheckOld / kindCheckNew are the kind CHECK of the jobs table before and after the gate kinds
+// (Wave F: slicing, judge).
+const (
+	kindCheckOld = "('review','fix','research','general'))"
+	kindCheckNew = "('review','fix','research','general','slicing','judge'))"
+)
+
+// migrateKindCheck rebuilds a jobs table whose kind CHECK predates the gate kinds (rebuildCheck).
+func migrateKindCheck(db *sql.DB) error { return rebuildCheck(db, "kind", kindCheckOld, kindCheckNew) }
+
+// rebuildCheck rebuilds a jobs table whose what CHECK is still old: same definition (all columns, in
+// order) with the new CHECK, rows copied, index recreated, all in one IMMEDIATE transaction that
+// re-checks the definition (several processes open the database). SQLite cannot alter a CHECK.
+func rebuildCheck(db *sql.DB, what, old, new string) error {
 	def := func() (string, error) {
 		var q string
 		err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'`).Scan(&q)
 		return q, err
 	}
 	q, err := def()
-	if err != nil || strings.Contains(q, statusCheckNew) {
+	if err != nil || strings.Contains(q, new) {
 		return err
 	}
 	// One connection (SetMaxOpenConns(1)): the statements below run inside this transaction.
@@ -394,17 +420,17 @@ func migrateStatusCheck(db *sql.DB) error {
 	if q, err = def(); err != nil {
 		return rollback(err)
 	}
-	if strings.Contains(q, statusCheckNew) {
+	if strings.Contains(q, new) {
 		return rollback(nil)
 	}
-	if strings.Count(q, statusCheckOld) != 1 {
-		return rollback(fmt.Errorf("jobs table: unexpected status check in %q", q))
+	if strings.Count(q, old) != 1 {
+		return rollback(fmt.Errorf("jobs table: unexpected %s check in %q", what, q))
 	}
 	head, rest, ok := strings.Cut(q, "(")
 	if !ok || !strings.Contains(head, "jobs") {
 		return rollback(fmt.Errorf("jobs table: unexpected definition %q", q))
 	}
-	newDef := "CREATE TABLE jobs_rebuild (" + strings.Replace(rest, statusCheckOld, statusCheckNew, 1)
+	newDef := "CREATE TABLE jobs_rebuild (" + strings.Replace(rest, old, new, 1)
 	for _, stmt := range []string{newDef, `INSERT INTO jobs_rebuild SELECT * FROM jobs`, `DROP TABLE jobs`,
 		`ALTER TABLE jobs_rebuild RENAME TO jobs`, `CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status)`} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -476,6 +502,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN covers TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN requirements_claimed INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN cover_contract TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN gate_input TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -608,7 +635,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract`
+	base_branch, merge_note, covers, cover_contract, gate_input`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -672,7 +699,7 @@ func insertArgs(j *Job) []any {
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
-		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract)}
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -693,7 +720,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract string
+	var skills, delivered, covers, coverContract, gate string
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
@@ -702,7 +729,7 @@ func scanJob(r scanner) (*Job, error) {
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
-		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract)
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate)
 	if err != nil {
 		return nil, err
 	}
@@ -710,6 +737,12 @@ func scanJob(r scanner) (*Job, error) {
 		j.CoverContract = &CoverContract{}
 		if err := json.Unmarshal([]byte(coverContract), j.CoverContract); err != nil {
 			return nil, fmt.Errorf("job %s: cover_contract: %w", j.ID, err)
+		}
+	}
+	if gate != "" {
+		j.Gate = &GateInput{}
+		if err := json.Unmarshal([]byte(gate), j.Gate); err != nil {
+			return nil, fmt.Errorf("job %s: gate_input: %w", j.ID, err)
 		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)

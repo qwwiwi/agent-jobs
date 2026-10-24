@@ -86,6 +86,12 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the skill catalog (config skill_roots, same as the
                                            skill_list MCP tool); search scores names, descriptions
                                            and SKILL.md text locally, best 10
+  gate slicing --agent A --repo PATH [--checklist-id ID]
+                                           the slicing check (Wave F, F3) of the repo's checklist
+                                           as JSON (same as slicing_get): its lists and decisions
+  gate verdict --agent A --repo PATH [--sha S] [--checklist-id ID]
+                                           the latest blind judge verdict (Wave F, F5) as JSON
+                                           (same as judge_get)
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
@@ -177,6 +183,8 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "gate":
+		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
 	case "schedules":
@@ -1334,6 +1342,41 @@ func cmdArchive(args []string) error {
 	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
 	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
 	return aerr
+}
+
+// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get) or `gate verdict` (judge_get).
+func cmdGate(args []string) error {
+	if len(args) == 0 || (args[0] != "slicing" && args[0] != "verdict") {
+		return errors.New("usage: agent-jobs gate slicing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID]")
+	}
+	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
+	agent := agentFlag(fs)
+	repo := fs.String("repo", "", "absolute path of the project's git work tree")
+	id := fs.String("checklist-id", "", "default: the id of the repository's checklist")
+	sha := ""
+	if args[0] == "verdict" {
+		fs.StringVar(&sha, "sha", "", "the verdict for this commit (default: the latest of any commit)")
+	}
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if args[0] == "slicing" {
+		out, err := mcp.SlicingGet(m, *repo, *id)
+		if err != nil {
+			return err
+		}
+		return printJSON(out)
+	}
+	out, err := mcp.JudgeGet(m, *repo, *id, sha)
+	if err != nil {
+		return err
+	}
+	return printJSON(out)
 }
 
 func cmdIntentions(args []string) error {

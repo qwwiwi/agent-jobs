@@ -40,14 +40,18 @@ type ChecklistView struct {
 	// Waivers are the owner waivers bound to the approved hash and version (any sha); none while the
 	// checklist is not approved.
 	Waivers []store.Waiver `json:"waivers"`
+	// Slicing is the slicing check (F3) for the current version and hash (current true), else the
+	// latest one of the checklist id (current false: it does not count); null when none ran.
+	Slicing *jobs.SlicingSummary `json:"slicing"`
 	// Set by checklist_init / checklist_set only.
-	Written       bool     `json:"written,omitempty"`
-	BriefWritten  bool     `json:"brief_written,omitempty"`
-	VersionBumped bool     `json:"version_bumped,omitempty"`
-	PreviousVoid  string   `json:"previous_void,omitempty"`
-	Redacted      int      `json:"redacted,omitempty"`
-	WaiversAdded  int      `json:"waivers_added,omitempty"`
-	Warnings      []string `json:"warnings,omitempty"`
+	Written        bool     `json:"written,omitempty"`
+	BriefWritten   bool     `json:"brief_written,omitempty"`
+	VersionBumped  bool     `json:"version_bumped,omitempty"`
+	PreviousVoid   string   `json:"previous_void,omitempty"`
+	Redacted       int      `json:"redacted,omitempty"`
+	WaiversAdded   int      `json:"waivers_added,omitempty"`
+	DecisionsAdded int      `json:"unmapped_decisions_added,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 // latestApproval is the repository's latest stored approval, as stored and as a checklist.Record (both
@@ -70,7 +74,8 @@ func binding(st *store.Store, main, id string) (*checklist.Binding, error) {
 	return &checklist.Binding{BriefSHA256: b.BriefSHA256, Approved: b.Approved}, nil
 }
 
-func checklistView(st *store.Store, top, main string, c *checklist.Checklist, brief []byte) (ChecklistView, error) {
+func checklistView(m *jobs.Manager, top, main string, c *checklist.Checklist, brief []byte) (ChecklistView, error) {
+	st := m.Store
 	last, rec, err := latestApproval(st, main)
 	if err != nil {
 		return ChecklistView{}, err
@@ -87,6 +92,13 @@ func checklistView(st *store.Store, top, main string, c *checklist.Checklist, br
 	}
 	if last != nil {
 		v.ApprovedAt, v.ApprovedVersion, v.ApprovedSHA256 = last.ApprovedAt.UTC().Format(time.RFC3339), last.Version, last.ChecklistSHA256
+	}
+	sl, err := m.SlicingOf(main, c.ID, c.Version, hash)
+	if err != nil {
+		return ChecklistView{}, err
+	}
+	if sl != nil {
+		v.Slicing = sl.Summary
 	}
 	v.Waivers = []store.Waiver{}
 	if approved {
@@ -137,13 +149,20 @@ type ChecklistWaiverInput struct {
 
 // ChecklistSetInput is checklist_set's input.
 type ChecklistSetInput struct {
-	Repo          string                   `json:"repo" jsonschema:"absolute path of the project's git work tree"`
-	Rows          []ChecklistRowInput      `json:"rows,omitempty" jsonschema:"rows to add (new id) or replace (existing id); rows are never removed: drop or defer them with the owner's quote"`
-	Additions     []ChecklistAdditionInput `json:"additions,omitempty" jsonschema:"later owner additions, appended to BRIEF.md under ## Additions in the same operation"`
-	Approve       bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
-	ApproveQuote  string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
-	ExpectVersion int                      `json:"expect_version,omitempty" jsonschema:"refuse the call unless the checklist is at this version"`
-	Waivers       []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the sha; the checklist must be approved after this call"`
+	Repo              string                   `json:"repo" jsonschema:"absolute path of the project's git work tree"`
+	Rows              []ChecklistRowInput      `json:"rows,omitempty" jsonschema:"rows to add (new id) or replace (existing id); rows are never removed: drop or defer them with the owner's quote"`
+	Additions         []ChecklistAdditionInput `json:"additions,omitempty" jsonschema:"later owner additions, appended to BRIEF.md under ## Additions in the same operation"`
+	Approve           bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
+	ApproveQuote      string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
+	ExpectVersion     int                      `json:"expect_version,omitempty" jsonschema:"refuse the call unless the checklist is at this version"`
+	Waivers           []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the sha; the checklist must be approved after this call"`
+	UnmappedDecisions []ChecklistDecisionInput `json:"unmapped_decisions,omitempty" jsonschema:"the owner's decision per unmapped brief quote of the slicing check (F3) for the checklist's version and hash after this call, stored in the agent-jobs store; approve needs one for every unmapped quote of that result"`
+}
+
+// ChecklistDecisionInput is the owner's decision on one unmapped quote of the slicing check (F3).
+type ChecklistDecisionInput struct {
+	Unmapped string `json:"unmapped" jsonschema:"the unmapped quote as slicing_get lists it"`
+	Quote    string `json:"quote" jsonschema:"the owner's words deciding it (out of scope, covered by R03, …), verbatim"`
 }
 
 func addChecklistInit(s *sdk.Server, d Deps) {
@@ -200,7 +219,7 @@ func addChecklistInit(s *sdk.Server, d Deps) {
 			_ = os.Remove(checklist.BriefPath(top))
 			return nil, ChecklistView{}, fmt.Errorf("checklist_init: the init record was not stored, nothing written: %w", err)
 		}
-		v, err := checklistView(d.Manager.Store, top, main, c, brief)
+		v, err := checklistView(d.Manager, top, main, c, brief)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
@@ -214,37 +233,43 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 		Name: "checklist_get",
 		Description: "The repo's brief checklist: header, rows, live requirements, the hash of the files as they are now, " +
 			"approved (false with a reason when not approved, or when a hashed field, a Basis or BRIEF.md was edited " +
-			"after the approval) and the owner waivers bound to the current hash.",
+			"after the approval), the owner waivers bound to the current hash and slicing: the slicing check (F3) " +
+			"{version, sha256, current, job_id, unmapped, half, invented, decided, undecided, at} (null when none ran).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
-		// Read under the lock: never half of a checklist_set's two renames.
-		unlock, err := d.Manager.LockChecklist(top)
-		if err != nil {
-			return nil, ChecklistView{}, err
-		}
-		defer unlock()
-		f, err := checklist.Read(top)
-		if err != nil {
-			return nil, ChecklistView{}, err
-		}
-		if f.Checklist == nil {
-			return nil, ChecklistView{}, checklist.ErrNoChecklist
-		}
-		if f.Brief == nil {
-			return nil, ChecklistView{}, fmt.Errorf("%s has %s but no %s", top, checklist.ChecklistRel, checklist.BriefRel)
-		}
-		// Redacted before it is parsed, as checklist_set reads it: a secret put there by hand is never returned.
-		text, _ := jobs.Redact(string(f.Checklist))
-		c, err := checklist.Parse(text)
-		if err != nil {
-			return nil, ChecklistView{}, fmt.Errorf("%s: %w", checklist.ChecklistRel, err)
-		}
-		v, err := checklistView(d.Manager.Store, top, main, c, f.Brief)
+		v, err := currentChecklist(d.Manager, top, main)
 		return nil, v, err
 	})
+}
+
+// currentChecklist is the checklist of the work tree top as checklist_get returns it, read under the lock
+// (never half of a checklist_set's two renames).
+func currentChecklist(m *jobs.Manager, top, main string) (ChecklistView, error) {
+	unlock, err := m.LockChecklist(top)
+	if err != nil {
+		return ChecklistView{}, err
+	}
+	defer unlock()
+	f, err := checklist.Read(top)
+	if err != nil {
+		return ChecklistView{}, err
+	}
+	if f.Checklist == nil {
+		return ChecklistView{}, checklist.ErrNoChecklist
+	}
+	if f.Brief == nil {
+		return ChecklistView{}, fmt.Errorf("%s has %s but no %s", top, checklist.ChecklistRel, checklist.BriefRel)
+	}
+	// Redacted before it is parsed, as checklist_set reads it: a secret put there by hand is never returned.
+	text, _ := jobs.Redact(string(f.Checklist))
+	c, err := checklist.Parse(text)
+	if err != nil {
+		return ChecklistView{}, fmt.Errorf("%s: %w", checklist.ChecklistRel, err)
+	}
+	return checklistView(m, top, main, c, f.Brief)
 }
 
 func addChecklistSet(s *sdk.Server, d Deps) {
@@ -253,7 +278,9 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		Description: "Change the repo's brief checklist; the only writer of version, approved and owner waivers. One call: " +
 			"rows upserted, owner additions appended to BRIEF.md ## Additions, both files written together (both or neither), " +
 			"secrets redacted before writing and hashing. A change of the hashed content (rows incl. Basis, BRIEF.md) raises " +
-			"the version and drops the approval; approve: true records the owner's approval of the result. Waivers need the " +
+			"the version and drops the approval; approve: true records the owner's approval of the result, refused without a " +
+			"slicing check (slicing_start) of that version and hash or while one of its unmapped quotes has no owner decision " +
+			"(unmapped_decisions). Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
 		m := d.Manager
@@ -319,9 +346,31 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			waivers = append(waivers, store.Waiver{Repo: main, ChecklistID: res.List.ID, ChecklistSHA256: res.Hash,
 				ChecklistVersion: res.List.Version, SHA: strings.TrimSpace(w.SHA), Requirement: row.ID, Quote: quote, CreatedAt: now})
 		}
+		// The slicing rule (F3): checked against the result before anything is written.
+		var given []jobs.UnmappedDecision
+		for _, u := range in.UnmappedDecisions {
+			given = append(given, jobs.UnmappedDecision{Unmapped: u.Unmapped, Quote: u.Quote})
+		}
+		decisions, n, err := m.SlicingGate(main, res.List.ID, res.List.Version, res.Hash, in.Approve, given, now)
+		if err != nil {
+			if res.VersionBumped {
+				// The slicing check reads the files as written: the new version must be on disk first.
+				err = fmt.Errorf("%w; this call raises the version (a change or a void approval line): call checklist_set "+
+					"without approve and unmapped_decisions first, then slicing_start on the version it writes", err)
+			}
+			return nil, ChecklistView{}, err
+		}
+		res.Redacted += n
 		if res.Brief != nil || res.Checklist != nil {
 			if err := checklist.WriteBoth(top, res.Brief, res.Checklist, f.Brief); err != nil {
 				return nil, ChecklistView{}, err
+			}
+		}
+		// The decisions are stored before the approval: one that fails leaves the checklist not approved.
+		for i, dec := range decisions {
+			if err := m.Store.PutSlicingDecision(dec); err != nil {
+				return nil, ChecklistView{}, fmt.Errorf("files written; %d of %d unmapped decisions stored, the approval was not: %w",
+					i, len(decisions), err)
 			}
 		}
 		// The approval is stored after the files are written: a failure in between leaves the new content
@@ -339,13 +388,13 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			}
 			added++
 		}
-		v, err := checklistView(m.Store, top, main, res.List, res.BriefAfter)
+		v, err := checklistView(m, top, main, res.List, res.BriefAfter)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
 		v.Written, v.BriefWritten = res.Brief != nil || res.Checklist != nil, res.Brief != nil
 		v.VersionBumped, v.PreviousVoid, v.Redacted, v.Warnings = res.VersionBumped, res.PreviousVoid, res.Redacted, res.Warnings
-		v.WaiversAdded = added
+		v.WaiversAdded, v.DecisionsAdded = added, len(decisions)
 		return nil, v, nil
 	})
 }

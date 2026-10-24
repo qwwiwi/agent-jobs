@@ -68,10 +68,10 @@ func ResolveRunner(runner, model string) (string, error) {
 	}
 }
 
-// CodexSandbox is the codex sandbox of a job kind: read-only for review and research, workspace-write
-// for fix and general.
+// CodexSandbox is the codex sandbox of a job kind: read-only for review, research and the gate kinds
+// (slicing, judge), workspace-write for fix and general.
 func CodexSandbox(kind string) string {
-	if kind == "review" || kind == "research" {
+	if kind == "research" || readOnlyKind(kind) {
 		return CodexSandboxReadOnly
 	}
 	return CodexSandboxWrite
