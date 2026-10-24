@@ -318,8 +318,6 @@ type gzReadCloser struct {
 
 func (g gzReadCloser) Close() error { return errors.Join(g.Reader.Close(), g.f.Close()) }
 
-// hasReport reports whether a non-empty report.md exists in the job folder or the archive. A stop
-// report the daemon wrote for an attempt that left none does not count.
 // requirementsClaimed counts the claimed «done» lines of the report's Requirements block (F4); 0 for
 // a job without covers or without a readable report (job folder first, then the log archive).
 func (m *Manager) requirementsClaimed(j *store.Job) int {
@@ -334,6 +332,8 @@ func (m *Manager) requirementsClaimed(j *store.Job) int {
 	return 0
 }
 
+// hasReport reports whether a non-empty report.md exists in the job folder or the archive. A stop
+// report the daemon wrote for an attempt that left none does not count.
 func (m *Manager) hasReport(j *store.Job) bool {
 	for _, p := range []string{filepath.Join(m.JobDir(j.ID), "report.md"), filepath.Join(m.archiveJobDir(j), "report.md")} {
 		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
