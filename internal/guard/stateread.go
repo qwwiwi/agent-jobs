@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -201,27 +202,90 @@ func rawOf(w string) string {
 	return w
 }
 
-// attachedPath is the path in a short option with its value attached (`-f/p`, `-T~/p`) or a curl-style
-// `@/p` argument ("" = none): rawOf sees only `--opt=value`.
-func attachedPath(w string) string {
+// attachedPaths are the paths a word may carry attached ("" = none): the value after `@` (curl's
+// `-d @p`) and, in a short option with its value attached (`-f/p`, `-T~/p`, `-xvf../p`), each suffix that
+// may start it (the guard does not know which letter takes the value): the one after the first letter
+// and each one starting a path (`/`, `~`, `.` after another character). rawOf sees only `--opt=value`.
+func attachedPaths(w string) []string {
 	switch {
-	case strings.HasPrefix(w, "@"):
-		return w[1:]
+	case strings.HasPrefix(w, "@") && len(w) > 1:
+		return []string{w[1:]}
 	case strings.HasPrefix(w, "-") && !strings.HasPrefix(w, "--"):
-		if i := strings.IndexAny(w, "/~"); i > 1 {
-			return w[i:]
+		var out []string
+		for k := 2; k < len(w); k++ {
+			if k == 2 || strings.IndexByte("/~.", w[k]) >= 0 && strings.IndexByte("/~.", w[k-1]) < 0 {
+				out = append(out, w[k:])
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// rePct is a percent-encoded byte (`%2F`).
+var rePct = regexp.MustCompile(`%[0-9A-Fa-f]{2}`)
+
+// percentDecoded returns w with every %xx decoded, ok false when it has none: a URL reader (curl,
+// python's urllib) opens `file:///tmp%2Fx` as /tmp/x, so the decoded form is checked as well.
+func percentDecoded(w string) (string, bool) {
+	if !rePct.MatchString(w) {
+		return "", false
+	}
+	return rePct.ReplaceAllStringFunc(w, func(h string) string {
+		b, _ := strconv.ParseUint(h[1:], 16, 8)
+		return string([]byte{byte(b)})
+	}), true
+}
+
+// reFileURL is a file URL in a text, in any case, up to a quote, a blank or a shell operator.
+var reFileURL = regexp.MustCompile("(?i)file:([^\\s'\"`<>|&;()]*)")
+
+// fileURLPaths are the paths of the file URLs in s as curl, wget and python's urllib open them: after
+// the scheme and an optional host (`file:///p`, `file://localhost/p`, `file:/p`), percent-decoded.
+func fileURLPaths(s string) []string {
+	if !strings.Contains(strings.ToLower(s), "file:") {
+		return nil
+	}
+	var out []string
+	for _, m := range reFileURL.FindAllStringSubmatch(s, -1) {
+		p := m[1]
+		if rest, ok := strings.CutPrefix(p, "//"); ok {
+			i := strings.IndexByte(rest, '/')
+			if i < 0 {
+				continue // a host and no path
+			}
+			p = rest[i:]
+		}
+		if d, ok := percentDecoded(p); ok {
+			p = d
+		}
+		if p != "" {
+			out = append(out, p)
 		}
 	}
-	return ""
+	return out
 }
 
 // word returns a refusal when a path word reaches the state from a directory the command may run in.
+// A path attached to an option, a file URL and the percent-decoded word are checked too.
 func (r *stateReadScope) word(w string, at where, m wordMode) string {
-	if r.allow {
-		if p := attachedPath(w); p != "" && (filepath.IsAbs(p) || strings.HasPrefix(p, "~")) {
-			if reason := r.word(p, at, m); reason != "" {
-				return reason
-			}
+	lenient := wordMode{tree: m.tree, dynamic: m.dynamic}
+	for _, p := range attachedPaths(w) {
+		if reason := r.word(p, at, lenient); reason != "" {
+			return reason
+		}
+	}
+	for _, p := range fileURLPaths(w) {
+		if reason := r.word(p, at, m); reason != "" {
+			return reason
+		}
+	}
+	if d, ok := percentDecoded(w); ok {
+		if reason := r.word(d, at, lenient); reason != "" {
+			return reason
+		}
+		if reason := r.text(d, at); reason != "" {
+			return reason
 		}
 	}
 	exp, ok := r.expandHome(rawOf(w))
@@ -377,8 +441,14 @@ func tokens(w string) []string {
 	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&")
 }
 
-// text returns a refusal when a path-like piece of a text names the state.
+// text returns a refusal when a path-like piece of a text, or the path of a file URL in it, names the
+// state.
 func (r *stateReadScope) text(w string, at where) string {
+	for _, p := range fileURLPaths(w) {
+		if reason := r.word(p, at, wordMode{}); reason != "" {
+			return reason
+		}
+	}
 	for _, t := range tokens(w) {
 		if reason := r.word(t, at, wordMode{}); reason != "" {
 			return reason
