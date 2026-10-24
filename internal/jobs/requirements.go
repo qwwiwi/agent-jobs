@@ -215,8 +215,9 @@ func failMarker(s string) bool {
 	return false
 }
 
-// proofLead is what may stand before a red proof's text: separators and punctuation («: », «· », «— »).
-func proofLead(r rune) bool { return tailChar(r) || strings.ContainsRune("-–—·", r) }
+// proofLead is what may stand before a red proof's text: wrappers, separators and punctuation («: »,
+// «· », «— »), never a dot (a «./x» program path keeps it).
+func proofLead(r rune) bool { return wrapChar(r) || strings.ContainsRune(",;:!?…-–—·", r) }
 
 // redEvidence reports whether a red proof s (its IDs left out) shows failing evidence: a test or command
 // reference (testRefRe, a backticked command, or s starting with a command; ranCommand) and a failure

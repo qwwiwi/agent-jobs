@@ -251,6 +251,7 @@ func TestProofsPositiveStructure(t *testing.T) {
 		"go test ./web -run TestLogin → exit status 2 on base", "test_login panicked before",
 		"tests/test_x.py::test_y AssertionError before", "TestX: error: want 2 got 1", "not cached; TestLogin failed before",
 		"login.test.ts failing on base", "`npm test -- login` exit code 1", "BenchmarkParse panic: nil map",
+		"./check.sh exit 1 on base",
 	} {
 		if !redEvidence(s) {
 			t.Errorf("redEvidence(%q) = false", s)
