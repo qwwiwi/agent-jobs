@@ -186,6 +186,8 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, 
 		for _, p := range append(m.ProtectedPaths(), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
+		// The checklist locks are shared by every agent: a job neither reads nor writes there.
+		parts = append(parts, "--no-read", shellQuote(m.ChecklistLockDir()))
 	}
 	if readOnly != "" {
 		parts = append(parts, "--read-only", shellQuote(readOnly))
@@ -209,6 +211,7 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 // brief/BRIEF.md and brief/CHECKLIST.md (briefProtected).
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
+	protected = append(protected, m.ChecklistLockDir())
 	readOnly := ""
 	if j.Kind == "review" {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
