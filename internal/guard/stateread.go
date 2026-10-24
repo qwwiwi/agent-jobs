@@ -54,6 +54,7 @@ type stateReadScope struct {
 	state, own []string
 	ownRests   [][]string // the components below StateDir of each own folder (jobs, <id>)
 	allow      bool       // the ReadAllow scope: stricter on what the guard cannot resolve
+	urls       bool       // the job has a read allowlist: file URLs are checked fail closed (fileURLs)
 	at         map[*simpleCmd]where
 }
 
@@ -68,7 +69,7 @@ func cleanForms(p string) []string {
 }
 
 func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
-	r := &stateReadScope{allow: cfg.readAllowScope, state: cleanForms(cfg.StateDir)}
+	r := &stateReadScope{allow: cfg.readAllowScope, urls: len(cfg.ReadAllow) > 0, state: cleanForms(cfg.StateDir)}
 	owns := []string{cfg.OwnDir}
 	if r.allow {
 		owns = cfg.ReadAllow
@@ -271,6 +272,48 @@ func fileURLPaths(s string) []string {
 	return out
 }
 
+// reDotSegment is a `.` or `..` segment of a URL path.
+var reDotSegment = regexp.MustCompile(`(^|/)\.\.?(/|$)`)
+
+// unsafeFileURL returns the first file URL in s whose text, as written or percent-decoded, has a query
+// or a fragment (`?`, `#`: a URL reader cuts the path there, the guard would check another one) or a
+// `.`/`..` segment ("" = none).
+func unsafeFileURL(s string) string {
+	if !strings.Contains(strings.ToLower(s), "file:") {
+		return ""
+	}
+	for _, m := range reFileURL.FindAllStringSubmatch(s, -1) {
+		forms := []string{m[1]}
+		if d, ok := percentDecoded(m[1]); ok {
+			forms = append(forms, d)
+		}
+		for _, f := range forms {
+			if strings.ContainsAny(f, "?#") || reDotSegment.MatchString(f) {
+				return m[0]
+			}
+		}
+	}
+	return ""
+}
+
+// fileURLs returns a refusal when a file URL in s reaches the state. For a job with a read allowlist
+// it fails closed: a URL with a query, a fragment or a dot segment is refused, and the path of any
+// other is checked strictly; otherwise each path is checked in mode m.
+func (r *stateReadScope) fileURLs(s string, at where, m wordMode) string {
+	if r.urls {
+		if u := unsafeFileURL(s); u != "" {
+			return r.blockedMsg("`"+u+"`", u+" (a file URL with a query, a fragment or a dot segment)")
+		}
+		m.strict = true
+	}
+	for _, p := range fileURLPaths(s) {
+		if reason := r.word(p, at, m); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
 // word returns a refusal when a path word reaches the state from a directory the command may run in.
 // A path attached to an option, a file URL and the percent-decoded word are checked too.
 func (r *stateReadScope) word(w string, at where, m wordMode) string {
@@ -283,10 +326,8 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 			return reason
 		}
 	}
-	for _, p := range fileURLPaths(w) {
-		if reason := r.word(p, at, m); reason != "" {
-			return reason
-		}
+	if reason := r.fileURLs(w, at, m); reason != "" {
+		return reason
 	}
 	if d, ok := percentDecoded(w); ok {
 		// The decoded word as a text: its path-like pieces (the word itself when it has no separator)
@@ -451,10 +492,8 @@ func tokens(w string) []string {
 // text returns a refusal when a path-like piece of a text, or the path of a file URL in it, names the
 // state.
 func (r *stateReadScope) text(w string, at where) string {
-	for _, p := range fileURLPaths(w) {
-		if reason := r.word(p, at, wordMode{}); reason != "" {
-			return reason
-		}
+	if reason := r.fileURLs(w, at, wordMode{}); reason != "" {
+		return reason
 	}
 	for _, t := range tokens(w) {
 		if reason := r.word(t, at, wordMode{}); reason != "" {
@@ -911,7 +950,7 @@ func readScopes(cfg Config) []Config {
 	}
 	for _, d := range cfg.NoRead {
 		c := cfg
-		c.StateDir, c.OwnDir, c.NoRead, c.ReadAllow = d, "", nil, nil
+		c.StateDir, c.OwnDir, c.NoRead = d, "", nil // ReadAllow kept: it marks a job with a read allowlist
 		out = append(out, c)
 	}
 	if len(cfg.ReadAllow) > 0 {
