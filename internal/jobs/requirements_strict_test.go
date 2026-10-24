@@ -139,3 +139,57 @@ func TestJobRequirementsTrailersRealTrailersOnly(t *testing.T) {
 		t.Fatalf("trailers %v note %q", got, note)
 	}
 }
+
+// One strict ID matcher for validation and extraction: an ID glued to a word character (R01_other,
+// xR01) is not that ID; a Markdown-wrapped or newly listed negative proof (tbd, skipped, pending,
+// missing, n.a., ?) is not a proof; a negative ran: value does not verify a done line.
+func TestRedProofStrictIDsAndNegatives(t *testing.T) {
+	verified := func(report string) bool {
+		t.Helper()
+		for _, l := range ParseRequirements(report, []string{"R01", "R02"}).Lines {
+			if l.ID == "R01" {
+				return l.Verified
+			}
+		}
+		t.Fatalf("no R01 line in %q", report)
+		return false
+	}
+	for name, report := range map[string]string{
+		"underscore suffix":  reqBlock(doneR01, "REDPROOF R01_other: test failed"),
+		"underscore prefix":  reqBlock(doneR01, "REDPROOF x_R01: test failed"),
+		"inline underscore":  reqBlock(doneR01 + " · REDPROOF R01_other: test failed"),
+		"bold none":          reqBlock(doneR01, "REDPROOF R01: **none**"),
+		"italic n/a":         reqBlock(doneR01, "REDPROOF R01: _n/a_"),
+		"backticked none":    reqBlock(doneR01 + " · REDPROOF R01: `none`"),
+		"tbd":                reqBlock(doneR01, "REDPROOF R01: TBD"),
+		"skipped":            reqBlock(doneR01, "REDPROOF R01: skipped, no time"),
+		"pending":            reqBlock(doneR01, "REDPROOF R01: pending"),
+		"missing":            reqBlock(doneR01, "REDPROOF R01: missing"),
+		"n.a.":               reqBlock(doneR01, "REDPROOF R01: n.a."),
+		"question mark":      reqBlock(doneR01, "REDPROOF R01: ?"),
+		"question marks":     reqBlock(doneR01, "REDPROOF R01: ???"),
+		"ran none":           reqBlock("- R01 · done · a.go:1 · ran: none", "REDPROOF R01: TestLogin failed before"),
+		"ran n/a":            reqBlock("- R01 · done · a.go:1 · ran: n/a", "REDPROOF R01: TestLogin failed before"),
+		"ran bold skipped":   reqBlock("- R01 · done · a.go:1 · ran: **skipped**", "REDPROOF R01: TestLogin failed before"),
+		"ran question mark":  reqBlock("- R01 · done · a.go:1 · ran: ?", "REDPROOF R01: TestLogin failed before"),
+		"ran backticked tbd": reqBlock("- R01 · done · a.go:1 · ran: `tbd`", "REDPROOF R01: TestLogin failed before"),
+	} {
+		if verified(report) {
+			t.Errorf("%s: verified", name)
+		}
+	}
+	for name, report := range map[string]string{
+		"plain":            reqBlock(doneR01, "REDPROOF R01: TestLogin failed before"),
+		"bold id":          reqBlock(doneR01, "REDPROOF **R01**: TestLogin failed before"),
+		"id list dashes":   reqBlock(doneR01, "REDPROOF R02-R01: TestBoth failed before"),
+		"test named nonce": reqBlock(doneR01, "REDPROOF R01: nonce_test failed before"),
+		"ran backticked":   reqBlock("- R01 · done · a.go:1 · ran: `go test ./...` → ok", "REDPROOF R01: TestLogin failed before"),
+	} {
+		if !verified(report) {
+			t.Errorf("%s: not verified", name)
+		}
+	}
+	if ids := idsIn("R01_other, xR02, R03, (G04) D05."); !slices.Equal(ids, []string{"R03", "G04", "D05"}) {
+		t.Fatalf("idsIn: %v", ids)
+	}
+}

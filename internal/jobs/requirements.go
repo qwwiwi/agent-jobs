@@ -34,8 +34,9 @@ type RequirementLine struct {
 	Evidence string `json:"evidence,omitempty"`
 	Ran      string `json:"ran,omitempty"`
 	RedProof string `json:"redproof,omitempty"`
-	// Verified: a «done» line with a «ran:» and a red proof of this ID (its own REDPROOF field or a
-	// REDPROOF line of the block; see redProof); a «done» line without either is claimed, not done.
+	// Verified: a «done» line with a «ran:» (not a negative one: none, n/a, tbd, ?, …) and a red proof of
+	// this ID (its own REDPROOF field or a REDPROOF line of the block; see redProof); a «done» line
+	// without either is claimed, not done.
 	Verified bool `json:"verified"`
 }
 
@@ -67,32 +68,77 @@ const NoteRequirementsEmpty = "report's ### Requirements block has no line for a
 // redProofRe is the exact REDPROOF marker at the start of a line or field: «REDPROOFLESS» is not one.
 var redProofRe = regexp.MustCompile(`^REDPROOF(?:[^A-Za-z0-9_]|$)`)
 
-// requirementIDRe is a requirement ID as a whole word (R01 does not match inside R01i or R010).
-var requirementIDRe = regexp.MustCompile(`\b(?:R[0-9]{2,}i?|G[0-9]{2,}|D[0-9]{2,})\b`)
+// idWordChar reports a character of an ID token: an ID is a whole run of these (R01 is not an ID inside
+// R01i, R010, R01_other or x_R01).
+func idWordChar(r rune) bool {
+	return r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r == '_'
+}
 
-// negativeProofs are first words of proof contents that say there is none (dashes split words, so
-// «-», «— none» and «not-run» are negative too).
-var negativeProofs = []string{"none", "n/a", "na", "no", "not", "nothing"}
+// idTokens is the one ID matcher of the Requirements block (validation and extraction): it returns
+// the checklist IDs that are whole tokens of s (runs of letters, digits and «_»), in order, once each,
+// and s with each of them replaced by a space.
+func idTokens(s string) (ids []string, rest string) {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		j := i
+		for j < len(s) && idWordChar(rune(s[j])) {
+			j++
+		}
+		if j == i {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		if tok := s[i:j]; checklist.ValidID(tok) {
+			if !slices.Contains(ids, tok) {
+				ids = append(ids, tok)
+			}
+			b.WriteByte(' ')
+		} else {
+			b.WriteString(tok)
+		}
+		i = j
+	}
+	return ids, b.String()
+}
+
+// negativeProofs are first words of a proof or a ran: value that say there is none (dashes split
+// words, so «-», «— none» and «not-run» are negative too; Markdown wrappers are stripped first, so
+// «**none**», «_n/a_» and «`tbd`» are negative too).
+var negativeProofs = []string{"none", "n/a", "na", "n.a", "no", "not", "nothing", "tbd", "skipped", "pending", "missing"}
+
+// negativeProof reports a proof content s (the IDs left out) that is empty or says there is none: its
+// first word, Markdown wrappers (*, _, `, ~) and trailing dots stripped, is a negative word or only
+// question marks (any case).
+func negativeProof(s string) bool {
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		switch r {
+		case ' ', '\t', ':', '·', ',', ';', '(', ')', '-', '–', '—', '!':
+			return true
+		}
+		return false
+	}) {
+		w = strings.TrimRight(strings.Trim(w, "*_`~"), ".")
+		if w == "" {
+			continue // only wrappers or dots
+		}
+		return slices.Contains(negativeProofs, w) || strings.Trim(w, "?") == ""
+	}
+	return true
+}
 
 // redProof reads a REDPROOF line or field s: the IDs it names and whether it is a proof. It is one only
-// with the exact marker and real content: what is left without the IDs is not empty and does not start
-// with a negative word (none, n/a, na, no, not, nothing, or only dashes; any case).
+// with the exact marker and real content: what is left without the IDs is not a negative proof
+// (negativeProof: empty, none, n/a, tbd, skipped, ?, only dashes, also in Markdown wrappers).
 func redProof(s string) (ids []string, ok bool) {
 	if !redProofRe.MatchString(s) {
 		return nil, false
 	}
-	rest := s[len("REDPROOF"):]
-	words := strings.FieldsFunc(strings.ToLower(requirementIDRe.ReplaceAllString(rest, " ")), func(r rune) bool {
-		switch r {
-		case ' ', '\t', ':', '·', ',', ';', '(', ')', '.', '-', '–', '—':
-			return true
-		}
-		return false
-	})
-	if len(words) == 0 || slices.Contains(negativeProofs, words[0]) {
+	ids, rest := idTokens(s[len("REDPROOF"):])
+	if negativeProof(rest) {
 		return nil, false
 	}
-	return idsIn(rest), true
+	return ids, true
 }
 
 // ValidateCovers trims covers, drops repeats (first one kept) and checks every ID is a checklist row ID.
@@ -167,17 +213,10 @@ func stripItem(s string) string {
 	return s
 }
 
-// idsIn returns the checklist IDs named in s (word-separated tokens), in order, once each.
+// idsIn returns the checklist IDs named in s (whole tokens, idTokens), in order, once each.
 func idsIn(s string) []string {
-	var out []string
-	for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
-		return !(r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
-	}) {
-		if checklist.ValidID(tok) && !slices.Contains(out, tok) {
-			out = append(out, tok)
-		}
-	}
-	return out
+	ids, _ := idTokens(s)
+	return ids
 }
 
 // ParseRequirements reads the «### Requirements» block of report against covers. Fields of a line are
@@ -238,7 +277,7 @@ func ParseRequirements(report string, covers []string) Requirements {
 		l := &r.Lines[i]
 		seen[l.ID] = true
 		if l.Status == "done" {
-			l.Verified = l.Ran != "" && (l.RedProof != "" || proved[l.ID])
+			l.Verified = !negativeProof(l.Ran) && (l.RedProof != "" || proved[l.ID])
 			if !l.Verified && !slices.Contains(r.Claimed, l.ID) {
 				r.Claimed = append(r.Claimed, l.ID)
 			}
