@@ -350,9 +350,10 @@ func hasDotDot(path string) bool {
 
 // CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
 // would write inside a git dir: any `.git` directory, the job's own git dirs (cfg.GitDirs), git
-// config/hooks paths; into a protected path. A path with a `..` segment is rejected outright; otherwise both the path as given and the path with symlinks resolved are
-// checked (a link in the job dir pointing into .git), and a path whose symlinks take more than
-// maxResolveSteps to resolve is refused.
+// config/hooks paths; into a protected path (also through a file descriptor alias or a hard link of
+// a protected file). A path with a `..` segment is rejected outright; otherwise both the path as
+// given and the path with symlinks resolved are checked (a link in the job dir pointing into .git),
+// and a path whose symlinks take more than maxResolveSteps to resolve is refused.
 func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
@@ -370,6 +371,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		return "blocked by guard: " + tool + " path `" + path + "` runs through symlinks whose targets take more " +
 			"than " + strconv.Itoa(maxResolveSteps) + " path components to resolve; the guard cannot verify it. Write the real path."
 	}
+	if alias, _ := fdAlias(given); alias && len(cfg.Protected) > 0 {
+		return fdAliasBlocked(path)
+	}
 	for _, p := range []string{given, resolved} {
 		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
@@ -382,19 +386,27 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
 	}
+	if len(cfg.Protected) > 0 {
+		links := &inodeSet{forms: protectedForms(cfg.Protected)}
+		if q, ok := links.hardlink(resolved); ok {
+			return protectedBlocked(q + " (`" + path + "` is a hard link of it)")
+		}
+	}
 	return ""
 }
 
+// protectedKinds names what the protected paths (cfg.Protected) are, for the refusals.
+const protectedKinds = "the subagent logs or the job database, agent-jobs configuration (config.json, the owner " +
+	"rules, the project cards), the job's own setup (its gitconfig, no-hooks dir, settings.json or mcp.json), a skill " +
+	"catalog (a skill root or a skill link), or a job session transcript directory"
+
 func protectedBlocked(p string) string {
-	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), agent-jobs " +
-		"configuration (config.json, the owner rules, the project cards), the job's git files (its gitconfig or " +
-		"no-hooks dir), a skill catalog (a skill root or a skill link), or a job session transcript directory; " +
-		"a job does not write there."
+	return "blocked by guard: `" + p + "` is agent-jobs state: " + protectedKinds + "; a job does not write there."
 }
 
 func ancestorBlocked(w, p string) string {
-	return "blocked by guard: argument `" + w + "` is an ancestor of agent-jobs state (`" + p + "`, the subagent log or " +
-		"the job database); a job does not remove, move or write into it."
+	return "blocked by guard: argument `" + w + "` is an ancestor of agent-jobs state (`" + p + "`: " + protectedKinds +
+		"); a job does not remove, move or write into it."
 }
 
 // checkProtected rejects Bash writes into cfg.Protected. Paths are resolved by pathScope (pathres.go):
@@ -436,6 +448,7 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 		return ""
 	}
 	s := newPathScope(scripts, cfg)
+	s.inodes = &inodeSet{forms: s.protected}
 	r := s.checkScripts(scripts)
 	if s.expired {
 		return "blocked by guard: the command is too complex to verify against agent-jobs state and configuration " +
@@ -553,9 +566,16 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					return ""
 				}
 				s.useLinks(c)
-				for _, t := range c.outRedirs {
+				// A redirection opens its file, also for reading (`exec 9<gitconfig`): the descriptor
+				// is a second name of it (/proc/self/fd/9), so no redirection names a protected path.
+				for _, t := range append(slices.Clone(c.outRedirs), c.inRedirs...) {
 					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
+					}
+				}
+				for _, t := range c.outRedirs {
+					if alias, std := s.fdWord(t); alias && !std {
+						return fdAliasBlocked(t)
 					}
 				}
 				v := split(c.words)
@@ -566,6 +586,11 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				name := progName(argv[0])
 				if gitFileReaders[name] {
 					continue
+				}
+				for _, a := range argv[1:] {
+					if alias, std := s.fdWord(a); alias && (fdMeta[name] || !std) {
+						return fdAliasBlocked(a)
+					}
 				}
 				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
 				var ca copyArgs
@@ -635,7 +660,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				for _, w := range words {
 					if s.feederHit(w) {
 						return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
-							"state (the subagent log or the job database); the guard cannot verify what it is fed."
+							"state (" + protectedKinds + "); the guard cannot verify what it is fed."
 					}
 				}
 			}

@@ -45,6 +45,7 @@ type pathScope struct {
 	writes       map[string]bool          // earlier possible writes; bool marks an entire subtree
 	writeUnknown bool                     // an earlier write target cannot be resolved
 	expired      bool                     // the budget ran out: every further check reports a hit
+	inodes       *inodeSet                // set by checkProtected: a hard link of a protected file is a hit too
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and
@@ -243,6 +244,7 @@ func kernelPath(raw string) (string, bool) {
 // expandHome expands a leading `~` / `~/` and $HOME / ${HOME} the way the shell would. ok is false
 // for a home the guard does not know (`~user/…`, `~+`, `~-`, or $HOME unset).
 func (s *pathScope) expandHome(p string) (string, bool) {
+	p = expandEnv(p)
 	for _, v := range []string{"${HOME}", "$HOME"} {
 		if p == v || strings.HasPrefix(p, v+"/") {
 			if s.home == "" {
@@ -264,6 +266,7 @@ func (s *pathScope) expandHome(p string) (string, bool) {
 // bracket, and every $HOME / ${HOME}, with the home directory: for the substring check of option
 // values (`of=~/…`) and inline code (`python3 -c "open('~/…')"`, os.path.expanduser).
 func (s *pathScope) expandAllHomes(w string) string {
+	w = expandEnv(w)
 	if s.home == "" {
 		return w
 	}
@@ -412,6 +415,11 @@ func (s *pathScope) match(cands []string, tree bool) (string, bool) {
 	for _, p := range cands {
 		if slices.ContainsFunc(s.protected, func(q string) bool { return within(p, q) }) {
 			return p, true
+		}
+		if s.inodes != nil {
+			if q, ok := s.inodes.hardlink(p); ok {
+				return q + " (`" + p + "` is a hard link of it)", true
+			}
 		}
 		if tree {
 			for _, q := range s.protected {
