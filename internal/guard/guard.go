@@ -98,8 +98,16 @@ type HookInput struct {
 // fileTools write the file named in their input (file_path, or notebook_path for NotebookEdit).
 var fileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
 
-// Decide parses the hook JSON and returns a non-empty reason when the call must be blocked.
+// Decide parses the hook JSON and returns a non-empty reason when the call must be blocked, within
+// decideBudget (a refusal past it) and with the symlink resolutions of the call memoized.
 func Decide(r io.Reader, cfg Config) (string, error) {
+	return withDeadline(func() (string, error) {
+		defer startMemo()()
+		return decideCall(r, cfg)
+	})
+}
+
+func decideCall(r io.Reader, cfg Config) (string, error) {
 	var raw struct {
 		ToolInput json.RawMessage `json:"tool_input"`
 	}
@@ -178,7 +186,7 @@ func resolveBounded(path, dir string) (string, bool) {
 	if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
 		return path, true
 	}
-	if r, ok := walkPath(path); ok {
+	if r, ok := memoWalk(path); ok {
 		return r, true
 	}
 	return path, false
@@ -760,6 +768,9 @@ func (s *pathScope) feederHit(w string) bool {
 
 // Check returns a non-empty reason when the shell command must be blocked.
 func Check(cmd string, cfg Config) string {
+	if len(cmd) > maxCommandBytes {
+		return commandSizeBlocked(len(cmd))
+	}
 	if p, bad := unresolvedRoot(cfg); bad {
 		return rootBlocked(p)
 	}

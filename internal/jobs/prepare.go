@@ -8,8 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	agentjobs "github.com/qwwiwi/agent-jobs"
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -235,6 +237,11 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gitDirs...), skillDenyRules(protected)...)
 }
 
+// GuardHookTimeout is the guard hook's timeout in seconds. Claude Code lets a tool call run when its
+// PreToolUse hook times out, so it is set well above guard.DecideBudget, the most time the guard
+// takes before it refuses a call as too complex to verify.
+const GuardHookTimeout = int(3 * guard.DecideBudget / time.Second)
+
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
 	deny := append(append([]string{}, denyRules...), extraDeny...)
 	if kind != "research" {
@@ -252,7 +259,7 @@ func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[strin
 			"PreToolUse": []any{
 				map[string]any{
 					"matcher": "*",
-					"hooks":   []any{map[string]any{"type": "command", "command": guardCmd}},
+					"hooks":   []any{map[string]any{"type": "command", "command": guardCmd, "timeout": GuardHookTimeout}},
 				},
 			},
 		},
