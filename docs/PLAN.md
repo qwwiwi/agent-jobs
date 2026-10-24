@@ -135,19 +135,80 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 - Monitors are experimental and work only in interactive sessions. They are never the only channel.
 - `asyncRewake` hooks are subject to timeouts and may not wake a session in every client; the next-prompt summary stays the floor.
 
+## Wave F: brief-acceptance gate
+
+*Status: approved 2026-10-24, not built.* Owner decisions of 2026-10-24 in [DECISIONS.md](DECISIONS.md); the items that diverge from the reference have a «proposed» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-wave-f). Takes ideas I1 (requirement ledger), I2 (blind acceptance job) and the REDPROOF and placeholder parts of I5 from «Ideas» below.
+
+**Goal.** For large work, the owner's words become a numbered checklist that the owner approves once. Every job reports against that checklist, a blind judge checks the code at a given sha against the brief, and merge or deploy happens only at 100% acceptance. Nothing the owner asked for is lost or reinterpreted on the way. The gate is held by hooks and tools, not by the orchestrator's memory.
+
+**Large vs small.** The orchestrator decides the size. LARGE = a new project, or a feature with more than 5 requirements, several jobs or more than a day of work; it goes through the brief flow below. SMALL (a fix, a single job) keeps the current pipeline. The owner can override («with brief» / «without brief»). A small task that grows is moved to the brief flow, and the owner is told.
+
+**Owner flow.** The owner tells the brief by voice or text; answers one or two rounds of questions (at most 4 per round, each with a recommended answer, so «ok» is a full reply); approves the checklist once; at the end gets one line «Acceptance: N of N» plus a link or a screenshot.
+
+**Files in the project repo.** Only two: `brief/BRIEF.md`, the owner's words verbatim, never edited, later additions appended under `## Additions` with the date and the quote; and `brief/CHECKLIST.md`, the numbered requirements. Nothing else goes into the project repo: job reports, verdicts and progress stay in the agent-jobs store. No dashboard for now.
+
+**Merge rule.** A LARGE task is merged or deployed only at 100% acceptance on the approved checklist, or with an explicit owner waiver per requirement.
+
+**Pack 1.**
+
+- **F1. CHECKLIST.md format.** A header (checklist id, brief file, version, and `approved: <time> owner sha256:<hex>`, written only by the tool) and a table `| ID | Brief (verbatim) | Contract | Basis |`.
+  - ID prefixes: `R` (from the brief), `Ri` (implied; the owner approves it), `G` (added later by the owner, also appended to the BRIEF `## Additions`), `D` (a constraint proven by a build; not counted in the 100%). Agent ideas (`A`) never enter the checklist; they live only in job reports, each with a parent `R`.
+  - Contract: `live`, `deferred` or `dropped`, plus an optional `placeholder-ok`. Only the owner can drop or defer, with a quote in Basis.
+  - Hash: sha256 over the normalized contract fields of every row (`ID|verbatim|contract|placeholder-ok`) plus the sha256 of `BRIEF.md`. Progress is not in the file and is not hashed; it is computed in the store.
+  - Rule of thumb: one row = one thing that can be true or false on its own. Fewer than 10 rows from a long brief is a retelling, not a checklist, and the lint warns.
+- **F2. Checklist tools.** MCP tools `checklist_init`, `checklist_get`, `checklist_set`. `checklist_set` is the only writer of `version` and `approved`; a manual edit of a contract field voids the approval. It writes the BRIEF `## Additions` and the CHECKLIST in one operation. Secret redaction (Wave D) runs over BRIEF and CHECKLIST before hashing. DEVIATIONS F2.
+- **F3. Slicing check before the owner approves.** A separate read-only job gets BRIEF and CHECKLIST only and returns three lists: `unmapped` (brief quotes that are in no `R`), `half` (quotes only partly covered), `invented` (rows the brief does not support). The owner approves only with an empty `unmapped`, or with an explicit decision per line.
+- **F4. Requirements in job reports.** `job_start` takes `covers:[R..]`. Findings / Changes must contain a `### Requirements` block, one line per covered requirement: `R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>`, plus a `REDPROOF` line for each new test (it failed before the code). A missing block = `report_off_contract`. `done` without `ran:` or without a REDPROOF counts as `claimed`, not done. Commit trailer `Requirements: R01, R03i`. DEVIATIONS F4.
+- **F5. Kind `acceptance` (blind judge).** Working name; the final name must differ from `acceptance_cmd` (see Risks). Read-only. Gets the full `BRIEF.md` (with Additions), the checklist contract rows, the manifest-check output and the code at the sha; never job briefs, reports or diffs. A model family different from the coders is preferred (a codex judge for Claude coders). DEVIATIONS F5.
+  - Verdict: structured JSON written to the store by the wrapper, not by the orchestrator: `{checklist {id, sha256, version}, repo, sha, ran[], could_not_run, requirements[{id, verdict met|partial|missing|placeholder|cannot_check, how ran|read, evidence}], unmapped_brief[], extra_scope[], suspect_tests[]}`.
+  - The wrapper validates it: every live `R` exactly once, the hash equals the approved one, the sha equals HEAD. An invalid verdict fails the job.
+  - Judge rules: reading code shows intent, running it shows the result; formally present but not working in substance = `partial`; facts only, no opinions on quality; name every brief quote that no requirement covers; stop one step before anything is sent outside.
+
+**Pack 2.**
+
+- **F6. `scripts/manifest-check.sh` in target repos.** Wired through `acceptance_cmd` and the repo's `check.sh`. Tests are tagged `[Rnn]`; every live `R` needs at least one tagged test that actually passed in this run; otherwise the script exits non-zero.
+- **F7. `release_check(repo, sha)`.** PASS only if all hold: the checklist is approved and its hash unchanged; manifest-check exits 0 and an acceptance verdict exists for this sha; every live `R` is `met` (or `placeholder` where the row is `placeholder-ok`); `cannot_check` only with an owner waiver for that `R`; `unmapped_brief` and `suspect_tests` are empty; the judge's model family differs from the coders'; the trace holds both ways (every live `R` is in some job's `covers`, every feature job covers at least one `R`). The owner gets one line: «Acceptance: 22 of 23, mismatch: R03i — …». DEVIATIONS F7.
+
+**Pack 3.**
+
+- **F8. Kind `briefing`.** Read-only. Input: BRIEF and the draft CHECKLIST. Output: JSON rounds of at most 4 questions `{n, closes[R..], kind, q, recommended, why}`, a `decided[]` list marked ASSUMPTION, and for large features an optional adversarial pass (7 questions). DEVIATIONS F8.
+  - Rules: a question without `closes` is dropped; blocking external items (payments, hosting, accounts, data location) go in round 1; facts are looked up by the job, only decisions are asked; never secrets; the owner is asked only about money or vendor lock-in, what the owner sees, rollbacks that need a rebuild, and business rules.
+  - Answers: one that adds → a `G##` row plus a BRIEF Addition; one that decides a fork → the Basis of the existing `R`; one that cancels → `dropped` with the quote. Each change makes a new version; only the changed rows are re-approved.
+
+**Enforcement hooks** (owner decision: hooks, not memory).
+
+- **F9.** (a) A PreToolUse hook on `job_start` in the orchestrator session requires a brief line `size: small|large`; `large` requires an approved `brief/CHECKLIST.md` in the repo and `covers:[R..]`; `small` is logged. (b) A merge hook: in a repo with an approved `CHECKLIST.md`, `gh pr merge` is blocked until `release_check` passes on that exact sha. (c) A `UserPromptSubmit` reminder line in the orchestrator session (soft). (a) needs F1, F2 and F4; (b) needs F7. DEVIATIONS F9.
+
+**Cheap prompt changes** (independent of the packs).
+
+- **F10.** `kind-fix` / `kind-general`: REDPROOF; visible placeholders instead of invented facts; the `Requirements:` commit trailer; out of scope → `BLOCKED`. `kind-review`: the rule «could the executor have known?»; a repair re-review mode (only the fix diff plus the conditions to close; another bypass of the same condition is «not closed», not a new finding). Orchestrator skill: fix jobs get the Blocking findings verbatim only; a retry only with a changed approach. DEVIATIONS F10.
+
+**Not taken.** A dashboard with a local server; a shared work tree, waves and zones for parallel writers; «done» from closing a ticket; blindness by prompt only (the judge's inputs are fixed by the wrapper); 12 mode × depth combinations (only `strict`); update checks over the network.
+
+**Risks.**
+
+- The owner approves without reading. Mitigated by the slicing check (F3) and by approving diffs of changed rows only.
+- 100% is unreachable for requirements that need accounts or external access. Owner waivers per requirement.
+- `[Rnn]` tags are formal: a tagged test may not test the requirement. REDPROOF and `suspect_tests`.
+- A codex read-only judge cannot run the product. The `how` field (`ran` / `read`), and the wrapper runs manifest-check.
+- Name clash: `acceptance_cmd` vs kind `acceptance`. Pick distinct names before the build.
+- Brief drift between BRIEF and CHECKLIST. The tool writes BRIEF Additions and CHECKLIST in one operation.
+
+**Attribution.** Ideas adapted from [nick-vels/skills](https://github.com/nick-vels/skills) «autopilot» (MIT, © 2026 Nick Vels). Every prompt adapted from it must carry this attribution line.
+
 ## Ideas (not approved)
 
 Ideas recorded for later; none is approved or scheduled. Each needs an owner go before work starts.
 
-- I1. Requirement ledger: the owner's words kept verbatim and split into numbered requirements R01..Rn in a feature brief; the report gives each a status (done / partial / missing / placeholder); only the owner may drop a requirement; later changes are appended, never rewritten.
+- I1. Requirement ledger: the owner's words kept verbatim and split into numbered requirements R01..Rn in a feature brief; the report gives each a status (done / partial / missing / placeholder); only the owner may drop a requirement; later changes are appended, never rewritten. *Taken into Wave F (F1, F2, F4), approved 2026-10-24.*
   - Why: nothing the owner asked for is silently lost or reinterpreted. Lives in: the orchestrator's brief habit and the report contract. Source: Autopilot, phases/1-manifest.md, 2-briefing.md, 8-final.md.
-- I2. Blind acceptance job: a separate job gets only the original brief and the merged code (not our briefs or spec), installs from a clean clone, runs the product, and reports done / partial / no per requirement with the commands it ran. Only for new products or large features.
+- I2. Blind acceptance job: a separate job gets only the original brief and the merged code (not our briefs or spec), installs from a clean clone, runs the product, and reports done / partial / no per requirement with the commands it ran. Only for new products or large features. *Taken into Wave F (F5, F7), approved 2026-10-24.*
   - Why: checks the result against what was asked, not against what we planned. Lives in: a new job kind or prompt. Source: Autopilot, phases/6-review.md, 8-final.md, prompts/review.md.
 - I3. Per-repo progress file and glossary: PROGRESS.md (settled / not done / known bugs) rewritten when work lands, and CONTEXT.md listing domain terms and synonyms to avoid.
   - Why: a fresh job starts from the real state and uses one vocabulary. Lives in: target repos, linked from project cards. Source: Autopilot, phases/9-memory.md, 4-plan.md.
 - I4. Wide changes in three steps: add the new beside the old, migrate, remove the old, so the project never breaks midway.
   - Why: every intermediate commit still builds and passes checks. Lives in: kind-fix / kind-general prompts. Source: Autopilot, phases/4-plan.md, 5-subagents.md.
-- I5. Executor discipline: show the new test failing before writing the code; visible placeholders instead of invented facts; a one-line STATUS: DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT (overlaps E3).
+- I5. Executor discipline: show the new test failing before writing the code; visible placeholders instead of invented facts; a one-line STATUS: DONE / DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT (overlaps E3). *The failing-test-first (REDPROOF) and placeholder parts are taken into Wave F (F4, F10), approved 2026-10-24.*
   - Why: fewer false "done" reports and invented details. Lives in: prompts. Source: Autopilot, prompts/executor.md, phases/5-subagents.md.
 - I6. Retry a failed job once on a stronger model.
   - Why: some failures are capability limits, not bad luck. Lives in: daemon retry policy. Source: Autopilot, phases/5-subagents.md, 6-review.md.
