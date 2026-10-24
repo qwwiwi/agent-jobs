@@ -270,6 +270,30 @@ func walkPath(abs string) (string, bool) {
 	return str(), true
 }
 
+// unresolvedRoot returns a configured path (the state dir, the job's folder, the read-only worktree,
+// a git dir, a protected path) whose symlinks take more than the resolution budget to resolve: where
+// it physically lies is unknown, so comparing a target with it as written would leave the real
+// location unprotected (fail open). Every write is refused instead.
+func unresolvedRoot(cfg Config) (string, bool) {
+	roots := append(append([]string{cfg.StateDir, cfg.OwnDir, cfg.ReadOnly}, cfg.GitDirs...), cfg.Protected...)
+	for _, p := range roots {
+		if p == "" {
+			continue
+		}
+		if _, ok := resolveBounded(p, "/"); !ok {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func rootBlocked(p string) string {
+	return "blocked by guard: the configured path `" + p + "` (agent-jobs state, configuration or a git dir) runs " +
+		"through more than " + strconv.Itoa(maxLinks) + " symlinks or symlink targets of more than " +
+		strconv.Itoa(maxResolveSteps) + " path components, so the guard cannot tell where it lies; every write is " +
+		"refused until the configuration names the real path."
+}
+
 // inGitDir reports a path with a `.git` segment: the git dir itself, a file in it, or a worktree's
 // `.git` file.
 func inGitDir(p string) bool {
@@ -358,10 +382,14 @@ func hasDotDot(path string) bool {
 // a protected file); or into the state dir outside the job's own folder. A path with a `..` segment
 // is rejected outright; otherwise both the path as given and the path with symlinks resolved are
 // checked (a link in the job dir pointing into .git), and a path whose symlinks take more than
-// maxResolveSteps to resolve is refused.
+// maxResolveSteps to resolve is refused, as is every write while a configured path is such a path
+// (unresolvedRoot).
 func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
+	}
+	if p, bad := unresolvedRoot(cfg); bad {
+		return rootBlocked(p)
 	}
 	if hasDotDot(path) {
 		return "blocked by guard: " + tool + " path `" + path + "` contains `..`; write the path without `..` " +
@@ -717,6 +745,9 @@ func (s *pathScope) feederHit(w string) bool {
 
 // Check returns a non-empty reason when the shell command must be blocked.
 func Check(cmd string, cfg Config) string {
+	if p, bad := unresolvedRoot(cfg); bad {
+		return rootBlocked(p)
+	}
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
 		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
@@ -1351,7 +1382,9 @@ func optValue(w string) string {
 }
 
 // pathForms returns the spellings of a word a cgroup check must see: the value (of `--opt=value`) as
-// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved.
+// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved. A path
+// whose symlinks take more than the resolution budget may lead anywhere: its resolved form is the
+// cgroup file system itself (fail closed).
 func pathForms(w, dir string) [][]string {
 	w = optValue(w)
 	if w == "" {
@@ -1363,7 +1396,11 @@ func pathForms(w, dir string) [][]string {
 		if !filepath.IsAbs(abs) {
 			abs = filepath.Join(dir, abs)
 		}
-		forms = append(forms, pathSegs(abs), pathSegs(resolvePath(abs, "/")))
+		r, ok := resolveBounded(abs, "/")
+		if !ok {
+			r = "/sys/fs/cgroup"
+		}
+		forms = append(forms, pathSegs(abs), pathSegs(r))
 	}
 	return forms
 }
