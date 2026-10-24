@@ -613,24 +613,30 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					return ""
 				}
 				s.useLinks(c)
+				v := split(c.words)
 				// A redirection opens its file, also for reading (`exec 9<gitconfig`): the descriptor
 				// is a second name of it (/proc/self/fd/9), so no redirection names a protected path.
-				for _, t := range append(slices.Clone(c.outRedirs), c.inRedirs...) {
+				for _, t := range c.outRedirs {
 					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
 					}
-				}
-				for _, t := range c.outRedirs {
 					if alias, std := s.fdWord(t); alias && !std {
 						return fdAliasBlocked(t)
 					}
 				}
-				v := split(c.words)
+				for _, t := range c.inRedirs {
+					if r := s.inputRedirBlocked(t, slices.Contains(v.wrappers, "exec")); r != "" {
+						return r
+					}
+				}
 				argv := c.words[v.start:]
 				if len(argv) == 0 {
 					continue
 				}
 				name := progName(argv[0])
+				if r := fdInCode(name, argv, c); r != "" {
+					return r
+				}
 				if gitFileReaders[name] {
 					continue
 				}

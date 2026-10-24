@@ -78,6 +78,65 @@ func (s *pathScope) fdRootWord(w string) bool {
 	return false
 }
 
+// reSimpleVar is a plain variable reference, $NAME or ${NAME}: a loop variable (`wc -l < "$f"`).
+var reSimpleVar = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`)
+
+// inputRedirBlocked refuses an input redirection (`<t`, `N<t`, `N<>t`) that opens a protected path or
+// a directory holding one: the descriptor is a second name of what it opens, and of every file below
+// a directory (`exec 9<dir` then /proc/self/fd/9/gitconfig). A target the guard cannot resolve is
+// refused too: a substitution, an expansion with an operator (`${V:0}`, `${V#x}`, `${!V}`), and, for
+// a descriptor kept by `exec`, any variable expansion left after the hook's environment.
+func (s *pathScope) inputRedirBlocked(t string, exec bool) string {
+	if p, ok := s.hit(t, true); ok {
+		if _, in := s.hit(t, false); in {
+			return protectedBlocked(p)
+		}
+		return "blocked by guard: the input redirection `<" + t + "` opens a directory holding agent-jobs state (`" + p +
+			"`: " + protectedKinds + "); the descriptor names every file below it (/proc/self/fd/N/…). Name the " +
+			"files you read instead."
+	}
+	rest := expandEnv(t)
+	if !exec {
+		rest = reSimpleVar.ReplaceAllString(rest, "")
+	}
+	if strings.ContainsAny(rest, "$`") {
+		return "blocked by guard: the input redirection `<" + t + "` opens a path computed at run time (a " +
+			"substitution, an expansion with an operator, or a variable for a descriptor kept by exec); it may be " +
+			"agent-jobs state, and the descriptor a second name of it. Write the path out."
+	}
+	return ""
+}
+
+// reFdCode is a descriptor alias inside code: /proc/<pid>/fd, /proc/<pid>/task/<tid>/fd (also cwd,
+// root, map_files) or /dev/fd, with the pid spelled any way (`/proc/{os.getpid()}/fd`, `/proc/$$/fd`).
+var reFdCode = regexp.MustCompile(`/proc/[^/\s'"]+/(task/[^/\s'"]+/)?(fd|cwd|root|map_files)\b|/dev/fd\b`)
+
+// codeRunner reports a program that runs code given in its arguments, its here-docs or here-strings.
+func codeRunner(name string) bool {
+	return stdinInterpreter(name) || shells[name] || awks[name]
+}
+
+// fdInCode refuses inline code, a here-doc program or here-string program that names a descriptor
+// alias: a descriptor the shell opened (`exec 9<…`) is reached through it, and a chmod, link or write
+// there changes the file behind it, which the guard cannot see from the code.
+func fdInCode(name string, argv []string, c *simpleCmd) string {
+	runner := codeRunner(name)
+	for k := 1; k < len(argv); k++ {
+		if !runner && !codeArg(argv, k) {
+			continue
+		}
+		if m := reFdCode.FindString(argv[k]); m != "" {
+			return fdAliasBlocked(m)
+		}
+	}
+	if runner {
+		if m := reFdCode.FindString(c.heredoc); m != "" {
+			return fdAliasBlocked(m)
+		}
+	}
+	return ""
+}
+
 func fdAliasBlocked(w string) string {
 	return "blocked by guard: `" + w + "` names an open file descriptor (/proc/*/fd, /dev/fd, /dev/std*), which can " +
 		"stand for agent-jobs state or configuration; a job does not change, link or write through one. Write the path out."
