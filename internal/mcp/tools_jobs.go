@@ -101,6 +101,8 @@ type JobView struct {
 	// Covers are the checklist requirement IDs the job works on (Wave F, F4); its report must carry a
 	// "### Requirements" block in Findings / Changes.
 	Covers []string `json:"covers,omitempty"`
+	// Size is the size given at job_start (small, large; omitted when none was given; Wave F, F9 (a)).
+	Size string `json:"size,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -123,7 +125,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
-		Covers: j.Covers,
+		Covers: j.Covers, Size: j.Size,
 	}
 }
 
@@ -171,6 +173,7 @@ type JobStartInput struct {
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
 	Covers          []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>) plus a REDPROOF line per new test naming the ID (REDPROOF R01 · <test> failed before the change); without the block, or with no line for any covered ID, it is off contract; a done line without ran: or a red proof naming its ID counts as claimed. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
+	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); stored on the job. Fix and general jobs declare it; review, research and the gate kinds are exempt. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job is refused when config size_required is on, otherwise logged and allowed"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. See skill_list"`
 }
 
@@ -190,7 +193,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
-			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers,
+			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)

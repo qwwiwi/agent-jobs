@@ -148,6 +148,10 @@ type Config struct {
 	// and the daemon and wrapper do not run it). Enabling requires a daemon restart; disabling on
 	// disk revokes it immediately. The command runs the job's code outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
+	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
+	// false during the rollout: a missing size is then logged and allowed, while size large is checked
+	// either way. The owner turns it on.
+	SizeRequired bool `json:"size_required"`
 	// SkillRoots are absolute directories of skill catalogs (E7), each holding index.json; earlier roots
 	// win a duplicate name. A missing or invalid root is a warning (status, system_doctor), never fatal.
 	// Empty = no catalog: jobs see only their repository's own .claude/skills.
