@@ -47,7 +47,8 @@ func TestLinkWalkBudget(t *testing.T) {
 
 // The kernel follows 40 symlinks in one lookup and fails the 41st (ELOOP): chains of 39 and 40
 // dangling links (each target with a `..`) ending in .git/hooks/pre-commit are refused, and the
-// kernel indeed creates the file through them; through 41 it creates nothing.
+// kernel indeed creates the file through them; through 41 it creates nothing, and the guard refuses
+// the 41-link path too (Write and Bash), by its link budget.
 func TestLinkChainKernelBoundary(t *testing.T) {
 	for _, n := range []int{39, 40, 41} {
 		repo, err := filepath.EvalSymlinks(t.TempDir())
@@ -65,6 +66,7 @@ func TestLinkChainKernelBoundary(t *testing.T) {
 		}
 		mustSymlink(t, "d/../.git/hooks/pre-commit", filepath.Join(repo, link(n)))
 		r := CheckFileWrite("Write", link(1), Config{Dir: repo})
+		bash := Check("echo x > "+link(1), Config{Dir: repo, Protected: []string{filepath.Join(repo, ".git", "hooks")}})
 		werr := os.WriteFile(filepath.Join(repo, link(1)), []byte("x"), 0o600)
 		_, serr := os.Stat(filepath.Join(repo, ".git", "hooks", "pre-commit"))
 		switch {
@@ -79,6 +81,14 @@ func TestLinkChainKernelBoundary(t *testing.T) {
 			if !errors.Is(werr, syscall.ELOOP) || serr == nil {
 				t.Fatalf("%d links: want ELOOP and no hook, got %v %v", n, werr, serr)
 			}
+			// The kernel stops here, the guard does not follow it either: past 40 links it cannot
+			// tell where a lookup that starts over (mkdir -p, a cwd through a link) leads, so it refuses.
+			if !strings.Contains(r, "more than 40") {
+				t.Errorf("%d links: Write not refused by the link budget: %q", n, r)
+			}
+		}
+		if bash == "" {
+			t.Errorf("%d links: echo x > %s allowed", n, link(1))
 		}
 	}
 }
