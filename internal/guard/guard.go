@@ -38,6 +38,7 @@
 package guard
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/qwwiwi/agent-jobs/internal/casefold"
@@ -154,87 +156,114 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	return Check(in.ToolInput.Command, cfg), nil
 }
 
-// resolvePath returns path made absolute (against dir), cleaned, with symlinks resolved on its
-// longest existing prefix (the file itself when it exists, else the nearest existing parent). A
-// dangling symlink on the way is followed by its target text (Write would create that target), a
-// `..` in that text taken as the kernel takes it (linkTarget).
+// resolvePath returns path made absolute (against dir), cleaned, with its symlinks resolved the way
+// the kernel looks it up (walkPath). Past the step budget it returns the cleaned path: callers that
+// must refuse then use resolveBounded.
 func resolvePath(path, dir string) string {
-	links := 0
-	return resolveDepth(path, dir, &links)
+	r, ok := resolveBounded(path, dir)
+	if !ok {
+		return filepath.Clean(r)
+	}
+	return r
 }
 
-// maxLinks is how many dangling symlinks one resolution follows, all branches together: the kernel
-// gives up a lookup past 40 links (ELOOP), so no file is created there.
-const maxLinks = 40
-
-func resolveDepth(path, dir string, links *int) string {
+// resolveBounded is resolvePath with ok false when the resolution needs more than maxResolveSteps
+// path components (the path itself was returned cleaned, not resolved).
+func resolveBounded(path, dir string) (string, bool) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, path)
 	}
 	path = filepath.Clean(path)
-	// Past a component that does not exist no longer prefix exists either: start from the longest
-	// existing one, so a deep path costs one pass, not one per level.
-	end := len(path)
-	for i := 1; i <= len(path); i++ {
-		if i < len(path) && path[i] != filepath.Separator {
-			continue
-		}
-		if _, err := os.Lstat(path[:i]); err != nil {
-			end = strings.LastIndexByte(path[:i], filepath.Separator)
-			break
-		}
+	if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
+		return path, true
 	}
-	for {
-		if end <= 0 {
-			if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
-				return path
-			}
-			end = 0
-		}
-		p := path[:end]
-		if end == 0 {
-			p = string(filepath.Separator)
-		}
-		rest := strings.TrimLeft(path[end:], string(filepath.Separator))
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return filepath.Join(r, rest)
-		}
-		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 && *links < maxLinks {
-			if target, err := os.Readlink(p); err == nil {
-				*links++
-				return resolveDepth(filepath.Join(linkTarget(target, filepath.Dir(p), links), rest), filepath.Dir(p), links)
-			}
-		}
-		if end == 0 {
-			return path
-		}
-		end = strings.LastIndexByte(path[:end], filepath.Separator)
+	if r, ok := walkPath(path); ok {
+		return r, true
 	}
+	return path, false
 }
 
-// linkTarget is a symlink's target text, read in the link's directory dir. Without a `..` segment it
-// is returned as is. With one, it is walked like the kernel walks it: each `..` steps up from the
-// directory the part before it resolves to, symlinks followed, not lexically (filepath.Join drops
-// `jump/..` even when jump is a link: `cfg -> jump/../hooks/pre-commit`, `jump -> .git/objects`
-// creates .git/hooks/pre-commit). dir itself may run through a symlink, so a leading `..` is walked
-// the same way.
-func linkTarget(target, dir string, links *int) string {
-	if !hasDotDot(target) {
-		return target
-	}
-	cur, rel := dir, target
-	if filepath.IsAbs(target) {
-		vol := filepath.VolumeName(target)
-		cur, rel = vol+string(filepath.Separator), target[len(vol):]
-	}
-	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
-		if seg == ".." {
-			cur = filepath.Dir(resolveDepth(cur, "", links))
-		} else {
-			cur = filepath.Join(cur, seg)
+// maxLinks is how many symlinks one lookup follows: the kernel gives up past 40 (ELOOP), so no file
+// is created there.
+const maxLinks = 40
+
+// maxResolveSteps is how many path components of symlink targets one resolution walks, all links
+// together (one Lstat and at most one Readlink each). The path itself costs one step per component,
+// but 40 links with long targets could make a lookup the kernel performs in microseconds cost the
+// guard minutes; past this budget the guard refuses instead of resolving.
+const maxResolveSteps = 4096
+
+// walkPath resolves an absolute path component by component like the kernel: a symlink is replaced
+// by its target text, which is walked the same way (a `..` in it leaves the directory the part before
+// it resolves to, not lexically: `cfg -> jump/../hooks/pre-commit` with `jump -> .git/objects` creates
+// .git/hooks/pre-commit), and `..` steps up from the physical directory reached so far. Past a
+// component that does not exist the rest is taken lexically (Write creates the missing directories);
+// a `..` back onto an existing directory makes its symlinks count again. Past maxLinks links the
+// kernel fails the lookup (ELOOP): the path is returned cleaned. ok is false past maxResolveSteps.
+func walkPath(abs string) (string, bool) {
+	vol := filepath.VolumeName(abs)
+	sep := byte(filepath.Separator)
+	// cur is the path reached so far, grown and cut in place: each component costs O(1) past a
+	// missing one (no string rebuilt per component), one Lstat while the path exists.
+	cur := append(make([]byte, 0, len(abs)), vol...)
+	rootLen := len(cur)
+	str := func() string {
+		if len(cur) == rootLen {
+			return string(cur) + string(sep)
 		}
+		return string(cur)
 	}
-	return cur
+	exists := true
+	todo := strings.Split(filepath.ToSlash(abs[len(vol):]), "/")
+	links, steps := 0, 0
+	for len(todo) > 0 {
+		seg := todo[0]
+		todo = todo[1:]
+		if seg == "" || seg == "." {
+			continue
+		}
+		if seg == ".." {
+			if i := bytes.LastIndexByte(cur[rootLen:], sep); i >= 0 {
+				cur = cur[:rootLen+i]
+			}
+			if !exists {
+				_, err := os.Lstat(str())
+				exists = err == nil
+			}
+			continue
+		}
+		n := len(cur)
+		cur = append(append(cur, sep), seg...)
+		if !exists {
+			continue
+		}
+		next := str()
+		fi, err := os.Lstat(next)
+		if err != nil {
+			exists = false
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			continue
+		}
+		if links++; links > maxLinks {
+			return filepath.Clean(abs), true
+		}
+		cur = cur[:n]
+		if filepath.IsAbs(target) {
+			cur = cur[:rootLen]
+		}
+		segs := strings.Split(filepath.ToSlash(target), "/")
+		if steps += len(segs); steps > maxResolveSteps {
+			return abs, false
+		}
+		todo = append(segs, todo...)
+	}
+	return str(), true
 }
 
 // inGitDir reports a path with a `.git` segment: the git dir itself, a file in it, or a worktree's
@@ -296,18 +325,17 @@ func within(p, d string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-// inJobGitDir reports a path inside one of the job's real git dirs (as given or symlinks resolved):
-// they need not be named .git (a separate git dir, a worktree admin dir).
+// inJobGitDir reports a path inside one of the job's real git dirs (as given or with symlinks resolved
+// like a write target, resolvePath: also a dir that does not exist yet behind a symlinked parent, or
+// the target of a dangling link): they need not be named .git (a separate git dir, a worktree admin
+// dir). It is used the same way for the protected paths and the read-only worktree.
 func inJobGitDir(p string, gitDirs []string) bool {
 	for _, d := range gitDirs {
 		if d == "" {
 			continue
 		}
 		d = filepath.Clean(d)
-		if within(p, d) {
-			return true
-		}
-		if r, err := filepath.EvalSymlinks(d); err == nil && within(p, r) {
+		if within(p, d) || within(p, resolvePath(d, "/")) {
 			return true
 		}
 	}
@@ -322,8 +350,9 @@ func hasDotDot(path string) bool {
 
 // CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
 // would write inside a git dir: any `.git` directory, the job's own git dirs (cfg.GitDirs), git
-// config/hooks paths. A path with a `..` segment is rejected outright; otherwise both the path as
-// given and the path with symlinks resolved are checked (a link in the job dir pointing into .git).
+// config/hooks paths; into a protected path. A path with a `..` segment is rejected outright; otherwise both the path as given and the path with symlinks resolved are
+// checked (a link in the job dir pointing into .git), and a path whose symlinks take more than
+// maxResolveSteps to resolve is refused.
 func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
@@ -336,7 +365,12 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 	if !filepath.IsAbs(given) {
 		given = filepath.Join(cfg.Dir, given)
 	}
-	for _, p := range []string{given, resolvePath(path, cfg.Dir)} {
+	resolved, ok := resolveBounded(path, cfg.Dir)
+	if !ok {
+		return "blocked by guard: " + tool + " path `" + path + "` runs through symlinks whose targets take more " +
+			"than " + strconv.Itoa(maxResolveSteps) + " path components to resolve; the guard cannot verify it. Write the real path."
+	}
+	for _, p := range []string{given, resolved} {
 		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
 				"(git would run programs from its config and hooks)."
@@ -404,8 +438,9 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 	s := newPathScope(scripts, cfg)
 	r := s.checkScripts(scripts)
 	if s.expired {
-		return "blocked by guard: the command is too complex to verify against agent-jobs state (the subagent log " +
-			"or the job database) within the guard's time budget; split it or write the code to a file and run that."
+		return "blocked by guard: the command is too complex to verify against agent-jobs state and configuration " +
+			"(protected paths) within the guard's time budget or its symlink resolution budget; split it or write " +
+			"the code to a file and run that."
 	}
 	return r
 }

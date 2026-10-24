@@ -60,7 +60,7 @@ func newPathScope(scripts []*script, cfg Config) *pathScope {
 		}
 		p = filepath.Clean(p)
 		s.protected = append(s.protected, p)
-		if r := resolvePath(p, "/"); r != p {
+		if r := s.resolve(p); r != p {
 			s.protected = append(s.protected, r)
 		}
 	}
@@ -191,7 +191,7 @@ func (s *pathScope) cd(argv []string, dyn []bool, cdpathEnv bool) {
 		// `cd` (logical) drops `x/..` lexically, `cd -P` lets the kernel resolve it after a symlink:
 		// both directories are possible. A `..` after a component that does not exist yet (it may be a
 		// symlink the call creates) leads somewhere the guard does not know.
-		targets := []string{resolvePath(p, d)}
+		targets := []string{s.resolveAt(p, d)}
 		if hasDotDot(p) {
 			raw := p
 			if !filepath.IsAbs(raw) {
@@ -347,47 +347,38 @@ func (s *pathScope) candidates(exp string) []string {
 	}
 	var out []string
 	for _, b := range bases {
-		out = append(out, filepath.Clean(b), resolvePath(b, "/"))
+		out = append(out, filepath.Clean(b), s.resolve(b))
 		if len(s.futureLinks) > 0 {
 			out = append(out, s.futurePath(b))
 		}
-		if hasDotDot(b) {
-			out = append(out, resolvePath(physical(b), "/"))
+		if hasDotDot(b) && filepath.IsAbs(b) {
+			out = append(out, s.kernelWalk(b))
 		}
 	}
 	return out
 }
 
-// physical walks an absolute path like the kernel: `..` leaves the directory its prefix resolves to
-// (symlinks followed), while filepath.Clean drops `link/..` lexically. The prefix is kept resolved,
-// so each step looks at the new segment only; past a prefix that does not exist the walk is lexical.
-func physical(abs string) string {
-	cur, exists := "/", true
-	for _, seg := range strings.Split(filepath.ToSlash(abs), "/") {
-		switch seg {
-		case "", ".":
-		case "..":
-			cur = filepath.Dir(cur)
-			if !exists {
-				// back at a directory that may exist: its symlinks count again
-				_, err := os.Lstat(cur)
-				exists = err == nil
-			}
-		default:
-			next := filepath.Join(cur, seg)
-			if exists {
-				fi, err := os.Lstat(next)
-				switch {
-				case err != nil:
-					exists = false
-				case fi.Mode()&os.ModeSymlink != 0:
-					next = resolvePath(next, "/")
-				}
-			}
-			cur = next
-		}
+// resolve is resolvePath against "/" for the checks of this call: past the resolution's step budget
+// the call counts as expired (refused as too complex to verify, like past the time budget).
+func (s *pathScope) resolve(p string) string { return s.resolveAt(p, "/") }
+
+// resolveAt is resolve with a relative p taken against dir.
+func (s *pathScope) resolveAt(p, dir string) string {
+	r, ok := resolveBounded(p, dir)
+	if !ok {
+		s.expired = true
 	}
-	return cur
+	return r
+}
+
+// kernelWalk is walkPath for the checks of this call: an absolute path as written, each `..` taken
+// after the symlinks before it.
+func (s *pathScope) kernelWalk(abs string) string {
+	r, ok := walkPath(abs)
+	if !ok {
+		s.expired = true
+	}
+	return r
 }
 
 // linkDotDot reports a home-expanded path with a `..` whose prefix (the part before the first `..`)
