@@ -148,3 +148,38 @@ func TestManifestCheckRunsGoTest(t *testing.T) {
 		t.Fatalf("failing run: exit %d\n%s", code, out)
 	}
 }
+
+// The live IDs are read before the tests run: a test that rewrites brief/CHECKLIST.md (here: down to
+// R01) does not shrink the set the script checks, so R02 without a passing tagged test still fails it.
+func TestManifestCheckReadsLiveIDsBeforeTheTests(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("no go on PATH")
+	}
+	repo := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n",
+		"brief/CHECKLIST.md": "| ID | Brief quote | Contract | Rationale |\n|---|---|---|---|\n| R01 | «a login page» | live | brief |\n" +
+			"| R02 | «a logout button» | live | brief |\n",
+		"app_test.go": "package app\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestLogin(t *testing.T) {\n" +
+			"\tt.Run(\"[R01] login page renders\", func(t *testing.T) {\n" +
+			"\t\tshrunk := \"| ID | Brief quote | Contract | Rationale |\\n|---|---|---|---|\\n| R01 | «a login page» | live | brief |\\n\"\n" +
+			"\t\tif err := os.WriteFile(\"brief/CHECKLIST.md\", []byte(shrunk), 0o644); err != nil {\n\t\t\tt.Fatal(err)\n\t\t}\n\t})\n}\n",
+	}
+	for rel, body := range files {
+		p := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, code := run(t, repo, "")
+	if code != 1 || !strings.Contains(out, "MISSING  R02  no passing test tagged [R02]") ||
+		!strings.Contains(out, "manifest-check: 1 of 2 live requirements have a passing tagged test") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if b, err := os.ReadFile(filepath.Join(repo, "brief", "CHECKLIST.md")); err != nil || strings.Contains(string(b), "R02") {
+		t.Fatalf("the fixture test did not rewrite the checklist: %v\n%s", err, b)
+	}
+}

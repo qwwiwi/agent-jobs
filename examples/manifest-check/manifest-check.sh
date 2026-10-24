@@ -26,21 +26,9 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/manifest-check.XXXXXX") || exit 2
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 2' HUP INT TERM
 
-if [ $# -gt 0 ]; then
-  json=$1
-  if [ ! -f "$json" ]; then
-    echo "manifest-check: $json not found" >&2
-    exit 2
-  fi
-else
-  json=$tmp/go-test.json
-  # shellcheck disable=SC2086 # the argument list is split on purpose
-  go test -json ${MANIFEST_GO_TEST_ARGS:-./...} >"$json" 2>"$tmp/go-test.stderr"
-  echo "manifest-check: go test exit $? (failing untagged tests are check.sh's business, not this script's)"
-fi
-
-# The live requirement IDs: table rows whose ID is R<nn>, R<nn>i or G<nn> and whose contract names
-# live. Cells may hold escaped pipes (\|) and backslashes (\\), as agent-jobs writes them.
+# The live requirement IDs, read before any test runs (a test that rewrites the checklist cannot
+# shrink the set): table rows whose ID is R<nn>, R<nn>i or G<nn> and whose contract names live.
+# Cells may hold escaped pipes (\|) and backslashes (\\), as agent-jobs writes them.
 awk '
 /^[ \t]*\|/ {
   line = $0
@@ -60,6 +48,19 @@ awk '
 if [ ! -s "$tmp/live" ]; then
   echo "manifest-check: $checklist has no live requirements" >&2
   exit 2
+fi
+
+if [ $# -gt 0 ]; then
+  json=$1
+  if [ ! -f "$json" ]; then
+    echo "manifest-check: $json not found" >&2
+    exit 2
+  fi
+else
+  json=$tmp/go-test.json
+  # shellcheck disable=SC2086 # the argument list is split on purpose
+  go test -json ${MANIFEST_GO_TEST_ARGS:-./...} >"$json" 2>"$tmp/go-test.stderr"
+  echo "manifest-check: go test exit $? (failing untagged tests are check.sh's business, not this script's)"
 fi
 
 if [ ! -s "$json" ]; then
