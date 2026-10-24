@@ -182,24 +182,50 @@ func (c *Checklist) Status(brief []byte, rec *Record) (approved bool, hash, reas
 	return false, hash, "approval void: " + why
 }
 
-// BriefPrefix is BRIEF.md's text above its «## Additions» heading (outside a ``` fence; the whole text
-// when it has none), trailing white space trimmed: the owner's first words, never edited after an
-// approval. Appending additions does not change it.
+// BriefPrefix is BRIEF.md's text above its «## Additions» heading (additionsAt; the whole text when
+// it has none), trailing white space trimmed: the owner's first words, never edited after an approval.
+// Appending additions does not change it.
 func BriefPrefix(brief []byte) string {
-	lines := strings.SplitAfter(string(brief), "\n")
-	fence, end := false, len(brief)
-	for i, off := 0, 0; i < len(lines); off, i = off+len(lines[i]), i+1 {
-		t := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(t, "```") {
+	end := additionsAt(string(brief))
+	if end < 0 {
+		end = len(brief)
+	}
+	return strings.TrimRight(string(brief[:end]), "\r\n \t")
+}
+
+// isFence reports a ``` fence line.
+func isFence(line string) bool { return strings.HasPrefix(strings.TrimSpace(line), "```") }
+
+// fenceOpen reports whether text ends inside a ``` fence (an odd number of fence lines).
+func fenceOpen(text string) bool {
+	open := false
+	for _, l := range strings.Split(text, "\n") {
+		if isFence(l) {
+			open = !open
+		}
+	}
+	return open
+}
+
+// additionsAt is the byte offset of BRIEF.md's «## Additions» heading line, -1 when it has none: the
+// first such line outside a ``` fence. When a fence is still open at the end (an unclosed fence in the
+// owner's words), fences are ignored and the first such line counts: otherwise the heading appended
+// after an unclosed fence would never be found. AppendAdditions closes a fence a quote leaves open, so
+// whether a fence is open at the end is decided by the owner's first words alone and stays the same
+// as additions are appended.
+func additionsAt(text string) int {
+	fences := !fenceOpen(text)
+	fence := false
+	for i, off, lines := 0, 0, strings.SplitAfter(text, "\n"); i < len(lines); off, i = off+len(lines[i]), i+1 {
+		if fences && isFence(lines[i]) {
 			fence = !fence
 			continue
 		}
 		if !fence && strings.TrimRight(lines[i], "\r\n \t") == AdditionsHeading {
-			end = off
-			break
+			return off
 		}
 	}
-	return strings.TrimRight(string(brief[:end]), "\r\n \t")
+	return -1
 }
 
 // BriefPrefixSHA256 is the hex sha256 of BriefPrefix.
@@ -472,35 +498,24 @@ func InitBrief(words string) string {
 }
 
 // AppendAdditions appends adds under «## Additions» (added at the end when the brief has none); the
-// text above is never changed. Each addition is «### <date>» and the quote verbatim.
+// text above is never changed. Each addition is «### <date>» and the quote verbatim (a ``` fence the
+// quote leaves open is closed after it).
 func AppendAdditions(brief string, adds []Addition) string {
 	if len(adds) == 0 {
 		return brief
 	}
 	out := strings.TrimRight(brief, "\n") + "\n"
-	if !hasHeading(brief, AdditionsHeading) {
+	if additionsAt(brief) < 0 {
 		out += "\n" + AdditionsHeading + "\n"
 	}
 	for _, a := range adds {
-		out += "\n### " + a.Date + "\n\n" + strings.TrimRight(a.Quote, "\n") + "\n"
+		q := strings.TrimRight(a.Quote, "\n") + "\n"
+		if fenceOpen(q) {
+			q += "```\n" // a quote never leaves a fence open (see additionsAt)
+		}
+		out += "\n### " + a.Date + "\n\n" + q
 	}
 	return out
-}
-
-// hasHeading reports whether text has the line heading outside a ``` fence.
-func hasHeading(text, heading string) bool {
-	fence := false
-	for _, l := range strings.Split(text, "\n") {
-		t := strings.TrimSpace(l)
-		if strings.HasPrefix(t, "```") {
-			fence = !fence
-			continue
-		}
-		if !fence && strings.TrimRight(l, "\r \t") == heading {
-			return true
-		}
-	}
-	return false
 }
 
 // LongBriefWarning is checklist_set's warning for fewer than MinRowsLongBrief rows from a long brief.
