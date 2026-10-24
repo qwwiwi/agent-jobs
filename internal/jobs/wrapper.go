@@ -34,7 +34,18 @@ type StreamResult struct {
 	TokensInvalid      bool
 	ReportPresent      bool
 	ReportContractNote string
-	ReportText         string `json:"-"` // last report from trusted assistant stdout
+	// GateFailure is why a gate job's result was rejected and not stored ("" = stored, or not a gate job).
+	GateFailure string
+	ReportText  string `json:"-"` // last report from trusted assistant stdout
+	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
+	// second one is a line another process wrote into the pipe), for codex its terminal turn events
+	// (turn.completed, turn.failed: codex exec runs one turn).
+	Results int `json:"-"`
+	// AfterEnd counts the codex events read after its first terminal turn event.
+	AfterEnd int `json:"-"`
+	// Invalid counts the stdout lines that are not JSON (blank lines aside) or over the line limit: an
+	// unterminated prefix written into the pipe joins the runner's next line into one of them.
+	Invalid int `json:"-"`
 
 	Found   bool
 	Subtype string
@@ -159,6 +170,9 @@ func (t *resultTee) scan(p []byte) {
 
 // end parses the line read so far (also a last line without a newline) and starts the next one.
 func (t *resultTee) end() {
+	if t.skip || len(bytes.TrimSpace(t.line)) > 0 && !json.Valid(t.line) {
+		t.res.Invalid++
+	}
 	if t.skip {
 		t.tokens.invalid = true
 		t.watch.lastResult = false
@@ -208,7 +222,7 @@ func (t *resultTee) end() {
 			}
 		}
 		if r, ok := parseResultLine(t.line); ok {
-			r.Progressed, r.ReportText = true, t.res.ReportText
+			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
 			t.res = r
 		}
 	}
@@ -487,6 +501,12 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		if rc := runAcceptanceStep(jobDir, token, stderrLog, &res); rc != 0 {
 			return rc
 		}
+		// A gate job's result (Wave F) is validated and stored here, by the wrapper, never by the orchestrator,
+		// from the runner's final message as the wrapper read it from the runner's stdout (res.Text): never
+		// from report.md or another file the job can write.
+		if res.GateFailure = gateStep(st, id, token, res, opts.ChecklistLockDir, time.Now()); res.GateFailure != "" {
+			fmt.Fprintln(stderrLog, "run-wrapper:", res.GateFailure)
+		}
 	}
 	if sw.Incomplete() {
 		res.SweepFailure = sweepResultFailure(sw)
@@ -514,6 +534,9 @@ type WrapperOptions struct {
 	FallbackPrompt  string // stdin file name for the fresh-session fallback; empty = no fallback
 	FallbackSession string // the fallback's session id
 	Runner          string // the program argv runs: claude (default) or codex
+	// ChecklistLockDir is the agent-jobs home's checklist lock dir (a gate job's launch only): a slicing
+	// result is stored under the repository's checklist lock there.
+	ChecklistLockDir string
 }
 
 func (o WrapperOptions) prompt() string {
@@ -540,6 +563,9 @@ func (o WrapperOptions) validate() error {
 		}
 	default:
 		return fmt.Errorf("runner %q must be claude or codex", o.Runner)
+	}
+	if o.ChecklistLockDir != "" && !filepath.IsAbs(o.ChecklistLockDir) {
+		return fmt.Errorf("checklist lock dir %q is not an absolute path", o.ChecklistLockDir)
 	}
 	if o.FallbackSession != "" && !ValidSessionID(o.FallbackSession) {
 		return fmt.Errorf("fallback session %q is not a session id", o.FallbackSession)
