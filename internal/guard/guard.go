@@ -38,6 +38,7 @@
 package guard
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +47,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/qwwiwi/agent-jobs/internal/casefold"
@@ -65,7 +67,8 @@ type Config struct {
 	// subagent unless max are used and returns the count before the call. Nil = the log alone counts.
 	SubagentReserve func(max int) (prev int, allowed bool, err error)
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
-	// database that holds the counter, skill roots/links, the job's session transcript directories, and
+	// database that holds the counter, the agent's config.json, owner rules and project cards, the
+	// job's gitconfig and no-hooks dir, skill roots/links, the job's session transcript directories, and
 	// a repository job's brief/BRIEF.md and brief/CHECKLIST.md (Wave F: the orchestrator's checklist
 	// tools are their only writers). File tools and literal Bash targets into them are refused.
 	Protected []string
@@ -100,8 +103,16 @@ type HookInput struct {
 // fileTools write the file named in their input (file_path, or notebook_path for NotebookEdit).
 var fileTools = map[string]bool{"Write": true, "Edit": true, "MultiEdit": true, "NotebookEdit": true}
 
-// Decide parses the hook JSON and returns a non-empty reason when the call must be blocked.
+// Decide parses the hook JSON and returns a non-empty reason when the call must be blocked, within
+// decideBudget (a refusal past it) and with the symlink resolutions of the call memoized.
 func Decide(r io.Reader, cfg Config) (string, error) {
+	return withDeadline(func() (string, error) {
+		defer startMemo()()
+		return decideCall(r, cfg)
+	})
+}
+
+func decideCall(r io.Reader, cfg Config) (string, error) {
 	var raw struct {
 		ToolInput json.RawMessage `json:"tool_input"`
 	}
@@ -158,53 +169,142 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	return Check(in.ToolInput.Command, cfg), nil
 }
 
-// resolvePath returns path made absolute (against dir), cleaned, with symlinks resolved on its
-// longest existing prefix (the file itself when it exists, else the nearest existing parent). A
-// dangling symlink on the way is followed by its target text (Write would create that target).
-func resolvePath(path, dir string) string { return resolveDepth(path, dir, 0) }
+// resolvePath returns path made absolute (against dir), cleaned, with its symlinks resolved the way
+// the kernel looks it up (walkPath). Past the step budget it returns the cleaned path: callers that
+// must refuse then use resolveBounded.
+func resolvePath(path, dir string) string {
+	r, ok := resolveBounded(path, dir)
+	if !ok {
+		return filepath.Clean(r)
+	}
+	return r
+}
 
-func resolveDepth(path, dir string, depth int) string {
+// resolveBounded is resolvePath with ok false when the resolution follows more than maxLinks links or
+// more than maxResolveSteps components of link targets (the path itself was returned cleaned, not
+// resolved).
+func resolveBounded(path, dir string) (string, bool) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, path)
 	}
 	path = filepath.Clean(path)
-	// Past a component that does not exist no longer prefix exists either: start from the longest
-	// existing one, so a deep path costs one pass, not one per level.
-	end := len(path)
-	for i := 1; i <= len(path); i++ {
-		if i < len(path) && path[i] != filepath.Separator {
+	if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
+		return path, true
+	}
+	if r, ok := memoWalk(path); ok {
+		return r, true
+	}
+	return path, false
+}
+
+// maxLinks is how many symlinks one lookup follows: the kernel gives up past 40 (ELOOP), so no file
+// is created there.
+const maxLinks = 40
+
+// maxResolveSteps is how many path components of symlink targets one resolution walks, all links
+// together (one Lstat and at most one Readlink each). The path itself costs one step per component,
+// but 40 links with long targets could make a lookup the kernel performs in microseconds cost the
+// guard minutes; past this budget the guard refuses instead of resolving.
+const maxResolveSteps = 4096
+
+// walkPath resolves an absolute path component by component like the kernel: a symlink is replaced
+// by its target text, which is walked the same way (a `..` in it leaves the directory the part before
+// it resolves to, not lexically: `cfg -> jump/../hooks/pre-commit` with `jump -> .git/objects` creates
+// .git/hooks/pre-commit), and `..` steps up from the physical directory reached so far. Past a
+// component that does not exist the rest is taken lexically (Write creates the missing directories);
+// a `..` back onto an existing directory makes its symlinks count again. ok is false past maxLinks
+// links or maxResolveSteps components of link targets (the path is then returned as given).
+func walkPath(abs string) (string, bool) {
+	vol := filepath.VolumeName(abs)
+	sep := byte(filepath.Separator)
+	// cur is the path reached so far, grown and cut in place: each component costs O(1) past a
+	// missing one (no string rebuilt per component), one Lstat while the path exists.
+	cur := append(make([]byte, 0, len(abs)), vol...)
+	rootLen := len(cur)
+	str := func() string {
+		if len(cur) == rootLen {
+			return string(cur) + string(sep)
+		}
+		return string(cur)
+	}
+	exists := true
+	todo := strings.Split(filepath.ToSlash(abs[len(vol):]), "/")
+	links, steps := 0, 0
+	for len(todo) > 0 {
+		seg := todo[0]
+		todo = todo[1:]
+		if seg == "" || seg == "." {
 			continue
 		}
-		if _, err := os.Lstat(path[:i]); err != nil {
-			end = strings.LastIndexByte(path[:i], filepath.Separator)
-			break
+		if seg == ".." {
+			if i := bytes.LastIndexByte(cur[rootLen:], sep); i >= 0 {
+				cur = cur[:rootLen+i]
+			}
+			if !exists {
+				_, err := os.Lstat(str())
+				exists = err == nil
+			}
+			continue
+		}
+		n := len(cur)
+		cur = append(append(cur, sep), seg...)
+		if !exists {
+			continue
+		}
+		next := str()
+		fi, err := os.Lstat(next)
+		if err != nil {
+			exists = false
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			continue
+		}
+		if links++; links > maxLinks {
+			// The kernel fails this lookup, but it counts links from the physical cwd and a tool
+			// that looks a path up component by component (mkdir -p) starts over for each lookup:
+			// the guard cannot tell where such a path leads, so it refuses (ok false).
+			return abs, false
+		}
+		cur = cur[:n]
+		if filepath.IsAbs(target) {
+			cur = cur[:rootLen]
+		}
+		segs := strings.Split(filepath.ToSlash(target), "/")
+		if steps += len(segs); steps > maxResolveSteps {
+			return abs, false
+		}
+		todo = append(segs, todo...)
+	}
+	return str(), true
+}
+
+// unresolvedRoot returns a configured path (the state dir, the job's folder, the read-only worktree,
+// a git dir, a protected path, a NoRead directory) whose symlinks take more than the resolution
+// budget to resolve: where it physically lies is unknown, so comparing a target with it as written
+// would leave the real location unprotected (fail open). Every write is refused instead.
+func unresolvedRoot(cfg Config) (string, bool) {
+	roots := append(append(append([]string{cfg.StateDir, cfg.OwnDir, cfg.ReadOnly}, cfg.GitDirs...), cfg.Protected...), cfg.NoRead...)
+	for _, p := range roots {
+		if p == "" {
+			continue
+		}
+		if _, ok := resolveBounded(p, "/"); !ok {
+			return p, true
 		}
 	}
-	for {
-		if end <= 0 {
-			if !filepath.IsAbs(path) { // dir was relative: nothing to resolve against
-				return path
-			}
-			end = 0
-		}
-		p := path[:end]
-		if end == 0 {
-			p = string(filepath.Separator)
-		}
-		rest := strings.TrimLeft(path[end:], string(filepath.Separator))
-		if r, err := filepath.EvalSymlinks(p); err == nil {
-			return filepath.Join(r, rest)
-		}
-		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 && depth < 40 {
-			if target, err := os.Readlink(p); err == nil {
-				return resolveDepth(filepath.Join(target, rest), filepath.Dir(p), depth+1)
-			}
-		}
-		if end == 0 {
-			return path
-		}
-		end = strings.LastIndexByte(path[:end], filepath.Separator)
-	}
+	return "", false
+}
+
+func rootBlocked(p string) string {
+	return "blocked by guard: the configured path `" + p + "` (agent-jobs state, configuration or a git dir) runs " +
+		"through more than " + strconv.Itoa(maxLinks) + " symlinks or symlink targets of more than " +
+		strconv.Itoa(maxResolveSteps) + " path components, so the guard cannot tell where it lies; every write is " +
+		"refused until the configuration names the real path."
 }
 
 // inGitDir reports a path with a `.git` segment: the git dir itself, a file in it, or a worktree's
@@ -266,18 +366,17 @@ func within(p, d string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-// inJobGitDir reports a path inside one of the job's real git dirs (as given or symlinks resolved):
-// they need not be named .git (a separate git dir, a worktree admin dir).
+// inJobGitDir reports a path inside one of the job's real git dirs (as given or with symlinks resolved
+// like a write target, resolvePath: also a dir that does not exist yet behind a symlinked parent, or
+// the target of a dangling link): they need not be named .git (a separate git dir, a worktree admin
+// dir). It is used the same way for the protected paths and the read-only worktree.
 func inJobGitDir(p string, gitDirs []string) bool {
 	for _, d := range gitDirs {
 		if d == "" {
 			continue
 		}
 		d = filepath.Clean(d)
-		if within(p, d) {
-			return true
-		}
-		if r, err := filepath.EvalSymlinks(d); err == nil && within(p, r) {
+		if within(p, d) || within(p, resolvePath(d, "/")) {
 			return true
 		}
 	}
@@ -292,11 +391,18 @@ func hasDotDot(path string) bool {
 
 // CheckFileWrite returns a non-empty reason when a file tool (Write, Edit, MultiEdit, NotebookEdit)
 // would write inside a git dir: any `.git` directory, the job's own git dirs (cfg.GitDirs), git
-// config/hooks paths. A path with a `..` segment is rejected outright; otherwise both the path as
-// given and the path with symlinks resolved are checked (a link in the job dir pointing into .git).
+// config/hooks paths; into a protected path (also through a file descriptor alias or a hard link of
+// a protected file); or into the state dir outside the job's own folder. A path with a `..` segment
+// is rejected outright; otherwise both the path as given and the path with symlinks resolved are
+// checked (a link in the job dir pointing into .git), and a path whose symlinks take more than
+// maxResolveSteps to resolve is refused, as is every write while a configured path is such a path
+// (unresolvedRoot).
 func CheckFileWrite(tool, path string, cfg Config) string {
 	if path == "" {
 		return ""
+	}
+	if p, bad := unresolvedRoot(cfg); bad {
+		return rootBlocked(p)
 	}
 	if hasDotDot(path) {
 		return "blocked by guard: " + tool + " path `" + path + "` contains `..`; write the path without `..` " +
@@ -306,7 +412,31 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 	if !filepath.IsAbs(given) {
 		given = filepath.Join(cfg.Dir, given)
 	}
-	for _, p := range []string{given, resolvePath(path, cfg.Dir)} {
+	resolved, ok := resolveBounded(path, cfg.Dir)
+	if !ok {
+		return "blocked by guard: " + tool + " path `" + path + "` runs through more than " + strconv.Itoa(maxLinks) +
+			" symlinks or symlink targets of more than " + strconv.Itoa(maxResolveSteps) + " path components; the " +
+			"guard cannot verify it. Write the real path."
+	}
+	if len(cfg.Protected) > 0 {
+		for _, p := range []string{given, resolved} {
+			if alias, _ := fdAlias(p); alias {
+				return fdAliasBlocked(path)
+			}
+		}
+	}
+	// The state dir keeps the job's own folder writable; the NoRead directories (the shared checklist
+	// locks) are state dirs without an own folder.
+	var state *stateReadScope
+	var noRead []*stateReadScope
+	for _, c := range readScopes(cfg) {
+		if c.StateDir == cfg.StateDir && state == nil {
+			state = newStateReadScope(nil, c)
+			continue
+		}
+		noRead = append(noRead, newStateReadScope(nil, c))
+	}
+	for _, p := range []string{given, resolved} {
 		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
 			return "blocked by guard: " + tool + " into `" + p + "`: a job does not write inside a .git directory " +
 				"(git would run programs from its config and hooks)."
@@ -314,25 +444,42 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		if inJobGitDir(p, cfg.Protected) {
 			return protectedBlocked(p)
 		}
-		if inJobGitDir(p, cfg.NoRead) {
-			return stateBlocked(tool+" into `"+p+"`", p)
+		if state != nil {
+			if q, in := state.blocked(p, "", false); in {
+				return stateWriteBlocked(tool, q)
+			}
+		}
+		for _, s := range noRead {
+			if q, in := s.blocked(p, "", false); in {
+				return stateBlocked(tool+" into `"+p+"`", q)
+			}
 		}
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
 	}
+	if len(cfg.Protected) > 0 {
+		links := &inodeSet{forms: protectedForms(cfg.Protected)}
+		if q, ok := links.hardlink(resolved); ok {
+			return protectedBlocked(q + " (`" + path + "` is a hard link of it)")
+		}
+	}
 	return ""
 }
 
+// protectedKinds names what the protected paths (cfg.Protected) are, for the refusals.
+const protectedKinds = "the subagent logs or the job database, agent-jobs configuration (config.json, the owner " +
+	"rules, the project cards), the job's own setup (its gitconfig, no-hooks dir, settings.json or mcp.json), a skill " +
+	"catalog (a skill root or a skill link), a job session transcript directory, or the brief files (brief/BRIEF.md, " +
+	"brief/CHECKLIST.md: only the orchestrator's checklist tools write them)"
+
 func protectedBlocked(p string) string {
-	return "blocked by guard: `" + p + "` is agent-jobs state (the subagent log or the job database), a skill catalog " +
-		"(a skill root or a skill link), a job session transcript directory, or the brief files (brief/BRIEF.md, " +
-		"brief/CHECKLIST.md: only the orchestrator's checklist tools write them); a job does not write there."
+	return "blocked by guard: `" + p + "` is agent-jobs state: " + protectedKinds + "; a job does not write there."
 }
 
 func ancestorBlocked(w, p string) string {
-	return "blocked by guard: argument `" + w + "` is an ancestor of agent-jobs state (`" + p + "`, the subagent log or " +
-		"the job database); a job does not remove, move or write into it."
+	return "blocked by guard: argument `" + w + "` is an ancestor of agent-jobs state (`" + p + "`: " + protectedKinds +
+		"); a job does not remove, move or write into it."
 }
 
 // checkProtected rejects Bash writes into cfg.Protected. Paths are resolved by pathScope (pathres.go):
@@ -374,10 +521,12 @@ func checkProtected(scripts []*script, _ string, cfg Config) string {
 		return ""
 	}
 	s := newPathScope(scripts, cfg)
+	s.inodes = &inodeSet{forms: s.protected}
 	r := s.checkScripts(scripts)
 	if s.expired {
-		return "blocked by guard: the command is too complex to verify against agent-jobs state (the subagent log " +
-			"or the job database) within the guard's time budget; split it or write the code to a file and run that."
+		return "blocked by guard: the command is too complex to verify against agent-jobs state and configuration " +
+			"(protected paths) within the guard's time budget or its symlink resolution budget; split it or write " +
+			"the code to a file and run that."
 	}
 	return r
 }
@@ -490,21 +639,51 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					return ""
 				}
 				s.useLinks(c)
+				v := split(c.words)
+				// A redirection opens its file, also for reading (`exec 9<gitconfig`): the descriptor
+				// is a second name of it (/proc/self/fd/9), so no redirection names a protected path.
 				for _, t := range c.outRedirs {
 					if p, ok := s.hit(t, false); ok {
 						return protectedBlocked(p)
 					}
+					if alias, std := s.fdWord(t); alias && !std {
+						return fdAliasBlocked(t)
+					}
 				}
-				v := split(c.words)
+				for _, t := range c.inRedirs {
+					if r := s.inputRedirBlocked(t, slices.Contains(v.wrappers, "exec")); r != "" {
+						return r
+					}
+				}
 				argv := c.words[v.start:]
 				if len(argv) == 0 {
 					continue
 				}
 				name := progName(argv[0])
+				if r := fdInCode(name, argv, c); r != "" {
+					return r
+				}
 				if gitFileReaders[name] {
 					continue
 				}
-				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
+				for _, a := range argv[1:] {
+					if alias, std := s.fdWord(a); alias && (fdMeta[name] || !std) {
+						return fdAliasBlocked(a)
+					}
+					if linkMakers[name] && s.fdRootWord(a) {
+						return fdAliasBlocked(a)
+					}
+				}
+				pyAll, pyDirs := pythonTreeTargets(name, argv)
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || fdWrites(name, argv) || pyAll
+				for _, d := range pyDirs {
+					if p, ok := s.hit(d, true); ok {
+						if _, in := s.hit(d, false); !in {
+							return ancestorBlocked(d, p)
+						}
+						return protectedBlocked(p)
+					}
+				}
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
@@ -539,7 +718,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					if h, ok := s.contains(a, code); ok {
 						return h.reason()
 					}
-					if name != "cd" && name != "pushd" {
+					if name != "cd" && name != "pushd" && !dirReader(name, argv) {
 						if p, ok := s.parentHit(a); ok {
 							return protectedBlocked(p)
 						}
@@ -572,7 +751,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				for _, w := range words {
 					if s.feederHit(w) {
 						return "blocked by guard: " + feeder + " reads `" + w + "`, which names agent-jobs " +
-							"state (the subagent log or the job database); the guard cannot verify what it is fed."
+							"state (" + protectedKinds + "); the guard cannot verify what it is fed."
 					}
 				}
 			}
@@ -607,6 +786,12 @@ func (s *pathScope) feederHit(w string) bool {
 
 // Check returns a non-empty reason when the shell command must be blocked.
 func Check(cmd string, cfg Config) string {
+	if len(cmd) > maxCommandBytes {
+		return commandSizeBlocked(len(cmd))
+	}
+	if p, bad := unresolvedRoot(cfg); bad {
+		return rootBlocked(p)
+	}
 	scripts := parseAll(cmd)
 	for _, check := range []func([]*script, string, Config) string{
 		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
@@ -1241,7 +1426,9 @@ func optValue(w string) string {
 }
 
 // pathForms returns the spellings of a word a cgroup check must see: the value (of `--opt=value`) as
-// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved.
+// written and cleaned, made absolute against dir when dir is known, and with symlinks resolved. A path
+// whose symlinks take more than the resolution budget may lead anywhere: its resolved form is the
+// cgroup file system itself (fail closed).
 func pathForms(w, dir string) [][]string {
 	w = optValue(w)
 	if w == "" {
@@ -1253,7 +1440,11 @@ func pathForms(w, dir string) [][]string {
 		if !filepath.IsAbs(abs) {
 			abs = filepath.Join(dir, abs)
 		}
-		forms = append(forms, pathSegs(abs), pathSegs(resolvePath(abs, "/")))
+		r, ok := resolveBounded(abs, "/")
+		if !ok {
+			r = "/sys/fs/cgroup"
+		}
+		forms = append(forms, pathSegs(abs), pathSegs(r))
 	}
 	return forms
 }

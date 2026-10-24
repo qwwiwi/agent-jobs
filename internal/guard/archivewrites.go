@@ -30,7 +30,7 @@ func (s *pathScope) archiveWritten(archive, cwd string) bool {
 		return true
 	}
 	abs := absoluteAt(archive, cwd)
-	for _, p := range []string{abs, resolvePath(abs, "/"), s.futurePath(abs)} {
+	for _, p := range []string{abs, s.resolve(abs), s.futurePath(abs)} {
 		p = fold(p)
 		if _, ok := s.writes[p]; ok {
 			return true

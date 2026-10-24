@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -56,10 +57,15 @@ type stateReadScope struct {
 
 func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
 	r := &stateReadScope{}
+	unresolved := false
 	for _, p := range []string{cfg.StateDir, cfg.OwnDir} {
 		p = filepath.Clean(p)
 		forms := []string{p}
-		if q := resolvePath(p, "/"); q != p {
+		q, ok := resolveBounded(p, "/")
+		if !ok {
+			unresolved = true // where the root lies is unknown: the scope counts as expired (fail closed)
+		}
+		if q != p {
 			forms = append(forms, q)
 		}
 		if r.state == nil {
@@ -83,6 +89,7 @@ func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
 		}
 	}
 	r.pathScope = newPathScope(scripts, inner)
+	r.expired = r.expired || unresolved
 	r.sequence(scripts)
 	return r
 }
@@ -130,7 +137,7 @@ func (r *stateReadScope) sequence(scripts []*script) {
 // directory without cleaning: for a path with `..` it is also resolved the way the kernel does
 // (`link/..` is the parent of the link's target).
 func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
-	cands := []string{filepath.Clean(abs), resolvePath(abs, "/")}
+	cands := []string{filepath.Clean(abs), r.resolve(abs)}
 	if len(r.futureLinks) > 0 {
 		path := raw
 		if path == "" {
@@ -140,7 +147,7 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 	}
 	if raw != "" && hasDotDot(raw) {
 		if q, ok := kernelPath(raw); ok {
-			cands = append(cands, q, resolvePath(q, "/"))
+			cands = append(cands, q, r.resolve(q))
 		}
 	}
 	for _, p := range cands {
@@ -237,13 +244,13 @@ func (r *stateReadScope) glob(what, pat string, tree bool) string {
 		}
 	}
 	lit := "/" + strings.Join(comps[:wi], "/")
-	forms := []string{filepath.Clean(lit), resolvePath(lit, "/")}
+	forms := []string{filepath.Clean(lit), r.resolve(lit)}
 	if hasDotDot(lit) {
 		k, ok := kernelPath(lit)
 		if !ok {
 			return dotDotBlocked(what)
 		}
-		forms = append(forms, k, resolvePath(k, "/"))
+		forms = append(forms, k, r.resolve(k))
 	}
 	for _, f := range forms {
 		full := path.Join(append([]string{filepath.ToSlash(f)}, rest...)...)
@@ -543,7 +550,7 @@ func (r *stateReadScope) whereOf(c *simpleCmd) (where, string) {
 			if !filepath.IsAbs(raw) {
 				raw = d + "/" + p
 			}
-			n := resolvePath(raw, "/")
+			n := r.resolve(raw)
 			if hasDotDot(raw) {
 				k, ok := kernelPath(raw)
 				if !ok {
@@ -894,7 +901,10 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 			pat = raw + "/" + pattern
 		}
 		if hasGlob(pat) {
-			return r.glob(tool+" of `"+pattern+"` in `"+path+"`", pat, false)
+			if reason := r.glob(tool+" of `"+pattern+"` in `"+path+"`", pat, false); reason != "" {
+				return reason
+			}
+			return r.unverified(tool + " of `" + pattern + "` in `" + path + "`")
 		}
 		raw = pat
 	}
@@ -906,5 +916,16 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 	if p, ok := r.blocked(raw, raw, tool == "Grep"); ok {
 		return stateBlocked(tool+" of `"+path+"`", p)
 	}
-	return ""
+	return r.unverified(tool + " of `" + path + "`")
+}
+
+// unverified refuses what when a path of the check (the state dir or a target) took more than the
+// symlink resolution budget to resolve: where it lies is unknown, so the read is not allowed.
+func (r *stateReadScope) unverified(what string) string {
+	if !r.expired {
+		return ""
+	}
+	return "blocked by guard: " + what + " runs through more than " + strconv.Itoa(maxLinks) + " symlinks or " +
+		"symlink targets of more than " + strconv.Itoa(maxResolveSteps) + " path components (the path or a " +
+		"directory the job does not read); the guard cannot verify it. Write the real path."
 }
