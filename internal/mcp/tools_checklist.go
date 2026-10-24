@@ -236,7 +236,9 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 		if f.Brief == nil {
 			return nil, ChecklistView{}, fmt.Errorf("%s has %s but no %s", top, checklist.ChecklistRel, checklist.BriefRel)
 		}
-		c, err := checklist.Parse(string(f.Checklist))
+		// Redacted before it is parsed, as checklist_set reads it: a secret put there by hand is never returned.
+		text, _ := jobs.Redact(string(f.Checklist))
+		c, err := checklist.Parse(text)
 		if err != nil {
 			return nil, ChecklistView{}, fmt.Errorf("%s: %w", checklist.ChecklistRel, err)
 		}
