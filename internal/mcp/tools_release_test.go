@@ -80,6 +80,7 @@ type judged struct {
 	status     string // how the job's row ends (default succeeded; running leaves it running)
 	hash       string // another checklist hash for the verdict
 	reattempt  bool   // the row ends at a later attempt than the verdict's
+	noVerdict  bool   // the job stores its manifest-check record but no verdict
 }
 
 func okJudge() judged {
@@ -94,16 +95,24 @@ func (f *releaseFix) judge(t *testing.T, j judged) string {
 		kind = jobs.KindJudge
 	}
 	id, token := gateJobRow(t, f.m, kind)
+	hash := f.v.SHA256
+	if j.hash != "" {
+		hash = j.hash
+	}
 	if !j.noManifest {
 		sha := f.head
 		if j.manifestAt != "" {
 			sha = j.manifestAt
 		}
 		if _, err := f.m.Store.PutManifestCheck(token, store.ManifestCheck{JobID: id, Repo: f.repo, SHA: sha, ChecklistID: f.v.ID,
-			Version: f.v.Version, ChecklistSHA256: f.v.SHA256, Script: jobs.ManifestScript, ExitCode: j.exit, Output: "R01 ok",
+			Version: f.v.Version, ChecklistSHA256: hash, Script: jobs.ManifestScript, ExitCode: j.exit, Output: "R01 ok",
 			CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if j.noVerdict {
+		f.finish(t, id, token, j.status)
+		return id
 	}
 	o := jobs.JudgeOutput{Schema: jobs.JudgeSchema, Checklist: jobs.GateChecklistRef{ID: f.v.ID, Version: f.v.Version, SHA256: f.v.SHA256},
 		SHA: f.head, Ran: []jobs.JudgeRun{}, CouldNotRun: []string{}, UnmappedBrief: nonNil(j.unmapped), ExtraScope: []string{},
@@ -113,10 +122,6 @@ func (f *releaseFix) judge(t *testing.T, j judged) string {
 			o.Requirements = append(o.Requirements, jobs.JudgeRequirement{ID: rid, Verdict: verdict, How: "read",
 				Evidence: []string{"main.go:1"}, Note: "NOTE_" + rid})
 		}
-	}
-	hash := f.v.SHA256
-	if j.hash != "" {
-		hash = j.hash
 	}
 	if _, err := f.m.Store.PutVerdict(token, store.JudgeVerdict{JobID: id, Repo: f.repo, SHA: f.head, ChecklistID: f.v.ID,
 		Version: f.v.Version, ChecklistSHA256: hash, JudgeModel: j.model, JudgeRunner: j.runner,
@@ -137,7 +142,14 @@ func (f *releaseFix) judge(t *testing.T, j judged) string {
 			t.Fatal(err)
 		}
 	}
-	switch status := j.status; status {
+	f.finish(t, id, token, j.status)
+	return id
+}
+
+// finish ends a judge job's row with status (default succeeded; running leaves it running).
+func (f *releaseFix) finish(t *testing.T, id, token, status string) {
+	t.Helper()
+	switch status {
 	case store.StatusRunning:
 	case "":
 		status = store.StatusSucceeded
@@ -147,7 +159,6 @@ func (f *releaseFix) judge(t *testing.T, j judged) string {
 			t.Fatal(err)
 		}
 	}
-	return id
 }
 
 func nonNil(l []string) []string {
@@ -336,6 +347,16 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 				red := okJudge()
 				red.exit = 1
+				f.judge(t, red)
+				f.judge(t, okJudge())
+			}},
+		{"a red manifest-check of a cancelled judge without a verdict", jobs.ReleaseManifestCheck,
+			"manifest_check — scripts/manifest-check.sh exited 1 (job gate-", func(t *testing.T, f *releaseFix) {
+				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+				red := okJudge()
+				red.exit = 1
+				red.noVerdict = true
+				red.status = store.StatusCancelled
 				f.judge(t, red)
 				f.judge(t, okJudge())
 			}},

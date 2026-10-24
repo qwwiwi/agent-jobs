@@ -119,3 +119,10 @@ func (s *Store) LatestManifestCheck(repo, sha string) (*ManifestCheck, error) {
 	return oneManifest(s.db.QueryRow(`SELECT `+manifestCols+` FROM gate_manifest_checks WHERE repo=? AND sha=?
 		ORDER BY seq DESC LIMIT 1`, repo, sha))
 }
+
+// RedManifestCheck is the latest manifest-check record of repo for sha at the checklist id, version and
+// hash whose exit code is not 0 (nil = none), whatever the job's status and whether it stored a verdict.
+func (s *Store) RedManifestCheck(repo, sha, checklistID string, version int, hash string) (*ManifestCheck, error) {
+	return oneManifest(s.db.QueryRow(`SELECT `+manifestCols+` FROM gate_manifest_checks WHERE repo=? AND sha=? AND checklist_id=?
+		AND version=? AND checklist_sha256=? AND exit_code<>0 ORDER BY seq DESC LIMIT 1`, repo, sha, checklistID, version, hash))
+}

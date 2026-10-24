@@ -198,7 +198,13 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	}
 
 	// The manifest-check record (F5) of every counted verdict's attempt, so a red run is not passed over
-	// by judging again; without a verdict, the latest record for the sha.
+	// by judging again; without a verdict, the latest record for the sha. Any red record for the sha at
+	// the approved checklist id, version and hash fails it too, so a red run whose judge was cancelled or
+	// stored no verdict is not passed over either.
+	red, err := m.Store.RedManifestCheck(main, sha, c.ID, c.Version, hash)
+	if err != nil {
+		return nil, err
+	}
 	if latest == nil {
 		mc, err := m.Store.LatestManifestCheck(main, sha)
 		if err != nil {
@@ -207,6 +213,8 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		out.ManifestCheck = mc
 		if why := manifestRecordWhy(mc, "", sha); why != "" {
 			set(ReleaseManifestCheck, false, "%s", why)
+		} else if red != nil {
+			set(ReleaseManifestCheck, false, "%s", manifestRecordWhy(red, red.JobID, sha))
 		} else {
 			set(ReleaseManifestCheck, true, "%s exit 0 (job %s)", mc.Script, mc.JobID)
 		}
@@ -223,6 +231,9 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 			if why == "" {
 				why = manifestRecordWhy(mc, v.JobID, sha)
 			}
+		}
+		if why == "" && red != nil {
+			why = manifestRecordWhy(red, red.JobID, sha)
 		}
 		if why != "" {
 			set(ReleaseManifestCheck, false, "%s", why)
