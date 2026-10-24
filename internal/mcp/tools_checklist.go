@@ -278,8 +278,9 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			"rows upserted, owner additions appended to BRIEF.md ## Additions, both files written together (both or neither), " +
 			"secrets redacted before writing and hashing. A change of the hashed content (rows incl. Basis, BRIEF.md) raises " +
 			"the version and drops the approval; approve: true records the owner's approval of the result, refused without a " +
-			"slicing check (slicing_start) of that version and hash or while one of its unmapped quotes has no owner decision " +
-			"(unmapped_decisions). Waivers need the " +
+			"slicing check (slicing_start) of that version and hash held to its input (a codex one does not count) or while one of " +
+			"its unmapped quotes has no owner decision (unmapped_decisions); an approval a later slicing check voided is restored " +
+			"only by a new approve, not by decisions alone. Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
 		m := d.Manager

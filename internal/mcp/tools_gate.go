@@ -69,7 +69,7 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 			"copy of the files at sha (no git history, no agent settings or instructions, no job briefs, reports or diffs), assembled " +
 			"by the daemon. It returns met | partial | missing | placeholder | cannot_check per live requirement with evidence in a " +
 			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
-			"judge of the coders' model family is stored but flagged (same_family; warnings says so at the start). A claude judge " +
+			"judge of a coder's model family is stored but flagged (same_family; warnings says so at the start). A claude judge " +
 			"is blind by enforcement (the guard's read allowlist, enforced_blind true); a codex judge is not confined " +
 			"(enforced_blind false). Manifest-check (F6) is not built. There is no brief: the job's input is the daemon's.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JudgeStartInput) (*sdk.CallToolResult, JobView, error) {
