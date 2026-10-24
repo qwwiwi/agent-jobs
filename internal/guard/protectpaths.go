@@ -160,19 +160,25 @@ func protectedForms(paths []string) []string {
 	return out
 }
 
-// maxInodeScan bounds the entries of protected directories looked at for hard links in one call;
-// past it a multiply linked target is refused (fail closed).
+// maxInodeScan bounds the entries looked at for hard links in one call, once for the protected
+// directories and once for the destination trees of recursive writes; past it a multiply linked
+// target, and a destination tree, is refused (fail closed). A variable for the tests.
 var maxInodeScan = 16384
 
 type inodeKey struct{ dev, ino uint64 }
 
 // inodeSet holds the (device, inode) of every protected regular file that has more than one link,
-// collected once per call and only when a write target has more than one link itself.
+// collected once per call and only when a write target has more than one link itself, or a recursive
+// write names a directory.
 type inodeSet struct {
 	forms []string
 	ids   map[inodeKey]string
 	done  bool
 	full  bool // maxInodeScan was reached: an unmatched multiply linked target is refused too
+	// trees caches the destination trees scanned in this call (by the directory's inode); treeLeft is
+	// what is left of their shared maxInodeScan budget.
+	trees    map[inodeKey]string
+	treeLeft int
 }
 
 func statKey(fi fs.FileInfo) (inodeKey, uint64, bool) {
@@ -183,31 +189,60 @@ func statKey(fi fs.FileInfo) (inodeKey, uint64, bool) {
 	return inodeKey{uint64(st.Dev), uint64(st.Ino)}, uint64(st.Nlink), true
 }
 
+// walkTree calls f with every regular file at or below root and its stat, following symlinks (as a
+// write into the tree does: `cp -r x/. dir` writes through dir/sub when sub links elsewhere); each
+// directory is walked once, by its (device, inode). It stops when f returns true, and returns false
+// when more than *budget entries would be looked at (the budget is used up in place).
+func walkTree(root string, budget *int, f func(p string, fi fs.FileInfo) bool) (complete bool) {
+	seen := map[inodeKey]bool{}
+	stack := []string{root}
+	for len(stack) > 0 {
+		p := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if *budget--; *budget < 0 {
+			return false
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if fi.Mode().IsRegular() {
+			if f(p, fi) {
+				return true
+			}
+			continue
+		}
+		if !fi.IsDir() {
+			continue
+		}
+		if k, _, ok := statKey(fi); ok {
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			stack = append(stack, filepath.Join(p, e.Name()))
+		}
+	}
+	return true
+}
+
 func (s *inodeSet) load() {
 	s.done, s.ids = true, map[inodeKey]string{}
-	seen := 0
+	budget := maxInodeScan
 	for _, q := range s.forms {
-		_ = filepath.WalkDir(q, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if seen++; seen > maxInodeScan {
-				s.full = true
-				return filepath.SkipAll
-			}
-			if !d.Type().IsRegular() {
-				return nil
-			}
-			fi, err := d.Info()
-			if err != nil {
-				return nil
-			}
+		if !walkTree(q, &budget, func(p string, fi fs.FileInfo) bool {
 			if k, n, ok := statKey(fi); ok && n > 1 {
 				s.ids[k] = p
 			}
-			return nil
-		})
-		if s.full {
+			return false
+		}) {
+			s.full = true
 			return
 		}
 	}
@@ -234,6 +269,50 @@ func (s *inodeSet) hardlink(p string) (string, bool) {
 		return p + " (a hard link the guard cannot rule out among protected files)", true
 	}
 	return "", false
+}
+
+// treeHardlink returns the protected file a recursive write into the existing directory dir may
+// reach under another name: a hard link of it anywhere below dir, symlinks followed (`chmod -R u+w d`,
+// `cp -r x/. d`, `tar -x -C d`). It looks only when some protected file has another link (or the
+// protected scan was cut off), and refuses a tree past the scan bound.
+func (s *inodeSet) treeHardlink(dir string) (string, bool) {
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return "", false
+	}
+	if !s.done {
+		s.load()
+	}
+	if len(s.ids) == 0 && !s.full {
+		return "", false // no protected file has a second name anywhere
+	}
+	dk, _, ok := statKey(fi)
+	if !ok {
+		return "", false
+	}
+	if s.trees == nil {
+		s.trees, s.treeLeft = map[inodeKey]string{}, maxInodeScan
+	}
+	if q, ok := s.trees[dk]; ok {
+		return q, q != ""
+	}
+	q := ""
+	if !walkTree(dir, &s.treeLeft, func(p string, fi fs.FileInfo) bool {
+		k, n, ok := statKey(fi)
+		if !ok || n < 2 {
+			return false
+		}
+		if pq, ok := s.ids[k]; ok {
+			q = pq + " (`" + p + "` is a hard link of it)"
+		} else if s.full {
+			q = p + " (a hard link the guard cannot rule out among protected files)"
+		}
+		return q != ""
+	}) {
+		q = dir + " (a tree larger than the guard's scan bound, which may hold a hard link of a protected file)"
+	}
+	s.trees[dk] = q
+	return q, q != ""
 }
 
 // reEnvRef is a variable reference: $NAME, ${NAME} or ${NAME<op>…} with an operator that keeps the

@@ -410,7 +410,8 @@ func (s *pathScope) linkDotDot(exp string) bool {
 }
 
 // match checks absolute candidate paths against the protected paths (s.protected already holds
-// their symlink-resolved forms).
+// their symlink-resolved forms) and, with s.inodes, their hard links: of the candidate itself, and,
+// with tree, of any file in the tree below it (treeHardlink).
 func (s *pathScope) match(cands []string, tree bool) (string, bool) {
 	for _, p := range cands {
 		if slices.ContainsFunc(s.protected, func(q string) bool { return within(p, q) }) {
@@ -424,6 +425,11 @@ func (s *pathScope) match(cands []string, tree bool) (string, bool) {
 		if tree {
 			for _, q := range s.protected {
 				if within(q, p) {
+					return q, true
+				}
+			}
+			if s.inodes != nil {
+				if q, ok := s.inodes.treeHardlink(p); ok {
 					return q, true
 				}
 			}
