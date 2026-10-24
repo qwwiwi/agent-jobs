@@ -19,7 +19,7 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// Acceptance command (Wave D autopilot): an optional shell command of the orchestrator's that a job
+// Acceptance command (Wave D): an optional shell command of the orchestrator's that a job
 // must pass. After claude exits 0 with a report and the session sweep is complete, the wrapper runs it
 // in the job's worktree, inside the job's own containment (the same scope or session; a process group
 // of its own so a timeout ends all of it, recorded in the job row so cancel, stop and the daemon's

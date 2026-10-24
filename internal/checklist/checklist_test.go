@@ -27,7 +27,7 @@ const sample = `# Checklist
 
 Free text outside the table is not hashed.
 
-| ID | Brief (verbatim) | Contract | Basis |
+| ID | Brief quote | Contract | Rationale |
 |---|---|---|---|
 | R01 | «a login page» | live | brief |
 | R02i | «sessions survive a restart» | live placeholder-ok | implied by R01 |
@@ -70,12 +70,13 @@ func TestParseErrors(t *testing.T) {
 		"dup id":       {strings.Replace(sample, "| D01 |", "| R01 |", 1), "duplicate ID R01"},
 		"contract":     {strings.Replace(sample, "| live | brief |", "| maybe | brief |", 1), "unknown word"},
 		"two":          {strings.Replace(sample, "| live | brief |", "| live dropped | brief |", 1), "more than one"},
-		"drop basis":   {strings.Replace(sample, "| deferred | owner: «later» |", "| dropped |  |", 1), "owner's quote in Basis"},
+		"drop reason":  {strings.Replace(sample, "| deferred | owner: «later» |", "| dropped |  |", 1), "owner's quote in Rationale"},
 		"cells":        {strings.Replace(sample, "| live | brief |", "| live |", 1), "4 cells"},
 		"version":      {strings.Replace(sample, "version: 2", "version: x", 1), "positive integer"},
 		"no approved":  {strings.Replace(sample, "- approved: no\n", "", 1), "header approved is missing"},
 		"brief path":   {strings.Replace(sample, "brief: brief/BRIEF.md", "brief: other.md", 1), "must be brief/BRIEF.md"},
-		"table header": {strings.Replace(sample, "| Basis |\n", "| Why |\n", 1), "table header"},
+		"table header": {strings.Replace(sample, "| Rationale |\n", "| Why |\n", 1), "table header"},
+		"old header":   {strings.Replace(sample, "| Brief quote | Contract | Rationale |", "| Brief (verbatim) | Contract | Basis |", 1), "table header"},
 		"empty quote":  {strings.Replace(sample, "| «a login page» |", "|   |", 1), "is empty"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -87,7 +88,7 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
-// The hash covers ID, verbatim, contract, placeholder-ok and Basis of every row and BRIEF.md; it is
+// The hash covers ID, verbatim, contract, placeholder-ok and Rationale of every row and BRIEF.md; it is
 // insensitive to white-space layout and to the unhashed header and free text.
 func TestHashFields(t *testing.T) {
 	c, err := Parse(sample)
@@ -106,7 +107,7 @@ func TestHashFields(t *testing.T) {
 		"verbatim":    mut(func(r *Row) { r.Verbatim += "!" }),
 		"contract":    mut(func(r *Row) { r.Contract = ContractDropped }),
 		"placeholder": mut(func(r *Row) { r.PlaceholderOK = true }),
-		"basis":       mut(func(r *Row) { r.Basis = "changed" }),
+		"rationale":   mut(func(r *Row) { r.Rationale = "changed" }),
 		"brief":       Hash(c.Rows, append(brief, '.')),
 	} {
 		if h == base {
@@ -159,10 +160,10 @@ func TestStatusManualEditVoids(t *testing.T) {
 		t.Fatalf("approved checklist not approved: %s", reason)
 	}
 	for name, edited := range map[string]string{
-		"basis":    strings.Replace(text, "| implied by R01 |", "| implied |", 1),
-		"contract": strings.Replace(text, "| live placeholder-ok |", "| live |", 1),
-		"version":  strings.Replace(text, "- version: 2", "- version: 5", 1),
-		"id":       strings.Replace(text, "- id: demo", "- id: other", 1),
+		"rationale": strings.Replace(text, "| implied by R01 |", "| implied |", 1),
+		"contract":  strings.Replace(text, "| live placeholder-ok |", "| live |", 1),
+		"version":   strings.Replace(text, "- version: 2", "- version: 5", 1),
+		"id":        strings.Replace(text, "- id: demo", "- id: other", 1),
 	} {
 		c, err := Parse(edited)
 		if err != nil {
@@ -274,7 +275,7 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
 	f := &Files{Brief: brief, Checklist: list}
-	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Basis: "brief"}}}, now, fakeRedact, nil, boundTo(brief, false))
+	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Rationale: "brief"}}}, now, fakeRedact, nil, boundTo(brief, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +304,7 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	}
 	// An addition with a G row: BRIEF and CHECKLIST change together, version up, approval dropped.
 	res, err = Apply(f, Change{
-		Rows:      []Row{{ID: "G01", Verbatim: "dark mode", Contract: "live", Basis: "addition 2026-10-25"}},
+		Rows:      []Row{{ID: "G01", Verbatim: "dark mode", Contract: "live", Rationale: "addition 2026-10-25"}},
 		Additions: []Addition{{Quote: "add dark mode SECRETVALUE"}},
 	}, now, fakeRedact, rec, boundTo(brief, true))
 	if err != nil {
@@ -428,8 +429,8 @@ func TestReadRefusesSymlink(t *testing.T) {
 // backslash-pipe or a trailing backslash survives Render → Parse.
 func TestCellEscapesBackslash(t *testing.T) {
 	brief := []byte("# Brief\n\nwords\n")
-	lit := []Row{{ID: "R01", Verbatim: `a \| b`, Contract: ContractLive, Basis: `ends with \`}}
-	pipe := []Row{{ID: "R01", Verbatim: "a | b", Contract: ContractLive, Basis: `ends with \`}}
+	lit := []Row{{ID: "R01", Verbatim: `a \| b`, Contract: ContractLive, Rationale: `ends with \`}}
+	pipe := []Row{{ID: "R01", Verbatim: "a | b", Contract: ContractLive, Rationale: `ends with \`}}
 	if Hash(lit, brief) == Hash(pipe, brief) {
 		t.Fatal(`«a \| b» and «a | b» hash the same`)
 	}

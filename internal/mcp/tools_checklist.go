@@ -117,9 +117,9 @@ type ChecklistRepoInput struct {
 type ChecklistRowInput struct {
 	ID            string `json:"id" jsonschema:"R<nn> (from the brief), R<nn>i (implied, the owner approves it), G<nn> (added later by the owner, needs an addition in the same call) or D<nn> (a constraint proven by a build, not counted)"`
 	Verbatim      string `json:"verbatim" jsonschema:"the owner's words this row stands for, verbatim"`
-	Contract      string `json:"contract" jsonschema:"live | deferred | dropped; only the owner defers or drops, with the quote in basis"`
+	Contract      string `json:"contract" jsonschema:"live | deferred | dropped; deferred and dropped are the owner's call and need the owner's words in rationale"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty" jsonschema:"a visible placeholder is an accepted result for this row"`
-	Basis         string `json:"basis,omitempty" jsonschema:"why the row exists: the owner's fork decisions, the drop or defer quote (hashed)"`
+	Rationale     string `json:"rationale,omitempty" jsonschema:"why the row exists: the owner's fork decisions, the drop or defer quote (hashed)"`
 }
 
 // ChecklistAdditionInput is one later owner addition to BRIEF.md.
@@ -138,7 +138,7 @@ type ChecklistWaiverInput struct {
 // ChecklistSetInput is checklist_set's input.
 type ChecklistSetInput struct {
 	Repo          string                   `json:"repo" jsonschema:"absolute path of the project's git work tree"`
-	Rows          []ChecklistRowInput      `json:"rows,omitempty" jsonschema:"rows to add (new id) or replace (existing id); rows are never removed: drop or defer them with the owner's quote"`
+	Rows          []ChecklistRowInput      `json:"rows,omitempty" jsonschema:"rows to add (new id) or replace (existing id); a row stays in the file for good: to retire it, set it to dropped or deferred with the owner's words"`
 	Additions     []ChecklistAdditionInput `json:"additions,omitempty" jsonschema:"later owner additions, appended to BRIEF.md under ## Additions in the same operation"`
 	Approve       bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
 	ApproveQuote  string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
@@ -213,7 +213,7 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "checklist_get",
 		Description: "The repo's brief checklist: header, rows, live requirements, the hash of the files as they are now, " +
-			"approved (false with a reason when not approved, or when a hashed field, a Basis or BRIEF.md was edited " +
+			"approved (false with a reason when not approved, or when a hashed field, a Rationale or BRIEF.md was edited " +
 			"after the approval) and the owner waivers bound to the current hash.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)
@@ -252,7 +252,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		Name: "checklist_set",
 		Description: "Change the repo's brief checklist; the only writer of version, approved and owner waivers. One call: " +
 			"rows upserted, owner additions appended to BRIEF.md ## Additions, both files written together (both or neither), " +
-			"secrets redacted before writing and hashing. A change of the hashed content (rows incl. Basis, BRIEF.md) raises " +
+			"secrets redacted before writing and hashing. A change of the hashed content (rows incl. Rationale, BRIEF.md) raises " +
 			"the version and drops the approval; approve: true records the owner's approval of the result. Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
@@ -273,7 +273,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		ch := checklist.Change{Approve: in.Approve, ExpectVersion: in.ExpectVersion}
 		for _, r := range in.Rows {
 			ch.Rows = append(ch.Rows, checklist.Row{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract,
-				PlaceholderOK: r.PlaceholderOK, Basis: r.Basis})
+				PlaceholderOK: r.PlaceholderOK, Rationale: r.Rationale})
 		}
 		for _, a := range in.Additions {
 			ch.Additions = append(ch.Additions, checklist.Addition{Quote: a.Quote, Date: a.Date})

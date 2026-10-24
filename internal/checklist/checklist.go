@@ -12,11 +12,11 @@
 //	- version: <n>
 //	- approved: <RFC 3339 time> owner sha256:<hex>   (or "approved: no")
 //
-//	| ID | Brief (verbatim) | Contract | Basis |
+//	| ID | Brief quote | Contract | Rationale |
 //	|---|---|---|---|
 //	| R01 | <owner quote> | live | <why this row exists> |
 //
-// The hash covers the normalized contract fields of every row (ID|verbatim|contract|placeholder-ok|basis)
+// The hash covers the normalized contract fields of every row (ID|verbatim|contract|placeholder-ok|rationale)
 // and the sha256 of BRIEF.md; the header (id, version, approved) and any text outside the table are not
 // hashed.
 //
@@ -53,10 +53,10 @@ const (
 )
 
 // TableHeader is the table's header row as written.
-const TableHeader = "| ID | Brief (verbatim) | Contract | Basis |"
+const TableHeader = "| ID | Brief quote | Contract | Rationale |"
 
 // LongBriefRunes is the BRIEF.md size (characters) from which a checklist of fewer than
-// MinRowsLongBrief rows draws a warning: a retelling, not a checklist (F1 rule of thumb).
+// MinRowsLongBrief rows draws a warning: so few rows for so much text likely merge requirements.
 const (
 	LongBriefRunes   = 1500
 	MinRowsLongBrief = 10
@@ -74,7 +74,7 @@ type Row struct {
 	Verbatim      string `json:"verbatim"`
 	Contract      string `json:"contract"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
-	Basis         string `json:"basis"`
+	Rationale     string `json:"rationale"`
 }
 
 // Live reports whether the row is a live requirement: an R, Ri or G row with contract live. Only
@@ -126,7 +126,7 @@ func SHA256Hex(b []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-// Hash is the checklist hash: sha256 over one line per row, «ID|verbatim|contract|placeholder-ok|basis»
+// Hash is the checklist hash: sha256 over one line per row, «ID|verbatim|contract|placeholder-ok|rationale»
 // (placeholder-ok is the flag or empty; a «\» and a «|» inside a field are escaped as «\\» and «\|», as in
 // the file),
 // then the line «BRIEF.md|<sha256 of BRIEF.md>».
@@ -137,7 +137,7 @@ func Hash(rows []Row, brief []byte) string {
 		if r.PlaceholderOK {
 			ph = PlaceholderOK
 		}
-		fmt.Fprintf(&b, "%s|%s|%s|%s|%s\n", r.ID, escapeCell(r.Verbatim), r.Contract, ph, escapeCell(r.Basis))
+		fmt.Fprintf(&b, "%s|%s|%s|%s|%s\n", r.ID, escapeCell(r.Verbatim), r.Contract, ph, escapeCell(r.Rationale))
 	}
 	fmt.Fprintf(&b, "BRIEF.md|%s\n", SHA256Hex(brief))
 	return SHA256Hex([]byte(b.String()))
@@ -164,7 +164,7 @@ func (c *Checklist) Status(brief []byte, rec *Record) (approved bool, hash, reas
 	case rec == nil:
 		why = "the approved line is not backed by an approval stored by checklist_set"
 	case rec.SHA256 != hash:
-		why = fmt.Sprintf("the hashed content (a row, a Basis or BRIEF.md) changed since version %d was approved "+
+		why = fmt.Sprintf("the hashed content (a row, a Rationale or BRIEF.md) changed since version %d was approved "+
 			"(approved sha256:%s, now sha256:%s)", rec.Version, rec.SHA256, hash)
 	case rec.Version != c.Version:
 		why = fmt.Sprintf("CHECKLIST.md says version %d, version %d was approved", c.Version, rec.Version)
@@ -289,10 +289,10 @@ func ParseContract(cell string) (contract string, placeholderOK bool, err error)
 }
 
 // NormalizeRow normalizes and validates one row: a valid ID (never an agent idea «A»), a verbatim quote,
-// a contract, and a Basis for a deferred or dropped row (the owner's quote).
+// a contract, and a Rationale for a deferred or dropped row (the owner's quote).
 func NormalizeRow(r Row) (Row, error) {
 	r.ID = strings.TrimSpace(r.ID)
-	r.Verbatim, r.Basis = NormalizeField(r.Verbatim), NormalizeField(r.Basis)
+	r.Verbatim, r.Rationale = NormalizeField(r.Verbatim), NormalizeField(r.Rationale)
 	r.Contract = strings.ToLower(strings.TrimSpace(r.Contract))
 	switch {
 	case strings.HasPrefix(r.ID, "A"):
@@ -300,13 +300,13 @@ func NormalizeRow(r Row) (Row, error) {
 	case !ValidID(r.ID):
 		return r, fmt.Errorf("row %q: the ID must be R<nn>, R<nn>i, G<nn> or D<nn>", r.ID)
 	case r.Verbatim == "":
-		return r, fmt.Errorf("row %s: Brief (verbatim) is empty", r.ID)
+		return r, fmt.Errorf("row %s: the brief quote is empty", r.ID)
 	}
 	if r.Contract != ContractLive && r.Contract != ContractDeferred && r.Contract != ContractDropped {
 		return r, fmt.Errorf("row %s: contract %q must be live, deferred or dropped", r.ID, r.Contract)
 	}
-	if r.Contract != ContractLive && r.Basis == "" {
-		return r, fmt.Errorf("row %s: a %s row needs the owner's quote in Basis", r.ID, r.Contract)
+	if r.Contract != ContractLive && r.Rationale == "" {
+		return r, fmt.Errorf("row %s: a %s row needs the owner's quote in Rationale", r.ID, r.Contract)
 	}
 	return r, nil
 }
@@ -462,14 +462,14 @@ func splitCells(line string) []string {
 func parseRow(line string) (Row, error) {
 	cells := splitCells(line)
 	if len(cells) != 4 {
-		return Row{}, fmt.Errorf("a row has 4 cells (ID, Brief, Contract, Basis), this one %d", len(cells))
+		return Row{}, fmt.Errorf("a row has 4 cells (ID, Brief, Contract, Rationale), this one %d", len(cells))
 	}
 	contract, ph, err := ParseContract(cells[2])
 	if err != nil {
 		return Row{}, err
 	}
 	return NormalizeRow(Row{ID: cells[0], Verbatim: unescapeCell(cells[1]), Contract: contract,
-		PlaceholderOK: ph, Basis: unescapeCell(cells[3])})
+		PlaceholderOK: ph, Rationale: unescapeCell(cells[3])})
 }
 
 // Render writes the checklist in the canonical form (what the tools write).
@@ -488,7 +488,7 @@ func Render(c *Checklist) string {
 		if r.PlaceholderOK {
 			contract += " " + PlaceholderOK
 		}
-		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", r.ID, escapeCell(r.Verbatim), contract, escapeCell(r.Basis))
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", r.ID, escapeCell(r.Verbatim), contract, escapeCell(r.Rationale))
 	}
 	return b.String()
 }
@@ -508,8 +508,8 @@ func InitBrief(words string) string {
 }
 
 // AppendAdditions appends adds under «## Additions» (added at the end when the brief has none); the
-// text above is never changed. Each addition is «### <date>» and the quote verbatim (a ``` fence the
-// quote leaves open is closed after it).
+// earlier text stays byte for byte. An addition is a «### <date>» heading followed by the owner's
+// quote as given; if the quote opens a ``` fence and never closes it, the fence is closed after it.
 func AppendAdditions(brief string, adds []Addition) string {
 	if len(adds) == 0 {
 		return brief
@@ -533,6 +533,6 @@ func LongBriefWarning(brief []byte, rows int) string {
 	if rows >= MinRowsLongBrief || utf8.RuneCount(brief) < LongBriefRunes {
 		return ""
 	}
-	return fmt.Sprintf("only %d rows from a brief of %d characters: fewer than %d rows from a long brief is a retelling, "+
-		"not a checklist (one row = one thing that can be true or false on its own)", rows, utf8.RuneCount(brief), MinRowsLongBrief)
+	return fmt.Sprintf("only %d rows from a brief of %d characters (expected %d or more): rows probably bundle several "+
+		"requirements; split until each row passes or fails by itself", rows, utf8.RuneCount(brief), MinRowsLongBrief)
 }

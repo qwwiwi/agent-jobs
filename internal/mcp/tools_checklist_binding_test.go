@@ -17,7 +17,7 @@ func approvedChecklist(t *testing.T, cs *sdk.ClientSession, repo, id, words stri
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "id": id, "brief": words}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
 	if !v.Approved {
 		t.Fatalf("approve %s: %+v", id, v)
