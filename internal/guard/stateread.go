@@ -729,7 +729,7 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 
 func stateBlocked(what, p string) string {
 	return "blocked by guard: " + what + " reaches `" + p + "`, agent-jobs state (the job database, other jobs' " +
-		"folders, the archive, the config); a job reads only its own folder and its work."
+		"folders, the archive, the config, the shared checklist locks); a job reads only its own folder and its work."
 }
 
 func dotDotBlocked(what string) string {
@@ -747,9 +747,30 @@ func dotDotBlocked(what string) string {
 // -C/--chdir). Paths resolve as in checkProtected; a path built at run time and a script the job
 // writes are the documented residual gap.
 func checkStateRead(scripts []*script, _ string, cfg Config) string {
-	if cfg.StateDir == "" {
-		return ""
+	for _, c := range readScopes(cfg) {
+		if reason := checkStateReadIn(scripts, c); reason != "" {
+			return reason
+		}
 	}
+	return ""
+}
+
+// readScopes are the configurations of the state-read check: cfg (its StateDir and OwnDir) when it
+// has a state dir, then one per NoRead directory, as a state dir without an own folder.
+func readScopes(cfg Config) []Config {
+	var out []Config
+	if cfg.StateDir != "" {
+		out = append(out, cfg)
+	}
+	for _, d := range cfg.NoRead {
+		c := cfg
+		c.StateDir, c.OwnDir, c.NoRead = d, "", nil
+		out = append(out, c)
+	}
+	return out
+}
+
+func checkStateReadIn(scripts []*script, cfg Config) string {
 	r := newStateReadScope(scripts, cfg)
 	if r.expired {
 		return cannot("symlink preservation is too complex to verify within the guard's time budget")
@@ -850,9 +871,15 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 // dir is refused for it too. A Glob pattern is refused when a wildcard component at or above the
 // state dir (or `**`) can match it, or when an existing match lies in the state.
 func CheckFileRead(tool, path, pattern string, cfg Config) string {
-	if cfg.StateDir == "" {
-		return ""
+	for _, c := range readScopes(cfg) {
+		if reason := checkFileReadIn(tool, path, pattern, c); reason != "" {
+			return reason
+		}
 	}
+	return ""
+}
+
+func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 	r := newStateReadScope(nil, cfg)
 	if path == "" {
 		path = "."

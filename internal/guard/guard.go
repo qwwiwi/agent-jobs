@@ -68,14 +68,19 @@ type Config struct {
 	SubagentReserve func(max int) (prev int, allowed bool, err error)
 	// Protected are paths (files or directories) a job never writes: the subagent logs and the job
 	// database that holds the counter, the agent's config.json, owner rules and project cards, the
-	// job's gitconfig and no-hooks dir, skill roots/links, and the job's session transcript directories.
-	// File tools and literal Bash targets into them are refused.
+	// job's gitconfig and no-hooks dir, skill roots/links, the job's session transcript directories, and
+	// a repository job's brief/BRIEF.md and brief/CHECKLIST.md (Wave F: the orchestrator's checklist
+	// tools are their only writers). File tools and literal Bash targets into them are refused.
 	Protected []string
 	// StateDir is the agent's state dir (jobs.db, every job's folder, archive, config): a job never
 	// reads it, except its own folder OwnDir. Empty = reads are not checked.
 	StateDir string
 	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
 	OwnDir string
+	// NoRead are directories outside StateDir a job never reads or writes, checked like StateDir without
+	// an own folder: the checklist locks every agent of the user shares (a job holding one would block
+	// the orchestrator's checklist tools).
+	NoRead []string
 	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
 	ReadOnly string
 }
@@ -420,9 +425,16 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 			}
 		}
 	}
+	// The state dir keeps the job's own folder writable; the NoRead directories (the shared checklist
+	// locks) are state dirs without an own folder.
 	var state *stateReadScope
-	if cfg.StateDir != "" {
-		state = newStateReadScope(nil, cfg)
+	var noRead []*stateReadScope
+	for _, c := range readScopes(cfg) {
+		if c.StateDir == cfg.StateDir && state == nil {
+			state = newStateReadScope(nil, c)
+			continue
+		}
+		noRead = append(noRead, newStateReadScope(nil, c))
 	}
 	for _, p := range []string{given, resolved} {
 		if inGitDir(p) || gitFile(p) || inJobGitDir(p, cfg.GitDirs) {
@@ -435,6 +447,11 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		if state != nil {
 			if q, in := state.blocked(p, "", false); in {
 				return stateWriteBlocked(tool, q)
+			}
+		}
+		for _, s := range noRead {
+			if q, in := s.blocked(p, "", false); in {
+				return stateBlocked(tool+" into `"+p+"`", q)
 			}
 		}
 		if readOnlyFile(p, cfg) {
@@ -453,7 +470,8 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 // protectedKinds names what the protected paths (cfg.Protected) are, for the refusals.
 const protectedKinds = "the subagent logs or the job database, agent-jobs configuration (config.json, the owner " +
 	"rules, the project cards), the job's own setup (its gitconfig, no-hooks dir, settings.json or mcp.json), a skill " +
-	"catalog (a skill root or a skill link), or a job session transcript directory"
+	"catalog (a skill root or a skill link), a job session transcript directory, or the brief files (brief/BRIEF.md, " +
+	"brief/CHECKLIST.md: only the orchestrator's checklist tools write them)"
 
 func protectedBlocked(p string) string {
 	return "blocked by guard: `" + p + "` is agent-jobs state: " + protectedKinds + "; a job does not write there."

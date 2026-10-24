@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -18,7 +19,9 @@ func TestTrustedLaunchMigrationPreservesPopulatedRows(t *testing.T) {
 	}
 	for _, preadded := range []int{0, 1, 2, 3} {
 		path := filepath.Join(t.TempDir(), "jobs.db")
-		migrations = all[:start+preadded]
+		// The four trusted-launch migrations from fallback_session on, minus the pre-added ones, are
+		// missing; later migrations (columns the current Insert writes) are kept.
+		migrations = append(slices.Clone(all[:start+preadded]), all[start+4:]...)
 		s, err := Open(path)
 		if err != nil {
 			t.Fatal(err)
