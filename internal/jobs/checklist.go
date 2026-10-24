@@ -36,14 +36,21 @@ func CheckCommit(repo, sha string) error {
 	return nil
 }
 
-// checklistLockFile serializes the checklist tools of this agent (every session's MCP server): one
-// checklist_set reads, computes and writes both brief files while no other runs.
-const checklistLockFile = "checklist.lock"
+// ChecklistLockFile serializes the checklist tools of every agent on a repository (every session's MCP
+// server of every agent): one checklist_set reads, computes and writes both brief files while no other
+// runs, and checklist_get reads a consistent pair. It lives in the repository's git common dir, the one
+// place all work trees and all agents share (a job never writes there: the guard protects git dirs).
+const ChecklistLockFile = "agent-jobs-checklist.lock"
 
-// LockChecklist takes <state>/checklist.lock exclusively (waiting for another holder) and returns the
-// unlock.
-func (m *Manager) LockChecklist() (func(), error) {
-	f, err := os.OpenFile(filepath.Join(m.StateDir, checklistLockFile), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+// LockChecklist takes <git-common-dir>/agent-jobs-checklist.lock of the repository repo (a work tree
+// root) exclusively, waiting for another holder, and returns the unlock. The lock does not depend on
+// m: two agents (two state dirs) on one repository wait for each other.
+func (m *Manager) LockChecklist(repo string) (func(), error) {
+	common, err := git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return nil, fmt.Errorf("checklist lock: the git common dir of %s: %w", repo, err)
+	}
+	f, err := os.OpenFile(filepath.Join(common, ChecklistLockFile), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open checklist lock: %w", err)
 	}
