@@ -3,6 +3,7 @@ package guard
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -148,4 +149,57 @@ func TestDirHoldingProtectedReadersAllowed(t *testing.T) {
 	refused(t, cfg, "cp f "+own+"/", "cp f ..", "mv f ..", "install f ..", "ln -s /tmp/x ..", "rsync -a d/ ..",
 		"tar -xf a.tar -C ..", "find .. -delete", "python3 -c 'import sys' ..", "python3 - .. <<'EOF'\nx\nEOF",
 		"patch -d .. -p1 < x.diff")
+}
+
+// Review of fix loop 1: a descriptor alias is recognised with symlinks resolved too (`p -> /proc`,
+// `d -> /dev`), and a link to /proc, /dev or / is not made in the call that would use it.
+func TestFdAliasThroughSymlinks(t *testing.T) {
+	_, _, cfg := jobFolderSetup(t)
+	mustSymlink(t, "/proc", filepath.Join(cfg.Dir, "p"))
+	mustSymlink(t, "/dev", filepath.Join(cfg.Dir, "d"))
+	refused(t, cfg, `echo PWNED > "p/$!/fd/3"`, `chmod u+w "p/$!/fd/3"`, "chmod u+w p/self/fd/9", "chmod u+w d/fd/9",
+		"printf x >> d/fd/9", "ln -s /proc p2 && chmod u+w p2/1/fd/3", "ln -s / r", "ln -s /dev d2", "ln -s /proc/self s",
+		"cp -s /proc/1 q", "ln -s ./p pp")
+	for _, p := range []string{"p/self/fd/9", "d/fd/9", filepath.Join(cfg.Dir, "p", "1", "fd", "3")} {
+		if r := CheckFileWrite("Write", p, cfg); r == "" {
+			t.Errorf("Write %s allowed", p)
+		}
+	}
+	allowed(t, cfg, "echo x > /dev/stderr", "cp out.txt /dev/stdout", "echo a | cp /dev/stdin out.txt",
+		"install -m 644 a /dev/stdout", "cp /proc/cpuinfo cpu.txt", "ln -s /etc/hostname h", "cat p/self/status")
+}
+
+// Review of fix loop 1: fd runs commands with -x/-X like find -exec, so it is no directory reader then.
+func TestFdExecIsNoReader(t *testing.T) {
+	_, _, cfg := jobFolderSetup(t)
+	own := "'" + cfg.OwnDir + "'"
+	refused(t, cfg, "fd . /tmp/e -X cp -f -t "+own, "fdfind -X cp -t "+own+" . /tmp/e", "fd -x cp {} "+own,
+		"fd --exec-batch=cp . "+own, "fd --exec cp {} ..")
+	allowed(t, cfg, "fd -e md . ..", "fdfind -H . "+own)
+}
+
+// Review of fix loop 1: past 40 links the guard refuses instead of taking the path lexically. The
+// kernel counts links from the physical cwd, so a cwd spelled through a symlink (one link the guard
+// counts and the kernel does not) left a 40-link chain unresolved and allowed.
+func TestPast40LinksRefused(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prot := filepath.Join(root, "prot")
+	for _, d := range []string{filepath.Join(root, "real"), prot} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustSymlink(t, filepath.Join(root, "real"), filepath.Join(root, "cwd"))
+	for i := 1; i < 40; i++ {
+		mustSymlink(t, "l"+strconv.Itoa(i+1), filepath.Join(root, "real", "l"+strconv.Itoa(i)))
+	}
+	mustSymlink(t, filepath.Join(prot, "settings.json"), filepath.Join(root, "real", "l40"))
+	cfg := Config{Dir: filepath.Join(root, "cwd"), Protected: []string{prot}}
+	if r := CheckFileWrite("Write", "l1", cfg); r == "" {
+		t.Error("Write l1 through 40 links from a symlinked cwd allowed")
+	}
+	refused(t, cfg, "echo x > l1")
 }

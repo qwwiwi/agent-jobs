@@ -167,8 +167,9 @@ func resolvePath(path, dir string) string {
 	return r
 }
 
-// resolveBounded is resolvePath with ok false when the resolution needs more than maxResolveSteps
-// path components (the path itself was returned cleaned, not resolved).
+// resolveBounded is resolvePath with ok false when the resolution follows more than maxLinks links or
+// more than maxResolveSteps components of link targets (the path itself was returned cleaned, not
+// resolved).
 func resolveBounded(path, dir string) (string, bool) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, path)
@@ -198,8 +199,8 @@ const maxResolveSteps = 4096
 // it resolves to, not lexically: `cfg -> jump/../hooks/pre-commit` with `jump -> .git/objects` creates
 // .git/hooks/pre-commit), and `..` steps up from the physical directory reached so far. Past a
 // component that does not exist the rest is taken lexically (Write creates the missing directories);
-// a `..` back onto an existing directory makes its symlinks count again. Past maxLinks links the
-// kernel fails the lookup (ELOOP): the path is returned cleaned. ok is false past maxResolveSteps.
+// a `..` back onto an existing directory makes its symlinks count again. ok is false past maxLinks
+// links or maxResolveSteps components of link targets (the path is then returned as given).
 func walkPath(abs string) (string, bool) {
 	vol := filepath.VolumeName(abs)
 	sep := byte(filepath.Separator)
@@ -251,7 +252,10 @@ func walkPath(abs string) (string, bool) {
 			continue
 		}
 		if links++; links > maxLinks {
-			return filepath.Clean(abs), true
+			// The kernel fails this lookup, but it counts links from the physical cwd and a tool
+			// that looks a path up component by component (mkdir -p) starts over for each lookup:
+			// the guard cannot tell where such a path leads, so it refuses (ok false).
+			return abs, false
 		}
 		cur = cur[:n]
 		if filepath.IsAbs(target) {
@@ -369,11 +373,16 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 	}
 	resolved, ok := resolveBounded(path, cfg.Dir)
 	if !ok {
-		return "blocked by guard: " + tool + " path `" + path + "` runs through symlinks whose targets take more " +
-			"than " + strconv.Itoa(maxResolveSteps) + " path components to resolve; the guard cannot verify it. Write the real path."
+		return "blocked by guard: " + tool + " path `" + path + "` runs through more than " + strconv.Itoa(maxLinks) +
+			" symlinks or symlink targets of more than " + strconv.Itoa(maxResolveSteps) + " path components; the " +
+			"guard cannot verify it. Write the real path."
 	}
-	if alias, _ := fdAlias(given); alias && len(cfg.Protected) > 0 {
-		return fdAliasBlocked(path)
+	if len(cfg.Protected) > 0 {
+		for _, p := range []string{given, resolved} {
+			if alias, _ := fdAlias(p); alias {
+				return fdAliasBlocked(path)
+			}
+		}
 	}
 	var state *stateReadScope
 	if cfg.StateDir != "" {
@@ -599,6 +608,9 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 				}
 				for _, a := range argv[1:] {
 					if alias, std := s.fdWord(a); alias && (fdMeta[name] || !std) {
+						return fdAliasBlocked(a)
+					}
+					if linkMakers[name] && s.fdRootWord(a) {
 						return fdAliasBlocked(a)
 					}
 				}

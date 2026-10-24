@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -39,8 +40,42 @@ func fdAlias(p string) (alias, std bool) {
 // on the file behind it (`chmod u+w /proc/self/fd/9`, `ln -L /dev/stdin alias`), never on a stream.
 var fdMeta = map[string]bool{
 	"chmod": true, "chown": true, "chgrp": true, "chattr": true, "setfacl": true, "ln": true, "link": true,
-	"touch": true, "truncate": true, "mv": true, "rm": true, "unlink": true, "shred": true, "install": true,
-	"cp": true, "rsync": true, "setfattr": true, "xattr": true,
+	"touch": true, "truncate": true, "mv": true, "rm": true, "unlink": true, "shred": true, "setfattr": true,
+	"xattr": true,
+}
+
+// linkMakers may create a link (`ln -s /proc p`, `cp -s`, `rsync -l`): one to /proc, /dev or an
+// ancestor of them makes a descriptor alias under a name that is not one (`p/<pid>/fd/3`) in the same
+// call, before the guard can resolve the link.
+var linkMakers = map[string]bool{"ln": true, "link": true, "cp": true, "rsync": true}
+
+// reFdRoot matches a directory a descriptor alias lies below: /, /proc, /dev, /proc/<pid>,
+// /proc/<pid>/task, /proc/<pid>/task/<tid>.
+var reFdRoot = regexp.MustCompile(`^/((proc(/[^/]+(/task(/[^/]+)?)?)?)|dev)?$`)
+
+// fdRootWord reports a word naming, from some directory of the call, a descriptor alias other than
+// a standard stream, or a directory one lies below (as written or with symlinks resolved; an
+// existing file such as /proc/cpuinfo is none).
+func (s *pathScope) fdRootWord(w string) bool {
+	if alias, std := s.fdWord(w); alias {
+		return !std
+	}
+	for _, v := range []string{w, wordValue(w)} {
+		exp, ok := s.expandHome(v)
+		if !ok {
+			continue
+		}
+		for _, c := range s.candidates(exp) {
+			c = filepath.ToSlash(filepath.Clean(c))
+			if !reFdRoot.MatchString(c) {
+				continue
+			}
+			if fi, err := os.Stat(c); err != nil || fi.IsDir() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func fdAliasBlocked(w string) string {
@@ -174,28 +209,31 @@ func stateWriteBlocked(tool, p string) string {
 }
 
 // fdWord reports a word (or its `key=value` value) that names a file descriptor alias from some
-// directory of the call, and whether every such name is a standard stream.
+// directory of the call, as written or with symlinks resolved (`p/<pid>/fd/3` with `p -> /proc`), and
+// whether it is a standard stream. A standard stream is judged as written: resolved, /dev/stderr is
+// the hook's own descriptor (/proc/<pid>/fd/2), which says nothing about the job's.
 func (s *pathScope) fdWord(w string) (alias, std bool) {
-	std = true
 	for _, v := range []string{w, wordValue(w)} {
 		exp, ok := s.expandHome(v)
 		if !ok {
 			continue
 		}
-		bases := []string{exp}
-		if !filepath.IsAbs(exp) {
-			bases = bases[:0]
-			for _, d := range s.dirs {
-				bases = append(bases, d+"/"+exp)
+		for _, d := range s.dirs {
+			b := exp
+			if !filepath.IsAbs(b) {
+				b = d + "/" + exp
+			}
+			if a, st := fdAlias(b); a && st {
+				return true, true
 			}
 		}
-		for _, b := range bases {
-			if a, st := fdAlias(b); a {
-				alias, std = true, std && st
+		for _, c := range s.candidates(exp) {
+			if a, _ := fdAlias(c); a {
+				alias = true
 			}
 		}
 	}
-	return alias, alias && std
+	return alias, false
 }
 
 // dirReaders only read the directory named by an argument, or list or measure what is in it: a
@@ -203,8 +241,18 @@ func (s *pathScope) fdWord(w string) (alias, std bool) {
 var dirReaders = map[string]bool{
 	"find": true, "du": true, "tree": true, "ls": true, "stat": true, "file": true, "realpath": true,
 	"readlink": true, "basename": true, "dirname": true, "df": true, "diff": true, "cmp": true, "md5sum": true,
-	"sha1sum": true, "sha256sum": true, "sha512sum": true, "b2sum": true, "cksum": true, "ag": true, "fd": true,
-	"fdfind": true, "exa": true, "eza": true, "lsd": true, "wc": true, "head": true, "tail": true, "more": true,
+	"sha1sum": true, "sha256sum": true, "sha512sum": true, "b2sum": true, "cksum": true, "fd": true,
+	"fdfind": true, "exa": true, "eza": true, "lsd": true, "wc": true, "head": true, "tail": true,
+}
+
+// fdExec are the options with which fd runs a command on what it finds (like find -exec).
+var fdExec = []string{"-x", "--exec", "-X", "--exec-batch"}
+
+// fdActs reports an fd/fdfind call that runs a command: an exec option, also as `--exec=…`.
+func fdActs(args []string) bool {
+	return slices.ContainsFunc(args, func(a string) bool {
+		return slices.Contains(fdExec, a) || strings.HasPrefix(a, "--exec=") || strings.HasPrefix(a, "--exec-batch=")
+	})
 }
 
 // dirReader reports a command for which the rule "the directory holding a protected path is a
@@ -214,7 +262,13 @@ var dirReaders = map[string]bool{
 // inline code (`python3 -c '…' <dir>`).
 func dirReader(name string, argv []string, c *simpleCmd) bool {
 	if dirReaders[name] {
-		return name != "find" || !findActs(argv[1:])
+		switch name {
+		case "find":
+			return !findActs(argv[1:])
+		case "fd", "fdfind":
+			return !fdActs(argv[1:])
+		}
+		return true
 	}
 	if !stdinInterpreter(name) && !shells[name] && !awks[name] {
 		return false
