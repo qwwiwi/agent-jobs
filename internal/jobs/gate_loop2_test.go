@@ -1,10 +1,13 @@
 package jobs
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -110,5 +113,139 @@ func TestJudgePromptNamesWithheldPaths(t *testing.T) {
 	}
 	if prompt, err = m2.BuildPrompt(j2, "rules", nil, MemoryNotes{}); err != nil || strings.Contains(prompt, "withheld") {
 		t.Fatalf("plain tree: %v\n%s", err, prompt)
+	}
+}
+
+// teeResult is what the wrapper's tee reads from a runner's stdout written as chunks.
+func teeResult(runner string, chunks ...string) StreamResult {
+	tee := &resultTee{w: io.Discard, runner: runner}
+	if runner == store.RunnerCodex {
+		tee.res.Runner = runner
+	}
+	for _, c := range chunks {
+		_, _ = tee.Write([]byte(c))
+	}
+	tee.end()
+	return tee.res
+}
+
+// claudeResultLine is a claude result event whose result is text.
+func claudeResultLine(t *testing.T, text string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"type": "result", "subtype": "success", "result": text})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b) + "\n"
+}
+
+// codexMessageLine is a codex agent_message item.
+func codexMessageLine(t *testing.T, text string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]any{"type": "agent_message", "text": text}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b) + "\n"
+}
+
+// A codex gate job's stdout carries exactly one terminal turn event with nothing after it: a second
+// turn.completed or an event after it came from another process writing into the pipe.
+func TestCodexGateResultEventsCounted(t *testing.T) {
+	m := newManager(t)
+	repo := briefRepo(t)
+	j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: repo, Model: "gpt-5.6-sol"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok-"+j.ID, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	report := slicingReport(t, j.Gate).Text
+	done := `{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}` + "\n"
+	start := `{"type":"thread.started","thread_id":"t"}` + "\n" + `{"type":"turn.started"}` + "\n"
+	for name, tc := range map[string]struct {
+		res  StreamResult
+		want string
+	}{
+		"two turns completed": {teeResult(store.RunnerCodex, start, codexMessageLine(t, report), done, start,
+			codexMessageLine(t, report), done), "2 terminal turn events"},
+		"event after turn.completed": {teeResult(store.RunnerCodex, start, codexMessageLine(t, report), done,
+			codexMessageLine(t, report)), "after the terminal turn event"},
+	} {
+		if !tc.res.Found {
+			t.Fatalf("%s: stream not ended: %+v", name, tc.res)
+		}
+		if msg := gateStep(m.Store, j.ID, "tok-"+j.ID, tc.res, m.ChecklistLockDir(), time.Now()); !strings.Contains(msg, tc.want) {
+			t.Errorf("%s: %q", name, msg)
+		}
+	}
+	ok := teeResult(store.RunnerCodex, start, codexMessageLine(t, "working"), `{"type":"item.completed","item":{"type":"command_execution"}}`+"\n",
+		codexMessageLine(t, report), done)
+	if msg := gateStep(m.Store, j.ID, "tok-"+j.ID, ok, m.ChecklistLockDir(), time.Now()); msg != "" {
+		t.Fatalf("one codex turn: %s", msg)
+	}
+	if r, _ := m.Store.SlicingByJob(j.ID, j.Attempt); r == nil || r.EnforcedBlind {
+		t.Fatalf("codex result: %+v", r)
+	}
+}
+
+// A codex slicing result never counts toward the approval: approve needs a result the guard held to
+// its input (enforced_blind true) for the version and hash.
+func TestCodexSlicingDoesNotCountForApproval(t *testing.T) {
+	m := newManager(t)
+	repo := briefRepo(t)
+	main := mainWorktree(repo)
+	j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: repo, Model: "gpt-5.6-sol"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok-"+j.ID, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	g := j.Gate
+	if _, err := m.Store.PutSlicing("tok-"+j.ID, store.SlicingResult{JobID: j.ID, Repo: g.Repo, ChecklistID: g.ChecklistID,
+		Version: g.Version, ChecklistSHA256: g.ChecklistSHA256, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: m.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err == nil ||
+		!strings.Contains(err.Error(), "enforced_blind") {
+		t.Fatalf("approve on a codex slicing result only: %v", err)
+	}
+	putSlicing(t, m, repo)
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err != nil {
+		t.Fatalf("approve with a claude result: %v", err)
+	}
+}
+
+// A gate job's stdout is JSON lines only: an unterminated prefix written into the pipe joins the next
+// line (the runner's own result) into one that is not JSON, so the run's result is not trusted.
+func TestGateNonJSONLineRejected(t *testing.T) {
+	m := newManager(t)
+	repo := briefRepo(t)
+	j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: repo, Model: "sonnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok-"+j.ID, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	forged := slicingReport(t, j.Gate).Text
+	res := teeResult(store.RunnerClaude, claudeResultLine(t, forged), `{"type":"x","pad":"`, claudeResultLine(t, "the real one"))
+	if res.Results != 1 || res.Text != forged {
+		t.Fatalf("setup: %d results, text %q", res.Results, res.Text)
+	}
+	if msg := gateStep(m.Store, j.ID, "tok-"+j.ID, res, m.ChecklistLockDir(), time.Now()); !strings.Contains(msg, "not JSON") {
+		t.Fatalf("claude stream with a line that is not JSON: %q", msg)
+	}
+	cx := teeResult(store.RunnerCodex, "garbage\n", codexMessageLine(t, forged), `{"type":"turn.completed"}`+"\n")
+	if msg := gateStep(m.Store, j.ID, "tok-"+j.ID, cx, m.ChecklistLockDir(), time.Now()); !strings.Contains(msg, "not JSON") {
+		t.Fatalf("codex stream with a line that is not JSON: %q", msg)
+	}
+	if msg := gateStep(m.Store, j.ID, "tok-"+j.ID, teeResult(store.RunnerClaude, "\n", claudeResultLine(t, forged)), m.ChecklistLockDir(),
+		time.Now()); msg != "" {
+		t.Fatalf("an empty line is no forgery: %q", msg)
 	}
 }

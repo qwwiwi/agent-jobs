@@ -38,8 +38,14 @@ type StreamResult struct {
 	GateFailure string
 	ReportText  string `json:"-"` // last report from trusted assistant stdout
 	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
-	// second one is a line another process wrote into the pipe).
+	// second one is a line another process wrote into the pipe), for codex its terminal turn events
+	// (turn.completed, turn.failed: codex exec runs one turn).
 	Results int `json:"-"`
+	// AfterEnd counts the codex events read after its first terminal turn event.
+	AfterEnd int `json:"-"`
+	// Invalid counts the stdout lines that are not JSON (blank lines aside) or over the line limit: an
+	// unterminated prefix written into the pipe joins the runner's next line into one of them.
+	Invalid int `json:"-"`
 
 	Found   bool
 	Subtype string
@@ -164,6 +170,9 @@ func (t *resultTee) scan(p []byte) {
 
 // end parses the line read so far (also a last line without a newline) and starts the next one.
 func (t *resultTee) end() {
+	if t.skip || len(bytes.TrimSpace(t.line)) > 0 && !json.Valid(t.line) {
+		t.res.Invalid++
+	}
 	if t.skip {
 		t.tokens.invalid = true
 		t.watch.lastResult = false
@@ -213,7 +222,7 @@ func (t *resultTee) end() {
 			}
 		}
 		if r, ok := parseResultLine(t.line); ok {
-			r.Progressed, r.ReportText, r.Results = true, t.res.ReportText, t.res.Results+1
+			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
 			t.res = r
 		}
 	}
