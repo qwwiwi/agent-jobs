@@ -19,6 +19,10 @@
 // The hash covers the normalized contract fields of every row (ID|verbatim|contract|placeholder-ok|basis)
 // and the sha256 of BRIEF.md; the header (id, version, approved) and any text outside the table are not
 // hashed.
+//
+// The hash is unkeyed: whoever edits the file can recompute it. So the approved line is informational;
+// an approval is a Record that checklist_set approve stores in the agent-jobs store, and a checklist is
+// approved only while its hash, version and id are those of the latest Record of its repository.
 package checklist
 
 import (
@@ -77,7 +81,7 @@ type Row struct {
 // live requirements count in the 100% (D rows never do).
 func (r Row) Live() bool { return r.Contract == ContractLive && !strings.HasPrefix(r.ID, "D") }
 
-// Approval is the parsed «approved:» header line.
+// Approval is the parsed «approved:» header line (informational: Status reads the stored Record).
 type Approval struct {
 	At     time.Time `json:"at"`
 	SHA256 string    `json:"sha256"`
@@ -139,21 +143,67 @@ func Hash(rows []Row, brief []byte) string {
 	return SHA256Hex([]byte(b.String()))
 }
 
-// Status is whether the checklist is approved for the BRIEF it was read with: approved only when the
-// approved line is well formed and names the current hash.
-func (c *Checklist) Status(brief []byte) (approved bool, hash, reason string) {
-	hash = Hash(c.Rows, brief)
-	switch {
-	case c.ApprovalErr != "":
-		return false, hash, "approval void: " + c.ApprovalErr
-	case c.Approval == nil:
-		return false, hash, "not approved"
-	case c.Approval.SHA256 != hash:
-		return false, hash, "approval void: the hashed content (a row, a Basis or BRIEF.md) changed since it was approved " +
-			"(approved sha256:" + c.Approval.SHA256 + ", now sha256:" + hash + ")"
-	}
-	return true, hash, ""
+// Record is an owner approval as the agent-jobs store keeps it (written only by checklist_set approve).
+type Record struct {
+	ChecklistID string
+	Version     int
+	// SHA256 is the approved checklist hash; BriefSHA256 the sha256 of BRIEF.md's text above
+	// «## Additions» (BriefPrefixSHA256) when it was approved.
+	SHA256      string
+	BriefSHA256 string
+	At          time.Time
 }
+
+// Status is whether the checklist is approved for the BRIEF it was read with: approved only when rec,
+// the latest stored approval of the repository (nil = none), names the current hash, this version and
+// this id. The approved line of the file is never trusted: one that rec does not back is void.
+func (c *Checklist) Status(brief []byte, rec *Record) (approved bool, hash, reason string) {
+	hash = Hash(c.Rows, brief)
+	var why string
+	switch {
+	case rec == nil:
+		why = "the approved line is not backed by an approval stored by checklist_set"
+	case rec.SHA256 != hash:
+		why = fmt.Sprintf("the hashed content (a row, a Basis or BRIEF.md) changed since version %d was approved "+
+			"(approved sha256:%s, now sha256:%s)", rec.Version, rec.SHA256, hash)
+	case rec.Version != c.Version:
+		why = fmt.Sprintf("CHECKLIST.md says version %d, version %d was approved", c.Version, rec.Version)
+	case rec.ChecklistID != c.ID:
+		why = fmt.Sprintf("CHECKLIST.md says id %q, %q was approved", c.ID, rec.ChecklistID)
+	default:
+		return true, hash, ""
+	}
+	if c.Approval == nil && c.ApprovalErr == "" {
+		if rec == nil {
+			return false, hash, "not approved"
+		}
+		return false, hash, "not approved: " + why
+	}
+	return false, hash, "approval void: " + why
+}
+
+// BriefPrefix is BRIEF.md's text above its «## Additions» heading (outside a ``` fence; the whole text
+// when it has none), trailing white space trimmed: the owner's first words, never edited after an
+// approval. Appending additions does not change it.
+func BriefPrefix(brief []byte) string {
+	lines := strings.SplitAfter(string(brief), "\n")
+	fence, end := false, len(brief)
+	for i, off := 0, 0; i < len(lines); off, i = off+len(lines[i]), i+1 {
+		t := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(t, "```") {
+			fence = !fence
+			continue
+		}
+		if !fence && strings.TrimRight(lines[i], "\r\n \t") == AdditionsHeading {
+			end = off
+			break
+		}
+	}
+	return strings.TrimRight(string(brief[:end]), "\r\n \t")
+}
+
+// BriefPrefixSHA256 is the hex sha256 of BriefPrefix.
+func BriefPrefixSHA256(brief []byte) string { return SHA256Hex([]byte(BriefPrefix(brief))) }
 
 // NormalizeField collapses runs of white space (line breaks included) into one space and trims it.
 func NormalizeField(s string) string { return strings.Join(strings.Fields(s), " ") }

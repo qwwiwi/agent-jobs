@@ -125,46 +125,100 @@ func TestHashFields(t *testing.T) {
 	}
 }
 
-func approvedSample(t *testing.T, brief []byte) string {
+// approvedSample is the sample with an approved line and the stored approval record it stands for.
+func approvedSample(t *testing.T, brief []byte) (string, *Record) {
 	t.Helper()
 	c, err := Parse(sample)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Approval = &Approval{At: time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC), SHA256: Hash(c.Rows, brief)}
-	return Render(c)
+	at := time.Date(2026, 10, 24, 8, 0, 0, 0, time.UTC)
+	c.Approval = &Approval{At: at, SHA256: Hash(c.Rows, brief)}
+	return Render(c), &Record{ChecklistID: c.ID, Version: c.Version, SHA256: c.Approval.SHA256,
+		BriefSHA256: BriefPrefixSHA256(brief), At: at}
 }
 
 func TestStatusManualEditVoids(t *testing.T) {
 	brief := []byte("# Brief\n\nwords\n")
-	text := approvedSample(t, brief)
+	text, rec := approvedSample(t, brief)
 	c, err := Parse(text)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, _, reason := c.Status(brief); !ok {
+	if ok, _, reason := c.Status(brief, rec); !ok {
 		t.Fatalf("approved checklist not approved: %s", reason)
 	}
 	for name, edited := range map[string]string{
 		"basis":    strings.Replace(text, "| implied by R01 |", "| implied |", 1),
 		"contract": strings.Replace(text, "| live placeholder-ok |", "| live |", 1),
-		"approved": strings.Replace(text, " owner sha256:", " sha256:", 1),
+		"version":  strings.Replace(text, "- version: 2", "- version: 5", 1),
+		"id":       strings.Replace(text, "- id: demo", "- id: other", 1),
 	} {
 		c, err := Parse(edited)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if ok, _, reason := c.Status(brief); ok || !strings.HasPrefix(reason, "approval void") {
+		if ok, _, reason := c.Status(brief, rec); ok || !strings.HasPrefix(reason, "approval void") {
 			t.Errorf("%s edit: approved=%v reason=%q", name, ok, reason)
 		}
 	}
-	if ok, _, reason := c.Status(append(brief, 'x')); ok || !strings.Contains(reason, "changed since it was approved") {
+	if ok, _, reason := c.Status(append(brief, 'x'), rec); ok || !strings.Contains(reason, "changed since version 2 was approved") {
 		t.Errorf("BRIEF edit: approved=%v reason=%q", ok, reason)
 	}
-	// The unhashed header and free text do not void it.
-	c, _ = Parse(strings.Replace(text, "- version: 2", "- version: 2\n\nA note.", 1))
-	if ok, _, reason := c.Status(brief); !ok {
-		t.Errorf("free text voided the approval: %s", reason)
+	// The unhashed header and free text do not void it; the approved line is informational: a malformed
+	// or missing one changes nothing while the stored approval matches.
+	for name, edited := range map[string]string{
+		"free text": strings.Replace(text, "- version: 2", "- version: 2\n\nA note.", 1),
+		"malformed": strings.Replace(text, " owner sha256:", " sha256:", 1),
+		"no line":   strings.Replace(text, "- approved: 2026-10-24T08:00:00Z owner sha256:"+rec.SHA256, "- approved: no", 1),
+	} {
+		c, _ := Parse(edited)
+		if ok, _, reason := c.Status(brief, rec); !ok {
+			t.Errorf("%s voided the approval: %s", name, reason)
+		}
+	}
+}
+
+// The hash is unkeyed: whoever edits CHECKLIST.md can recompute it. An approved line with the right
+// hash but no stored approval, or a stored approval of another version, approves nothing.
+func TestStatusForgedApproval(t *testing.T) {
+	brief := []byte("# Brief\n\nwords\n")
+	text, rec := approvedSample(t, brief)
+	c, err := Parse(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Approval == nil || c.Approval.SHA256 != Hash(c.Rows, brief) {
+		t.Fatal("the forged line does not name the current hash")
+	}
+	if ok, _, reason := c.Status(brief, nil); ok || !strings.HasPrefix(reason, "approval void") ||
+		!strings.Contains(reason, "not backed by an approval") {
+		t.Fatalf("forged line: approved=%v %q", ok, reason)
+	}
+	older := *rec
+	older.Version = 1
+	if ok, _, reason := c.Status(brief, &older); ok || !strings.Contains(reason, "version 1 was approved") {
+		t.Fatalf("other version: approved=%v %q", ok, reason)
+	}
+	plain, _ := Parse(sample)
+	if ok, _, reason := plain.Status(brief, nil); ok || reason != "not approved" {
+		t.Fatalf("no approval: approved=%v %q", ok, reason)
+	}
+}
+
+func TestBriefPrefix(t *testing.T) {
+	b := InitBrief("I want a login page.")
+	once := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "also dark mode"}})
+	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "and export"}})
+	if BriefPrefixSHA256([]byte(b)) != BriefPrefixSHA256([]byte(once)) || BriefPrefixSHA256([]byte(once)) != BriefPrefixSHA256([]byte(twice)) {
+		t.Fatalf("additions changed the prefix: %q / %q", BriefPrefix([]byte(b)), BriefPrefix([]byte(once)))
+	}
+	if BriefPrefixSHA256([]byte(strings.Replace(once, "login", "logout", 1))) == BriefPrefixSHA256([]byte(once)) {
+		t.Fatal("an edit above ## Additions left the prefix unchanged")
+	}
+	fenced := "# Brief\n\n```\n## Additions\n```\nwords\n"
+	if BriefPrefix([]byte(fenced)) != strings.TrimRight(fenced, "\n") {
+		t.Fatalf("a fenced heading cut the prefix: %q", BriefPrefix([]byte(fenced)))
 	}
 }
 
@@ -210,60 +264,95 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
 	f := &Files{Brief: brief, Checklist: list}
-	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Basis: "brief"}}}, now, fakeRedact)
+	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Basis: "brief"}}}, now, fakeRedact, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.List.Version != 2 || res.Approved || res.Redacted != 1 || strings.Contains(string(res.Checklist), "SECRETVALUE") {
+	if res.List.Version != 2 || res.Approved || res.Record != nil || res.Redacted != 1 || strings.Contains(string(res.Checklist), "SECRETVALUE") {
 		t.Fatalf("draft: v%d approved=%v redacted=%d\n%s", res.List.Version, res.Approved, res.Redacted, res.Checklist)
 	}
 	if res.Brief != nil {
 		t.Fatal("BRIEF rewritten without additions")
 	}
-	// Approve without a change: same version, approved over the content as written.
+	// Approve without a change: same version, approved over the content as written; the record to store
+	// names the version, the hash and the BRIEF text above ## Additions.
 	f.Checklist = res.Checklist
-	res, err = Apply(f, Change{Approve: true}, now, fakeRedact)
+	res, err = Apply(f, Change{Approve: true}, now, fakeRedact, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.List.Version != 2 || !res.Approved || res.List.Approval.SHA256 != Hash(res.List.Rows, f.Brief) {
-		t.Fatalf("approve: v%d approved=%v %s", res.List.Version, res.Approved, res.Reason)
+	rec := res.Record
+	if res.List.Version != 2 || !res.Approved || res.List.Approval.SHA256 != Hash(res.List.Rows, f.Brief) || rec == nil ||
+		rec.Version != 2 || rec.SHA256 != res.Hash || rec.ChecklistID != "demo" || rec.BriefSHA256 != BriefPrefixSHA256(f.Brief) {
+		t.Fatalf("approve: v%d approved=%v %s %+v", res.List.Version, res.Approved, res.Reason, rec)
+	}
+	// A call without a change keeps it (the stored record decides).
+	f.Checklist = res.Checklist
+	if res, err := Apply(f, Change{}, now, fakeRedact, rec); err != nil || !res.Approved || res.VersionBumped || res.Checklist != nil {
+		t.Fatalf("no change: %+v %v", res, err)
 	}
 	// An addition with a G row: BRIEF and CHECKLIST change together, version up, approval dropped.
-	f.Checklist = res.Checklist
 	res, err = Apply(f, Change{
 		Rows:      []Row{{ID: "G01", Verbatim: "dark mode", Contract: "live", Basis: "addition 2026-10-25"}},
 		Additions: []Addition{{Quote: "add dark mode SECRETVALUE"}},
-	}, now, fakeRedact)
+	}, now, fakeRedact, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Brief == nil || !strings.Contains(string(res.Brief), "### 2026-10-24\n\nadd dark mode [redacted:secret]\n") {
 		t.Fatalf("BRIEF:\n%s", res.Brief)
 	}
-	if res.List.Version != 3 || res.Approved || res.Reason != "not approved" {
+	if res.List.Version != 3 || res.Approved || !strings.HasPrefix(res.Reason, "not approved") || res.List.Approval != nil {
 		t.Fatalf("after change: v%d approved=%v %q", res.List.Version, res.Approved, res.Reason)
 	}
 	// A new G row without the owner's words is refused.
-	if _, err := Apply(f, Change{Rows: []Row{{ID: "G02", Verbatim: "x", Contract: "live"}}}, now, fakeRedact); err == nil {
+	if _, err := Apply(f, Change{Rows: []Row{{ID: "G02", Verbatim: "x", Contract: "live"}}}, now, fakeRedact, rec); err == nil {
 		t.Fatal("G row without an addition accepted")
 	}
 	// expect_version guards against a concurrent change.
-	if _, err := Apply(f, Change{ExpectVersion: 1}, now, fakeRedact); err == nil || !strings.Contains(err.Error(), "version 2") {
+	if _, err := Apply(f, Change{ExpectVersion: 1}, now, fakeRedact, rec); err == nil || !strings.Contains(err.Error(), "version 2") {
 		t.Fatalf("expect_version: %v", err)
 	}
 }
 
 func TestApplyManualEditBumpsVersion(t *testing.T) {
 	brief := []byte("# Brief\n\nwords\n")
-	text := approvedSample(t, brief)
+	text, rec := approvedSample(t, brief)
 	edited := strings.Replace(text, "| implied by R01 |", "| implied |", 1)
-	res, err := Apply(&Files{Brief: brief, Checklist: []byte(edited)}, Change{}, time.Now(), noRedact)
+	res, err := Apply(&Files{Brief: brief, Checklist: []byte(edited)}, Change{}, time.Now(), noRedact, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(res.PreviousVoid, "approval void") || !res.VersionBumped || res.List.Version != 3 || res.Approved {
 		t.Fatalf("manual edit: %+v", res)
+	}
+	// A forged approved line (right hash, nothing stored) is void too: dropped, version up.
+	res, err = Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(res.PreviousVoid, "approval void") || !res.VersionBumped || res.Approved || res.List.Approval != nil {
+		t.Fatalf("forged line: %+v", res)
+	}
+}
+
+// The BRIEF text above ## Additions is never edited after an approval: checklist_set refuses until it
+// is restored; additions below it are fine.
+func TestApplyRefusesEditedBriefPrefix(t *testing.T) {
+	brief := []byte(InitBrief("I want a login page."))
+	text, rec := approvedSample(t, brief)
+	edited := []byte(strings.Replace(string(brief), "login", "logout", 1))
+	_, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, rec)
+	if err == nil || !strings.Contains(err.Error(), "above ## Additions") {
+		t.Fatalf("edited BRIEF accepted: %v", err)
+	}
+	res, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec)
+	if err != nil || res.Brief == nil {
+		t.Fatalf("addition refused: %v", err)
+	}
+	// Without a stored approval there is nothing to compare against.
+	if _, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil); err != nil {
+		t.Fatalf("unapproved: %v", err)
 	}
 }
 

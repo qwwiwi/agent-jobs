@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -21,18 +22,22 @@ type ChecklistView struct {
 	ChecklistPath string `json:"checklist_path"`
 	ID            string `json:"id"`
 	Version       int    `json:"version"`
-	// Approved: the approved line is well formed and names the current hash; Reason says why not.
-	Approved       bool   `json:"approved"`
-	ApprovedAt     string `json:"approved_at,omitempty"`
-	ApprovedSHA256 string `json:"approved_sha256,omitempty"`
-	Reason         string `json:"reason,omitempty"`
+	// Approved: the repository's latest approval stored by checklist_set approve names the current hash,
+	// version and id (the approved line in the file is informational); Reason says why not. ApprovedAt,
+	// ApprovedVersion and ApprovedSHA256 are that stored approval, whether it still holds or not.
+	Approved        bool   `json:"approved"`
+	ApprovedAt      string `json:"approved_at,omitempty"`
+	ApprovedVersion int    `json:"approved_version,omitempty"`
+	ApprovedSHA256  string `json:"approved_sha256,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 	// SHA256 is the hash of the files as they are now; BriefSHA256 the sha256 of BRIEF.md in it.
 	SHA256      string          `json:"sha256"`
 	BriefSHA256 string          `json:"brief_sha256"`
 	Rows        []checklist.Row `json:"rows"`
 	// Live are the live requirements (R, Ri, G with contract live): only they count in the 100%.
 	Live []string `json:"live"`
-	// Waivers are the owner waivers bound to the current hash (any sha).
+	// Waivers are the owner waivers bound to the approved hash and version (any sha); none while the
+	// checklist is not approved.
 	Waivers []store.Waiver `json:"waivers"`
 	// Set by checklist_init / checklist_set only.
 	Written       bool     `json:"written,omitempty"`
@@ -44,8 +49,23 @@ type ChecklistView struct {
 	Warnings      []string `json:"warnings,omitempty"`
 }
 
+// latestApproval is the repository's latest stored approval, as stored and as a checklist.Record (both
+// nil when there is none).
+func latestApproval(st *store.Store, main string) (*store.ChecklistApproval, *checklist.Record, error) {
+	a, err := st.LatestApproval(main)
+	if err != nil || a == nil {
+		return nil, nil, err
+	}
+	return a, &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256,
+		BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}, nil
+}
+
 func checklistView(st *store.Store, top, main string, c *checklist.Checklist, brief []byte) (ChecklistView, error) {
-	approved, hash, reason := c.Status(brief)
+	last, rec, err := latestApproval(st, main)
+	if err != nil {
+		return ChecklistView{}, err
+	}
+	approved, hash, reason := c.Status(brief, rec)
 	v := ChecklistView{Repo: top, BriefPath: checklist.BriefPath(top), ChecklistPath: checklist.ChecklistPath(top),
 		ID: c.ID, Version: c.Version, Approved: approved, Reason: reason, SHA256: hash,
 		BriefSHA256: checklist.SHA256Hex(brief), Rows: c.Rows, Live: c.LiveIDs()}
@@ -55,17 +75,19 @@ func checklistView(st *store.Store, top, main string, c *checklist.Checklist, br
 	if v.Live == nil {
 		v.Live = []string{}
 	}
-	if c.Approval != nil {
-		v.ApprovedAt, v.ApprovedSHA256 = c.Approval.At.UTC().Format(time.RFC3339), c.Approval.SHA256
+	if last != nil {
+		v.ApprovedAt, v.ApprovedVersion, v.ApprovedSHA256 = last.ApprovedAt.UTC().Format(time.RFC3339), last.Version, last.ChecklistSHA256
 	}
-	w, err := st.Waivers(main, hash)
-	if err != nil {
-		return ChecklistView{}, err
+	v.Waivers = []store.Waiver{}
+	if approved {
+		w, err := st.Waivers(main, last.ChecklistSHA256, last.Version)
+		if err != nil {
+			return ChecklistView{}, err
+		}
+		if w != nil {
+			v.Waivers = w
+		}
 	}
-	if w == nil {
-		w = []store.Waiver{}
-	}
-	v.Waivers = w
 	return v, nil
 }
 
@@ -108,9 +130,10 @@ type ChecklistSetInput struct {
 	Repo          string                   `json:"repo" jsonschema:"absolute path of the project's git work tree"`
 	Rows          []ChecklistRowInput      `json:"rows,omitempty" jsonschema:"rows to add (new id) or replace (existing id); rows are never removed: drop or defer them with the owner's quote"`
 	Additions     []ChecklistAdditionInput `json:"additions,omitempty" jsonschema:"later owner additions, appended to BRIEF.md under ## Additions in the same operation"`
-	Approve       bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: writes approved: <time> owner sha256:<hash>"`
+	Approve       bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
+	ApproveQuote  string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
 	ExpectVersion int                      `json:"expect_version,omitempty" jsonschema:"refuse the call unless the checklist is at this version"`
-	Waivers       []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and the sha; the checklist must be approved after this call"`
+	Waivers       []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the sha; the checklist must be approved after this call"`
 }
 
 func addChecklistInit(s *sdk.Server, d Deps) {
@@ -145,11 +168,18 @@ func addChecklistInit(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
-		if err := checklist.WriteBoth(top, brief, list, nil); err != nil {
-			return nil, ChecklistView{}, err
-		}
 		c, err := checklist.Parse(string(list))
 		if err != nil {
+			return nil, ChecklistView{}, err
+		}
+		// A checklist id once approved in this repository is bound to its BRIEF: a new brief takes a new id.
+		if last, err := d.Manager.Store.LatestApproval(main); err != nil {
+			return nil, ChecklistView{}, err
+		} else if last != nil && last.ChecklistID == c.ID {
+			return nil, ChecklistView{}, fmt.Errorf("checklist %q was approved in this repository before (version %d): "+
+				"a new brief takes a new id", c.ID, last.Version)
+		}
+		if err := checklist.WriteBoth(top, brief, list, nil); err != nil {
 			return nil, ChecklistView{}, err
 		}
 		v, err := checklistView(d.Manager.Store, top, main, c, brief)
@@ -222,11 +252,24 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		for _, a := range in.Additions {
 			ch.Additions = append(ch.Additions, checklist.Addition{Quote: a.Quote, Date: a.Date})
 		}
-		now := m.Now()
-		res, err := checklist.Apply(f, ch, now, jobs.Redact)
+		var quote string
+		quoteRedacted := 0
+		if in.Approve {
+			quote, quoteRedacted = jobs.Redact(in.ApproveQuote) // raw, before any trimming
+			if quote = strings.TrimSpace(quote); quote == "" {
+				return nil, ChecklistView{}, errors.New("approve needs approve_quote: the owner's words approving, verbatim")
+			}
+		}
+		_, last, err := latestApproval(m.Store, main)
 		if err != nil {
 			return nil, ChecklistView{}, err
 		}
+		now := m.Now()
+		res, err := checklist.Apply(f, ch, now, jobs.Redact, last)
+		if err != nil {
+			return nil, ChecklistView{}, err
+		}
+		res.Redacted += quoteRedacted
 		// Waivers are checked against the result before anything is written.
 		var waivers []store.Waiver
 		for i, w := range in.Waivers {
@@ -246,11 +289,19 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			}
 			res.Redacted += n
 			waivers = append(waivers, store.Waiver{Repo: main, ChecklistID: res.List.ID, ChecklistSHA256: res.Hash,
-				SHA: strings.TrimSpace(w.SHA), Requirement: row.ID, Quote: quote, CreatedAt: now})
+				ChecklistVersion: res.List.Version, SHA: strings.TrimSpace(w.SHA), Requirement: row.ID, Quote: quote, CreatedAt: now})
 		}
 		if res.Brief != nil || res.Checklist != nil {
 			if err := checklist.WriteBoth(top, res.Brief, res.Checklist, f.Brief); err != nil {
 				return nil, ChecklistView{}, err
+			}
+		}
+		// The approval is stored after the files are written: a failure in between leaves the new content
+		// without a stored approval, so not approved (fail closed).
+		if r := res.Record; r != nil {
+			if err := m.Store.PutApproval(store.ChecklistApproval{Repo: main, ChecklistID: r.ChecklistID, Version: r.Version,
+				ChecklistSHA256: r.SHA256, BriefSHA256: r.BriefSHA256, Quote: quote, ApprovedAt: r.At}); err != nil {
+				return nil, ChecklistView{}, fmt.Errorf("files written; the approval was not stored, so the checklist is not approved: %w", err)
 			}
 		}
 		added := 0

@@ -50,7 +50,7 @@ type Change struct {
 	Rows []Row
 	// Additions are appended to BRIEF.md under «## Additions» in the same operation.
 	Additions []Addition
-	// Approve records the owner's approval of the resulting content.
+	// Approve approves the resulting content: Result.Record is then the approval for the caller to store.
 	Approve bool
 	// ExpectVersion, when > 0, refuses the call unless the file is at that version.
 	ExpectVersion int
@@ -63,8 +63,12 @@ type Result struct {
 	// BriefAfter is BRIEF.md as it will be after the call (written or not).
 	BriefAfter []byte
 	Hash       string
-	Approved   bool
-	Reason     string
+	// Approved and Reason: Status of the result against Record when the call approves, else against the
+	// stored approval Apply was given.
+	Approved bool
+	Reason   string
+	// Record is the approval to store (Approve only): the result's id, version, hash and BRIEF prefix hash.
+	Record *Record
 	// VersionBumped: the hashed content changed (or a void approval was dropped).
 	VersionBumped bool
 	// PreviousVoid is why the approval on disk was void before the call ("" = it was valid or absent).
@@ -78,9 +82,12 @@ var dateRe = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
 // Apply computes checklist_set's new BRIEF.md and CHECKLIST.md from the files on disk: rows upserted,
 // additions appended, everything redacted before the hash is taken (every raw input and the files as
 // read first, before any normalization, then the results again); the version goes up when the
-// hashed content changes (or a void approval is dropped); an approval is kept only while the hash it
-// names stays the hash, and Approve sets a new one over the result.
-func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error) {
+// hashed content changes (or a void approval is dropped); last is the latest stored approval of the
+// repository (nil = none): the approved line is kept only while last backs it, and Approve sets a new
+// one over the result. After an approval the BRIEF text above «## Additions» is never edited: a call on
+// a BRIEF.md whose prefix differs from last's is refused (for the checklist id last approved; a new
+// checklist_init needs a new id).
+func Apply(f *Files, ch Change, now time.Time, redact Redactor, last *Record) (*Result, error) {
 	if f.Checklist == nil || f.Brief == nil {
 		return nil, ErrNoChecklist
 	}
@@ -95,11 +102,14 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 	if ch.ExpectVersion > 0 && ch.ExpectVersion != cur.Version {
 		return nil, fmt.Errorf("expect_version %d, the checklist is at version %d (changed meanwhile; read it again)", ch.ExpectVersion, cur.Version)
 	}
-	_, oldHash, reason := cur.Status(f.Brief)
-	if cur.Approval != nil || cur.ApprovalErr != "" {
-		if strings.HasPrefix(reason, "approval void") {
-			res.PreviousVoid = reason
-		}
+	if last != nil && last.ChecklistID == cur.ID && BriefPrefixSHA256(f.Brief) != last.BriefSHA256 {
+		return nil, fmt.Errorf("%s: the text above %s changed since version %d was approved (%s); it is the owner's "+
+			"words and is never edited: restore it as approved (later owner words go in additions)",
+			BriefRel, AdditionsHeading, last.Version, last.At.UTC().Format(time.RFC3339))
+	}
+	prevApproved, oldHash, reason := cur.Status(f.Brief, last)
+	if strings.HasPrefix(reason, "approval void") {
+		res.PreviousVoid = reason
 	}
 	// BRIEF: additions appended; the whole file redacted (a secret must never reach it).
 	for i, a := range ch.Additions {
@@ -157,16 +167,25 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 		res.Redacted += k
 	}
 	res.Hash = Hash(next.Rows, res.BriefAfter)
-	if res.Hash != oldHash || res.PreviousVoid != "" {
+	rec := last
+	switch {
+	case res.Hash != oldHash || res.PreviousVoid != "":
 		next.Version++
 		next.Approval = nil
 		res.VersionBumped = true
+	case prevApproved:
+		// The informational line follows the stored approval.
+		next.Approval = &Approval{At: last.At.UTC(), SHA256: last.SHA256}
 	}
 	if ch.Approve {
 		if len(next.Rows) == 0 {
 			return nil, errors.New("approve: the checklist has no rows")
 		}
-		next.Approval = &Approval{At: now.UTC().Truncate(time.Second), SHA256: res.Hash}
+		at := now.UTC().Truncate(time.Second)
+		next.Approval = &Approval{At: at, SHA256: res.Hash}
+		res.Record = &Record{ChecklistID: next.ID, Version: next.Version, SHA256: res.Hash,
+			BriefSHA256: BriefPrefixSHA256(res.BriefAfter), At: at}
+		rec = res.Record
 	}
 	list, k := redact(Render(next))
 	res.Redacted += k
@@ -177,7 +196,7 @@ func Apply(f *Files, ch Change, now time.Time, redact Redactor) (*Result, error)
 	if res.List, err = Parse(list); err != nil {
 		return nil, fmt.Errorf("internal: the rendered checklist does not parse: %w", err)
 	}
-	res.Approved, res.Hash, res.Reason = res.List.Status(res.BriefAfter)
+	res.Approved, res.Hash, res.Reason = res.List.Status(res.BriefAfter, rec)
 	if w := LongBriefWarning(res.BriefAfter, len(res.List.Rows)); w != "" {
 		res.Warnings = append(res.Warnings, w)
 	}

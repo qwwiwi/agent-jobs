@@ -43,7 +43,7 @@ func TestApplyRedactsRawInputWithRealRedactor(t *testing.T) {
 					{ID: "G01", Verbatim: "dark mode", Contract: "deferred", Basis: frag},
 				},
 				Additions: []checklist.Addition{{Quote: frag}},
-			}, now, jobs.Redact)
+			}, now, jobs.Redact, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -74,7 +74,7 @@ func TestApplyRedactsBeforeErrors(t *testing.T) {
 		{ID: "R01 " + tok, Verbatim: "x", Contract: "live"},
 	} {
 		_, err := checklist.Apply(&checklist.Files{Brief: brief, Checklist: list}, checklist.Change{Rows: []checklist.Row{r}},
-			time.Now(), jobs.Redact)
+			time.Now(), jobs.Redact, nil)
 		if err == nil || strings.Contains(err.Error(), tok) {
 			t.Fatalf("row %+v: err %v", r, err)
 		}
