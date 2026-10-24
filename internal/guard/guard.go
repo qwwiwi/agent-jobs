@@ -166,6 +166,12 @@ func Decide(r io.Reader, cfg Config) (string, error) {
 	if in.ToolName != "Bash" {
 		return "", nil
 	}
+	if len(cfg.ReadAllow) > 0 && backgroundBash(in.RawInput) {
+		// claude prints another result event when a background task ends: a gate job's result must be the
+		// only result event of its run (a second one is taken for a line another process wrote).
+		return "blocked by guard: a gate job runs Bash in the foreground only (run_in_background is refused): " +
+			"run the command without it.", nil
+	}
 	return Check(in.ToolInput.Command, cfg), nil
 }
 
@@ -2836,4 +2842,16 @@ func checkForeignIdentity(scripts []*script, _ string, cfg Config) string {
 		}
 		return ""
 	})
+}
+
+// backgroundBash reports a Bash input whose run_in_background is set to anything but false or null.
+func backgroundBash(raw json.RawMessage) bool {
+	var in struct {
+		RunInBackground json.RawMessage `json:"run_in_background"`
+	}
+	if json.Unmarshal(raw, &in) != nil {
+		return true // an input the guard cannot read is refused
+	}
+	v := strings.TrimSpace(string(in.RunInBackground))
+	return v != "" && v != "false" && v != "null"
 }
