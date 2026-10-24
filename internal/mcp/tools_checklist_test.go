@@ -218,3 +218,17 @@ func TestChecklistForgedApprovalRefused(t *testing.T) {
 		t.Fatalf("second checklist: %+v", v)
 	}
 }
+
+// checklist_init refuses owner words with a literal «## Additions» line and writes nothing.
+func TestChecklistInitRefusesAdditionsHeading(t *testing.T) {
+	m := newManager(t)
+	repo, _ := gitRepo(t)
+	cs := connect(t, mustServer(t, m))
+	msg := callErr(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "Format:\n```\n## Additions\n```\nI want CSV export."})
+	if !strings.Contains(msg, "quote it differently") {
+		t.Fatalf("init: %q", msg)
+	}
+	if _, err := os.Stat(checklist.BriefPath(repo)); !os.IsNotExist(err) {
+		t.Fatalf("BRIEF.md written: %v", err)
+	}
+}

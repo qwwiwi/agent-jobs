@@ -533,3 +533,48 @@ func TestApplyRefusesRedactedPrefix(t *testing.T) {
 		t.Fatalf("redacted prefix: %v", err)
 	}
 }
+
+// A closed ``` example holding a «## Additions» line, then an unclosed fence: the example heading is
+// not the Additions heading, the prefix is the whole owner text, and a later requirement edit is
+// refused (an unclosed fence at the end must not switch off every fence before it).
+func TestBriefPrefixClosedExampleThenUnclosedFence(t *testing.T) {
+	words := "Format:\n\n```\n## Additions\n```\n\nI want CSV export.\n\n```\nunclosed code"
+	brief := []byte(InitBrief(words))
+	if got, want := BriefPrefix(brief), strings.TrimRight(string(brief), "\n"); got != want {
+		t.Fatalf("prefix stops at the example heading:\n%q\nwant\n%q", got, want)
+	}
+	once := AppendAdditions(string(brief), []Addition{{Date: "2026-10-24", Quote: "also dark mode"}})
+	if BriefPrefix([]byte(once)) != BriefPrefix(brief) || strings.Count(once, AdditionsHeading+"\n") != 2 {
+		t.Fatalf("addition:\n%s", once)
+	}
+	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "```\nx\n```"}})
+	if BriefPrefix([]byte(twice)) != BriefPrefix(brief) || strings.Count(twice, AdditionsHeading+"\n") != 2 {
+		t.Fatalf("second addition:\n%s", twice)
+	}
+	text, rec := approvedSample(t, brief)
+	edited := []byte(strings.Replace(string(brief), "CSV", "PDF", 1))
+	_, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{Rows: []Row{{ID: "R09", Verbatim: "PDF export", Contract: ContractLive}}},
+		time.Now(), noRedact, rec, boundTo(brief, true))
+	if err == nil || !strings.Contains(err.Error(), "never edited") {
+		t.Fatalf("a requirement edit below the example heading was accepted: %v", err)
+	}
+}
+
+// checklist_init refuses owner words with a literal «## Additions» line, inside a fence or not: it
+// would be ambiguous with the heading additions go under.
+func TestInitRefusesAdditionsHeading(t *testing.T) {
+	for _, words := range []string{
+		"I want a login page.\n## Additions\nmore",
+		"Format:\n```\n## Additions\n```\nI want CSV export.",
+		"x\n  ## Additions  \r\ny",
+	} {
+		if _, _, _, err := Init("demo", words, noRedact); err == nil || !strings.Contains(err.Error(), AdditionsHeading) {
+			t.Fatalf("%q: err %v, want a refusal naming %s", words, err, AdditionsHeading)
+		}
+	}
+	for _, words := range []string{"## Additions to the plan", "### Additions", "see ## Additions below"} {
+		if _, _, _, err := Init("demo", words, noRedact); err != nil {
+			t.Fatalf("%q refused: %v", words, err)
+		}
+	}
+}

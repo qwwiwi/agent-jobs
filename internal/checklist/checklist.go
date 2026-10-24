@@ -208,24 +208,45 @@ func fenceOpen(text string) bool {
 }
 
 // additionsAt is the byte offset of BRIEF.md's «## Additions» heading line, -1 when it has none: the
-// first such line outside a ``` fence. When a fence is still open at the end (an unclosed fence in the
-// owner's words), fences are ignored and the first such line counts: otherwise the heading appended
-// after an unclosed fence would never be found. AppendAdditions closes a fence a quote leaves open, so
-// whether a fence is open at the end is decided by the owner's first words alone and stays the same
-// as additions are appended.
+// first such line outside a ``` fence. Only an unclosed fence in the owner's words (an odd number of
+// fence lines; AppendAdditions closes a fence a quote leaves open, so the parity is the owner's alone
+// and stays the same as additions are appended) is not a fence for the heading AppendAdditions wrote
+// after it: with an odd number, the heading is the first such line inside an open fence that is
+// followed by a «### <date>» addition, and a line outside a fence (before the unclosed one, so in the
+// owner's words) does not count. Headings inside closed fences never count. checklist_init refuses
+// owner words with such a line, so for a brief it created the first such line is the heading.
 func additionsAt(text string) int {
-	fences := !fenceOpen(text)
+	odd := fenceOpen(text)
 	fence := false
-	for i, off, lines := 0, 0, strings.SplitAfter(text, "\n"); i < len(lines); off, i = off+len(lines[i]), i+1 {
-		if fences && isFence(lines[i]) {
+	lines := strings.SplitAfter(text, "\n")
+	for i, off := 0, 0; i < len(lines); off, i = off+len(lines[i]), i+1 {
+		if isFence(lines[i]) {
 			fence = !fence
 			continue
 		}
-		if !fence && strings.TrimRight(lines[i], "\r\n \t") == AdditionsHeading {
+		if !isAdditionsHeading(lines[i]) {
+			continue
+		}
+		if !odd && !fence || odd && fence && additionFollows(lines[i+1:]) {
 			return off
 		}
 	}
 	return -1
+}
+
+// isAdditionsHeading reports a «## Additions» heading line as AppendAdditions writes it.
+func isAdditionsHeading(line string) bool {
+	return strings.TrimRight(line, "\r\n \t") == AdditionsHeading
+}
+
+// additionFollows reports whether the first non-blank line of lines is a «### » addition heading.
+func additionFollows(lines []string) bool {
+	for _, l := range lines {
+		if t := strings.TrimSpace(l); t != "" {
+			return strings.HasPrefix(t, "### ")
+		}
+	}
+	return false
 }
 
 // BriefPrefixSHA256 is the hex sha256 of BriefPrefix.

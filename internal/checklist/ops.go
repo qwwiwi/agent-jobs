@@ -27,6 +27,14 @@ func Init(id, words string, redact Redactor) (brief, list []byte, redacted int, 
 	if strings.TrimSpace(words) == "" {
 		return nil, nil, 0, errors.New("brief is empty: give the owner's words verbatim")
 	}
+	// A «## Additions» line in the owner's words (in a fence or not) would be ambiguous with the heading
+	// additions go under, and the text above it is all that stays bound.
+	for _, l := range strings.Split(words, "\n") {
+		if strings.TrimSpace(l) == AdditionsHeading {
+			return nil, nil, 0, fmt.Errorf("brief has a line %q: it is the heading later additions go under; quote "+
+				"it differently (for example indent it in a quote or write «Additions:»)", AdditionsHeading)
+		}
+	}
 	b, n := redact(InitBrief(words))
 	c := &Checklist{ID: id, Brief: BriefRel, Version: 1}
 	l, k := redact(Render(c))
