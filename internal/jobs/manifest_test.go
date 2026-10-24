@@ -210,3 +210,49 @@ func TestJudgeToReleaseCheckEndToEnd(t *testing.T) {
 		t.Fatalf("after the edit: %+v %v", r, err)
 	}
 }
+
+// The script runs without the guard as the agent user, so the wrapper reads the prompt before it runs
+// and fingerprints the rest of the judge's input: a script that edits prompt.md does not reach the
+// judge's prompt, one that edits the judge's copy of the code or its settings fails the job before the
+// judge starts. (The script's cwd is <jobdir>/manifest-check/work.)
+func TestManifestCheckCannotTamperWithTheJudge(t *testing.T) {
+	up := "../" + "../"
+	for name, tc := range map[string]struct {
+		edit   string
+		failed bool
+	}{
+		"prompt":   {"printf 'INJECTED_MARKER\\n' >> " + up + "prompt.md", false},
+		"code":     {"printf 'package main // TAMPERED\\n' > " + up + "work/main.go", true},
+		"settings": {"printf '{}' > " + up + "settings.json", true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := acceptanceManager(t, "")
+			repo, _ := gateRepo(t)
+			script := "#!/bin/sh\n" + tc.edit + "\necho done\n"
+			if err := os.WriteFile(filepath.Join(repo, "scripts", "manifest-check.sh"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, repo, "commit", "-qam", "tampering manifest-check")
+			sha := gitT(t, repo, "rev-parse", "HEAD")
+			approveBrief(t, m, repo)
+			j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID)
+			if tc.failed {
+				if j.Status != store.StatusFailed || !strings.Contains(j.Error, "changed while") {
+					t.Fatalf("status %s: %q", j.Status, j.Error)
+				}
+				noRunner(t, m, j.ID)
+				if mc, _ := m.Store.ManifestCheckByJob(j.ID, j.Attempt); mc != nil {
+					t.Fatalf("recorded: %+v", mc)
+				}
+				return
+			}
+			if j.Status != store.StatusSucceeded {
+				t.Fatalf("status %s: %q", j.Status, j.Error)
+			}
+			stdin, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stdin.txt"))
+			if strings.Contains(string(stdin), "INJECTED_MARKER") || !strings.Contains(string(stdin), "## Manifest-check") {
+				t.Fatalf("judge prompt:\n%s", stdin)
+			}
+		})
+	}
+}

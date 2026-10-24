@@ -2,8 +2,12 @@ package jobs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -11,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -79,7 +84,8 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 		return fail("%v", err)
 	}
 	cleanup := func() error {
-		if _, err := git(g.Repo, "worktree", "remove", "--force", checkout); err != nil {
+		// Twice: a worktree the script locked is removed too.
+		if _, err := git(g.Repo, "worktree", "remove", "--force", "--force", checkout); err != nil {
 			fmt.Fprintln(log, "run-wrapper: manifest-check: remove worktree:", err)
 		}
 		return removeTree(dir)
@@ -105,6 +111,31 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 	cmdline := "./" + ManifestScript
 	if fi.Mode().Perm()&0o111 == 0 {
 		cmdline = "/bin/sh ./" + ManifestScript
+	}
+	// The script checks the approved checklist, the one the judge is given, not what the commit holds.
+	if err := writeApprovedBrief(checkout, g); err != nil {
+		return failClean("write the approved brief files into the checkout: %v", err)
+	}
+	// The runner's prompt files are read now, before the script runs, and the rest of what the runner
+	// reads from the job dir is fingerprinted: the script runs as the agent user without the guard, so
+	// it could otherwise change the judge's input before the judge starts.
+	files := []*string{&opts.Prompt}
+	if opts.FallbackPrompt != "" {
+		files = append(files, &opts.FallbackPrompt)
+	}
+	prompts := make([][]byte, len(files))
+	for i, f := range files {
+		name := *f
+		if name == "" {
+			name = opts.prompt()
+		}
+		if prompts[i], err = os.ReadFile(filepath.Join(abs, name)); err != nil {
+			return failClean("read %s: %v", name, err)
+		}
+	}
+	before, err := judgeInputsDigest(abs)
+	if err != nil {
+		return failClean("fingerprint the judge's input: %v", err)
 	}
 	// From here on a stop signal must not kill the wrapper before the script's group is gone.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
@@ -145,6 +176,14 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 		// The judge must not find the checkout (brief files, agent context, build output) in its job dir.
 		return fail("the checkout could not be removed before the judge starts: %v", err)
 	}
+	if after, err := judgeInputsDigest(abs); err != nil || after != before {
+		return fail("the judge's input in the job dir changed while %s ran (or could not be read: %v): the judge is not started", ManifestScript, err)
+	}
+	if ctx.Err() != nil {
+		// A stop signal after the script ended: the daemon is ending the job, the runner must not start.
+		fmt.Fprintln(log, "run-wrapper: stopped by a signal after manifest-check")
+		return "", 128 + int(syscall.SIGTERM)
+	}
 	rec := store.ManifestCheck{JobID: id, Repo: g.Repo, SHA: g.SHA, ChecklistID: g.ChecklistID, Version: g.Version,
 		ChecklistSHA256: g.ChecklistSHA256, Script: ManifestScript, ExitCode: exit, DurationSec: int(dur.Round(time.Second).Seconds()),
 		Output: text, OutputCut: cut, CreatedAt: time.Now()}
@@ -152,26 +191,96 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 		return fail("record: %v", err)
 	}
 	section := ManifestPromptSection(rec)
-	files := []*string{&opts.Prompt}
-	if opts.FallbackPrompt != "" {
-		files = append(files, &opts.FallbackPrompt)
-	}
-	for _, f := range files {
+	for i, f := range files {
 		name := *f
 		if name == "" {
 			name = opts.prompt()
 		}
-		b, err := os.ReadFile(filepath.Join(abs, name))
-		if err != nil {
-			return fail("read %s: %v", name, err)
-		}
 		next := manifestPromptPrefix + name
-		if err := writeFileReplace(filepath.Join(abs, next), append(b, []byte(section)...)); err != nil {
+		if err := writeFileReplace(filepath.Join(abs, next), append(prompts[i], []byte(section)...)); err != nil {
 			return fail("write %s: %v", next, err)
 		}
 		*f = next
 	}
 	return "", 0
+}
+
+// writeApprovedBrief writes the gate input's BRIEF.md and checklist (the approved ones, rendered from
+// the rows) over brief/ in the checkout; a brief/ that is not a real directory (a link out of the
+// checkout) is replaced by one.
+func writeApprovedBrief(checkout string, g *store.GateInput) error {
+	dir := filepath.Join(checkout, filepath.Dir(filepath.FromSlash(checklist.ChecklistRel)))
+	if fi, err := os.Lstat(dir); err == nil && !fi.IsDir() {
+		if err := os.Remove(dir); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	c := &checklist.Checklist{ID: g.ChecklistID, Version: g.Version, Approval: &checklist.Approval{At: g.At, SHA256: g.ChecklistSHA256}}
+	for _, r := range g.Rows {
+		c.Rows = append(c.Rows, checklist.Row{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract, PlaceholderOK: r.PlaceholderOK,
+			Rationale: r.Rationale})
+	}
+	if err := writeFileReplace(checklist.BriefPath(checkout), []byte(g.Brief)); err != nil {
+		return err
+	}
+	return writeFileReplace(checklist.ChecklistPath(checkout), []byte(checklist.Render(c)))
+}
+
+// judgeInputsDigest fingerprints what the judge's runner reads from its job dir besides the prompt:
+// settings.json (the guard hook), mcp.json, the git files and the read-only copy of the code (every
+// path, mode, link target and file content), symlinks never followed.
+func judgeInputsDigest(jobDir string) (string, error) {
+	h := sha256.New()
+	for _, name := range []string{"settings.json", "mcp.json", gitConfigFile} {
+		b, err := os.ReadFile(filepath.Join(jobDir, name))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		fmt.Fprintf(h, "file %s %d %t\n", name, len(b), err == nil)
+		h.Write(b)
+	}
+	for _, root := range []string{"work", noHooksDir} {
+		base := filepath.Join(jobDir, root)
+		err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(jobDir, p)
+			fmt.Fprintf(h, "path %q %o", rel, fi.Mode())
+			switch {
+			case fi.Mode()&fs.ModeSymlink != 0:
+				target, err := os.Readlink(p)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(h, " -> %q", target)
+			case fi.Mode().IsRegular():
+				f, err := os.Open(p)
+				if err != nil {
+					return err
+				}
+				n, err := io.Copy(h, f)
+				f.Close()
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(h, " %d", n)
+			}
+			h.Write([]byte("\n"))
+			return nil
+		})
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // ManifestPromptSection is the part of the judge's prompt the wrapper appends: the manifest-check run

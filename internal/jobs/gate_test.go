@@ -50,6 +50,7 @@ func gateRepo(t *testing.T) (string, string) {
 const manifestScriptOK = `#!/bin/sh
 echo "MANIFEST_OUTPUT_MARKER pwd=$(pwd) home=$HOME secret=${AGENT_JOBS_TEST_SECRET:-unset}"
 test -f brief/CHECKLIST.md && echo "checklist present"
+grep '^- approved:' brief/CHECKLIST.md
 exit "$(cat .manifest-exit 2>/dev/null || echo 0)"
 `
 
@@ -275,7 +276,7 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 	if mc.JobID != j.ID || mc.Attempt != j.Attempt || mc.SHA != sha || mc.ExitCode != 0 || mc.Script != ManifestScript ||
 		!strings.Contains(mc.Output, "MANIFEST_OUTPUT_MARKER pwd="+filepath.Join(dir, "manifest-check", "work")) ||
 		!strings.Contains(mc.Output, "home="+filepath.Join(dir, "manifest-check", "home")) || !strings.Contains(mc.Output, "secret=unset") ||
-		!strings.Contains(mc.Output, "checklist present") {
+		!strings.Contains(mc.Output, "checklist present") || !strings.Contains(mc.Output, "owner sha256:"+j.Gate.ChecklistSHA256) {
 		t.Fatalf("manifest-check record: %+v", mc)
 	}
 	if rec, err := m.Store.ManifestCheckByJob(j.ID, j.Attempt); err != nil || rec == nil || rec.Seq != mc.Seq {
@@ -430,7 +431,7 @@ func TestMaterializeTree(t *testing.T) {
 		return nil
 	})
 	slices.Sort(got)
-	if want := []string{"inside.link", "main.go", "run.sh", "tracked.txt"}; !slices.Equal(got, want) {
+	if want := []string{"inside.link", "main.go", "run.sh", "scripts", "scripts/manifest-check.sh", "tracked.txt"}; !slices.Equal(got, want) {
 		t.Fatalf("files %v, want %v", got, want)
 	}
 	if b, _ := os.ReadFile(filepath.Join(dst, "inside.link")); !strings.Contains(string(b), "CODE_MARKER") {
