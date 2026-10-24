@@ -123,7 +123,8 @@ func SHA256Hex(b []byte) string {
 }
 
 // Hash is the checklist hash: sha256 over one line per row, «ID|verbatim|contract|placeholder-ok|basis»
-// (placeholder-ok is the flag or empty; a «|» inside a field stays escaped as «\|», as in the file),
+// (placeholder-ok is the flag or empty; a «\» and a «|» inside a field are escaped as «\\» and «\|», as in
+// the file),
 // then the line «BRIEF.md|<sha256 of BRIEF.md>».
 func Hash(rows []Row, brief []byte) string {
 	var b strings.Builder
@@ -157,13 +158,27 @@ func (c *Checklist) Status(brief []byte) (approved bool, hash, reason string) {
 // NormalizeField collapses runs of white space (line breaks included) into one space and trims it.
 func NormalizeField(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-// escapeCell writes a normalized field as a table cell: «|» escaped as «\|» (an already escaped one kept).
-func escapeCell(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, `\|`, "|"), "|", `\|`)
-}
+// cellEscaper writes a field as a table cell: «\» as «\\» and «|» as «\|».
+var cellEscaper = strings.NewReplacer(`\`, `\\`, "|", `\|`)
 
-// unescapeCell is the inverse of escapeCell.
-func unescapeCell(s string) string { return strings.ReplaceAll(s, `\|`, "|") }
+// escapeCell writes a normalized field as a table cell: «\» escaped as «\\» and «|» as «\|», so a
+// literal «\|» in a field stays distinct from a «|».
+func escapeCell(s string) string { return cellEscaper.Replace(s) }
+
+// unescapeCell is the inverse of escapeCell; a «\» before any other character is kept as written.
+func unescapeCell(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && (s[i+1] == '\\' || s[i+1] == '|') {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
 
 // ParseContract reads a Contract cell: exactly one of live, deferred, dropped, plus optionally
 // placeholder-ok (separated by spaces or commas, any order).
@@ -331,29 +346,31 @@ func parseApproved(val string) (*Approval, string) {
 	return &Approval{At: at.UTC(), SHA256: m[2]}, ""
 }
 
-// splitCells splits a table row on unescaped «|»; the outer pipes are dropped.
+// splitCells splits a table row on unescaped «|»; the outer pipes are dropped. An escape pair
+// («\» and the character after it) is kept as written for unescapeCell.
 func splitCells(line string) []string {
-	line = strings.TrimSpace(line)
-	line = strings.TrimPrefix(line, "|")
-	if strings.HasSuffix(line, "|") && !strings.HasSuffix(line, `\|`) {
-		line = line[:len(line)-1]
-	}
+	line = strings.TrimPrefix(strings.TrimSpace(line), "|")
 	var cells []string
 	var b strings.Builder
+	sep := false // the last character read was an unescaped «|»
 	for i := 0; i < len(line); i++ {
-		if line[i] == '\\' && i+1 < len(line) && line[i+1] == '|' {
-			b.WriteString(`\|`)
+		sep = false
+		switch {
+		case line[i] == '\\' && i+1 < len(line):
+			b.WriteString(line[i : i+2])
 			i++
-			continue
-		}
-		if line[i] == '|' {
+		case line[i] == '|':
 			cells = append(cells, b.String())
 			b.Reset()
-			continue
+			sep = true
+		default:
+			b.WriteByte(line[i])
 		}
-		b.WriteByte(line[i])
 	}
-	return append(cells, b.String())
+	if !sep {
+		cells = append(cells, b.String())
+	}
+	return cells
 }
 
 func parseRow(line string) (Row, error) {
