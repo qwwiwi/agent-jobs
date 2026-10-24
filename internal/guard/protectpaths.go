@@ -103,7 +103,7 @@ func protectedForms(paths []string) []string {
 
 // maxInodeScan bounds the entries of protected directories looked at for hard links in one call;
 // past it a multiply linked target is refused (fail closed).
-const maxInodeScan = 16384
+var maxInodeScan = 16384
 
 type inodeKey struct{ dev, ino uint64 }
 
@@ -256,30 +256,43 @@ func fdActs(args []string) bool {
 }
 
 // dirReader reports a command for which the rule "the directory holding a protected path is a
-// destination" (parentHit) does not apply: a directory reader (find without an action), or an
-// interpreter running a script file, which the guard does not see in any case (`python3 x.py ..`).
-// Every other program keeps it (fail closed): cp, mv, install, ln, rsync, tar -x, unzip -d, patch -d,
-// inline code (`python3 -c '…' <dir>`).
-func dirReader(name string, argv []string, c *simpleCmd) bool {
-	if dirReaders[name] {
-		switch name {
-		case "find":
-			return !findActs(argv[1:])
-		case "fd", "fdfind":
-			return !fdActs(argv[1:])
-		}
-		return true
-	}
-	if !stdinInterpreter(name) && !shells[name] && !awks[name] {
+// destination" (parentHit) does not apply: a plain directory reader (find or fd without an action,
+// du, ls, tree, …). Every other program keeps it (fail closed): cp, mv, install, ln, rsync, tar -x,
+// unzip -d, patch -d, and any interpreter, with a script file too: the guard does not see what a
+// script or module does with a directory (`python3 -m zipfile --extract evil.zip ..`).
+func dirReader(name string, argv []string) bool {
+	if !dirReaders[name] {
 		return false
 	}
-	if c.stdin || c.heredoc != "" || len(argv) < 2 {
-		return false // the program comes from stdin or a here-doc the guard checks as code
+	switch name {
+	case "find":
+		return !findActs(argv[1:])
+	case "fd", "fdfind":
+		return !fdActs(argv[1:])
+	}
+	return true
+}
+
+// pythonTreeModules are the modules of the python distribution that write a whole tree into a
+// directory operand: `-m zipfile -e a.zip <dir>`, `-m tarfile -e a.tar <dir>`, `-m pip install
+// --target <dir>`, `-m pip download -d <dir>`.
+var pythonTreeModules = map[string]bool{"zipfile": true, "tarfile": true, "pip": true, "ensurepip": true}
+
+// pythonTreeWriter reports a python call running one of pythonTreeModules: its operands are checked
+// as ancestors too, like those of tar -x or unzip -d.
+func pythonTreeWriter(name string, argv []string) bool {
+	if !strings.HasPrefix(name, "python") && !strings.HasPrefix(name, "pypy") {
+		return false
 	}
 	for k := 1; k < len(argv); k++ {
-		if inlineCode(name, argv, k) || codeArg(argv, k) {
+		switch a := argv[k]; {
+		case a == "-m" && k+1 < len(argv):
+			return pythonTreeModules[argv[k+1]]
+		case strings.HasPrefix(a, "-m") && len(a) > 2:
+			return pythonTreeModules[a[2:]]
+		case !strings.HasPrefix(a, "-") || a == "-" || a == "--":
 			return false
 		}
 	}
-	return !awks[name] // an awk program is its first operand: inline code
+	return false
 }

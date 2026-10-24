@@ -144,11 +144,17 @@ func TestFileToolsStayInOwnFolder(t *testing.T) {
 func TestDirHoldingProtectedReadersAllowed(t *testing.T) {
 	_, _, cfg := jobFolderSetup(t)
 	own := "'" + cfg.OwnDir + "'"
-	allowed(t, cfg, "find ..", "find .. -name '*.md'", "du -sh ..", "tree ..", "ls -la ..", "python3 x.py ..",
-		"du -sh "+own, "node scan.js "+own, "bash count.sh ..")
+	homeProtected(t, &cfg)
+	allowed(t, cfg, "find ..", "find .. -name '*.md'", "du -sh ..", "tree ..", "ls -la ..", "du -sh "+own,
+		"fd -e md . ..", "ls ~", "du -sh ~/.claude/projects")
+	// An interpreter is no reader: the script or module it runs may write into the directory
+	// (`python3 -m zipfile --extract evil.zip ..`); `python3 x.py ..` is a known false refusal.
 	refused(t, cfg, "cp f "+own+"/", "cp f ..", "mv f ..", "install f ..", "ln -s /tmp/x ..", "rsync -a d/ ..",
 		"tar -xf a.tar -C ..", "find .. -delete", "python3 -c 'import sys' ..", "python3 - .. <<'EOF'\nx\nEOF",
-		"patch -d .. -p1 < x.diff")
+		"patch -d .. -p1 < x.diff", "python3 -m zipfile --extract evil.zip ..", "python3 -m zipfile --extract evil.zip ~",
+		`python3 -m zipfile --extract evil.zip "$HOME"`, "python3 -m tarfile --extract evil.tar ~/.claude/projects",
+		"python3 -m pip install --target ~ x", "python3 -m pip download -d ~/.claude/projects x",
+		"python3 x.py ..", "node scan.js "+own, "bash count.sh ..")
 }
 
 // Review of fix loop 1: a descriptor alias is recognised with symlinks resolved too (`p -> /proc`,
