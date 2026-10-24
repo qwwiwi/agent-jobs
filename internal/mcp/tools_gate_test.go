@@ -58,7 +58,7 @@ func TestGateToolsClosedToJobs(t *testing.T) {
 	}
 	jcs := connect(t, job)
 	names := toolNames(t, jcs)
-	for _, n := range []string{"slicing_start", "slicing_get", "judge_start", "judge_get"} {
+	for _, n := range []string{"slicing_start", "slicing_get", "judge_start", "judge_get", "release_check"} {
 		if !slices.Contains(OrchestratorOnly, n) || Allowed(RoleJob, n) || slices.Contains(names, n) {
 			t.Fatalf("%s open to jobs", n)
 		}
