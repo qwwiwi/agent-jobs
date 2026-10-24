@@ -411,26 +411,57 @@ func dirReader(name string, argv []string) bool {
 	return true
 }
 
-// pythonTreeModules are the modules of the python distribution that write a whole tree into a
-// directory operand: `-m zipfile -e a.zip <dir>`, `-m tarfile -e a.tar <dir>`, `-m pip install
-// --target <dir>`, `-m pip download -d <dir>`.
-var pythonTreeModules = map[string]bool{"zipfile": true, "tarfile": true, "pip": true, "ensurepip": true}
-
-// pythonTreeWriter reports a python call running one of pythonTreeModules: its operands are checked
-// as ancestors too, like those of tar -x or unzip -d.
-func pythonTreeWriter(name string, argv []string) bool {
+// pythonModule returns the module a python call runs with -m (`-m zipfile`, `-mzipfile`) and the
+// index of the first word after it, or "" when it runs none.
+func pythonModule(name string, argv []string) (string, int) {
 	if !strings.HasPrefix(name, "python") && !strings.HasPrefix(name, "pypy") {
-		return false
+		return "", 0
 	}
 	for k := 1; k < len(argv); k++ {
 		switch a := argv[k]; {
 		case a == "-m" && k+1 < len(argv):
-			return pythonTreeModules[argv[k+1]]
+			return argv[k+1], k + 2
 		case strings.HasPrefix(a, "-m") && len(a) > 2:
-			return pythonTreeModules[a[2:]]
+			return a[2:], k + 1
 		case !strings.HasPrefix(a, "-") || a == "-" || a == "--":
-			return false
+			return "", 0
 		}
 	}
-	return false
+	return "", 0
+}
+
+// pipDirOpts are the pip and ensurepip options naming a directory they write a tree into.
+var pipDirOpts = map[string]bool{
+	"--target": true, "-t": true, "--prefix": true, "--root": true, "-d": true, "--dest": true, "--src": true,
+	"-b": true, "--build": true, "--download": true,
+}
+
+// pythonTreeTargets returns how a python call that runs an archive or package module writes trees:
+// `-m zipfile` and `-m tarfile` extract into their operands, so all of them are checked as ancestors
+// (all); `-m pip` and `-m ensurepip` write into the directories of their directory options
+// (`--target <dir>`, `--target=<dir>`, `-t<dir>`, `-d <dir>`, …), returned as dirs, while their
+// other operands (`pip install -e .`) are sources.
+func pythonTreeTargets(name string, argv []string) (all bool, dirs []string) {
+	mod, k := pythonModule(name, argv)
+	switch mod {
+	case "zipfile", "tarfile":
+		return true, nil
+	case "pip", "ensurepip":
+	default:
+		return false, nil
+	}
+	for ; k < len(argv); k++ {
+		a := argv[k]
+		opt, v, eq := strings.Cut(a, "=")
+		switch {
+		case pipDirOpts[a] && k+1 < len(argv):
+			dirs = append(dirs, argv[k+1])
+			k++
+		case eq && strings.HasPrefix(a, "--") && pipDirOpts[opt]:
+			dirs = append(dirs, v)
+		case len(a) > 2 && a[0] == '-' && a[1] != '-' && pipDirOpts[a[:2]]:
+			dirs = append(dirs, a[2:])
+		}
+	}
+	return false, dirs
 }
