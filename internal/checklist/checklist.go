@@ -208,15 +208,12 @@ func fenceOpen(text string) bool {
 }
 
 // additionsAt is the byte offset of BRIEF.md's «## Additions» heading line, -1 when it has none: the
-// first such line outside a ``` fence. Only an unclosed fence in the owner's words (an odd number of
-// fence lines; AppendAdditions closes a fence a quote leaves open, so the parity is the owner's alone
-// and stays the same as additions are appended) is not a fence for the heading AppendAdditions wrote
-// after it: with an odd number, the heading is the first such line inside an open fence that is
-// followed by a «### <date>» addition, and a line outside a fence (before the unclosed one, so in the
-// owner's words) does not count. Headings inside closed fences never count. checklist_init refuses
-// owner words with such a line, so for a brief it created the first such line is the heading.
+// first such line outside a ``` fence (a heading inside a fence never counts). The owner's words above
+// it are balanced (checklist_init refuses an unclosed fence, checklist_set a prefix with one) and
+// AppendAdditions closes a fence a quote leaves open, so the heading it wrote is never inside a fence.
+// checklist_init also refuses owner words with such a line, so for a brief it created the first such
+// line is the heading.
 func additionsAt(text string) int {
-	odd := fenceOpen(text)
 	fence := false
 	lines := strings.SplitAfter(text, "\n")
 	for i, off := 0, 0; i < len(lines); off, i = off+len(lines[i]), i+1 {
@@ -224,10 +221,7 @@ func additionsAt(text string) int {
 			fence = !fence
 			continue
 		}
-		if !isAdditionsHeading(lines[i]) {
-			continue
-		}
-		if !odd && !fence || odd && fence && additionFollows(lines[i+1:]) {
+		if !fence && isAdditionsHeading(lines[i]) {
 			return off
 		}
 	}
@@ -239,15 +233,10 @@ func isAdditionsHeading(line string) bool {
 	return strings.TrimRight(line, "\r\n \t") == AdditionsHeading
 }
 
-// additionFollows reports whether the first non-blank line of lines is a «### » addition heading.
-func additionFollows(lines []string) bool {
-	for _, l := range lines {
-		if t := strings.TrimSpace(l); t != "" {
-			return strings.HasPrefix(t, "### ")
-		}
-	}
-	return false
-}
+// ErrUnclosedFence is the refusal of owner words (or a BRIEF prefix) with an unclosed ``` fence.
+var ErrUnclosedFence = errors.New("an unclosed ``` fence (an odd number of lines starting with ```): close the fence " +
+	"(add a line ``` after the code); the owner's words must not leave one open, it would hide the " + AdditionsHeading +
+	" heading and the requirements after it")
 
 // BriefPrefixSHA256 is the hex sha256 of BriefPrefix.
 func BriefPrefixSHA256(brief []byte) string { return SHA256Hex([]byte(BriefPrefix(brief))) }

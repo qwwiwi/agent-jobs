@@ -445,25 +445,6 @@ func TestCellEscapesBackslash(t *testing.T) {
 	}
 }
 
-// An unclosed ``` fence in the owner's words must not hide the «## Additions» heading: the prefix
-// stays the owner's words after an addition, and a second addition reuses the heading.
-func TestBriefPrefixUnclosedFence(t *testing.T) {
-	b := InitBrief("I want a login page.\n\n```\nsome code without a closing fence")
-	once := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "also dark mode"}})
-	if BriefPrefixSHA256([]byte(b)) != BriefPrefixSHA256([]byte(once)) {
-		t.Fatalf("an addition after an unclosed fence changed the prefix: %q / %q", BriefPrefix([]byte(b)), BriefPrefix([]byte(once)))
-	}
-	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "and export"}})
-	if strings.Count(twice, AdditionsHeading+"\n") != 1 || BriefPrefixSHA256([]byte(twice)) != BriefPrefixSHA256([]byte(b)) {
-		t.Fatalf("second addition:\n%s", twice)
-	}
-	// A heading found outside a fence before an unclosed one (in an addition's quote) is kept.
-	quoted := AppendAdditions(b, []Addition{{Date: "2026-10-24", Quote: "```\nunclosed in the quote"}})
-	if BriefPrefix([]byte(quoted)) != BriefPrefix([]byte(b)) {
-		t.Fatalf("an unclosed fence in an addition moved the prefix: %q", BriefPrefix([]byte(quoted)))
-	}
-}
-
 // A quote that leaves a fence open is closed after it: a later heading or addition is not swallowed.
 func TestAppendAdditionsClosesQuoteFence(t *testing.T) {
 	b := InitBrief("I want a login page.")
@@ -474,22 +455,6 @@ func TestAppendAdditionsClosesQuoteFence(t *testing.T) {
 	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "and export"}})
 	if strings.Count(twice, AdditionsHeading+"\n") != 1 || BriefPrefix([]byte(twice)) != BriefPrefix([]byte(b)) {
 		t.Fatalf("second addition:\n%s", twice)
-	}
-}
-
-// After an approval of a brief with an unclosed fence, additions keep the stored prefix: the next call
-// is not refused as an edit of the owner's words.
-func TestApplyUnclosedFenceAdditions(t *testing.T) {
-	brief := []byte(InitBrief("I want a login page.\n\n```\nunclosed"))
-	text, rec := approvedSample(t, brief)
-	f := &Files{Brief: brief, Checklist: []byte(text)}
-	res, err := Apply(f, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec, boundTo(brief, true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Brief, f.Checklist = res.BriefAfter, res.Checklist
-	if _, err := Apply(f, Change{Additions: []Addition{{Quote: "and dark mode"}}}, time.Now(), noRedact, rec, boundTo(brief, true)); err != nil {
-		t.Fatalf("second addition refused: %v", err)
 	}
 }
 
@@ -534,32 +499,6 @@ func TestApplyRefusesRedactedPrefix(t *testing.T) {
 	}
 }
 
-// A closed ``` example holding a «## Additions» line, then an unclosed fence: the example heading is
-// not the Additions heading, the prefix is the whole owner text, and a later requirement edit is
-// refused (an unclosed fence at the end must not switch off every fence before it).
-func TestBriefPrefixClosedExampleThenUnclosedFence(t *testing.T) {
-	words := "Format:\n\n```\n## Additions\n```\n\nI want CSV export.\n\n```\nunclosed code"
-	brief := []byte(InitBrief(words))
-	if got, want := BriefPrefix(brief), strings.TrimRight(string(brief), "\n"); got != want {
-		t.Fatalf("prefix stops at the example heading:\n%q\nwant\n%q", got, want)
-	}
-	once := AppendAdditions(string(brief), []Addition{{Date: "2026-10-24", Quote: "also dark mode"}})
-	if BriefPrefix([]byte(once)) != BriefPrefix(brief) || strings.Count(once, AdditionsHeading+"\n") != 2 {
-		t.Fatalf("addition:\n%s", once)
-	}
-	twice := AppendAdditions(once, []Addition{{Date: "2026-10-25", Quote: "```\nx\n```"}})
-	if BriefPrefix([]byte(twice)) != BriefPrefix(brief) || strings.Count(twice, AdditionsHeading+"\n") != 2 {
-		t.Fatalf("second addition:\n%s", twice)
-	}
-	text, rec := approvedSample(t, brief)
-	edited := []byte(strings.Replace(string(brief), "CSV", "PDF", 1))
-	_, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{Rows: []Row{{ID: "R09", Verbatim: "PDF export", Contract: ContractLive}}},
-		time.Now(), noRedact, rec, boundTo(brief, true))
-	if err == nil || !strings.Contains(err.Error(), "never edited") {
-		t.Fatalf("a requirement edit below the example heading was accepted: %v", err)
-	}
-}
-
 // checklist_init refuses owner words with a literal «## Additions» line, inside a fence or not: it
 // would be ambiguous with the heading additions go under.
 func TestInitRefusesAdditionsHeading(t *testing.T) {
@@ -575,6 +514,77 @@ func TestInitRefusesAdditionsHeading(t *testing.T) {
 	for _, words := range []string{"## Additions to the plan", "### Additions", "see ## Additions below"} {
 		if _, _, _, err := Init("demo", words, noRedact); err != nil {
 			t.Fatalf("%q refused: %v", words, err)
+		}
+	}
+}
+
+// astraBrief is a hand-written BRIEF.md: a closed ``` example holding «## Additions» and «### <date>»,
+// the owner's requirement, then a trailing unclosed fence.
+const astraBrief = "# Brief\n\nFormat:\n\n```\n## Additions\n\n### 2026-10-24\n```\n\nI want CSV export.\n\n```\nunclosed code\n"
+
+// checklist_init refuses owner words with an unclosed ``` fence (an odd number of fence lines): the
+// text above «## Additions» must be balanced, so no fence can hide the heading or a requirement.
+func TestInitRefusesUnclosedFence(t *testing.T) {
+	for _, words := range []string{
+		"I want a login page.\n\n```\nsome code without a closing fence",
+		"```go\nx := 1\n```\nand\n  ```\nopen",
+		strings.TrimPrefix(astraBrief, "# Brief\n\n"),
+	} {
+		if _, _, _, err := Init("demo", words, noRedact); err == nil || !strings.Contains(err.Error(), "unclosed") {
+			t.Fatalf("%q: err %v, want an unclosed-fence refusal", words, err)
+		}
+	}
+	for _, words := range []string{"I want a login page.", "Code:\n\n```go\nx := 1\n```\n\nand\n```\ny\n```"} {
+		if _, _, _, err := Init("demo", words, noRedact); err != nil {
+			t.Fatalf("%q refused: %v", words, err)
+		}
+	}
+}
+
+// A hand-written BRIEF.md whose owner prefix leaves a fence open is refused by checklist_set, before
+// anything is computed: a requirement rewrite under it is never approved.
+func TestApplyRefusesUnbalancedPrefix(t *testing.T) {
+	brief := []byte(astraBrief)
+	text, rec := approvedSample(t, brief)
+	edited := []byte(strings.Replace(astraBrief, "CSV", "PDF", 1))
+	for name, b := range map[string][]byte{"as approved": brief, "rewritten": edited} {
+		res, err := Apply(&Files{Brief: b, Checklist: []byte(text)}, Change{Approve: true}, time.Now(), noRedact, rec, boundTo(brief, true))
+		if err == nil || !strings.Contains(err.Error(), "unclosed") {
+			t.Fatalf("%s: err %v, approved %v; want an unclosed-fence refusal", name, err, res != nil && res.Approved)
+		}
+	}
+	// A heading inside a fence never counts, closed or not: the prefix is the whole text.
+	if got, want := BriefPrefix(brief), strings.TrimRight(astraBrief, "\n"); got != want {
+		t.Fatalf("prefix:\n%q\nwant\n%q", got, want)
+	}
+}
+
+// A brief with closed code blocks (one holding «## Additions») keeps its prefix as additions are
+// appended, also a quote that leaves a fence open, and checklist_set accepts the additions.
+func TestApplyClosedFencesAdditions(t *testing.T) {
+	brief, list, _, err := Init("demo", "Code:\n\n```go\nx := 1\n```\n\nI want CSV export.\n\n```\ny\n```", noRedact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	example := []byte(strings.Replace(string(brief), "x := 1\n", "## Additions\n### 2026-10-24\n", 1))
+	for name, b := range map[string][]byte{"init": brief, "hand-written example": example} {
+		f := &Files{Brief: b, Checklist: list}
+		bind := boundTo(b, false)
+		res, err := Apply(f, Change{Additions: []Addition{{Quote: "```\nunclosed in the quote"}}}, time.Now(), noRedact, nil, bind)
+		if err != nil {
+			t.Fatalf("%s: first addition: %v", name, err)
+		}
+		f.Brief, f.Checklist = res.BriefAfter, res.Checklist
+		if fenceOpen(string(f.Brief)) || BriefPrefixSHA256(f.Brief) != BriefPrefixSHA256(b) {
+			t.Fatalf("%s: after the first addition:\n%s", name, f.Brief)
+		}
+		res, err = Apply(f, Change{Additions: []Addition{{Quote: "and dark mode"}}}, time.Now(), noRedact, nil, bind)
+		if err != nil {
+			t.Fatalf("%s: second addition: %v", name, err)
+		}
+		if strings.Count(string(res.BriefAfter), "\n"+AdditionsHeading+"\n") != strings.Count(string(b), "\n"+AdditionsHeading+"\n")+1 ||
+			BriefPrefixSHA256(res.BriefAfter) != BriefPrefixSHA256(b) {
+			t.Fatalf("%s: after the second addition:\n%s", name, res.BriefAfter)
 		}
 	}
 }
