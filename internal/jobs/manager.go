@@ -589,7 +589,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	var plan launchPlan
 	launchCfg := m.Config()
-	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" {
+	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
 		if err != nil {
 			return err
@@ -597,6 +597,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	if j.AcceptanceCmd != "" && !launchCfg.AcceptanceAllowed {
 		return errors.New("acceptance_allowed is off in active daemon config or config.json; acceptance job not launched")
+	}
+	if j.Kind == KindJudge && !launchCfg.AcceptanceAllowed {
+		// The judge's manifest-check step (F5) runs repository code the way acceptance_cmd does.
+		return errors.New("acceptance_allowed is off in active daemon config or config.json: the judge's manifest-check " +
+			"(scripts/manifest-check.sh) cannot run, so the judge is not launched")
 	}
 	if j.Runner == store.RunnerCodex {
 		if j.Attempt > 1 {
@@ -638,7 +643,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
-		AcceptanceAllowed: j.AcceptanceCmd != "" && launchCfg.AcceptanceAllowed,
+		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}

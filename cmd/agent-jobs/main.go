@@ -91,7 +91,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            as JSON (same as slicing_get): its lists and decisions
   gate verdict --agent A --repo PATH [--sha S] [--checklist-id ID]
                                            the latest blind judge verdict (Wave F, F5) as JSON
-                                           (same as judge_get)
+                                           (same as judge_get), with its manifest_check record
+  gate release-check --agent A --repo PATH --sha S
+                                           whether sha may ship (Wave F, F7; same as release_check):
+                                           JSON, the owner line on stderr, exit 1 unless it passed
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
@@ -1348,10 +1351,15 @@ func cmdArchive(args []string) error {
 	return aerr
 }
 
-// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get) or `gate verdict` (judge_get).
+// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get) or `gate verdict` (judge_get);
+// `gate release-check` prints release_check (F7) and exits non-zero unless it passed.
 func cmdGate(args []string) error {
+	if len(args) > 0 && args[0] == "release-check" {
+		return cmdReleaseCheck(args[1:])
+	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "verdict") {
-		return errors.New("usage: agent-jobs gate slicing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID]")
+		return errors.New("usage: agent-jobs gate slicing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
+			"gate release-check --agent A --repo PATH --sha S")
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -1381,6 +1389,38 @@ func cmdGate(args []string) error {
 		return err
 	}
 	return printJSON(out)
+}
+
+// errReleaseFailed is `gate release-check`'s error when the check ran and did not pass (the result is
+// printed first).
+var errReleaseFailed = errors.New("release check did not pass")
+
+// cmdReleaseCheck is `agent-jobs gate release-check`: release_check as JSON, then the owner line on stderr.
+func cmdReleaseCheck(args []string) error {
+	fs := flag.NewFlagSet("gate release-check", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	repo := fs.String("repo", "", "absolute path of the project's git work tree")
+	sha := fs.String("sha", "", "the full commit id to ship")
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	out, err := mcp.ReleaseCheck(m, *repo, *sha)
+	if err != nil {
+		return err
+	}
+	if err := printJSON(out); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, out.OwnerLine)
+	if !out.Pass {
+		return errReleaseFailed
+	}
+	return nil
 }
 
 func cmdIntentions(args []string) error {

@@ -25,6 +25,13 @@ func gateRepo(t *testing.T) (string, string) {
 	if err := os.WriteFile(filepath.Join(repo, "run.sh"), []byte("#!/bin/sh\necho run\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The repository's manifest-check (F6): the judge's wrapper runs it at the sha before the judge.
+	if err := os.MkdirAll(filepath.Join(repo, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "scripts", "manifest-check.sh"), []byte(manifestScriptOK), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	// A link inside the tree is kept, one that leaves it is not.
 	if err := os.Symlink("main.go", filepath.Join(repo, "inside.link")); err != nil {
 		t.Fatal(err)
@@ -36,6 +43,15 @@ func gateRepo(t *testing.T) (string, string) {
 	gitT(t, repo, "commit", "-qm", "code")
 	return repo, gitT(t, repo, "rev-parse", "HEAD")
 }
+
+// manifestScriptOK is gateRepo's scripts/manifest-check.sh: it prints a marker, where it runs, its HOME and
+// whether a secret of the wrapper's environment reached it, then exits MANIFEST_EXIT (default 0) when
+// the file .manifest-exit is absent.
+const manifestScriptOK = `#!/bin/sh
+echo "MANIFEST_OUTPUT_MARKER pwd=$(pwd) home=$HOME secret=${AGENT_JOBS_TEST_SECRET:-unset}"
+test -f brief/CHECKLIST.md && echo "checklist present"
+exit "$(cat .manifest-exit 2>/dev/null || echo 0)"
+`
 
 // gateReport writes report as the fake claude's report for the next gate job (FAKE_GATE_REPORT).
 func gateReport(t *testing.T, block any) string {
@@ -188,7 +204,8 @@ func TestGateVerdictFailsClosed(t *testing.T) {
 // .git, no brief files, no link out of the tree); the verdict is stored with the judge's family and the
 // coders' (feature jobs with covers of the checklist), same_family flagged.
 func TestJudgeJobEndToEnd(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
+	t.Setenv("AGENT_JOBS_TEST_SECRET", "s3cr3t")
 	repo, sha := gateRepo(t)
 	if _, err := m.StartGate(GateRequest{Kind: KindJudge, Repo: repo, SHA: sha, Model: "sonnet"}); err == nil || !strings.Contains(err.Error(), "not approved") {
 		t.Fatalf("judge of an unapproved checklist: %v", err)
@@ -219,7 +236,7 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 	}
 	dir := m.JobDir(j.ID)
 	seen, _ := os.ReadFile(filepath.Join(dir, "work-seen.txt"))
-	if string(seen) != "./inside.link\n./main.go\n./run.sh\n./tracked.txt\n" {
+	if string(seen) != "./inside.link\n./main.go\n./run.sh\n./scripts\n./scripts/manifest-check.sh\n./tracked.txt\n" {
 		t.Fatalf("judge work dir:\n%s", seen)
 	}
 	if fi, err := os.Stat(filepath.Join(dir, "work", "run.sh")); err != nil || fi.Mode().Perm()&0o100 == 0 {
@@ -248,8 +265,35 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 	}
 	if v.SHA != sha || v.Version != 2 || v.JudgeFamily != "anthropic" || v.JudgeModel != "sonnet" || !v.SameFamily || v.FamilyDiffers ||
 		!slices.Equal(v.CoderFamilies, []string{"anthropic", "openai"}) || !slices.Equal(v.CoderJobs, []string{coder.ID, "cx1"}) ||
-		v.Counts["met"] != 3 || v.ManifestCheck != nil {
+		v.Counts["met"] != 3 || v.ManifestCheck == nil {
 		t.Fatalf("verdict: %+v", v)
+	}
+	// The manifest-check ran at the sha in its own checkout (brief files there), with a scrubbed
+	// environment, before the judge; the record is bound to the job, its attempt and the sha, and the
+	// output reached the judge's prompt; the checkout was gone before the judge started.
+	mc := v.ManifestCheck
+	if mc.JobID != j.ID || mc.Attempt != j.Attempt || mc.SHA != sha || mc.ExitCode != 0 || mc.Script != ManifestScript ||
+		!strings.Contains(mc.Output, "MANIFEST_OUTPUT_MARKER pwd="+filepath.Join(dir, "manifest-check", "work")) ||
+		!strings.Contains(mc.Output, "home="+filepath.Join(dir, "manifest-check", "home")) || !strings.Contains(mc.Output, "secret=unset") ||
+		!strings.Contains(mc.Output, "checklist present") {
+		t.Fatalf("manifest-check record: %+v", mc)
+	}
+	if rec, err := m.Store.ManifestCheckByJob(j.ID, j.Attempt); err != nil || rec == nil || rec.Seq != mc.Seq {
+		t.Fatalf("stored record: %+v %v", rec, err)
+	}
+	stdin, _ := os.ReadFile(filepath.Join(dir, "stdin.txt"))
+	if !strings.Contains(string(stdin), "## Manifest-check (run by agent-jobs before you started)") ||
+		!strings.Contains(string(stdin), "MANIFEST_OUTPUT_MARKER") || !strings.Contains(string(stdin), "BRIEF_TEXT_MARKER") {
+		t.Fatalf("the judge's stdin lacks the manifest-check output:\n%s", stdin)
+	}
+	if strings.Contains(string(prompt), "MANIFEST_OUTPUT_MARKER") {
+		t.Fatal("prompt.md (the daemon's) carries the output: it is appended by the wrapper")
+	}
+	if seen, _ := os.ReadFile(filepath.Join(dir, "jobdir-seen.txt")); strings.Contains(string(seen), "manifest-check\n") {
+		t.Fatalf("the manifest-check checkout was in the job dir when the judge ran:\n%s", seen)
+	}
+	if out, _ := gitRaw(repo, "worktree", "list", "--porcelain"); strings.Contains(string(out), "manifest-check") {
+		t.Fatalf("the manifest-check worktree is still registered:\n%s", out)
 	}
 	vv, err := m.LatestVerdictOf(mainWorktree(repo), "demo", sha)
 	if err != nil || vv.Verdict == nil || !vv.Current {

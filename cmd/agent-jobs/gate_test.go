@@ -63,7 +63,7 @@ func TestGateCLI(t *testing.T) {
 	out = captureStdout(t, func() error {
 		return cmdGate([]string{"verdict", "--agent", "test", "--repo", repo, "--sha", strings.Repeat("a", 40)})
 	})
-	if err := json.Unmarshal([]byte(out), &vv); err != nil || vv.Verdict != nil || vv.ManifestCheck != jobs.ManifestCheckNotBuilt {
+	if err := json.Unmarshal([]byte(out), &vv); err != nil || vv.Verdict != nil {
 		t.Fatalf("gate verdict: %s %v", out, err)
 	}
 	if err := cmdGate([]string{"judge"}); err == nil || !strings.Contains(err.Error(), "usage") {

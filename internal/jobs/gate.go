@@ -290,7 +290,9 @@ func gateWorkLine(j *store.Job, withheld []string) string {
 	if j.Kind == KindJudge {
 		s := fmt.Sprintf("Your working directory is a read-only copy of the repository's files at commit %s: no git history, "+
 			"%s and %s left out (they are given below). You have nothing else of the repository: no job briefs, reports or diffs. "+
-			"A symlink that resolves outside the copy is left out too.", j.Gate.SHA, checklist.BriefRel, checklist.ChecklistRel)
+			"A symlink that resolves outside the copy is left out too. The output of the repository's %s, which agent-jobs "+
+			"ran at this commit in a separate checkout before you started, is at the end of this prompt.", j.Gate.SHA,
+			checklist.BriefRel, checklist.ChecklistRel, ManifestScript)
 		if len(withheld) == 0 {
 			return s
 		}
@@ -1001,9 +1003,19 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 	if err != nil {
 		return fail(err)
 	}
+	// The manifest-check run this attempt's wrapper made before the runner started (F5): a verdict is
+	// stored only with it.
+	mc, err := st.ManifestCheckByJob(j.ID, j.Attempt)
+	if err != nil {
+		return fail(err)
+	}
+	if mc == nil || mc.SHA != j.Gate.SHA {
+		return gateFailPrefix + "no manifest-check record of this attempt at the judged commit (fail closed)"
+	}
 	v := store.JudgeVerdict{JobID: j.ID, Repo: j.Gate.Repo, SHA: j.Gate.SHA, ChecklistID: j.Gate.ChecklistID,
 		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, JudgeModel: j.Model, JudgeRunner: j.Runner,
-		JudgeFamily: ModelFamily(j.Runner, j.Model), EnforcedBlind: blind, Counts: counts, Verdict: o, CreatedAt: now}
+		JudgeFamily: ModelFamily(j.Runner, j.Model), EnforcedBlind: blind, ManifestCheck: mc, Counts: counts, Verdict: o,
+		CreatedAt: now}
 	coders, err := st.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return fail(err)
@@ -1032,11 +1044,15 @@ func enforcedBlind(runner string) bool { return runner != store.RunnerCodex }
 // gateVerdict fails a succeeded gate job whose result was rejected or not stored by this attempt (fail
 // closed): a result an earlier attempt of the job stored does not count for a later one.
 func (m *Manager) gateVerdict(j *store.Job, status, msg string, res StreamResult) (string, string) {
-	if status != store.StatusSucceeded || !IsGateKind(j.Kind) {
+	if !IsGateKind(j.Kind) {
 		return status, msg
 	}
-	if res.GateFailure != "" {
+	if res.GateFailure != "" && (status == store.StatusSucceeded || status == store.StatusFailed) {
+		// Also a judge whose manifest-check step failed before its runner started (exit 1).
 		return store.StatusFailed, res.GateFailure
+	}
+	if status != store.StatusSucceeded {
+		return status, msg
 	}
 	var stored bool
 	if j.Kind == KindSlicing {
@@ -1290,23 +1306,19 @@ func quoteList(qs []string) string {
 }
 
 // VerdictView is judge_get's answer: the verdict and whether it is for the repository's latest approved
-// checklist (its id, version and hash).
+// checklist (its id, version and hash). The verdict's manifest_check is the record of the manifest-check
+// run the judge's wrapper made at the sha before the judge started (F5).
 type VerdictView struct {
 	Verdict *store.JudgeVerdict `json:"verdict"`
 	// Current: the verdict's checklist id, version and hash are the latest stored approval's.
 	Current bool `json:"current"`
-	// ManifestCheck notes that the manifest-check record (F6) is not built: the verdict's field is null.
-	ManifestCheck string `json:"manifest_check_note"`
 }
-
-// ManifestCheckNotBuilt is VerdictView.ManifestCheck.
-const ManifestCheckNotBuilt = "manifest-check (F6) is not built: manifest_check is null"
 
 // LatestVerdictOf returns the latest judge verdict of checklist id in repo main (for sha when given).
 func (m *Manager) LatestVerdictOf(main, id, sha string) (*VerdictView, error) {
 	v, err := m.Store.LatestVerdict(main, id, sha)
 	if err != nil || v == nil {
-		return &VerdictView{ManifestCheck: ManifestCheckNotBuilt}, err
+		return &VerdictView{}, err
 	}
 	a, err := m.Store.LatestApproval(main)
 	if err != nil {
@@ -1321,7 +1333,7 @@ func (m *Manager) LatestVerdictOf(main, id, sha string) (*VerdictView, error) {
 		}
 		cur = void == ""
 	}
-	return &VerdictView{Verdict: v, Current: cur, ManifestCheck: ManifestCheckNotBuilt}, nil
+	return &VerdictView{Verdict: v, Current: cur}, nil
 }
 
 // ChecklistIDOf is the id of the checklist in the work tree top (read under the lock, redacted).

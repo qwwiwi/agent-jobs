@@ -139,8 +139,10 @@ type JudgeVerdict struct {
 	CoderJobs     []string `json:"coder_jobs"`
 	FamilyDiffers bool     `json:"family_differs"`
 	SameFamily    bool     `json:"same_family"`
-	// ManifestCheck is the manifest-check record (F6), not built yet: always null.
-	ManifestCheck any `json:"manifest_check"`
+	// ManifestCheck is the manifest-check record (F5 / F6) of the job's attempt that stored the verdict:
+	// the run of scripts/manifest-check.sh the wrapper made at the sha before the judge started (null only
+	// for a verdict stored by an earlier build, which release_check does not take).
+	ManifestCheck *ManifestCheck `json:"manifest_check"`
 	// Counts per verdict value (met, partial, missing, placeholder, cannot_check).
 	Counts map[string]int `json:"counts"`
 	// Verdict is the judge's validated block (JSON object), redacted.
@@ -456,7 +458,7 @@ func (s *Store) PutVerdict(token string, v JudgeVerdict) (int64, error) {
 	families, _ := json.Marshal(nonNil(v.CoderFamilies))
 	coders, _ := json.Marshal(nonNil(v.CoderJobs))
 	counts, _ := json.Marshal(v.Counts)
-	var manifest any // F6 is not built: NULL unless a record is given
+	var manifest any // NULL unless a record is given
 	if v.ManifestCheck != nil {
 		b, err := json.Marshal(v.ManifestCheck)
 		if err != nil {
@@ -539,6 +541,26 @@ func (s *Store) LatestVerdict(repo, id, sha string) (*JudgeVerdict, error) {
 	return v, nil
 }
 
+// VerdictsAt lists every verdict of checklist id at version for sha in repo, oldest first: release_check
+// (F7) takes them all, so a verdict that disagrees with the latest one is not passed over.
+func (s *Store) VerdictsAt(repo, id string, version int, sha string) ([]*JudgeVerdict, error) {
+	rows, err := s.db.Query(`SELECT `+verdictCols+` FROM gate_verdicts WHERE repo=? AND checklist_id=? AND version=? AND sha=?
+		ORDER BY seq`, repo, id, version, sha)
+	if err != nil {
+		return nil, fmt.Errorf("verdicts: %w", err)
+	}
+	defer rows.Close()
+	var out []*JudgeVerdict
+	for rows.Next() {
+		v, err := scanVerdict(rows)
+		if err != nil {
+			return nil, fmt.Errorf("verdicts: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // VerdictByJob is the verdict attempt of a job stored (nil = none).
 func (s *Store) VerdictByJob(jobID string, attempt int) (*JudgeVerdict, error) {
 	v, err := scanVerdict(s.db.QueryRow(`SELECT `+verdictCols+` FROM gate_verdicts WHERE job_id=? AND attempt=? ORDER BY seq DESC
@@ -558,12 +580,14 @@ type CoverJob struct {
 	Kind   string
 	Runner string
 	Model  string
+	// Covers are the requirement IDs the job was started with.
+	Covers []string
 }
 
 // CoverJobs lists the fix and general jobs of repo whose covers were read from checklist id (any
 // version), oldest first.
 func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
-	rows, err := s.db.Query(`SELECT id, kind, runner, model, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
+	rows, err := s.db.Query(`SELECT id, kind, runner, model, covers, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
 		AND kind IN ('fix','general') ORDER BY created_at, id`, repo)
 	if err != nil {
 		return nil, fmt.Errorf("cover jobs: %w", err)
@@ -572,8 +596,8 @@ func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
 	var out []CoverJob
 	for rows.Next() {
 		var j CoverJob
-		var cc string
-		if err := rows.Scan(&j.ID, &j.Kind, &j.Runner, &j.Model, &cc); err != nil {
+		var covers, cc string
+		if err := rows.Scan(&j.ID, &j.Kind, &j.Runner, &j.Model, &covers, &cc); err != nil {
 			return nil, fmt.Errorf("cover jobs: %w", err)
 		}
 		var c CoverContract
@@ -581,6 +605,7 @@ func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
 			return nil, fmt.Errorf("cover jobs: job %s: cover_contract: %w", j.ID, err)
 		}
 		if c.ChecklistID == id {
+			j.Covers = SplitNames(covers)
 			out = append(out, j)
 		}
 	}

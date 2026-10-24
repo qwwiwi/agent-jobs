@@ -377,6 +377,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate db: gate results: %w", err)
 		}
 	}
+	if _, err := db.Exec(manifestSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: manifest-check records: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 

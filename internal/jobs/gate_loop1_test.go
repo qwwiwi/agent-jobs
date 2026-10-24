@@ -60,7 +60,7 @@ func TestJudgeTreeDropsAgentContext(t *testing.T) {
 		return nil
 	})
 	slices.Sort(got)
-	if want := []string{"inside.link", "main.go", "run.sh", "sub/code.go", "tracked.txt"}; !slices.Equal(got, want) {
+	if want := []string{"inside.link", "main.go", "run.sh", "scripts/manifest-check.sh", "sub/code.go", "tracked.txt"}; !slices.Equal(got, want) {
 		t.Fatalf("files %v, want %v", got, want)
 	}
 }
@@ -68,7 +68,7 @@ func TestJudgeTreeDropsAgentContext(t *testing.T) {
 // A judge job runs with no project setting source and no MCP server: the daemon-written settings.json is
 // all claude loads, and the code's agent context is not in its work dir.
 func TestJudgeLaunchLoadsNoProjectContext(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	repo, sha := contextRepo(t)
 	approveBrief(t, m, repo)
 	j, err := m.StartGate(GateRequest{Kind: KindJudge, Repo: repo, SHA: sha, Model: "sonnet"})
@@ -154,7 +154,7 @@ func TestBrainProxyRefusesGateJobs(t *testing.T) {
 // A schema-valid block the job writes into report.md itself, with an empty final message, is not the
 // gate result: the job fails and nothing is stored.
 func TestGateResultFromFileIsRejected(t *testing.T) {
-	m := newManager(t)
+	m := acceptanceManager(t, "")
 	repo := briefRepo(t)
 	for _, kind := range []string{KindSlicing, KindJudge} {
 		r := GateRequest{Kind: kind, Repo: repo, Model: "sonnet"}

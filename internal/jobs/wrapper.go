@@ -456,6 +456,18 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
+	if manifestStepFor(st, id) {
+		// The judge's manifest-check (Wave F, F5): before the runner starts, never after; a failure ends the
+		// job here, with nothing recorded but the failure.
+		fail, rc := runManifestStep(jobDir, token, st, id, &opts, stderrLog)
+		if rc != 0 {
+			return rc
+		}
+		if fail != "" {
+			fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+			return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, GateFailure: fail}, record, stderrLog)
+		}
+	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
 		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record)
@@ -523,6 +535,21 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)
+		return 2
+	}
+	return 0
+}
+
+// finishBeforeRunner records the completion of a job that ends before its runner starts (exit 1, the
+// reason in res) and writes exit_code.
+func finishBeforeRunner(jobDir string, res StreamResult, record func(StreamResult) error, log io.Writer) int {
+	res.Completed, res.ExitCode = true, 1
+	if err := record(res); err != nil {
+		fmt.Fprintln(log, "run-wrapper: record completion:", err)
+		return 2
+	}
+	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n")); err != nil {
+		fmt.Fprintln(log, "run-wrapper: write exit_code:", err)
 		return 2
 	}
 	return 0
