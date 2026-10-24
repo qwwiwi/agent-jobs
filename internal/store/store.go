@@ -327,6 +327,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
 	}
+	for _, alter := range waiversMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
