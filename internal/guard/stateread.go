@@ -46,38 +46,49 @@ type where struct {
 }
 
 // stateReadScope is what a job may not read: StateDir minus OwnDir, as configured and with symlinks
-// resolved. The path words of a Bash call resolve as in the protected-path check (pathScope), each
-// command of the top-level script against the directories in effect when it runs (at).
+// resolved; for the ReadAllow scope, everything ("/") minus the allowed paths. The path words of a
+// Bash call resolve as in the protected-path check (pathScope), each command of the top-level script
+// against the directories in effect when it runs (at).
 type stateReadScope struct {
 	*pathScope
 	state, own []string
-	ownRest    []string // the components of OwnDir below StateDir (jobs, <id>)
+	ownRests   [][]string // the components below StateDir of each own folder (jobs, <id>)
+	allow      bool       // the ReadAllow scope: stricter on what the guard cannot resolve
+	urls       bool       // the job has a read allowlist: a file URL with a query or a fragment is refused (fileURLs)
 	at         map[*simpleCmd]where
 }
 
+// cleanForms are p cleaned and, when it differs, with symlinks resolved; ok is false when the
+// resolution ran out of its link budget (resolveBounded).
+func cleanForms(p string) ([]string, bool) {
+	p = filepath.Clean(p)
+	forms := []string{p}
+	q, ok := resolveBounded(p, "/")
+	if q != p {
+		forms = append(forms, q)
+	}
+	return forms, ok
+}
+
 func newStateReadScope(scripts []*script, cfg Config) *stateReadScope {
-	r := &stateReadScope{}
-	unresolved := false
-	for _, p := range []string{cfg.StateDir, cfg.OwnDir} {
-		p = filepath.Clean(p)
-		forms := []string{p}
-		q, ok := resolveBounded(p, "/")
-		if !ok {
-			unresolved = true // where the root lies is unknown: the scope counts as expired (fail closed)
-		}
-		if q != p {
-			forms = append(forms, q)
-		}
-		if r.state == nil {
-			r.state = forms
-		} else {
-			r.own = forms
+	state, ok := cleanForms(cfg.StateDir)
+	unresolved := !ok // where the root lies is unknown: the scope counts as expired (fail closed)
+	r := &stateReadScope{allow: cfg.readAllowScope, urls: len(cfg.ReadAllow) > 0, state: state}
+	owns := []string{cfg.OwnDir}
+	if r.allow {
+		owns = cfg.ReadAllow
+	}
+	for _, o := range owns {
+		if o != "" {
+			forms, ok := cleanForms(o)
+			unresolved = unresolved || !ok
+			r.own = append(r.own, forms...)
 		}
 	}
-	if cfg.OwnDir == "" {
-		r.own = nil
-	} else if rel, err := filepath.Rel(r.state[0], r.own[0]); err == nil && within(r.own[0], r.state[0]) {
-		r.ownRest = strings.Split(filepath.ToSlash(rel), "/")
+	for _, o := range r.own {
+		if rel, err := filepath.Rel(r.state[0], o); err == nil && within(o, r.state[0]) && rel != "." {
+			r.ownRests = append(r.ownRests, strings.Split(filepath.ToSlash(rel), "/"))
+		}
 	}
 	// The protected set of the scope is the state dir and its entries: after a cd the guard cannot
 	// resolve, a relative word naming one of them (`jobs.db`, `jobs/k`) is refused.
@@ -151,6 +162,9 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 		}
 	}
 	for _, p := range cands {
+		if r.allow && !topExists(p) {
+			continue // nothing to read under a top-level name that does not exist
+		}
 		if inJobGitDir(p, r.state) && !inJobGitDir(p, r.own) {
 			return p, true
 		}
@@ -159,6 +173,25 @@ func (r *stateReadScope) blocked(abs, raw string, tree bool) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// topExists reports whether the first component of the absolute path p exists ("/" does).
+func topExists(p string) bool {
+	c := splitPath(p)
+	if len(c) == 0 {
+		return true
+	}
+	_, err := os.Lstat(string(filepath.Separator) + c[0])
+	return err == nil
+}
+
+// blockedMsg is the refusal of what reaching p: agent-jobs state, or for the ReadAllow scope a path
+// outside what the job may read.
+func (r *stateReadScope) blockedMsg(what, p string) string {
+	if r.allow {
+		return readAllowBlocked(what, p)
+	}
+	return stateBlocked(what, p)
 }
 
 // wordMode says how a path word is checked: tree for an argument of a recursive reader (an ancestor
@@ -177,16 +210,161 @@ func rawOf(w string) string {
 	return w
 }
 
+// attachedPaths are the paths a word may carry attached ("" = none): the value after `@` (curl's
+// `-d @p`) and, in a short option with its value attached (`-f/p`, `-T~/p`, `-xvf../p`), each suffix that
+// may start it (the guard does not know which letter takes the value): the one after the first letter
+// and each one starting a path (`/`, `~`, `.` after another character). rawOf sees only `--opt=value`.
+func attachedPaths(w string) []string {
+	switch {
+	case strings.HasPrefix(w, "@") && len(w) > 1:
+		return []string{w[1:]}
+	case strings.HasPrefix(w, "-") && !strings.HasPrefix(w, "--"):
+		var out []string
+		for k := 2; k < len(w); k++ {
+			if k == 2 || strings.IndexByte("/~.", w[k]) >= 0 && strings.IndexByte("/~.", w[k-1]) < 0 {
+				out = append(out, w[k:])
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// rePct is a percent-encoded byte (`%2F`).
+var rePct = regexp.MustCompile(`%[0-9A-Fa-f]{2}`)
+
+// percentDecoded returns w with every %xx decoded, round after round until none is left (`%252F`
+// decodes to `%2F`, then to `/`), ok false when it has none: a URL reader (curl, python's urllib) opens
+// `file:///tmp%2Fx` as /tmp/x, so the decoded form is checked as well. Each round shortens the word, so
+// the rounds are at most a third of its length.
+func percentDecoded(w string) (string, bool) {
+	if !rePct.MatchString(w) {
+		return "", false
+	}
+	for rePct.MatchString(w) {
+		w = percentDecodedOnce(w)
+	}
+	return w, true
+}
+
+// percentDecodedOnce returns w with each %xx decoded once, as curl, wget and python's urllib decode the
+// path of a file URL (`%252F` decodes to `%2F`).
+func percentDecodedOnce(w string) string {
+	return rePct.ReplaceAllStringFunc(w, func(h string) string {
+		b, _ := strconv.ParseUint(h[1:], 16, 8)
+		return string([]byte{byte(b)})
+	})
+}
+
+// reFileURL is a file URL in a text, in any case, up to a quote, a blank or a shell operator.
+var reFileURL = regexp.MustCompile("(?i)file:([^\\s'\"`<>|&;()]*)")
+
+// fileURLPaths returns the paths of a file URL u (the text after `file:`) as curl, wget and python's
+// urllib open it: after an optional host (`file:///p`, `file://localhost/p`, `file:/p`), cut at a raw
+// query or fragment and percent-decoded once. curl cuts at the first raw `?` or `#`, urllib only at the
+// first raw `#` (it opens `x?q` as is), so both forms are returned when they differ; an encoded
+// `%3F`/`%23` stays a filename character. A host with no path has none.
+func fileURLPaths(u string) []string {
+	curl, _, _ := strings.Cut(u, "#")
+	urllib := curl
+	if i := strings.IndexByte(curl, '?'); i >= 0 {
+		curl = curl[:i]
+	}
+	cuts := []string{curl}
+	if urllib != curl {
+		cuts = append(cuts, urllib)
+	}
+	var out []string
+	for _, c := range cuts {
+		if rest, ok := strings.CutPrefix(c, "//"); ok {
+			i := strings.IndexByte(rest, '/')
+			if i < 0 {
+				continue
+			}
+			c = rest[i:]
+		}
+		out = append(out, percentDecodedOnce(c))
+	}
+	return out
+}
+
+// reDotSegment is a `.` or `..` segment of a URL path.
+var reDotSegment = regexp.MustCompile(`(^|/)\.\.?(/|$)`)
+
+// unsafeFileURL returns why a file URL u (the text after `file:`) is refused without a path check (""
+// = it is not): still percent-encoded after one decode (`%252F`: a URL reader opens a name with `%2F`
+// in it, a full decode would check another path), a `.`/`..` segment as written or decoded once (the
+// reader resolves it against a path the guard may see differently), and, with queries (a job with a
+// read allowlist), a query or a fragment (`?`, `#`: a URL reader cuts the path there).
+func unsafeFileURL(u string, queries bool) string {
+	once := percentDecodedOnce(u)
+	switch {
+	case rePct.MatchString(once):
+		return "a file URL still percent-encoded after one decode"
+	case reDotSegment.MatchString(u) || reDotSegment.MatchString(once):
+		return "a file URL with a dot segment"
+	case queries && strings.ContainsAny(once, "?#"):
+		return "a file URL with a query or a fragment"
+	}
+	return ""
+}
+
+// fileURLs returns a refusal when a file URL in s reaches the state. It fails closed in every scope: a
+// URL still percent-encoded after one decode or with a dot segment is refused, for a job with a read
+// allowlist also one with a query or a fragment (a sqlite URI `file:x.db?mode=ro` stays usable in
+// other jobs), and the paths of any other, cut at a raw query or fragment as each reader cuts them and
+// decoded once, are checked strictly.
+func (r *stateReadScope) fileURLs(s string, at where, m wordMode) string {
+	if !strings.Contains(strings.ToLower(s), "file:") {
+		return ""
+	}
+	m.strict = true
+	for _, u := range reFileURL.FindAllStringSubmatch(s, -1) {
+		if why := unsafeFileURL(u[1], r.urls); why != "" {
+			return r.blockedMsg("`"+u[0]+"`", u[0]+" ("+why+")")
+		}
+		for _, p := range fileURLPaths(u[1]) {
+			if p == "" {
+				continue
+			}
+			if reason := r.word(p, at, m); reason != "" {
+				return reason
+			}
+		}
+	}
+	return ""
+}
+
 // word returns a refusal when a path word reaches the state from a directory the command may run in.
+// A path attached to an option, a file URL and the percent-decoded word are checked too.
 func (r *stateReadScope) word(w string, at where, m wordMode) string {
+	if r.over() {
+		return cannot("state read check exceeded the guard time budget")
+	}
+	lenient := wordMode{tree: m.tree, dynamic: m.dynamic}
+	for _, p := range attachedPaths(w) {
+		if reason := r.word(p, at, lenient); reason != "" {
+			return reason
+		}
+	}
+	if reason := r.fileURLs(w, at, m); reason != "" {
+		return reason
+	}
+	if d, ok := percentDecoded(w); ok {
+		// The decoded word as a text: its path-like pieces (the word itself when it has no separator)
+		// and its file URLs; decoded to the end, none of them decodes again.
+		if reason := r.text(d, at); reason != "" {
+			return reason
+		}
+	}
 	exp, ok := r.expandHome(rawOf(w))
 	if !ok {
 		p, rest := pathOf(w), ""
 		if _, s, found := strings.Cut(p, "/"); found {
 			rest = s
 		}
-		if m.dynamic && r.couldReach(rest, m.tree) {
-			return stateBlocked("`"+w+"`", w)
+		if m.dynamic && (r.allow || r.couldReach(rest, m.tree)) {
+			return r.blockedMsg("`"+w+"`", w+" (a word the guard cannot expand)")
 		}
 		return ""
 	}
@@ -200,7 +378,7 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 	}
 	for _, raw := range raws {
 		if r.extractedLinkPath(raw) {
-			return stateBlocked("`"+w+"`", w+" (through a link the extraction may create)")
+			return r.blockedMsg("`"+w+"`", w+" (through a link the extraction may create)")
 		}
 		if hasGlob(exp) {
 			if reason := r.glob("`"+w+"`", raw, m.tree); reason != "" {
@@ -214,11 +392,11 @@ func (r *stateReadScope) word(w string, at where, m wordMode) string {
 			}
 		}
 		if q, ok := r.blocked(raw, raw, m.tree); ok {
-			return stateBlocked("`"+w+"`", q)
+			return r.blockedMsg("`"+w+"`", q)
 		}
 	}
-	if m.dynamic && at.dynamic != "" && r.couldReach(filepath.Clean(exp), m.tree) {
-		return stateBlocked("`"+w+"`", w+" (after cd "+at.dynamic+")")
+	if m.dynamic && at.dynamic != "" && (r.allow && !filepath.IsAbs(exp) || r.couldReach(filepath.Clean(exp), m.tree)) {
+		return r.blockedMsg("`"+w+"`", w+" (after cd "+at.dynamic+")")
 	}
 	return ""
 }
@@ -256,14 +434,14 @@ func (r *stateReadScope) glob(what, pat string, tree bool) string {
 		full := path.Join(append([]string{filepath.ToSlash(f)}, rest...)...)
 		pc := splitPath(full)
 		for _, s := range r.state {
-			if globReach(pc, splitPath(s), r.ownRest, tree) {
-				return stateBlocked(what, full)
+			if globReach(pc, splitPath(s), r.ownRests, tree) && (!r.allow || topCanMatch(pc)) {
+				return r.blockedMsg(what, full)
 			}
 		}
 		matches, _ := filepath.Glob(full)
 		for _, m := range matches {
 			if q, ok := r.blocked(m, "", tree); ok {
-				return stateBlocked(what, q)
+				return r.blockedMsg(what, q)
 			}
 		}
 	}
@@ -279,10 +457,16 @@ func splitPath(p string) []string {
 	return strings.Split(p, "/")
 }
 
+// topCanMatch reports whether the first component of the pattern components pat can stand for an
+// existing top-level name (a wildcard one can).
+func topCanMatch(pat []string) bool {
+	return len(pat) == 0 || hasGlob(pat[0]) || topExists("/"+pat[0])
+}
+
 // globReach reports whether the pattern components pat can match the state dir s, a path inside it
-// that is not inside the own folder (ownRest: its components below s), or, with tree, an ancestor of
-// s. A brace or `**` component can stand for anything.
-func globReach(pat, s, ownRest []string, tree bool) bool {
+// that is not inside an own folder (ownRests: their components below s), or, with tree, an ancestor
+// of s. A brace or `**` component can stand for anything.
+func globReach(pat, s []string, ownRests [][]string, tree bool) bool {
 	for ; len(s) > 0; pat, s = pat[1:], s[1:] {
 		if len(pat) == 0 {
 			return tree
@@ -294,15 +478,21 @@ func globReach(pat, s, ownRest []string, tree bool) bool {
 			return false
 		}
 	}
-	if len(ownRest) == 0 || len(pat) < len(ownRest) {
-		return true
+	return !slices.ContainsFunc(ownRests, func(own []string) bool { return ownCovers(pat, own) })
+}
+
+// ownCovers reports whether the pattern components pat stay inside the own folder whose components are
+// own: its literal first components are own's.
+func ownCovers(pat, own []string) bool {
+	if len(own) == 0 || len(pat) < len(own) {
+		return false
 	}
-	for i, o := range ownRest {
+	for i, o := range own {
 		if hasGlob(pat[i]) || pat[i] != o {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // globComp reports whether one pattern component can match a name (a brace or a malformed pattern can).
@@ -320,8 +510,12 @@ func tokens(w string) []string {
 	return literalTokens(w, " \t\r\n`=:,;()[]{}<>|&")
 }
 
-// text returns a refusal when a path-like piece of a text names the state.
+// text returns a refusal when a path-like piece of a text, or the path of a file URL in it, names the
+// state.
 func (r *stateReadScope) text(w string, at where) string {
+	if reason := r.fileURLs(w, at, wordMode{}); reason != "" {
+		return reason
+	}
 	for _, t := range tokens(w) {
 		if reason := r.word(t, at, wordMode{}); reason != "" {
 			return reason
@@ -559,7 +753,7 @@ func (r *stateReadScope) whereOf(c *simpleCmd) (where, string) {
 				n = k
 			}
 			if q, bad := r.blocked(n, "", false); bad {
-				return at, stateBlocked("the working directory `"+v+"`", q)
+				return at, r.blockedMsg("the working directory `"+v+"`", q)
 			}
 			if !slices.Contains(dirs, n) && len(dirs) < maxScopeDirs {
 				dirs = append(dirs, n)
@@ -674,7 +868,7 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 					w := argv[ti]
 					t, ok := r.expandHome(w)
 					if !ok {
-						return stateBlocked("the symlink target `"+w+"`", w)
+						return r.blockedMsg("the symlink target `"+w+"`", w)
 					}
 					// under places a link directory (or link) in each working directory; an absolute one
 					// stays as written (`ln -s . ~/L` links to $HOME, not to <cwd>/$HOME).
@@ -705,12 +899,12 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 							}
 						}
 						if q, bad := r.blocked(raw, raw, true); bad {
-							return stateBlocked("the symlink target `"+w+"`", q)
+							return r.blockedMsg("the symlink target `"+w+"`", q)
 						}
 					}
 					for _, raw := range lexical {
 						if q, bad := r.blocked(filepath.Clean(raw), "", true); bad {
-							return stateBlocked("the symlink target `"+w+"`", q)
+							return r.blockedMsg("the symlink target `"+w+"`", q)
 						}
 					}
 				}
@@ -732,6 +926,11 @@ func (r *stateReadScope) checkSymlinks(scripts []*script) string {
 		}
 	}
 	return ""
+}
+
+func readAllowBlocked(what, p string) string {
+	return "blocked by guard: " + what + " reaches `" + p + "`, outside what this job may read (its own job folder " +
+		"with its work dir, its session dir and the system dirs programs run from); a gate job gets nothing but its input."
 }
 
 func stateBlocked(what, p string) string {
@@ -763,7 +962,8 @@ func checkStateRead(scripts []*script, _ string, cfg Config) string {
 }
 
 // readScopes are the configurations of the state-read check: cfg (its StateDir and OwnDir) when it
-// has a state dir, then one per NoRead directory, as a state dir without an own folder.
+// has a state dir, then one per NoRead directory, as a state dir without an own folder, then, with
+// ReadAllow, the whole file system ("/") with the allowed paths as its own folders.
 func readScopes(cfg Config) []Config {
 	var out []Config
 	if cfg.StateDir != "" {
@@ -771,7 +971,12 @@ func readScopes(cfg Config) []Config {
 	}
 	for _, d := range cfg.NoRead {
 		c := cfg
-		c.StateDir, c.OwnDir, c.NoRead = d, "", nil
+		c.StateDir, c.OwnDir, c.NoRead = d, "", nil // ReadAllow kept: it marks a job with a read allowlist
+		out = append(out, c)
+	}
+	if len(cfg.ReadAllow) > 0 {
+		c := cfg
+		c.StateDir, c.OwnDir, c.NoRead, c.readAllowScope = "/", "", nil, true
 		out = append(out, c)
 	}
 	return out
@@ -786,7 +991,7 @@ func checkStateReadIn(scripts []*script, cfg Config) string {
 	// resolved against the directories later cds lead to (`cd .. && cat prompt.md`).
 	for _, d := range r.dirs[1:] {
 		if p, ok := r.blocked(d, "", false); ok {
-			return stateBlocked("cd", p)
+			return r.blockedMsg("cd", p)
 		}
 	}
 	if reason := r.checkSymlinks(scripts); reason != "" {
@@ -813,13 +1018,32 @@ func checkStateReadIn(scripts []*script, cfg Config) string {
 				if tree { // `cd ~ && rg x`, `grep -r x` with no path: the working directory is read
 					for _, d := range at.dirs {
 						if p, ok := r.blocked(d, "", true); ok {
-							return stateBlocked("`"+name+"` in `"+d+"`", p)
+							return r.blockedMsg("`"+name+"` in `"+d+"`", p)
 						}
 					}
 				}
 				for _, w := range append(slices.Clone(c.inRedirs), c.outRedirs...) {
 					if reason := r.word(w, at, wordMode{dynamic: true, strict: true}); reason != "" {
 						return reason
+					}
+				}
+				if r.allow {
+					// An expansion is resolved only when the command runs: under an allowlist, no word of a
+					// command or redirection may come from one.
+					for k, w := range c.words {
+						if k < len(c.dyn) && c.dyn[k] && !((name == "cd" || name == "pushd") && k > v.start) {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
+					}
+					for k, w := range c.outRedirs {
+						if k < len(c.outDyn) && c.outDyn[k] || strings.ContainsAny(w, "$`") {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
+					}
+					for _, w := range c.inRedirs {
+						if strings.ContainsAny(w, "$`") {
+							return readAllowBlocked("`"+w+"`", w+" (an expansion the guard cannot resolve)")
+						}
 					}
 				}
 				words := c.words
@@ -914,7 +1138,7 @@ func checkFileReadIn(tool, path, pattern string, cfg Config) string {
 		}
 	}
 	if p, ok := r.blocked(raw, raw, tool == "Grep"); ok {
-		return stateBlocked(tool+" of `"+path+"`", p)
+		return r.blockedMsg(tool+" of `"+path+"`", p)
 	}
 	return r.unverified(tool + " of `" + path + "`")
 }

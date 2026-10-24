@@ -9,15 +9,17 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
+	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
 
-// approvedChecklist inits id in repo, adds one row and approves it.
-func approvedChecklist(t *testing.T, cs *sdk.ClientSession, repo, id, words string) ChecklistView {
+// approvedChecklist inits id in repo, adds one row, records a clean slicing check (F3) and approves it.
+func approvedChecklist(t *testing.T, m *jobs.Manager, cs *sdk.ClientSession, repo, id, words string) ChecklistView {
 	t.Helper()
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "id": id, "brief": words}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
 		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
+	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
 	if !v.Approved {
 		t.Fatalf("approve %s: %+v", id, v)
@@ -31,7 +33,7 @@ func TestChecklistPrefixBoundPerID(t *testing.T) {
 	m := newManager(t)
 	repo, _ := gitRepo(t)
 	cs := connect(t, mustServer(t, m))
-	approvedChecklist(t, cs, repo, "first", "I want a login page.")
+	approvedChecklist(t, m, cs, repo, "first", "I want a login page.")
 	path, briefPath := checklist.ChecklistPath(repo), checklist.BriefPath(repo)
 	text, _ := os.ReadFile(path)
 	brief, _ := os.ReadFile(briefPath)
@@ -52,7 +54,7 @@ func TestChecklistPrefixBoundPerID(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(repo, "brief")); err != nil {
 		t.Fatal(err)
 	}
-	approvedChecklist(t, cs, repo, "second", "other words")
+	approvedChecklist(t, m, cs, repo, "second", "other words")
 	if err := os.RemoveAll(filepath.Join(repo, "brief")); err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +91,9 @@ func TestChecklistPrefixBoundAtInit(t *testing.T) {
 // checklist_set writes nothing (the first agent's approval holds) and a change is refused.
 func TestChecklistOtherAgentStoreNoVoid(t *testing.T) {
 	repo, _ := gitRepo(t)
-	a := connect(t, mustServer(t, newManager(t)))
-	approvedChecklist(t, a, repo, "demo", "I want a login page.")
+	ma := newManager(t)
+	a := connect(t, mustServer(t, ma))
+	approvedChecklist(t, ma, a, repo, "demo", "I want a login page.")
 	before, _ := os.ReadFile(checklist.ChecklistPath(repo))
 	b := connect(t, mustServer(t, newManager(t)))
 	var v ChecklistView
@@ -117,7 +120,7 @@ func TestChecklistGetRedactsRows(t *testing.T) {
 	m := newManager(t)
 	repo, _ := gitRepo(t)
 	cs := connect(t, mustServer(t, m))
-	approvedChecklist(t, cs, repo, "demo", "I want a login page.")
+	approvedChecklist(t, m, cs, repo, "demo", "I want a login page.")
 	secret := "ghp_" + strings.Repeat("a1B2", 9)
 	path := checklist.ChecklistPath(repo)
 	text, _ := os.ReadFile(path)

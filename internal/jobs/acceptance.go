@@ -53,7 +53,7 @@ const (
 )
 
 // AcceptanceRefusedKinds are the kinds that change no code; acceptance_cmd is refused for them.
-var AcceptanceRefusedKinds = []string{"review", "research"}
+var AcceptanceRefusedKinds = []string{"review", "research", KindSlicing, KindJudge}
 
 // ValidateAcceptanceCmd checks an acceptance command for a job of kind and returns it trimmed ("" =
 // none): one line (no newline, carriage return or NUL anywhere in the input, also not at either end),
@@ -161,11 +161,12 @@ func acceptanceNote(j *store.Job) string {
 	return RedactPrintable(strings.TrimSpace(note), 80)
 }
 
-// verdict is Verdict, then a succeeded verdict turns into a failure when the job's acceptance command
-// did not pass. The row is read again: the wrapper records the result right before exit_code, possibly
+// verdict is Verdict, then a succeeded verdict turns into a failure when a gate job's result was not
+// stored (gateVerdict) or the job's acceptance command did not pass. The row is read again: the wrapper records the result right before exit_code, possibly
 // after this tick listed the running jobs.
 func (m *Manager) verdict(j *store.Job, code int, res StreamResult, dir string) (string, string) {
 	status, msg := Verdict(code, res, dir)
+	status, msg = m.gateVerdict(j, status, msg, res)
 	if status != store.StatusSucceeded || j.AcceptanceCmd == "" {
 		return m.completedReportContract(j, status, msg, res, dir)
 	}

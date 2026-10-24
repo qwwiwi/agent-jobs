@@ -83,6 +83,17 @@ type Config struct {
 	NoRead []string
 	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
 	ReadOnly string
+	// ReadAllow, when not empty, are the only paths (directories or files) a job reads, a gate job's
+	// (Wave F: its own folder with its work dir, its session dirs, the system dirs programs run from):
+	// every other path is refused for the read tools and as a Bash word, as agent-jobs state is, with
+	// the same resolution (symlinks, cd, -C, globs, recursive readers, xargs). Two rules are stricter
+	// than the state check: after a cd the guard cannot resolve every relative word is refused, and so is
+	// a command or redirection word it cannot expand ($VAR, a substitution). A path under a top-level
+	// name that does not exist (`/api/v1` in a pattern) cannot be read and is not refused.
+	ReadAllow []string
+	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
+	// paths its own folders).
+	readAllowScope bool
 }
 
 // HookInput is the subset of the Claude Code PreToolUse payload the guard reads.
@@ -165,6 +176,12 @@ func decideCall(r io.Reader, cfg Config) (string, error) {
 	}
 	if in.ToolName != "Bash" {
 		return "", nil
+	}
+	if len(cfg.ReadAllow) > 0 && backgroundBash(in.RawInput) {
+		// claude prints another result event when a background task ends: a gate job's result must be the
+		// only result event of its run (a second one is taken for a line another process wrote).
+		return "blocked by guard: a gate job runs Bash in the foreground only (run_in_background is refused): " +
+			"run the command without it.", nil
 	}
 	return Check(in.ToolInput.Command, cfg), nil
 }
@@ -3016,4 +3033,23 @@ func checkForeignIdentity(scripts []*script, _ string, cfg Config) string {
 		}
 		return ""
 	})
+}
+
+// backgroundBash reports a Bash input with a key run_in_background, in any case, set to anything but
+// false or null: encoding/json matches a field ignoring case and keeps the last key, so a decoded struct
+// would read `{"run_in_background":true,"Run_In_Background":false}` as false.
+func backgroundBash(raw json.RawMessage) bool {
+	var in map[string]json.RawMessage
+	if json.Unmarshal(raw, &in) != nil {
+		return true // an input the guard cannot read is refused
+	}
+	for k, v := range in {
+		if !strings.EqualFold(k, "run_in_background") {
+			continue
+		}
+		if s := strings.TrimSpace(string(v)); s != "false" && s != "null" {
+			return true
+		}
+	}
+	return false
 }

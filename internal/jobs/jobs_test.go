@@ -36,6 +36,23 @@ echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
 printf '%s' "$prompt" > ../stdin.txt
 { printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt
+if [[ -n "${FAKE_GATE_REPORT-}" ]]; then
+  # A gate job (gate_test.go): what its work dir holds, then the report the test wrote.
+  find . -mindepth 1 | LC_ALL=C sort > ../work-seen.txt
+  printf '%s\n' "${CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD-unset}" > ../claudemd-env.txt
+  if [[ -n "${FAKE_GATE_FILE-}" ]]; then
+    # The job writes the block into report.md itself and ends with an empty final message.
+    cp "$FAKE_GATE_REPORT" ../report.md
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":""}'
+    exit 0
+  fi
+  if [[ -n "${FAKE_GATE_TWICE-}" ]]; then
+    # Another process writes a second result line into the runner's stdout after the real one.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.1,"result":"no block"}'
+  fi
+  python3 -c 'import json,sys; print(json.dumps({"type":"result","subtype":"success","is_error":False,"num_turns":2,"total_cost_usd":0.1,"result":open(sys.argv[1]).read()}))' "$FAKE_GATE_REPORT"
+  exit 0
+fi
 # Sessions (FAKE_SESSIONS = the test's CLAUDE_CONFIG_DIR): --session-id creates the transcript,
 # --resume needs it (and fails like claude when it is missing or the update says FAKE_RESUME_FAIL).
 sid=""; resume=""; args=("$@")

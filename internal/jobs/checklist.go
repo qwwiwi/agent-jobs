@@ -36,7 +36,7 @@ func CheckCommit(repo, sha string) error {
 	if !commitSHARe.MatchString(sha) {
 		return fmt.Errorf("sha %q must be a full commit id (40 or 64 lowercase hex)", sha)
 	}
-	if _, err := git(repo, "cat-file", "-e", sha+"^{commit}"); err != nil {
+	if _, err := git(repo, noReplace, "cat-file", "-e", sha+"^{commit}"); err != nil {
 		return fmt.Errorf("sha %s is not a commit in %s", sha, repo)
 	}
 	return nil
@@ -49,8 +49,11 @@ func CheckCommit(repo, sha string) error {
 // reads a consistent pair. A job never reaches it: the guard refuses every read and write there
 // (--no-read), so a job cannot hold a lock and block the tools.
 func (m *Manager) ChecklistLockDir() string {
-	return filepath.Join(filepath.Dir(m.StateDir), "checklist-locks")
+	return filepath.Join(filepath.Dir(m.StateDir), checklistLockDirName)
 }
+
+// checklistLockDirName is the name of the checklist lock directory under the agent-jobs home.
+const checklistLockDirName = "checklist-locks"
 
 // checklistLockWait bounds the wait for the checklist lock: a stuck holder (a hung tool call) must not
 // hang the orchestrator's tools.
@@ -66,10 +69,15 @@ func (m *Manager) LockChecklist(repo string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("checklist lock: the git common dir of %s: %w", repo, err)
 	}
+	return lockChecklistAt(m.ChecklistLockDir(), common)
+}
+
+// lockChecklistAt takes the checklist lock of the repository whose git common dir is common in the lock
+// directory dir (LockChecklist; a gate job's wrapper, which knows the common dir from the job's input).
+func lockChecklistAt(dir, common string) (func(), error) {
 	if r, err := filepath.EvalSymlinks(common); err == nil {
 		common = r
 	}
-	dir := m.ChecklistLockDir()
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("checklist lock dir: %w", err)
 	}
@@ -124,15 +132,11 @@ func (m *Manager) coverContract(top, main, base string, covers []string) (*store
 	if err != nil {
 		return nil, fmt.Errorf("covers: %s (%s): %w", checklist.ChecklistRel, source, err)
 	}
-	a, err := m.Store.LatestApproval(main)
+	ok, _, reason, _, err := m.ChecklistStatus(main, c, []byte(brief))
 	if err != nil {
 		return nil, fmt.Errorf("covers: %w", err)
 	}
-	var rec *checklist.Record
-	if a != nil {
-		rec = &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256, BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}
-	}
-	if ok, _, reason := c.Status([]byte(brief), rec); !ok {
+	if !ok {
 		return nil, fmt.Errorf("covers: %s (%s; checklist %s, version %d) is not the repository's latest approved checklist: %s "+
 			"(the owner approves it with checklist_set first)", checklist.ChecklistRel, source, c.ID, c.Version, reason)
 	}
