@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -46,23 +47,35 @@ func CheckCommit(repo, sha string) error {
 // place all work trees and all agents share (a job never writes there: the guard protects git dirs).
 const ChecklistLockFile = "agent-jobs-checklist.lock"
 
+// checklistLockWait bounds the wait for the checklist lock: a job can open the lock file (it lies in
+// the git common dir every worktree shares) and hold it, which must not hang the orchestrator's tools.
+var checklistLockWait = 30 * time.Second
+
 // LockChecklist takes <git-common-dir>/agent-jobs-checklist.lock of the repository repo (a work tree
-// root) exclusively, waiting for another holder, and returns the unlock. The lock does not depend on
-// m: two agents (two state dirs) on one repository wait for each other.
+// root) exclusively, waiting up to checklistLockWait for another holder, and returns the unlock. The
+// lock does not depend on m: two agents (two state dirs) on one repository wait for each other.
 func (m *Manager) LockChecklist(repo string) (func(), error) {
 	common, err := git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return nil, fmt.Errorf("checklist lock: the git common dir of %s: %w", repo, err)
 	}
-	f, err := os.OpenFile(filepath.Join(common, ChecklistLockFile), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	path := filepath.Join(common, ChecklistLockFile)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open checklist lock: %w", err)
 	}
+	deadline := time.Now().Add(checklistLockWait)
 	for {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-		if !errors.Is(err, syscall.EINTR) {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil || !(errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR)) {
 			break
 		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("the checklist lock %s is still held after %s (another checklist tool, or a stuck "+
+				"process holding it): try again", path, checklistLockWait)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if err != nil {
 		f.Close()

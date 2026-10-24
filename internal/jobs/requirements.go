@@ -62,7 +62,7 @@ const NoteNoRequirements = "report has no ### Requirements block in Findings / C
 
 // NoteRequirementsEmpty is the note of a job with covers whose «### Requirements» block has no line for
 // any covered ID (empty, prose or a table); it counts as report_off_contract.
-const NoteRequirementsEmpty = "report's ### Requirements block has no line for a covered ID (empty, prose or a table; the job has covers)"
+const NoteRequirementsEmpty = "report's ### Requirements block has no line for any covered ID (empty, prose or a table; the job has covers)"
 
 // redProofRe is the exact REDPROOF marker at the start of a line or field: «REDPROOFLESS» is not one.
 var redProofRe = regexp.MustCompile(`^REDPROOF(?:[^A-Za-z0-9_]|$)`)
@@ -70,19 +70,24 @@ var redProofRe = regexp.MustCompile(`^REDPROOF(?:[^A-Za-z0-9_]|$)`)
 // requirementIDRe is a requirement ID as a whole word (R01 does not match inside R01i or R010).
 var requirementIDRe = regexp.MustCompile(`\b(?:R[0-9]{2,}i?|G[0-9]{2,}|D[0-9]{2,})\b`)
 
-// negativeProofs are proof contents that say there is none.
-var negativeProofs = []string{"none", "n/a", "no", "not", "-"}
+// negativeProofs are first words of proof contents that say there is none (dashes split words, so
+// «-», «— none» and «not-run» are negative too).
+var negativeProofs = []string{"none", "n/a", "na", "no", "not", "nothing"}
 
 // redProof reads a REDPROOF line or field s: the IDs it names and whether it is a proof. It is one only
 // with the exact marker and real content: what is left without the IDs is not empty and does not start
-// with a negative word (none, n/a, no, not, -, any case).
+// with a negative word (none, n/a, na, no, not, nothing, or only dashes; any case).
 func redProof(s string) (ids []string, ok bool) {
 	if !redProofRe.MatchString(s) {
 		return nil, false
 	}
 	rest := s[len("REDPROOF"):]
 	words := strings.FieldsFunc(strings.ToLower(requirementIDRe.ReplaceAllString(rest, " ")), func(r rune) bool {
-		return r == ' ' || r == '\t' || r == ':' || r == '·' || r == ',' || r == ';' || r == '(' || r == ')' || r == '.'
+		switch r {
+		case ' ', '\t', ':', '·', ',', ';', '(', ')', '.', '-', '–', '—':
+			return true
+		}
+		return false
 	})
 	if len(words) == 0 || slices.Contains(negativeProofs, words[0]) {
 		return nil, false
@@ -251,7 +256,7 @@ func ParseRequirements(report string, covers []string) Requirements {
 }
 
 // requirementsNote is the report contract note for a job with covers: NoteNoRequirements when the
-// report has no block, NoteRequirementsEmpty when the block has no line for a covered ID, "" otherwise
+// report has no block, NoteRequirementsEmpty when the block has no line for any covered ID, "" otherwise
 // (and always "" without covers).
 func requirementsNote(report string, covers []string) string {
 	if len(covers) == 0 {
