@@ -36,7 +36,7 @@ func CheckCommit(repo, sha string) error {
 	if !commitSHARe.MatchString(sha) {
 		return fmt.Errorf("sha %q must be a full commit id (40 or 64 lowercase hex)", sha)
 	}
-	if _, err := git(repo, "cat-file", "-e", sha+"^{commit}"); err != nil {
+	if _, err := git(repo, noReplace, "cat-file", "-e", sha+"^{commit}"); err != nil {
 		return fmt.Errorf("sha %s is not a commit in %s", sha, repo)
 	}
 	return nil

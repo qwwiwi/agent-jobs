@@ -103,8 +103,8 @@ func TestGateEnforcedBlindAndLockDir(t *testing.T) {
 	}
 }
 
-// judge_start warns when the judge runs on the family of every coder of the checklist, and not when a
-// coder of another family exists or there is none.
+// judge_start warns when the judge runs on the family of a coder of the checklist, and not when no
+// coder shares it or there is none.
 func TestJudgeFamilyWarning(t *testing.T) {
 	m := newManager(t)
 	repo, sha := gateRepo(t)
