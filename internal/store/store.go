@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -156,6 +157,27 @@ type Job struct {
 	// Covers are the checklist requirement IDs the job works on (Wave F, F4), in the order given; empty
 	// for a job without (its report contract is unchanged).
 	Covers []string
+	// CoverContract is the snapshot of the covered rows taken at job_start, which the daemon puts into
+	// the job's prompt (nil for a job without covers).
+	CoverContract *CoverContract
+}
+
+// CoverContract is what a covered job is told about its requirements: the covered rows of the
+// repository's brief/CHECKLIST.md as they were at job_start (never the other rows, never BRIEF.md).
+type CoverContract struct {
+	ChecklistID string `json:"checklist_id"`
+	Version     int    `json:"version"`
+	// Source says where the checklist was read: "<base>" (committed there) or "work tree".
+	Source string     `json:"source"`
+	Rows   []CoverRow `json:"rows"`
+}
+
+// CoverRow is one covered checklist row: the ID, the owner's words verbatim and the contract.
+type CoverRow struct {
+	ID            string `json:"id"`
+	Verbatim      string `json:"verbatim"`
+	Contract      string `json:"contract"`
+	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
 }
 
 // AcceptanceTimedOut is the AcceptanceExit of an acceptance command ended by its timeout.
@@ -448,6 +470,7 @@ var migrations = []string{
 	`ALTER TABLE attempts ADD COLUMN wrapper_result TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN covers TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN requirements_claimed INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN cover_contract TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -580,7 +603,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers`
+	base_branch, merge_note, covers, cover_contract`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -644,7 +667,19 @@ func insertArgs(j *Job) []any {
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
-		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers)}
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract)}
+}
+
+// coverContractJSON is the cover_contract column: "" for none.
+func coverContractJSON(c *CoverContract) string {
+	if c == nil {
+		return ""
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "" // a struct of strings, ints and bools always marshals
+	}
+	return string(b)
 }
 
 type scanner interface{ Scan(dest ...any) error }
@@ -653,7 +688,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers string
+	var skills, delivered, covers, coverContract string
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
@@ -662,9 +697,15 @@ func scanJob(r scanner) (*Job, error) {
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
-		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers)
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract)
 	if err != nil {
 		return nil, err
+	}
+	if coverContract != "" {
+		j.CoverContract = &CoverContract{}
+		if err := json.Unmarshal([]byte(coverContract), j.CoverContract); err != nil {
+			return nil, fmt.Errorf("job %s: cover_contract: %w", j.ID, err)
+		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)
 	j.OutcomeAt = convTS(outcomeAt)
