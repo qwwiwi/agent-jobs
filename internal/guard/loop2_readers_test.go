@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// homeProtected adds a protected skill root directly in $HOME and a protected session transcript
 // dir in ~/.claude/projects, as a job's real configuration has them.
 func homeProtected(t *testing.T, cfg *Config) {
 	t.Helper()
@@ -18,6 +19,8 @@ func homeProtected(t *testing.T, cfg *Config) {
 	}
 }
 
+// Fix loop 2, item 1: an interpreter running a script or a module is no directory reader: the
+// directory holding a protected path stays a destination for it (`python3 -m zipfile --extract
 // evil.zip ..` writes into it), and the archive and package modules of python write whole trees.
 func TestInterpretersAreNoDirReaders(t *testing.T) {
 	_, _, cfg := jobFolderSetup(t)
@@ -33,6 +36,7 @@ func TestInterpretersAreNoDirReaders(t *testing.T) {
 		"python3 x.py src", "node scan.js .", "python3 -m pytest tests")
 }
 
+// Normal job work stays allowed under the fixes of loop 2: writes in the work tree and the job's
 // folder, go test, git add/commit, and readers in the job's folder.
 func TestNormalJobWorkAllowed(t *testing.T) {
 	_, _, cfg := jobFolderSetup(t)
