@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -87,18 +88,37 @@ func (m *Manager) LockChecklist(repo string) (func(), error) {
 	}, nil
 }
 
+// MaxCoverRowRunes caps the owner's words of a covered row (characters): a job's prompt carries each
+// covered row whole, never cut, so a longer row refuses job_start (split it into rows).
+const MaxCoverRowRunes = 4000
+
 // coverContract is the snapshot of covered rows a job with covers carries into its prompt (Wave F, F4):
-// the rows named in covers, read from brief/CHECKLIST.md as committed at base when that commit has
-// it, else from the work tree top the job was started from (where the checklist tools write; they
-// never commit). A covered ID that is not a row of that checklist refuses the start.
-func (m *Manager) coverContract(top, base string, covers []string) (*store.CoverContract, error) {
-	text, source, err := m.readCoverChecklist(top, base)
+// the rows named in covers, read from brief/CHECKLIST.md of the work tree top the job was started
+// from (where the checklist tools write; they never commit) when it has one, else as committed at
+// base, redacted before it is parsed. That checklist must be the latest approval stored for the
+// repository main (its hash, version and id), and every covered ID one of its rows, no longer than
+// MaxCoverRowRunes; otherwise the start is refused.
+func (m *Manager) coverContract(top, main, base string, covers []string) (*store.CoverContract, error) {
+	brief, text, source, err := m.readCoverChecklist(top, base)
 	if err != nil {
 		return nil, fmt.Errorf("covers: %w", err)
 	}
+	text, _ = Redact(text)
 	c, err := checklist.Parse(text)
 	if err != nil {
 		return nil, fmt.Errorf("covers: %s (%s): %w", checklist.ChecklistRel, source, err)
+	}
+	a, err := m.Store.LatestApproval(main)
+	if err != nil {
+		return nil, fmt.Errorf("covers: %w", err)
+	}
+	var rec *checklist.Record
+	if a != nil {
+		rec = &checklist.Record{ChecklistID: a.ChecklistID, Version: a.Version, SHA256: a.ChecklistSHA256, BriefSHA256: a.BriefSHA256, At: a.ApprovedAt}
+	}
+	if ok, _, reason := c.Status([]byte(brief), rec); !ok {
+		return nil, fmt.Errorf("covers: %s (%s; checklist %s, version %d) is not the repository's latest approved checklist: %s "+
+			"(the owner approves it with checklist_set first)", checklist.ChecklistRel, source, c.ID, c.Version, reason)
 	}
 	out := &store.CoverContract{ChecklistID: c.ID, Version: c.Version, Source: source}
 	var missing []string
@@ -107,6 +127,10 @@ func (m *Manager) coverContract(top, base string, covers []string) (*store.Cover
 		if !ok {
 			missing = append(missing, id)
 			continue
+		}
+		if n := utf8.RuneCountInString(r.Verbatim); n > MaxCoverRowRunes {
+			return nil, fmt.Errorf("covers: row %s is longer than %d characters (%d): a job's prompt carries a covered row whole; "+
+				"split it into rows", r.ID, MaxCoverRowRunes, n)
 		}
 		out.Rows = append(out.Rows, store.CoverRow{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract, PlaceholderOK: r.PlaceholderOK})
 	}
@@ -117,32 +141,53 @@ func (m *Manager) coverContract(top, base string, covers []string) (*store.Cover
 	return out, nil
 }
 
-// readCoverChecklist reads brief/CHECKLIST.md for coverContract and says where from.
-func (m *Manager) readCoverChecklist(top, base string) (text, source string, err error) {
-	spec := base + ":" + checklist.ChecklistRel
-	if _, err := git(top, "cat-file", "-e", spec); err == nil {
+// readCoverChecklist reads brief/BRIEF.md and brief/CHECKLIST.md for coverContract and says where from:
+// the work tree top when it has CHECKLIST.md (read under the checklist lock), else both as committed at
+// base.
+func (m *Manager) readCoverChecklist(top, base string) (brief, text, source string, err error) {
+	f, err := m.readWorkTreeBrief(top)
+	if err != nil {
+		return "", "", "", err
+	}
+	if f.Checklist != nil {
+		if f.Brief == nil {
+			return "", "", "", fmt.Errorf("%s has %s but no %s", top, checklist.ChecklistRel, checklist.BriefRel)
+		}
+		return string(f.Brief), string(f.Checklist), "work tree " + top, nil
+	}
+	blob := func(rel string) (string, error) {
+		spec := base + ":" + rel
+		if _, err := git(top, "cat-file", "-e", spec); err != nil {
+			return "", fmt.Errorf("%s has no %s in the work tree or committed at %s (run checklist_init and checklist_set first)",
+				top, rel, base)
+		}
 		b, err := gitRaw(top, "cat-file", "blob", spec)
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
 		if len(b) > checklist.MaxFileBytes {
-			return "", "", fmt.Errorf("%s at %s is larger than %d bytes", checklist.ChecklistRel, base, checklist.MaxFileBytes)
+			return "", fmt.Errorf("%s at %s is larger than %d bytes", rel, base, checklist.MaxFileBytes)
 		}
-		return string(b), "committed at " + base, nil
+		return string(b), nil
 	}
+	if text, err = blob(checklist.ChecklistRel); err != nil {
+		return "", "", "", err
+	}
+	if brief, err = blob(checklist.BriefRel); err != nil {
+		return "", "", "", err
+	}
+	return brief, text, "committed at " + base, nil
+}
+
+// readWorkTreeBrief reads the brief files of the work tree top under the checklist lock (never half of
+// a checklist_set's two renames).
+func (m *Manager) readWorkTreeBrief(top string) (*checklist.Files, error) {
 	unlock, err := m.LockChecklist(top)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	defer unlock()
-	f, err := checklist.Read(top)
-	if err != nil {
-		return "", "", err
-	}
-	if f.Checklist == nil {
-		return "", "", fmt.Errorf("%s has no %s (run checklist_init and checklist_set first)", top, checklist.ChecklistRel)
-	}
-	return string(f.Checklist), "work tree " + top, nil
+	return checklist.Read(top)
 }
 
 // RenderCoverContract is the prompt section of a job with covers: its rows (only those) and the
@@ -161,7 +206,8 @@ func RenderCoverContract(c *store.CoverContract, rules string) string {
 		if r.PlaceholderOK {
 			contract += " " + checklist.PlaceholderOK
 		}
-		fmt.Fprintf(&b, "- %s · %s · %s\n", r.ID, contract, Printable(r.Verbatim, 4000))
+		// Whole (coverContract caps the length) and redacted again: the stored snapshot is data from disk.
+		fmt.Fprintf(&b, "- %s · %s · %s\n", r.ID, contract, RedactPrintable(r.Verbatim, 0))
 	}
 	b.WriteString("\n" + rules + "\n\n")
 	return b.String()

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
+	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -27,6 +28,24 @@ func coverRepo(t *testing.T) string {
 	return repo
 }
 
+// approveCovers stores an owner approval of repo's work-tree brief files, as checklist_set approve does.
+func approveCovers(t *testing.T, m *jobs.Manager, repo string) {
+	t.Helper()
+	f, err := checklist.Read(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := checklist.Parse(string(f.Checklist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.PutApproval(store.ChecklistApproval{Repo: repo, ChecklistID: c.ID, Version: c.Version,
+		ChecklistSHA256: checklist.Hash(c.Rows, f.Brief), BriefSHA256: checklist.BriefPrefixSHA256(f.Brief), Quote: "yes",
+		ApprovedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // job_start takes covers (stored, shown by job_status); job_result of a covered job reads its
 // Requirements block (claimed done lines) and its commits' Requirements: trailers; a job without
 // covers shows neither.
@@ -34,6 +53,7 @@ func TestJobCoversRequirements(t *testing.T) {
 	m := newManager(t)
 	cs := connect(t, mustServer(t, m))
 	covered := coverRepo(t)
+	approveCovers(t, m, covered)
 	var v JobView
 	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = covered; a["covers"] = []string{"R01", "R03i"} }), &v)
 	if !slices.Equal(v.Covers, []string{"R01", "R03i"}) {

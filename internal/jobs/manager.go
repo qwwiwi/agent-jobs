@@ -365,7 +365,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if top == "" {
 			return nil, errors.New("covers need a repo: the covered rows are read from its " + checklist.ChecklistRel)
 		}
-		if cover, err = m.coverContract(top, base, covers); err != nil {
+		if cover, err = m.coverContract(top, repo, base, covers); err != nil {
 			return nil, err
 		}
 	}
