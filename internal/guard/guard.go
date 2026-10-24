@@ -614,7 +614,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						return fdAliasBlocked(a)
 					}
 				}
-				tree := treeWriters[name] || (name == "find" && findActs(argv[1:]))
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || pythonTreeWriter(name, argv)
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
@@ -649,7 +649,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					if h, ok := s.contains(a, code); ok {
 						return h.reason()
 					}
-					if name != "cd" && name != "pushd" && !dirReader(name, argv, c) {
+					if name != "cd" && name != "pushd" && !dirReader(name, argv) {
 						if p, ok := s.parentHit(a); ok {
 							return protectedBlocked(p)
 						}
