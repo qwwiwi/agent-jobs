@@ -322,3 +322,24 @@ func TestReadRefusesSymlink(t *testing.T) {
 		t.Fatal("write through a symlink accepted")
 	}
 }
+
+// A backslash is escaped as well as a pipe: «a \| b» and «a | b» hash differently, and a literal
+// backslash-pipe or a trailing backslash survives Render → Parse.
+func TestCellEscapesBackslash(t *testing.T) {
+	brief := []byte("# Brief\n\nwords\n")
+	lit := []Row{{ID: "R01", Verbatim: `a \| b`, Contract: ContractLive, Basis: `ends with \`}}
+	pipe := []Row{{ID: "R01", Verbatim: "a | b", Contract: ContractLive, Basis: `ends with \`}}
+	if Hash(lit, brief) == Hash(pipe, brief) {
+		t.Fatal(`«a \| b» and «a | b» hash the same`)
+	}
+	for _, rows := range [][]Row{lit, pipe, {{ID: "R01", Verbatim: `x \\ y \`, Contract: ContractLive}}} {
+		c := &Checklist{ID: "demo", Brief: BriefRel, Version: 1, Rows: rows}
+		again, err := Parse(Render(c))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(again.Rows) != 1 || again.Rows[0] != rows[0] {
+			t.Fatalf("round trip %+v, want %+v\n%s", again.Rows, rows[0], Render(c))
+		}
+	}
+}
