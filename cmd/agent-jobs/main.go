@@ -36,11 +36,13 @@ const usage = `usage: agent-jobs <command> [flags]
              (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
              [--runner claude|codex] [--reasoning-effort low|medium|high|xhigh|max] [--owner-waits]
-             [--skills a,+b,-c]
+             [--skills a,+b,-c] [--size small|large]
                                            a gpt-* model runs on codex exec (read-only kinds
                                            review/research unless codex_write_allowed);
                                            --owner-waits: the owner asked for it (Stop hook);
                                            --skills: edits to the default catalog skills
+                                           --size: fix/general (Wave F; required with config
+                                           size_required); large needs covers (job_start only)
              [--acceptance-cmd CMD]       fix/general: one-line shell command the job must
                                            pass in its worktree after claude exits 0
                                            (needs config acceptance_allowed)
@@ -110,6 +112,9 @@ const usage = `usage: agent-jobs <command> [flags]
                                            holds only the session bound by hook bind
   hook bind  --agent A                     SessionStart hook of the orchestrator session (JSON on
                                            stdin): binds it as the session the Stop hook holds
+  hook brief-reminder --agent A            UserPromptSubmit hook of the orchestrator session (JSON
+                                           on stdin): one line with the size rule and whether the
+                                           session's repo has an approved checklist; never blocks
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
@@ -140,6 +145,10 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if reason := refuseInsideJob(cmd, args); reason != "" {
+		// The brief reminder always exits 0: inside a job it ends here, silently, before any state is opened.
+		if cmd == "hook" && len(args) > 0 && args[0] == "brief-reminder" {
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
 		os.Exit(1)
 	}
@@ -449,6 +458,9 @@ func cmdStart(args []string) error {
 		"low|medium|high|xhigh|max on claude (default: effort_by_kind, else high; general medium)")
 	fs.StringVar(&r.AcceptanceCmd, "acceptance-cmd", "", "fix/general: shell command (one line, max 1 KB) run in the worktree after claude exits 0; non-zero fails the job (needs config acceptance_allowed)")
 	fs.BoolVar(&r.OwnerWaits, "owner-waits", false, "the owner asked for this job: its done line says «owner waits» and the Stop hook holds the session until owner_replied")
+	fs.StringVar(&r.Size, "size", "", "small|large (Wave F): fix and general jobs declare it, required when config size_required is on; "+
+		"large needs covers, which only job_start takes")
+	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
 	if _, err := parse(fs, args); err != nil {
 		return err
@@ -1857,13 +1869,46 @@ func cmdDoctor(args []string) error {
 //	                      from the notify tmux pane ($TMUX_PANE) with its cwd inside orchestrator_dir
 //	hook stop --agent A   Stop hook: prints the block decision while an owner reply is pending, for
 //	                      the bound session only
+//	hook brief-reminder --agent A
+//	                      UserPromptSubmit hook: prints one reminder line (the size rule, whether the
+//	                      repo at the session's cwd has an approved checklist), for the bound session only
 //
 // Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
-// output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding.
+// output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding. The
+// brief reminder is softer still: it always exits 0, an error only goes to stderr, and a job context
+// (main's job-role refusal, a job session) stays silent. It reads the store read-only (openReadOnly).
 func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
 	sub := ""
 	if len(args) > 0 {
 		sub = args[0]
+	}
+	if sub == "brief-reminder" {
+		type answer struct {
+			line string
+			err  error
+		}
+		done := make(chan answer, 1)
+		go func() {
+			line, err := briefReminder(args[1:], stdin, openReadOnly)
+			done <- answer{line, err}
+		}()
+		var a answer
+		select {
+		case a = <-done:
+		case <-time.After(briefReminderTimeout):
+			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+		}
+		switch {
+		case errors.Is(a.err, jobs.ErrInJobSession):
+			// A job session: silent, like the job-role refusal in main.
+		case a.err != nil:
+			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", a.err, "(no reminder)")
+		case a.line != "":
+			if _, err := fmt.Fprintln(stdout, a.line); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err)
+			}
+		}
+		return 0
 	}
 	fail := func(err error) int {
 		if sub == "bind" {
@@ -1874,7 +1919,8 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return 1
 	}
 	if sub != "stop" && sub != "bind" {
-		return fail(errors.New("usage: agent-jobs hook stop|bind --agent A (Claude Code Stop / SessionStart hook, JSON on stdin)"))
+		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder --agent A (Claude Code Stop / SessionStart / " +
+			"UserPromptSubmit hook, JSON on stdin)"))
 	}
 	fs := flag.NewFlagSet("hook "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -1932,6 +1978,52 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return fail(err)
 	}
 	return 0
+}
+
+// briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
+// prompt goes on without a reminder.
+const briefReminderTimeout = 2 * time.Second
+
+// briefReminder is `hook brief-reminder`: the reminder line (UserPromptSubmit stdout becomes context),
+// "" for a session other than the bound one.
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, error) {
+	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	agent := agentFlag(fs)
+	pos, err := parse(fs, args)
+	if err != nil {
+		return "", err
+	}
+	if len(pos) > 0 {
+		return "", errors.New("no positional arguments")
+	}
+	in, err := jobs.ParseUserPromptInput(stdin)
+	if err != nil {
+		return "", err
+	}
+	m, err := opener(*agent)
+	if err != nil {
+		return "", err
+	}
+	defer m.Close()
+	return m.BriefReminder(in)
+}
+
+// openReadOnly is open for the brief reminder: the existing state for reads only (jobs.OpenReadOnly),
+// never created or migrated, with the same job-session exclusion.
+func openReadOnly(agent string) (*jobs.Manager, error) {
+	if agent == "" {
+		return nil, errors.New("--agent is required")
+	}
+	m, err := jobs.OpenReadOnly(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.CheckNotInJobSession(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
+	return m, nil
 }
 
 func cmdHTTPAPI(args []string) error {

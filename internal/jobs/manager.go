@@ -111,6 +111,28 @@ func Open(agent string) (*Manager, error) {
 	}, nil
 }
 
+// OpenReadOnly opens an existing state for reads only (store.OpenReadOnly): it creates no directory or
+// file, runs no migration and never waits for the store's lock. The manager has no brain and no own
+// binary; it serves read paths such as the brief reminder, never a job's lifecycle.
+func OpenReadOnly(agent string) (*Manager, error) {
+	dir, err := StateDir(agent)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	st, err := store.OpenReadOnly(filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{
+		Agent: agent, StateDir: dir, Cfg: cfg, Store: st, Now: time.Now, Brain: brain.Disabled{},
+		Log: log.New(os.Stderr, "agent-jobs["+agent+"] ", log.LstdFlags),
+	}, nil
+}
+
 // Close releases the DB.
 func (m *Manager) Close() error { return m.Store.Close() }
 
@@ -146,6 +168,11 @@ type StartRequest struct {
 	// Covers are the checklist requirement IDs the job works on (Wave F, F4): its report must then
 	// carry a «### Requirements» block with one line per ID.
 	Covers []string
+	// Size is small or large (Wave F, F9 (a)); see checkSize.
+	Size string
+	// SizeRule is set by the callers that take a size (job_start, agent-jobs start): with config
+	// size_required on, a fix or general job without one is refused. Schedules and gate jobs leave it off.
+	SizeRule bool
 	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
 	Gate *store.GateInput
 }
@@ -259,11 +286,13 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			return nil, fmt.Errorf("codex daily cap reached: %d codex jobs of agent %s in the last 24 hours, limit %d "+
 				"(config codex_jobs_per_day, per agent; 0 turns it off); start a claude job or wait", n, m.Agent, limit)
 		}
+		m.logSize(j)
 		return j, nil
 	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err
 	}
+	m.logSize(j)
 	return j, nil
 }
 
@@ -374,6 +403,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 			return nil, err
 		}
 	}
+	size, err := m.checkSize(r, covers, cover)
+	if err != nil {
+		return nil, err
+	}
 	var selected []string
 	// A gate job gets nothing but its input: no catalog skills (checkGateRequest refused edits).
 	if skills.BriefDeclinesSkills(r.Brief) {
@@ -393,7 +426,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate,
+		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 	}
 	return j, nil
 }

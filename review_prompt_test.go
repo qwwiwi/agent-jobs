@@ -61,3 +61,29 @@ func TestReviewPromptKeepsContractOrder(t *testing.T) {
 		t.Error("report-contract.md no longer states the four-section contract this test relies on")
 	}
 }
+
+// F10: for each finding the reviewer asks whether the executor's brief let it see the problem (if not,
+// a brief gap), and a review of a fix looks only at the fix diff and the conditions it must close, a
+// condition still defeatable another way staying open, never a new finding.
+func TestReviewPromptBriefGapAndFixReview(t *testing.T) {
+	b, err := Templates.ReadFile("prompts/kind-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		"Brief gap: for each finding", "executor's brief gave it a way to see the problem",
+		"`brief gap: <what the brief should have said>`",
+		"Fix review:", "look only at the fix diff and the conditions the fix has to close",
+		"`closed` or `open`", "can still be defeated another way stays `open`", "do not file that as a new finding",
+		"Each `open` condition is a Blocking line",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("kind-review.md lacks %q", want)
+		}
+	}
+	// Both rules come before the Blocking / Non-blocking subsections they feed.
+	if i := strings.Index(s, "### Blocking"); strings.Index(s, "Brief gap:") > i || strings.Index(s, "Fix review:") > i {
+		t.Error("brief gap and fix review must come before the Blocking subsection")
+	}
+}
