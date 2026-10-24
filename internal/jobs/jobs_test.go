@@ -36,6 +36,12 @@ echo launch >> ../launches.txt
 echo '{"type":"system","subtype":"init"}'
 printf '%s' "$prompt" > ../stdin.txt
 { printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt
+if [[ -n "${FAKE_GATE_REPORT-}" ]]; then
+  # A gate job (gate_test.go): what its work dir holds, then the report the test wrote.
+  find . -mindepth 1 | LC_ALL=C sort > ../work-seen.txt
+  python3 -c 'import json,sys; print(json.dumps({"type":"result","subtype":"success","is_error":False,"num_turns":2,"total_cost_usd":0.1,"result":open(sys.argv[1]).read()}))' "$FAKE_GATE_REPORT"
+  exit 0
+fi
 # Sessions (FAKE_SESSIONS = the test's CLAUDE_CONFIG_DIR): --session-id creates the transcript,
 # --resume needs it (and fails like claude when it is missing or the update says FAKE_RESUME_FAIL).
 sid=""; resume=""; args=("$@")
