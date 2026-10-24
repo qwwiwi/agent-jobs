@@ -705,17 +705,27 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	return nil
 }
 
-// spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
-// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
-// the new scope (same pid).
-func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
-	dir := m.JobDir(j.ID)
-	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
+// wrapperArgv is the run-wrapper command line of j's launch, before "--" and the runner's argv.
+func (m *Manager) wrapperArgv(j *store.Job, token string, plan launchPlan) []string {
+	argv := append([]string{m.SelfBin, "run-wrapper", m.JobDir(j.ID), "--token", token}, plan.wrapper...)
 	if IsGateKind(j.Kind) {
 		// The wrapper stores a slicing result under the checklist lock: told where the locks are, never
 		// deriving it from the job dir's layout.
 		argv = append(argv, "--checklist-lock-dir", m.ChecklistLockDir())
 	}
+	if j.Kind == KindJudge {
+		// The judge's manifest-check step (F5) is decided here, at launch, from the job the daemon claimed.
+		argv = append(argv, "--manifest-check")
+	}
+	return argv
+}
+
+// spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
+// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
+// the new scope (same pid).
+func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
+	dir := m.JobDir(j.ID)
+	argv := m.wrapperArgv(j, token, plan)
 	bin := plan.bin
 	if bin == "" {
 		bin = m.Config().claudeBin()

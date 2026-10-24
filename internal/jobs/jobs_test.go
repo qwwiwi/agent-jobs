@@ -33,6 +33,11 @@ prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
+if [[ -s ../stray.pid ]]; then
+  # A process the judge's manifest-check left (manifest_test.go): its state when the runner starts.
+  state=$(awk '{print $3}' "/proc/$(cat ../stray.pid)/stat" 2>/dev/null)
+  echo "${state:-gone}" > ../stray.state
+fi
 echo '{"type":"system","subtype":"init"}'
 printf '%s' "$prompt" > ../stdin.txt
 { printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt

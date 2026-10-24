@@ -1,10 +1,15 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -71,7 +76,7 @@ func TestJudgeManifestCheckScriptMissing(t *testing.T) {
 	sha := gitT(t, repo, "rev-parse", "HEAD")
 	approveBrief(t, m, repo)
 	j := judgeJob(t, m, repo, sha)
-	if w := m.ManifestCheckWarnings(j); len(w) != 1 || !strings.Contains(w[0], "scripts/manifest-check.sh is not at") {
+	if w := m.ManifestCheckWarnings(j); len(w) != 1 || !strings.Contains(w[0], "scripts/manifest-check.sh is not a regular file at") {
 		t.Fatalf("warnings: %q", w)
 	}
 	j = runToEnd(t, m, j.ID)
@@ -86,7 +91,7 @@ func TestJudgeManifestCheckScriptMissing(t *testing.T) {
 		t.Fatalf("checkout left in the job dir: %v", err)
 	}
 	if out, _ := gitRaw(repo, "worktree", "list", "--porcelain"); strings.Contains(string(out), manifestDir) {
-		t.Fatalf("worktree still registered:\n%s", out)
+		t.Fatalf("a worktree registered for the checkout:\n%s", out)
 	}
 }
 
@@ -298,5 +303,262 @@ func TestManifestCheckCannotTamperWithTheJudge(t *testing.T) {
 				t.Fatalf("judge prompt:\n%s", stdin)
 			}
 		})
+	}
+}
+
+// manifestScript commits script as the repository's scripts/manifest-check.sh and returns the new sha.
+func manifestScript(t *testing.T, repo, script string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, "scripts", "manifest-check.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "commit", "-qam", "manifest-check")
+	return gitT(t, repo, "rev-parse", "HEAD")
+}
+
+// The checkout is the tree at the sha read raw, not a work tree of the repository: a smudge filter of
+// the repository's config never runs, and the script finds no .git leading back to the repository.
+func TestManifestCheckoutRunsNoFilterAndHasNoGit(t *testing.T) {
+	m := acceptanceManager(t, "")
+	repo, _ := gateRepo(t)
+	marker := filepath.Join(t.TempDir(), "smudge-ran")
+	gitT(t, repo, "config", "filter.evil.smudge", "touch "+marker+"; cat")
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("* filter=evil\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "add", ".gitattributes")
+	sha := manifestScript(t, repo, "#!/bin/sh\nif [ -e .git ]; then echo HAS_GIT; fi\necho \"top=$(git rev-parse --show-toplevel 2>&1)\"\n"+
+		"grep -c CODE_MARKER main.go\n")
+	_ = os.Remove(marker) // git add and commit do not smudge; start clean anyway
+	approveBrief(t, m, repo)
+	j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s: %s", j.Status, j.Error)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the repository's smudge filter ran for the manifest-check checkout")
+	}
+	mc, err := m.Store.ManifestCheckByJob(j.ID, j.Attempt)
+	if err != nil || mc == nil || mc.ExitCode != 0 {
+		t.Fatalf("record: %+v %v", mc, err)
+	}
+	if strings.Contains(mc.Output, "HAS_GIT") || strings.Contains(mc.Output, mainWorktree(repo)) || !strings.Contains(mc.Output, "\n1\n") {
+		t.Fatalf("the checkout reaches the repository or lacks the code:\n%s", mc.Output)
+	}
+}
+
+// The script must be a regular file blob at exactly scripts/manifest-check.sh: below a symlinked
+// scripts/ (a link out of the tree), as a symlink or as a directory it is not run, and judge_start's
+// warnings say so in advance.
+func TestManifestScriptMustBeARegularBlob(t *testing.T) {
+	outside := t.TempDir()
+	ran := filepath.Join(outside, "ran")
+	if err := os.WriteFile(filepath.Join(outside, "manifest-check.sh"), []byte("#!/bin/sh\ntouch "+ran+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, setup := range map[string]func(t *testing.T, repo string){
+		"symlinked parent": func(t *testing.T, repo string) {
+			gitT(t, repo, "rm", "-rq", "scripts")
+			if err := os.Symlink(outside, filepath.Join(repo, "scripts")); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, repo, "add", "scripts")
+		},
+		"symlink": func(t *testing.T, repo string) {
+			gitT(t, repo, "mv", "scripts/manifest-check.sh", "scripts/real.sh")
+			if err := os.Symlink("real.sh", filepath.Join(repo, "scripts", "manifest-check.sh")); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, repo, "add", "scripts")
+		},
+		"directory": func(t *testing.T, repo string) {
+			gitT(t, repo, "rm", "-q", "scripts/manifest-check.sh")
+			if err := os.MkdirAll(filepath.Join(repo, "scripts", "manifest-check.sh"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "scripts", "manifest-check.sh", "x"), []byte("x\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitT(t, repo, "add", "scripts")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := acceptanceManager(t, "")
+			repo, _ := gateRepo(t)
+			setup(t, repo)
+			gitT(t, repo, "commit", "-qm", name)
+			sha := gitT(t, repo, "rev-parse", "HEAD")
+			approveBrief(t, m, repo)
+			j := judgeJob(t, m, repo, sha)
+			if w := m.ManifestCheckWarnings(j); len(w) != 1 || !strings.Contains(w[0], "scripts/manifest-check.sh") {
+				t.Fatalf("warnings: %q", w)
+			}
+			j = runToEnd(t, m, j.ID)
+			if j.Status != store.StatusFailed || !strings.Contains(j.Error, "manifest-check: scripts/manifest-check.sh") ||
+				!strings.Contains(j.Error, "regular file") {
+				t.Fatalf("status %s: %q", j.Status, j.Error)
+			}
+			if _, err := os.Stat(ran); err == nil {
+				t.Fatal("a script outside the tree ran")
+			}
+			noRunner(t, m, j.ID)
+		})
+	}
+}
+
+// The approved BRIEF.md and CHECKLIST.md the wrapper writes into the checkout must be byte-identical
+// after the script: a script (or a test it runs) that rewrites either fails the job, nothing recorded.
+func TestManifestCheckMustNotRewriteTheApprovedBrief(t *testing.T) {
+	for _, file := range []string{"CHECKLIST.md", "BRIEF.md"} {
+		t.Run(file, func(t *testing.T) {
+			m := acceptanceManager(t, "")
+			repo, _ := gateRepo(t)
+			sha := manifestScript(t, repo, "#!/bin/sh\nprintf 'shrunk\\n' > brief/"+file+"\necho done\n")
+			approveBrief(t, m, repo)
+			j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID)
+			if j.Status != store.StatusFailed || !strings.Contains(j.Error, "changed the approved brief files") {
+				t.Fatalf("status %s: %q", j.Status, j.Error)
+			}
+			noRunner(t, m, j.ID)
+			if mc, _ := m.Store.ManifestCheckByJob(j.ID, j.Attempt); mc != nil {
+				t.Fatalf("recorded: %+v", mc)
+			}
+		})
+	}
+}
+
+// stepFixture claims a judge job of repo at sha as the daemon does before the wrapper's step: running
+// under a launch token, acceptance authorized, a prompt in its job dir.
+func stepFixture(t *testing.T, m *Manager, repo, sha string) (id, token, dir string) {
+	t.Helper()
+	j := judgeJob(t, m, repo, sha)
+	token = "tok-" + j.ID
+	if err := m.Store.Claim(j.ID, token, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetLaunchAuthorization(j.ID, token, 1, store.LaunchAuthorization{AcceptanceAllowed: true}); err != nil {
+		t.Fatal(err)
+	}
+	dir = m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte("judge prompt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureGitFiles(filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir)); err != nil {
+		t.Fatal(err)
+	}
+	return j.ID, token, dir
+}
+
+// signalSelf sends SIGTERM to this process (the wrapper's step catches it) and waits until the step's
+// context has seen it.
+func signalSelf(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the step's context did not see the signal")
+	}
+}
+
+// A stop signal ends the step without starting the runner: during the script (its group is ended, the
+// checkout removed, nothing recorded), after the script before the record, and after the record and
+// the prompt files are written, the last moment before the runner would start.
+func TestManifestStepStopSignal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		script string // "" = manifestScriptOK
+		stage  string // the hook stage that signals ("" = the script signals)
+		record bool   // a record is stored before the signal
+	}{
+		{name: "during the script", script: "#!/bin/sh\nkill -TERM " + strconv.Itoa(os.Getpid()) + "\nsleep 30\n"},
+		{name: "after the script", stage: "script-ended"},
+		{name: "after the record and the prompt files", stage: "recorded", record: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := acceptanceManager(t, "")
+			repo, sha := gateRepo(t)
+			if tc.script != "" {
+				sha = manifestScript(t, repo, tc.script)
+			}
+			approveBrief(t, m, repo)
+			id, token, dir := stepFixture(t, m, repo, sha)
+			if tc.stage != "" {
+				manifestStepHook = func(stage string, ctx context.Context) {
+					if stage == tc.stage {
+						signalSelf(t, ctx)
+					}
+				}
+				t.Cleanup(func() { manifestStepHook = nil })
+			}
+			start := time.Now()
+			var opts WrapperOptions
+			fail, rc := runManifestStep(dir, token, m.Store, id, &opts, os.Stderr)
+			if rc != 128+int(syscall.SIGTERM) || fail != "" {
+				t.Fatalf("fail %q rc %d: the runner would start", fail, rc)
+			}
+			if time.Since(start) > 20*time.Second {
+				t.Fatalf("the script was not ended: %s", time.Since(start))
+			}
+			if _, err := os.Stat(filepath.Join(dir, manifestDir)); !os.IsNotExist(err) {
+				t.Fatalf("checkout left: %v", err)
+			}
+			if mc, _ := m.Store.ManifestCheckByJob(id, 1); (mc != nil) != tc.record {
+				t.Fatalf("record %+v, want one: %v", mc, tc.record)
+			}
+		})
+	}
+}
+
+// The step is decided at launch: the daemon passes --manifest-check to a judge's wrapper only, so a
+// wrapper of another kind never runs it, whatever a row read at the wrapper's start would say; a
+// judge's step that cannot read its row fails the job with that reason.
+func TestManifestStepDecidedAtLaunch(t *testing.T) {
+	m := newManager(t)
+	for _, kind := range []string{KindJudge, KindSlicing, "fix", "general", "review", "research"} {
+		argv := m.wrapperArgv(&store.Job{ID: "x", Kind: kind}, "tok", launchPlan{})
+		if got := slices.Contains(argv, "--manifest-check"); got != (kind == KindJudge) {
+			t.Fatalf("%s: --manifest-check %v in %q", kind, got, argv)
+		}
+	}
+	dir := m.JobDir("no-such-job")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var opts WrapperOptions
+	if fail, rc := runManifestStep(dir, "tok", m.Store, "no-such-job", &opts, os.Stderr); rc != 0 ||
+		!strings.HasPrefix(fail, "manifest-check: job row unreadable: ") {
+		t.Fatalf("unreadable row: %q rc %d", fail, rc)
+	}
+}
+
+// A process the script leaves in another process group of the wrapper's session is ended before the
+// judge's runner starts (the fake claude reads its state from /proc when it starts).
+func TestManifestCheckLeftoverIsSweptBeforeTheRunner(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("no perl on PATH")
+	}
+	m := acceptanceManager(t, "")
+	repo, _ := gateRepo(t)
+	// The pid file goes to the job dir (the script runs in <jobdir>/manifest-check/work).
+	sha := manifestScript(t, repo, "#!/bin/sh\nperl -e 'setpgrp(0, 0); open(my $f, \">\", \"../../stray.pid.tmp\") or die; print $f $$; "+
+		"close $f; rename(\"../../stray.pid.tmp\", \"../../stray.pid\"); sleep 300' &\n"+
+		"while [ ! -s ../../stray.pid ]; do sleep 0.05; done\necho left one\n")
+	approveBrief(t, m, repo)
+	j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("status %s: %s", j.Status, j.Error)
+	}
+	state, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stray.state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := strings.TrimSpace(string(state)); s != "gone" && s != "Z" {
+		t.Fatalf("the script's leftover was %q when the runner started", s)
 	}
 }

@@ -128,7 +128,7 @@ const usage = `usage: agent-jobs <command> [flags]
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] -- <claude|codex> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -266,7 +266,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] -- <claude|codex> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] [--manifest-check] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -274,6 +274,11 @@ func runWrapper(args []string) int {
 	var opts jobs.WrapperOptions
 	rest := args[3:]
 	for len(rest) >= 2 && rest[0] != "--" {
+		if rest[0] == "--manifest-check" {
+			opts.ManifestCheck = true
+			rest = rest[1:]
+			continue
+		}
 		switch rest[0] {
 		case "--prompt":
 			opts.Prompt = rest[1]

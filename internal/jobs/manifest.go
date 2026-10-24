@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +12,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -19,14 +22,17 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// Manifest-check step (Wave F, F5 / F6): before the judge's runner starts, its wrapper checks out the
-// judged sha in a separate git worktree inside the job dir and runs the repository's
-// scripts/manifest-check.sh there, the way it runs acceptance_cmd (#18): the job's own containment, a
-// scrubbed environment, no guard hook. The exit code and the output tail go into the store
-// (gate_manifest_checks, bound to the job, its attempt and the sha) and the output into the judge's
-// prompt; the checkout is removed before the runner starts, so the judge's read-only copy stays the
-// only code it sees. Off unless config acceptance_allowed is true: without it, or without the script at
-// the sha, the job fails before the runner starts and nothing is recorded.
+// Manifest-check step (Wave F, F5 / F6): before the judge's runner starts, its wrapper writes the tree
+// of the judged sha into a plain directory inside the job dir (materializeTree, as for the judge's own
+// copy: blobs read raw with git ls-tree and cat-file, so no smudge, process or eol filter, no hook and
+// no .git leading back to the repository) and runs the repository's scripts/manifest-check.sh there,
+// the way it runs acceptance_cmd (#18): the job's own containment, a scrubbed environment, no guard
+// hook. The exit code and the output tail go into the store (gate_manifest_checks, bound to the job,
+// its attempt and the sha) and the output into the judge's prompt; the checkout is removed before the
+// runner starts, so the judge's read-only copy stays the only code it sees. Off unless config
+// acceptance_allowed is true: without it, or without the script as a regular file at the sha, the job
+// fails before the runner starts and nothing is recorded. The script runs as the agent user without
+// the guard or a sandbox (DEVIATIONS #31): this holds against mistakes, not against a hostile script.
 const (
 	// ManifestScript is the script's path in the repository.
 	ManifestScript = "scripts/manifest-check.sh"
@@ -39,17 +45,60 @@ const (
 	manifestFailPrefix   = "manifest-check: "
 )
 
-// manifestStepFor reports whether the wrapper runs the manifest-check step for job id: a judge job. An
-// unreadable row counts as one (fail closed: the step then fails the job before the runner starts).
-func manifestStepFor(st *store.Store, id string) bool {
-	j, err := st.Get(id)
-	return err != nil || j.Kind == KindJudge
+// manifestStepHook, when set (tests only), is called at the named stages of runManifestStep with its
+// stop-signal context: "script-ended" after the script and its checks, "recorded" after the record and
+// the prompt files are written.
+var manifestStepHook func(stage string, ctx context.Context)
+
+// runManifestStep is the wrapper's manifest-check step (the daemon launches a judge's wrapper with
+// --manifest-check). It returns why the job fails before its runner starts ("" = the record is stored
+// and opts names the prompt files with the output appended), or a non-zero rc when a stop signal ended
+// the run (the wrapper exits with it and does not start the runner). The stop signals are caught for the
+// whole step and released only when it returns: a signal caught up to then, even after the record and
+// the prompt files are written, is a stop; one after it has its default action and ends the wrapper
+// before the runner starts.
+func runManifestStep(jobDir, token string, st *store.Store, id string, opts *WrapperOptions, log io.Writer) (string, int) {
+	ctx, release := catchStopSignals()
+	fail, rc := manifestStep(ctx, jobDir, token, st, id, opts, log)
+	if release() && rc == 0 {
+		fmt.Fprintln(log, "run-wrapper: stopped by a signal at the end of manifest-check; the runner is not started")
+		return "", 128 + int(syscall.SIGTERM)
+	}
+	return fail, rc
 }
 
-// runManifestStep is the wrapper's manifest-check step. It returns why the job fails before its runner
-// starts ("" = the record is stored and opts names the prompt files with the output appended), or a
-// non-zero rc when a stop signal ended the run (the wrapper exits with it, recording nothing).
-func runManifestStep(jobDir, token string, st *store.Store, id string, opts *WrapperOptions, log io.Writer) (string, int) {
+// catchStopSignals catches SIGTERM, SIGINT and SIGHUP: ctx ends at the first one. release stops catching
+// them (from then on they end the process again) and reports whether one was caught before.
+func catchStopSignals() (ctx context.Context, release func() bool) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	ctx, cancel := context.WithCancel(context.Background())
+	var caught atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-ch:
+			caught.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() bool {
+		signal.Stop(ch) // no signal reaches ch after this; one delivered before is buffered or was taken
+		select {
+		case <-ch:
+			caught.Store(true)
+		default:
+		}
+		cancel()
+		<-done
+		return caught.Load()
+	}
+}
+
+// manifestStep is runManifestStep's work, ctx ending at a stop signal.
+func manifestStep(ctx context.Context, jobDir, token string, st *store.Store, id string, opts *WrapperOptions, log io.Writer) (string, int) {
 	fail := func(format string, a ...any) (string, int) {
 		return manifestFailPrefix + RedactPrintable(fmt.Sprintf(format, a...), 400), 0
 	}
@@ -83,37 +132,35 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fail("%v", err)
 	}
-	cleanup := func() error {
-		// Twice: a worktree the script locked is removed too.
-		if _, err := git(g.Repo, "worktree", "remove", "--force", "--force", checkout); err != nil {
-			fmt.Fprintln(log, "run-wrapper: manifest-check: remove worktree:", err)
-		}
-		return removeTree(dir)
-	}
+	cleanup := func() error { return removeTree(dir) }
 	failClean := func(format string, a ...any) (string, int) {
 		if err := cleanup(); err != nil {
 			fmt.Fprintln(log, "run-wrapper: manifest-check: remove checkout:", err)
 		}
 		return fail(format, a...)
 	}
-	// Replace refs are ignored, as for the judge's copy; -f takes over a path a crashed attempt left
-	// registered. The daemon's git environment runs no hooks.
-	if _, err := git(g.Repo, noReplace, "worktree", "add", "-f", "--detach", checkout, g.SHA); err != nil {
-		return failClean("check out %s: %v", g.SHA, err)
+	// The script must be a regular file blob at exactly its path at the sha (not a link, not below a
+	// linked directory, not a submodule), read from the tree, never from what a checkout resolves.
+	mode, err := manifestScriptAt(g.Repo, g.SHA)
+	if err != nil {
+		return failClean("%v: the judge needs the repository's manifest-check (F6)", err)
 	}
-	if head, err := git(checkout, noReplace, "rev-parse", "HEAD"); err != nil || head != g.SHA {
-		return failClean("the checkout is not at %s (%s %v)", g.SHA, head, err)
+	if err := os.Mkdir(checkout, 0o700); err != nil {
+		return failClean("%v", err)
 	}
-	fi, err := os.Lstat(filepath.Join(checkout, filepath.FromSlash(ManifestScript)))
-	if err != nil || !fi.Mode().IsRegular() {
-		return failClean("%s is not a regular file at %s: the judge needs the repository's manifest-check (F6)", ManifestScript, g.SHA)
+	if err := materializeTree(g.Repo, g.SHA, checkout, nil); err != nil {
+		return failClean("copy the tree at %s: %v", g.SHA, err)
+	}
+	if err := realFileBelow(checkout, ManifestScript); err != nil {
+		return failClean("%s is not a regular file at %s (%v): the judge needs the repository's manifest-check (F6)", ManifestScript, g.SHA, err)
 	}
 	cmdline := "./" + ManifestScript
-	if fi.Mode().Perm()&0o111 == 0 {
+	if mode != "100755" {
 		cmdline = "/bin/sh ./" + ManifestScript
 	}
 	// The script checks the approved checklist, the one the judge is given, not what the commit holds.
-	if err := writeApprovedBrief(checkout, g); err != nil {
+	approved, err := writeApprovedBrief(checkout, g)
+	if err != nil {
 		return failClean("write the approved brief files into the checkout: %v", err)
 	}
 	// The runner's prompt files are read now, before the script runs, and the rest of what the runner
@@ -137,9 +184,6 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 	if err != nil {
 		return failClean("fingerprint the judge's input: %v", err)
 	}
-	// From here on a stop signal must not kill the wrapper before the script's group is gone.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	defer stop()
 	timeout := c.AcceptanceTimeout()
 	now := time.Now()
 	if err := st.SetAcceptanceStarted(id, token, now, acceptanceDeadline(now, timeout)); err != nil {
@@ -170,6 +214,12 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 	if err := st.SetAcceptancePGID(id, token, 0); err != nil {
 		fmt.Fprintln(log, "run-wrapper: manifest-check: clear process group:", err)
 	}
+	// The approved files must be as written: a script (or a test it runs) that rewrote them may have
+	// checked something else than the approved checklist.
+	if changed := changedFiles(checkout, approved); len(changed) > 0 {
+		return failClean("%s changed the approved brief files in the checkout (%s): nothing is recorded", ManifestScript,
+			strings.Join(changed, ", "))
+	}
 	body, cut := keptTail(out)
 	text, _ := Redact(string(body))
 	if err := cleanup(); err != nil {
@@ -178,6 +228,9 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 	}
 	if after, err := judgeInputsDigest(abs); err != nil || after != before {
 		return fail("the judge's input in the job dir changed while %s ran (or could not be read: %v): the judge is not started", ManifestScript, err)
+	}
+	if manifestStepHook != nil {
+		manifestStepHook("script-ended", ctx)
 	}
 	if ctx.Err() != nil {
 		// A stop signal after the script ended: the daemon is ending the job, the runner must not start.
@@ -202,31 +255,95 @@ func runManifestStep(jobDir, token string, st *store.Store, id string, opts *Wra
 		}
 		*f = next
 	}
+	if manifestStepHook != nil {
+		manifestStepHook("recorded", ctx)
+	}
 	return "", 0
 }
 
 // writeApprovedBrief writes the gate input's BRIEF.md and checklist (the approved ones, rendered from
-// the rows) over brief/ in the checkout; a brief/ that is not a real directory (a link out of the
-// checkout) is replaced by one.
-func writeApprovedBrief(checkout string, g *store.GateInput) error {
+// the rows) over brief/ in the checkout and returns what it wrote by path relative to the checkout; a
+// brief/ that is not a real directory (a link out of the checkout) is replaced by one.
+func writeApprovedBrief(checkout string, g *store.GateInput) (map[string][]byte, error) {
 	dir := filepath.Join(checkout, filepath.Dir(filepath.FromSlash(checklist.ChecklistRel)))
 	if fi, err := os.Lstat(dir); err == nil && !fi.IsDir() {
 		if err := os.Remove(dir); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return nil, err
 	}
 	c := &checklist.Checklist{ID: g.ChecklistID, Version: g.Version, Approval: &checklist.Approval{At: g.At, SHA256: g.ChecklistSHA256}}
 	for _, r := range g.Rows {
 		c.Rows = append(c.Rows, checklist.Row{ID: r.ID, Verbatim: r.Verbatim, Contract: r.Contract, PlaceholderOK: r.PlaceholderOK,
 			Rationale: r.Rationale})
 	}
-	if err := writeFileReplace(checklist.BriefPath(checkout), []byte(g.Brief)); err != nil {
-		return err
+	files := map[string][]byte{checklist.BriefRel: []byte(g.Brief), checklist.ChecklistRel: []byte(checklist.Render(c))}
+	for rel, b := range files {
+		if err := writeFileReplace(filepath.Join(checkout, filepath.FromSlash(rel)), b); err != nil {
+			return nil, err
+		}
 	}
-	return writeFileReplace(checklist.ChecklistPath(checkout), []byte(checklist.Render(c)))
+	return files, nil
+}
+
+// changedFiles lists, sorted, the files of want (relative slash paths in dir) that are no longer
+// regular files below real directories holding exactly those bytes.
+func changedFiles(dir string, want map[string][]byte) []string {
+	var changed []string
+	for rel, b := range want {
+		if err := realFileBelow(dir, rel); err != nil {
+			changed = append(changed, rel)
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
+		if err != nil || !bytes.Equal(got, b) {
+			changed = append(changed, rel)
+		}
+	}
+	slices.Sort(changed)
+	return changed
+}
+
+// manifestScriptAt returns the mode of ManifestScript in the tree of commit sha of repo (100644 or
+// 100755): an error unless it is a regular file blob at exactly that path. git ls-tree reads the tree
+// and follows no link, so a script below a linked directory is not found.
+func manifestScriptAt(repo, sha string) (string, error) {
+	out, err := gitRaw(repo, noReplace, "--literal-pathspecs", "ls-tree", "-z", "--full-tree", sha, "--", ManifestScript)
+	if err != nil {
+		return "", err
+	}
+	for _, rec := range strings.Split(string(out), "\x00") {
+		meta, p, ok := strings.Cut(rec, "\t")
+		if !ok || p != ManifestScript {
+			continue
+		}
+		f := strings.Fields(meta)
+		if len(f) == 3 && f[1] == "blob" && (f[0] == "100644" || f[0] == "100755") {
+			return f[0], nil
+		}
+		return "", fmt.Errorf("%s at %s is not a regular file (%s)", ManifestScript, shortSHA(sha), meta)
+	}
+	return "", fmt.Errorf("%s is not a regular file at %s", ManifestScript, shortSHA(sha))
+}
+
+// realFileBelow checks that rel (a slash path) below dir is a regular file and that each of its parent
+// components is a real directory, not a symlink.
+func realFileBelow(dir, rel string) error {
+	parts := strings.Split(rel, "/")
+	cur := dir
+	for i, c := range parts {
+		cur = filepath.Join(cur, c)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			return err
+		}
+		if last := i == len(parts)-1; !last && !fi.IsDir() || last && !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s is a %v, not a real directory or regular file", strings.Join(parts[:i+1], "/"), fi.Mode().Type())
+		}
+	}
+	return nil
 }
 
 // judgeInputsDigest fingerprints what the judge's runner reads from its job dir besides the prompt:
@@ -306,7 +423,7 @@ func ManifestPromptSection(rec store.ManifestCheck) string {
 }
 
 // ManifestCheckWarnings are judge_start's warnings about the manifest-check step of the queued judge j:
-// config acceptance_allowed off, or no scripts/manifest-check.sh at its sha. Either fails the job
+// config acceptance_allowed off, or no scripts/manifest-check.sh as a regular file at its sha. Either fails the job
 // before the judge starts; the wrapper decides, these only say so early.
 func (m *Manager) ManifestCheckWarnings(j *store.Job) []string {
 	if j.Kind != KindJudge || j.Gate == nil {
@@ -317,9 +434,9 @@ func (m *Manager) ManifestCheckWarnings(j *store.Job) []string {
 		out = append(out, "acceptance_allowed is off in config.json: the judge's manifest-check step cannot run, so the job "+
 			"will fail before the judge starts and nothing will be recorded")
 	}
-	if _, err := git(j.Gate.Repo, noReplace, "cat-file", "-e", j.Gate.SHA+":"+ManifestScript); err != nil {
-		out = append(out, fmt.Sprintf("%s is not at %s: the job will fail before the judge starts and nothing will be recorded "+
-			"(examples/manifest-check in agent-jobs is a reference)", ManifestScript, shortSHA(j.Gate.SHA)))
+	if _, err := manifestScriptAt(j.Gate.Repo, j.Gate.SHA); err != nil {
+		out = append(out, fmt.Sprintf("%s is not a regular file at %s: the job will fail before the judge starts and nothing will be "+
+			"recorded (examples/manifest-check in agent-jobs is a reference)", ManifestScript, shortSHA(j.Gate.SHA)))
 	}
 	return out
 }

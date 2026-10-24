@@ -456,7 +456,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
-	if manifestStepFor(st, id) {
+	if opts.ManifestCheck {
 		// The judge's manifest-check (Wave F, F5): before the runner starts, never after; a failure ends the
 		// job here, with nothing recorded but the failure.
 		fail, rc := runManifestStep(jobDir, token, st, id, &opts, stderrLog)
@@ -564,6 +564,9 @@ type WrapperOptions struct {
 	// ChecklistLockDir is the agent-jobs home's checklist lock dir (a gate job's launch only): a slicing
 	// result is stored under the repository's checklist lock there.
 	ChecklistLockDir string
+	// ManifestCheck runs the judge's manifest-check step before the runner (the daemon passes
+	// --manifest-check for a judge job's launch only): decided at launch, never from a row read here.
+	ManifestCheck bool
 }
 
 func (o WrapperOptions) prompt() string {
