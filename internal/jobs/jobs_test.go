@@ -269,6 +269,11 @@ if [[ $prompt == *FAKE_NOREPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
   exit 0
 fi
+if [[ $prompt == *FAKE_REQUIREMENTS_REPORT* ]]; then
+  # A report with a Requirements block: R01 done with ran: and a REDPROOF, R02 done without ran: (claimed).
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.25,"result":"## Summary\nok\n\n## Findings / Changes\n- x\n\n### Requirements\n- R01 · done · a.go:1 · ran: go test → ok · REDPROOF R01: TestA failed before\n- R02 · done · b.go:2\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
+  exit 0
+fi
 if [[ $prompt == *FAKE_MIDTASK* ]]; then
   # Ends its turn mid-task: the final message is no report.
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Now let me check the remaining callers in store.go."}'

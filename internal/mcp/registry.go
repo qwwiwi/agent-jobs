@@ -79,6 +79,11 @@ var OrchestratorOnly = []string{
 	"owner_replied",
 	// The heartbeat's stored decisions (their reason is untrusted model text): the session reads them.
 	"heartbeat_get",
+	// The brief checklist (Wave F, F2): only the session writes the owner's brief, rows, approval and
+	// waivers into the project repo and the store; a job reports against the checklist, never edits it.
+	"checklist_init",
+	"checklist_get",
+	"checklist_set",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

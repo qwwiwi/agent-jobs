@@ -198,7 +198,7 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	if err != nil || len(report) > maxContractReportBytes {
 		return status, msg // Verdict saw a report; one unreadable now, or longer than the limit, is not judged here
 	}
-	return m.applyReportContract(j, status, msg, reportContractNote(report))
+	return m.applyReportContract(j, status, msg, reportContractNote(report, j.Covers))
 }
 
 func (m *Manager) applyReportContract(j *store.Job, status, msg, note string) (string, string) {
