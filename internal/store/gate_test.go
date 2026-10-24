@@ -36,14 +36,14 @@ func TestKindCheckMigration(t *testing.T) {
 	if j, err := s.Get("old"); err != nil || j.Kind != "fix" {
 		t.Fatalf("old row: %+v %v", j, err)
 	}
-	g := &GateInput{Repo: "/r", ChecklistID: "demo", Version: 2, SHA: strings.Repeat("a", 40), Rows: []GateRow{{ID: "R01", Basis: "b"}}}
+	g := &GateInput{Repo: "/r", ChecklistID: "demo", Version: 2, SHA: strings.Repeat("a", 40), Rows: []GateRow{{ID: "R01", Rationale: "b"}}}
 	j := &Job{ID: "judge1", Agent: "a", Title: "t", Kind: "judge", Brief: "b", Status: StatusQueued, Model: "opus", MaxTurns: 1,
 		MaxBudgetUSD: 1, TimeoutMinutes: 1, CreatedAt: time.Now(), Gate: g}
 	if err := s.Insert(j); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Get("judge1")
-	if err != nil || got.Gate == nil || got.Gate.SHA != g.SHA || got.Gate.Rows[0].Basis != "b" {
+	if err != nil || got.Gate == nil || got.Gate.SHA != g.SHA || got.Gate.Rows[0].Rationale != "b" {
 		t.Fatalf("gate input round trip: %+v %v", got, err)
 	}
 	if err := s.Insert(&Job{ID: "bad", Agent: "a", Title: "t", Kind: "deploy", Brief: "b", Status: StatusQueued, Model: "opus",

@@ -47,7 +47,8 @@ func addSlicingStart(s *sdk.Server, d Deps) {
 		Name: "slicing_start",
 		Description: "Queue the slicing check of the repo's checklist (Wave F, F3): a read-only job of kind slicing that gets only " +
 			"brief/BRIEF.md and the checklist rows (read by the daemon now, no code, no briefs or reports) and returns unmapped " +
-			"(brief quotes in no row), half (partly covered) and invented (rows the brief does not support) in a validated JSON " +
+			"(brief passages no row points to), half (passages a row covers in part) and invented (rows with nothing in the " +
+			"brief behind them) in a validated JSON " +
 			"block of its final message, stored for the checklist id, version and hash. checklist_set approve needs a result for " +
 			"the current version and an owner decision on every unmapped quote of every result for it. There is no brief: the " +
 			"job's input is the daemon's. A claude job is held to its input by the guard (enforced_blind true); a codex job is " +
@@ -65,7 +66,7 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "judge_start",
 		Description: "Queue the acceptance judge (Wave F, F5; kind judge, not acceptance_cmd) of the code at sha against the repo's " +
-			"approved checklist: a read-only job that gets BRIEF.md in full, the checklist rows (ID, verbatim, contract, Basis) and a " +
+			"approved checklist: a read-only job that gets BRIEF.md in full, the checklist rows (ID, brief quote, contract, rationale) and a " +
 			"copy of the files at sha (no git history, no agent settings or instructions, no job briefs, reports or diffs), assembled " +
 			"by the daemon. It returns met | partial | missing | placeholder | cannot_check per live requirement with evidence in a " +
 			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
