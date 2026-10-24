@@ -12,7 +12,7 @@ A tag only says which requirement a test is for, not that it tests it. The judge
 
 ## How agent-jobs runs it
 
-Before a judge job (`judge_start`) starts its model, the job's wrapper checks out the judged commit in a separate git worktree and runs `./scripts/manifest-check.sh` from the repository root, with no arguments, the way it runs `acceptance_cmd`: the job's containment, a scrubbed environment (`HOME` is a throwaway dir, no tokens), no guard hook, the `acceptance_timeout_minutes` limit. It needs config `acceptance_allowed: true`; without it, or without the script at the commit, the judge job fails before the judge starts and nothing is recorded. The exit code and the output tail are stored with the job and the commit, the output goes into the judge's prompt, and `release_check` passes only with exit `0`.
+Before a judge job (`judge_start`) starts its model, the job's wrapper checks out the judged commit in a separate git worktree and writes the approved `brief/BRIEF.md` and `brief/CHECKLIST.md` over the commit's copies (so the script checks the requirements the owner approved), and runs `./scripts/manifest-check.sh` from the repository root, with no arguments, the way it runs `acceptance_cmd`: the job's containment, a scrubbed environment (`HOME` is a throwaway dir, no tokens), no guard hook, the `acceptance_timeout_minutes` limit. It needs config `acceptance_allowed: true`; without it, or without the script at the commit, the judge job fails before the judge starts and nothing is recorded. The exit code and the output tail are stored with the job and the commit, the output goes into the judge's prompt, and `release_check` passes only with exit `0`.
 
 ## Wiring it into a repository
 
