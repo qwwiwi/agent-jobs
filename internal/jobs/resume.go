@@ -964,7 +964,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
 		return launchPlan{}, err
 	}
-	brief, err := m.BuildPrompt(j, rules, cards, m.LookupMemoryNotes(j))
+	var notes MemoryNotes
+	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
+		notes = m.LookupMemoryNotes(j)
+	}
+	brief, err := m.BuildPrompt(j, rules, cards, notes)
 	if err != nil {
 		return launchPlan{}, err
 	}
