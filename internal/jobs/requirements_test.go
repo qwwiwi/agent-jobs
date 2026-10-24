@@ -13,7 +13,7 @@ const reqReport = "## Summary\nok\n\n## Findings / Changes\n- changed a.go\n\n##
 	"- R01 · done · login page in web/login.go:12 · ran: go test ./web → ok\n" +
 	"- R02 · done · sessions kept · REDPROOF: TestSession failed before\n" +
 	"- R03i · partial · only the form · ran: go test ./web → ok\n" +
-	"- R09 · done · not covered · ran: true → ok · REDPROOF R09: TestX failed before\n" +
+	"- R09 · done · not covered · ran: go test ./x → ok · REDPROOF R09: TestX failed before\n" +
 	"- R04 · finished · bad status\n" +
 	"REDPROOF R01 · TestLogin · FAIL before the change, ok after\n\n" +
 	"### Other\nR05 · done · outside the block · ran: x\n\n" +
