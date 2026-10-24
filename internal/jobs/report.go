@@ -127,7 +127,7 @@ func reportContractNote(report string, covers []string) string {
 
 // OffContractNote returns the report contract note a job's error carries, "" when none.
 func OffContractNote(errMsg string) string {
-	for _, n := range []string{NoteNoSummary, NoteNoNotDone, NoteNoRequirements} {
+	for _, n := range []string{NoteNoSummary, NoteNoNotDone, NoteNoRequirements, NoteRequirementsEmpty, NoteJobRowUnread} {
 		if strings.Contains(errMsg, n) {
 			return n
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -26,15 +27,15 @@ const requirementsHeading = "### Requirements"
 
 // RequirementLine is one line of a «### Requirements» block:
 // «R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>», optionally with
-// a «REDPROOF: …» field.
+// a «REDPROOF R01: …» field.
 type RequirementLine struct {
 	ID       string `json:"id"`
 	Status   string `json:"status"`
 	Evidence string `json:"evidence,omitempty"`
 	Ran      string `json:"ran,omitempty"`
 	RedProof string `json:"redproof,omitempty"`
-	// Verified: a «done» line with a «ran:» and a REDPROOF naming this ID (its own field or a REDPROOF
-	// line of the block); a «done» line without either is claimed, not done.
+	// Verified: a «done» line with a «ran:» and a red proof of this ID (its own REDPROOF field or a
+	// REDPROOF line of the block; see redProof); a «done» line without either is claimed, not done.
 	Verified bool `json:"verified"`
 }
 
@@ -43,7 +44,8 @@ type Requirements struct {
 	// Block: the report has the block inside its Findings / Changes section.
 	Block bool              `json:"block"`
 	Lines []RequirementLine `json:"lines"`
-	// RedProofs are the block's REDPROOF lines (one per new test that failed before the code).
+	// RedProofs are the block's REDPROOF lines that are proofs (one per new test that failed before the
+	// code); a negative or empty one is left out.
 	RedProofs []string `json:"redproofs,omitempty"`
 	// Claimed are the IDs of «done» lines without a «ran:» or without a REDPROOF.
 	Claimed []string `json:"claimed,omitempty"`
@@ -57,6 +59,36 @@ type Requirements struct {
 // NoteNoRequirements is the report contract note of a job with covers whose report has no
 // «### Requirements» block in Findings / Changes; it counts as report_off_contract.
 const NoteNoRequirements = "report has no ### Requirements block in Findings / Changes (the job has covers)"
+
+// NoteRequirementsEmpty is the note of a job with covers whose «### Requirements» block has no line for
+// any covered ID (empty, prose or a table); it counts as report_off_contract.
+const NoteRequirementsEmpty = "report's ### Requirements block has no line for a covered ID (empty, prose or a table; the job has covers)"
+
+// redProofRe is the exact REDPROOF marker at the start of a line or field: «REDPROOFLESS» is not one.
+var redProofRe = regexp.MustCompile(`^REDPROOF(?:[^A-Za-z0-9_]|$)`)
+
+// requirementIDRe is a requirement ID as a whole word (R01 does not match inside R01i or R010).
+var requirementIDRe = regexp.MustCompile(`\b(?:R[0-9]{2,}i?|G[0-9]{2,}|D[0-9]{2,})\b`)
+
+// negativeProofs are proof contents that say there is none.
+var negativeProofs = []string{"none", "n/a", "no", "not", "-"}
+
+// redProof reads a REDPROOF line or field s: the IDs it names and whether it is a proof. It is one only
+// with the exact marker and real content: what is left without the IDs is not empty and does not start
+// with a negative word (none, n/a, no, not, -, any case).
+func redProof(s string) (ids []string, ok bool) {
+	if !redProofRe.MatchString(s) {
+		return nil, false
+	}
+	rest := s[len("REDPROOF"):]
+	words := strings.FieldsFunc(strings.ToLower(requirementIDRe.ReplaceAllString(rest, " ")), func(r rune) bool {
+		return r == ' ' || r == '\t' || r == ':' || r == '·' || r == ',' || r == ';' || r == '(' || r == ')' || r == '.'
+	})
+	if len(words) == 0 || slices.Contains(negativeProofs, words[0]) {
+		return nil, false
+	}
+	return idsIn(rest), true
+}
 
 // ValidateCovers trims covers, drops repeats (first one kept) and checks every ID is a checklist row ID.
 func ValidateCovers(covers []string) ([]string, error) {
@@ -159,10 +191,12 @@ func ParseRequirements(report string, covers []string) Requirements {
 		if l == "" {
 			continue
 		}
-		if strings.HasPrefix(strings.ToUpper(l), "REDPROOF") {
-			r.RedProofs = append(r.RedProofs, l)
-			for _, id := range idsIn(l) {
-				proved[id] = true
+		if redProofRe.MatchString(l) {
+			if ids, ok := redProof(l); ok {
+				r.RedProofs = append(r.RedProofs, l)
+				for _, id := range ids {
+					proved[id] = true
+				}
 			}
 			continue
 		}
@@ -182,10 +216,10 @@ func ParseRequirements(report string, covers []string) Requirements {
 			switch {
 			case strings.HasPrefix(strings.ToLower(p), "ran:"):
 				line.Ran = strings.TrimSpace(p[len("ran:"):])
-			case strings.HasPrefix(strings.ToUpper(p), "REDPROOF"):
-				line.RedProof = strings.TrimSpace(strings.TrimLeft(p[len("REDPROOF"):], ": "))
-				if line.RedProof == "" {
-					line.RedProof = p
+			case redProofRe.MatchString(p):
+				// An inline proof counts only when it names this line's ID; the first such one is kept.
+				if ids, ok := redProof(p); ok && slices.Contains(ids, id) && line.RedProof == "" {
+					line.RedProof = strings.TrimSpace(strings.TrimLeft(p[len("REDPROOF"):], ": "))
 				}
 			case p != "":
 				evidence = append(evidence, p)
@@ -217,7 +251,8 @@ func ParseRequirements(report string, covers []string) Requirements {
 }
 
 // requirementsNote is the report contract note for a job with covers: NoteNoRequirements when the
-// report has no block, "" otherwise (and always "" without covers).
+// report has no block, NoteRequirementsEmpty when the block has no line for a covered ID, "" otherwise
+// (and always "" without covers).
 func requirementsNote(report string, covers []string) string {
 	if len(covers) == 0 {
 		return ""
@@ -225,19 +260,36 @@ func requirementsNote(report string, covers []string) string {
 	if _, ok := requirementsBlock(report); !ok {
 		return NoteNoRequirements
 	}
+	if !slices.ContainsFunc(ParseRequirements(report, covers).Lines, func(l RequirementLine) bool { return slices.Contains(covers, l.ID) }) {
+		return NoteRequirementsEmpty
+	}
 	return ""
 }
 
-// RequirementsTrailers returns the IDs of the «Requirements: R01, R03i» trailers in commit messages,
-// in order, once each (report only: nothing enforces them).
-func RequirementsTrailers(messages string) []string {
+// NoteJobRowUnread is the run-wrapper's note when it cannot read the job's row: without the covers the
+// Requirements block cannot be checked, so the report counts as off contract (fail closed).
+const NoteJobRowUnread = "job row unreadable: the report's ### Requirements block was not checked (fail closed)"
+
+// wrapperContractNote is the run-wrapper's report contract note: the sections first, then the
+// Requirements block against the covers in the job's row (get), NoteJobRowUnread when it cannot be read.
+func wrapperContractNote(report string, get func() (*store.Job, error)) string {
+	if n := reportContractNote(report, nil); n != "" {
+		return n
+	}
+	j, err := get()
+	if err != nil {
+		return NoteJobRowUnread + ": " + RedactPrintable(err.Error(), 160)
+	}
+	return reportContractNote(report, j.Covers)
+}
+
+// RequirementsTrailers returns the IDs of «Requirements» trailer values (one value per line, as
+// `git log --format=%(trailers:key=Requirements,valueonly)` prints them), in order, once each (report
+// only: nothing enforces them).
+func RequirementsTrailers(values string) []string {
 	var out []string
-	for _, l := range strings.Split(messages, "\n") {
-		key, val, ok := strings.Cut(strings.TrimSpace(l), ":")
-		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Requirements") {
-			continue
-		}
-		for _, id := range idsIn(val) {
+	for _, l := range strings.Split(values, "\n") {
+		for _, id := range idsIn(l) {
 			if !slices.Contains(out, id) {
 				out = append(out, id)
 			}
@@ -272,9 +324,11 @@ func (m *Manager) JobRequirementsTrailers(j *store.Job) ([]string, string) {
 	if head == "" || head == j.BaseCommit {
 		return nil, ""
 	}
-	msgs, err := gitCtxOK(ctx, j.RepoPath, "log", "--no-merges", "--no-show-signature", "--format=%B", j.BaseCommit+".."+head)
+	// Real trailers only (git's own trailer parsing): a «Requirements:» line in a body paragraph is not one.
+	vals, err := gitCtxOK(ctx, j.RepoPath, "log", "--no-merges", "--no-show-signature",
+		"--format=%(trailers:key=Requirements,valueonly)", j.BaseCommit+".."+head)
 	if err != nil {
 		return nil, "commit trailers not read: " + RedactPrintable(err.Error(), 160)
 	}
-	return RequirementsTrailers(msgs), ""
+	return RequirementsTrailers(vals), ""
 }
