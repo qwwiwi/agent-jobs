@@ -49,15 +49,17 @@ type ReleaseRequirement struct {
 	WaiverQuote string `json:"waiver_quote,omitempty"`
 	// Accepted: met, placeholder on a placeholder-ok row, or waived.
 	Accepted bool `json:"accepted"`
-	// CoveredBy are the feature jobs whose covers name it.
+	// CoveredBy are the succeeded feature jobs whose covers name it.
 	CoveredBy []string `json:"covered_by"`
 }
 
 // ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository whose
-// covers name the checklist id (F9 (a)'s size is not read yet; DEVIATIONS #34).
+// covers name the checklist id (F9 (a)'s size is not read yet; DEVIATIONS #34). Every status counts for
+// the family condition (a failed coder may have commits in the sha); only a succeeded one for the trace.
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
+	Status string   `json:"status"`
 	Family string   `json:"family"`
 	Covers []string `json:"covers"`
 	// LiveCovers are its covers that are live requirements of the approved checklist.
@@ -79,10 +81,12 @@ type ReleaseCheckResult struct {
 	Requirements []ReleaseRequirement `json:"requirements"`
 	FeatureJobs  []ReleaseFeatureJob  `json:"feature_jobs"`
 	// VerdictJob is the judge job whose verdict was read (the latest for the sha); Verdicts counts the
-	// verdicts for the sha at this checklist version (all must agree).
-	VerdictJob    string               `json:"verdict_job,omitempty"`
-	Verdicts      int                  `json:"verdicts"`
-	JudgeFamily   string               `json:"judge_family,omitempty"`
+	// verdicts for the sha at this checklist version and hash (all must agree, each from a judge job that
+	// ended succeeded at the verdict's attempt, each with that attempt's manifest-check at exit 0).
+	VerdictJob  string `json:"verdict_job,omitempty"`
+	Verdicts    int    `json:"verdicts"`
+	JudgeFamily string `json:"judge_family,omitempty"`
+	// ManifestCheck is the record of the latest verdict's attempt (without a verdict: the latest for the sha).
 	ManifestCheck *store.ManifestCheck `json:"manifest_check"`
 	Mismatches    []string             `json:"mismatches"`
 	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …».
@@ -184,6 +188,8 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		if lo, err = verdictOutput(latest); err != nil {
 			set(ReleaseVerdict, false, "verdict of job %s unreadable: %v", latest.JobID, err)
 			lo = nil
+		} else if why := m.verdictJobsWhy(verdicts); why != "" {
+			set(ReleaseVerdict, false, "%s", why)
 		} else if why := verdictsDisagree(verdicts, lo); why != "" {
 			set(ReleaseVerdict, false, "ambiguous: %s", why)
 		} else {
@@ -191,28 +197,39 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	// The manifest-check record of the judge's attempt (F5), else the latest one for the sha.
-	var mc *store.ManifestCheck
-	if latest != nil {
-		mc, err = m.Store.ManifestCheckByJob(latest.JobID, latest.Attempt)
+	// The manifest-check record (F5) of every counted verdict's attempt, so a red run is not passed over
+	// by judging again; without a verdict, the latest record for the sha.
+	if latest == nil {
+		mc, err := m.Store.LatestManifestCheck(main, sha)
+		if err != nil {
+			return nil, err
+		}
+		out.ManifestCheck = mc
+		if why := manifestRecordWhy(mc, "", sha); why != "" {
+			set(ReleaseManifestCheck, false, "%s", why)
+		} else {
+			set(ReleaseManifestCheck, true, "%s exit 0 (job %s)", mc.Script, mc.JobID)
+		}
 	} else {
-		mc, err = m.Store.LatestManifestCheck(main, sha)
-	}
-	if err != nil {
-		return nil, err
-	}
-	out.ManifestCheck = mc
-	switch {
-	case mc == nil && latest != nil:
-		set(ReleaseManifestCheck, false, "no manifest-check record of judge job %s", latest.JobID)
-	case mc == nil:
-		set(ReleaseManifestCheck, false, "no manifest-check record for %s", shortSHA(sha))
-	case mc.SHA != sha:
-		set(ReleaseManifestCheck, false, "the record of job %s is for %s, not %s", mc.JobID, shortSHA(mc.SHA), shortSHA(sha))
-	case mc.ExitCode != 0:
-		set(ReleaseManifestCheck, false, "%s exited %d (job %s)", mc.Script, mc.ExitCode, mc.JobID)
-	default:
-		set(ReleaseManifestCheck, true, "%s exit 0 (job %s)", mc.Script, mc.JobID)
+		why := ""
+		for _, v := range verdicts {
+			mc, err := m.Store.ManifestCheckByJob(v.JobID, v.Attempt)
+			if err != nil {
+				return nil, err
+			}
+			if v == latest {
+				out.ManifestCheck = mc
+			}
+			if why == "" {
+				why = manifestRecordWhy(mc, v.JobID, sha)
+			}
+		}
+		if why != "" {
+			set(ReleaseManifestCheck, false, "%s", why)
+		} else {
+			set(ReleaseManifestCheck, true, "%s exit 0 (job %s; %d judge attempt(s), each exit 0)", out.ManifestCheck.Script, latest.JobID,
+				len(verdicts))
+		}
 	}
 
 	waivers, err := m.Store.Waivers(main, hash, c.Version)
@@ -233,7 +250,7 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 			}
 		}
 		for _, cj := range coders {
-			if slices.Contains(cj.Covers, id) {
+			if cj.Status == store.StatusSucceeded && slices.Contains(cj.Covers, id) {
 				r.CoveredBy = append(r.CoveredBy, cj.ID)
 			}
 		}
@@ -317,19 +334,29 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	// The trace both ways: every live requirement in some feature job's covers, every feature job
-	// covering at least one live requirement.
+	// The trace both ways, over the succeeded feature jobs only (a cancelled or failed job delivered
+	// nothing): every live requirement in some succeeded job's covers, and every succeeded job covering
+	// some row of the checklist (a row since deferred or dropped still counts, so a later re-scoping does
+	// not fail the trace for good; only covers naming no row of it at all leave a job idle).
 	var uncovered, idle []string
+	succeeded := 0
 	for _, cj := range coders {
-		fj := ReleaseFeatureJob{ID: cj.ID, Kind: cj.Kind, Family: ModelFamily(cj.Runner, cj.Model), Covers: nonNilSlice(cj.Covers),
-			LiveCovers: []string{}}
+		fj := ReleaseFeatureJob{ID: cj.ID, Kind: cj.Kind, Status: cj.Status, Family: ModelFamily(cj.Runner, cj.Model),
+			Covers: nonNilSlice(cj.Covers), LiveCovers: []string{}}
+		known := false
 		for _, id := range cj.Covers {
 			if slices.Contains(live, id) {
 				fj.LiveCovers = append(fj.LiveCovers, id)
 			}
+			if _, ok := c.Row(id); ok {
+				known = true
+			}
 		}
-		if len(fj.LiveCovers) == 0 {
-			idle = append(idle, cj.ID)
+		if cj.Status == store.StatusSucceeded {
+			succeeded++
+			if !known {
+				idle = append(idle, cj.ID)
+			}
 		}
 		out.FeatureJobs = append(out.FeatureJobs, fj)
 	}
@@ -339,17 +366,17 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 	var trace []string
-	if len(coders) == 0 {
-		trace = append(trace, "no feature job covers checklist "+c.ID)
+	if succeeded == 0 {
+		trace = append(trace, "no succeeded feature job covers checklist "+c.ID)
 	}
 	if len(uncovered) > 0 {
 		trace = append(trace, "in no feature job's covers: "+strings.Join(uncovered, ", "))
 	}
 	if len(idle) > 0 {
-		trace = append(trace, "feature job(s) covering no live requirement: "+strings.Join(idle, ", "))
+		trace = append(trace, "feature job(s) covering no row of the checklist: "+strings.Join(idle, ", "))
 	}
 	if len(trace) == 0 {
-		set(ReleaseTrace, true, "%d feature job(s), every live requirement covered", len(coders))
+		set(ReleaseTrace, true, "%d succeeded feature job(s), every live requirement covered", succeeded)
 	} else {
 		set(ReleaseTrace, false, "%s", strings.Join(trace, "; "))
 	}
@@ -374,6 +401,41 @@ func (m *Manager) releaseChecklist(top string) (c *checklist.Checklist, brief []
 		return nil, nil, fmt.Sprintf("%s does not parse: %v", checklist.ChecklistRel, err), nil
 	}
 	return c, f.Brief, "", nil
+}
+
+// verdictJobsWhy is why a verdict for the sha does not count ("" = each does): each must come from a
+// judge job whose row ended succeeded at the verdict's attempt.
+func (m *Manager) verdictJobsWhy(vs []*store.JudgeVerdict) string {
+	for _, v := range vs {
+		j, err := m.Store.Get(v.JobID)
+		switch {
+		case err != nil:
+			return fmt.Sprintf("the verdict of job %s: the job row is unreadable: %v", v.JobID, err)
+		case j.Kind != KindJudge:
+			return fmt.Sprintf("the verdict of job %s: the job is a %s job, not a judge", v.JobID, j.Kind)
+		case j.Status != store.StatusSucceeded:
+			return fmt.Sprintf("the verdict of job %s: the job is %s, not succeeded", v.JobID, j.Status)
+		case j.Attempt != v.Attempt:
+			return fmt.Sprintf("the verdict of job %s is of attempt %d, the job ended attempt %d", v.JobID, v.Attempt, j.Attempt)
+		}
+	}
+	return ""
+}
+
+// manifestRecordWhy is why a manifest-check record does not let the sha ship ("" = it does): none (of
+// judge job when named), one for another sha, or a non-zero exit.
+func manifestRecordWhy(mc *store.ManifestCheck, job, sha string) string {
+	switch {
+	case mc == nil && job != "":
+		return fmt.Sprintf("no manifest-check record of judge job %s", job)
+	case mc == nil:
+		return fmt.Sprintf("no manifest-check record for %s", shortSHA(sha))
+	case mc.SHA != sha:
+		return fmt.Sprintf("the record of job %s is for %s, not %s", mc.JobID, shortSHA(mc.SHA), shortSHA(sha))
+	case mc.ExitCode != 0:
+		return fmt.Sprintf("%s exited %d (job %s)", mc.Script, mc.ExitCode, mc.JobID)
+	}
+	return ""
 }
 
 // verdictOutput decodes a stored verdict's block.

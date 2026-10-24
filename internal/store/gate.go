@@ -578,6 +578,7 @@ func (s *Store) VerdictByJob(jobID string, attempt int) (*JudgeVerdict, error) {
 type CoverJob struct {
 	ID     string
 	Kind   string
+	Status string
 	Runner string
 	Model  string
 	// Covers are the requirement IDs the job was started with.
@@ -585,9 +586,9 @@ type CoverJob struct {
 }
 
 // CoverJobs lists the fix and general jobs of repo whose covers were read from checklist id (any
-// version), oldest first.
+// version, any status), oldest first.
 func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
-	rows, err := s.db.Query(`SELECT id, kind, runner, model, covers, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
+	rows, err := s.db.Query(`SELECT id, kind, status, runner, model, covers, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
 		AND kind IN ('fix','general') ORDER BY created_at, id`, repo)
 	if err != nil {
 		return nil, fmt.Errorf("cover jobs: %w", err)
@@ -597,7 +598,7 @@ func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
 	for rows.Next() {
 		var j CoverJob
 		var covers, cc string
-		if err := rows.Scan(&j.ID, &j.Kind, &j.Runner, &j.Model, &covers, &cc); err != nil {
+		if err := rows.Scan(&j.ID, &j.Kind, &j.Status, &j.Runner, &j.Model, &covers, &cc); err != nil {
 			return nil, fmt.Errorf("cover jobs: %w", err)
 		}
 		var c CoverContract

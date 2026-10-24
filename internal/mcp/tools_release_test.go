@@ -46,13 +46,19 @@ func newReleaseFix(t *testing.T) *releaseFix {
 
 var releaseSeq int
 
-// coder stores a feature job (kind general) of the checklist with covers, as job_start stores one.
+// coder stores a succeeded feature job (kind general) of the checklist with covers, as job_start stores one.
 func (f *releaseFix) coder(t *testing.T, runner, model string, covers ...string) string {
+	t.Helper()
+	return f.coderStatus(t, store.StatusSucceeded, runner, model, covers...)
+}
+
+// coderStatus stores a feature job of the checklist that ended with status.
+func (f *releaseFix) coderStatus(t *testing.T, status, runner, model string, covers ...string) string {
 	t.Helper()
 	releaseSeq++
 	id := fmt.Sprintf("coder-%d", releaseSeq)
 	if err := f.m.Store.Insert(&store.Job{ID: id, Agent: f.m.Agent, Title: "coder", Kind: "general", Brief: "b", RepoPath: f.repo,
-		Status: store.StatusSucceeded, Model: model, Runner: runner, MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1,
+		Status: status, Model: model, Runner: runner, MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1,
 		CreatedAt: time.Now(), Covers: covers, CoverContract: &store.CoverContract{ChecklistID: f.v.ID, Version: f.v.Version}}); err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +76,10 @@ type judged struct {
 	runner     string
 	model      string
 	blind      bool
+	kind       string // the job's kind (default judge)
+	status     string // how the job's row ends (default succeeded; running leaves it running)
+	hash       string // another checklist hash for the verdict
+	reattempt  bool   // the row ends at a later attempt than the verdict's
 }
 
 func okJudge() judged {
@@ -79,7 +89,11 @@ func okJudge() judged {
 // judge stores a judge job's records for the fixture's head, under the job's launch token.
 func (f *releaseFix) judge(t *testing.T, j judged) string {
 	t.Helper()
-	id, token := gateJobRow(t, f.m, jobs.KindJudge)
+	kind := j.kind
+	if kind == "" {
+		kind = jobs.KindJudge
+	}
+	id, token := gateJobRow(t, f.m, kind)
 	if !j.noManifest {
 		sha := f.head
 		if j.manifestAt != "" {
@@ -100,11 +114,38 @@ func (f *releaseFix) judge(t *testing.T, j judged) string {
 				Evidence: []string{"main.go:1"}, Note: "NOTE_" + rid})
 		}
 	}
+	hash := f.v.SHA256
+	if j.hash != "" {
+		hash = j.hash
+	}
 	if _, err := f.m.Store.PutVerdict(token, store.JudgeVerdict{JobID: id, Repo: f.repo, SHA: f.head, ChecklistID: f.v.ID,
-		Version: f.v.Version, ChecklistSHA256: f.v.SHA256, JudgeModel: j.model, JudgeRunner: j.runner,
+		Version: f.v.Version, ChecklistSHA256: hash, JudgeModel: j.model, JudgeRunner: j.runner,
 		JudgeFamily: jobs.ModelFamily(j.runner, j.model), EnforcedBlind: j.blind, Counts: map[string]int{}, Verdict: o,
 		CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
+	}
+	if j.reattempt {
+		// The attempt fails after storing its verdict; the next attempt (no verdict of its own) succeeds.
+		if err := f.m.Store.Finish(id, token, store.StatusFailed, 0, 0, 0, "x", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.m.Store.Requeue(id, store.ResumeLimits{MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1}, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		token = token + "-2"
+		if err := f.m.Store.Claim(id, token, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switch status := j.status; status {
+	case store.StatusRunning:
+	case "":
+		status = store.StatusSucceeded
+		fallthrough
+	default:
+		if err := f.m.Store.Finish(id, token, status, 0, 0, 0, "", time.Now()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return id
 }
@@ -270,9 +311,78 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01")
 			f.judge(t, okJudge())
 		}},
-		{"a feature job covering no live requirement", jobs.ReleaseTrace, "feature job(s) covering no live requirement", func(t *testing.T, f *releaseFix) {
+		{"a feature job covering no row of the checklist", jobs.ReleaseTrace, "feature job(s) covering no row of the checklist: coder-",
+			func(t *testing.T, f *releaseFix) {
+				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R09") // a row since removed from the checklist
+				f.judge(t, okJudge())
+			}},
+		{"a cancelled coder supplies no coverage", jobs.ReleaseTrace, "trace — in no feature job's covers: R02", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01")
+			f.coderStatus(t, store.StatusCancelled, store.RunnerCodex, "gpt-5.6-sol", "R02")
+			f.judge(t, okJudge())
+		}},
+		{"a failed coder supplies no coverage", jobs.ReleaseTrace, "trace — no succeeded feature job covers checklist", func(t *testing.T, f *releaseFix) {
+			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			f.judge(t, okJudge())
+		}},
+		{"a failed coder of the judge's family", jobs.ReleaseFamily, "family — the judge (anthropic", func(t *testing.T, f *releaseFix) {
 			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R03")
+			f.coderStatus(t, store.StatusFailed, store.RunnerClaude, "sonnet", "R02") // its commits may be in the sha
+			f.judge(t, okJudge())
+		}},
+		{"a red manifest-check judged again until green", jobs.ReleaseManifestCheck, "manifest_check — scripts/manifest-check.sh exited 1 (job gate-",
+			func(t *testing.T, f *releaseFix) {
+				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+				red := okJudge()
+				red.exit = 1
+				f.judge(t, red)
+				f.judge(t, okJudge())
+			}},
+		{"an earlier verdict without a manifest-check record", jobs.ReleaseManifestCheck, "manifest_check — no manifest-check record of judge job",
+			func(t *testing.T, f *releaseFix) {
+				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+				j := okJudge()
+				j.noManifest = true
+				f.judge(t, j)
+				f.judge(t, okJudge())
+			}},
+		{"a verdict of a judge job that failed", jobs.ReleaseVerdict, "verdict — the verdict of job gate-", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.status = store.StatusFailed
+			f.judge(t, j)
+		}},
+		{"a verdict of a judge job still running", jobs.ReleaseVerdict, "is running, not succeeded", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.status = store.StatusRunning
+			f.judge(t, j)
+		}},
+		{"a verdict stored by a job that is not a judge", jobs.ReleaseVerdict, "is a slicing job, not a judge", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.kind = jobs.KindSlicing
+			f.judge(t, j)
+		}},
+		{"a verdict of an earlier attempt of the judge", jobs.ReleaseVerdict, "is of attempt 0, the job ended attempt 1", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.reattempt = true
+			f.judge(t, j)
+		}},
+		{"an earlier verdict disagrees on unmapped_brief", jobs.ReleaseVerdict, "disagree on unmapped_brief or suspect_tests", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.unmapped = []string{"a logout button"}
+			f.judge(t, j)
+			f.judge(t, okJudge())
+		}},
+		{"an earlier verdict disagrees on suspect_tests", jobs.ReleaseVerdict, "disagree on unmapped_brief or suspect_tests", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			j := okJudge()
+			j.suspect = []string{"TestLogin passes without a login"}
+			f.judge(t, j)
 			f.judge(t, okJudge())
 		}},
 	} {
@@ -293,6 +403,22 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Only the verdicts at the approved checklist hash count: a disagreeing verdict at another hash (same id
+// and version) is not read; a coder covering only a deferred row does not fail the trace.
+func TestReleaseCheckIgnoresOtherHashAndDeferredCovers(t *testing.T) {
+	f := passing(t)
+	other := okJudge()
+	other.hash = strings.Repeat("e", 64)
+	other.verdicts = map[string]string{"R01": "missing", "R02": "missing"}
+	other.exit = 1
+	f.judge(t, other)
+	f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R03") // R03 was deferred after this job started
+	r := f.check(t)
+	if !r.Pass || r.Verdicts != 1 || r.OwnerLine != "Acceptance: 2 of 2" || len(r.FeatureJobs) != 2 {
+		t.Fatalf("release_check: %+v", r)
 	}
 }
 
