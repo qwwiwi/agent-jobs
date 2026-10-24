@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -287,6 +288,27 @@ CREATE TABLE IF NOT EXISTS job_notes (
 	created_at INTEGER NOT NULL
 );
 `
+
+// OpenReadOnly opens the existing database at path for reads only: it never creates the file, runs no
+// migration, does not change the journal mode and never waits for a lock (a locked database fails at
+// once with SQLITE_BUSY). For callers that must not change the state or block on it (the brief reminder
+// hook); a database from an older version may then lack a table the caller reads.
+func OpenReadOnly(path string) (*Store, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout(0)&_pragma=query_only(1)", path)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	return &Store{db: db}, nil
+}
 
 // Open opens (and migrates) the database at path.
 func Open(path string) (*Store, error) {

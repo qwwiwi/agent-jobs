@@ -1878,8 +1878,30 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		sub = args[0]
 	}
 	if sub == "brief-reminder" {
-		if err := briefReminder(args[1:], stdin, stdout, opener); err != nil {
-			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(no reminder)")
+		type answer struct {
+			line string
+			err  error
+		}
+		done := make(chan answer, 1)
+		go func() {
+			line, err := briefReminder(args[1:], stdin, openReadOnly)
+			done <- answer{line, err}
+		}()
+		var a answer
+		select {
+		case a = <-done:
+		case <-time.After(briefReminderTimeout):
+			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+		}
+		switch {
+		case errors.Is(a.err, jobs.ErrInJobSession):
+			// A job session: silent, like the job-role refusal in main.
+		case a.err != nil:
+			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", a.err, "(no reminder)")
+		case a.line != "":
+			if _, err := fmt.Fprintln(stdout, a.line); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err)
+			}
 		}
 		return 0
 	}
@@ -1953,34 +1975,50 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	return 0
 }
 
-// briefReminder is `hook brief-reminder`: the reminder line on stdout (UserPromptSubmit stdout becomes
-// context), nothing for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, stdout io.Writer, opener func(string) (*jobs.Manager, error)) error {
+// briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
+// prompt goes on without a reminder.
+const briefReminderTimeout = 2 * time.Second
+
+// briefReminder is `hook brief-reminder`: the reminder line (UserPromptSubmit stdout becomes context),
+// "" for a session other than the bound one.
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(pos) > 0 {
-		return errors.New("no positional arguments")
+		return "", errors.New("no positional arguments")
 	}
 	in, err := jobs.ParseUserPromptInput(stdin)
 	if err != nil {
-		return err
+		return "", err
 	}
 	m, err := opener(*agent)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer m.Close()
-	line, err := m.BriefReminder(in)
-	if err != nil || line == "" {
-		return err
+	return m.BriefReminder(in)
+}
+
+// openReadOnly is open for the brief reminder: the existing state for reads only (jobs.OpenReadOnly),
+// never created or migrated, with the same job-session exclusion.
+func openReadOnly(agent string) (*jobs.Manager, error) {
+	if agent == "" {
+		return nil, errors.New("--agent is required")
 	}
-	_, err = fmt.Fprintln(stdout, line)
-	return err
+	m, err := jobs.OpenReadOnly(agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.CheckNotInJobSession(); err != nil {
+		_ = m.Close()
+		return nil, err
+	}
+	return m, nil
 }
 
 func cmdHTTPAPI(args []string) error {

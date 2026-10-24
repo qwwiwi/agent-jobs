@@ -111,6 +111,28 @@ func Open(agent string) (*Manager, error) {
 	}, nil
 }
 
+// OpenReadOnly opens an existing state for reads only (store.OpenReadOnly): it creates no directory or
+// file, runs no migration and never waits for the store's lock. The manager has no brain and no own
+// binary; it serves read paths such as the brief reminder, never a job's lifecycle.
+func OpenReadOnly(agent string) (*Manager, error) {
+	dir, err := StateDir(agent)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	st, err := store.OpenReadOnly(filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{
+		Agent: agent, StateDir: dir, Cfg: cfg, Store: st, Now: time.Now, Brain: brain.Disabled{},
+		Log: log.New(os.Stderr, "agent-jobs["+agent+"] ", log.LstdFlags),
+	}, nil
+}
+
 // Close releases the DB.
 func (m *Manager) Close() error { return m.Store.Close() }
 

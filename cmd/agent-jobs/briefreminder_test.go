@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
@@ -59,5 +64,145 @@ func TestHookBriefReminder(t *testing.T) {
 		if code != 0 || out != "" || !strings.Contains(errs, "agent-jobs hook brief-reminder:") {
 			t.Errorf("%s: %d %q %q", name, code, out, errs)
 		}
+	}
+}
+
+// The brief reminder never changes the state: against a missing state dir it creates nothing; against a
+// store with an older schema it runs no migration; against a store another connection holds locked it
+// returns at once. Every case exits 0.
+func TestHookBriefReminderReadOnly(t *testing.T) {
+	orch := bindableAgent(t, "test")
+	home := os.Getenv("AGENT_JOBS_HOME")
+	dir, err := jobs.StateDir("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reminder := []string{"brief-reminder", "--agent", "test"}
+	b, _ := json.Marshal(map[string]string{"session_id": "s1", "hook_event_name": "UserPromptSubmit", "cwd": orch, "prompt": "hi"})
+	run := func(name string) (string, string) {
+		t.Helper()
+		var out, errb bytes.Buffer
+		start := time.Now()
+		code := runHook(reminder, bytes.NewReader(b), &out, &errb, open)
+		took := time.Since(start)
+		if code != 0 || took > 3*time.Second {
+			t.Fatalf("%s: exit %d after %s (%q)", name, code, took, errb.String())
+		}
+		t.Logf("%s: %s", name, took)
+		return out.String(), errb.String()
+	}
+	entries := func() []string {
+		t.Helper()
+		var names []string
+		err := filepath.WalkDir(home, func(p string, _ os.DirEntry, err error) error {
+			names = append(names, p)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
+
+	// Missing state dir: nothing is created (bindableAgent wrote only config.json).
+	if err := os.Remove(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	before := entries()
+	if out, _ := run("missing state dir"); out != "" {
+		t.Errorf("missing state dir: stdout %q", out)
+	}
+	if after := entries(); !slices.Equal(before, after) {
+		t.Errorf("missing state dir: files created: %v -> %v", before, after)
+	}
+
+	// An older schema (a store without the heartbeats table, the session bound): the reminder is printed,
+	// no table is added.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.BindHookSession("s1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Close()
+	// tables lists the schema, optionally after dropping one table; the connection is closed again, so
+	// no -wal or -shm file stays behind it.
+	tables := func(drop string) []string {
+		t.Helper()
+		db, err := sql.Open("sqlite", filepath.Join(dir, "jobs.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if drop != "" {
+			if _, err := db.Exec(`DROP TABLE ` + drop); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows, err := db.Query(`SELECT name FROM sqlite_master ORDER BY name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var names []string
+		for rows.Next() {
+			var n string
+			if err := rows.Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, n)
+		}
+		return names
+	}
+	beforeTables := tables("heartbeats")
+	before = entries()
+	if out, _ := run("older schema"); !strings.HasPrefix(out, jobs.BriefReminderPrefix) {
+		t.Errorf("older schema: no reminder for the bound session: %q", out)
+	}
+	// SQLite's read-only reader of a WAL database whose -wal and -shm were removed on the last close
+	// recreates those two (empty) companions; nothing else may appear.
+	after := slices.DeleteFunc(entries(), func(p string) bool {
+		return p == filepath.Join(dir, "jobs.db-wal") || p == filepath.Join(dir, "jobs.db-shm")
+	})
+	if afterTables := tables(""); !slices.Equal(before, after) || !slices.Equal(beforeTables, afterTables) {
+		t.Errorf("older schema: state changed: files %v -> %v, tables %v -> %v", before, after, beforeTables, afterTables)
+	}
+
+	// A full store held under an exclusive lock: the hook does not wait for it.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if m, err = jobs.Open("test"); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Close()
+	lock, err := sql.Open("sqlite", filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	lock.SetMaxOpenConns(1)
+	if _, err := lock.Exec(`PRAGMA locking_mode=EXCLUSIVE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lock.Exec(`BEGIN EXCLUSIVE; INSERT INTO hook_session (id, session_id, bound_at) VALUES (1, 's1', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	before = entries()
+	if out, errs := run("locked store"); out != "" || !strings.Contains(errs, "agent-jobs hook brief-reminder:") {
+		t.Errorf("locked store: %q %q", out, errs)
+	}
+	if after := entries(); !slices.Equal(before, after) {
+		t.Errorf("locked store: files created: %v -> %v", before, after)
+	}
+	if _, err := lock.Exec(`ROLLBACK`); err != nil {
+		t.Fatal(err)
 	}
 }
