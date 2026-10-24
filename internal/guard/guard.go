@@ -3035,14 +3035,21 @@ func checkForeignIdentity(scripts []*script, _ string, cfg Config) string {
 	})
 }
 
-// backgroundBash reports a Bash input whose run_in_background is set to anything but false or null.
+// backgroundBash reports a Bash input with a key run_in_background, in any case, set to anything but
+// false or null: encoding/json matches a field ignoring case and keeps the last key, so a decoded struct
+// would read `{"run_in_background":true,"Run_In_Background":false}` as false.
 func backgroundBash(raw json.RawMessage) bool {
-	var in struct {
-		RunInBackground json.RawMessage `json:"run_in_background"`
-	}
+	var in map[string]json.RawMessage
 	if json.Unmarshal(raw, &in) != nil {
 		return true // an input the guard cannot read is refused
 	}
-	v := strings.TrimSpace(string(in.RunInBackground))
-	return v != "" && v != "false" && v != "null"
+	for k, v := range in {
+		if !strings.EqualFold(k, "run_in_background") {
+			continue
+		}
+		if s := strings.TrimSpace(string(v)); s != "false" && s != "null" {
+			return true
+		}
+	}
+	return false
 }
