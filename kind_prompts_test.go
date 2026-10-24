@@ -26,7 +26,11 @@ func TestWriteKindPromptsExecutorRules(t *testing.T) {
 			t.Errorf("%s: reference rows not kept on lines 3-4", name)
 		}
 		for _, want := range []string{
-			"Red proof:", "`REDPROOF` line in Evidence", "failed before your change", "`REDPROOF R01 · ...`",
+			"Red proof:", "write a `REDPROOF` line", "failed before your change", "`REDPROOF R01 · ...`",
+			// ParseRequirements reads proofs only inside the Requirements block: a covered job puts them
+			// there; a job without covers may keep them in Evidence.
+			"put these lines inside the `### Requirements` block", "a proof only in Evidence leaves the requirement claimed",
+			"A job without covers may put its `REDPROOF` lines in Evidence",
 			"Do not make up a fact", "visible placeholder", "`<<PLACEHOLDER: what is missing>>`", "list each one in Not done / uncertain",
 			"`Requirements: R01, R03i`", "end each commit message with a trailer",
 			"`BLOCKED: <requirement or item> · <why>`", "is `missing` or `partial` in the `### Requirements` block",
@@ -34,6 +38,9 @@ func TestWriteKindPromptsExecutorRules(t *testing.T) {
 			if !strings.Contains(s, want) {
 				t.Errorf("%s lacks %q", name, want)
 			}
+		}
+		if strings.Contains(s, "line in Evidence that names the test") {
+			t.Errorf("%s still asks every job for its red proof in Evidence", name)
 		}
 		if strings.Contains(s, "`## ") {
 			t.Errorf("%s asks for a top-level (##) report section beyond the four of the report contract", name)
