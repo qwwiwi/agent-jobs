@@ -151,11 +151,29 @@ func (m *Manager) JobGuardCommand(id string, gitDirs ...string) string {
 	return m.guardCommand(id, "", m.skillProtected(nil), gitDirs...)
 }
 
-// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log and the job
-// database (with its WAL files) that holds the monotonic subagent counter.
+// ProtectedPaths are the agent-jobs state a job never writes: every job's subagent log, the job
+// database (with its WAL files) that holds the monotonic subagent counter, and the configuration the
+// daemon and the MCP server load: <state>/config.json (hot-reloaded each tick: max_running, models,
+// skill_roots, ...), the owner rules and the project cards glued into every brief (wherever
+// owner_rules_path and cards_dir point).
 func (m *Manager) ProtectedPaths() []string {
 	db := filepath.Join(m.StateDir, "jobs.db")
-	return []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal"}
+	out := []string{filepath.Join(m.StateDir, "subagents"), db, db + "-wal", db + "-shm", db + "-journal",
+		filepath.Join(m.StateDir, "config.json")}
+	for _, p := range []string{m.Config().OwnerRulesPath, m.Config().CardsDir} {
+		if p != "" {
+			out = append(out, filepath.Clean(p))
+		}
+	}
+	return out
+}
+
+// jobGitProtected are job id's git files: <jobdir>/gitconfig (its GIT_CONFIG_GLOBAL) and
+// <jobdir>/no-hooks (its core.hooksPath). Their 0400/0500 modes do not hold a job back (it owns them
+// and may chmod them), and a changed diff.external or a planted hook makes git run a program.
+func (m *Manager) jobGitProtected(id string) []string {
+	dir := m.JobDir(id)
+	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir)}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -182,7 +200,7 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected []string, 
 	if jobID != "" {
 		parts = append(parts, "--subagent-log", shellQuote(m.SubagentLogPath(jobID)),
 			"--subagent-db", shellQuote(filepath.Join(m.StateDir, "jobs.db")), "--subagent-job", shellQuote(jobID))
-		for _, p := range append(m.ProtectedPaths(), extraProtected...) {
+		for _, p := range append(append(m.ProtectedPaths(), m.jobGitProtected(jobID)...), extraProtected...) {
 			parts = append(parts, "--protect", shellQuote(p))
 		}
 	}
