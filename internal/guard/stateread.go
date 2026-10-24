@@ -259,18 +259,33 @@ func percentDecodedOnce(w string) string {
 // reFileURL is a file URL in a text, in any case, up to a quote, a blank or a shell operator.
 var reFileURL = regexp.MustCompile("(?i)file:([^\\s'\"`<>|&;()]*)")
 
-// fileURLPath returns the path of a file URL u (the text after `file:`) as curl, wget and python's
-// urllib open it: after an optional host (`file:///p`, `file://localhost/p`, `file:/p`), percent-decoded
-// once; ok is false for a host and no path.
-func fileURLPath(u string) (string, bool) {
-	if rest, ok := strings.CutPrefix(u, "//"); ok {
-		i := strings.IndexByte(rest, '/')
-		if i < 0 {
-			return "", false
-		}
-		u = rest[i:]
+// fileURLPaths returns the paths of a file URL u (the text after `file:`) as curl, wget and python's
+// urllib open it: after an optional host (`file:///p`, `file://localhost/p`, `file:/p`), cut at a raw
+// query or fragment and percent-decoded once. curl cuts at the first raw `?` or `#`, urllib only at the
+// first raw `#` (it opens `x?q` as is), so both forms are returned when they differ; an encoded
+// `%3F`/`%23` stays a filename character. A host with no path has none.
+func fileURLPaths(u string) []string {
+	curl, _, _ := strings.Cut(u, "#")
+	urllib := curl
+	if i := strings.IndexByte(curl, '?'); i >= 0 {
+		curl = curl[:i]
 	}
-	return percentDecodedOnce(u), true
+	cuts := []string{curl}
+	if urllib != curl {
+		cuts = append(cuts, urllib)
+	}
+	var out []string
+	for _, c := range cuts {
+		if rest, ok := strings.CutPrefix(c, "//"); ok {
+			i := strings.IndexByte(rest, '/')
+			if i < 0 {
+				continue
+			}
+			c = rest[i:]
+		}
+		out = append(out, percentDecodedOnce(c))
+	}
+	return out
 }
 
 // reDotSegment is a `.` or `..` segment of a URL path.
@@ -297,7 +312,8 @@ func unsafeFileURL(u string, queries bool) string {
 // fileURLs returns a refusal when a file URL in s reaches the state. It fails closed in every scope: a
 // URL still percent-encoded after one decode or with a dot segment is refused, for a job with a read
 // allowlist also one with a query or a fragment (a sqlite URI `file:x.db?mode=ro` stays usable in
-// other jobs), and the path of any other, decoded once, is checked strictly.
+// other jobs), and the paths of any other, cut at a raw query or fragment as each reader cuts them and
+// decoded once, are checked strictly.
 func (r *stateReadScope) fileURLs(s string, at where, m wordMode) string {
 	if !strings.Contains(strings.ToLower(s), "file:") {
 		return ""
@@ -307,12 +323,13 @@ func (r *stateReadScope) fileURLs(s string, at where, m wordMode) string {
 		if why := unsafeFileURL(u[1], r.urls); why != "" {
 			return r.blockedMsg("`"+u[0]+"`", u[0]+" ("+why+")")
 		}
-		p, ok := fileURLPath(u[1])
-		if !ok || p == "" {
-			continue
-		}
-		if reason := r.word(p, at, m); reason != "" {
-			return reason
+		for _, p := range fileURLPaths(u[1]) {
+			if p == "" {
+				continue
+			}
+			if reason := r.word(p, at, m); reason != "" {
+				return reason
+			}
 		}
 	}
 	return ""
