@@ -27,6 +27,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `model` **or** `complexity` | mandatory, one of them. `complexity` is `light`, `normal` or `hard` and picks the model by kind. With neither, job_start is rejected: there is no default and no classifier |
 | `repo`, `base` | optional: the job gets a git worktree of `repo` at `base` (default HEAD). Without a repo it works in an empty directory |
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
+| `size` | `small` or `large`; pass it on every `fix` and `general` job (review and research jobs are exempt). `small`: a fix or a single job. `large`: a new project, or a feature with more than 5 requirements, several jobs or more than a day of work; it needs `repo` and `covers` naming only live requirement IDs of the repo's approved, unchanged `brief/CHECKLIST.md`, otherwise the call is rejected. While config `size_required` is off (the default until the owner turns it on) a missing size is logged and allowed; once it is on, a `fix` or `general` job without it is rejected |
 | `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults |
 
 job_start returns the id at once; the daemon starts the job within a minute, at most `max_running` at a time per agent (config.json, default two). Do not poll it in a loop: wait for the job-done line.
@@ -91,6 +92,12 @@ You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.
 2. The report is a claim, not a result. Check the diff yourself against `base_commit`: in the worktree while it exists, afterwards `commits.patch`, `staged.patch`, `uncommitted.patch`, `untracked.tar`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`. Run the checks yourself.
 3. Only then does anything leave the machine: push, PR, deploy, a message to a person. That is this session's job, never the job's.
 4. A failed job without a report: look at `stderr.log`, then `stream.jsonl` in the job's directory.
+
+After a review, and when a job failed:
+
+- A fix job gets the review's Blocking findings as written and nothing more: copy them unchanged, without the Non-blocking items, your own rewording or extra ideas. Non-blocking items go to a separate ticket.
+- The review of that fix is a fix review: say «fix review» in its brief and give it only the fix diff and the Blocking findings as the conditions to close. It marks each one `closed` or `open`.
+- Rerun a failed job only after something in the approach changed (the brief, the inputs, the model, the limits or how the work is split), and say in the new brief what changed. The same brief on the same model again is not a rerun.
 
 The daemon removes the worktree 30 minutes after the job-done line. Read within that window; later the work is still in the patches and the ref.
 
