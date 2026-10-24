@@ -240,8 +240,8 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			if err := jobs.CheckCommit(main, strings.TrimSpace(w.SHA)); err != nil {
 				return nil, ChecklistView{}, fmt.Errorf("waiver %d: %w", i+1, err)
 			}
-			quote, n := jobs.Redact(strings.TrimSpace(w.Quote))
-			if quote == "" {
+			quote, n := jobs.Redact(w.Quote) // raw, before any trimming
+			if quote = strings.TrimSpace(quote); quote == "" {
 				return nil, ChecklistView{}, fmt.Errorf("waiver %d: the owner's quote is empty", i+1)
 			}
 			res.Redacted += n
