@@ -68,14 +68,18 @@ func (m *Manager) checkSize(r StartRequest, covers []string, cover *store.CoverC
 }
 
 // logSize logs the size of a queued fix or general job: small, large, or none given (allowed while
-// size_required is off).
+// size_required is off; with it on, only a schedule firing, which does not take the rule, is queued so).
 func (m *Manager) logSize(j *store.Job) {
 	if !slices.Contains(SizeKinds, j.Kind) || m.Log == nil {
 		return
 	}
 	switch j.Size {
 	case "":
-		m.Log.Printf("job %s (%s): queued without size (size_required is off)", j.ID, j.Kind)
+		why := "size_required is off"
+		if m.Config().SizeRequired {
+			why = "size_required is on; exempt: a schedule firing"
+		}
+		m.Log.Printf("job %s (%s): queued without size (%s)", j.ID, j.Kind, why)
 	case SizeLarge:
 		m.Log.Printf("job %s (%s): size large, covers %s of checklist %s", j.ID, j.Kind, strings.Join(j.Covers, ", "),
 			j.CoverContract.ChecklistID)

@@ -68,10 +68,21 @@ func TestSizeRequired(t *testing.T) {
 	}
 	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "review"; r.SizeRule = true })
 	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "research"; r.SizeRule = true })
-	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix" }) // a schedule's firing: no SizeRule
+	var logs bytes.Buffer
+	m.Log = log.New(&logs, "", 0)
+	fired := enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix" }) // a schedule's firing: no SizeRule
+	// The exempt job is logged as exempt, not as if size_required were off.
+	if s := logs.String(); !strings.Contains(s, "job "+fired.ID+" (fix): queued without size (size_required is on; exempt") ||
+		strings.Contains(s, "size_required is off") {
+		t.Errorf("exempt job's log: %q", s)
+	}
 	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix"; r.Size = SizeSmall; r.SizeRule = true })
 	m.Cfg.SizeRequired = false
-	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix"; r.SizeRule = true })
+	logs.Reset()
+	off := enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix"; r.SizeRule = true })
+	if s := logs.String(); !strings.Contains(s, "job "+off.ID+" (fix): queued without size (size_required is off)") {
+		t.Errorf("size_required off, log: %q", s)
+	}
 }
 
 // size large on a fix or general job needs covers naming only live requirements of the repository's
