@@ -18,7 +18,7 @@ func approvedChecklist(t *testing.T, m *jobs.Manager, cs *sdk.ClientSession, rep
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "id": id, "brief": words}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
 	if !v.Approved {

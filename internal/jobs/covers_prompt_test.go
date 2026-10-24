@@ -26,9 +26,9 @@ const coverChecklist = `# Checklist
 - version: 2
 - approved: no
 
-| ID | Brief (verbatim) | Contract | Basis |
+| ID | Brief quote | Contract | Rationale |
 |---|---|---|---|
-| R01 | «a login page with \| a pipe» | live | BASIS_MARKER |
+| R01 | «a login page with \| a pipe» | live | RATIONALE_MARKER |
 | R02 | SECOND_ROW_MARKER | live | brief |
 | R03i | «sessions survive a restart» | live placeholder-ok | implied by R01 |
 `
@@ -96,7 +96,7 @@ func TestCoversInjectedIntoPrompt(t *testing.T) {
 			t.Errorf("prompt lacks %q", want)
 		}
 	}
-	for _, never := range []string{"SECOND_ROW_MARKER", "BRIEF_TEXT_MARKER", "BASIS_MARKER", "- R02 "} {
+	for _, never := range []string{"SECOND_ROW_MARKER", "BRIEF_TEXT_MARKER", "RATIONALE_MARKER", "- R02 "} {
 		if strings.Contains(prompt, never) {
 			t.Errorf("prompt shows %q", never)
 		}

@@ -39,8 +39,8 @@ func TestApplyRedactsRawInputWithRealRedactor(t *testing.T) {
 			f := &checklist.Files{Brief: brief, Checklist: list}
 			res, err := checklist.Apply(f, checklist.Change{
 				Rows: []checklist.Row{
-					{ID: "R01", Verbatim: frag, Contract: "live", Basis: frag},
-					{ID: "G01", Verbatim: "dark mode", Contract: "deferred", Basis: frag},
+					{ID: "R01", Verbatim: frag, Contract: "live", Rationale: frag},
+					{ID: "G01", Verbatim: "dark mode", Contract: "deferred", Rationale: frag},
 				},
 				Additions: []checklist.Addition{{Quote: frag}},
 			}, now, jobs.Redact, nil, func(string) (*checklist.Binding, error) {
@@ -55,7 +55,7 @@ func TestApplyRedactsRawInputWithRealRedactor(t *testing.T) {
 				}
 			}
 			for _, r := range res.List.Rows {
-				if strings.Contains(r.Verbatim+r.Basis, bodyMark) {
+				if strings.Contains(r.Verbatim+r.Rationale, bodyMark) {
 					t.Fatalf("row %s kept the key: %+v", r.ID, r)
 				}
 			}

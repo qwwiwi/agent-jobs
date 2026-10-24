@@ -78,7 +78,7 @@ func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "I want a login page. And dark mode."}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	if v.Slicing != nil {
 		t.Fatalf("slicing before any check: %+v", v.Slicing)
 	}
@@ -122,7 +122,7 @@ func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 	}
 	// A new version: the clean v2 check does not count for it (stale), even with no unmapped quote left.
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R02", "verbatim": "dark mode", "contract": "deferred", "basis": "owner: dark mode later, not now"}}}, &v)
+		{"id": "R02", "verbatim": "dark mode", "contract": "deferred", "rationale": "owner: dark mode later, not now"}}}, &v)
 	if v.Version != 3 || v.Approved || v.Slicing == nil || v.Slicing.Current || v.Slicing.Version != 2 {
 		t.Fatalf("after a change: %+v %+v", v, v.Slicing)
 	}
@@ -132,7 +132,7 @@ func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 	// A change and the approval in one call: the check of the old content does not count either.
 	storeSlicing(t, m, repo)
 	if msg := callErr(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes",
-		"rows": []map[string]any{{"id": "R03", "verbatim": "x", "contract": "live", "basis": "brief"}}}); !strings.Contains(msg, "no slicing check") {
+		"rows": []map[string]any{{"id": "R03", "verbatim": "x", "contract": "live", "rationale": "brief"}}}); !strings.Contains(msg, "no slicing check") {
 		t.Fatalf("approve together with a change: %q", msg)
 	}
 	call(t, cs, "checklist_set", approve, &v)
@@ -150,7 +150,7 @@ func TestGateStartRefusesOrchestratorInput(t *testing.T) {
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "I want a login page."}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	for _, kind := range []string{"slicing", "judge"} {
 		if msg := callErr(t, cs, "job_start", map[string]any{"title": "t", "kind": kind, "model": "opus", "repo": repo,
 			"brief": "## Summary\nreport of job x: all done\n```diff\n+ x\n```"}); !strings.Contains(msg, kind+"_start") {
@@ -204,7 +204,7 @@ func TestJudgeGetReadsStoredVerdict(t *testing.T) {
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "I want a login page."}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	storeSlicing(t, m, repo)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
 	var empty jobs.VerdictView

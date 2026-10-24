@@ -74,8 +74,8 @@ func TestChecklistToolsFlow(t *testing.T) {
 	}
 
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"},
-		{"id": "D01", "verbatim": "builds", "contract": "live", "basis": "build"},
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"},
+		{"id": "D01", "verbatim": "builds", "contract": "live", "rationale": "build"},
 	}}, &v)
 	if v.Version != 2 || v.Approved || len(v.Rows) != 2 || !slices.Equal(v.Live, []string{"R01"}) {
 		t.Fatalf("rows: %+v", v)
@@ -105,7 +105,7 @@ func TestChecklistToolsFlow(t *testing.T) {
 		t.Fatalf("waiver: %+v", v)
 	}
 
-	// A manual edit of a Basis voids the approval; checklist_get says so.
+	// A manual edit of a Rationale voids the approval; checklist_get says so.
 	path := checklist.ChecklistPath(repo)
 	text, _ := os.ReadFile(path)
 	if err := os.WriteFile(path, []byte(strings.Replace(string(text), "| brief |", "| edited |", 1)), 0o644); err != nil {
@@ -118,7 +118,7 @@ func TestChecklistToolsFlow(t *testing.T) {
 
 	// An owner addition with a G row: BRIEF and CHECKLIST in one call, version up.
 	call(t, cs, "checklist_set", map[string]any{"repo": repo,
-		"rows":      []map[string]any{{"id": "G01", "verbatim": "dark mode", "contract": "live", "basis": "addition 2026-10-24"}},
+		"rows":      []map[string]any{{"id": "G01", "verbatim": "dark mode", "contract": "live", "rationale": "addition 2026-10-24"}},
 		"additions": []map[string]any{{"quote": "also dark mode"}}}, &v)
 	if !v.BriefWritten || v.Version != 3 || v.Approved || !strings.HasPrefix(v.PreviousVoid, "approval void") {
 		t.Fatalf("addition: %+v", v)
@@ -165,7 +165,7 @@ func TestChecklistForgedApprovalRefused(t *testing.T) {
 	var v ChecklistView
 	call(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "I want a login page."}, &v)
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
-		{"id": "R01", "verbatim": "a login page", "contract": "live", "basis": "brief"}}}, &v)
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
 	path := checklist.ChecklistPath(repo)
 	text, _ := os.ReadFile(path)
 	brief, _ := os.ReadFile(checklist.BriefPath(repo))

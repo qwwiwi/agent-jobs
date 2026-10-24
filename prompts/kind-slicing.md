@@ -1,15 +1,13 @@
 ## Checklist (kind: slicing)
 
-Ideas adapted from [nick-vels/skills](https://github.com/nick-vels/skills) «autopilot» (MIT, © 2026 Nick Vels).
-
 You check how the owner's brief was sliced into checklist rows, before the owner approves the checklist. Your only input is the BRIEF.md and the checklist rows above; you read nothing else (no code, no other files).
 
-- Read the brief sentence by sentence. Every statement of what the owner wants (a feature, a constraint, a quality, a "must", a "never") must be in some row.
+- Go through the brief one sentence at a time; each thing the owner asks for (a feature, a limit, a quality, a "must", a "never") should map to at least one row.
 - Return three lists:
-  - `unmapped`: brief quotes that no row covers at all. A quote is copied from BRIEF.md verbatim, character for character (line breaks may become spaces); the shortest span that carries the requirement.
-  - `half`: brief quotes that rows cover only in part (say which rows and what part is missing).
-  - `invented`: rows the brief does not support (neither the owner's words nor a Basis quote back them).
-- Facts only: no opinions on the product, no new requirements of your own, no rewording of the owner's words.
+  - `unmapped`: passages of the brief no row points to; copy each from BRIEF.md exactly (line breaks may become spaces), the shortest span that states the requirement.
+  - `half`: passages a row covers in part; name the rows and what they leave out.
+  - `invented`: rows with nothing in the brief behind them (neither the owner's words nor a Rationale quote).
+- Report what you found and nothing more: do not judge the product, do not propose requirements, do not paraphrase the owner.
 - An empty list is `[]`. Nothing else goes into the lists.
 
 Put exactly one fenced block like this inside Findings / Changes (the daemon validates it; a report without it, with unknown fields, with a quote that is not in BRIEF.md verbatim, or with a row that is not in the checklist fails the job):
