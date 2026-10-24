@@ -68,10 +68,10 @@ func ResolveRunner(runner, model string) (string, error) {
 	}
 }
 
-// CodexSandbox is the codex sandbox of a job kind: read-only for review and research, workspace-write
-// for fix and general.
+// CodexSandbox is the codex sandbox of a job kind: read-only for review, research and the gate kinds
+// (slicing, judge), workspace-write for fix and general.
 func CodexSandbox(kind string) string {
-	if kind == "review" || kind == "research" {
+	if kind == "research" || readOnlyKind(kind) {
 		return CodexSandboxReadOnly
 	}
 	return CodexSandboxWrite
@@ -299,6 +299,9 @@ func applyCodexLine(out *StreamResult, line []byte) {
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return
 	}
+	if out.Results > 0 {
+		out.AfterEnd++
+	}
 	switch ev.Type {
 	case "turn.started":
 		out.Found, out.IsError, out.Subtype = false, false, ""
@@ -312,6 +315,7 @@ func applyCodexLine(out *StreamResult, line []byte) {
 			out.Text = ev.Item.Text
 		}
 	case "turn.completed":
+		out.Results++
 		out.Found, out.IsError, out.Subtype = true, false, "success"
 		if ev.Usage != nil {
 			out.InputTokens += ev.Usage.InputTokens
@@ -319,6 +323,7 @@ func applyCodexLine(out *StreamResult, line []byte) {
 			out.OutputTokens += ev.Usage.OutputTokens
 		}
 	case "turn.failed":
+		out.Results++
 		out.Found, out.IsError, out.Subtype = true, true, "turn_failed"
 		if msg := RedactPrintable(ev.Error.Message, 200); msg != "" {
 			out.Subtype += ": " + msg

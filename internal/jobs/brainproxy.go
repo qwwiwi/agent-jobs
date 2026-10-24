@@ -116,6 +116,12 @@ func (m *Manager) HandleBrainRequest(ctx context.Context, peer int, r brain.Sock
 		m.Log.Printf("WARN brain proxy: pid %d of job %s called as job %s; refused", peer, pj.ID, j.ID)
 		return fail(fmt.Errorf("brain proxy: the calling process belongs to job %s, not to job %q", pj.ID, r.JobID))
 	}
+	if IsGateKind(j.Kind) {
+		// A gate job (Wave F) has no MCP server; should one reach the socket anyway, it gets nothing: no
+		// notes (they are not its input), no writes or marks (it is read-only), no owner calls.
+		m.Log.Printf("WARN brain proxy: %s job %s called %q; refused", j.Kind, j.ID, r.Op)
+		return fail(fmt.Errorf("brain proxy: job %s is a %s job: memory, notify_owner and check_mark are not available to it", j.ID, j.Kind))
+	}
 	switch r.Op {
 	case brain.SocketOpSearch:
 		if r.Limit < 1 || r.Limit > 20 {

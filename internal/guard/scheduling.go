@@ -6,7 +6,7 @@ import "strings"
 // by the sequential path snapshots: traps run later and pipeline/background
 // commands can overlap any later extraction or link creation in the call.
 func checkLinkScheduling(scripts []*script, _ string, cfg Config) string {
-	if len(cfg.Protected) == 0 && cfg.StateDir == "" && len(cfg.NoRead) == 0 {
+	if len(cfg.Protected) == 0 && cfg.StateDir == "" && len(cfg.NoRead) == 0 && len(cfg.ReadAllow) == 0 {
 		return ""
 	}
 	links, concurrent, pathTrap := false, false, false

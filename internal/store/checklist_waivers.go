@@ -35,6 +35,8 @@ type Waiver struct {
 // CHECKLIST.md, which anyone editing the file can recompute, is informational. A checklist is approved
 // only while its hash and version are those of the latest approval of its repository.
 type ChecklistApproval struct {
+	// Seq orders the approvals of all repositories (read only; PutApproval assigns it).
+	Seq int64 `json:"-"`
 	// Repo is the repository's main worktree (the key, as a job's repo_path).
 	Repo        string `json:"repo"`
 	ChecklistID string `json:"checklist_id"`
@@ -208,8 +210,8 @@ func (s *Store) PutApproval(a ChecklistApproval) error {
 func (s *Store) LatestApproval(repo string) (*ChecklistApproval, error) {
 	var a ChecklistApproval
 	var at int64
-	err := s.db.QueryRow(`SELECT repo, checklist_id, version, checklist_sha256, brief_sha256, quote, approved_at
-		FROM checklist_approvals WHERE repo = ? ORDER BY seq DESC LIMIT 1`, repo).Scan(&a.Repo, &a.ChecklistID, &a.Version,
+	err := s.db.QueryRow(`SELECT seq, repo, checklist_id, version, checklist_sha256, brief_sha256, quote, approved_at
+		FROM checklist_approvals WHERE repo = ? ORDER BY seq DESC LIMIT 1`, repo).Scan(&a.Seq, &a.Repo, &a.ChecklistID, &a.Version,
 		&a.ChecklistSHA256, &a.BriefSHA256, &a.Quote, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

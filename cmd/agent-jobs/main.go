@@ -86,6 +86,12 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the skill catalog (config skill_roots, same as the
                                            skill_list MCP tool); search scores names, descriptions
                                            and SKILL.md text locally, best 10
+  gate slicing --agent A --repo PATH [--checklist-id ID]
+                                           the slicing check (Wave F, F3) of the repo's checklist
+                                           as JSON (same as slicing_get): its lists and decisions
+  gate verdict --agent A --repo PATH [--sha S] [--checklist-id ID]
+                                           the latest blind judge verdict (Wave F, F5) as JSON
+                                           (same as judge_get)
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
@@ -114,7 +120,7 @@ const usage = `usage: agent-jobs <command> [flags]
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] -- <claude|codex> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -177,6 +183,8 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "gate":
+		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
 	case "schedules":
@@ -246,7 +254,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] -- <claude|codex> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -263,6 +271,8 @@ func runWrapper(args []string) int {
 			opts.FallbackSession = rest[1]
 		case "--runner":
 			opts.Runner = rest[1]
+		case "--checklist-lock-dir":
+			opts.ChecklistLockDir = rest[1]
 		default:
 			fmt.Fprintln(os.Stderr, u)
 			return 2
@@ -297,6 +307,8 @@ func runGuard(args []string, stdin io.Reader) int {
 	var noRead multi
 	fs.Var(&noRead, "no-read", "a directory a job never reads or writes, like the agent state (repeatable)")
 	readOnly := fs.String("read-only", "", "the worktree of a review job: no tool call writes inside it")
+	var readAllow multi
+	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -317,7 +329,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	}
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
-		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly,
+		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -1334,6 +1346,41 @@ func cmdArchive(args []string) error {
 	fmt.Printf("archive: %d jobs\n", len(rep.Jobs))
 	printArchived(n, rep.Expired, rep.RetentionOff, *dry)
 	return aerr
+}
+
+// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get) or `gate verdict` (judge_get).
+func cmdGate(args []string) error {
+	if len(args) == 0 || (args[0] != "slicing" && args[0] != "verdict") {
+		return errors.New("usage: agent-jobs gate slicing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID]")
+	}
+	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
+	agent := agentFlag(fs)
+	repo := fs.String("repo", "", "absolute path of the project's git work tree")
+	id := fs.String("checklist-id", "", "default: the id of the repository's checklist")
+	sha := ""
+	if args[0] == "verdict" {
+		fs.StringVar(&sha, "sha", "", "the verdict for this commit (default: the latest of any commit)")
+	}
+	if _, err := parse(fs, args[1:]); err != nil {
+		return err
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	if args[0] == "slicing" {
+		out, err := mcp.SlicingGet(m, *repo, *id)
+		if err != nil {
+			return err
+		}
+		return printJSON(out)
+	}
+	out, err := mcp.JudgeGet(m, *repo, *id, sha)
+	if err != nil {
+		return err
+	}
+	return printJSON(out)
 }
 
 func cmdIntentions(args []string) error {
