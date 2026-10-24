@@ -40,6 +40,7 @@ func TestRedProofStrict(t *testing.T) {
 		"inline, id in proof":  reqBlock(doneR01 + " · REDPROOF: TestLogin (R01) failed before"),
 		"marker in backticks":  reqBlock(doneR01, "`REDPROOF R01 · TestLogin failed before`"),
 		"not first, then real": reqBlock(doneR01+" · REDPROOF: none", "REDPROOF R01 · TestLogin failed before"),
+		"dashed test name":     reqBlock(doneR01, "REDPROOF R01 · login-form test failed before"),
 	} {
 		if !verified(report) {
 			t.Errorf("%s: not verified", name)
@@ -58,6 +59,12 @@ func TestRedProofStrict(t *testing.T) {
 		"no":                  reqBlock(doneR01, "REDPROOF: R01 no"),
 		"not run":             reqBlock(doneR01, "REDPROOF R01: not run, the test is new"),
 		"dash":                reqBlock(doneR01, "REDPROOF R01 · -"),
+		"em dash none":        reqBlock(doneR01, "REDPROOF R01 — none"),
+		"double dash none":    reqBlock(doneR01, "REDPROOF R01 -- none"),
+		"not-run":             reqBlock(doneR01 + " · REDPROOF R01: not-run"),
+		"no-test":             reqBlock(doneR01, "REDPROOF R01 · no-test"),
+		"NA":                  reqBlock(doneR01, "REDPROOF R01 · NA"),
+		"nothing":             reqBlock(doneR01, "REDPROOF R01: nothing failed"),
 		"inline names R02":    reqBlock(doneR01 + " · REDPROOF: R02 TestOther failed before"),
 		"inline without id":   reqBlock(doneR01 + " · REDPROOF: TestLogin failed before"),
 		"block names R02":     reqBlock(doneR01, "REDPROOF R02 · TestOther failed before"),

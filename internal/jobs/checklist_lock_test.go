@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,5 +41,30 @@ func TestChecklistLockSharedAcrossAgents(t *testing.T) {
 		u()
 	case <-time.After(5 * time.Second):
 		t.Fatal("the second agent did not get the lock after the first released it")
+	}
+}
+
+// The wait is bounded: a holder that never lets go (a job can open the lock file) makes the tool fail
+// with a clear error instead of hanging.
+func TestChecklistLockWaitBounded(t *testing.T) {
+	repo := newRepo(t)
+	m := newManager(t)
+	unlock, err := m.LockChecklist(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	old := checklistLockWait
+	checklistLockWait = 200 * time.Millisecond
+	defer func() { checklistLockWait = old }()
+	start := time.Now()
+	if u, err := m.LockChecklist(repo); err == nil || !strings.Contains(err.Error(), "still held") {
+		if u != nil {
+			u()
+		}
+		t.Fatalf("second lock: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("waited %s", d)
 	}
 }
