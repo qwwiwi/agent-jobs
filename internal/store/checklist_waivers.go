@@ -47,6 +47,26 @@ type ChecklistApproval struct {
 	ApprovedAt      time.Time `json:"approved_at"`
 }
 
+// ChecklistInit is the record checklist_init stores for a new checklist id of a repository: the sha256
+// of the BRIEF text above «## Additions» it was created with. An id is used once per repository.
+type ChecklistInit struct {
+	Repo        string    `json:"repo"`
+	ChecklistID string    `json:"checklist_id"`
+	BriefSHA256 string    `json:"brief_sha256"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// ChecklistBinding is what the store holds for one checklist id of a repository: the BRIEF prefix
+// hash of its latest approval (Approved) or, before any, of its init. checklist_set works only on an
+// id with a binding, and only while BRIEF.md's prefix matches it.
+type ChecklistBinding struct {
+	BriefSHA256 string
+	Approved    bool
+}
+
+// ErrInitIncomplete is an init record without a repo, a checklist id or the BRIEF hash.
+var ErrInitIncomplete = errors.New("checklist init needs repo, checklist id and BRIEF hash")
+
 // waiversKey is the primary key of checklist_waivers since the version joined it.
 const waiversKey = "PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)"
 
@@ -65,7 +85,8 @@ const waiversColumns = `(
 
 // waiversSchema is applied on every Open (CREATE … IF NOT EXISTS). One waiver per requirement, checklist
 // hash and version, and sha; a second one replaces the first (a new quote). Approvals are a log: the
-// latest one of a repository (highest seq) is the one in force.
+// latest one of a repository (highest seq) is the one in force. Inits: one per checklist id of a
+// repository, written by checklist_init.
 const waiversSchema = `
 CREATE TABLE IF NOT EXISTS checklist_waivers ` + waiversColumns + `;
 CREATE TABLE IF NOT EXISTS checklist_approvals (
@@ -79,6 +100,13 @@ CREATE TABLE IF NOT EXISTS checklist_approvals (
 	approved_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS checklist_approvals_repo ON checklist_approvals(repo, seq);
+CREATE TABLE IF NOT EXISTS checklist_inits (
+	repo         TEXT NOT NULL,
+	checklist_id TEXT NOT NULL,
+	brief_sha256 TEXT NOT NULL,
+	created_at   INTEGER NOT NULL,
+	PRIMARY KEY (repo, checklist_id)
+);
 `
 
 // waiversMigrations add columns to a checklist_waivers table created before them.
@@ -191,4 +219,40 @@ func (s *Store) LatestApproval(repo string) (*ChecklistApproval, error) {
 	}
 	a.ApprovedAt = time.Unix(at, 0).UTC()
 	return &a, nil
+}
+
+// PutInit stores the init record of a new checklist id; an id already recorded for the repository is
+// refused (an error).
+func (s *Store) PutInit(in ChecklistInit) error {
+	if in.Repo == "" || in.ChecklistID == "" || in.BriefSHA256 == "" {
+		return ErrInitIncomplete
+	}
+	if _, err := s.db.Exec(`INSERT INTO checklist_inits (repo, checklist_id, brief_sha256, created_at) VALUES (?,?,?,?)`,
+		in.Repo, in.ChecklistID, in.BriefSHA256, in.CreatedAt.Unix()); err != nil {
+		return fmt.Errorf("put checklist init: %w", err)
+	}
+	return nil
+}
+
+// Binding is the binding of checklist id in repo: its latest approval's BRIEF prefix hash, else its
+// init's; nil when the store has neither (an id this store never created or approved).
+func (s *Store) Binding(repo, id string) (*ChecklistBinding, error) {
+	var b ChecklistBinding
+	err := s.db.QueryRow(`SELECT brief_sha256 FROM checklist_approvals WHERE repo = ? AND checklist_id = ? ORDER BY seq DESC LIMIT 1`,
+		repo, id).Scan(&b.BriefSHA256)
+	if err == nil {
+		b.Approved = true
+		return &b, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("checklist binding: %w", err)
+	}
+	err = s.db.QueryRow(`SELECT brief_sha256 FROM checklist_inits WHERE repo = ? AND checklist_id = ?`, repo, id).Scan(&b.BriefSHA256)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("checklist binding: %w", err)
+	}
+	return &b, nil
 }

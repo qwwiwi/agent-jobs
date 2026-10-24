@@ -138,6 +138,16 @@ func approvedSample(t *testing.T, brief []byte) (string, *Record) {
 		BriefSHA256: BriefPrefixSHA256(brief), At: at}
 }
 
+// boundTo is a store binding of every id to brief's prefix (approved: an approval stored it).
+func boundTo(brief []byte, approved bool) func(string) (*Binding, error) {
+	return func(string) (*Binding, error) {
+		return &Binding{BriefSHA256: BriefPrefixSHA256(brief), Approved: approved}, nil
+	}
+}
+
+// unbound is a store with no record of any id.
+func unbound(string) (*Binding, error) { return nil, nil }
+
 func TestStatusManualEditVoids(t *testing.T) {
 	brief := []byte("# Brief\n\nwords\n")
 	text, rec := approvedSample(t, brief)
@@ -264,7 +274,7 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
 	f := &Files{Brief: brief, Checklist: list}
-	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Basis: "brief"}}}, now, fakeRedact, nil)
+	res, err := Apply(f, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page SECRETVALUE", Contract: "live", Basis: "brief"}}}, now, fakeRedact, nil, boundTo(brief, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +287,7 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	// Approve without a change: same version, approved over the content as written; the record to store
 	// names the version, the hash and the BRIEF text above ## Additions.
 	f.Checklist = res.Checklist
-	res, err = Apply(f, Change{Approve: true}, now, fakeRedact, nil)
+	res, err = Apply(f, Change{Approve: true}, now, fakeRedact, nil, boundTo(brief, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,14 +298,14 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 	}
 	// A call without a change keeps it (the stored record decides).
 	f.Checklist = res.Checklist
-	if res, err := Apply(f, Change{}, now, fakeRedact, rec); err != nil || !res.Approved || res.VersionBumped || res.Checklist != nil {
+	if res, err := Apply(f, Change{}, now, fakeRedact, rec, boundTo(brief, true)); err != nil || !res.Approved || res.VersionBumped || res.Checklist != nil {
 		t.Fatalf("no change: %+v %v", res, err)
 	}
 	// An addition with a G row: BRIEF and CHECKLIST change together, version up, approval dropped.
 	res, err = Apply(f, Change{
 		Rows:      []Row{{ID: "G01", Verbatim: "dark mode", Contract: "live", Basis: "addition 2026-10-25"}},
 		Additions: []Addition{{Quote: "add dark mode SECRETVALUE"}},
-	}, now, fakeRedact, rec)
+	}, now, fakeRedact, rec, boundTo(brief, true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,11 +316,11 @@ func TestApplyVersionApprovalAndRedaction(t *testing.T) {
 		t.Fatalf("after change: v%d approved=%v %q", res.List.Version, res.Approved, res.Reason)
 	}
 	// A new G row without the owner's words is refused.
-	if _, err := Apply(f, Change{Rows: []Row{{ID: "G02", Verbatim: "x", Contract: "live"}}}, now, fakeRedact, rec); err == nil {
+	if _, err := Apply(f, Change{Rows: []Row{{ID: "G02", Verbatim: "x", Contract: "live"}}}, now, fakeRedact, rec, boundTo(brief, true)); err == nil {
 		t.Fatal("G row without an addition accepted")
 	}
 	// expect_version guards against a concurrent change.
-	if _, err := Apply(f, Change{ExpectVersion: 1}, now, fakeRedact, rec); err == nil || !strings.Contains(err.Error(), "version 2") {
+	if _, err := Apply(f, Change{ExpectVersion: 1}, now, fakeRedact, rec, boundTo(brief, true)); err == nil || !strings.Contains(err.Error(), "version 2") {
 		t.Fatalf("expect_version: %v", err)
 	}
 }
@@ -319,15 +329,16 @@ func TestApplyManualEditBumpsVersion(t *testing.T) {
 	brief := []byte("# Brief\n\nwords\n")
 	text, rec := approvedSample(t, brief)
 	edited := strings.Replace(text, "| implied by R01 |", "| implied |", 1)
-	res, err := Apply(&Files{Brief: brief, Checklist: []byte(edited)}, Change{}, time.Now(), noRedact, rec)
+	res, err := Apply(&Files{Brief: brief, Checklist: []byte(edited)}, Change{}, time.Now(), noRedact, rec, boundTo(brief, true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(res.PreviousVoid, "approval void") || !res.VersionBumped || res.List.Version != 3 || res.Approved {
 		t.Fatalf("manual edit: %+v", res)
 	}
-	// A forged approved line (right hash, nothing stored) is void too: dropped, version up.
-	res, err = Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil)
+	// A forged approved line (right hash, no approval stored; the id created by this store) is void too:
+	// dropped, version up.
+	res, err = Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil, boundTo(brief, false))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,17 +353,18 @@ func TestApplyRefusesEditedBriefPrefix(t *testing.T) {
 	brief := []byte(InitBrief("I want a login page."))
 	text, rec := approvedSample(t, brief)
 	edited := []byte(strings.Replace(string(brief), "login", "logout", 1))
-	_, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, rec)
+	_, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, rec, boundTo(brief, true))
 	if err == nil || !strings.Contains(err.Error(), "above ## Additions") {
 		t.Fatalf("edited BRIEF accepted: %v", err)
 	}
-	res, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec)
+	res, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec, boundTo(brief, true))
 	if err != nil || res.Brief == nil {
 		t.Fatalf("addition refused: %v", err)
 	}
-	// Without a stored approval there is nothing to compare against.
-	if _, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil); err != nil {
-		t.Fatalf("unapproved: %v", err)
+	// Before an approval the prefix is bound to checklist_init's record.
+	if _, err := Apply(&Files{Brief: edited, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil, boundTo(brief, false)); err == nil ||
+		!strings.Contains(err.Error(), "since checklist_init") {
+		t.Fatalf("edited BRIEF before approval: %v", err)
 	}
 }
 
@@ -471,12 +483,53 @@ func TestApplyUnclosedFenceAdditions(t *testing.T) {
 	brief := []byte(InitBrief("I want a login page.\n\n```\nunclosed"))
 	text, rec := approvedSample(t, brief)
 	f := &Files{Brief: brief, Checklist: []byte(text)}
-	res, err := Apply(f, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec)
+	res, err := Apply(f, Change{Additions: []Addition{{Quote: "also export"}}}, time.Now(), noRedact, rec, boundTo(brief, true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.Brief, f.Checklist = res.BriefAfter, res.Checklist
-	if _, err := Apply(f, Change{Additions: []Addition{{Quote: "and dark mode"}}}, time.Now(), noRedact, rec); err != nil {
+	if _, err := Apply(f, Change{Additions: []Addition{{Quote: "and dark mode"}}}, time.Now(), noRedact, rec, boundTo(brief, true)); err != nil {
 		t.Fatalf("second addition refused: %v", err)
+	}
+}
+
+// Without a store record of the id, a call that changes nothing writes nothing (another agent's
+// approved line is not voided), and a change is refused: ErrOtherStore when the file carries an
+// approved line.
+func TestApplyUnboundID(t *testing.T) {
+	brief := []byte("# Brief\n\nwords\n")
+	text, rec := approvedSample(t, brief)
+	res, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, nil, unbound)
+	if err != nil || res.Brief != nil || res.Checklist != nil || res.VersionBumped || res.List.Version != 2 {
+		t.Fatalf("no-op: %+v %v", res, err)
+	}
+	if res.Approved || !strings.HasPrefix(res.Reason, "approval void") {
+		t.Fatalf("no-op status: %+v", res)
+	}
+	if res, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, Change{}, time.Now(), noRedact, rec, unbound); err != nil || !res.Approved {
+		t.Fatalf("no-op with the repository's approval: %+v %v", res, err)
+	}
+	change := Change{Rows: []Row{{ID: "R09", Verbatim: "x", Contract: "live"}}}
+	if _, err := Apply(&Files{Brief: brief, Checklist: []byte(text)}, change, time.Now(), noRedact, nil, unbound); !errors.Is(err, ErrOtherStore) {
+		t.Fatalf("change with another store's approved line: %v", err)
+	}
+	unapproved := strings.Replace(text, text[strings.Index(text, "- approved:"):strings.Index(text, "\n\n|")], "- approved: no", 1)
+	if _, err := Apply(&Files{Brief: brief, Checklist: []byte(unapproved)}, change, time.Now(), noRedact, nil, unbound); err == nil ||
+		errors.Is(err, ErrOtherStore) || !strings.Contains(err.Error(), "no checklist_init or approval record") {
+		t.Fatalf("change of an unknown id: %v", err)
+	}
+}
+
+// A redactor that rewrites the BRIEF text above ## Additions is refused before anything is written.
+func TestApplyRefusesRedactedPrefix(t *testing.T) {
+	brief := []byte(InitBrief("I want a login page. SECRETVALUE"))
+	_, list, _, err := Init("demo", "x", noRedact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Apply(&Files{Brief: brief, Checklist: list}, Change{Rows: []Row{{ID: "R01", Verbatim: "a login page", Contract: "live"}}},
+		time.Now(), fakeRedact, nil, boundTo(brief, false))
+	if err == nil || !strings.Contains(err.Error(), "redaction would rewrite") {
+		t.Fatalf("redacted prefix: %v", err)
 	}
 }

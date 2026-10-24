@@ -94,3 +94,37 @@ func TestChecklistApprovalsLatest(t *testing.T) {
 		t.Fatal("approval without a quote stored")
 	}
 }
+
+// An id's binding is its latest approval's BRIEF prefix hash, else its init's; an id is recorded once.
+func TestChecklistBinding(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if b, err := s.Binding("/r", "demo"); err != nil || b != nil {
+		t.Fatalf("no record: %+v %v", b, err)
+	}
+	at := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
+	if err := s.PutInit(ChecklistInit{Repo: "/r", ChecklistID: "demo", BriefSHA256: "p0", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutInit(ChecklistInit{Repo: "/r", ChecklistID: "demo", BriefSHA256: "p9", CreatedAt: at}); err == nil {
+		t.Fatal("a second init of one id accepted")
+	}
+	if b, err := s.Binding("/r", "demo"); err != nil || b == nil || b.BriefSHA256 != "p0" || b.Approved {
+		t.Fatalf("init: %+v %v", b, err)
+	}
+	if b, err := s.Binding("/other", "demo"); err != nil || b != nil {
+		t.Fatalf("other repo: %+v %v", b, err)
+	}
+	for _, p := range []string{"p1", "p2"} {
+		if err := s.PutApproval(ChecklistApproval{Repo: "/r", ChecklistID: "demo", Version: 2, ChecklistSHA256: "h",
+			BriefSHA256: p, Quote: "yes", ApprovedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b, err := s.Binding("/r", "demo"); err != nil || b == nil || b.BriefSHA256 != "p2" || !b.Approved {
+		t.Fatalf("approved: %+v %v", b, err)
+	}
+}
