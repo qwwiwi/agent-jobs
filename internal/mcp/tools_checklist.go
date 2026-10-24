@@ -43,9 +43,10 @@ type ChecklistView struct {
 	// Slicing is the slicing check (F3) for the current version and hash (current true), else the
 	// latest one of the checklist id (current false: it does not count); null when none ran.
 	Slicing *jobs.SlicingSummary `json:"slicing"`
-	// ChangedSinceApproval is what differs from the repository's latest approval of this checklist id
-	// when the hash is not the approved one: the owner re-reads and re-approves only these rows (F8).
-	// Null when the hash is the approved one or the id was never approved.
+	// ChangedSinceApproval is what differs from the repository's latest approval (the one approved
+	// reads), when that approval is of this checklist id and the hash is not the approved one: the owner
+	// re-reads and re-approves only these rows (F8). Null otherwise (the hash is the approved one, or the
+	// latest approval is of another id or there is none).
 	ChangedSinceApproval *ApprovalChanges `json:"changed_since_approval"`
 	// Set by checklist_init / checklist_set only.
 	Written        bool     `json:"written,omitempty"`
@@ -69,8 +70,8 @@ type ApprovalChanges struct {
 	BriefChanged bool `json:"brief_changed"`
 }
 
-// approvalChanges compares checklist c with the approval last (nil when last approves the same hash or
-// is of another checklist id).
+// approvalChanges compares checklist c with the repository's latest approval last (nil when there is
+// none, when last approves the same hash or when it is of another checklist id).
 func approvalChanges(last *store.ChecklistApproval, c *checklist.Checklist, brief []byte, hash string) *ApprovalChanges {
 	if last == nil || last.ChecklistID != c.ID || last.ChecklistSHA256 == hash {
 		return nil
@@ -280,8 +281,8 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 			"approved (false with a reason when not approved, or when a hashed field, a Rationale or BRIEF.md was edited " +
 			"after the approval), the owner waivers bound to the current hash and slicing: the slicing check (F3) " +
 			"{version, sha256, current, job_id, unmapped, half, invented, decided, undecided, at} (null when none ran), and " +
-			"changed_since_approval: the rows added, changed (which fields) or removed since the latest approval of this id and " +
-			"whether BRIEF.md changed (null when the hash is the approved one or the id was never approved): the owner " +
+			"changed_since_approval: the rows added, changed (which fields) or removed since the repository's latest approval and " +
+			"whether BRIEF.md changed (null when the hash is the approved one, or that approval is of another id or absent): the owner " +
 			"re-approves only those rows.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)

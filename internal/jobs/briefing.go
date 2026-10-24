@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -26,11 +27,27 @@ var BriefingKinds = []string{"cost_or_vendor", "owner_visible", "costly_to_undo"
 const AssumptionPrefix = "ASSUMPTION:"
 
 // briefingSecretRe catches a question that asks the owner for a secret: the words password, passphrase,
-// token, secret, credential, key (api key, ssh key, ...) and their Russian counterparts, as whole words
-// (any Unicode letter or digit next to them makes another word). A question never needs them: a
-// credential is set up by the owner out of band, never typed into a reply.
+// token, secret, credential, key (api key, ssh key, ...) and the Russian nouns пароль, токен, ключ,
+// секрет in their case forms, as whole words (any Unicode letter or digit next to them makes another
+// word: «ключевой», «секретарь», "monkey" pass). A question never needs them: a credential is set up by
+// the owner out of band, never typed into a reply. It is matched on secretText.
 var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?|passwds?|passphrases?|pass\s*words?|tokens?|` +
-	`secrets?|credentials?|api[\s_-]*keys?|apikeys?|keys?|парол\p{L}*|токен\p{L}*|ключ\p{L}*|секрет\p{L}*)(?:$|[^\p{L}\p{N}_])`)
+	`secrets?|credentials?|api[\s_-]*keys?|apikeys?|keys?|парол(?:ь|я|ю|ем|е|и|ей|ям|ями|ях)|токен(?:а|у|ом|е|ы|ов|ам|ами|ах)?|` +
+	`ключ(?:а|у|ом|е|и|ей|ам|ами|ах)?|секрет(?:а|у|ом|е|ы|ов|ам|ами|ах)?)(?:$|[^\p{L}\p{N}_])`)
+
+// secretText is s as briefingSecretRe reads it: format characters (zero-width spaces and joiners, soft
+// hyphens) dropped, so they cannot split a word, and every Unicode space made an ASCII space.
+func secretText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.Is(unicode.Cf, r):
+			return -1
+		case unicode.IsSpace(r):
+			return ' '
+		}
+		return r
+	}, s)
+}
 
 // BriefingOutput is the agent-jobs/briefing/v1 block of a briefing job's report.
 type BriefingOutput struct {
@@ -106,7 +123,7 @@ func ValidateBriefing(report string, g *store.GateInput) (*BriefingOutput, error
 			v    *string
 		}{{"q", &q.Q}, {"recommended", &q.Recommended}, {"why", &q.Why}} {
 			// Checked before redaction: a masked value must not hide what the question asks for.
-			if f.name != "why" && briefingSecretRe.MatchString(*f.v) {
+			if f.name != "why" && briefingSecretRe.MatchString(secretText(*f.v)) {
 				return fmt.Errorf("%s: %s asks for a secret (password, token, key and the like are never asked of the owner)", what, f.name)
 			}
 			if *f.v, err = gateText(what+" "+f.name, *f.v, true); err != nil {

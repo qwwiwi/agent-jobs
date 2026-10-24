@@ -209,11 +209,25 @@ func TestValidateBriefingRules(t *testing.T) {
 			t.Fatalf("%s: %v (want %q)", name, err, c.want)
 		}
 	}
-	// Words that only contain a secret word are not one: "monkey", "keynote", "tokenizer" pass.
-	b = briefingBlock(g)
-	q0(b)["q"] = "Monkey test the keynote page, or the tokenizer demo?"
-	if _, err := ValidateBriefing(report(b), g); err != nil {
-		t.Fatalf("a word containing a secret word was refused: %v", err)
+	// Words that only contain a secret word are not one: "monkey", "keynote", "tokenizer", «ключевой»,
+	// «секретарь», «токенизатор» pass.
+	for _, ok := range []string{"Monkey test the keynote page, or the tokenizer demo?", "Какой ключевой экран показать первым?",
+		"Секретарь получает письма о заказах?", "Нужен ли токенизатор для поиска?"} {
+		b = briefingBlock(g)
+		q0(b)["q"] = ok
+		if _, err := ValidateBriefing(report(b), g); err != nil {
+			t.Fatalf("%q was refused: %v", ok, err)
+		}
+	}
+	// A zero-width character or a non-breaking space does not hide a secret word; Russian case forms are
+	// caught.
+	for _, bad := range []string{"Send the pass\u200bword", "Send the pass\u00a0word", "the admin p\u00adassword?",
+		"Пришлите ключи от сервера", "Где взять токена?", "Скажите паролем"} {
+		b = briefingBlock(g)
+		q0(b)["q"] = bad
+		if _, err := ValidateBriefing(report(b), g); err == nil || !strings.Contains(err.Error(), "asks for a secret") {
+			t.Fatalf("%q passed: %v", bad, err)
+		}
 	}
 }
 
