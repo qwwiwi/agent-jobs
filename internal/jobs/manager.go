@@ -705,8 +705,8 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	return nil
 }
 
-// wrapperArgv is the run-wrapper command line of j's launch, before "--" and the runner's argv.
-func (m *Manager) wrapperArgv(j *store.Job, token string, plan launchPlan) []string {
+// buildWrapperArgv is the run-wrapper command line of j's launch, before "--" and the runner's argv.
+func (m *Manager) buildWrapperArgv(j *store.Job, token string, plan launchPlan) []string {
 	argv := append([]string{m.SelfBin, "run-wrapper", m.JobDir(j.ID), "--token", token}, plan.wrapper...)
 	if IsGateKind(j.Kind) {
 		// The wrapper stores a slicing result under the checklist lock: told where the locks are, never
@@ -725,7 +725,7 @@ func (m *Manager) wrapperArgv(j *store.Job, token string, plan launchPlan) []str
 // the new scope (same pid).
 func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
 	dir := m.JobDir(j.ID)
-	argv := m.wrapperArgv(j, token, plan)
+	argv := m.buildWrapperArgv(j, token, plan)
 	bin := plan.bin
 	if bin == "" {
 		bin = m.Config().claudeBin()

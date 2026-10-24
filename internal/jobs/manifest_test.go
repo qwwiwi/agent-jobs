@@ -551,7 +551,7 @@ func TestManifestStepStopSignal(t *testing.T) {
 func TestManifestStepDecidedAtLaunch(t *testing.T) {
 	m := newManager(t)
 	for _, kind := range []string{KindJudge, KindSlicing, "fix", "general", "review", "research"} {
-		argv := m.wrapperArgv(&store.Job{ID: "x", Kind: kind}, "tok", launchPlan{})
+		argv := m.buildWrapperArgv(&store.Job{ID: "x", Kind: kind}, "tok", launchPlan{})
 		if got := slices.Contains(argv, "--manifest-check"); got != (kind == KindJudge) {
 			t.Fatalf("%s: --manifest-check %v in %q", kind, got, argv)
 		}
