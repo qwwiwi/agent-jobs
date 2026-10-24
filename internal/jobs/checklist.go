@@ -42,25 +42,41 @@ func CheckCommit(repo, sha string) error {
 	return nil
 }
 
-// ChecklistLockFile serializes the checklist tools of every agent on a repository (every session's MCP
-// server of every agent): one checklist_set reads, computes and writes both brief files while no other
-// runs, and checklist_get reads a consistent pair. It lives in the repository's git common dir, the one
-// place all work trees and all agents share (a job never writes there: the guard protects git dirs).
-const ChecklistLockFile = "agent-jobs-checklist.lock"
+// ChecklistLockDir is the directory of the checklist locks, <agent-jobs home>/checklist-locks (the home
+// is the parent of every agent's state dir): one lock file per repository serializes the checklist
+// tools of every agent of the user on it (every session's MCP server of every agent): one
+// checklist_set reads, computes and writes both brief files while no other runs, and checklist_get
+// reads a consistent pair. A job never reaches it: the guard refuses every read and write there
+// (--no-read), so a job cannot hold a lock and block the tools.
+func (m *Manager) ChecklistLockDir() string {
+	return filepath.Join(filepath.Dir(m.StateDir), "checklist-locks")
+}
 
-// checklistLockWait bounds the wait for the checklist lock: a job can open the lock file (it lies in
-// the git common dir every worktree shares) and hold it, which must not hang the orchestrator's tools.
+// checklistLockWait bounds the wait for the checklist lock: a stuck holder (a hung tool call) must not
+// hang the orchestrator's tools.
 var checklistLockWait = 30 * time.Second
 
-// LockChecklist takes <git-common-dir>/agent-jobs-checklist.lock of the repository repo (a work tree
-// root) exclusively, waiting up to checklistLockWait for another holder, and returns the unlock. The
-// lock does not depend on m: two agents (two state dirs) on one repository wait for each other.
+// LockChecklist takes the checklist lock of the repository repo (a work tree root) exclusively,
+// waiting up to checklistLockWait for another holder, and returns the unlock. The lock file is
+// ChecklistLockDir/<sha256 of the repository's git common dir, symlinks resolved>.lock: every work
+// tree of the repository maps to it, and it does not depend on m's agent, so two agents (two state
+// dirs under one home) on one repository wait for each other.
 func (m *Manager) LockChecklist(repo string) (func(), error) {
 	common, err := git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return nil, fmt.Errorf("checklist lock: the git common dir of %s: %w", repo, err)
 	}
-	path := filepath.Join(common, ChecklistLockFile)
+	if r, err := filepath.EvalSymlinks(common); err == nil {
+		common = r
+	}
+	dir := m.ChecklistLockDir()
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("checklist lock dir: %w", err)
+	}
+	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("checklist lock dir %s is not a directory (a symlink is refused)", dir)
+	}
+	path := filepath.Join(dir, checklist.SHA256Hex([]byte(filepath.Clean(common)))+".lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open checklist lock: %w", err)
@@ -73,8 +89,8 @@ func (m *Manager) LockChecklist(repo string) (func(), error) {
 		}
 		if time.Now().After(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("the checklist lock %s is still held after %s (another checklist tool, or a stuck "+
-				"process holding it): try again", path, checklistLockWait)
+			return nil, fmt.Errorf("the checklist lock %s of %s is still held after %s (another checklist tool, or a stuck "+
+				"process holding it): try again", path, common, checklistLockWait)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

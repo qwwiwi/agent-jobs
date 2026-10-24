@@ -74,6 +74,10 @@ type Config struct {
 	StateDir string
 	// OwnDir is the job's own folder inside StateDir (prompt, report, work): it stays readable.
 	OwnDir string
+	// NoRead are directories outside StateDir a job never reads or writes, checked like StateDir without
+	// an own folder: the checklist locks every agent of the user shares (a job holding one would block
+	// the orchestrator's checklist tools).
+	NoRead []string
 	// ReadOnly is the worktree of a review job: no tool call writes inside it (readonly.go). "" = off.
 	ReadOnly string
 }
@@ -309,6 +313,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		}
 		if inJobGitDir(p, cfg.Protected) {
 			return protectedBlocked(p)
+		}
+		if inJobGitDir(p, cfg.NoRead) {
+			return stateBlocked(tool+" into `"+p+"`", p)
 		}
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
