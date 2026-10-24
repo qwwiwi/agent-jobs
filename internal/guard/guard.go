@@ -648,7 +648,16 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						return fdAliasBlocked(a)
 					}
 				}
-				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || pythonTreeWriter(name, argv)
+				pyAll, pyDirs := pythonTreeTargets(name, argv)
+				tree := treeWriters[name] || (name == "find" && findActs(argv[1:])) || pyAll
+				for _, d := range pyDirs {
+					if p, ok := s.hit(d, true); ok {
+						if _, in := s.hit(d, false); !in {
+							return ancestorBlocked(d, p)
+						}
+						return protectedBlocked(p)
+					}
+				}
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
