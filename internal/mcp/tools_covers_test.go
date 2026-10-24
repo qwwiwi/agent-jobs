@@ -9,8 +9,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
+
+// coverRepo is a repository whose work tree has a checklist with rows R01 and R03i.
+func coverRepo(t *testing.T) string {
+	t.Helper()
+	repo, _ := gitRepo(t)
+	if err := os.Mkdir(filepath.Join(repo, "brief"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	list := "# Checklist\n\n- id: demo\n- brief: brief/BRIEF.md\n- version: 2\n- approved: no\n\n" + checklist.TableHeader +
+		"\n|---|---|---|---|\n| R01 | a login page | live | brief |\n| R03i | sessions survive | live | implied |\n"
+	writeFile(t, checklist.BriefPath(repo), "# Brief\n\nwords\n")
+	writeFile(t, checklist.ChecklistPath(repo), list)
+	return repo
+}
 
 // job_start takes covers (stored, shown by job_status); job_result of a covered job reads its
 // Requirements block (claimed done lines) and its commits' Requirements: trailers; a job without
@@ -18,8 +33,9 @@ import (
 func TestJobCoversRequirements(t *testing.T) {
 	m := newManager(t)
 	cs := connect(t, mustServer(t, m))
+	covered := coverRepo(t)
 	var v JobView
-	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["covers"] = []string{"R01", "R03i"} }), &v)
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = covered; a["covers"] = []string{"R01", "R03i"} }), &v)
 	if !slices.Equal(v.Covers, []string{"R01", "R03i"}) {
 		t.Fatalf("job_start covers: %+v", v.Covers)
 	}
@@ -28,8 +44,11 @@ func TestJobCoversRequirements(t *testing.T) {
 	if !slices.Equal(st.Covers, []string{"R01", "R03i"}) {
 		t.Fatalf("job_status covers: %+v", st.Covers)
 	}
-	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["covers"] = []string{"A1"} })); !strings.Contains(msg, "covers") {
+	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = covered; a["covers"] = []string{"A1"} })); !strings.Contains(msg, "covers") {
 		t.Fatalf("bad covers: %q", msg)
+	}
+	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = covered; a["covers"] = []string{"R02"} })); !strings.Contains(msg, "R02 is not a row") {
+		t.Fatalf("covers missing from the checklist: %q", msg)
 	}
 
 	// A finished covered job whose commit (saved under its ref, worktree gone) carries a trailer.

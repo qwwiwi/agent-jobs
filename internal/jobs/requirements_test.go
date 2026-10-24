@@ -67,7 +67,8 @@ func TestReportContractNoteCovers(t *testing.T) {
 
 func TestEnqueueCovers(t *testing.T) {
 	m := newManager(t)
-	j := enqueue(t, m, "do it", func(r *StartRequest) { r.Covers = []string{" R02", "R01", "R02"} })
+	repo := briefRepo(t)
+	j := enqueue(t, m, "do it", func(r *StartRequest) { r.RepoPath = repo; r.Covers = []string{" R02", "R01", "R02"} })
 	got, err := m.Store.Get(j.ID)
 	if err != nil || !slices.Equal(got.Covers, []string{"R02", "R01"}) {
 		t.Fatalf("covers %v %v", got.Covers, err)
@@ -86,11 +87,12 @@ func TestEnqueueCovers(t *testing.T) {
 // a block counts its claimed done lines in the stats; a job without covers is unchanged.
 func TestCoversReportContract(t *testing.T) {
 	m := newManager(t)
-	j := runToEnd(t, m, enqueue(t, m, "do the thing", func(r *StartRequest) { r.Covers = []string{"R01"} }).ID)
+	repo := briefRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "do the thing", func(r *StartRequest) { r.RepoPath = repo; r.Covers = []string{"R01"} }).ID)
 	if j.Status != store.StatusSucceeded || j.Error != NoteNoRequirements {
 		t.Fatalf("no block: %s %q", j.Status, j.Error)
 	}
-	ok := runToEnd(t, m, enqueue(t, m, "FAKE_REQUIREMENTS_REPORT", func(r *StartRequest) { r.Covers = []string{"R01", "R02"} }).ID)
+	ok := runToEnd(t, m, enqueue(t, m, "FAKE_REQUIREMENTS_REPORT", func(r *StartRequest) { r.RepoPath = repo; r.Covers = []string{"R01", "R02"} }).ID)
 	if ok.Status != store.StatusSucceeded || ok.Error != "" {
 		t.Fatalf("block: %s %q", ok.Status, ok.Error)
 	}

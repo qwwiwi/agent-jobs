@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -329,7 +330,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		// Passed as --effort, so a project effortLevel in the worktree cannot change it.
 		effort = m.Config().claudeEffort(r.Kind, effort)
 	}
-	var repo, base, branch string
+	var repo, top, base, branch string
 	if r.RepoPath != "" {
 		if repo, err = filepath.Abs(r.RepoPath); err != nil {
 			return nil, fmt.Errorf("repo path: %w", err)
@@ -346,6 +347,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 			return nil, fmt.Errorf("base %q: %w", ref, err)
 		}
 		branch = baseBranch(repo, ref)
+		top = repo
 		// The job stores the main worktree: a linked one (e.g. an earlier job's) may be removed
 		// before this job's cleanup, which then could not reach the repository (#57).
 		repo = mainWorktree(repo)
@@ -355,6 +357,17 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	covers, err := ValidateCovers(r.Covers)
 	if err != nil {
 		return nil, err
+	}
+	// A covered job gets its rows in its prompt (F4): they are read now, from the work tree it was
+	// started from, and kept with the job.
+	var cover *store.CoverContract
+	if len(covers) > 0 {
+		if top == "" {
+			return nil, errors.New("covers need a repo: the covered rows are read from its " + checklist.ChecklistRel)
+		}
+		if cover, err = m.coverContract(top, base, covers); err != nil {
+			return nil, err
+		}
 	}
 	var selected []string
 	if skills.BriefDeclinesSkills(r.Brief) {
@@ -374,7 +387,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers,
+		BaseBranch: branch, Covers: covers, CoverContract: cover,
 	}
 	return j, nil
 }

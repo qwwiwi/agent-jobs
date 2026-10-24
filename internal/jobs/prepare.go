@@ -267,7 +267,8 @@ func (m *Manager) readOwnerRules() (string, error) {
 }
 
 // BuildPrompt assembles prompt.md: preamble, subagent rules, owner rules (the job profile), the
-// project cards that match the job's repository, the memory notes, task, kind checklist, report contract.
+// project cards that match the job's repository, the memory notes, task, the covered requirements (a
+// job with covers, F4), kind checklist, report contract.
 func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes) (string, error) {
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
@@ -285,6 +286,14 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if err != nil {
 		return "", err
 	}
+	cover := ""
+	if j.CoverContract != nil {
+		rules, err := template("prompts/requirements.md")
+		if err != nil {
+			return "", err
+		}
+		cover = RenderCoverContract(j.CoverContract, rules)
+	}
 	work := "Your working directory is an empty directory."
 	if j.RepoPath != "" {
 		work = fmt.Sprintf("Your working directory is a git worktree of the repository at base commit %s (detached HEAD). "+
@@ -294,8 +303,8 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
-	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), check, contract)
+	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s\n\n%s\n",
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), cover, check, contract)
 	return b.String(), nil
 }
 
