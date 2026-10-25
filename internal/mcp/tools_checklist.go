@@ -189,7 +189,7 @@ type ChecklistAdditionInput struct {
 // ChecklistWaiverInput is one owner waiver (F7).
 type ChecklistWaiverInput struct {
 	Requirement string `json:"requirement" jsonschema:"a live requirement of the approved checklist"`
-	SHA         string `json:"sha" jsonschema:"the full commit id the waiver is for"`
+	SHA         string `json:"sha,omitempty" jsonschema:"optional and ignored by release_check: a waiver binds to the checklist hash and the requirement, not to a commit (kept for the record when given)"`
 	Quote       string `json:"quote" jsonschema:"the owner's words waiving it, verbatim"`
 }
 
@@ -201,7 +201,7 @@ type ChecklistSetInput struct {
 	Approve           bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
 	ApproveQuote      string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
 	ExpectVersion     int                      `json:"expect_version,omitempty" jsonschema:"refuse the call unless the checklist is at this version"`
-	Waivers           []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the sha; the checklist must be approved after this call"`
+	Waivers           []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the requirement (not to a commit: sha is optional and ignored); the checklist must be approved after this call"`
 	UnmappedDecisions []ChecklistDecisionInput `json:"unmapped_decisions,omitempty" jsonschema:"the owner's decision per unmapped brief quote of the slicing check (F3) for the checklist's version and hash after this call, stored in the agent-jobs store; approve needs one for every unmapped quote of that result"`
 }
 
@@ -381,6 +381,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		res.Redacted += quoteRedacted
 		// Waivers are checked against the result before anything is written.
 		var waivers []store.Waiver
+		waiverSHANote := false
 		for i, w := range in.Waivers {
 			if !res.Approved {
 				return nil, ChecklistView{}, fmt.Errorf("waivers need an approved checklist after this call (%s)", res.Reason)
@@ -389,8 +390,8 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			if !ok || !row.Live() {
 				return nil, ChecklistView{}, fmt.Errorf("waiver %d: %q is not a live requirement of the checklist", i+1, w.Requirement)
 			}
-			if err := jobs.CheckCommit(main, strings.TrimSpace(w.SHA)); err != nil {
-				return nil, ChecklistView{}, fmt.Errorf("waiver %d: %w", i+1, err)
+			if strings.TrimSpace(w.SHA) != "" {
+				waiverSHANote = true
 			}
 			quote, n := jobs.Redact(w.Quote) // raw, before any trimming
 			if quote = strings.TrimSpace(quote); quote == "" {
@@ -398,7 +399,8 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			}
 			res.Redacted += n
 			waivers = append(waivers, store.Waiver{Repo: main, ChecklistID: res.List.ID, ChecklistSHA256: res.Hash,
-				ChecklistVersion: res.List.Version, SHA: strings.TrimSpace(w.SHA), Requirement: row.ID, Quote: quote, CreatedAt: now})
+				ChecklistVersion: res.List.Version, SHA: jobs.RedactPrintable(strings.TrimSpace(w.SHA), 64), Requirement: row.ID, Quote: quote,
+				CreatedAt: now})
 		}
 		// The slicing rule (F3): checked against the result before anything is written.
 		var given []jobs.UnmappedDecision
@@ -450,6 +452,10 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 				res.Warnings = append(res.Warnings, "approved; the remote names for the merge gate were not stored "+
 					"(release_check stores them on a pass, the daemon's backfill at its next start; the merge hook only reads them): "+jobs.RedactPrintable(err.Error(), 200))
 			}
+		}
+		if waiverSHANote {
+			res.Warnings = append(res.Warnings, "waiver sha ignored: a waiver binds to the checklist hash and the requirement, "+
+				"so a later commit keeps it (kept for the record only)")
 		}
 		added := 0
 		for _, w := range waivers {

@@ -44,7 +44,7 @@ type ReleaseRequirement struct {
 	// Verdict is the judge's ("" = none).
 	Verdict       string `json:"verdict"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
-	// Waived: an owner waiver bound to this checklist hash and version and this sha covers it.
+	// Waived: an owner waiver bound to this checklist hash and version covers it (any sha).
 	Waived      bool   `json:"waived,omitempty"`
 	WaiverQuote string `json:"waiver_quote,omitempty"`
 	// Accepted: met, placeholder on a placeholder-ok row, or waived.
@@ -280,7 +280,9 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		row, _ := c.Row(id)
 		r := ReleaseRequirement{ID: id, PlaceholderOK: row.PlaceholderOK, CoveredBy: []string{}}
 		for _, w := range waivers {
-			if w.SHA == sha && w.Requirement == id {
+			// Bound to the checklist hash and version (Waivers) and the requirement, not to a commit (owner
+			// decision 2026-10-25): a fix commit after the waiver does not void it.
+			if w.Requirement == id {
 				r.Waived, r.WaiverQuote = true, RedactPrintable(w.Quote, 300)
 			}
 		}

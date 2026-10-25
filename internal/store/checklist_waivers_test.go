@@ -47,10 +47,15 @@ func TestWaiversBoundToHashVersionAndSHA(t *testing.T) {
 	if got, _ := s.Waivers("/r", "h1", 5); len(got) != 1 || got[0].Quote != "other version" {
 		t.Fatalf("other version %+v", got)
 	}
+	// A waiver without a sha is complete (it binds to the hash, version and requirement).
+	if err := s.PutWaiver(Waiver{Repo: "/r", ChecklistSHA256: "h9", ChecklistVersion: 1, Requirement: "R01", Quote: "q"}); err != nil {
+		t.Fatalf("waiver without a sha: %v", err)
+	}
 	for _, bad := range []Waiver{
 		{Repo: "/r", ChecklistSHA256: "h1", ChecklistVersion: 2, SHA: "s1", Requirement: "R01"},
 		{Repo: "", ChecklistSHA256: "h", ChecklistVersion: 2, SHA: "s", Requirement: "R01", Quote: "q"},
 		{Repo: "/r", ChecklistSHA256: "h", SHA: "s", Requirement: "R01", Quote: "q"},
+		{Repo: "/r", ChecklistSHA256: "h", ChecklistVersion: 2, Quote: "q"},
 	} {
 		if err := s.PutWaiver(bad); err == nil {
 			t.Fatalf("incomplete waiver stored: %+v", bad)

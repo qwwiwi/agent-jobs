@@ -9,17 +9,17 @@ import (
 	"time"
 )
 
-// ErrWaiverIncomplete is a waiver without a repo, a checklist hash and version, a sha, a requirement or
-// a quote.
-var ErrWaiverIncomplete = errors.New("waiver needs repo, checklist hash and version, sha, requirement and the owner's quote")
+// ErrWaiverIncomplete is a waiver without a repo, a checklist hash and version, a requirement or a quote.
+var ErrWaiverIncomplete = errors.New("waiver needs repo, checklist hash and version, requirement and the owner's quote")
 
 // ErrApprovalIncomplete is an approval without a repo, a checklist id, version and hash, the BRIEF hash
 // or the owner's quote.
 var ErrApprovalIncomplete = errors.New("approval needs repo, checklist id, version, checklist hash, BRIEF hash and the owner's quote")
 
 // Waiver is an owner waiver for one requirement of an approved checklist (Wave F, F7): written only by
-// checklist_set with the owner's quote, bound to the checklist hash and version and the commit sha, so
-// a new checklist version or another sha voids it.
+// checklist_set with the owner's quote, bound to the checklist hash and version and the requirement, so a
+// new checklist version voids it and a new commit does not (owner decision 2026-10-25). SHA is the commit
+// the caller named, kept for the record only ("" = none named); release_check does not read it.
 type Waiver struct {
 	Repo             string    `json:"repo"`
 	ChecklistID      string    `json:"checklist_id"`
@@ -169,7 +169,7 @@ func migrateWaiversKey(db *sql.DB) error {
 
 // PutWaiver stores (or replaces) a waiver.
 func (s *Store) PutWaiver(w Waiver) error {
-	if w.Repo == "" || w.ChecklistSHA256 == "" || w.ChecklistVersion < 1 || w.SHA == "" || w.Requirement == "" || w.Quote == "" {
+	if w.Repo == "" || w.ChecklistSHA256 == "" || w.ChecklistVersion < 1 || w.Requirement == "" || w.Quote == "" {
 		return ErrWaiverIncomplete
 	}
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO checklist_waivers (repo, checklist_id, checklist_sha256, checklist_version, sha,

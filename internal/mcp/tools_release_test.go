@@ -291,14 +291,13 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.verdicts = map[string]string{"R01": "placeholder", "R02": "met"}
 			f.judge(t, j)
 		}},
-		{"waiver for another sha", jobs.ReleaseRequirements, "R01 — missing", func(t *testing.T, f *releaseFix) {
+		{"waiver at another checklist hash", jobs.ReleaseRequirements, "R01 — missing", func(t *testing.T, f *releaseFix) {
 			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 			j := okJudge()
 			j.verdicts = map[string]string{"R01": "missing", "R02": "met"}
 			f.judge(t, j)
-			if err := f.m.Store.PutWaiver(store.Waiver{Repo: f.repo, ChecklistID: f.v.ID, ChecklistSHA256: f.v.SHA256,
-				ChecklistVersion: f.v.Version, SHA: strings.Repeat("c", 40), Requirement: "R01", Quote: "ship it",
-				CreatedAt: time.Now()}); err != nil {
+			if err := f.m.Store.PutWaiver(store.Waiver{Repo: f.repo, ChecklistID: f.v.ID, ChecklistSHA256: strings.Repeat("e", 64),
+				ChecklistVersion: f.v.Version, Requirement: "R01", Quote: "ship it", CreatedAt: time.Now()}); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -460,6 +459,25 @@ func TestReleaseCheckWaiverAndNoApproval(t *testing.T) {
 	}
 	if msg := callErr(t, f.cs, "release_check", map[string]any{"repo": filepath.Join(t.TempDir(), "x"), "sha": head}); msg == "" {
 		t.Fatal("no repo accepted")
+	}
+}
+
+// An owner waiver binds to the checklist hash and the requirement, not to a commit (owner decision
+// 2026-10-25): one recorded for another sha, or for none, still accepts the requirement at a fix commit.
+func TestReleaseCheckWaiverSurvivesFixCommit(t *testing.T) {
+	for _, sha := range []string{strings.Repeat("c", 40), ""} {
+		f := newReleaseFix(t)
+		f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+		j := okJudge()
+		j.verdicts = map[string]string{"R01": "missing", "R02": "met"}
+		f.judge(t, j)
+		if err := f.m.Store.PutWaiver(store.Waiver{Repo: f.repo, ChecklistID: f.v.ID, ChecklistSHA256: f.v.SHA256,
+			ChecklistVersion: f.v.Version, SHA: sha, Requirement: "R01", Quote: "ship it", CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		if r := f.check(t); !r.Pass || !r.Requirements[0].Waived || r.OwnerLine != "Acceptance: 2 of 2" {
+			t.Fatalf("waiver for sha %q: %+v", sha, r)
+		}
 	}
 }
 
