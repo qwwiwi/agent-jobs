@@ -55,10 +55,8 @@ type ReleaseRequirement struct {
 }
 
 // ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository started
-// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36): only a succeeded one
-// counts for the trace, whose source stays its covers. The family condition counts every fix or general
-// job with covers of the checklist, of any size and any status (a failed coder may have commits in the
-// sha).
+// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36). The family condition
+// counts only the succeeded ones (owner decision 2026-10-25).
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
@@ -278,12 +276,6 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The family condition counts every job that coded against the checklist (any size): a same-family
-	// coder of size small still saw the code the judge reads.
-	anyCoders, err := m.Store.CoverJobs(main, c.ID)
-	if err != nil {
-		return nil, err
-	}
 	var reqMismatch []string
 	for _, id := range live {
 		row, _ := c.Row(id)
@@ -356,15 +348,23 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		set(ReleaseBlind, false, "no verdict")
 	} else {
 		out.JudgeFamily = ModelFamily(latest.JudgeRunner, latest.JudgeModel)
+		// Only the succeeded feature jobs count (owner decision 2026-10-25): a failed, cancelled or small
+		// coder delivered no feature, and counting it deadlocked claude coders against every judge.
 		var same []string
-		for _, cj := range anyCoders {
+		delivered := 0
+		for _, cj := range coders {
+			if cj.Status != store.StatusSucceeded {
+				continue
+			}
+			delivered++
 			if ModelFamily(cj.Runner, cj.Model) == out.JudgeFamily {
 				same = append(same, cj.ID)
 			}
 		}
 		switch {
-		case len(coders) == 0:
-			set(ReleaseFamily, false, "no feature job (a fix or general job of size large) covers checklist %s, so no coder family to differ from", c.ID)
+		case delivered == 0:
+			set(ReleaseFamily, false, "no succeeded feature job (a fix or general job of size large) covers checklist %s, so no coder "+
+				"family to differ from", c.ID)
 		case len(same) > 0:
 			set(ReleaseFamily, false, "the judge (%s, model %s) shares its family with coder job(s) %s", out.JudgeFamily,
 				latest.JudgeModel, strings.Join(same, ", "))

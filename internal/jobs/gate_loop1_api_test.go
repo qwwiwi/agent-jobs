@@ -142,3 +142,33 @@ func TestWrapperChecklistLockDirOption(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A codex gate job launched under the read-only codex sandbox (the launch record) stores its result with
+// enforced_blind true (owner decision 2026-10-25); one under worktree-full-access stays not blind.
+func TestGateCodexReadOnlySandboxIsBlind(t *testing.T) {
+	m := newManager(t)
+	repo := briefRepo(t)
+	for _, tc := range []struct {
+		sandbox string
+		blind   bool
+	}{{CodexSandboxReadOnly, true}, {CodexSandboxFullAccess, false}} {
+		j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: repo, Model: "gpt-5.6-sol"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := "tok-" + j.ID
+		if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
+			t.Fatal(err)
+		}
+		cx := get(t, m, j.ID)
+		if err := m.Store.SetLaunchAuthorization(cx.ID, tok, cx.Attempt, store.LaunchAuthorization{CodexSandbox: tc.sandbox}); err != nil {
+			t.Fatal(err)
+		}
+		if msg := gateStep(m.Store, cx.ID, tok, slicingReport(t, cx.Gate), m.ChecklistLockDir(), time.Now()); msg != "" {
+			t.Fatal(msg)
+		}
+		if r, _ := m.Store.SlicingByJob(cx.ID, cx.Attempt); r == nil || r.EnforcedBlind != tc.blind {
+			t.Fatalf("codex result under %s: %+v", tc.sandbox, r)
+		}
+	}
+}

@@ -340,15 +340,6 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			f.coderStatus(t, store.StatusCancelled, store.RunnerCodex, "gpt-5.6-sol", "R02")
 			f.judge(t, okJudge())
 		}},
-		{"a failed coder supplies no coverage", jobs.ReleaseTrace, "trace — no succeeded feature job covers checklist", func(t *testing.T, f *releaseFix) {
-			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			f.judge(t, okJudge())
-		}},
-		{"a failed coder of the judge's family", jobs.ReleaseFamily, "family — the judge (anthropic", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			f.coderStatus(t, store.StatusFailed, store.RunnerClaude, "sonnet", "R02") // its commits may be in the sha
-			f.judge(t, okJudge())
-		}},
 		{"a red manifest-check judged again until green", jobs.ReleaseManifestCheck, "manifest_check — scripts/manifest-check.sh exited 1 (job gate-",
 			func(t *testing.T, f *releaseFix) {
 				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
@@ -505,17 +496,35 @@ func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	}
 }
 
-// The family condition counts every coder with covers of the checklist, whatever its size: a codex
-// feature job (size large) and a claude fix job of size small with covers, judged by claude, fail it.
-func TestReleaseCheckFamilyCountsCodersOfAnySize(t *testing.T) {
+// The family condition counts only the succeeded feature jobs (owner decision 2026-10-25): a failed or
+// cancelled claude feature job and a claude coder of size small do not fail it under a claude judge; a
+// succeeded claude feature job does.
+func TestReleaseCheckFamilyCountsSucceededFeatureJobsOnly(t *testing.T) {
 	f := passing(t)
-	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
-	r := f.check(t)
-	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, small) {
-		t.Fatalf("a same-family small coder passes the family condition: %+v", r)
+	f.coderStatus(t, store.StatusFailed, store.RunnerClaude, "sonnet", "R02")
+	f.coderStatus(t, store.StatusCancelled, store.RunnerClaude, "opus", "R01")
+	f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
+	if r := f.check(t); !r.Pass || !condition(r, jobs.ReleaseFamily).OK {
+		t.Fatalf("failed, cancelled or small coders fail the family: %+v", r)
 	}
-	if len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || !condition(r, jobs.ReleaseTrace).OK {
-		t.Fatalf("the trace counts the small coder: %+v", r)
+	same := f.coder(t, store.RunnerClaude, "sonnet", "R01")
+	r := f.check(t)
+	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, same) {
+		t.Fatalf("a succeeded same-family feature job passes the family condition: %+v", r)
+	}
+}
+
+// Claude coders and a codex judge launched under the read-only codex sandbox (stored enforced_blind true)
+// pass: the family differs and the judge counts as blind.
+func TestReleaseCheckClaudeCodersCodexJudgePass(t *testing.T) {
+	f := newReleaseFix(t)
+	f.coder(t, store.RunnerClaude, "opus", "R01", "R02")
+	f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01")
+	j := okJudge()
+	j.runner, j.model, j.blind = store.RunnerCodex, "gpt-5.6-sol", true
+	f.judge(t, j)
+	if r := f.check(t); !r.Pass || r.OwnerLine != "Acceptance: 2 of 2" {
+		t.Fatalf("claude coders, codex judge: %+v", r)
 	}
 }
 

@@ -985,7 +985,15 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 			res.AfterEnd)
 	}
 	fail := func(err error) string { return gateFailPrefix + RedactPrintable(err.Error(), 300) }
-	blind := enforcedBlind(j.Runner)
+	sandbox := ""
+	if j.Runner == store.RunnerCodex {
+		// The sandbox this attempt's launch chose, from the protected launch record (none readable = not
+		// blind, fail closed).
+		if a, err := st.ReadLaunchAuthorization(id, token); err == nil {
+			sandbox = a.CodexSandbox
+		}
+	}
+	blind := enforcedBlind(j.Runner, sandbox)
 	if j.Kind == KindBriefing {
 		// A briefing result never bears on an approval: no checklist lock.
 		o, err := ValidateBriefing(report, j.Gate)
@@ -1058,10 +1066,15 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 	return ""
 }
 
-// enforcedBlind reports whether a gate job of runner is held to its input by the guard: claude's tool
-// calls pass the guard's read allowlist; codex runs its own tools with no OS confinement of reads
-// (ticket 684), so its gate results are stored with enforced_blind false.
-func enforcedBlind(runner string) bool { return runner != store.RunnerCodex }
+// enforcedBlind reports whether a gate job of runner, launched under the codex sandbox value sandbox
+// (codex only), counts as held to its input: claude's tool calls pass the guard's read allowlist; a codex
+// job counts when its launch ran it under the read-only codex sandbox (owner decision 2026-10-25: that
+// sandbox stops writes and network, not reads (ticket 684), and is accepted as enforcement so a codex
+// judge can pass release_check against claude coders). Any other codex sandbox (worktree-full-access,
+// none recorded) is not blind.
+func enforcedBlind(runner, sandbox string) bool {
+	return runner != store.RunnerCodex || sandbox == CodexSandboxReadOnly
+}
 
 // gateVerdict fails a succeeded gate job whose result was rejected or not stored by this attempt (fail
 // closed): a result an earlier attempt of the job stored does not count for a later one.
