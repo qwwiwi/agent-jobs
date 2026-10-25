@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/testutil"
 )
 
 const acceptanceScript = "scripts/acceptance-clean-clone.sh"
@@ -55,15 +56,9 @@ func acceptanceCmd(t *testing.T, script string, extra []string, argv0 []string, 
 	if len(g) != 3 {
 		t.Fatalf("go env: %q", goEnv)
 	}
-	// A short TMPDIR: the daemon's unix sockets live under it (the script refuses a long one).
-	tmp, err := os.MkdirTemp("", "aj")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("chmod", "-R", "u+w", tmp).Run()
-		_ = os.RemoveAll(tmp)
-	})
+	// A short TMPDIR: the daemon's unix sockets live under it (the script refuses a long one), and
+	// the caller's TMPDIR may be long (a job's is <state>/jobs/<id>/tmp).
+	tmp := testutil.ShortTempDir(t)
 	argv := append(append(append([]string{}, argv0...), "bash", script), args...)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append([]string{

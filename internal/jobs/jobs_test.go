@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
+	"github.com/qwwiwi/agent-jobs/internal/testutil"
 )
 
 var (
@@ -384,7 +385,8 @@ func newManager(t *testing.T) *Manager {
 	if runtime.GOOS == "darwin" {
 		t.Setenv("PATH", fakeHelpr+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
-	home := t.TempDir()
+	// A short home: the daemon's unix sockets (brain.sock) live in the state dir below it.
+	home := testutil.ShortTempDir(t)
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("AGENT_JOBS_CLAUDE_BIN", filepath.Join(fakeHelpr, "claude"))
 	t.Setenv("AGENT_JOBS_TMUX_BIN", filepath.Join(fakeHelpr, "tmux"))
