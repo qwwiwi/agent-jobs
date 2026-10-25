@@ -31,13 +31,17 @@ func gateAnswer(t *testing.T, m *Manager, cwd, cmd, env string) string {
 }
 
 // A gated repository whose work tree is gone never makes a merge in an unrelated repository unreadable
-// (its stored names, TestMergeGateRetire, still gate it by name).
+// once its names are stored (here by the daemon's backfill; they still gate it by name,
+// TestMergeGateRetire; without them, TestMergeGateNoNamesUnreadable).
 func TestMergeGateWorkTreeGone(t *testing.T) {
 	m, repo := mergeGateRepo(t)
 	plain := newRepo(t)
 	gitT(t, plain, "remote", "add", "origin", "https://github.com/other/repo.git")
 	if r := gateAnswer(t, m, plain, "gh pr merge 5 -R acme/demo", ""); !strings.Contains(r, "without --match-head-commit") {
 		t.Fatalf("by name, work tree present: %q", r)
+	}
+	if err := m.BackfillGateNames(); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.RemoveAll(repo); err != nil {
 		t.Fatal(err)

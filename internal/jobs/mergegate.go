@@ -93,10 +93,12 @@ func MergeGateNeeded(command string) bool {
 // gatedRepo is the checklist state of one repository's main work tree.
 type gatedRepo struct {
 	// names are the OWNER/REPO names of a gated repository: its stored ones and those of its remotes now
-	// (read once, namesRead).
-	names     []string
-	namesRead bool
-	main      string
+	// (read once, namesRead); namesUnknown says it has no stored names and its remotes are unreadable
+	// (approved before names were stored, its work tree gone before the backfill read it).
+	names        []string
+	namesRead    bool
+	namesUnknown bool
+	main         string
 	// gated: the checklist is approved now, or it was approved once and the approval is void (void says
 	// why; every merge is refused then).
 	gated   bool
@@ -204,6 +206,9 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 				add(r)
 			}
 		}
+		if why, err := g.unknownNames(); why != "" || err != nil {
+			return nil, why, err
+		}
 	}
 	if call.Repo != "" {
 		return out, "", nil
@@ -211,9 +216,16 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 	if cwd == "" || !filepath.IsAbs(cwd) {
 		return nil, "the hook input has no absolute cwd", nil
 	}
+	skipped := 0
 	for _, d := range call.Dirs {
 		if _, err := os.Stat(d); err != nil {
-			// The command may create it before the call (git clone, mkdir, ln -s): what is there then is unknown.
+			// A relative cd from another candidate to a directory missing now fails there: the call does not
+			// run in it. Else the command may create it before the call (git clone, mkdir, ln -s): what is
+			// there then is unknown.
+			if slices.Contains(call.RelDirs, d) {
+				skipped++
+				continue
+			}
 			return nil, fmt.Sprintf("the directory %s does not exist now", d), nil
 		}
 		// Inside a .git directory git has no work tree, gh still finds the repository's remotes.
@@ -236,6 +248,12 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 		if why, err := g.byRemotes(r, add); why != "" || err != nil {
 			return nil, why, err
 		}
+		if why, err := g.unknownNames(); why != "" || err != nil {
+			return nil, why, err
+		}
+	}
+	if skipped > 0 && skipped == len(call.Dirs) {
+		return nil, "every directory the call may run in is missing now (the command may create it before the call)", nil
 	}
 	return out, "", nil
 }
@@ -275,26 +293,92 @@ func (g *mergeGate) gatedNames(r *gatedRepo) ([]string, error) {
 		return nil, err
 	}
 	names := slices.Clone(rec.Names)
-	if live, err := remoteRepoNames(r.main); err == nil {
+	live, err := remoteRepoNames(r.main)
+	if err == nil {
 		for _, n := range live {
 			if !slices.Contains(names, n) {
 				names = append(names, n)
 			}
 		}
 	}
-	r.names, r.namesRead = names, true
+	r.names, r.namesRead, r.namesUnknown = names, true, len(rec.Names) == 0 && err != nil
 	return names, nil
 }
 
+// unknownNames is why a merge that names a repository or runs in another work tree cannot be told apart
+// from one in a gated repository whose names are unknown (gatedRepo.namesUnknown; "" = none is).
+func (g *mergeGate) unknownNames() (string, error) {
+	all, err := g.approvedRepos()
+	if err != nil {
+		return "", err
+	}
+	for _, r := range all {
+		if _, err := g.gatedNames(r); err != nil {
+			return "", err
+		}
+		if r.namesUnknown {
+			return fmt.Sprintf("gated %s has no stored names and unreadable remotes: restore it and restart the daemon, "+
+				"or retire it", Printable(r.main, 120)), nil
+		}
+	}
+	return "", nil
+}
+
 // RecordGateNames stores the OWNER/REPO names of main's remotes for the merge hook (checklist_set calls it
-// when it stores an approval, release_check on a pass; the hook itself opens the store read-only), so the
-// hook still knows them once the work tree is gone or moved.
+// when it stores an approval, release_check on a pass, BackfillGateNames at the daemon's start; the hook
+// itself opens the store read-only), so the hook still knows them once the work tree is gone or moved.
 func (m *Manager) RecordGateNames(main string) error {
 	names, err := remoteRepoNames(main)
 	if err != nil || len(names) == 0 {
 		return err
 	}
 	return m.Store.AddGateRepoNames(main, names)
+}
+
+// BackfillGateNames stores the remote names of every repository with a stored approval, not retired,
+// whose main work tree is readable now (the daemon runs it at start): an approval stored before names
+// were recorded is then matched by name once its work tree is gone. A work tree that is gone, moved or
+// unreadable is skipped; a store error is returned.
+func (m *Manager) BackfillGateNames() error {
+	mains, err := m.Store.ApprovalRepos()
+	if err != nil {
+		return err
+	}
+	for _, main := range mains {
+		last, err := m.Store.LatestApproval(main)
+		if err != nil {
+			return err
+		}
+		rec, err := m.Store.GateRepoOf(main)
+		if err != nil {
+			return err
+		}
+		if last == nil || last.Seq <= rec.RetiredSeq {
+			continue
+		}
+		// Only the stored main work tree itself: a directory inside another repository is not it.
+		if _, got, err := ChecklistRepo(main); err != nil || got != main {
+			continue
+		}
+		names, err := remoteRepoNames(main)
+		if err != nil || len(names) == 0 {
+			continue
+		}
+		if err := m.Store.AddGateRepoNames(main, names); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RetireRefusal is the hook's refusal of a Bash command that runs `agent-jobs gate retire` ("" = it does
+// not, guard.RunsGateRetire): the owner retires a repository in a terminal outside the agent session.
+func RetireRefusal(command string) string {
+	if !guard.RunsGateRetire(command) {
+		return ""
+	}
+	return MergeGatePrefix + "agent-jobs gate retire takes a repository out of the merge gate; only the owner runs it, " +
+		"in a terminal outside the agent session."
 }
 
 // check is the refusal for a merge in gated repository r ("" = allowed).

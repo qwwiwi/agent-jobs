@@ -1211,6 +1211,11 @@ func cmdDaemon(args []string) error {
 		m.Log.Printf("%v (MCP servers cannot compare their version with the daemon's)", err)
 	}
 	m.WatchDaemonConfig()
+	// The merge hook (F9 (b)) matches a gated repository by its stored names once its work tree is gone:
+	// store them for approvals recorded before names were.
+	if err := m.BackfillGateNames(); err != nil {
+		m.Log.Printf("merge gate names: %v (approvals without stored names stay unsure for merges by name)", err)
+	}
 	// The brain proxy: jobs reach shared memory through the daemon and never hold the token.
 	go func() {
 		if err := m.ServeBrain(ctx); err != nil {
@@ -1464,7 +1469,8 @@ func cmdReleaseCheck(args []string) error {
 
 // cmdGateRetire is `agent-jobs gate retire --agent A REPO`, the owner's way to take a repository out of the
 // merge gate (a moved or deleted work tree, a repository no longer worked on). It is a CLI command only:
-// no MCP tool reaches it, and inside a job the CLI refuses every command.
+// no MCP tool reaches it, inside a job the CLI refuses every command, and the merge hook refuses it in the
+// orchestrator session's Bash (jobs.RetireRefusal): the owner runs it in a terminal outside the session.
 func cmdGateRetire(args []string) error {
 	fs := flag.NewFlagSet("gate retire", flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -2102,6 +2108,9 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 	in, err := jobs.ParsePreToolUseInput(stdin)
 	if err != nil {
 		return block(jobs.MergeGatePrefix + "unreadable hook input (" + jobs.Printable(err.Error(), 200) + ")")
+	}
+	if r := jobs.RetireRefusal(in.Command); in.ToolName == "Bash" && r != "" {
+		return block(r)
 	}
 	if in.ToolName != "Bash" || !jobs.MergeGateNeeded(in.Command) {
 		return 0

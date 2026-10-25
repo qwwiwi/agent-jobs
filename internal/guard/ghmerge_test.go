@@ -47,9 +47,9 @@ func TestGhPrMerges(t *testing.T) {
 		{"--repo after", "gh pr merge 5 --repo o/r", &GhMerge{Repo: "o/r"}, ""},
 		{"-R after", "gh pr merge -R o/r 5", &GhMerge{Repo: "o/r"}, ""},
 		{"url", "gh pr merge https://github.com/o/r/pull/5 -R x/y", &GhMerge{Repo: "github.com/o/r"}, ""},
-		{"cd first", "cd /srv/app && gh pr merge 5", &GhMerge{Dirs: []string{"/w", "/srv/app"}}, ""},
-		{"cd twice", "cd /srv && cd app; gh pr merge 5", &GhMerge{Dirs: []string{"/w", "/srv", "/w/app", "/srv/app"}}, ""},
-		{"bare cd", "cd && gh pr merge 5", &GhMerge{Dirs: []string{"/w", home}}, ""},
+		{"cd first", "cd /srv/app && gh pr merge 5", &GhMerge{Dirs: []string{"/srv/app"}}, ""},
+		{"cd twice", "cd /srv && cd app; gh pr merge 5", &GhMerge{Dirs: []string{"/w", "/srv", "/srv/app"}}, ""},
+		{"bare cd", "cd && gh pr merge 5", &GhMerge{Dirs: []string{home}}, ""},
 		{"variable sha", `gh pr merge 5 --match-head-commit "$SHA"`, &GhMerge{HasMatchHead: true,
 			Unsure: "a variable or substitution in the words of gh pr merge"}, ""},
 		{"sh -c", `sh -c 'gh pr merge 5'`, &GhMerge{Unsure: "inside a substitution, eval or sh -c"}, "gh inside"},
@@ -66,10 +66,10 @@ func TestGhPrMerges(t *testing.T) {
 		{"git merge-base in a substitution", "git diff $(git merge-base origin/main HEAD)", nil, ""},
 		{"git commit here-doc about merge", "git commit -F - <<'EOF'\nmerge the branch\nEOF", nil, ""},
 		{"program from a variable", `$GH pr merge 5`, nil, "command name from a variable"},
-		{"subcommand from a variable", `gh pr $M 5`, nil, "gh subcommand from a variable"},
+		{"subcommand from a variable", `gh pr $M 5`, &GhMerge{Unsure: "an empty word or a variable"}, "gh subcommand from a variable"},
 		{"unknown flag before pr", "gh --foo pr merge 5", &GhMerge{Unsure: "gh flag --foo before the subcommand"}, "gh flag --foo"},
 		{"shell from stdin", "echo 'gh pr merge 5' | sh", nil, "reading commands from stdin"},
-		{"unverifiable without merge or gh", "echo x | sh", nil, "reading commands from stdin"},
+		{"unverifiable without merge or gh", "echo x | sh", nil, ""},
 	} {
 		calls, unsure := GhPrMerges(tc.cmd, "/w")
 		if tc.unsure == "" && unsure != "" || tc.unsure != "" && !strings.Contains(unsure, tc.unsure) {
@@ -107,7 +107,7 @@ func TestGhPrMerges(t *testing.T) {
 // Two merges in one command are both found, each with the cd targets before it.
 func TestGhPrMergesSeveral(t *testing.T) {
 	calls, unsure := GhPrMerges("gh pr merge 1 && cd /other && gh pr merge 2 --auto", "/w")
-	if unsure != "" || len(calls) != 2 || !slices.Equal(calls[0].Dirs, []string{"/w"}) || !slices.Equal(calls[1].Dirs, []string{"/w", "/other"}) ||
+	if unsure != "" || len(calls) != 2 || !slices.Equal(calls[0].Dirs, []string{"/w"}) || !slices.Equal(calls[1].Dirs, []string{"/other"}) ||
 		!calls[1].Auto {
 		t.Fatalf("%+v %q", calls, unsure)
 	}
@@ -159,7 +159,7 @@ func TestGhPrMergesFollowsTheShell(t *testing.T) {
 		{"popd", "popd; gh pr merge 5", 1, "", "a cd the reader cannot follow", ""},
 		{"cd ~user", "cd ~bob && gh pr merge 5", 1, "", "a cd the reader cannot follow", ""},
 		{"cd glob", "cd dem* && gh pr merge 5", 1, "", "glob, brace or tilde in a cd target", ""},
-		{"cd -P ..", "cd -P .. && gh pr merge 5", 1, "", "cd -P with ..", ""},
+		{"cd -P ..", "cd -P .. && gh pr merge 5", 1, "", "cd -P", ""},
 		{"cd in eval", "eval cd /x; gh pr merge 5", 1, "", "inside an eval or trap body", ""},
 		{"GH_REPO in eval", "eval export GH_REPO=o/r; gh pr merge 5", 1, "", "inside an eval or trap body", ""},
 		{"cd in a trap", "trap 'cd /x' DEBUG; gh pr merge 5", 1, "", "inside an eval or trap body", ""},
@@ -178,11 +178,11 @@ func TestGhPrMergesFollowsTheShell(t *testing.T) {
 		{"branch name", "gh pr merge feature/x", 1, "/w", "", ""},
 		{"over-long, continued", "# " + strings.Repeat("x", maxCommandBytes) + "\ngh pr mer\\\nge 5", 0, "", "", "longer than the reader's limit"},
 		{"too deep", deep, 0, "", "", "nests deeper than the reader's limit"},
-		{"stdin shell without merge", "echo Z2g= | base64 -d | sh", 0, "", "", "reading commands from stdin"},
+		{"stdin shell without gh or merge", "echo Z2g= | base64 -d | sh", 0, "", "", ""},
 		{"gh pr view in a substitution", "X=$(gh pr view 5 --json mergeStateStatus -q .mergeStateStatus)", 0, "", "", ""},
 		{"gh pr view in a quoted substitution", `echo "$(gh pr view 5 --json mergeable)"`, 0, "", "", ""},
 		{"gh pr view in bash -c", "bash -c 'gh pr view 5 --json mergeable'", 0, "", "", ""},
-		{"gh pr subcommand from a variable in a substitution", "X=$(gh pr $S 5)", 0, "", "", "gh"},
+		{"gh pr subcommand from a variable in a substitution", "X=$(gh pr $S 5)", 1, "", "an empty word or a variable", "gh"},
 		{"gh pr merge --help", "gh pr merge --help", 1, "/w", "", ""},
 	} {
 		calls, unsure := GhPrMerges(tc.cmd, "/w")

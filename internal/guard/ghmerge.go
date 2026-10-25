@@ -20,12 +20,16 @@ type GhMerge struct {
 	// GHRepos are the literal GH_REPO values set on the call or earlier in the command (an earlier one
 	// counts only if the variable is exported, which the reader cannot tell: the hook checks them all).
 	GHRepos []string
-	// Dirs are the absolute directories the call may run in: the directory the command starts in (when
-	// it is absolute) and, after each cd / pushd before the call, every earlier candidate moved by it. A
-	// cd that fails, runs in a subshell or in a branch not taken leaves the shell where it was, so each
-	// cd adds to the candidates and removes none: the list holds the real directory whichever way the
-	// command runs.
+	// Dirs are the absolute directories the call may run in. Along an && chain the directory is followed
+	// exactly (the call runs only if every cd before it in the chain succeeded): an absolute cd replaces
+	// it, a relative cd joins it. Where the control flow forks (;, a newline, &, ||, a subshell or group,
+	// a keyword such as if or !, a pipe) a cd may have failed or run elsewhere, so the candidates are
+	// every directory the shell may have reached so far, the start directory (when it is absolute)
+	// included: the list holds the real directory whichever way the command runs.
 	Dirs []string
+	// RelDirs are the Dirs reached only by a relative cd from another candidate: one missing now is a cd
+	// that fails (the call does not run there), unless every candidate is such a one.
+	RelDirs []string
 	// MatchHead is the last --match-head-commit value; HasMatchHead says whether one was given.
 	MatchHead    string
 	HasMatchHead bool
@@ -50,14 +54,22 @@ var (
 // GhPrMerges reads cmd, run in directory cwd, for `gh pr merge` calls. unsure is why the command may run
 // a merge that is not in calls ("" = it cannot): a form the guard's reader cannot verify (a program from
 // a variable, a gh subcommand from a variable, gh flags it cannot read before the subcommand, a shell
-// reading stdin, …), whatever the command's text says (git's own forms, such as git in a substitution,
-// never run gh, and a gh call of another group or a literal `gh pr` subcommand other than merge merges
-// nothing: neither counts), and a command the reader cannot read whole (longer than its limit, nested
-// deeper than its limit). What makes one call unreadable (a cd it cannot follow, GH_REPO from a variable,
-// GIT_DIR / GIT_WORK_TREE set) is the call's Unsure.
+// reading stdin, …) in a command whose text names gh or merge as a word (mergeText: quotes split no
+// word; git's own forms, such as git in a substitution, never run gh, and a gh call of another group or
+// a literal `gh pr` subcommand other than merge merges nothing: neither counts), a shell option or
+// extglob pattern that changes how the words of a gh call are read (shellOptions), and a command the
+// reader cannot read whole (longer than its limit, nested deeper than its limit). What makes one call
+// unreadable (a cd it cannot follow, GH_REPO from a variable, GIT_DIR / GIT_WORK_TREE set) is the
+// call's Unsure.
 func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	if len(cmd) > maxCommandBytes {
 		return nil, "the command is longer than the reader's limit"
+	}
+	text := mergeText(cmd)
+	mentionsGh := reGhWord.MatchString(text)
+	mentions := mentionsGh || reMergeWord.MatchString(text)
+	if mentionsGh && reExtglob.MatchString(text) {
+		unsure = "an extglob pattern in a command that runs gh (the shell may turn it into gh pr merge)"
 	}
 	scripts := parseAll(cmd)
 	for _, sc := range scripts {
@@ -79,8 +91,13 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	dirWhy, shellWhy := sameShellChanges(scripts)
 	later(dirWhy)
 	shellPending = shellWhy
+	var prev *pipeline // the previous pipeline of the command itself (depth 0)
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
+			if sc.depth == 0 {
+				dirs.next(prev, pl)
+				prev = pl
+			}
 			for _, c := range pl.cmds {
 				v := split(c.words)
 				argv, dyn := c.words[v.start:], c.dyn[v.start:]
@@ -89,8 +106,13 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 				// merge, or a shell running literal -c code (read as a nested script, where a gh call counts).
 				quiet := (ghOtherGroup(argv, dyn) || ghPrNotMerge(argv, dyn) || literalShellCode(c, argv, dyn)) &&
 					!v.splitString && v.wrapperUnknown == "" && v.envUnknown == ""
-				if r := unverifiable(sc, c); r != "" && unsure == "" && !git && !quiet {
+				if r := unverifiable(sc, c); r != "" && unsure == "" && !git && !quiet && mentions {
 					unsure = cannotForm(r)
+				}
+				if physical, other := shellOptions(argv); physical != "" {
+					later(physical)
+				} else if other != "" && mentionsGh && unsure == "" {
+					unsure = other
 				}
 				if g, ok := ghGroup(argv, dyn); ok && !ghGroups[g] && unsure == "" {
 					unsure = "gh " + g + " is no built-in gh command (an alias or an extension, which may run gh pr merge)"
@@ -109,7 +131,11 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 				}
 				switch name := progName(argv[0]); {
 				case sc.depth == 0 && cdName(name):
-					if why := dirs.cd(argv, dyn); why != "" {
+					// Followed exactly only as the one command of its pipeline, without a keyword (`! cd x`).
+					exact := len(pl.cmds) == 1 && !pl.piped && !slices.ContainsFunc(c.words[:v.lead], func(w string) bool {
+						return keywords[w]
+					})
+					if why := dirs.cd(argv, dyn, exact); why != "" {
 						later(why)
 					}
 				case sc.depth == 0 && (name == "source" || name == "."):
@@ -132,7 +158,12 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 					case call.Repo == "":
 						call.Unsure = dirPending
 					}
-					call.Dirs = slices.Clone(dirs.dirs)
+					call.Dirs = slices.Clone(dirs.cur)
+					for _, d := range dirs.cur {
+						if dirs.rel[d] {
+							call.RelDirs = append(call.RelDirs, d)
+						}
+					}
 					call.GHRepos = append(slices.Clone(ghRepos), call.GHRepos...)
 					calls = append(calls, call)
 				}
@@ -140,6 +171,89 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 		}
 	}
 	return calls, unsure
+}
+
+// mergeText is cmd as the merge reader's pre-filter reads it: backslash-newlines joined, quote and
+// backslash characters dropped, case folded, so a word split by quoting or a continuation (`g\h`,
+// `"g"h`, `mer\<newline>ge`) is still one word.
+func mergeText(cmd string) string {
+	s := strings.ReplaceAll(cmd, "\\\n", "")
+	s = strings.Map(func(r rune) rune {
+		if r == '\'' || r == '"' || r == '\\' {
+			return -1
+		}
+		return r
+	}, s)
+	return strings.ToLower(s)
+}
+
+var (
+	// reGhWord / reMergeWord are gh and merge as words of mergeText.
+	reGhWord    = regexp.MustCompile(`(^|[^a-z0-9_])gh([^a-z0-9_]|$)`)
+	reMergeWord = regexp.MustCompile(`(^|[^a-z0-9_])merge([^a-z0-9_]|$)`)
+	// reExtglob is an extglob pattern (`@(…)`, `?(…)`, `*(…)`, `+(…)`, `!(…)`): with extglob on (bash -O
+	// extglob, shopt, or the Bash tool's own shell options) `gh pr m@(erge)` is gh pr merge.
+	reExtglob = regexp.MustCompile(`[@?*+!]\(`)
+)
+
+// Shell options that cannot change what the words of a gh call are or where it runs: set's short flags
+// and -o names (allexport, errexit, noglob, pipefail, xtrace, …).
+const safeSetFlags = "abeEfhmnuvxBCHT"
+
+var safeSetOptions = map[string]bool{"allexport": true, "braceexpand": true, "emacs": true, "errexit": true,
+	"errtrace": true, "functrace": true, "hashall": true, "histexpand": true, "history": true, "ignoreeof": true,
+	"monitor": true, "noclobber": true, "noexec": true, "noglob": true, "nolog": true, "notify": true, "nounset": true,
+	"onecmd": true, "pipefail": true, "verbose": true, "vi": true, "xtrace": true}
+
+// shellOptions is what a command changes in how the shell reads later words: physical is set for set -P
+// or set -o physical (a cd then follows the physical directory, which the reader does not resolve);
+// other for shopt (extglob and the other shopt options), a shell started with -O / +O, or a set option
+// outside safeSetFlags / safeSetOptions (set -k reads name=value words after gh as its environment, set
+// +o posix, …).
+func shellOptions(argv []string) (physical, other string) {
+	if len(argv) == 0 {
+		return "", ""
+	}
+	name := progName(argv[0])
+	switch {
+	case name == "shopt":
+		return "", "shopt in a command that runs gh (extglob or another shell option may change how its words are read)"
+	case shells[name]:
+		for _, a := range argv[1:] {
+			if a == "--" || !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+") {
+				break
+			}
+			if !strings.HasPrefix(a, "--") && strings.Contains(a, "O") {
+				return "", name + " " + a + " (a shell option such as extglob) in a command that runs gh"
+			}
+		}
+		return "", ""
+	case name != "set":
+		return "", ""
+	}
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" || a == "-" || len(a) < 2 || a[0] != '-' && a[0] != '+' {
+			break
+		}
+		for _, f := range a[1:] {
+			switch {
+			case f == 'P':
+				physical = "set " + a + " (a cd then follows the physical directory, which the reader does not resolve)"
+			case f == 'o' && i+1 < len(argv):
+				i++
+				switch o := argv[i]; {
+				case o == "physical":
+					physical = "set -o physical (a cd then follows the physical directory, which the reader does not resolve)"
+				case !safeSetOptions[o] && other == "":
+					other = "set " + a + " " + o + " in a command that runs gh (a shell option that may change how its words are read)"
+				}
+			case f != 'o' && !strings.ContainsRune(safeSetFlags, f) && other == "":
+				other = "set " + a + " in a command that runs gh (a shell option that may change how its words are read)"
+			}
+		}
+	}
+	return physical, other
 }
 
 // literalShellCode reports a shell running -c code whose words are all literal: the reader parsed the
@@ -296,24 +410,68 @@ func sameShellChanges(scripts []*script) (dirWhy, shellWhy string) {
 type mergeDirs struct {
 	view   cdView
 	cdpath bool
-	cwd    bool // the start directory is absolute (else a relative cd cannot be followed)
-	dirs   []string
+	cwd    bool     // the start directory is absolute (else a relative cd cannot be followed)
+	all    []string // every directory the shell may have reached so far, the start directory first
+	cur    []string // the directories the current pipeline may run in
+	// orSucc are the directories of the and-or list before a `||` when it succeeded: after `A || P`, a
+	// command joined by && runs after A succeeded (P skipped) or after P did.
+	orSucc []string
+	rel    map[string]bool // reached only by a relative cd from another candidate (GhMerge.RelDirs)
 }
 
 func newMergeDirs(cmd, cwd string) *mergeDirs {
 	home, cdpath := cdEnv(cmd)
-	d := &mergeDirs{view: cdView{home: home}, cdpath: cdpath, cwd: filepath.IsAbs(cwd)}
+	d := &mergeDirs{view: cdView{home: home}, cdpath: cdpath, cwd: filepath.IsAbs(cwd), rel: map[string]bool{}}
 	if d.cwd {
-		d.dirs = []string{filepath.Clean(cwd)}
+		d.all = []string{filepath.Clean(cwd)}
+		d.cur = slices.Clone(d.all)
 	}
 	return d
 }
 
-// cd adds the directories cd / pushd / popd argv moves each candidate to; why is set when the target
-// cannot be followed exactly (then the candidates are no longer known).
-func (d *mergeDirs) cd(argv []string, dyn []bool) (why string) {
+// next is called before each pipeline of the command itself (prev is the one before it, nil for the
+// first): joined by && to the pipeline before it in the same list, it runs where that list succeeded;
+// after || where the list before failed (any directory reached so far); after any other separator
+// (;, a newline, &, a subshell or group boundary) anywhere the shell may be.
+func (d *mergeDirs) next(prev, pl *pipeline) {
+	joined := prev != nil && prev.nest == pl.nest && pl.before == prev.after
+	succ := union(d.cur, d.orSucc)
+	switch {
+	case joined && pl.before == "&&":
+		d.cur, d.orSucc = succ, nil
+	case joined && pl.before == "||":
+		d.cur, d.orSucc = slices.Clone(d.all), succ
+	default:
+		d.cur, d.orSucc = slices.Clone(d.all), nil
+	}
+}
+
+// union is a with the elements of b it lacks appended.
+func union(a, b []string) []string {
+	out := slices.Clone(a)
+	for _, s := range b {
+		if !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// cd moves the current candidates by cd / pushd / popd argv: exact (the cd is the one command of its
+// pipeline) replaces them with the moved ones, else (a cd in a pipe or after `!`, which may not move the
+// shell) the moved ones are added. why is set when the target cannot be followed exactly (then the
+// candidates are no longer known).
+func (d *mergeDirs) cd(argv []string, dyn []bool, exact bool) (why string) {
 	if i := slices.Index(argv, "--"); i > 0 && i+1 < len(argv) && strings.HasPrefix(argv[i+1], "-") {
 		return "a cd to a directory whose name starts with -"
+	}
+	for _, a := range argv[1:] {
+		if a == "--" || !strings.HasPrefix(a, "-") || len(a) < 2 {
+			break
+		}
+		if strings.Contains(a, "P") {
+			return "cd " + a + " (a physical directory the reader does not resolve)"
+		}
 	}
 	t, ok := d.view.cdTarget(argv, dyn, d.cdpath)
 	switch {
@@ -322,27 +480,32 @@ func (d *mergeDirs) cd(argv []string, dyn []bool) (why string) {
 			"HOME set in the command, CDPATH or cdable_vars with a bare relative target, ~user)"
 	case hasGlob(t) || strings.HasPrefix(t, "~"):
 		return "a glob, brace or tilde in a cd target: " + t
-	case slices.Contains(argv[1:], "-P") && slices.Contains(strings.Split(t, "/"), ".."):
-		return "cd -P with .. (a physical parent the reader does not resolve)"
 	case !filepath.IsAbs(t) && !d.cwd:
 		return "a relative cd without an absolute start directory"
 	}
-	if filepath.IsAbs(t) && len(d.dirs) == 0 {
-		d.dirs = []string{filepath.Clean(t)}
-		return ""
+	var moved []string
+	if filepath.IsAbs(t) {
+		moved = []string{filepath.Clean(t)}
+		delete(d.rel, moved[0])
+	} else {
+		for _, from := range d.cur {
+			to := filepath.Join(from, t)
+			if !slices.Contains(d.all, to) {
+				d.rel[to] = true
+			}
+			if !slices.Contains(moved, to) {
+				moved = append(moved, to)
+			}
+		}
 	}
-	for _, from := range slices.Clone(d.dirs) {
-		to := filepath.Clean(t)
-		if !filepath.IsAbs(t) {
-			to = filepath.Join(from, t)
-		}
-		if slices.Contains(d.dirs, to) {
-			continue
-		}
-		if len(d.dirs) >= maxCdDirs {
-			return "more cd candidates than the reader's limit"
-		}
-		d.dirs = append(d.dirs, to)
+	if exact {
+		d.cur = moved
+	} else {
+		d.cur = union(d.cur, moved)
+	}
+	d.all = union(d.all, moved)
+	if len(d.all) > maxCdDirs {
+		return "more cd candidates than the reader's limit"
 	}
 	return ""
 }
@@ -389,10 +552,15 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 		call.Unsure = "gh flag " + unknown + " before the subcommand"
 		return call, true
 	}
-	if len(pos) < 2 || argv[pos[0]] != "pr" || argv[pos[1]] != "merge" {
+	pos, vague, isPr := ghPrHead(argv, dyn)
+	// A gh pr call with the word merge among its arguments counts as a merge (`gh pr "" merge`, which gh
+	// runs as merge, read with an empty word ignored).
+	if !isPr || !vague && !slices.Contains(argv[pos[1]:], "merge") {
 		return call, false
 	}
 	switch {
+	case vague:
+		call.Unsure = "an empty word or a variable at or before the gh pr subcommand"
 	case slices.Contains(dyn, true):
 		call.Unsure = "a variable or substitution in the words of gh pr merge"
 	case slices.ContainsFunc(argv[1:], shellExpands):
@@ -525,25 +693,75 @@ func ghOtherGroup(argv []string, dyn []bool) bool {
 		case strings.HasPrefix(a, "-"):
 			return false // a flag that may take a value: the group is not known
 		default:
-			return !dyn[i] && !hasGlob(a) && a != "pr"
+			return !dyn[i] && !hasGlob(a) && a != "pr" && a != ""
 		}
 	}
 	return false
 }
 
-// ghPrNotMerge reports a gh call whose words are all literal and whose group is pr with a literal
-// subcommand other than merge (`gh pr view 5 --json mergeable`): it merges nothing, wherever it is nested
-// (a substitution, sh -c, eval).
-func ghPrNotMerge(argv []string, dyn []bool) bool {
-	if len(argv) == 0 || slices.Contains(dyn, true) || !isProg(argv[0], "gh") {
-		return false
+// ghPrHead reads a gh call up to its subcommand: isPr when gh and the group are a literal pr with a
+// subcommand after it (pos are the positions of the group and the subcommand); vague when a word at or
+// before the subcommand is empty or not literal (gh may read another word as the subcommand: it runs
+// `gh pr "" merge` as merge).
+func ghPrHead(argv []string, dyn []bool) (pos []int, vague, isPr bool) {
+	if len(argv) == 0 || dyn[0] || !isProg(argv[0], "gh") {
+		return nil, false, false
 	}
 	pos, unknown := ghPositional(argv)
-	if unknown != "" || len(pos) < 2 {
+	if unknown != "" || len(pos) < 2 || dyn[pos[0]] || argv[pos[0]] != "pr" {
+		return nil, false, false
+	}
+	for i := 1; i <= pos[1]; i++ {
+		if dyn[i] || argv[i] == "" {
+			vague = true
+		}
+	}
+	return pos, vague, true
+}
+
+// ghPrNotMerge reports a gh call whose program, group and subcommand are literal, the group pr and the
+// subcommand another than merge, with no word merge among its arguments (`gh pr view "$PR" --json
+// mergeable`): it merges nothing, wherever it is nested (a substitution, sh -c, eval). Its data arguments
+// may be dynamic; a substitution in them is read as a script of its own.
+func ghPrNotMerge(argv []string, dyn []bool) bool {
+	pos, vague, isPr := ghPrHead(argv, dyn)
+	if !isPr || vague {
 		return false
 	}
-	group, sub := argv[pos[0]], argv[pos[1]]
-	return group == "pr" && sub != "merge" && !hasGlob(sub)
+	sub := argv[pos[1]]
+	return sub != "merge" && !hasGlob(sub) && !slices.Contains(argv[pos[1]+1:], "merge")
+}
+
+// RunsGateRetire reports a command that runs `agent-jobs gate retire` in a form the reader can read:
+// behind wrappers and env prefixes, in a chain, sh -c, eval or a substitution, by any path, through `go
+// run …/agent-jobs`, or with the program from a variable. A command longer than the reader's limit counts
+// when it holds the word retire.
+func RunsGateRetire(cmd string) bool {
+	if len(cmd) > maxCommandBytes {
+		return strings.Contains(cmd, "retire")
+	}
+	for _, sc := range parseAll(cmd) {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				v := split(c.words)
+				argv, dyn := c.words[v.start:], c.dyn[v.start:]
+				i := 1
+				switch {
+				case len(argv) == 0:
+					continue
+				case dyn[0] || progName(argv[0]) == "agent-jobs":
+				case progName(argv[0]) == "go" && len(argv) > 2 && argv[1] == "run" && base(argv[2]) == "agent-jobs":
+					i = 3
+				default:
+					continue
+				}
+				if len(argv) > i+1 && argv[i] == "gate" && argv[i+1] == "retire" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // cannotForm is the form named by a cannot() reason, without the guard's wording around it.
