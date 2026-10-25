@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-25
+
 ### Added
 - Job outcomes (#44): the orchestrator-only MCP tool `job_outcome(id, outcome, note?)` records what was done with a finished job's result (`accepted`, `extended`, `reworked`, `rerun`, `discarded`; note ≤ 300 characters) on the job row and its `job_stats` row; a second call overwrites it, unknown ids, other agents' jobs and queued, running or stopped jobs are refused. `job_stats` / `agent-jobs stats` report per group the outcome counts and shares, `unrecorded` (finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended); `--by repo` groups by repository. The agent-jobs skill and the server instructions tell the session to call it.
 - Estimated cost of unreported attempts (#44): the stats row records the stream's token totals (each assistant message once by its id; codex `turn.completed` usage) and prices the attempts that ended without a result event (timed out, cancelled, stopped, dead wrapper, codex) at list prices: `cost_estimated_usd`, `cost_source` = `result` | `estimated` | `unknown`. Estimated jobs count in the cost figures (`cost_estimated_usd`, `estimated_jobs`), the stats table and the job-done line show `$0.42 est.`; config `model_prices` adds or overrides prices (codex models have no built-in row and stay `unknown` without one).
@@ -207,7 +209,8 @@ No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released her
 - File tools (Write/Edit/MultiEdit/NotebookEdit) cannot write inside `.git` or the job's own git dirs (symlinks resolved, `..` rejected).
 - Wrapper starts claude with a scrubbed git environment (job-only global config with the job identity, no system config, hooks/fsmonitor/ssh/credential helper/pager/editor overridden); the daemon's own git calls use the same overrides, and cleanup makes no patch when the repository config names a filter, diff command or textconv.
 
-[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/qwwiwi/agent-jobs/releases/tag/v0.1.0
