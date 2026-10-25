@@ -65,10 +65,13 @@ func TestNoiseLoop2GitWriters(t *testing.T) {
 	})
 	// format-patch creates files in its directory, it does not reach below: a protected file deeper in
 	// the worktree (brief/BRIEF.md in a real job) does not refuse it; the protected dir itself does.
-	cfg.Protected = append(cfg.Protected, filepath.Join(cfg.Dir, "brief", "BRIEF.md"), filepath.Join(state, "subagents"))
+	skills := filepath.Join(filepath.Dir(filepath.Dir(state)), "lib", "skills")
+	cfg.Protected = append(cfg.Protected, filepath.Join(cfg.Dir, "brief", "BRIEF.md"), filepath.Join(state, "subagents"), skills)
 	runRefused(t, cfg, []refusalCase{
 		{"format-patch into protected dir", "git format-patch -1 -o " + filepath.Join(state, "subagents"), ""},
 		{"format-patch -C protected dir", "git -C " + state + " format-patch -1 -o subagents", ""},
+		// An absolute -C after a relative one starts from there.
+		{"archive -C relative then absolute", "git -C internal -C " + filepath.Dir(skills) + " archive -o skills/x.tar HEAD", ""},
 	})
 	runAllowed(t, cfg, []string{
 		"git archive -o out.tar HEAD",
@@ -85,6 +88,8 @@ func TestNoiseLoop2GitWriters(t *testing.T) {
 		{"read-only format-patch default", "git format-patch -1", "review job, read-only"},
 		{"read-only archive -o", "git archive -o out.tar HEAD", "review job, read-only"},
 		{"read-only archive attached -o", "git archive -oout.tar HEAD", "review job, read-only"},
+		// An absolute -C after another one starts from there: the output lands in the worktree.
+		{"read-only -C absolute after -C", "git -C /tmp -C " + review.ReadOnly + " diff --output=notes.md", "review job, read-only"},
 	})
 	runAllowed(t, review, []string{"git diff HEAD", "git log --oneline -3"})
 }

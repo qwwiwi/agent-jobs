@@ -82,21 +82,30 @@ func gitWriteTargets(argv []string, g gitCall) (dests []string, found bool) {
 	if sub == "format-patch" && !found && !stdout {
 		dests, found = append(dests, "."), true
 	}
-	var dirs []string
+	// Each -C applies in turn: a relative one below the last, an absolute or `~` one from there.
+	dir := ""
 	for i := 1; i+1 < g.subIdx; i++ {
 		if argv[i] == "-C" {
-			dirs = append(dirs, argv[i+1])
+			dir = joinRel(dir, argv[i+1])
 		}
 		if gitValueOpts[argv[i]] {
 			i++
 		}
 	}
 	for i, d := range dests {
-		if len(dirs) > 0 && !filepath.IsAbs(d) && !strings.HasPrefix(d, "~") {
-			dests[i] = filepath.Join(append(slices.Clone(dirs), d)...)
+		if dir != "" {
+			dests[i] = joinRel(dir, d)
 		}
 	}
 	return dests, found
+}
+
+// joinRel is p below dir, or p itself when it is absolute or starts with `~`.
+func joinRel(dir, p string) string {
+	if dir == "" || filepath.IsAbs(p) || strings.HasPrefix(p, "~") {
+		return p
+	}
+	return filepath.Join(dir, p)
 }
 
 // dataSinks copy their standard input to standard output or to the files they name: a here-doc they
