@@ -46,7 +46,8 @@ func newReleaseFix(t *testing.T) *releaseFix {
 
 var releaseSeq int
 
-// coder stores a succeeded feature job (kind general) of the checklist with covers, as job_start stores one.
+// coder stores a succeeded feature job (kind general, size large) of the checklist with covers, as
+// job_start stores one.
 func (f *releaseFix) coder(t *testing.T, runner, model string, covers ...string) string {
 	t.Helper()
 	return f.coderStatus(t, store.StatusSucceeded, runner, model, covers...)
@@ -55,10 +56,16 @@ func (f *releaseFix) coder(t *testing.T, runner, model string, covers ...string)
 // coderStatus stores a feature job of the checklist that ended with status.
 func (f *releaseFix) coderStatus(t *testing.T, status, runner, model string, covers ...string) string {
 	t.Helper()
+	return f.coderSized(t, jobs.SizeLarge, status, runner, model, covers...)
+}
+
+// coderSized stores a general job of the repository with covers of the checklist and the given size.
+func (f *releaseFix) coderSized(t *testing.T, size, status, runner, model string, covers ...string) string {
+	t.Helper()
 	releaseSeq++
 	id := fmt.Sprintf("coder-%d", releaseSeq)
 	if err := f.m.Store.Insert(&store.Job{ID: id, Agent: f.m.Agent, Title: "coder", Kind: "general", Brief: "b", RepoPath: f.repo,
-		Status: status, Model: model, Runner: runner, MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1,
+		Status: status, Model: model, Runner: runner, MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1, Size: size,
 		CreatedAt: time.Now(), Covers: covers, CoverContract: &store.CoverContract{ChecklistID: f.v.ID, Version: f.v.Version}}); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +224,7 @@ func TestReleaseCheckPasses(t *testing.T) {
 		len(r.FeatureJobs) != 1 || !slices.Equal(r.FeatureJobs[0].LiveCovers, []string{"R01", "R02"}) {
 		t.Fatalf("requirements / feature jobs: %+v %+v", r.Requirements, r.FeatureJobs)
 	}
-	// Read-only: the call stores nothing (a second call answers the same).
+	// The only write is the pass record (a second call answers the same).
 	if again := f.check(t); again.OwnerLine != r.OwnerLine || !again.Pass {
 		t.Fatalf("second call: %+v", again)
 	}
@@ -473,5 +480,50 @@ func TestReleaseCheckWaiverAndNoApproval(t *testing.T) {
 	}
 	if msg := callErr(t, f.cs, "release_check", map[string]any{"repo": filepath.Join(t.TempDir(), "x"), "sha": head}); msg == "" {
 		t.Fatal("no repo accepted")
+	}
+}
+
+// A feature job is a fix or general job of size large (F9 (a)): a same-family coder with covers but size
+// small, or none, is not one, so it neither fails the family condition nor supplies the trace; alone, such
+// coders leave the check without a feature job.
+func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
+	f := passing(t)
+	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
+	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerClaude, "opus", "R02")
+	r := f.check(t)
+	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || r.FeatureJobs[0].ID == unsized {
+		t.Fatalf("small and unsized coders counted: %+v", r)
+	}
+
+	g := newReleaseFix(t)
+	g.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+	g.judge(t, okJudge())
+	r = g.check(t)
+	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseTrace).OK || condition(r, jobs.ReleaseFamily).OK ||
+		!strings.Contains(r.OwnerLine, "(a feature job is a fix or general job of size large)") {
+		t.Fatalf("only a small coder: %+v", r)
+	}
+}
+
+// A pass is recorded for the merge hook (repo, sha, checklist id, version, hash); a later run for the
+// same sha that does not pass removes it.
+func TestReleaseCheckRecordsPass(t *testing.T) {
+	f := passing(t)
+	if p, err := f.m.Store.ReleasePassed(f.repo, f.head, f.v.ID, f.v.Version, f.v.SHA256); err != nil || p != nil {
+		t.Fatalf("a pass before the check: %+v %v", p, err)
+	}
+	r := f.check(t)
+	p, err := f.m.Store.ReleasePassed(f.repo, f.head, f.v.ID, f.v.Version, f.v.SHA256)
+	if err != nil || p == nil || !r.Pass || p.VerdictJob != r.VerdictJob {
+		t.Fatalf("pass not recorded: %+v %v (%+v)", p, err, r)
+	}
+	bad := okJudge()
+	bad.verdicts = map[string]string{"R01": "missing", "R02": "placeholder"}
+	f.judge(t, bad)
+	if r := f.check(t); r.Pass {
+		t.Fatalf("passes with a disagreeing verdict: %+v", r)
+	}
+	if p, err := f.m.Store.ReleasePassed(f.repo, f.head, f.v.ID, f.v.Version, f.v.SHA256); err != nil || p != nil {
+		t.Fatalf("pass kept after a failing run: %+v %v", p, err)
 	}
 }

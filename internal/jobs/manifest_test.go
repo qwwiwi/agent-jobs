@@ -188,7 +188,7 @@ func TestJudgeToReleaseCheckEndToEnd(t *testing.T) {
 	// The coder: a codex feature job covering every live requirement (inserted as stored).
 	if err := m.Store.Insert(&store.Job{ID: "cx-e2e", Agent: m.Agent, Title: "codex coder", Kind: "general", Brief: "b",
 		RepoPath: mainWorktree(repo), Status: store.StatusSucceeded, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: time.Now(),
-		CoverContract: &store.CoverContract{ChecklistID: "demo", Version: 2}, Covers: []string{"R01", "R02", "R03i"}}); err != nil {
+		Size: SizeLarge, CoverContract: &store.CoverContract{ChecklistID: "demo", Version: 2}, Covers: []string{"R01", "R02", "R03i"}}); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := m.ReleaseCheck(repo, sha); err != nil || r.Pass || !strings.Contains(r.OwnerLine, "verdict — no judge verdict") {

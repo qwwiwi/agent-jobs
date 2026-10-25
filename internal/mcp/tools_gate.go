@@ -208,14 +208,17 @@ func ReleaseCheck(m *jobs.Manager, repo, sha string) (jobs.ReleaseCheckResult, e
 func addReleaseCheck(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "release_check",
-		Description: "Whether the code at sha may ship under the repo's approved checklist (Wave F, F7). Read-only; pass is true only " +
+		Description: "Whether the code at sha may ship under the repo's approved checklist (Wave F, F7). Its one write: a pass is recorded " +
+			"for the merge hook (`agent-jobs hook merge-gate`, F9 (b)) and any other answer removes the pass for the repo and sha. " +
+			"pass is true only " +
 			"when every condition holds, and a missing, unreadable or ambiguous record fails its condition: approval (the latest " +
 			"owner approval exists and the checklist hash is unchanged), manifest_check (the judge's manifest-check record for sha " +
 			"exits 0), verdict (a judge verdict for sha at the approved checklist id and version; every verdict for them must agree), " +
 			"requirements (each live requirement met, placeholder on a placeholder-ok row, or carrying an owner waiver bound to this " +
 			"hash and sha), unmapped_brief and suspect_tests (empty), family (the judge's model family differs from every coder's, " +
 			"recomputed now), enforced_blind (true), trace (every live requirement is in some feature job's covers and every feature " +
-			"job covers one; a feature job is a fix or general job of the repo whose covers name the checklist id). owner_line is " +
+			"job covers one; a feature job is a fix or general job of the repo started with size large whose covers name the " +
+			"checklist id). owner_line is " +
 			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason».",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ReleaseCheckInput) (*sdk.CallToolResult, jobs.ReleaseCheckResult, error) {
 		out, err := ReleaseCheck(d.Manager, in.Repo, in.SHA)

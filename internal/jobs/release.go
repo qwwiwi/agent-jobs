@@ -10,9 +10,10 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
-// release_check (Wave F, F7): read-only, it answers whether the code at a commit may ship under the
-// repository's approved checklist. PASS only when every condition holds; a missing, unreadable or
-// ambiguous record fails its condition (fail closed). It writes nothing.
+// release_check (Wave F, F7): it answers whether the code at a commit may ship under the repository's
+// approved checklist. PASS only when every condition holds; a missing, unreadable or ambiguous record
+// fails its condition (fail closed). Its one write is the pass record the merge hook reads (F9 (b),
+// store.ReleasePass): stored on a pass, removed for the repository and sha on any other answer.
 
 // Release-check condition names, in the order they are reported.
 const (
@@ -53,9 +54,10 @@ type ReleaseRequirement struct {
 	CoveredBy []string `json:"covered_by"`
 }
 
-// ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository whose
-// covers name the checklist id (F9 (a)'s size is not read yet; DEVIATIONS #34). Every status counts for
-// the family condition (a failed coder may have commits in the sha); only a succeeded one for the trace.
+// ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository started
+// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36). Every status counts
+// for the family condition (a failed coder may have commits in the sha); only a succeeded one for the
+// trace, whose source stays its covers.
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
@@ -98,8 +100,29 @@ const maxReleaseReason = 160
 
 // ReleaseCheck is release_check(repo, sha) (and `agent-jobs gate release-check`). An error is returned
 // only for a bad argument or an unreadable store or work tree; every missing record is a failed
-// condition in the result.
+// condition in the result. A pass is recorded for the merge hook (F9 (b)); any other answer removes the
+// repository's passes for the sha, so the latest run decides. A pass whose record cannot be stored is an
+// error: the hook would not see it.
 func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
+	out, err := m.releaseCheck(repo, sha)
+	if err != nil {
+		return nil, err
+	}
+	if !out.Pass {
+		if err := m.Store.DropReleasePasses(out.Repo, out.SHA); err != nil {
+			return nil, fmt.Errorf("release_check did not pass, and the earlier pass record could not be removed: %w", err)
+		}
+		return out, nil
+	}
+	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: out.Repo, SHA: out.SHA, ChecklistID: out.ChecklistID,
+		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now()}); err != nil {
+		return nil, fmt.Errorf("release_check passed, but its record for the merge hook could not be stored: %w", err)
+	}
+	return out, nil
+}
+
+// releaseCheck computes release_check without writing anything.
+func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	top, main, err := ChecklistRepo(repo)
 	if err != nil {
 		return nil, err
@@ -247,7 +270,7 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	coders, err := m.Store.CoverJobs(main, c.ID)
+	coders, err := m.Store.FeatureJobs(main, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +354,7 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 		switch {
 		case len(coders) == 0:
-			set(ReleaseFamily, false, "no feature job covers checklist %s, so no coder family to differ from", c.ID)
+			set(ReleaseFamily, false, "no feature job (a fix or general job of size large) covers checklist %s, so no coder family to differ from", c.ID)
 		case len(same) > 0:
 			set(ReleaseFamily, false, "the judge (%s, model %s) shares its family with coder job(s) %s", out.JudgeFamily,
 				latest.JudgeModel, strings.Join(same, ", "))
@@ -378,7 +401,7 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	}
 	var trace []string
 	if succeeded == 0 {
-		trace = append(trace, "no succeeded feature job covers checklist "+c.ID)
+		trace = append(trace, "no succeeded feature job covers checklist "+c.ID+" (a feature job is a fix or general job of size large)")
 	}
 	if len(uncovered) > 0 {
 		trace = append(trace, "in no feature job's covers: "+strings.Join(uncovered, ", "))
