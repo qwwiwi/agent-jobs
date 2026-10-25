@@ -55,8 +55,14 @@ var errPidfdUnsupported = errors.New("pidfd unsupported")
 
 // pidfdOpen and pidfdSend live in pidfd_linux.go and pidfd_other.go.
 
-// signalIgnore is signal.Ignore; a variable so the non-Linux sweep stays testable.
-var signalIgnore = signal.Ignore
+// signalIgnore, killGroup, getsid and sweepGOOS are signal.Ignore, syscall.Kill, unix.Getsid and
+// runtime.GOOS; variables so the non-Linux sweep stays testable on every OS.
+var (
+	signalIgnore = signal.Ignore
+	killGroup    = syscall.Kill
+	getsid       = unix.Getsid
+	sweepGOOS    = runtime.GOOS
+)
 
 // sessionMembers lists the live (non-zombie) processes of session sid other than this process.
 // A process that vanishes during the scan is skipped; an unreadable /proc is an error.
@@ -235,18 +241,26 @@ func sweepRoundsOf(list func() ([]int, error), isMember func(int) bool, log io.W
 // sweepSession sweeps the wrapper's own session. The daemon starts the wrapper with setsid, so the
 // wrapper leads it; run by hand (not a leader) there is nothing of the job's to sweep. Elsewhere than
 // Linux there is no /proc and no pidfd: the wrapper ignores SIGTERM and sends it to its own process
-// group (its own live pid, so no reuse risk), and the result is unverified (weaker; documented).
-func sweepSession(log io.Writer) SweepResult {
-	sid, err := unix.Getsid(0)
+// group (its own live pid, so no reuse risk), and the result is unverified (weaker; documented). With
+// stopsCaught (the manifest step, which catches the stop signals until the runner starts) nothing is
+// sent there: ignoring SIGTERM would undo the step's catch (a stop after the sweep would be missed and
+// the runner would inherit SIGTERM ignored), and a SIGTERM to its own group would be caught as a stop.
+// The script ran in its own process group, ended when it exited; only a process that joined the
+// wrapper's group by hand is left to the wrapper's last sweep.
+func sweepSession(log io.Writer, stopsCaught bool) SweepResult {
+	sid, err := getsid(0)
 	if err != nil {
 		return SweepResult{Err: fmt.Errorf("getsid: %w", err)}
 	}
 	if sid != os.Getpid() {
 		return SweepResult{}
 	}
-	if runtime.GOOS != "linux" {
+	if sweepGOOS != "linux" {
+		if stopsCaught {
+			return SweepResult{}
+		}
 		signalIgnore(syscall.SIGTERM)
-		_ = syscall.Kill(-sid, syscall.SIGTERM)
+		_ = killGroup(-sid, syscall.SIGTERM)
 		return SweepResult{}
 	}
 	return sweepSid(sid, log)
@@ -255,14 +269,14 @@ func sweepSession(log io.Writer) SweepResult {
 // sweepJob is the wrapper's sweep before exit_code. In its own job scope (the daemon launched it with
 // systemd-run) it first ends every other process of the scope's cgroup, then sweeps the session as
 // well (a process that moved its pid into another cgroup by hand but kept the session); without a scope
-// only the session is swept (weaker: setsid leaves it).
-func sweepJob(jobDir string, log io.Writer) SweepResult {
+// only the session is swept (weaker: setsid leaves it). stopsCaught is sweepSession's.
+func sweepJob(jobDir string, log io.Writer, stopsCaught bool) SweepResult {
 	path := ownJobScope(wrapperScope(jobDir))
 	if path == "" {
-		return sweepSession(log)
+		return sweepSession(log, stopsCaught)
 	}
 	c := sweepCgroup(path, log)
-	s := sweepSession(log)
+	s := sweepSession(log, stopsCaught)
 	survivors := append(append([]int{}, c.Survivors...), s.Survivors...)
 	slices.Sort(survivors)
 	survivors = slices.Compact(survivors)

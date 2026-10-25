@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,8 +64,24 @@ func TestGateCLI(t *testing.T) {
 	out = captureStdout(t, func() error {
 		return cmdGate([]string{"verdict", "--agent", "test", "--repo", repo, "--sha", strings.Repeat("a", 40)})
 	})
-	if err := json.Unmarshal([]byte(out), &vv); err != nil || vv.Verdict != nil || vv.ManifestCheck != jobs.ManifestCheckNotBuilt {
+	if err := json.Unmarshal([]byte(out), &vv); err != nil || vv.Verdict != nil {
 		t.Fatalf("gate verdict: %s %v", out, err)
+	}
+	// release-check: the result as JSON, an error unless it passed (here: no stored approval, so it
+	// fails closed).
+	gitOut(t, repo, "commit", "-q", "--allow-empty", "-m", "c")
+	sha := strings.TrimSpace(gitOut(t, repo, "rev-parse", "HEAD"))
+	var rc jobs.ReleaseCheckResult
+	c2 := captureStdoutErr(t, func() error {
+		return cmdGate([]string{"release-check", "--agent", "test", "--repo", repo, "--sha", sha})
+	})
+	if err := json.Unmarshal([]byte(c2.stdout), &rc); err != nil || rc.Pass || rc.SHA != sha ||
+		!strings.Contains(rc.OwnerLine, "mismatch: approval") || !errors.Is(c2.err, errReleaseFailed) {
+		t.Fatalf("gate release-check: %s %v %v", c2.stdout, err, c2.err)
+	}
+	if err := cmdGate([]string{"release-check", "--agent", "test", "--repo", repo, "--sha", "abc"}); err == nil ||
+		errors.Is(err, errReleaseFailed) {
+		t.Fatalf("release-check with a short sha: %v", err)
 	}
 	if err := cmdGate([]string{"judge"}); err == nil || !strings.Contains(err.Error(), "usage") {
 		t.Fatalf("unknown subcommand: %v", err)
@@ -72,4 +89,14 @@ func TestGateCLI(t *testing.T) {
 	if err := cmdGate([]string{"slicing", "--agent", "test", "--repo", repo, "--sha", "x"}); err == nil {
 		t.Fatal("gate slicing took --sha")
 	}
+}
+
+func gitOut(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", repo, "-c", "user.name=T", "-c", "user.email=t@example.com"}, args...)
+	out, err := exec.Command("git", full...).Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return string(out)
 }

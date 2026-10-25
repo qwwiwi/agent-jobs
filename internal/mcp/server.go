@@ -99,6 +99,7 @@ var toolDefs = []toolDef{
 	{"briefing_get", addBriefingGet},
 	{"judge_start", addJudgeStart},
 	{"judge_get", addJudgeGet},
+	{"release_check", addReleaseCheck},
 }
 
 func definitions() []toolDef { return toolDefs }

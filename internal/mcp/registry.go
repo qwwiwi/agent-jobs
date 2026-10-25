@@ -92,6 +92,8 @@ var OrchestratorOnly = []string{
 	"briefing_get",
 	"judge_start",
 	"judge_get",
+	// The release check (Wave F, F7): only the session asks whether a commit may ship.
+	"release_check",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the

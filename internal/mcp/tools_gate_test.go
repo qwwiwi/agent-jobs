@@ -58,7 +58,7 @@ func TestGateToolsClosedToJobs(t *testing.T) {
 	}
 	jcs := connect(t, job)
 	names := toolNames(t, jcs)
-	for _, n := range []string{"slicing_start", "slicing_get", "judge_start", "judge_get", "briefing_start", "briefing_get"} {
+	for _, n := range []string{"slicing_start", "slicing_get", "judge_start", "judge_get", "briefing_start", "briefing_get", "release_check"} {
 		if !slices.Contains(OrchestratorOnly, n) || Allowed(RoleJob, n) || slices.Contains(names, n) {
 			t.Fatalf("%s open to jobs", n)
 		}
@@ -195,7 +195,7 @@ func TestGateStartRefusesOrchestratorInput(t *testing.T) {
 	}
 }
 
-// judge_get returns the latest stored verdict with its families and a null manifest_check; current
+// judge_get returns the latest stored verdict with its families and its manifest-check record; current
 // follows the latest approval.
 func TestJudgeGetReadsStoredVerdict(t *testing.T) {
 	m := newManager(t)
@@ -209,15 +209,20 @@ func TestJudgeGetReadsStoredVerdict(t *testing.T) {
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
 	var empty jobs.VerdictView
 	call(t, cs, "judge_get", map[string]any{"repo": repo}, &empty)
-	if empty.Verdict != nil || empty.ManifestCheck != jobs.ManifestCheckNotBuilt {
+	if empty.Verdict != nil {
 		t.Fatalf("judge_get without a verdict: %+v", empty)
 	}
 	id, token := gateJobRow(t, m, jobs.KindJudge)
 	raw := map[string]any{"schema": jobs.JudgeSchema}
+	mc := store.ManifestCheck{JobID: id, Repo: repo, SHA: head, ChecklistID: v.ID, Version: v.Version, ChecklistSHA256: v.SHA256,
+		Script: jobs.ManifestScript, Output: "R01 ok\n", CreatedAt: time.Now()}
+	if _, err := m.Store.PutManifestCheck(token, mc); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.Store.PutVerdict(token, store.JudgeVerdict{JobID: id, Repo: repo, SHA: head, ChecklistID: v.ID, Version: v.Version,
 		ChecklistSHA256: v.SHA256, JudgeModel: "gpt-5", JudgeRunner: store.RunnerCodex, JudgeFamily: "openai",
 		CoderFamilies: []string{"anthropic"}, CoderJobs: []string{"c1"}, FamilyDiffers: true, Counts: map[string]int{"met": 1},
-		Verdict: raw, CreatedAt: time.Now()}); err != nil {
+		ManifestCheck: &mc, Verdict: raw, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	// Another launch token cannot write a verdict.
@@ -228,7 +233,8 @@ func TestJudgeGetReadsStoredVerdict(t *testing.T) {
 	var got jobs.VerdictView
 	call(t, cs, "judge_get", map[string]any{"repo": repo, "sha": head}, &got)
 	if got.Verdict == nil || !got.Current || got.Verdict.JudgeFamily != "openai" || !got.Verdict.FamilyDiffers ||
-		got.Verdict.ManifestCheck != nil || got.Verdict.Counts["met"] != 1 {
+		got.Verdict.ManifestCheck == nil || got.Verdict.ManifestCheck.Output != "R01 ok\n" || got.Verdict.ManifestCheck.SHA != head ||
+		got.Verdict.Counts["met"] != 1 {
 		t.Fatalf("judge_get: %+v %+v", got, got.Verdict)
 	}
 	call(t, cs, "judge_get", map[string]any{"repo": repo, "sha": strings.Repeat("0", 40)}, &got)

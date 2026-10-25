@@ -303,7 +303,7 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 		fmt.Fprintln(log, "run-wrapper: stopped by a signal during the acceptance command; its process group is ended")
 		return 128 + int(syscall.SIGTERM)
 	}
-	sw := sweepJob(jobDir, log)
+	sw := sweepJob(jobDir, log, false)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(log, "run-wrapper: ended %d leftover process(es) of the acceptance command\n", sw.Signalled)
 	}
@@ -334,21 +334,8 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
 	out := &tailBuffer{max: AcceptanceLogBytes}
 	exit := runAcceptanceCmd(ctx, jobDir, cmdline, timeout, out, log, onStart)
 	dur := time.Since(start)
-	body, dropped := out.Bytes(), out.dropped
+	body, dropped := keptTail(out)
 	if dropped > 0 {
-		// The first kept line was cut at its start: drop it whole, so a value split by the cut leaves
-		// no part of itself (too short to match its format) in the log.
-		cut := bytes.IndexByte(body, '\n') + 1
-		if cut == 0 {
-			cut = len(body)
-		}
-		// The dropped line completes the evicted text's last line: was a key block open at the cut
-		// (its BEGIN line evicted, its END line not), what is kept of it goes until its END line.
-		out.evicted.feed(body[:cut])
-		body, dropped = body[cut:], dropped+int64(cut)
-		if kept, n := redactPEM(string(body), out.evicted.open); n > 0 {
-			body = []byte(kept)
-		}
 		body = append([]byte(fmt.Sprintf("[... %d earlier bytes cut, last %d kept ...]\n", dropped, len(body))), body...)
 	}
 	if err := writeAtomic(filepath.Join(jobDir, AcceptanceLog), body); err != nil {
@@ -358,9 +345,45 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
 	return exit, dur
 }
 
+// keptTail is what out kept, and the bytes cut before it. When out dropped bytes, the first kept line
+// was cut at its start and is dropped whole, so a value split by the cut leaves no part of itself (too
+// short to match its format) behind.
+func keptTail(out *tailBuffer) ([]byte, int64) {
+	body, dropped := out.Bytes(), out.dropped
+	if dropped == 0 {
+		return body, 0
+	}
+	cut := bytes.IndexByte(body, '\n') + 1
+	if cut == 0 {
+		cut = len(body)
+	}
+	// The dropped line completes the evicted text's last line: was a key block open at the cut (its
+	// BEGIN line evicted, its END line not), what is kept of it goes until its END line.
+	out.evicted.feed(body[:cut])
+	body, dropped = body[cut:], dropped+int64(cut)
+	if kept, n := redactPEM(string(body), out.evicted.open); n > 0 {
+		body = []byte(kept)
+	}
+	return body, dropped
+}
+
 func runAcceptanceCmd(parent context.Context, jobDir, cmdline string, timeout time.Duration, out io.Writer, log io.Writer,
 	onStart func(pgid int)) int {
-	env, err := acceptanceEnv(jobDir, os.Environ())
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		fmt.Fprintln(log, "run-wrapper: acceptance environment:", err)
+		return 127
+	}
+	return runContainedCmd(parent, jobDir, filepath.Join(abs, "work"), filepath.Join(abs, acceptanceHome), cmdline, timeout, out,
+		log, onStart)
+}
+
+// runContainedCmd runs cmdline with /bin/sh -c in dir with the environment acceptanceEnvAt(home), as
+// runAcceptance describes: the job's containment, a scrubbed environment and no guard. The acceptance
+// command (#18) and the judge's manifest-check step (F5) run through it.
+func runContainedCmd(parent context.Context, jobDir, dir, home, cmdline string, timeout time.Duration, out io.Writer, log io.Writer,
+	onStart func(pgid int)) int {
+	env, err := acceptanceEnvAt(jobDir, home, os.Environ())
 	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance environment:", err)
 		return 127
@@ -371,7 +394,7 @@ func runAcceptanceCmd(parent context.Context, jobDir, cmdline string, timeout ti
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdline)
-	cmd.Dir = filepath.Join(jobDir, "work")
+	cmd.Dir = dir
 	cmd.Env = env
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -421,10 +444,14 @@ func acceptanceEnv(jobDir string, env []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	home := filepath.Join(abs, acceptanceHome)
+	return acceptanceEnvAt(jobDir, filepath.Join(abs, acceptanceHome), env)
+}
+
+// acceptanceEnvAt is acceptanceEnv with HOME at home (an absolute path in the job dir).
+func acceptanceEnvAt(jobDir, home string, env []string) ([]string, error) {
 	// Fresh for every run: nothing a previous run or the job planted there (an rc file) is picked up.
 	if err := os.RemoveAll(home); err != nil {
-		return nil, fmt.Errorf("reset %s: %w", acceptanceHome, err)
+		return nil, fmt.Errorf("reset %s: %w", filepath.Base(home), err)
 	}
 	if err := os.MkdirAll(filepath.Join(home, "tmp"), 0o700); err != nil {
 		return nil, err
@@ -436,7 +463,7 @@ func acceptanceEnv(jobDir string, env []string) ([]string, error) {
 			keep = append(keep, kv)
 		}
 	}
-	keep, err = GitEnv(jobDir, TempEnv(keep, filepath.Join(home, "tmp")))
+	keep, err := GitEnv(jobDir, TempEnv(keep, filepath.Join(home, "tmp")))
 	if err != nil {
 		return nil, err
 	}

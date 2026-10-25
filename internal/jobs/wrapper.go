@@ -456,6 +456,18 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
+	if opts.ManifestCheck {
+		// The judge's manifest-check (Wave F, F5): before the runner starts, never after; a failure ends the
+		// job here, with nothing recorded but the failure.
+		fail, rc := runManifestStep(jobDir, token, st, id, &opts, stderrLog)
+		if rc != 0 {
+			return rc
+		}
+		if fail != "" {
+			fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+			return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, GateFailure: fail}, record, stderrLog)
+		}
+	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
 		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record)
@@ -463,7 +475,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before trusted completion says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
-	sw := sweepJob(jobDir, stderrLog)
+	sw := sweepJob(jobDir, stderrLog, false)
 	if sw.Signalled > 0 {
 		fmt.Fprintf(stderrLog, "run-wrapper: ended %d leftover process(es) of the job's session\n", sw.Signalled)
 	}
@@ -528,6 +540,21 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	return 0
 }
 
+// finishBeforeRunner records the completion of a job that ends before its runner starts (exit 1, the
+// reason in res) and writes exit_code.
+func finishBeforeRunner(jobDir string, res StreamResult, record func(StreamResult) error, log io.Writer) int {
+	res.Completed, res.ExitCode = true, 1
+	if err := record(res); err != nil {
+		fmt.Fprintln(log, "run-wrapper: record completion:", err)
+		return 2
+	}
+	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n")); err != nil {
+		fmt.Fprintln(log, "run-wrapper: write exit_code:", err)
+		return 2
+	}
+	return 0
+}
+
 // WrapperOptions are the run-wrapper options of a resume launch (see RunWrapper).
 type WrapperOptions struct {
 	Prompt          string // stdin file name in the job dir; empty = prompt.md
@@ -537,6 +564,9 @@ type WrapperOptions struct {
 	// ChecklistLockDir is the agent-jobs home's checklist lock dir (a gate job's launch only): a slicing
 	// result is stored under the repository's checklist lock there.
 	ChecklistLockDir string
+	// ManifestCheck runs the judge's manifest-check step before the runner (the daemon passes
+	// --manifest-check for a judge job's launch only): decided at launch, never from a row read here.
+	ManifestCheck bool
 }
 
 func (o WrapperOptions) prompt() string {
