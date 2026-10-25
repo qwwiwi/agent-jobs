@@ -702,10 +702,11 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					}
 				}
 				if g, ok := parseGit(argv); ok {
-					// git diff --output, archive -o, format-patch's directory: a protected path is no target.
+					// git diff --output, archive -o, format-patch's directory (new files in it, nothing
+					// below): a protected path is no target.
 					outs, _ := gitWriteTargets(argv, g)
 					for _, t := range outs {
-						if p, ok := s.hit(t, true); ok {
+						if p, ok := s.hit(t, false); ok {
 							return protectedBlocked(p)
 						}
 					}

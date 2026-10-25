@@ -63,6 +63,13 @@ func TestNoiseLoop2GitWriters(t *testing.T) {
 		{"archive in subst", `echo "$(git archive HEAD)"`, ""},
 		{"format-patch in subst", `echo "$(git format-patch -1 --stdout)"`, ""},
 	})
+	// format-patch creates files in its directory, it does not reach below: a protected file deeper in
+	// the worktree (brief/BRIEF.md in a real job) does not refuse it; the protected dir itself does.
+	cfg.Protected = append(cfg.Protected, filepath.Join(cfg.Dir, "brief", "BRIEF.md"), filepath.Join(state, "subagents"))
+	runRefused(t, cfg, []refusalCase{
+		{"format-patch into protected dir", "git format-patch -1 -o " + filepath.Join(state, "subagents"), ""},
+		{"format-patch -C protected dir", "git -C " + state + " format-patch -1 -o subagents", ""},
+	})
 	runAllowed(t, cfg, []string{
 		"git archive -o out.tar HEAD",
 		"git archive --format=tar HEAD",
