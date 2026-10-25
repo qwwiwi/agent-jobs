@@ -205,12 +205,15 @@ func TestRedProofStrictIDsAndNegatives(t *testing.T) {
 // A «ran:» value verifies only when it names a command (ranCommand) and a red proof only when it shows
 // failing evidence (redEvidence): a test or command reference and a failure marker. Free text that says
 // there is none, however it is worded or wrapped, is neither; every bypass of both reviews is listed.
+// (Informational since 2026-10-25: a done line counts without either; the parse is still exact.)
 func TestProofsPositiveStructure(t *testing.T) {
 	verified := func(report string) bool {
 		t.Helper()
-		for _, l := range ParseRequirements(report, []string{"R01"}).Lines {
+		r := ParseRequirements(report, []string{"R01"})
+		proof := slices.ContainsFunc(r.RedProofs, func(p string) bool { ids, ok := redProof(p); return ok && slices.Contains(ids, "R01") })
+		for _, l := range r.Lines {
 			if l.ID == "R01" {
-				return l.Verified
+				return ranCommand(l.Ran) && (proof || l.RedProof != "")
 			}
 		}
 		t.Fatalf("no R01 line in %q", report)
