@@ -167,6 +167,9 @@ type Job struct {
 	// Gate is the input the daemon assembled for a gate job (Wave F: kind slicing, F3, or judge, F5);
 	// nil for every other kind. The job's prompt is built from it, never from an orchestrator brief.
 	Gate *GateInput
+	// MilestoneID and TaskKey attach the job to a task of a milestone (0 and "" for none).
+	MilestoneID int64
+	TaskKey     string
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -414,6 +417,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)
 	}
+	if _, err := db.Exec(milestonesSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: milestones: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -560,6 +567,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN gate_input TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN size TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_sandbox TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN milestone_id INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -692,7 +701,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -756,7 +765,8 @@ func insertArgs(j *Job) []any {
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
-		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size}
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
+		nullID(j.MilestoneID), j.TaskKey}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -778,6 +788,7 @@ func scanJob(r scanner) (*Job, error) {
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
 	var skills, delivered, covers, coverContract, gate string
+	var milestone sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
@@ -786,7 +797,8 @@ func scanJob(r scanner) (*Job, error) {
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
-		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size)
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
+		&milestone, &j.TaskKey)
 	if err != nil {
 		return nil, err
 	}
@@ -803,6 +815,7 @@ func scanJob(r scanner) (*Job, error) {
 		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)
+	j.MilestoneID = milestone.Int64
 	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
