@@ -488,8 +488,8 @@ func TestReleaseCheckWaiverAndNoApproval(t *testing.T) {
 // coders leave the check without a feature job.
 func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	f := passing(t)
-	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
-	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerClaude, "opus", "R02")
+	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01")
+	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R02")
 	r := f.check(t)
 	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || r.FeatureJobs[0].ID == unsized {
 		t.Fatalf("small and unsized coders counted: %+v", r)
@@ -502,6 +502,20 @@ func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseTrace).OK || condition(r, jobs.ReleaseFamily).OK ||
 		!strings.Contains(r.OwnerLine, "(a feature job is a fix or general job of size large)") {
 		t.Fatalf("only a small coder: %+v", r)
+	}
+}
+
+// The family condition counts every coder with covers of the checklist, whatever its size: a codex
+// feature job (size large) and a claude fix job of size small with covers, judged by claude, fail it.
+func TestReleaseCheckFamilyCountsCodersOfAnySize(t *testing.T) {
+	f := passing(t)
+	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
+	r := f.check(t)
+	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, small) {
+		t.Fatalf("a same-family small coder passes the family condition: %+v", r)
+	}
+	if len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || !condition(r, jobs.ReleaseTrace).OK {
+		t.Fatalf("the trace counts the small coder: %+v", r)
 	}
 }
 
