@@ -709,10 +709,6 @@ func (p *parser) braced(dq bool) bool {
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
 		case c == '\'', c == '$' && p.peek(1) == '\'':
-			if dq {
-				// In posix mode and in sh (dash) a single quote in "${x:-…}" is a plain character.
-				p.out.vague = "a single quote inside \"${…}\" (bash reads it as a quote, sh and posix mode do not)"
-			}
 			if !p.quotedInBraces(dq) {
 				return false
 			}
@@ -773,6 +769,11 @@ func (p *parser) quotedInBraces(dq bool) bool {
 	if end < 0 {
 		return false
 	}
+	// In posix mode and in sh (dash) a single quote in "${x:-…}" is a plain character: with a `}`,
+	// quote, backslash or expansion between the quotes the two readings end the word apart.
+	if dq && strings.ContainsAny(p.src[p.i+1:end], "}\"\\$`") {
+		p.out.vague = "a single quote inside \"${…}\" (bash reads it as a quote, sh and posix mode do not)"
+	}
 	if dq || ansi {
 		p.word.WriteString(p.src[start : end+1])
 	} else {
@@ -784,15 +785,26 @@ func (p *parser) quotedInBraces(dq bool) bool {
 }
 
 // doubleInBraces reads a "…" nested inside `${…}` at p.i: a single quote is literal there, `${`
-// nests and substitutions run.
+// nests and substitutions run. As in braced, the text after a substitution up to the closing quote
+// is also recorded as a script, and $[…] makes the script vague.
 func (p *parser) doubleInBraces() bool {
 	p.i++
+	after := -1
 	for p.i < len(p.src) {
 		c := p.src[p.i]
 		switch {
 		case c == '"':
+			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
+				p.subs = append(p.subs, rest)
+				p.cmd.subSources = append(p.cmd.subSources, rest)
+			}
 			p.i++
 			return true
+		case c == '$' && p.peek(1) == '[':
+			p.out.vague = "$[…] inside ${…}"
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
 		case c == '\\' && p.i+1 < len(p.src) && strings.IndexByte("$`\"\\\n", p.src[p.i+1]) >= 0:
 			if p.src[p.i+1] != '\n' {
 				p.word.WriteByte(p.src[p.i+1])
@@ -810,6 +822,9 @@ func (p *parser) doubleInBraces() bool {
 			lit := p.substitution(true)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
+			if after < 0 {
+				after = p.i
+			}
 		default:
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)

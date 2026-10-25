@@ -126,6 +126,9 @@ func TestNoiseLoop3ParamExpansionUnit(t *testing.T) {
 		{"single quote in quoted expansion", `echo "${x:-'}"; git push origin main; : '}"'`, "cannot verify this form"},
 		// bash nests $[…] in ${…}: `}` and `#` in it are part of the word (bash prints `1 #]}`).
 		{"old arithmetic in expansion", "y=1; echo ${y:-$[ } #]}; git push origin main", "cannot verify this form"},
+		{"old arithmetic in nested quotes", `true || echo ${x:-"$[ ' " ' ]"}; git push origin main; echo \'}`, "cannot verify this form"},
+		{"case pattern in nested quotes", `echo ${x:-"$(case a in a) git push origin main;; esac)"}`, ""},
+		{"case pattern in nested quotes after a substitution", `echo ${x:-$(:)"$(case a in a) git push origin main;; esac)"}`, ""},
 		{"single quote in quoted expansion sh -c", `sh -c 'echo "${x:-'"'"'}"; git push origin main; : '"'"'}"'"'"''`, ""},
 	})
 	runAllowed(t, cfg, []string{
@@ -138,6 +141,9 @@ func TestNoiseLoop3ParamExpansionUnit(t *testing.T) {
 		`f=${HOME}/x; echo "$f"`,
 		`echo "${x:-$(git rev-parse HEAD)}"`,
 		"echo ${x:-$(pwd)/out}",
+		// A single quote in "${…}" around plain text: bash and sh end the word at the same `}`.
+		`echo "${name:-'unnamed'}"`,
+		`msg="${1:-'no message'}"; echo "$msg"`,
 		"echo ${x:-'}'}",
 	})
 }
