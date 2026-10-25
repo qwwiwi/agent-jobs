@@ -36,7 +36,9 @@ func TestMergeGateFollowUpFalseBlocks(t *testing.T) {
 		{`gh -R $R pr view 5`, unsureWarn},
 		{"gh pr view 5 # ok?(x)", unsureWarn},
 		{"[[ x == @(#) ]]; gh pr merge 5", unsureWarn},
-		{"gh pr view merge ${x:- #}; gh pr merge 5", unsureWarn}, // read strictly: unreadable as a whole, so a warning
+		// Read strictly, the comment hides the real call; the merge word with a variable in the gated
+		// repository is refused (write the words literally).
+		{"gh pr view merge ${x:- #}; gh pr merge 5", MergeGatePrefix},
 	} {
 		if r := gateAnswer(t, m, repo, tc.cmd, ""); !strings.Contains(r, tc.want) {
 			t.Errorf("%q: %q, want %q", tc.cmd, r, tc.want)
@@ -70,10 +72,11 @@ func TestMergeGateInertRangesExact(t *testing.T) {
 }
 
 // While a repository is gated, a merge the reader cannot read runs (no refusal) with one warning line,
-// and a parsed gh pr merge without a release pass is still refused (owner decision 2026-10-25).
+// and a parsed gh pr merge without a release pass is still refused (owner decision 2026-10-25), also one
+// into the gated repository whose sha or PR number is a variable.
 func TestMergeGateUnreadableRunsParsedBlocked(t *testing.T) {
 	m, repo := mergeGateRepo(t)
-	for _, cmd := range []string{"sh -c 'gh pr merge 5'", `gh pr $M 5`, `gh pr merge 5 --match-head-commit "$SHA"`} {
+	for _, cmd := range []string{"sh -c 'gh pr merge 5'", `gh pr $M 5`, `gh pr merge 5 -R "$REPO"`} {
 		r, err := m.MergeGate(repo, cmd, "")
 		if err != nil || r != "" {
 			t.Fatalf("%q refused: %q %v", cmd, r, err)
@@ -81,6 +84,12 @@ func TestMergeGateUnreadableRunsParsedBlocked(t *testing.T) {
 		a, err := m.MergeGateCheck(repo, cmd, "")
 		if err != nil || a.Refusal != "" || !strings.HasPrefix(a.Warning, unsureWarn) || strings.Contains(a.Warning, "\n") {
 			t.Fatalf("%q: %+v %v", cmd, a, err)
+		}
+	}
+	// The target resolves to the gated repository, only the sha or PR word is a variable: refused.
+	for _, cmd := range []string{`gh pr merge 5 --match-head-commit "$SHA"`, `gh pr merge $PR`} {
+		if r := gateAnswer(t, m, repo, cmd, ""); !strings.HasPrefix(r, MergeGatePrefix) || !strings.Contains(r, "literally") {
+			t.Fatalf("%q: %q", cmd, r)
 		}
 	}
 	if r := gateAnswer(t, m, repo, "gh pr merge 5", ""); !strings.HasPrefix(r, MergeGatePrefix) {

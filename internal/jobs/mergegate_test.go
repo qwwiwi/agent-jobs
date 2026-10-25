@@ -118,7 +118,7 @@ func TestMergeGateEndToEnd(t *testing.T) {
 		{"disable auto", repo, "gh pr merge 5 --disable-auto", "", ""},
 		{"no merge", repo, "gh pr view 5 && git log", "", ""},
 		{"sh -c", elsewhere, "sh -c 'gh pr merge 5'", "", MergeGateWarnPrefix + "cannot tell whether this command runs gh pr merge"},
-		{"variable sha", repo, `gh pr merge 5 --match-head-commit "$SHA"`, "", unsureWarn},
+		{"variable sha", repo, `gh pr merge 5 --match-head-commit "$SHA"`, "", "write the sha (--match-head-commit <full sha>) and the PR number literally"},
 		{"subcommand from a variable", elsewhere, `gh pr $M 5`, "", unsureWarn},
 		{"GIT_DIR", elsewhere, "GIT_DIR=" + repo + "/.git " + merge + shaA, "", unsureWarn},
 		{"another clone without flag", clone, "gh pr merge 5", "", "without --match-head-commit"},
