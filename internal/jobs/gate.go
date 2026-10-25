@@ -226,10 +226,10 @@ func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
 	if len(ids) == 0 {
 		return "", nil
 	}
-	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of coder job(s) %s of checklist %s: "+
-		"its verdict will be stored with same_family true; a cross-family verdict needs a judge of a family no coder job "+
-		"shares (a gpt-* model runs on codex, stored with enforced_blind false)", family, j.Model, strings.Join(ids, ", "),
-		j.Gate.ChecklistID), nil
+	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of succeeded coder job(s) %s of "+
+		"checklist %s: its verdict will be stored with same_family true; a cross-family verdict needs a judge of a family no "+
+		"succeeded coder job shares (a gpt-* model runs on codex, blind under the read-only codex sandbox)", family, j.Model,
+		strings.Join(ids, ", "), j.Gate.ChecklistID), nil
 }
 
 // gateBriefLine is the brief column of a gate job: a description for job lists, never put in its prompt.
@@ -368,7 +368,7 @@ var GateRuntimeReads = []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib
 // and with symlinks resolved, the claude project dirs of its work dir (its session's transcript and
 // tool results, which claude has the model read back; none when claude's name for the dir cannot be
 // known in advance) and GateRuntimeReads. The guard holds a claude job to it; a codex job runs its own
-// tools (enforced_blind false, ticket 684).
+// tools, held only by the codex sandbox (enforcedBlind; reads are not confined, ticket 684).
 func (m *Manager) gateReadAllow(j *store.Job) []string {
 	if !IsGateKind(j.Kind) {
 		return nil

@@ -201,7 +201,7 @@ type ChecklistSetInput struct {
 	Approve           bool                     `json:"approve,omitempty" jsonschema:"the owner approved the checklist as it is after this call: the approval (id, version, hash, BRIEF hash, owner quote) is stored in the agent-jobs store, the only source of approved; the file's approved: <time> owner sha256:<hash> line is informational"`
 	ApproveQuote      string                   `json:"approve_quote,omitempty" jsonschema:"with approve: the owner's words approving, verbatim (redacted, stored with the approval); required"`
 	ExpectVersion     int                      `json:"expect_version,omitempty" jsonschema:"refuse the call unless the checklist is at this version"`
-	Waivers           []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the approved hash and version and the requirement (not to a commit: sha is optional and ignored); the checklist must be approved after this call"`
+	Waivers           []ChecklistWaiverInput   `json:"waivers,omitempty" jsonschema:"owner waivers per requirement (F7), stored in the agent-jobs store bound to the checklist id, the approved hash and version and the requirement (not to a commit: sha is optional and ignored); the checklist must be approved after this call"`
 	UnmappedDecisions []ChecklistDecisionInput `json:"unmapped_decisions,omitempty" jsonschema:"the owner's decision per unmapped brief quote of the slicing check (F3) for the checklist's version and hash after this call, stored in the agent-jobs store; approve needs one for every unmapped quote of that result"`
 }
 
