@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // The merge hook (Wave F, F9 (b)): `agent-jobs hook merge-gate`, a PreToolUse hook on Bash in the
@@ -23,10 +23,16 @@ import (
 // on (a newer verdict for the sha, a red manifest-check run). A repository whose checklist was never
 // approved is not gated; one whose approval is void now (the checklist or brief edited by hand or gone, a
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
-// closed: a void approval never lifts the gate). Another clone of a gated repository (a shared OWNER/REPO
-// remote) is gated with it. A command whose merge the reader cannot read is refused while some repository
-// is gated. It reads the store and the brief files only. `gh api` merges, `git push` to the base
-// branch and the web UI pass by it (PLAN Wave F, Risks): it catches honest mistakes, it is not a boundary.
+// closed: a void approval never lifts the gate) until the owner retires it (`agent-jobs gate retire`).
+// Another clone of a gated repository (a shared OWNER/REPO remote) is gated with it: the names of a gated
+// repository's remotes are stored (store.GateRepo, at the approval and whenever the hook reads them), so a
+// gated work tree that is gone or moved is still matched by name and never makes other merges unreadable.
+// A gh pr merge written in the Bash command whose target the reader cannot tell is refused while some
+// repository is gated. It reads the store, git remotes and the brief files, and writes only remote names.
+// It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
+// `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
+// does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
+// honest mistakes, it is not a boundary.
 
 // MergeGatePrefix starts the hook's refusal line.
 const MergeGatePrefix = "agent-jobs merge-gate: blocked: "
@@ -79,16 +85,17 @@ func ParsePreToolUseInput(r io.Reader) (PreToolUseInput, error) {
 // MergeGateNeeded reports whether the command runs, or may run, `gh pr merge`: only then does the hook
 // open the store.
 func MergeGateNeeded(command string) bool {
-	calls, unsure := guard.GhPrMerges(command)
+	calls, unsure := guard.GhPrMerges(command, "")
 	return len(calls) > 0 || unsure != ""
 }
 
 // gatedRepo is the checklist state of one repository's main work tree.
 type gatedRepo struct {
-	// remotes are the OWNER/REPO names of its remotes (read once, remotesRead).
-	remotes     []string
-	remotesRead bool
-	main        string
+	// names are the OWNER/REPO names of a gated repository: its stored ones and those of its remotes now
+	// (read once, namesRead).
+	names     []string
+	namesRead bool
+	main      string
 	// gated: the checklist is approved now, or it was approved once and the approval is void (void says
 	// why; every merge is refused then).
 	gated   bool
@@ -109,7 +116,7 @@ type mergeGate struct {
 // GH_REPO of the session's environment. An error (unreadable store or brief files) is returned as is;
 // the caller refuses on it.
 func (m *Manager) MergeGate(cwd, command, envRepo string) (string, error) {
-	calls, unsure := guard.GhPrMerges(command)
+	calls, unsure := guard.GhPrMerges(command, cwd)
 	if len(calls) == 0 && unsure == "" {
 		return "", nil
 	}
@@ -162,9 +169,9 @@ func (g *mergeGate) refuseUnsure(why string) (string, error) {
 }
 
 // targets are the gated repositories a call may merge in. A repository the call names (PR URL, -R) is
-// the one gh uses; without one, every candidate counts (each GH_REPO value, the cwd and every cd target
-// before the call), since the reader cannot tell which one gh takes. why is set when a candidate cannot
-// be read.
+// the one gh uses; without one, every candidate counts (each GH_REPO value and every directory the call
+// may run in, guard.GhMerge.Dirs), since the reader cannot tell which one gh takes. why is set when a
+// candidate cannot be read.
 func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out []*gatedRepo, why string, err error) {
 	add := func(r *gatedRepo) {
 		if r.gated && !slices.Contains(out, r) {
@@ -188,9 +195,9 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 			return nil, "", err
 		}
 		for _, r := range all {
-			names, why := g.remoteNames(r)
-			if why != "" {
-				return nil, why, nil
+			names, err := g.gatedNames(r)
+			if err != nil {
+				return nil, "", err
 			}
 			if slices.Contains(names, name) {
 				add(r)
@@ -203,25 +210,7 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 	if cwd == "" || !filepath.IsAbs(cwd) {
 		return nil, "the hook input has no absolute cwd", nil
 	}
-	home, _ := os.UserHomeDir()
-	dirs, prev := []string{cwd}, cwd
 	for _, d := range call.Dirs {
-		switch {
-		case d == "" || d == "~":
-			d = home
-		case strings.HasPrefix(d, "~/"):
-			d = filepath.Join(home, d[2:])
-		case strings.HasPrefix(d, "~"):
-			return nil, "cd to another user's home " + d, nil
-		case !filepath.IsAbs(d):
-			d = filepath.Join(prev, d)
-		}
-		if d == "" {
-			return nil, "cd to the home directory, which is unknown", nil
-		}
-		dirs, prev = append(dirs, d), d
-	}
-	for _, d := range dirs {
 		_, main, err := ChecklistRepo(d)
 		if err != nil {
 			continue // not a git work tree (or gone): gh has no repository there
@@ -242,21 +231,21 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 	return out, "", nil
 }
 
-// byRemotes adds every gated repository that shares an OWNER/REPO remote with r; why is set when a
-// remote list is unreadable.
+// byRemotes adds every gated repository that shares an OWNER/REPO name with work tree r (not gated
+// itself); why is set when r's remotes are unreadable (what the call merges is then unknown).
 func (g *mergeGate) byRemotes(r *gatedRepo, add func(*gatedRepo)) (string, error) {
 	all, err := g.approvedRepos()
 	if err != nil || len(all) == 0 {
 		return "", err
 	}
-	mine, why := g.remoteNames(r)
-	if why != "" {
-		return why, nil
+	mine, err := remoteRepoNames(r.main)
+	if err != nil {
+		return fmt.Sprintf("the remotes of %s are unreadable: %v", r.main, err), nil
 	}
 	for _, gr := range all {
-		names, why := g.remoteNames(gr)
-		if why != "" {
-			return why, nil
+		names, err := g.gatedNames(gr)
+		if err != nil {
+			return "", err
 		}
 		if slices.ContainsFunc(mine, func(n string) bool { return slices.Contains(names, n) }) {
 			add(gr)
@@ -265,16 +254,44 @@ func (g *mergeGate) byRemotes(r *gatedRepo, add func(*gatedRepo)) (string, error
 	return "", nil
 }
 
-// remoteNames are r's remote OWNER/REPO names (cached); why is set when they are unreadable.
-func (g *mergeGate) remoteNames(r *gatedRepo) ([]string, string) {
-	if !r.remotesRead {
-		names, err := remoteRepoNames(r.main)
-		if err != nil {
-			return nil, fmt.Sprintf("the remotes of %s are unreadable: %v", r.main, err)
-		}
-		r.remotes, r.remotesRead = names, true
+// gatedNames are gated repository r's OWNER/REPO names (cached): those stored for it and those of its
+// remotes now, which are stored too when new. A work tree that is gone, moved or whose remotes are
+// unreadable has its stored names only: it is never a reason to refuse a merge elsewhere.
+func (g *mergeGate) gatedNames(r *gatedRepo) ([]string, error) {
+	if r.namesRead {
+		return r.names, nil
 	}
-	return r.remotes, ""
+	rec, err := g.m.Store.GateRepoOf(r.main)
+	if err != nil {
+		return nil, err
+	}
+	names := rec.Names
+	if live, err := remoteRepoNames(r.main); err == nil {
+		var fresh []string
+		for _, n := range live {
+			if !slices.Contains(names, n) {
+				fresh = append(fresh, n)
+			}
+		}
+		if len(fresh) > 0 {
+			names = append(slices.Clone(names), fresh...)
+			// Best effort: the names read now decide this call either way; a failed write is retried by the
+			// next call that reads them.
+			_ = g.m.Store.AddGateRepoNames(r.main, fresh)
+		}
+	}
+	r.names, r.namesRead = names, true
+	return names, nil
+}
+
+// RecordGateNames stores the OWNER/REPO names of main's remotes for the merge hook (checklist_set calls it
+// when it stores an approval), so the hook still knows them once the work tree is gone or moved.
+func (m *Manager) RecordGateNames(main string) error {
+	names, err := remoteRepoNames(main)
+	if err != nil || len(names) == 0 {
+		return err
+	}
+	return m.Store.AddGateRepoNames(main, names)
 }
 
 // check is the refusal for a merge in gated repository r ("" = allowed).
@@ -336,9 +353,10 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 }
 
 // repo reads the checklist state of a main work tree (cached), without the checklist lock like the
-// brief reminder: a read that races a checklist_set can misjudge one call. A repository never approved
-// is not gated; one approved once stays gated (void when its checklist is not approved now, also when the
-// file is gone); a store error is returned.
+// brief reminder: a read that races a checklist_set can misjudge one call. A repository never approved,
+// or retired by the owner since its latest approval, is not gated; one approved once stays gated (void
+// when its checklist is not approved now, also when the file or the work tree is gone); a store error is
+// returned.
 func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if r, ok := g.repos[main]; ok {
 		return r, nil
@@ -348,6 +366,16 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 		return nil, err
 	}
 	r := &gatedRepo{main: main}
+	if last != nil {
+		rec, err := g.m.Store.GateRepoOf(main)
+		if err != nil {
+			return nil, err
+		}
+		if last.Seq <= rec.RetiredSeq {
+			g.repos[main] = r // retired: out of the gate until it is approved again
+			return r, nil
+		}
+	}
 	voided := func(why string) (*gatedRepo, error) {
 		r.gated, r.void = last != nil, why
 		g.repos[main] = r
@@ -447,4 +475,26 @@ func remoteRepoNames(dir string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// RetireGate takes a repository out of the merge gate (owner CLI `agent-jobs gate retire`, no MCP tool):
+// path is its main work tree as stored, or any work tree of it while one exists. It returns the stored
+// repository; store.ErrNotGated when none of path's forms has a stored approval. A later approval of the
+// repository gates it again.
+func (m *Manager) RetireGate(path string) (string, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return "", fmt.Errorf("repo %q must be an absolute path", path)
+	}
+	forms := []string{filepath.Clean(path)}
+	if _, main, err := ChecklistRepo(path); err == nil && main != forms[0] {
+		forms = append([]string{main}, forms...)
+	}
+	for _, repo := range forms {
+		_, err := m.Store.RetireGateRepo(repo)
+		if errors.Is(err, store.ErrNotGated) {
+			continue
+		}
+		return repo, err
+	}
+	return "", fmt.Errorf("%s: %w", Printable(path, 200), store.ErrNotGated)
 }

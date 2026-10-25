@@ -100,3 +100,39 @@ func gitOut(t *testing.T, repo string, args ...string) string {
 	}
 	return string(out)
 }
+
+// `agent-jobs gate retire --agent A REPO` takes a repository with a stored approval out of the merge
+// gate, also when its work tree is gone; one without an approval, a missing or extra REPO is an error.
+func TestGateRetireCLI(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	gone := filepath.Join(t.TempDir(), "gone")
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.PutApproval(store.ChecklistApproval{Repo: gone, ChecklistID: "demo", Version: 1, ChecklistSHA256: "h",
+		BriefSHA256: "b", Quote: "yes", ApprovedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Close()
+	for _, args := range [][]string{{"retire", "--agent", "test"}, {"retire", "--agent", "test", gone, "x"}} {
+		if err := cmdGate(args); err == nil || !strings.Contains(err.Error(), "usage: agent-jobs gate retire") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+	if err := cmdGate([]string{"retire", "--agent", "test", t.TempDir()}); !errors.Is(err, store.ErrNotGated) {
+		t.Fatalf("an ungated repo: %v", err)
+	}
+	out := captureStdout(t, func() error { return cmdGate([]string{"retire", "--agent", "test", gone}) })
+	if !strings.Contains(out, "retired "+gone+" from the merge gate") {
+		t.Fatalf("retire: %q", out)
+	}
+	m, err = jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if g, err := m.Store.GateRepoOf(gone); err != nil || g.RetiredSeq == 0 {
+		t.Fatalf("not retired: %+v %v", g, err)
+	}
+}

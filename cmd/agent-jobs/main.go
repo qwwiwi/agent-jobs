@@ -100,6 +100,9 @@ const usage = `usage: agent-jobs <command> [flags]
   gate release-check --agent A --repo PATH --sha S
                                            whether sha may ship (Wave F, F7; same as release_check):
                                            JSON, the owner line on stderr, exit 1 unless it passed
+  gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
+                                           also when it is gone) out of the merge gate (F9 (b)); a
+                                           later checklist approval gates it again
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
@@ -1378,14 +1381,17 @@ func cmdArchive(args []string) error {
 
 // cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get), `gate briefing`
 // (briefing_get) or `gate verdict` (judge_get); `gate release-check` prints release_check (F7) and exits
-// non-zero unless it passed.
+// non-zero unless it passed; `gate retire` takes a repository out of the merge gate (F9 (b)).
 func cmdGate(args []string) error {
 	if len(args) > 0 && args[0] == "release-check" {
 		return cmdReleaseCheck(args[1:])
 	}
+	if len(args) > 0 && args[0] == "retire" {
+		return cmdGateRetire(args[1:])
+	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
-			"gate release-check --agent A --repo PATH --sha S")
+			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -1453,6 +1459,32 @@ func cmdReleaseCheck(args []string) error {
 	if !out.Pass {
 		return errReleaseFailed
 	}
+	return nil
+}
+
+// cmdGateRetire is `agent-jobs gate retire --agent A REPO`, the owner's way to take a repository out of the
+// merge gate (a moved or deleted work tree, a repository no longer worked on). It is a CLI command only:
+// no MCP tool reaches it, and inside a job the CLI refuses every command.
+func cmdGateRetire(args []string) error {
+	fs := flag.NewFlagSet("gate retire", flag.ContinueOnError)
+	agent := agentFlag(fs)
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("usage: agent-jobs gate retire --agent A REPO (the repository's absolute path)")
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	repo, err := m.RetireGate(pos[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("retired %s from the merge gate; a new checklist approval gates it again\n", repo)
 	return nil
 }
 
