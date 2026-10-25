@@ -382,15 +382,19 @@ func admitted(jobDir, token string, argv []string) error {
 		}
 	}
 	if j.Runner == store.RunnerCodex {
-		return admittedCodex(st, j, token, codexSandboxArg(argv))
+		sandbox, err := codexArgvSandbox(argv)
+		if err != nil {
+			return fmt.Errorf("codex command line was not authorized by the launching daemon: %w", err)
+		}
+		return admittedCodex(st, j, token, sandbox)
 	}
 	return nil
 }
 
-// admittedCodex checks a codex launch's sandbox (the `-s` of its argv) against the launching daemon's
-// authorization: the kind's read-only sandbox needs none; workspace-write needs codex_write_allowed;
-// danger-full-access (codex_sandbox worktree-full-access) needs codex_write_allowed and the recorded
-// sandbox; anything else (no, several or another `-s`) is refused.
+// admittedCodex checks a codex launch's sandbox (codexArgvSandbox of its argv) against the launching
+// daemon's authorization: the kind's read-only sandbox needs none; workspace-write needs
+// codex_write_allowed; danger-full-access (codex_sandbox worktree-full-access) needs codex_write_allowed
+// and the recorded sandbox; any other sandbox is refused.
 func admittedCodex(st *store.Store, j *store.Job, token, sandbox string) error {
 	native := CodexSandbox(j.Kind)
 	if sandbox == native && native != CodexSandboxWrite {
@@ -409,24 +413,73 @@ func admittedCodex(st *store.Store, j *store.Job, token, sandbox string) error {
 	return fmt.Errorf("codex sandbox %q was not authorized by the launching daemon", sandbox)
 }
 
-// codexSandboxArg is the sandbox of a codex command line: the value of its only `-s` / `--sandbox`
-// option ("" = none, or more than one).
-func codexSandboxArg(argv []string) string {
-	var found []string
-	for i, a := range argv {
-		switch {
-		case (a == "-s" || a == "--sandbox") && i+1 < len(argv):
-			found = append(found, argv[i+1])
-		case strings.HasPrefix(a, "--sandbox="):
-			found = append(found, strings.TrimPrefix(a, "--sandbox="))
-		case strings.HasPrefix(a, "-s") && len(a) > 2 && !strings.HasPrefix(a, "--"):
-			found = append(found, strings.TrimPrefix(a, "-s"))
+// codexArgvSandbox is the sandbox of a codex command line (argv[0] is the binary), read with codex's
+// option boundaries: options end at `--` (what follows is the prompt); `-s X`, `-sX`, `-s=X`,
+// `--sandbox X` and `--sandbox=X` name the sandbox. Only the options CodexArgs builds are known and
+// anything else is an error, since an unknown option may take a value or change the sandbox: a sandbox
+// or approval bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo, --full-auto), a profile,
+// a `-c` / `--config` override of a sandbox or profile key, a value starting with "-", a repeated or
+// missing sandbox, and a positional other than the leading `exec` and the stdin prompt "-".
+func codexArgvSandbox(argv []string) (string, error) {
+	sandbox, seenSandbox := "", false
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			break
+		}
+		if (a == "exec" && i == 1) || (a == "-" && i > 1 && argv[1] == "exec") {
+			continue
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return "", fmt.Errorf("unexpected codex argument %q", a)
+		}
+		name, value, attached := a, "", false
+		if strings.HasPrefix(a, "--") {
+			if k, v, ok := strings.Cut(a, "="); ok {
+				name, value, attached = k, v, true
+			}
+		} else if len(a) > 2 {
+			name, value, attached = a[:2], strings.TrimPrefix(a[2:], "="), true
+		}
+		switch name {
+		case "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check":
+			if attached {
+				return "", fmt.Errorf("codex option %q takes no value", a)
+			}
+			continue
+		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable":
+		default:
+			return "", fmt.Errorf("codex option %q is not one the daemon passes", a)
+		}
+		if !attached {
+			if i+1 >= len(argv) {
+				return "", fmt.Errorf("codex option %s has no value", name)
+			}
+			i++
+			value = argv[i]
+		}
+		if value == "" || strings.HasPrefix(value, "-") {
+			return "", fmt.Errorf("codex option %s has value %q", name, value)
+		}
+		switch name {
+		case "-s", "--sandbox":
+			if seenSandbox {
+				return "", errors.New("codex sandbox given more than once")
+			}
+			sandbox, seenSandbox = value, true
+		case "-c", "--config":
+			key, _, _ := strings.Cut(value, "=")
+			for _, part := range strings.Split(key, ".") {
+				if part = strings.Trim(part, " \t\"'"); strings.Contains(part, "sandbox") || part == "profile" {
+					return "", fmt.Errorf("codex config override %q changes the sandbox", key)
+				}
+			}
 		}
 	}
-	if len(found) != 1 {
-		return ""
+	if !seenSandbox {
+		return "", errors.New("codex sandbox not given")
 	}
-	return found[0]
+	return sandbox, nil
 }
 
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,

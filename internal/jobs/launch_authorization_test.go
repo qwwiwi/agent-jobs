@@ -266,3 +266,70 @@ func TestWrapperChecksCodexSandboxAuthorization(t *testing.T) {
 		})
 	}
 }
+
+// The wrapper reads a codex argv's sandbox with codex's option boundaries: an `-s` after `--` is the
+// prompt, not a sandbox; a sandbox or approval bypass flag, a `-c` sandbox override, a repeated sandbox
+// or an option it does not know is refused, so a read-only review cannot launch without a sandbox
+// (issue #81, L4).
+func TestWrapperRefusesCodexSandboxBypass(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{"bypass with -s after --", []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--", "-sread-only"}, false},
+		{"yolo", []string{"exec", "--yolo", "-s", "read-only", "-"}, false},
+		{"bypass beside read-only", []string{"exec", "-s", "read-only", "--dangerously-bypass-approvals-and-sandbox", "-"}, false},
+		{"full-auto", []string{"exec", "--full-auto", "-s", "read-only", "-"}, false},
+		{"profile", []string{"exec", "-p", "open", "-s", "read-only", "-"}, false},
+		{"-c sandbox_mode", []string{"exec", "-s", "read-only", "-c", `sandbox_mode="danger-full-access"`, "-"}, false},
+		{"-c sandbox", []string{"exec", "-s", "read-only", "-c", `sandbox="danger-full-access"`, "-"}, false},
+		{"--config=sandbox_mode", []string{"exec", "-s", "read-only", "--config=sandbox_mode=danger-full-access", "-"}, false},
+		{"-c attached profile sandbox", []string{"exec", "-s", "read-only", "-cprofiles.x.sandbox_mode=danger-full-access", "-"}, false},
+		{"-s repeated", []string{"exec", "-s", "read-only", "-s", "danger-full-access", "-"}, false},
+		{"-sX and --sandbox=X", []string{"exec", "-sread-only", "--sandbox=danger-full-access", "-"}, false},
+		{"no sandbox, -s only after --", []string{"exec", "--", "-sread-only"}, false},
+		{"value swallowing a flag", []string{"exec", "-s", "read-only", "-m", "--yolo", "-"}, false},
+		{"unknown option", []string{"exec", "-s", "read-only", "--add-dir", "/", "-"}, false},
+		{"-s X", []string{"exec", "-s", "read-only", "-"}, true},
+		{"-sX", []string{"exec", "-sread-only", "-"}, true},
+		{"--sandbox X", []string{"exec", "--sandbox", "read-only", "-"}, true},
+		{"--sandbox=X", []string{"exec", "--sandbox=read-only", "-"}, true},
+		{"daemon argv", nil, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newCodexManager(t)
+			j := enqueue(t, m, "review it", codexReview)
+			const token = "current-token"
+			if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			j = get(t, m, j.ID)
+			if err := m.prepare(j, token, m.JobDir(j.ID)); err != nil {
+				t.Fatal(err)
+			}
+			args := c.args
+			if args == nil {
+				args = CodexArgs(j, "high", CodexSandbox(j.Kind))
+			}
+			argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", token, "--runner", store.RunnerCodex, "--", m.Cfg.codexBin()}
+			cmd := exec.Command(selfBin, append(argv, args...)...)
+			cmd.Dir, cmd.Env = filepath.Join(m.JobDir(j.ID), "work"), m.spawnEnv("")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			out, err := cmd.CombinedOutput()
+			_, ranErr := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
+			if c.ok {
+				if err != nil || ranErr != nil {
+					t.Fatalf("sandboxed read-only launch: %v %v\n%s", err, ranErr, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(string(out), "was not authorized by the launching daemon") {
+				t.Fatalf("wrapper not refused: %v\n%s", err, out)
+			}
+			if !os.IsNotExist(ranErr) {
+				t.Fatalf("unsandboxed codex ran: %v", ranErr)
+			}
+		})
+	}
+}
