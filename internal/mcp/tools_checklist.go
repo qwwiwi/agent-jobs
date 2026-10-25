@@ -328,9 +328,9 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 		Description: "Change the repo's brief checklist; the only writer of version, approved and owner waivers. One call: " +
 			"rows upserted, owner additions appended to BRIEF.md ## Additions, both files written together (both or neither), " +
 			"secrets redacted before writing and hashing. A change of the hashed content (rows incl. Rationale, BRIEF.md) raises " +
-			"the version and drops the approval; approve: true records the owner's approval of the result, refused without a " +
-			"slicing check (slicing_start) of that version and hash held to its input (a codex one does not count) or while one of " +
-			"its unmapped quotes has no owner decision (unmapped_decisions); an approval a later slicing check voided is restored " +
+			"the version and drops the approval; approve: true records the owner's approval of the result; the slicing check " +
+			"(slicing_start) is advisory, but while a slicing result of that version and hash lists an unmapped quote without an " +
+			"owner decision (unmapped_decisions) approve is refused; an approval a later slicing check voided is restored " +
 			"only by a new approve, not by decisions alone. Owner replies to a briefing (F8): new scope is a G<nn> row with the " +
 			"owner's words in additions (dated) in the same call; a choice goes into the Rationale of the row it concerns; a " +
 			"cancellation sets the row to dropped with the owner's words in rationale; each raises the version, and " +

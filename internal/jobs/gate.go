@@ -1213,9 +1213,10 @@ type UnmappedDecision struct {
 
 // SlicingGate is checklist_set's slicing rule (F3), checked before anything is written. Decisions are
 // taken only on the unmapped quotes of the slicing results for the checklist's version and hash after
-// the call (all of them: a re-run does not drop a quote an earlier run listed); an approval needs at
-// least one such result (one for an older version or hash does not count) and a decision, stored or
-// given now, for each unmapped quote of every one of them. It returns the decisions to store.
+// the call (all of them: a re-run does not drop a quote an earlier run listed). The slicing check is
+// advisory for an approval (owner decision 2026-10-25): without such a result, or with only codex ones,
+// approve is not refused; when results exist, an approval needs a decision, stored or given now, for
+// each unmapped quote of every one of them. It returns the decisions to store.
 func (m *Manager) SlicingGate(main, id string, version int, hash string, approve bool, given []UnmappedDecision,
 	now time.Time) ([]store.SlicingDecision, int, error) {
 	if !approve && len(given) == 0 {
@@ -1226,23 +1227,15 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 		return nil, 0, err
 	}
 	if len(rs) == 0 {
-		what := "approve"
-		if !approve {
-			what = "unmapped_decisions"
+		if len(given) == 0 {
+			return nil, 0, nil // approve without a slicing check: advisory, not required
 		}
-		return nil, 0, fmt.Errorf("%s: no slicing check of checklist %s version %d (sha256 %s): run slicing_start on this version "+
-			"and let it finish (a result for an older version or another hash does not count)", what, id, version, hash)
+		return nil, 0, fmt.Errorf("unmapped_decisions: no slicing check of checklist %s version %d (sha256 %s) lists unmapped quotes "+
+			"to decide (a result for an older version or another hash does not count)", id, version, hash)
 	}
 	jobs := make([]string, 0, len(rs))
 	for _, r := range rs {
 		jobs = append(jobs, r.JobID)
-	}
-	if approve && !slices.ContainsFunc(rs, func(r *store.SlicingResult) bool { return r.EnforcedBlind }) {
-		// A codex result (no OS confinement of its reads, ticket 684) adds its unmapped quotes, but never
-		// stands for the slicing check an approval needs.
-		return nil, 0, fmt.Errorf("approve: no slicing check of checklist %s version %d (sha256 %s) was held to its input by the "+
-			"guard (enforced_blind true; jobs %s are not): a codex result does not count toward the approval; run slicing_start "+
-			"with a claude model", id, version, hash, strings.Join(jobs, ", "))
 	}
 	var out []store.SlicingDecision
 	var quotes []string

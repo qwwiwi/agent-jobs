@@ -191,8 +191,9 @@ func TestCodexGateResultEventsCounted(t *testing.T) {
 	}
 }
 
-// A codex slicing result never counts toward the approval: approve needs a result the guard held to
-// its input (enforced_blind true) for the version and hash.
+// The slicing check is advisory (owner decision 2026-10-25): approve passes with no result and with a
+// codex result only (enforced_blind false); a result's undecided unmapped quote, codex or not, still
+// needs an owner decision.
 func TestCodexSlicingDoesNotCountForApproval(t *testing.T) {
 	m := newManager(t)
 	repo := briefRepo(t)
@@ -205,17 +206,21 @@ func TestCodexSlicingDoesNotCountForApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := j.Gate
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err != nil {
+		t.Fatalf("approve without a slicing result: %v", err)
+	}
 	if _, err := m.Store.PutSlicing("tok-"+j.ID, store.SlicingResult{JobID: j.ID, Repo: g.Repo, ChecklistID: g.ChecklistID,
-		Version: g.Version, ChecklistSHA256: g.ChecklistSHA256, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: m.Now()}); err != nil {
+		Version: g.Version, ChecklistSHA256: g.ChecklistSHA256, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: m.Now(),
+		Unmapped: []store.Quote{{Quote: "a quote no row covers"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err == nil ||
-		!strings.Contains(err.Error(), "enforced_blind") {
-		t.Fatalf("approve on a codex slicing result only: %v", err)
+		!strings.Contains(err.Error(), "without an owner decision") {
+		t.Fatalf("approve with an undecided quote of a codex result: %v", err)
 	}
-	putSlicing(t, m, repo)
-	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err != nil {
-		t.Fatalf("approve with a claude result: %v", err)
+	given := []UnmappedDecision{{Unmapped: "a quote no row covers", Quote: "out of scope"}}
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, given, m.Now()); err != nil {
+		t.Fatalf("approve on a codex slicing result only, quote decided: %v", err)
 	}
 }
 
