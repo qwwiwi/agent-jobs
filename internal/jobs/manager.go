@@ -622,7 +622,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	var plan launchPlan
 	launchCfg := m.Config()
-	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" {
+	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
 		if err != nil {
 			return err
@@ -630,6 +630,11 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	if j.AcceptanceCmd != "" && !launchCfg.AcceptanceAllowed {
 		return errors.New("acceptance_allowed is off in active daemon config or config.json; acceptance job not launched")
+	}
+	if j.Kind == KindJudge && !launchCfg.AcceptanceAllowed {
+		// The judge's manifest-check step (F5) runs repository code the way acceptance_cmd does.
+		return errors.New("acceptance_allowed is off in active daemon config or config.json: the judge's manifest-check " +
+			"(scripts/manifest-check.sh) cannot run, so the judge is not launched")
 	}
 	if j.Runner == store.RunnerCodex {
 		if j.Attempt > 1 {
@@ -671,7 +676,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
-		AcceptanceAllowed: j.AcceptanceCmd != "" && launchCfg.AcceptanceAllowed,
+		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}
@@ -700,17 +705,27 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	return nil
 }
 
-// spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
-// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
-// the new scope (same pid).
-func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
-	dir := m.JobDir(j.ID)
-	argv := append([]string{m.SelfBin, "run-wrapper", dir, "--token", token}, plan.wrapper...)
+// buildWrapperArgv is the run-wrapper command line of j's launch, before "--" and the runner's argv.
+func (m *Manager) buildWrapperArgv(j *store.Job, token string, plan launchPlan) []string {
+	argv := append([]string{m.SelfBin, "run-wrapper", m.JobDir(j.ID), "--token", token}, plan.wrapper...)
 	if IsGateKind(j.Kind) {
 		// The wrapper stores a slicing result under the checklist lock: told where the locks are, never
 		// deriving it from the job dir's layout.
 		argv = append(argv, "--checklist-lock-dir", m.ChecklistLockDir())
 	}
+	if j.Kind == KindJudge {
+		// The judge's manifest-check step (F5) is decided here, at launch, from the job the daemon claimed.
+		argv = append(argv, "--manifest-check")
+	}
+	return argv
+}
+
+// spawn starts the detached wrapper; the wrapper registers itself in wrapper.json before claude runs.
+// With a scope unit the wrapper is started through `systemd-run --user --scope`, which execs it inside
+// the new scope (same pid).
+func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int, error) {
+	dir := m.JobDir(j.ID)
+	argv := m.buildWrapperArgv(j, token, plan)
 	bin := plan.bin
 	if bin == "" {
 		bin = m.Config().claudeBin()

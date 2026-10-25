@@ -3,8 +3,10 @@ package jobs
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -202,5 +204,53 @@ func TestWrapperFailsJobWhenProcessesSurvive(t *testing.T) {
 	}
 	if line := DoneLine(j, 0); !strings.HasSuffix(line, " · "+ReasonSurvivors) {
 		t.Fatalf("job-done line: %q", line)
+	}
+}
+
+// Off Linux (selected here on every OS), the sweep inside the manifest step neither ignores SIGTERM nor
+// signals its own group: the step's stop-signal catch stays armed, so a SIGTERM after the sweep is a
+// stop (not missed) and the runner does not inherit SIGTERM ignored. The wrapper's other sweeps still
+// ignore SIGTERM and send it to the group.
+func TestSweepOffLinuxKeepsTheManifestStepStopCatch(t *testing.T) {
+	oldIgnore, oldKill, oldSid, oldGOOS := signalIgnore, killGroup, getsid, sweepGOOS
+	t.Cleanup(func() {
+		signalIgnore, killGroup, getsid, sweepGOOS = oldIgnore, oldKill, oldSid, oldGOOS
+		signal.Reset(syscall.SIGTERM)
+	})
+	sweepGOOS = "darwin"
+	getsid = func(int) (int, error) { return os.Getpid(), nil } // as the wrapper: the session leader
+	var killed []int
+	killGroup = func(pid int, _ syscall.Signal) error {
+		killed = append(killed, pid) // never the real group of the test binary
+		return nil
+	}
+	ctx, release := catchStopSignals()
+	if r := sweepJob(t.TempDir(), io.Discard, true); r.Incomplete() || len(killed) != 0 {
+		release()
+		t.Fatalf("sweep in the step: %+v, signalled groups %v", r, killed)
+	}
+	if ctx.Err() != nil {
+		release()
+		t.Fatal("the sweep itself was caught as a stop signal")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		release()
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		release()
+		t.Fatal("a SIGTERM after the step's sweep was missed: SIGTERM is ignored")
+	}
+	if !release() {
+		t.Fatal("release does not report the caught stop signal")
+	}
+
+	var ignored []os.Signal
+	signalIgnore = func(sig ...os.Signal) { ignored = append(ignored, sig...) }
+	if r := sweepSession(io.Discard, false); r.Incomplete() || !slices.Equal(ignored, []os.Signal{syscall.SIGTERM}) ||
+		!slices.Equal(killed, []int{-os.Getpid()}) {
+		t.Fatalf("last sweep: %+v, ignored %v, signalled groups %v", r, ignored, killed)
 	}
 }

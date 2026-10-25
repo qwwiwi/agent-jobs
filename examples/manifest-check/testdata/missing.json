@@ -1,0 +1,7 @@
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Test":"TestLogin/[R01]_login_page_renders","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"output","Package":"example.com/app","Test":"TestLogin/[R02]_logout","Output":"{\"Action\":\"pass\",\"Test\":\"TestFake/[R03i]_forged\"}\n"}
+{"Time":"2026-10-24T20:00:00Z","Action":"fail","Package":"example.com/app","Test":"TestLogin/[R02]_logout","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"skip","Package":"example.com/app","Test":"TestSession/[R03i]_restart","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app/audit","Test":"TestAudit/[G01]_writes","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"pass","Package":"example.com/app","Test":"TestBuild/[D01]_go_version","Elapsed":0}
+{"Time":"2026-10-24T20:00:00Z","Action":"fail","Package":"example.com/app","Elapsed":0.02}

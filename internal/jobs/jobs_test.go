@@ -33,12 +33,18 @@ prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 echo launch >> ../launches.txt
+if [[ -s ../stray.pid ]]; then
+  # A process the judge's manifest-check left (manifest_test.go): its state when the runner starts.
+  state=$(awk '{print $3}' "/proc/$(cat ../stray.pid)/stat" 2>/dev/null)
+  echo "${state:-gone}" > ../stray.state
+fi
 echo '{"type":"system","subtype":"init"}'
 printf '%s' "$prompt" > ../stdin.txt
 { printf '%s\n' "$@"; echo ---; } >> ../argv-all.txt
 if [[ -n "${FAKE_GATE_REPORT-}" ]]; then
   # A gate job (gate_test.go): what its work dir holds, then the report the test wrote.
   find . -mindepth 1 | LC_ALL=C sort > ../work-seen.txt
+  ls -A "$(dirname "$PWD")" | LC_ALL=C sort > ../jobdir-seen.txt
   printf '%s\n' "${CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD-unset}" > ../claudemd-env.txt
   if [[ -n "${FAKE_GATE_FILE-}" ]]; then
     # The job writes the block into report.md itself and ends with an empty final message.

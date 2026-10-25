@@ -72,7 +72,11 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
 			"judge of a coder's model family is stored but flagged (same_family; warnings says so at the start). A claude judge " +
 			"is blind by enforcement (the guard's read allowlist, enforced_blind true); a codex judge is not confined " +
-			"(enforced_blind false). Manifest-check (F6) is not built. There is no brief: the job's input is the daemon's.",
+			"(enforced_blind false). Before the judge starts, its wrapper runs the repository's scripts/manifest-check.sh (F6) in a " +
+			"separate checkout of sha (the job's containment, a scrubbed environment, no guard) and gives the judge its output; the " +
+			"exit code and output tail are stored with the job and sha. It needs config acceptance_allowed true and the script at " +
+			"sha: without either the job fails before the judge starts and nothing is recorded (warnings says so at the start). " +
+			"There is no brief: the job's input is the daemon's.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JudgeStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.StartGate(gateRequest(jobs.KindJudge, in.Repo, in.SHA, in.ChecklistID, in.GateRunInput))
 		if err != nil {
@@ -86,6 +90,7 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 		if w != "" {
 			v.Warnings = append(v.Warnings, w)
 		}
+		v.Warnings = append(v.Warnings, d.Manager.ManifestCheckWarnings(j)...)
 		return nil, v, nil
 	})
 }
@@ -176,9 +181,47 @@ func addJudgeGet(s *sdk.Server, d Deps) {
 			"verdict, how and evidence, the commands run, unmapped_brief, extra_scope, suspect_tests, the judge model and family, " +
 			"enforced_blind (true for a claude judge held by the guard, false for a codex one), the coders' families with " +
 			"family_differs / same_family (a snapshot taken when the verdict was stored; release_check, F7, recomputes them), and " +
-			"current (the verdict is for the latest approved checklist). manifest_check is null: F6 is not built.",
+			"current (the verdict is for the latest approved checklist), and manifest_check: the record of the run of " +
+			"scripts/manifest-check.sh the judge's wrapper made at sha before the judge started (exit_code, duration_sec, the " +
+			"output tail).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, jobs.VerdictView, error) {
 		v, err := JudgeGet(d.Manager, in.Repo, in.ChecklistID, in.SHA)
 		return nil, v, err
+	})
+}
+
+// ReleaseCheckInput is release_check's input.
+type ReleaseCheckInput struct {
+	Repo string `json:"repo" jsonschema:"absolute path of the project's git work tree with the approved brief/CHECKLIST.md"`
+	SHA  string `json:"sha" jsonschema:"the full commit id to ship"`
+}
+
+// ReleaseCheck is release_check (and `agent-jobs gate release-check`).
+func ReleaseCheck(m *jobs.Manager, repo, sha string) (jobs.ReleaseCheckResult, error) {
+	r, err := m.ReleaseCheck(repo, sha)
+	if err != nil {
+		return jobs.ReleaseCheckResult{}, err
+	}
+	return *r, nil
+}
+
+func addReleaseCheck(s *sdk.Server, d Deps) {
+	addManagerTool(s, d, &sdk.Tool{
+		Name: "release_check",
+		Description: "Whether the code at sha may ship under the repo's approved checklist (Wave F, F7). Read-only; pass is true only " +
+			"when every condition holds, and a missing, unreadable or ambiguous record fails its condition: approval (the latest " +
+			"owner approval exists and the checklist hash is unchanged), manifest_check (the judge's manifest-check record for sha " +
+			"exits 0), verdict (a judge verdict for sha at the approved checklist id and version; every verdict for them must agree), " +
+			"requirements (each live requirement met, placeholder on a placeholder-ok row, or carrying an owner waiver bound to this " +
+			"hash and sha), unmapped_brief and suspect_tests (empty), family (the judge's model family differs from every coder's, " +
+			"recomputed now), enforced_blind (true), trace (every live requirement is in some feature job's covers and every feature " +
+			"job covers one; a feature job is a fix or general job of the repo whose covers name the checklist id). owner_line is " +
+			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason».",
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in ReleaseCheckInput) (*sdk.CallToolResult, jobs.ReleaseCheckResult, error) {
+		out, err := ReleaseCheck(d.Manager, in.Repo, in.SHA)
+		if err != nil {
+			return nil, out, fmt.Errorf("release_check: %w", err)
+		}
+		return nil, out, nil
 	})
 }
