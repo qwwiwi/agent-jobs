@@ -46,6 +46,10 @@ func TestMergeGateCdChains(t *testing.T) {
 	other := newRepo(t)
 	gitT(t, other, "remote", "add", "origin", "https://github.com/other/repo.git")
 	elsewhere := t.TempDir()
+	// elsewhere/sub exists, repo/sub does not: the mkdir in the command may create it before the cd.
+	if err := os.Mkdir(filepath.Join(elsewhere, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name, cwd, cmd string
 		want           string // part of the refusal ("" = allowed)
@@ -55,6 +59,8 @@ func TestMergeGateCdChains(t *testing.T) {
 			"without --match-head-commit"},
 		{"relative after a fork", elsewhere, "cd " + parent + "; cd " + name + " && gh pr merge 5", "without --match-head-commit"},
 		{"a directory the command creates", elsewhere, "mkdir y && cd y && gh pr merge 5", "cannot tell"},
+		{"a relative directory the command may create", elsewhere, "cd " + repo + "; mkdir -p sub; cd sub && gh pr merge 5",
+			"cannot tell"},
 	} {
 		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)

@@ -39,6 +39,8 @@ func TestGhPrMergesPreFilter(t *testing.T) {
 		`echo 'gh pr merge 5' | sh`,
 		`echo 'g''h pr mer''ge 5' | sh`,
 		`$GH pr merge 5`,
+		`$PR_MERGE 5`,
+		`eval "$GH_MERGE_CMD"`,
 		"# " + strings.Repeat("x", maxCommandBytes) + "\nls",
 	} {
 		if !unsureMerge(cmd) {
@@ -86,6 +88,9 @@ func TestGhPrMergesWordsAndOptions(t *testing.T) {
 		`set -euo pipefail; gh pr view 5`,
 		`set -x && gh pr view 5 --json mergeable`,
 		`cd -L /srv && gh pr view 5`,
+		`gh run view 5 --log | grep -E 'fail(ed)?(x)'`,
+		`gh pr list --json number --jq 'length*(1)'`,
+		`gh pr view 5 && awk '!(NR%2)' f`,
 	} {
 		if unsureMerge(cmd) {
 			t.Errorf("%q: unsure", cmd)
@@ -113,6 +118,11 @@ func TestGhPrMergesCdChains(t *testing.T) {
 		{"cd in a subshell", "(cd /a) && gh pr merge 5", nil, []string{"/w"}},
 		{"chain in a subshell", "(cd /a && gh pr merge 5)", []string{"/a"}, nil},
 		{"if", "if cd /a; then gh pr merge 5; fi", nil, []string{"/w", "/a"}},
+		{"cd behind env", "env cd /a && gh pr merge 5", nil, []string{"/w", "/a"}},
+		{"cd behind nohup", "nohup cd /a && gh pr merge 5", nil, []string{"/w", "/a"}},
+		{"cd behind command", "command cd /a && gh pr merge 5", []string{"/a"}, nil},
+		{"command -v cd", "command -v cd && gh pr merge 5", nil, []string{"/w"}},
+		{"pushd -n", "pushd -n /x && gh pr merge 5", []string{"/w"}, nil},
 	} {
 		calls, unsure := GhPrMerges(tc.cmd, "/w")
 		if unsure != "" || len(calls) != 1 || calls[0].Unsure != "" {
@@ -127,6 +137,25 @@ func TestGhPrMergesCdChains(t *testing.T) {
 			if !slices.Contains(got, d) {
 				t.Errorf("%s: dirs %q lack %s", tc.name, got, d)
 			}
+		}
+	}
+}
+
+// RelDirs are the candidates reached by a relative cd from another one, told only when no command before
+// the call may have created a directory.
+func TestGhPrMergesRelDirs(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  string
+		want []string
+	}{
+		{"cd /a; cd sub && gh pr merge 5", []string{"/w/sub", "/a/sub"}},
+		{"cd /a; mkdir -p sub; cd sub && gh pr merge 5", nil},
+		{"cd /a; git checkout b; cd sub && gh pr merge 5", nil},
+		{"cd /a && gh pr merge 5", nil},
+	} {
+		calls, unsure := GhPrMerges(tc.cmd, "/w")
+		if unsure != "" || len(calls) != 1 || !slices.Equal(calls[0].RelDirs, tc.want) {
+			t.Errorf("%q: calls %+v, unsure %q, want RelDirs %q", tc.cmd, calls, unsure, tc.want)
 		}
 	}
 }

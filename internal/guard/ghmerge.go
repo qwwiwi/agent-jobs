@@ -68,10 +68,12 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	text := mergeText(cmd)
 	mentionsGh := reGhWord.MatchString(text)
 	mentions := mentionsGh || reMergeWord.MatchString(text)
-	if mentionsGh && reExtglob.MatchString(text) {
-		unsure = "an extglob pattern in a command that runs gh (the shell may turn it into gh pr merge)"
-	}
 	scripts := parseAll(cmd)
+	for _, sc := range scripts {
+		if mentionsGh && unsure == "" && reExtglob.MatchString(unquotedText(sc.src)) {
+			unsure = "an extglob pattern in a command that runs gh (the shell may turn it into gh pr merge)"
+		}
+	}
 	for _, sc := range scripts {
 		if sc.depth >= maxNesting {
 			return nil, "the command nests deeper than the reader's limit"
@@ -92,6 +94,9 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	later(dirWhy)
 	shellPending = shellWhy
 	var prev *pipeline // the previous pipeline of the command itself (depth 0)
+	// onlyMoves: every command read so far is a cd or a no-op (createsNothing), and the command nests no
+	// script (a substitution, sh -c or eval body runs commands the order of scripts does not place).
+	onlyMoves := len(scripts) == 1
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			if sc.depth == 0 {
@@ -129,12 +134,20 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 					}
 					continue
 				}
+				// RelDirs are only told for a call that no command but a cd or a no-op runs before (one that
+				// may create a directory makes a missing candidate unknown again: `mkdir -p sub; cd sub`).
+				relOK := onlyMoves
+				if sc.depth > 0 || dyn[0] || !createsNothing[progName(argv[0])] {
+					onlyMoves = false
+				}
 				switch name := progName(argv[0]); {
 				case sc.depth == 0 && cdName(name):
-					// Followed exactly only as the one command of its pipeline, without a keyword (`! cd x`).
+					// Followed exactly only as the one command of its pipeline, without a keyword (`! cd x`) and
+					// with no word before it but a bare command / builtin (`env cd x` runs a cd program in a
+					// child, `command -v cd` runs no cd).
 					exact := len(pl.cmds) == 1 && !pl.piped && !slices.ContainsFunc(c.words[:v.lead], func(w string) bool {
 						return keywords[w]
-					})
+					}) && !slices.ContainsFunc(c.words[v.lead:v.start], func(w string) bool { return w != "command" && w != "builtin" })
 					if why := dirs.cd(argv, dyn, exact); why != "" {
 						later(why)
 					}
@@ -160,7 +173,7 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 					}
 					call.Dirs = slices.Clone(dirs.cur)
 					for _, d := range dirs.cur {
-						if dirs.rel[d] {
+						if relOK && dirs.rel[d] {
 							call.RelDirs = append(call.RelDirs, d)
 						}
 					}
@@ -188,13 +201,42 @@ func mergeText(cmd string) string {
 }
 
 var (
-	// reGhWord / reMergeWord are gh and merge as words of mergeText.
-	reGhWord    = regexp.MustCompile(`(^|[^a-z0-9_])gh([^a-z0-9_]|$)`)
-	reMergeWord = regexp.MustCompile(`(^|[^a-z0-9_])merge([^a-z0-9_]|$)`)
+	// reGhWord / reMergeWord are gh and merge as words of mergeText; _ ends a word, so a variable such as
+	// $GH_MERGE_CMD or $PR_MERGE counts.
+	reGhWord    = regexp.MustCompile(`(^|[^a-z0-9])gh([^a-z0-9]|$)`)
+	reMergeWord = regexp.MustCompile(`(^|[^a-z0-9])merge([^a-z0-9]|$)`)
 	// reExtglob is an extglob pattern (`@(…)`, `?(…)`, `*(…)`, `+(…)`, `!(…)`): with extglob on (bash -O
-	// extglob, shopt, or the Bash tool's own shell options) `gh pr m@(erge)` is gh pr merge.
+	// extglob, shopt, or the Bash tool's own shell options) `gh pr m@(erge)` is gh pr merge. It is matched
+	// on the unquoted text of each script (unquotedText): a quoted pattern is no pattern.
 	reExtglob = regexp.MustCompile(`[@?*+!]\(`)
 )
+
+// unquotedText is src without its quoted parts and escaped characters ('…', "…", \c): what is left may
+// hold a glob or extglob pattern the shell expands.
+func unquotedText(src string) string {
+	var b strings.Builder
+	for i := 0; i < len(src); i++ {
+		switch c := src[i]; c {
+		case '\\':
+			i++
+		case '\'':
+			if end := strings.IndexByte(src[i+1:], '\''); end >= 0 {
+				i += end + 1
+			} else {
+				i = len(src)
+			}
+		case '"':
+			for i++; i < len(src) && src[i] != '"'; i++ {
+				if src[i] == '\\' {
+					i++
+				}
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
 
 // Shell options that cannot change what the words of a gh call are or where it runs: set's short flags
 // and -o names (allexport, errexit, noglob, pipefail, xtrace, …).
@@ -326,6 +368,10 @@ func gitMovesRepo(argv []string) string {
 	}
 	return "git " + sub + " in the command may change the repository or remotes gh takes"
 }
+
+// createsNothing are the commands that cannot create a directory a later cd goes to (GhMerge.RelDirs).
+var createsNothing = map[string]bool{"cd": true, "pushd": true, "popd": true, "chdir": true, "pwd": true, "echo": true,
+	"printf": true, "true": true, "false": true, ":": true, "test": true, "[": true}
 
 // cdName is a command that changes the shell's directory (chdir as the guard's cdView counts it).
 func cdName(name string) bool {
@@ -471,6 +517,9 @@ func (d *mergeDirs) cd(argv []string, dyn []bool, exact bool) (why string) {
 		}
 		if strings.Contains(a, "P") {
 			return "cd " + a + " (a physical directory the reader does not resolve)"
+		}
+		if progName(argv[0]) == "pushd" && strings.Contains(a, "n") {
+			return "" // pushd -n only changes the directory stack
 		}
 	}
 	t, ok := d.view.cdTarget(argv, dyn, d.cdpath)
