@@ -13,13 +13,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
 
-// `hook brief-reminder` prints one reminder line for the bound session and nothing for another; it
-// never blocks and never fails: every error exits 0 with nothing on stdout.
+// draftRepo is a git repository with a brief and a checklist that was never approved: the reminder's
+// case of a pending checklist decision.
+func draftRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	repo, _ = filepath.EvalSymlinks(repo)
+	if err := os.Mkdir(filepath.Join(repo, "brief"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	list := "# Checklist\n\n- id: demo\n- brief: brief/BRIEF.md\n- version: 1\n- approved: no\n\n" + checklist.TableHeader +
+		"\n|---|---|---|---|\n| R01 | a login page | live | brief |\n"
+	if err := os.WriteFile(checklist.BriefPath(repo), []byte("# Brief\n\nI want a login page.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checklist.ChecklistPath(repo), []byte(list), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
+// `hook brief-reminder` prints one reminder line for the bound session's owner prompt in a repository
+// with a pending checklist decision, and nothing for another session, a daemon prompt or a cwd without a
+// brief; it never blocks and never fails: every error exits 0 with nothing on stdout.
 func TestHookBriefReminder(t *testing.T) {
 	orch := bindableAgent(t, "test")
+	draft := draftRepo(t)
 	opener := func(agent string) (*jobs.Manager, error) {
 		if agent != "test" {
 			return nil, errors.New("wrong agent " + agent)
@@ -31,11 +57,12 @@ func TestHookBriefReminder(t *testing.T) {
 		code := runHook(args, strings.NewReader(stdin), &out, &errb, opener)
 		return code, out.String(), errb.String()
 	}
-	prompt := func(session string) string {
+	promptIn := func(session, cwd, text string) string {
 		b, _ := json.Marshal(map[string]string{"session_id": session, "hook_event_name": "UserPromptSubmit",
-			"cwd": orch, "prompt": "hello"})
+			"cwd": cwd, "prompt": text})
 		return string(b)
 	}
+	prompt := func(session string) string { return promptIn(session, draft, "hello") }
 	reminder := []string{"brief-reminder", "--agent", "test"}
 	if code, out, _ := run(reminder, prompt("s1")); code != 0 || out != "" {
 		t.Fatalf("no session bound: %d %q", code, out)
@@ -44,9 +71,15 @@ func TestHookBriefReminder(t *testing.T) {
 		t.Fatalf("bind: %d %q", code, errs)
 	}
 	code, out, _ := run(reminder, prompt("s1"))
-	if code != 0 || strings.Count(out, "\n") != 1 || !strings.HasPrefix(out, jobs.BriefReminderPrefix+jobs.SizeRuleNote) ||
-		!strings.Contains(out, "not a git work tree") {
+	if code != 0 || strings.Count(out, "\n") != 1 || !strings.HasPrefix(out, jobs.BriefReminderPrefix+"Checklist: ") ||
+		!strings.Contains(out, "demo v1 in "+draft+" is not approved") {
 		t.Fatalf("bound session: %d %q", code, out)
+	}
+	if code, out, _ := run(reminder, promptIn("s1", orch, "hello")); code != 0 || out != "" {
+		t.Fatalf("bound session, no brief: %d %q", code, out)
+	}
+	if code, out, _ := run(reminder, promptIn("s1", draft, "[jobs:job-done] job x")); code != 0 || out != "" {
+		t.Fatalf("daemon prompt: %d %q", code, out)
 	}
 	if code, out, _ := run(reminder, prompt("s2")); code != 0 || out != "" {
 		t.Fatalf("another session: %d %q", code, out)
@@ -110,14 +143,14 @@ func TestHookBriefReminderInsideJob(t *testing.T) {
 // store with an older schema it runs no migration; against a store another connection holds locked it
 // returns at once. Every case exits 0.
 func TestHookBriefReminderReadOnly(t *testing.T) {
-	orch := bindableAgent(t, "test")
+	bindableAgent(t, "test")
 	home := os.Getenv("AGENT_JOBS_HOME")
 	dir, err := jobs.StateDir("test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	reminder := []string{"brief-reminder", "--agent", "test"}
-	b, _ := json.Marshal(map[string]string{"session_id": "s1", "hook_event_name": "UserPromptSubmit", "cwd": orch, "prompt": "hi"})
+	b, _ := json.Marshal(map[string]string{"session_id": "s1", "hook_event_name": "UserPromptSubmit", "cwd": draftRepo(t), "prompt": "hi"})
 	run := func(name string) (string, string) {
 		t.Helper()
 		var out, errb bytes.Buffer
