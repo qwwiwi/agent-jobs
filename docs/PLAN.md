@@ -211,23 +211,23 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)). A design to be specified before the build; the proposal:
 
 - Scope: a checklist whose work touches no hard gate (money/billing, auth, prod DB, payment config, gateway/model config, destructive ops, mass sends). If any row touches one, the checklist needs an explicit owner approval, quoted verbatim, as today.
-- The agent still shows the checklist to the owner, with the hard-gate verdict and the end of the window. If the owner does not object within the act-with-veto window (proposed default: 30 minutes, configurable), the checklist counts as approved; `checklist_set` records it as a veto-window approval (shown at, window, no objection), distinct from an explicit one.
-- Any owner objection or question stops the window; a change to a hashed row (F1) restarts it. The merge rule (100% acceptance) is unchanged.
+- The agent still shows the checklist to the owner, with the hard-gate verdict and the end of the window. If the owner does not object within the 30-minute act-with-veto window (approved by the owner; making it configurable is a proposal), the checklist counts as approved; `checklist_set` records it as a veto-window approval (shown at, window, no objection), distinct from an explicit one.
+- Any owner objection or question stops the window; a change to a hashed field (F1) restarts it. The merge rule (100% acceptance) is unchanged.
 
 ## Milestones phase 2 (approved, not built)
 
-Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)); starts after the milestones MVP merges.
+Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)); starts after the milestones MVP merges (PR #88, branch `feature/milestones`, not on main yet).
 
 - An automatic capstone task «judge + release_check» when a milestone has a checklist.
-- Waves and the maximum parallelism shown in `milestone_get`.
+- Waves and the maximum parallelism shown in `milestone_get` (a tool of the milestones MVP, PR #88).
 - Gates as task dependencies: `gate:owner`, `gate:timer`, `gate:ci`.
 - A one-line milestone progress for the owner («stage 4/5, acceptance 6/8») via `notify_owner`.
 - A Prior-results handoff format: Decided / Rejected / Risks / Files / Remaining.
 - Daemon auto-start of ready tasks (already intended).
 
-## Ideas (not approved)
+## Ideas
 
-Ideas recorded for later; none is approved or scheduled unless marked. Each needs an owner go before work starts.
+Ideas recorded for later; none is approved or scheduled unless it is marked approved. Each needs an owner go before work starts.
 
 - I1. Requirement ledger: for a feature, the owner's own words are saved untouched and broken into numbered requirements (R01..Rn); every report marks each of them done / partial / missing / placeholder; dropping one is the owner's call; later changes are added on, and the original text stays as it was. *Taken into Wave F (F1, F2, F4), approved 2026-10-24.*
   - Why: no part of the request disappears or changes meaning unnoticed. Lives in: the orchestrator's brief habit and the report contract.
