@@ -17,7 +17,10 @@ type simpleCmd struct {
 	dyn   []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
 	// bare[i]: words[i] has an expansion outside double quotes (the shell may split or glob it into
 	// several words); a dyn word that is not bare stays one word.
-	bare    []bool
+	bare []bool
+	// glob[i]: words[i] has a glob or brace character (`*?[{`) outside quotes: the shell may expand
+	// it into other words, more of them too.
+	glob    []bool
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents and words of the here-strings attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
@@ -103,6 +106,7 @@ type parser struct {
 	dyn      bool // current word contains an expansion
 	bare     bool // current word contains an expansion outside double quotes
 	quoted   bool // current word contains quoting
+	glob     bool // current word contains an unquoted `*?[{`
 	redir    redirKind
 	redirOut bool // the pending redirFile target is written to
 	redirIn  bool // the pending redirFile source is read (`<`, `<>`, `<<<`)
@@ -138,6 +142,7 @@ func (p *parser) endWord() {
 		p.cmd.words = append(p.cmd.words, w)
 		p.cmd.dyn = append(p.cmd.dyn, p.dyn)
 		p.cmd.bare = append(p.cmd.bare, p.bare)
+		p.cmd.glob = append(p.cmd.glob, p.glob)
 	case redirFile:
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
@@ -152,7 +157,7 @@ func (p *parser) endWord() {
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
-	p.started, p.dyn, p.bare, p.quoted = false, false, false, false
+	p.started, p.dyn, p.bare, p.quoted, p.glob = false, false, false, false, false
 	p.redir, p.redirOut, p.redirIn = redirNone, false, false
 }
 
@@ -222,8 +227,8 @@ func matchParen(s string, open int) int {
 }
 
 // substitution consumes `$(...)`, `<(...)`, `>(...)` or a backtick block starting at p.i,
-// records its inner source and returns the literal text.
-func (p *parser) substitution() string {
+// records its inner source and returns the literal text. dq: the block is inside double quotes.
+func (p *parser) substitution(dq bool) string {
 	start := p.i
 	if p.src[p.i] == '`' {
 		end := p.i + 1
@@ -233,7 +238,7 @@ func (p *parser) substitution() string {
 			}
 			end++
 		}
-		inner := p.src[start+1 : min(end, len(p.src))]
+		inner := backtickText(p.src[start+1:min(end, len(p.src))], dq)
 		p.subs = append(p.subs, inner)
 		p.cmd.subSources = append(p.cmd.subSources, inner)
 		p.i = min(end+1, len(p.src))
@@ -254,19 +259,30 @@ func (p *parser) substitution() string {
 	return p.src[start:end]
 }
 
+// backtickText is the command a backtick block runs: bash removes the backslash of \\, \` and \$
+// (and of \" inside double quotes) before it parses the text, so an escaped backtick pair inside a
+// backtick block opens a substitution of its own (echo `git log \`git push\` HEAD` runs git push).
+// Any other backslash stays.
+func backtickText(raw string, dq bool) string {
+	if !strings.Contains(raw, `\`) {
+		return raw
+	}
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) && (strings.IndexByte("\\`$", raw[i+1]) >= 0 || dq && raw[i+1] == '"') {
+			i++
+		}
+		b.WriteByte(raw[i])
+	}
+	return b.String()
+}
+
 func (p *parser) readHeredocs() {
 	for _, h := range p.heredocs {
 		var body strings.Builder
 		start := p.i
 		for p.i < len(p.src) {
-			nl := strings.IndexByte(p.src[p.i:], '\n')
-			line := p.src[p.i:]
-			if nl >= 0 {
-				line = p.src[p.i : p.i+nl]
-				p.i += nl + 1
-			} else {
-				p.i = len(p.src)
-			}
+			line := p.heredocLine(!h.quoted)
 			cmp := line
 			if h.strip {
 				cmp = strings.TrimLeft(line, "\t")
@@ -279,7 +295,9 @@ func (p *parser) readHeredocs() {
 		}
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
-		if !h.exact || (!h.quoted && strings.ContainsAny(body.String(), "$`")) {
+		// A backslash in an unquoted body is processed by bash (`\$`, a joined line), so its text is not
+		// the data written either.
+		if !h.exact || (!h.quoted && strings.ContainsAny(p.src[start:p.i], "$`\\")) {
 			h.cmd.expandingStdin = true
 		}
 		switch {
@@ -294,6 +312,31 @@ func (p *parser) readHeredocs() {
 	p.heredocs = nil
 }
 
+// heredocLine reads the next here-doc line from p.i. join: the delimiter is unquoted, and bash then
+// removes each backslash-newline before it compares the line with the delimiter (`EO\` + `F` ends
+// <<EOF and the lines after it run as commands), as in the body it expands; `\\` is one escaped
+// backslash and joins nothing.
+func (p *parser) heredocLine(join bool) string {
+	var line strings.Builder
+	for p.i < len(p.src) {
+		nl := strings.IndexByte(p.src[p.i:], '\n')
+		part := p.src[p.i:]
+		if nl >= 0 {
+			part = p.src[p.i : p.i+nl]
+			p.i += nl + 1
+		} else {
+			p.i = len(p.src)
+		}
+		n := len(part) - len(strings.TrimRight(part, `\`))
+		if !join || n%2 == 0 || nl < 0 {
+			line.WriteString(part)
+			break
+		}
+		line.WriteString(part[:len(part)-1])
+	}
+	return line.String()
+}
+
 // bodySubstitutions returns the command substitutions of an unquoted here-doc body.
 func bodySubstitutions(body string) []string {
 	q := &parser{src: body, cmd: &simpleCmd{}}
@@ -302,7 +345,7 @@ func bodySubstitutions(body string) []string {
 		case body[q.i] == '\\':
 			q.i += 2
 		case body[q.i] == '$' && q.peek(1) == '(', body[q.i] == '`':
-			q.substitution()
+			q.substitution(false)
 		default:
 			q.i++
 		}
@@ -353,7 +396,7 @@ func (p *parser) run() {
 		case c == '"':
 			p.double()
 		case c == '$' && p.peek(1) == '(', c == '`':
-			lit := p.substitution()
+			lit := p.substitution(false)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.started, p.dyn, p.bare = true, true, true
@@ -416,6 +459,9 @@ func (p *parser) run() {
 		default:
 			if c == '$' {
 				p.dyn, p.bare = true, true
+			}
+			if strings.IndexByte("*?[{", c) >= 0 {
+				p.glob = true
 			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
@@ -525,7 +571,7 @@ func sourceFeederWords(src string, over func() bool) (words []string) {
 
 func (p *parser) redirect() {
 	if p.peek(1) == '(' { // process substitution <(...) / >(...)
-		lit := p.substitution()
+		lit := p.substitution(false)
 		p.word.WriteString(lit)
 		p.started, p.dyn, p.bare = true, true, true
 		return
@@ -577,7 +623,7 @@ func (p *parser) double() {
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
 		case c == '$' && p.peek(1) == '(', c == '`':
-			lit := p.substitution()
+			lit := p.substitution(true)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.dyn = true
