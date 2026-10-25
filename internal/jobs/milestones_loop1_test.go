@@ -208,7 +208,8 @@ func TestMilestoneCursorStampedInSQL(t *testing.T) {
 }
 
 // The prompt's prior results and the prior/ folder come from one read of the dependencies: a resumed
-// job whose dependency got a newer accepted job meanwhile gets that job in both, prior/ refreshed.
+// job whose dependency got a newer accepted job meanwhile gets that job in both, prior/ refreshed, and
+// so does the update of a resumed session.
 func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, false) // fresh session: the fallback prompt carries the prior results
@@ -257,6 +258,9 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 	}
 	if s := readFile(t, filepath.Join(dir, PriorDir, "T1", "report.md")); !strings.Contains(s, "SECOND_T1_REPORT") {
 		t.Fatalf("prior/T1/report.md is not the job the prompt names: %.200s", s)
+	}
+	if s := readFile(t, filepath.Join(dir, resumePromptFile)); !strings.Contains(s, "Accepted job: "+second.ID) {
+		t.Fatalf("the resumed session's update lacks the prior results:\n%s", s)
 	}
 }
 

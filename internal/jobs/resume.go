@@ -969,24 +969,27 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := m.refreshJobFiles(j, dir, gitDirs...); err != nil {
 		return launchPlan{}, err
 	}
+	// One read of the dependencies feeds the prior results of both prompts (the resumed session's update
+	// and the fallback prompt) and the prior/ folder, which is rewritten from it.
+	prior := m.priorSnapshot(j)
+	if err := m.writePriorReports(prior, dir); err != nil {
+		return launchPlan{}, err
+	}
 	update := m.resumeMessage(j)
-	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
+	resumed := update
+	if section := m.priorResults(j, prior); section != "" {
+		resumed += "\nThe prior results, read again for this attempt (prior/ was rewritten from the same read):\n\n" + section
+	}
+	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
 	}
 	var notes MemoryNotes
 	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
 		notes = m.LookupMemoryNotes(j)
 	}
-	// The prior/ folder is refreshed from the snapshot the fallback prompt's prior results come from.
-	prior := m.priorSnapshot(j)
 	brief, err := m.buildPrompt(j, rules, cards, notes, prior)
 	if err != nil {
 		return launchPlan{}, err
-	}
-	if !IsGateKind(j.Kind) {
-		if err := m.writePriorReports(prior, dir); err != nil {
-			return launchPlan{}, err
-		}
 	}
 	fallback := brief + "\n" + m.previousAttempt(j, dir) + "\n" + update +
 		"\nNote: the previous claude session could not be resumed, so this is a fresh session in the same work " +
