@@ -124,7 +124,7 @@ func TestMilestonePriorTakesReworked(t *testing.T) {
 	if err := m.SetOutcome(j1.ID, OutcomeReworked, ""); err != nil {
 		t.Fatal(err)
 	}
-	if s := m.PriorResults(&store.Job{ID: "x", MilestoneID: v.ID, TaskKey: "T2"}); !strings.Contains(s, "Accepted job: "+j1.ID) {
+	if s := m.PriorResults(&store.Job{ID: "x", MilestoneID: v.ID, TaskKey: "T2"}); !strings.Contains(s, "Used job "+j1.ID+" (outcome reworked: fixed by hand after the job; this ref does not contain the fix) · ref: ") {
 		t.Fatalf("prior results without the reworked job:\n%s", s)
 	}
 }
@@ -241,7 +241,7 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 	if s := readFile(t, filepath.Join(dir, PriorDir, "T1", "report.md")); !strings.Contains(s, "FIRST_T1_REPORT") {
 		t.Fatalf("first attempt prior/T1: %s", s)
 	}
-	if p := readFile(t, filepath.Join(dir, "prompt.md")); !strings.Contains(p, "Accepted job: "+first.ID) {
+	if p := readFile(t, filepath.Join(dir, "prompt.md")); !strings.Contains(p, "Used job "+first.ID) {
 		t.Fatal("first prompt lacks the first T1 job")
 	}
 	second := accepted("SECOND_T1_REPORT")
@@ -253,13 +253,13 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 		t.Fatalf("resumed: %s %q", j.Status, j.Error)
 	}
 	stdin := readFile(t, filepath.Join(dir, "stdin.txt"))
-	if !strings.Contains(stdin, "Accepted job: "+second.ID) {
+	if !strings.Contains(stdin, "Used job "+second.ID) {
 		t.Fatalf("the resumed prompt lacks the newer T1 job:\n%s", stdin)
 	}
 	if s := readFile(t, filepath.Join(dir, PriorDir, "T1", "report.md")); !strings.Contains(s, "SECOND_T1_REPORT") {
 		t.Fatalf("prior/T1/report.md is not the job the prompt names: %.200s", s)
 	}
-	if s := readFile(t, filepath.Join(dir, resumePromptFile)); !strings.Contains(s, "Accepted job: "+second.ID) {
+	if s := readFile(t, filepath.Join(dir, resumePromptFile)); !strings.Contains(s, "Used job "+second.ID) {
 		t.Fatalf("the resumed session's update lacks the prior results:\n%s", s)
 	}
 }

@@ -73,6 +73,9 @@ type Manager struct {
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
 
+	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
+	beforeClaim func(*store.Job)
+
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
 	codexProbeKey string             // the codex binary identity it ran on (codexBinKey)
@@ -561,15 +564,22 @@ func (m *Manager) launchQueued() error {
 				m.cancelQueued(j, "cancelled before start: "+cancel)
 				continue
 			}
-			if wait {
+			if wait != "" {
 				continue
 			}
 		}
+		if m.beforeClaim != nil {
+			m.beforeClaim(j)
+		}
 		token := newToken()
 		// The row is ours (running + token) before anything is created or spawned.
-		if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		if err := m.claim(j, token); err != nil {
 			if errors.Is(err, store.ErrImmutable) {
 				continue // cancelled or taken meanwhile
+			}
+			if errors.Is(err, errMilestoneChanged) {
+				m.Log.Printf("job %s: its milestone changed before the claim; checked again next tick", j.ID)
+				continue
 			}
 			return err
 		}
@@ -593,6 +603,26 @@ func (m *Manager) launchQueued() error {
 		}
 	}
 	return nil
+}
+
+// errMilestoneChanged: the launch check, taken again inside the claim, no longer lets the job start.
+var errMilestoneChanged = errors.New("the milestone changed since the launch check")
+
+// claim moves queued job j to running under token. A job on a task is claimed with its launch check taken
+// again inside the claim's write transaction (launchVerdict): a milestone edit, a job or an outcome
+// committed after launchQueued's check (a dependency added, the task dropped, the milestone closed)
+// cannot let it start. It stays queued (errMilestoneChanged); the next tick waits or cancels.
+func (m *Manager) claim(j *store.Job, token string) error {
+	if j.MilestoneID == 0 {
+		return m.Store.Claim(j.ID, token, m.Now())
+	}
+	return m.Store.ClaimOnMilestone(j.ID, token, m.Now(), j.MilestoneID,
+		func(ms *store.Milestone, tasks []store.MilestoneTask, jobs []*store.Job) error {
+			if wait, cancel := launchVerdict(j, ms, tasks, jobs); wait != "" || cancel != "" {
+				return errMilestoneChanged
+			}
+			return nil
+		})
 }
 
 // cancelQueued ends a queued job that may not start (launchQueued holds the lifecycle lock) as

@@ -336,7 +336,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			"cancellation sets the row to dropped with the owner's words in rationale; each raises the version, and " +
 			"changed_since_approval lists the rows the owner re-approves (with known false, every current row). Waivers need the " +
 			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
-	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (*sdk.CallToolResult, ChecklistView, error) {
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (_ *sdk.CallToolResult, out ChecklistView, err error) {
 		m := d.Manager
 		top, main, err := jobs.ChecklistRepo(in.Repo)
 		if err != nil {
@@ -430,6 +430,23 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 				return nil, ChecklistView{}, err
 			}
 		}
+		if res.Brief != nil || res.Checklist != nil || res.Record != nil {
+			// A milestone tied to this checklist shows its rows (uncovered, acceptance): once the files are
+			// written its change cursor moves on every exit, an error one too (the new files stay). A failed
+			// mark is in the error, or a warning of a call that otherwise succeeded.
+			defer func() {
+				terr := m.Store.TouchChecklistMilestones(main, res.List.ID)
+				switch {
+				case terr == nil:
+				case err != nil:
+					err = fmt.Errorf("%w; the milestones tied to the checklist were not marked changed either (milestone_set on "+
+						"each marks it): %s", err, jobs.RedactPrintable(terr.Error(), 200))
+				default:
+					out.Warnings = append(out.Warnings, "the milestones tied to the checklist were not marked changed (milestone_set "+
+						"on each marks it): "+jobs.RedactPrintable(terr.Error(), 200))
+				}
+			}()
+		}
 		// The decisions are stored before the approval: one that fails leaves the checklist not approved.
 		for i, dec := range decisions {
 			if err := m.Store.PutSlicingDecision(dec); err != nil {
@@ -457,13 +474,6 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 				return nil, ChecklistView{}, fmt.Errorf("files written; %d of %d waivers stored: %w", added, len(waivers), err)
 			}
 			added++
-		}
-		if res.Brief != nil || res.Checklist != nil || res.Record != nil {
-			// A milestone tied to this checklist shows its rows (uncovered, acceptance): its change cursor moves.
-			if err := m.Store.TouchChecklistMilestones(main, res.List.ID); err != nil {
-				res.Warnings = append(res.Warnings, "the milestones tied to the checklist were not marked changed: "+
-					jobs.RedactPrintable(err.Error(), 200))
-			}
 		}
 		v, err := checklistView(m, top, main, res.List, res.BriefAfter)
 		if err != nil {

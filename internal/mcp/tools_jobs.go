@@ -110,6 +110,8 @@ type JobView struct {
 	// Milestone and Task are the milestone task the job works on (omitted for none).
 	Milestone int64  `json:"milestone,omitempty"`
 	Task      string `json:"task,omitempty"`
+	// Waiting is why a queued job of a task does not start yet ("waiting for T1 (failed)"; omitted otherwise).
+	Waiting string `json:"waiting,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -133,6 +135,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Milestone: j.MilestoneID, Task: j.TaskKey,
+		Waiting: m.MilestoneWaiting(context.Background(), j),
 	}
 }
 

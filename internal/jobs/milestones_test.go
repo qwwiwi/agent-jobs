@@ -331,7 +331,7 @@ func TestMilestonePriorResults(t *testing.T) {
 	p := string(prompt)
 	_, section, _ := strings.Cut(p, "## Prior results")
 	section, _, _ = strings.Cut(section, "## Checklist")
-	for _, s := range []string{"### T1 · first step", "Accepted job: " + j1.ID, "refs/agent-jobs/jobs/" + j1.ID,
+	for _, s := range []string{"### T1 · first step", "Used job " + j1.ID + " (outcome accepted) · ref: ", "refs/agent-jobs/jobs/" + j1.ID,
 		"added.txt", "PRIOR_SUMMARY_MARKER", "PRIOR_FINDINGS_MARKER", "[... cut by agent-jobs]",
 		"Full report: " + filepath.Join(dir, "prior", "T1", "report.md")} {
 		if !strings.Contains(section, s) {

@@ -55,7 +55,7 @@ Inside a job:
 | `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
 | `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, covers?}]`), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel` |
-| `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; new unfinished work reopens a done milestone) |
+| `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; any edit of a done milestone while a task is not done or dropped reopens it) |
 | `milestone_get` | the tree: each task's derived status (blocked, running, review, done, failed, ready, dropped) and jobs, `ready` keys, progress |
 | `milestone_list` | by repo and order; `repo` + `tree: true` is the whole project in one call; pass the returned `cursor` as the next `updated_since` |
 

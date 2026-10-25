@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -181,33 +182,54 @@ func TestMilestoneUpdatedAtFollowsJobs(t *testing.T) {
 	}
 }
 
-// MilestoneFull: a milestone with max_parallel is full at that many running jobs; one without never is.
-func TestMilestoneFull(t *testing.T) {
+// ClaimOnMilestone runs the check on the milestone's state inside the claim: a check error leaves the job
+// queued, a nil one claims it; the check sees the job's milestone, tasks and jobs (nil for a gone id).
+func TestClaimOnMilestone(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 	now := time.Now()
-	one := 1
-	capped, _ := s.CreateMilestone(&Milestone{Title: "c", MaxParallel: &one}, []MilestoneTask{{Key: "T1", Title: "x"}}, now)
-	free, _ := s.CreateMilestone(&Milestone{Title: "f"}, []MilestoneTask{{Key: "T1", Title: "x"}}, now)
-	for _, j := range []*Job{milestoneJob("a", capped, "T1", now), milestoneJob("b", free, "T1", now)} {
-		if err := s.Insert(j); err != nil {
-			t.Fatal(err)
-		}
-		if full, err := s.MilestoneFull(j.MilestoneID); err != nil || full {
-			t.Fatalf("%s queued: full=%v %v", j.ID, full, err)
-		}
-		if err := s.Claim(j.ID, "tok", now); err != nil {
-			t.Fatal(err)
-		}
+	mid, _ := s.CreateMilestone(&Milestone{Title: "c"}, []MilestoneTask{{Key: "T1", Title: "x"}}, now)
+	j := milestoneJob("a", mid, "T1", now)
+	if err := s.Insert(j); err != nil {
+		t.Fatal(err)
 	}
-	if full, _ := s.MilestoneFull(capped); !full {
-		t.Fatal("max_parallel 1 with one running job is not full")
+	refused := errors.New("not now")
+	var seen []string
+	check := func(ms *Milestone, tasks []MilestoneTask, jobs []*Job) error {
+		if ms == nil || len(tasks) != 1 || len(jobs) != 1 || jobs[0].ID != "a" {
+			return fmt.Errorf("state: %+v %+v %+v", ms, tasks, jobs)
+		}
+		seen = append(seen, jobs[0].Status)
+		if len(seen) == 1 {
+			return refused
+		}
+		return nil
 	}
-	if full, _ := s.MilestoneFull(free); full {
-		t.Fatal("a milestone without max_parallel is full")
+	if err := s.ClaimOnMilestone("a", "tok", now, mid, check); !errors.Is(err, refused) {
+		t.Fatalf("refused claim: %v", err)
+	}
+	if got, _ := s.Get("a"); got.Status != StatusQueued || got.Attempt != 0 {
+		t.Fatalf("after a refused check: %s attempt %d", got.Status, got.Attempt)
+	}
+	if err := s.ClaimOnMilestone("a", "tok", now, mid, check); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if got, _ := s.Get("a"); got.Status != StatusRunning || got.Attempt != 1 || got.LaunchToken != "tok" {
+		t.Fatalf("after the claim: %s attempt %d", got.Status, got.Attempt)
+	}
+	if err := s.ClaimOnMilestone("a", "tok2", now, mid, func(*Milestone, []MilestoneTask, []*Job) error { return nil }); !errors.Is(err, ErrImmutable) {
+		t.Fatalf("second claim: %v", err)
+	}
+	gone := false
+	_ = s.ClaimOnMilestone("a", "tok3", now, mid+100, func(ms *Milestone, tasks []MilestoneTask, jobs []*Job) error {
+		gone = ms == nil && tasks == nil && jobs == nil
+		return refused
+	})
+	if !gone {
+		t.Fatal("a gone milestone is not passed as nil")
 	}
 }
 

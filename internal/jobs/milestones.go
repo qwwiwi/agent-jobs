@@ -103,6 +103,8 @@ type MilestoneTaskView struct {
 	Jobs      []MilestoneJobView `json:"jobs"`
 	CreatedAt string             `json:"created_at"`
 	UpdatedAt string             `json:"updated_at"`
+	// Waiting is why the task's queued job does not start yet ("waiting for T1 (failed)"), "" when none waits.
+	Waiting string `json:"waiting,omitempty"`
 }
 
 // MilestoneProgress counts the done tasks (dropped ones left out) and, for a milestone tied to a
@@ -641,8 +643,8 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 			next.CloseNote = note
 		}
 		// The resulting state is checked on every edit: done only while every task is done or dropped. A
-		// close as done is refused otherwise; an edit that adds unfinished work to a done milestone (a new
-		// task, a revived one) reopens it.
+		// close as done is refused otherwise; any other edit of a done milestone with such a task (a new
+		// task, a revived one, or a task whose latest job failed after the close) reopens it.
 		status := ms.Status
 		if in.Status != "" {
 			status = in.Status
@@ -765,6 +767,9 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt)}
 		if tv.Jobs == nil {
 			tv.Jobs = []MilestoneJobView{}
+		}
+		if i := slices.IndexFunc(jobs, func(j *store.Job) bool { return j.TaskKey == t.Key && j.Status == store.StatusQueued }); i >= 0 {
+			tv.Waiting, _ = launchVerdict(jobs[i], ms, tasks, jobs)
 		}
 		v.Tasks = append(v.Tasks, tv)
 		if t.Dropped {
@@ -991,43 +996,84 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 }
 
 // milestoneLaunch is the launch check of a queued job on a task (launchQueued), taken again because the
-// milestone may have changed since job_start: wait when the job stays queued this tick (a dependency is
-// not done, or the milestone runs max_parallel jobs); cancel, a reason, when it can no longer run (the
-// milestone is closed, the task dropped or gone). A job of no milestone is not looked at.
-func (m *Manager) milestoneLaunch(ctx context.Context, j *store.Job) (wait bool, cancel string, err error) {
+// milestone may have changed since job_start: launchVerdict on the milestone as stored now. A job of no
+// milestone is not looked at.
+func (m *Manager) milestoneLaunch(ctx context.Context, j *store.Job) (wait, cancel string, err error) {
 	if j.MilestoneID == 0 {
-		return false, "", nil
+		return "", "", nil
 	}
 	ms, err := m.Store.GetMilestone(ctx, j.MilestoneID)
 	if errors.Is(err, store.ErrMilestoneNotFound) {
-		return false, fmt.Sprintf("milestone %d no longer exists", j.MilestoneID), nil
+		ms, err = nil, nil
 	}
 	if err != nil {
-		return false, "", err
+		return "", "", err
+	}
+	var tasks []store.MilestoneTask
+	var jobs []*store.Job
+	if ms != nil {
+		if tasks, err = m.Store.MilestoneTasks(ctx, ms.ID); err != nil {
+			return "", "", err
+		}
+		if jobs, err = m.Store.MilestoneJobs(ctx, ms.ID); err != nil {
+			return "", "", err
+		}
+	}
+	wait, cancel = launchVerdict(j, ms, tasks, jobs)
+	return wait, cancel, nil
+}
+
+// launchVerdict judges queued job j of milestone ms (nil = gone) from its tasks and jobs: wait, a reason,
+// when it stays queued this tick (a dependency is not done, or the milestone runs max_parallel jobs);
+// cancel, a reason, when it can no longer run (the milestone is closed, the task dropped or gone).
+// launchQueued takes it before the claim and again inside the claim's transaction (Manager.claim).
+func launchVerdict(j *store.Job, ms *store.Milestone, tasks []store.MilestoneTask, jobs []*store.Job) (wait, cancel string) {
+	if ms == nil {
+		return "", fmt.Sprintf("milestone %d no longer exists", j.MilestoneID)
 	}
 	if ms.Status != store.MilestoneOpen {
-		return false, fmt.Sprintf("milestone %d is %s", ms.ID, ms.Status), nil
-	}
-	tasks, err := m.Store.MilestoneTasks(ctx, ms.ID)
-	if err != nil {
-		return false, "", err
+		return "", fmt.Sprintf("milestone %d is %s", ms.ID, ms.Status)
 	}
 	i := slices.IndexFunc(tasks, func(t store.MilestoneTask) bool { return t.Key == j.TaskKey })
 	if i < 0 {
-		return false, fmt.Sprintf("task %s is not a task of milestone %d", j.TaskKey, ms.ID), nil
+		return "", fmt.Sprintf("task %s is not a task of milestone %d", j.TaskKey, ms.ID)
 	}
 	if tasks[i].Dropped {
-		return false, fmt.Sprintf("task %s of milestone %d was dropped", j.TaskKey, ms.ID), nil
+		return "", fmt.Sprintf("task %s of milestone %d was dropped", j.TaskKey, ms.ID)
 	}
-	jobs, err := m.Store.MilestoneJobs(ctx, ms.ID)
+	if deps := waitingDeps(tasks, jobs, j.TaskKey); len(deps) > 0 {
+		for k, d := range deps {
+			key, status, _ := strings.Cut(d, " ")
+			deps[k] = key + " (" + status + ")"
+		}
+		return "waiting for " + strings.Join(deps, ", "), ""
+	}
+	if ms.MaxParallel != nil {
+		running := 0
+		for _, o := range jobs {
+			if o.Status == store.StatusRunning {
+				running++
+			}
+		}
+		if running >= *ms.MaxParallel {
+			return fmt.Sprintf("waiting for a slot: milestone %d runs %d jobs (max_parallel %d)", ms.ID, running, *ms.MaxParallel), ""
+		}
+	}
+	return "", ""
+}
+
+// MilestoneWaiting is why a queued job of a task does not start yet ("waiting for T1 (failed)": the
+// launch check as the daemon takes it), "" for any other job or when it can start. A waiting job is not
+// cancelled for it: once the dependency is done again, or dropped, it starts.
+func (m *Manager) MilestoneWaiting(ctx context.Context, j *store.Job) string {
+	if j.MilestoneID == 0 || j.Status != store.StatusQueued {
+		return ""
+	}
+	wait, _, err := m.milestoneLaunch(ctx, j)
 	if err != nil {
-		return false, "", err
+		return "launch check not read: " + RedactPrintable(err.Error(), 200)
 	}
-	if len(waitingDeps(tasks, jobs, j.TaskKey)) > 0 {
-		return true, "", nil
-	}
-	full, err := m.Store.MilestoneFull(ms.ID)
-	return full, "", err
+	return wait
 }
 
 // milestoneResumable refuses job_resume of a job whose milestone is closed or whose task was dropped: its

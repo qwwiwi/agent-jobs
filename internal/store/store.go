@@ -421,6 +421,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: milestones: %w", err)
 	}
+	if err := migrateMilestoneTriggers(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: milestone triggers: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -957,9 +961,12 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	}
 	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
 	// report of the ended attempt has been redacted (ClearRedactionPending).
-	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-		attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`, token, now.Unix(), id))
+	return affected(s.db.Exec(claimSQL, token, now.Unix(), id))
 }
+
+// claimSQL moves a queued job to running (Claim, ClaimOnMilestone): launch token, started_at, id.
+const claimSQL = `UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
+	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
 // report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.
