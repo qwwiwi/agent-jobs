@@ -38,8 +38,9 @@ func TestParsePreToolUseInput(t *testing.T) {
 
 // End to end: release_check passed on sha A in a repository with an approved checklist; gh pr merge with
 // --match-head-commit A is allowed (also from another directory after cd, by -R or by GH_REPO), with B,
-// a short sha, --auto or no flag it is refused with the missing condition named; a merge the reader
-// cannot read is refused; a repository without a checklist is not gated; a void approval stays gated.
+// a short sha, --auto or no flag it is refused with the missing condition named; another clone is gated
+// by its remote; a newer verdict makes the pass stale; a merge the reader cannot read is refused; a
+// repository without a checklist is not gated; a void or removed approval stays gated.
 func TestMergeGateEndToEnd(t *testing.T) {
 	m := acceptanceManager(t, "")
 	repo, shaA := gateRepo(t)
@@ -78,6 +79,9 @@ func TestMergeGateEndToEnd(t *testing.T) {
 	gitT(t, repo, "commit", "-qm", "next")
 	shaB := gitT(t, repo, "rev-parse", "HEAD")
 	elsewhere := t.TempDir()
+	clone := filepath.Join(t.TempDir(), "clone")
+	gitT(t, elsewhere, "clone", "-q", repo, clone)
+	gitT(t, clone, "remote", "set-url", "origin", "https://github.com/acme/demo.git")
 
 	for _, tc := range []struct {
 		name, cwd, cmd, env string
@@ -104,11 +108,29 @@ func TestMergeGateEndToEnd(t *testing.T) {
 		{"sh -c", elsewhere, "sh -c 'gh pr merge 5'", "", "cannot tell whether this command runs gh pr merge"},
 		{"variable sha", repo, `gh pr merge 5 --match-head-commit "$SHA"`, "", "cannot tell"},
 		{"subcommand from a variable", elsewhere, `gh pr $M 5`, "", "cannot tell"},
+		{"GIT_DIR", elsewhere, "GIT_DIR=" + repo + "/.git " + merge + shaA, "", "cannot tell"},
+		{"another clone without flag", clone, "gh pr merge 5", "", "without --match-head-commit"},
+		{"another clone, A", clone, merge + shaA, "", ""},
+		{"git about merge, not gated", elsewhere, "git diff $(git merge-base main HEAD)", "", ""},
 	} {
 		r := gate(tc.cwd, tc.cmd, tc.env)
 		if tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)
 		}
+	}
+
+	// A newer verdict for the sha makes the pass stale until release_check runs again.
+	if j := runToEnd(t, m, judgeJob(t, m, repo, shaA).ID); j.Status != store.StatusSucceeded {
+		t.Fatalf("second judge: %s %s", j.Status, j.Error)
+	}
+	if r := gate(repo, merge+shaA, ""); !strings.Contains(r, "the release_check pass on "+shaA+" is stale") {
+		t.Fatalf("newer verdict: %q", r)
+	}
+	if r, err := m.ReleaseCheck(repo, shaA); err != nil || !r.Pass {
+		t.Fatalf("release_check again: %+v %v", r, err)
+	}
+	if r := gate(repo, merge+shaA, ""); r != "" {
+		t.Fatalf("after release_check again: %q", r)
 	}
 
 	// A repository without a checklist is not gated (here, and with nothing gated at all).
@@ -132,6 +154,13 @@ func TestMergeGateEndToEnd(t *testing.T) {
 	}
 	if r := gate(repo, merge+shaA, ""); !strings.Contains(r, "its checklist approval is void") {
 		t.Fatalf("void approval: %q", r)
+	}
+	// So does a checklist removed after the approval.
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if r := gate(repo, merge+shaA, ""); !strings.Contains(r, "its checklist approval is void (the work tree has no brief/CHECKLIST.md)") {
+		t.Fatalf("removed checklist: %q", r)
 	}
 }
 

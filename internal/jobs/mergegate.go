@@ -19,11 +19,13 @@ import (
 // orchestrator session. In a repository with an approved brief/CHECKLIST.md, `gh pr merge` is allowed
 // only with `--match-head-commit <full sha>` (GitHub refuses the merge if the head moved) and only when
 // release_check passed on exactly that sha at the checklist as it is (store.ReleasePass); `--auto` is
-// refused (auto-merge merges a later head). A repository without a checklist, or whose checklist was
-// never approved, is not gated; one whose approval is void now (the checklist or brief edited by hand, a
+// refused (auto-merge merges a later head), and so is a pass older than evidence release_check would fail
+// on (a newer verdict for the sha, a red manifest-check run). A repository whose checklist was never
+// approved is not gated; one whose approval is void now (the checklist or brief edited by hand or gone, a
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
-// closed: a void approval never lifts the gate). A command whose merge the reader cannot read is refused
-// while some repository is gated. It reads the store and the brief files only. `gh api` merges, `git push` to the base
+// closed: a void approval never lifts the gate). Another clone of a gated repository (a shared OWNER/REPO
+// remote) is gated with it. A command whose merge the reader cannot read is refused while some repository
+// is gated. It reads the store and the brief files only. `gh api` merges, `git push` to the base
 // branch and the web UI pass by it (PLAN Wave F, Risks): it catches honest mistakes, it is not a boundary.
 
 // MergeGatePrefix starts the hook's refusal line.
@@ -83,7 +85,10 @@ func MergeGateNeeded(command string) bool {
 
 // gatedRepo is the checklist state of one repository's main work tree.
 type gatedRepo struct {
-	main string
+	// remotes are the OWNER/REPO names of its remotes (read once, remotesRead).
+	remotes     []string
+	remotesRead bool
+	main        string
 	// gated: the checklist is approved now, or it was approved once and the approval is void (void says
 	// why; every merge is refused then).
 	gated   bool
@@ -183,9 +188,9 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 			return nil, "", err
 		}
 		for _, r := range all {
-			names, err := remoteRepoNames(r.main)
-			if err != nil {
-				return nil, fmt.Sprintf("the remotes of %s are unreadable: %v", r.main, err), nil
+			names, why := g.remoteNames(r)
+			if why != "" {
+				return nil, why, nil
 			}
 			if slices.Contains(names, name) {
 				add(r)
@@ -225,9 +230,51 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 		if err != nil {
 			return nil, "", err
 		}
-		add(r)
+		if r.gated {
+			add(r)
+			continue
+		}
+		// Another clone of a gated repository merges the same pull requests: match it by its remotes.
+		if why, err := g.byRemotes(r, add); why != "" || err != nil {
+			return nil, why, err
+		}
 	}
 	return out, "", nil
+}
+
+// byRemotes adds every gated repository that shares an OWNER/REPO remote with r; why is set when a
+// remote list is unreadable.
+func (g *mergeGate) byRemotes(r *gatedRepo, add func(*gatedRepo)) (string, error) {
+	all, err := g.approvedRepos()
+	if err != nil || len(all) == 0 {
+		return "", err
+	}
+	mine, why := g.remoteNames(r)
+	if why != "" {
+		return why, nil
+	}
+	for _, gr := range all {
+		names, why := g.remoteNames(gr)
+		if why != "" {
+			return why, nil
+		}
+		if slices.ContainsFunc(mine, func(n string) bool { return slices.Contains(names, n) }) {
+			add(gr)
+		}
+	}
+	return "", nil
+}
+
+// remoteNames are r's remote OWNER/REPO names (cached); why is set when they are unreadable.
+func (g *mergeGate) remoteNames(r *gatedRepo) ([]string, string) {
+	if !r.remotesRead {
+		names, err := remoteRepoNames(r.main)
+		if err != nil {
+			return nil, fmt.Sprintf("the remotes of %s are unreadable: %v", r.main, err)
+		}
+		r.remotes, r.remotesRead = names, true
+	}
+	return r.remotes, ""
 }
 
 // check is the refusal for a merge in gated repository r ("" = allowed).
@@ -260,12 +307,38 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: release_check has not passed on %s at this checklist; "+
 			"run release_check(repo, sha) first.", where, sha), nil
 	}
+	// Evidence stored after the pass that release_check would fail on: a newer verdict for the sha, or a
+	// red manifest-check run. The pass then no longer counts until release_check runs again.
+	stale := ""
+	if red, err := g.m.Store.RedManifestCheck(r.main, sha, r.id, r.version, r.hash); err != nil {
+		return "", err
+	} else if red != nil {
+		stale = fmt.Sprintf("manifest-check of job %s exited %d after it", red.JobID, red.ExitCode)
+	}
+	vs, err := g.m.Store.VerdictsAt(r.main, r.id, r.version, sha)
+	if err != nil {
+		return "", err
+	}
+	latest := ""
+	for _, v := range vs {
+		if v.ChecklistSHA256 == r.hash {
+			latest = v.JobID
+		}
+	}
+	if stale == "" && latest != p.VerdictJob {
+		stale = fmt.Sprintf("the latest verdict for the sha is of job %s, the pass read job %s", latest, p.VerdictJob)
+	}
+	if stale != "" {
+		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: the release_check pass on %s is stale (%s); run "+
+			"release_check(repo, sha) again.", where, sha, RedactPrintable(stale, 200)), nil
+	}
 	return "", nil
 }
 
 // repo reads the checklist state of a main work tree (cached), without the checklist lock like the
-// brief reminder: a read that races a checklist_set can misjudge one call. No checklist file, or one never
-// approved, is not gated; a store error is returned.
+// brief reminder: a read that races a checklist_set can misjudge one call. A repository never approved
+// is not gated; one approved once stays gated (void when its checklist is not approved now, also when the
+// file is gone); a store error is returned.
 func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if r, ok := g.repos[main]; ok {
 		return r, nil
@@ -284,9 +357,11 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	switch {
 	case err != nil:
 		return voided("the brief files are unreadable: " + err.Error())
-	case f.Checklist == nil:
+	case f.Checklist == nil && last == nil:
 		g.repos[main] = r
 		return r, nil
+	case f.Checklist == nil:
+		return voided("the work tree has no " + checklist.ChecklistRel)
 	case f.Brief == nil:
 		return voided("the work tree has no " + checklist.BriefRel)
 	}

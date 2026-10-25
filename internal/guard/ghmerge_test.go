@@ -54,7 +54,16 @@ func TestGhPrMerges(t *testing.T) {
 		{"sh -c", `sh -c 'gh pr merge 5'`, &GhMerge{Unsure: "inside a substitution, eval or sh -c"}, "indirectly"},
 		{"eval", `eval "gh pr merge 5"`, &GhMerge{Unsure: "inside a substitution, eval or sh -c"}, "gh inside"},
 		{"wrapper option", "env -C /srv gh pr merge 5", &GhMerge{Unsure: "a wrapper option before gh"}, ""},
-		{"cd to a variable", `cd "$D" && gh pr merge 5`, &GhMerge{}, "cd to a variable"},
+		{"cd to a variable", `cd "$D" && gh pr merge 5`, &GhMerge{Unsure: "cd to a variable"}, ""},
+		{"cd to a variable, no merge", `cd "$D" && git log --merges`, nil, ""},
+		{"GH_REPO from a variable, no merge", `GH_REPO=$X; echo hi`, nil, ""},
+		{"GH_REPO from a variable", `GH_REPO=$X; gh pr merge 5`, &GhMerge{Unsure: "GH_REPO set from a variable"}, ""},
+		{"GIT_DIR prefix", "GIT_DIR=/srv/app/.git gh pr merge 5", &GhMerge{Unsure: "GIT_DIR or GIT_WORK_TREE"}, ""},
+		{"GIT_WORK_TREE exported", "export GIT_WORK_TREE=/srv/app; gh pr merge 5", &GhMerge{Unsure: "GIT_DIR or GIT_WORK_TREE"}, ""},
+		{"declare -x", "declare -x GH_REPO=o/r; gh pr merge 5", &GhMerge{GHRepos: []string{"o/r"}}, ""},
+		{"upper-case url", "gh pr merge HTTPS://github.com/o/r/pull/5", &GhMerge{Repo: "github.com/o/r"}, ""},
+		{"git merge-base in a substitution", "git diff $(git merge-base origin/main HEAD)", nil, ""},
+		{"git commit here-doc about merge", "git commit -F - <<'EOF'\nmerge the branch\nEOF", nil, ""},
 		{"program from a variable", `$GH pr merge 5`, nil, "command name from a variable"},
 		{"subcommand from a variable", `gh pr $M 5`, nil, "gh subcommand from a variable"},
 		{"unknown flag before pr", "gh --foo pr merge 5", &GhMerge{Unsure: "gh flag --foo before the subcommand"}, "gh flag --foo"},
@@ -97,7 +106,10 @@ func TestGhPrMergesSeveral(t *testing.T) {
 	if unsure != "" || len(calls) != 2 || len(calls[0].Dirs) != 0 || !slices.Equal(calls[1].Dirs, []string{"/other"}) || !calls[1].Auto {
 		t.Fatalf("%+v %q", calls, unsure)
 	}
-	if _, unsure := GhPrMerges(strings.Repeat("x", maxCommandBytes+1)); unsure == "" {
-		t.Fatal("an over-long command is read")
+	if _, unsure := GhPrMerges("gh pr merge 5 " + strings.Repeat("x", maxCommandBytes)); unsure == "" {
+		t.Fatal("an over-long command with a merge is read")
+	}
+	if calls, unsure := GhPrMerges("cat > f <<'EOF'\n" + strings.Repeat("x", maxCommandBytes) + "\nEOF"); unsure != "" || calls != nil {
+		t.Fatalf("an over-long command without merge: %+v %q", calls, unsure)
 	}
 }

@@ -43,52 +43,57 @@ var (
 // GhPrMerges reads cmd for `gh pr merge` calls. unsure is why the command may run a merge that is not in
 // calls ("" = it cannot): a form the guard's reader cannot verify (a program from a variable, a gh
 // subcommand from a variable, gh flags it cannot read before the subcommand, a shell reading stdin, …) in
-// a command that runs gh or mentions merge, or a command too long to read.
+// a command that runs gh or mentions merge (git's own forms, such as git in a substitution, never run gh
+// and do not count), or a command too long to read that mentions merge. What makes one call unreadable
+// (a cd to a variable, GH_REPO from a variable, GIT_DIR / GIT_WORK_TREE set) is the call's Unsure.
 func GhPrMerges(cmd string) (calls []GhMerge, unsure string) {
-	if len(cmd) > maxCommandBytes {
-		return nil, "the command is longer than the reader's limit"
-	}
 	mentions := strings.Contains(strings.ToLower(cmd), "merge")
+	if len(cmd) > maxCommandBytes {
+		if mentions {
+			return nil, "the command is longer than the reader's limit"
+		}
+		return nil, ""
+	}
 	var dirs, ghRepos []string
+	pending := "" // why every later call of the command cannot be read
+	later := func(why string) {
+		if pending == "" {
+			pending = why
+		}
+	}
 	for _, sc := range parseAll(cmd) {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				v := split(c.words)
 				argv, dyn := c.words[v.start:], c.dyn[v.start:]
 				gh := len(argv) > 0 && (dyn[0] || progName(argv[0]) == "gh")
-				if r := unverifiable(sc, c); r != "" && unsure == "" && (mentions || gh) && !ghOtherGroup(argv, dyn) {
+				git := len(argv) > 0 && !dyn[0] && isGitName(progName(argv[0]))
+				if r := unverifiable(sc, c); r != "" && unsure == "" && (mentions || gh) && !git && !ghOtherGroup(argv, dyn) {
 					unsure = cannotForm(r)
 				}
 				if len(argv) == 0 {
 					// `GH_REPO=o/r` alone sets it for the rest of the command (if exported already).
 					if sc.depth == 0 {
-						if r, ok := ghRepoAssigned(c.words, c.dyn, 0, len(c.words)); ok {
-							ghRepos = append(ghRepos, r...)
-						} else if unsure == "" {
-							unsure = "GH_REPO set from a variable"
-						}
+						ghRepos = append(ghRepos, envAssigned(c.words, c.dyn, 0, len(c.words), later)...)
 					}
 					continue
 				}
 				switch name := progName(argv[0]); {
 				case sc.depth == 0 && (name == "cd" || name == "pushd"):
-					d, why := cdTarget(argv, dyn)
-					if why != "" && unsure == "" && mentions {
-						unsure = why
-					}
-					if why == "" {
+					if d, why := cdTarget(argv, dyn); why != "" {
+						later(why)
+					} else {
 						dirs = append(dirs, d)
 					}
-				case sc.depth == 0 && name == "export":
-					if r, ok := ghRepoAssigned(argv, dyn, 1, len(argv)); ok {
-						ghRepos = append(ghRepos, r...)
-					} else if unsure == "" {
-						unsure = "GH_REPO exported from a variable"
-					}
+				case sc.depth == 0 && (name == "export" || name == "declare" || name == "typeset"):
+					ghRepos = append(ghRepos, envAssigned(argv, dyn, 1, len(argv), later)...)
 				case name == "gh":
 					call, ok := ghMergeCall(sc, c, v)
 					if !ok {
 						continue
+					}
+					if call.Unsure == "" {
+						call.Unsure = pending
 					}
 					call.Dirs = slices.Clone(dirs)
 					call.GHRepos = append(slices.Clone(ghRepos), call.GHRepos...)
@@ -100,18 +105,22 @@ func GhPrMerges(cmd string) (calls []GhMerge, unsure string) {
 	return calls, unsure
 }
 
-// ghRepoAssigned is the literal GH_REPO=value words among words[from:to]; ok is false when one comes
-// from a variable or substitution.
-func ghRepoAssigned(words []string, dyn []bool, from, to int) (repos []string, ok bool) {
+// envAssigned is the literal GH_REPO values among the name=value words of words[from:to]; unsure is told
+// about a GH_REPO from a variable or substitution and about GIT_DIR / GIT_WORK_TREE (gh then takes the
+// repository from them, which the reader does not follow).
+func envAssigned(words []string, dyn []bool, from, to int, unsure func(string)) (repos []string) {
 	for i := from; i < to; i++ {
-		if v, found := strings.CutPrefix(words[i], "GH_REPO="); found {
-			if dyn[i] {
-				return nil, false
-			}
-			repos = append(repos, v)
+		w := words[i]
+		switch {
+		case strings.HasPrefix(w, "GH_REPO=") && dyn[i]:
+			unsure("GH_REPO set from a variable or substitution")
+		case strings.HasPrefix(w, "GH_REPO="):
+			repos = append(repos, strings.TrimPrefix(w, "GH_REPO="))
+		case strings.HasPrefix(w, "GIT_DIR=") || strings.HasPrefix(w, "GIT_WORK_TREE="):
+			unsure("GIT_DIR or GIT_WORK_TREE set, which moves gh to another repository")
 		}
 	}
-	return repos, true
+	return repos
 }
 
 // cdTarget is the directory `cd` / `pushd` argv moves to, as written ("" = home); why is set when it
@@ -170,11 +179,11 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 			call.Unsure = "a wrapper option before gh (" + w + "), which may change its directory"
 		}
 	}
-	if r, ok := ghRepoAssigned(c.words, c.dyn, 0, v.start); ok {
-		call.GHRepos = r
-	} else if call.Unsure == "" {
-		call.Unsure = "GH_REPO set from a variable"
-	}
+	call.GHRepos = envAssigned(c.words, c.dyn, 0, v.start, func(why string) {
+		if call.Unsure == "" {
+			call.Unsure = why
+		}
+	})
 	flagRepo := ""
 	// -R / --repo before the subcommand (ghPositional skipped them).
 	for i := 1; i < pos[1]; i++ {
@@ -283,11 +292,9 @@ func boolTrue(s string) bool {
 
 // prURLRepo is HOST/OWNER/REPO of a pull request URL (https://HOST/OWNER/REPO/pull/N…), "" otherwise.
 func prURLRepo(s string) string {
-	rest, ok := strings.CutPrefix(s, "https://")
-	if !ok {
-		if rest, ok = strings.CutPrefix(s, "http://"); !ok {
-			return ""
-		}
+	scheme, rest, ok := strings.Cut(s, "://")
+	if !ok || !strings.EqualFold(scheme, "https") && !strings.EqualFold(scheme, "http") {
+		return ""
 	}
 	parts := strings.Split(rest, "/")
 	if len(parts) < 5 || parts[3] != "pull" || parts[0] == "" || parts[1] == "" || parts[2] == "" {
