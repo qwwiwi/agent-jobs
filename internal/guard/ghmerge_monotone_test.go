@@ -80,6 +80,8 @@ var mustRefuseMerges = []string{
 	"echo merge | xargs --replace=% gh pr % 5 --title merge",
 	"echo merge | xargs -I% -- gh pr % 5 --title merge",
 	"echo merge | xargs -I @@ gh pr @@ 5 --body merge",
+	// sudo's shell mode hands its argv to a root shell, which expands $NAME in the quoted word again.
+	"DISPLAY=merge sudo -s gh pr '$DISPLAY' 5 --title merge",
 }
 
 // mustPassMerges run no gh pr merge: the relaxed reading reports neither a call nor unsure.
