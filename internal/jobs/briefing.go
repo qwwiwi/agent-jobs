@@ -32,10 +32,39 @@ const AssumptionPrefix = "ASSUMPTION:"
 // пароль, токен, ключ, секрет in their case forms, as whole words (any Unicode letter or digit next to
 // them makes another word: «ключевой», «секретарь», "monkey" pass). A briefing never needs them: a
 // credential is set up by the owner out of band, never typed into a reply. It is matched on both
-// secretForms, so a whole word in any casing and a word of an identifier both count.
+// secretForms, so a whole word in any casing and a word of an identifier both count. Casing inside a
+// compound ("pAssword2", "clientToKen") can defeat both forms, so briefingSecret also reads the words of
+// the first form for secretStems inside them (secretStem); key and ключ stay whole-word only here.
 var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?|passwds?|passphrases?|pass\s*words?|pass\s*phrases?|tokens?|` +
 	`secrets?|credentials?|api[\s_-]*keys?|apikeys?|keys?|парол(?:ь|я|ю|ем|е|и|ей|ям|ями|ях)|токен(?:а|у|ом|е|ы|ов|ам|ами|ах)?|` +
 	`ключ(?:а|у|ом|е|и|ей|ам|ами|ах)?|секрет(?:а|у|ом|е|ы|ов|ам|ами|ах)?)(?:$|[^\p{L}\p{N}_])`)
+
+// secretStems are matched inside a lower-cased word of any length ("clientpassword", "myapitoken",
+// "secretvalue"); key and ключ are not stems (monkey, keyboard, ключевой), only briefingSecretRe's whole words.
+var secretStems = []string{"password", "passwd", "passphrase", "secret", "credential", "apikey", "token", "парол", "токен", "секрет"}
+
+// benignStemWords are the only lower-cased whole words that contain a secretStem and pass; any other word
+// with a stem is refused.
+var benignStemWords = []string{"tokenizer", "tokenizers", "tokenize", "tokenized", "tokenization", "secretary", "secretaries",
+	"секретарь", "секретаря"}
+
+// secretStem reports whether a word of s, split on every rune that is not a Unicode letter (digits too)
+// and lower-cased, contains a secretStem and is not one of benignStemWords. s is the first secretForms
+// form, so format characters are already gone.
+func secretStem(s string) bool {
+	for _, w := range strings.FieldsFunc(s, func(r rune) bool { return !unicode.IsLetter(r) }) {
+		w = strings.ToLower(w)
+		if slices.Contains(benignStemWords, w) {
+			continue
+		}
+		for _, stem := range secretStems {
+			if strings.Contains(w, stem) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // secretForms are the two forms of s that briefingSecretRe reads; a text is refused when either hits.
 // Both drop format characters (zero-width spaces and joiners, soft hyphens), so they cannot split a word,
@@ -45,7 +74,8 @@ var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?
 // one, between a letter and a digit, and before the last capital of a run followed by a lower-case
 // letter ("clientSecret", "APIKey", "key2", "clientPassPhrase" read as "client Secret", "API Key",
 // "key 2", "client Pass Phrase"). A word in one case is never split, so "monkey", "tokenizer" and
-// "keyboard" stay whole in both forms.
+// "keyboard" stay whole in both forms. The first form's words are also read by secretStem, which
+// ignores casing and word boundaries inside a word.
 func secretForms(s string) [2]string {
 	rs := []rune(strings.Map(func(r rune) rune {
 		switch {
@@ -80,10 +110,11 @@ func identifierBreak(p, r rune, nextLower bool) bool {
 	return false
 }
 
-// briefingSecret refuses a briefing text that asks for a secret or names one; checked before redaction,
-// so a masked value cannot hide what the text asks for.
+// briefingSecret refuses a briefing text that asks for a secret or names one: briefingSecretRe on either
+// secretForms form, or a secretStem inside a word of the first; checked before redaction, so a masked
+// value cannot hide what the text asks for.
 func briefingSecret(what, s string) error {
-	if f := secretForms(s); briefingSecretRe.MatchString(f[0]) || briefingSecretRe.MatchString(f[1]) {
+	if f := secretForms(s); briefingSecretRe.MatchString(f[0]) || briefingSecretRe.MatchString(f[1]) || secretStem(f[0]) {
 		return fmt.Errorf("%s asks for a secret or names one (password, token, key and the like are never asked of the owner)", what)
 	}
 	return nil

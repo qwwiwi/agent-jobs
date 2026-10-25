@@ -210,9 +210,9 @@ func TestValidateBriefingRules(t *testing.T) {
 		}
 	}
 	// Words that only contain a secret word are not one: "monkey", "keynote", "tokenizer", «ключевой»,
-	// «секретарь», «токенизатор» pass.
+	// «секретарь» pass.
 	for _, ok := range []string{"Monkey test the keynote page, or the tokenizer demo?", "Какой ключевой экран показать первым?",
-		"Секретарь получает письма о заказах?", "Нужен ли токенизатор для поиска?"} {
+		"Секретарь получает письма о заказах?"} {
 		b = briefingBlock(g)
 		q0(b)["q"] = ok
 		if _, err := ValidateBriefing(report(b), g); err != nil {
@@ -220,9 +220,9 @@ func TestValidateBriefingRules(t *testing.T) {
 		}
 	}
 	// A zero-width character or a non-breaking space does not hide a secret word; Russian case forms are
-	// caught.
+	// caught, and so is a stem inside a word not on the allowlist («токенизатор»).
 	for _, bad := range []string{"Send the pass\u200bword", "Send the pass\u00a0word", "the admin p\u00adassword?",
-		"Пришлите ключи от сервера", "Где взять токена?", "Скажите паролем"} {
+		"Пришлите ключи от сервера", "Где взять токена?", "Скажите паролем", "Нужен ли токенизатор для поиска?"} {
 		b = briefingBlock(g)
 		q0(b)["q"] = bad
 		if _, err := ValidateBriefing(report(b), g); err == nil || !strings.Contains(err.Error(), "asks for a secret") {
@@ -349,13 +349,16 @@ func TestValidateBriefingSecretIdentifiers(t *testing.T) {
 		pre   string
 	}
 	places := []place{{"q", q0, "q", ""}, {"recommended", q0, "recommended", ""}, {"why", q0, "why", ""},
-		{"adversarial q", adv, "q", ""}, {"adversarial recommended", adv, "recommended", ""}, {"decided", dec, "text", AssumptionPrefix + " "}}
+		{"adversarial q", adv, "q", ""}, {"adversarial recommended", adv, "recommended", ""}, {"adversarial why", adv, "why", ""},
+		{"decided", dec, "text", AssumptionPrefix + " "}}
 	for _, p := range places {
 		for _, bad := range []string{"Paste client_secret here", "Send admin_password", "Send access_token", "Set clientSecret in the panel",
 			"Where is the OpenAI APIKey?", "Put it in OPENAI_API_KEY", "the x-api-key header", "Send the botToken", "the ssh-key2 file",
 			"-----BEGIN PRIVATE KEY-----\n" + pemBody(),
 			"Paste your passPhrase in the reply?", "Send the pAssword", "Which toKen do we use?", "Set clientPassPhrase in the panel",
-			"Send myApiToken", "Put it in PASSPHRASE_FILE", "Send the PASSPHRASE", "Send the dbPassword"} {
+			"Send myApiToken", "Put it in PASSPHRASE_FILE", "Send the PASSPHRASE", "Send the dbPassword",
+			"Send pAssword2 here", "Send clientToKen here", "Send clientPaSsWoRd here", "Send clientpAssword here",
+			"Send dbPassWord1", "MyApITokEn", "set secretValue"} {
 			b := briefingBlock(g)
 			p.field(b)[p.key] = p.pre + bad
 			if _, err := ValidateBriefing(report(b), g); err == nil || !strings.Contains(err.Error(), "asks for a secret") {
@@ -364,7 +367,7 @@ func TestValidateBriefingSecretIdentifiers(t *testing.T) {
 		}
 		for _, ok := range []string{"Monkey test the keynote page, or the tokenizer demo?", "Which keyboard shortcuts first?",
 			"Keep the monkeyPatch helper or the KeynoteSpeaker page?", "Rename tokenizer_config to search_tokenizer?",
-			"Какой ключевой экран показать первым?"} {
+			"Какой ключевой экран показать первым?", "Секретарь получает письма о заказах?"} {
 			b := briefingBlock(g)
 			p.field(b)[p.key] = p.pre + ok
 			if _, err := ValidateBriefing(report(b), g); err != nil {
