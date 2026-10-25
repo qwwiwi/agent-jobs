@@ -267,7 +267,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	waivers, err := m.Store.Waivers(main, hash, c.Version)
+	waivers, err := m.Store.Waivers(main, c.ID, hash, c.Version)
 	if err != nil {
 		return nil, err
 	}
@@ -280,8 +280,9 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		row, _ := c.Row(id)
 		r := ReleaseRequirement{ID: id, PlaceholderOK: row.PlaceholderOK, CoveredBy: []string{}}
 		for _, w := range waivers {
-			// Bound to the checklist hash and version (Waivers) and the requirement, not to a commit (owner
-			// decision 2026-10-25): a fix commit after the waiver does not void it.
+			// Bound to the checklist id, hash and version (Waivers) and the requirement, not to a commit
+			// (owner decision 2026-10-25): a fix commit after the waiver does not void it. Waivers lists the
+			// oldest first, so the newest quote is the one kept.
 			if w.Requirement == id {
 				r.Waived, r.WaiverQuote = true, RedactPrintable(w.Quote, 300)
 			}

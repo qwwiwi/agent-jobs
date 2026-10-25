@@ -76,8 +76,9 @@ type ChecklistBinding struct {
 // ErrInitIncomplete is an init record without a repo, a checklist id or the BRIEF hash.
 var ErrInitIncomplete = errors.New("checklist init needs repo, checklist id and BRIEF hash")
 
-// waiversKey is the primary key of checklist_waivers since the version joined it.
-const waiversKey = "PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)"
+// waiversKey is the primary key of checklist_waivers since the checklist id joined it (two ids with
+// identical content share a hash and version, and keep their own waivers).
+const waiversKey = "PRIMARY KEY (repo, checklist_id, checklist_sha256, checklist_version, sha, requirement)"
 
 // waiversColumns is the column list of checklist_waivers (CREATE TABLE <name> waiversColumns).
 const waiversColumns = `(
@@ -93,7 +94,7 @@ const waiversColumns = `(
 )`
 
 // waiversSchema is applied on every Open (CREATE … IF NOT EXISTS). One waiver per requirement, checklist
-// hash and version, and sha; a second one replaces the first (a new quote). Approvals are a log: the
+// id, hash and version, and sha; a second one replaces the first (a new quote). Approvals are a log: the
 // latest one of a repository (highest seq) is the one in force. Inits: one per checklist id of a
 // repository, written by checklist_init.
 const waiversSchema = `
@@ -127,10 +128,12 @@ var waiversMigrations = []string{
 	`ALTER TABLE checklist_approvals ADD COLUMN brief_file_sha256 TEXT NOT NULL DEFAULT ''`,
 }
 
-// migrateWaiversKey rebuilds a checklist_waivers table created before checklist_version joined its
-// primary key (the column itself is added by waiversMigrations): the table is recreated with the
-// current key and its rows copied, keeping each row's version (0 for a row from before the column),
-// all in one IMMEDIATE transaction that re-checks the definition (several processes open the database).
+// migrateWaiversKey rebuilds a checklist_waivers table created before checklist_version or checklist_id
+// joined its primary key (the version column itself is added by waiversMigrations; every row always had
+// its checklist_id): the table is recreated with the current key and its rows copied, keeping each row's
+// id and version (0 for a row from before the column), all in one IMMEDIATE transaction that re-checks the
+// definition (several processes open the database). The new key is a superset of every old one, so no
+// row is lost.
 func migrateWaiversKey(db *sql.DB) error {
 	def := func() (string, error) {
 		var q string
@@ -181,11 +184,12 @@ func (s *Store) PutWaiver(w Waiver) error {
 	return nil
 }
 
-// Waivers lists the waivers of repo bound to checklist hash and version, by sha then requirement.
-func (s *Store) Waivers(repo, checklistSHA256 string, version int) ([]Waiver, error) {
+// Waivers lists the waivers of repo bound to checklist id, hash and version, oldest first (created time,
+// then insertion: a replaced waiver is a new row), so the last one of a requirement is its newest.
+func (s *Store) Waivers(repo, checklistID, checklistSHA256 string, version int) ([]Waiver, error) {
 	rows, err := s.db.Query(`SELECT repo, checklist_id, checklist_sha256, checklist_version, sha, requirement, quote, created_at
-		FROM checklist_waivers WHERE repo = ? AND checklist_sha256 = ? AND checklist_version = ? ORDER BY sha, requirement`,
-		repo, checklistSHA256, version)
+		FROM checklist_waivers WHERE repo = ? AND checklist_id = ? AND checklist_sha256 = ? AND checklist_version = ?
+		ORDER BY created_at, rowid`, repo, checklistID, checklistSHA256, version)
 	if err != nil {
 		return nil, fmt.Errorf("waivers: %w", err)
 	}

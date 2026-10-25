@@ -574,3 +574,31 @@ func TestReleaseCheckRecordsPass(t *testing.T) {
 		t.Fatalf("pass kept after a failing run: %+v %v", p, err)
 	}
 }
+
+// A waiver stored for another checklist id with the same hash and version (identical content) does not
+// accept a requirement of this checklist; the newest waiver's quote is the one shown.
+func TestReleaseCheckWaiverBoundToChecklistID(t *testing.T) {
+	f := newReleaseFix(t)
+	f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+	j := okJudge()
+	j.verdicts = map[string]string{"R01": "missing", "R02": "met"}
+	f.judge(t, j)
+	at := time.Now()
+	if err := f.m.Store.PutWaiver(store.Waiver{Repo: f.repo, ChecklistID: f.v.ID + "-other", ChecklistSHA256: f.v.SHA256,
+		ChecklistVersion: f.v.Version, Requirement: "R01", Quote: "other checklist", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.check(t); r.Pass || r.Requirements[0].Waived {
+		t.Fatalf("waiver of another checklist id accepted R01: %+v", r)
+	}
+	for i, sha := range []string{strings.Repeat("f", 40), strings.Repeat("0", 40)} {
+		if err := f.m.Store.PutWaiver(store.Waiver{Repo: f.repo, ChecklistID: f.v.ID, ChecklistSHA256: f.v.SHA256,
+			ChecklistVersion: f.v.Version, SHA: sha, Requirement: "R01", Quote: "quote " + sha[:1],
+			CreatedAt: at.Add(time.Duration(i+1) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := f.check(t); !r.Pass || !r.Requirements[0].Waived || r.Requirements[0].WaiverQuote != "quote 0" {
+		t.Fatalf("own waiver: %+v", r.Requirements)
+	}
+}

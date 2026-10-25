@@ -148,7 +148,7 @@ func checklistView(m *jobs.Manager, top, main string, c *checklist.Checklist, br
 	}
 	v.Waivers = []store.Waiver{}
 	if approved {
-		w, err := st.Waivers(main, last.ChecklistSHA256, last.Version)
+		w, err := st.Waivers(main, last.ChecklistID, last.ChecklistSHA256, last.Version)
 		if err != nil {
 			return ChecklistView{}, err
 		}
