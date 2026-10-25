@@ -103,8 +103,8 @@ func TestGateEnforcedBlindAndLockDir(t *testing.T) {
 	}
 }
 
-// judge_start warns when the judge runs on the family of a coder of the checklist, and not when no
-// coder shares it or there is none.
+// judge_start warns when the judge runs on the family of a succeeded coder of the checklist, and not
+// when no coder shares it, there is none or the only one was cancelled.
 func TestJudgeFamilyWarning(t *testing.T) {
 	m := newManager(t)
 	repo, sha := gateRepo(t)
@@ -120,12 +120,16 @@ func TestJudgeFamilyWarning(t *testing.T) {
 	if w, err := m.JudgeFamilyWarning(judge("sonnet")); err != nil || w != "" {
 		t.Fatalf("no coders: %q %v", w, err)
 	}
-	coder := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	if err := m.Cancel(coder.ID); err != nil {
+	cancelled := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
+	if err := m.Cancel(cancelled.ID); err != nil {
 		t.Fatal(err)
 	}
+	if w, err := m.JudgeFamilyWarning(judge("sonnet")); err != nil || w != "" {
+		t.Fatalf("a cancelled coder only: %q %v", w, err)
+	}
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "sonnet", "R01")
 	w, err := m.JudgeFamilyWarning(judge("sonnet"))
-	if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, coder.ID) {
+	if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, "claude-ok") || strings.Contains(w, cancelled.ID) {
 		t.Fatalf("claude judge of claude coders: %q %v", w, err)
 	}
 	if w, err := m.JudgeFamilyWarning(judge("gpt-5.6-sol")); err != nil || w != "" {

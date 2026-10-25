@@ -203,7 +203,7 @@ func TestGateVerdictFailsClosed(t *testing.T) {
 
 // The judge end to end: it needs the approved checklist; its work dir is the files at the sha only (no
 // .git, no brief files, no link out of the tree); the verdict is stored with the judge's family and the
-// coders' (feature jobs with covers of the checklist), same_family flagged.
+// coders' (the succeeded feature jobs with covers of the checklist, familyCoders), same_family flagged.
 func TestJudgeJobEndToEnd(t *testing.T) {
 	m := acceptanceManager(t, "")
 	t.Setenv("AGENT_JOBS_TEST_SECRET", "s3cr3t")
@@ -212,9 +212,11 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 		t.Fatalf("judge of an unapproved checklist: %v", err)
 	}
 	approveBrief(t, m, repo)
-	// The coders: a claude fix job with covers of this checklist, and a codex one (inserted as stored).
-	coder := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	if err := m.Cancel(coder.ID); err != nil {
+	// The coders: a succeeded claude feature job, a cancelled claude fix job with covers of this checklist
+	// (not counted), and a codex one queued before sizes (inserted as stored, size none).
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "opus", "R01")
+	cancelled := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
+	if err := m.Cancel(cancelled.ID); err != nil {
 		t.Fatal(err)
 	}
 	cx := &store.Job{ID: "cx1", Agent: m.Agent, Title: "codex coder", Kind: "general", Brief: "b", RepoPath: mainWorktree(repo),
@@ -265,7 +267,7 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 		t.Fatalf("no verdict: %v", err)
 	}
 	if v.SHA != sha || v.Version != 2 || v.JudgeFamily != "anthropic" || v.JudgeModel != "sonnet" || !v.SameFamily || v.FamilyDiffers ||
-		!slices.Equal(v.CoderFamilies, []string{"anthropic", "openai"}) || !slices.Equal(v.CoderJobs, []string{coder.ID, "cx1"}) ||
+		!slices.Equal(v.CoderFamilies, []string{"anthropic", "openai"}) || !slices.Equal(v.CoderJobs, []string{"claude-ok", "cx1"}) ||
 		v.Counts["met"] != 3 || v.ManifestCheck == nil {
 		t.Fatalf("verdict: %+v", v)
 	}

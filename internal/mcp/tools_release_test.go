@@ -324,7 +324,7 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.runner, j.model, j.blind = store.RunnerCodex, "gpt-5.6-sol", false
 			f.judge(t, j)
 		}},
-		{"only a failed coder", jobs.ReleaseFamily, "family — no succeeded feature job (a fix or general job of size large)", func(t *testing.T, f *releaseFix) {
+		{"only a failed coder", jobs.ReleaseFamily, "family — no succeeded feature job (a fix or general job with covers, size not small)", func(t *testing.T, f *releaseFix) {
 			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 			f.judge(t, okJudge())
 		}},
@@ -481,16 +481,20 @@ func TestReleaseCheckWaiverSurvivesFixCommit(t *testing.T) {
 	}
 }
 
-// A feature job is a fix or general job of size large (F9 (a)): a same-family coder with covers but size
-// small, or none, is not one, so it does not fail the family condition; alone, such coders leave the check
-// without a feature job.
-func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
+// A feature job is a fix or general job with covers whose size is not small (F9 (a)): one queued before
+// sizes (none recorded) counts, so a same-family one fails the family condition; a small one does not;
+// alone, small coders leave the check without a feature job.
+func TestReleaseCheckFeatureJobsBySize(t *testing.T) {
 	f := passing(t)
-	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01")
-	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R02")
+	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
 	r := f.check(t)
-	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || r.FeatureJobs[0].ID == unsized {
-		t.Fatalf("small and unsized coders counted: %+v", r)
+	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small {
+		t.Fatalf("small coder counted: %+v", r)
+	}
+	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerClaude, "opus", "R02")
+	r = f.check(t)
+	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, unsized) || len(r.FeatureJobs) != 2 {
+		t.Fatalf("a same-family coder without a recorded size not counted: %+v", r)
 	}
 
 	g := newReleaseFix(t)
@@ -498,7 +502,7 @@ func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	g.judge(t, okJudge())
 	r = g.check(t)
 	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseFamily).OK ||
-		!strings.Contains(r.OwnerLine, "no succeeded feature job (a fix or general job of size large)") {
+		!strings.Contains(r.OwnerLine, "no succeeded feature job (a fix or general job with covers, size not small)") {
 		t.Fatalf("only a small coder: %+v", r)
 	}
 }

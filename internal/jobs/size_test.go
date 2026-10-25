@@ -158,11 +158,10 @@ func TestSizeInferredFromCovers(t *testing.T) {
 			t.Errorf("%s inferred large with a deferred cover: %v", kind, err)
 		}
 	}
-	// An explicit size is kept.
-	small := enqueue(t, m, "b", func(r *StartRequest) {
-		r.Kind, r.RepoPath, r.Covers, r.Size, r.SizeRule = "fix", repo, []string{"R01"}, SizeSmall, true
-	})
-	if got := get(t, m, small.ID).Size; got != SizeSmall {
-		t.Errorf("explicit small with covers: %q", got)
+	// An explicit size small takes no covers (a job with covers is a feature job, counted by the family
+	// check): refused, whatever size_required says.
+	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "fix", Brief: "b", Model: "sonnet", RepoPath: repo,
+		Covers: []string{"R01"}, Size: SizeSmall, SizeRule: true}); err == nil || !strings.Contains(err.Error(), "size small takes no covers") {
+		t.Errorf("explicit small with covers: %v", err)
 	}
 }

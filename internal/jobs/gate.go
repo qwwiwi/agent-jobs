@@ -185,16 +185,34 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	})
 }
 
+// familyCoders selects the coders a judge's model family is compared with, the one rule of
+// JudgeFamilyWarning, the verdict's snapshot (gateStep) and release_check's family condition: feature
+// are the feature jobs of checklist id in repo (store.FeatureJobs: fix and general jobs with covers of
+// it, size not small), family those of them that succeeded (owner decision 2026-10-25: a failed or
+// cancelled coder delivered no feature).
+func familyCoders(st *store.Store, repo, id string) (feature, family []store.CoverJob, err error) {
+	feature, err = st.FeatureJobs(repo, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, c := range feature {
+		if c.Status == store.StatusSucceeded {
+			family = append(family, c)
+		}
+	}
+	return feature, family, nil
+}
+
 // JudgeFamilyWarning is judge_start's warning ("" = none) when the queued judge j runs on the model
-// family of any coder job of its checklist (the fix and general jobs whose covers name it), the rule of
-// same_family in gateStep: its verdict will be stored with same_family true, which release_check (F7)
-// does not take. The default judge model is a claude model, so a judge without an explicit gpt-* model
-// of work a claude job coded gets it.
+// family of a coder of its checklist (familyCoders, the rule of same_family in gateStep and of
+// release_check's family condition): its verdict will be stored with same_family true, which
+// release_check (F7) does not take. The default judge model is a claude model, so a judge without an
+// explicit gpt-* model of work a claude job coded gets it.
 func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
 	if j.Kind != KindJudge || j.Gate == nil {
 		return "", nil
 	}
-	coders, err := m.Store.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
+	_, coders, err := familyCoders(m.Store, j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return "", err
 	}
@@ -1046,7 +1064,7 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, JudgeModel: j.Model, JudgeRunner: j.Runner,
 		JudgeFamily: ModelFamily(j.Runner, j.Model), EnforcedBlind: blind, ManifestCheck: mc, Counts: counts, Verdict: o,
 		CreatedAt: now}
-	coders, err := st.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
+	_, coders, err := familyCoders(st, j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return fail(err)
 	}
@@ -1056,8 +1074,8 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 			v.CoderFamilies = append(v.CoderFamilies, f)
 		}
 	}
-	// A snapshot of the cover jobs as they are now: a coder job started later does not change the stored
-	// flags, so release_check (F7) recomputes them from the cover jobs.
+	// A snapshot of the coders as they are now (familyCoders): a coder job that ends later does not
+	// change the stored flags, so release_check (F7) recomputes them with the same selection.
 	v.SameFamily = slices.Contains(v.CoderFamilies, v.JudgeFamily)
 	v.FamilyDiffers = len(v.CoderFamilies) > 0 && !v.SameFamily
 	if _, err := st.PutVerdict(token, v); err != nil {

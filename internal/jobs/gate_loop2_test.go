@@ -44,11 +44,10 @@ func TestJudgeIgnoresReplaceRefs(t *testing.T) {
 	}
 }
 
-// judge_start warns when any coder of the checklist shares the judge's family, as same_family is set:
-// mixed coders do not hide it.
+// judge_start warns when any succeeded coder of the checklist shares the judge's family, as same_family
+// is set: mixed coders do not hide it.
 func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
 	m := newManager(t)
-	m.Cfg.CodexWriteAllowed = true // a codex fix job
 	repo, sha := gateRepo(t)
 	approveBrief(t, m, repo)
 	judge := func(model string) *store.Job {
@@ -59,23 +58,16 @@ func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
 		}
 		return j
 	}
-	claude := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	codex := enqueue(t, m, "build it too", func(r *StartRequest) {
-		r.Kind, r.RepoPath, r.Covers, r.Model = "fix", repo, []string{"R01"}, "gpt-5.6-sol"
-	})
-	for _, c := range []*store.Job{claude, codex} {
-		if err := m.Cancel(c.ID); err != nil {
-			t.Fatal(err)
-		}
-	}
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "opus", "R01")
+	insertCoder(t, m, repo, "codex-ok", store.StatusSucceeded, SizeLarge, store.RunnerCodex, "gpt-5.6-sol", "R01")
 	for _, model := range []string{"sonnet", "gpt-5.6-sol"} {
 		j := judge(model)
-		share := claude
+		share := "claude-ok"
 		if model != "sonnet" {
-			share = codex
+			share = "codex-ok"
 		}
 		w, err := m.JudgeFamilyWarning(j)
-		if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, share.ID) {
+		if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, share) {
 			t.Fatalf("judge %s of mixed coders: %q %v", model, w, err)
 		}
 	}

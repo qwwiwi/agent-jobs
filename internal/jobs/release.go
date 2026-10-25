@@ -271,7 +271,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	coders, err := m.Store.FeatureJobs(main, c.ID)
+	coders, familyOf, err := familyCoders(m.Store, main, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,23 +350,19 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		set(ReleaseBlind, false, "no verdict")
 	} else {
 		out.JudgeFamily = ModelFamily(latest.JudgeRunner, latest.JudgeModel)
-		// Only the succeeded feature jobs count (owner decision 2026-10-25): a failed, cancelled or small
-		// coder delivered no feature, and counting it deadlocked claude coders against every judge.
+		// Only the succeeded feature jobs count (familyCoders, owner decision 2026-10-25): a failed,
+		// cancelled or small coder delivered no feature, and counting it deadlocked claude coders against
+		// every judge.
 		var same []string
-		delivered := 0
-		for _, cj := range coders {
-			if cj.Status != store.StatusSucceeded {
-				continue
-			}
-			delivered++
+		for _, cj := range familyOf {
 			if ModelFamily(cj.Runner, cj.Model) == out.JudgeFamily {
 				same = append(same, cj.ID)
 			}
 		}
 		switch {
-		case delivered == 0:
-			set(ReleaseFamily, false, "no succeeded feature job (a fix or general job of size large) covers checklist %s, so no coder "+
-				"family to differ from", c.ID)
+		case len(familyOf) == 0:
+			set(ReleaseFamily, false, "no succeeded feature job (a fix or general job with covers, size not small) covers checklist "+
+				"%s, so no coder family to differ from", c.ID)
 		case len(same) > 0:
 			set(ReleaseFamily, false, "the judge (%s, model %s) shares its family with coder job(s) %s", out.JudgeFamily,
 				latest.JudgeModel, strings.Join(same, ", "))
