@@ -35,11 +35,15 @@ func TestJobStartSize(t *testing.T) {
 	if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["size"] = "huge" })); !strings.Contains(msg, "must be small or large") {
 		t.Fatalf("bad size: %q", msg)
 	}
-	// Without size: allowed while size_required is off; the stored size stays empty.
-	var none JobView
+	// Without size: allowed while size_required is off; inferred from covers (owner decision 2026-10-25).
+	var none, covered JobView
 	call(t, cs, "job_start", startArgs(nil), &none)
-	if none.ID == "" || none.Size != "" {
+	if none.ID == "" || none.Size != "small" {
 		t.Fatalf("no size: %+v", none)
+	}
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = repo; a["covers"] = []string{"R01"} }), &covered)
+	if covered.Size != "large" {
+		t.Fatalf("no size, covers: %+v", covered)
 	}
 }
 

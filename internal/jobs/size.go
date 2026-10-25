@@ -32,9 +32,11 @@ const SizeRuleNote = "size: small for a fix or a single job; large for a new pro
 //
 //   - Any kind: size is "", small or large.
 //   - fix / general without a size: refused when r.SizeRule is set (job_start, agent-jobs start) and
-//     config size_required is on; otherwise allowed and logged by Enqueue.
-//   - fix / general with size large: covers must be non-empty, and every covered row a live requirement
-//     (an R, Ri or G row with contract live). This holds whether size_required is on or off.
+//     config size_required is on (default off); otherwise it is inferred (owner decision 2026-10-25):
+//     large when the job has covers, else small, and logged by Enqueue.
+//   - fix / general with size large (given or inferred): covers must be non-empty, and every covered row
+//     a live requirement (an R, Ri or G row with contract live). This holds whether size_required is on
+//     or off.
 func (m *Manager) checkSize(r StartRequest, covers []string, cover *store.CoverContract) (string, error) {
 	size := strings.TrimSpace(r.Size)
 	if size != "" && size != SizeSmall && size != SizeLarge {
@@ -43,11 +45,16 @@ func (m *Manager) checkSize(r StartRequest, covers []string, cover *store.CoverC
 	if !slices.Contains(SizeKinds, r.Kind) {
 		return size, nil
 	}
-	switch size {
-	case "":
+	if size == "" {
 		if r.SizeRule && m.Config().SizeRequired {
 			return "", fmt.Errorf("size is required for a %s job (config size_required is on): %s", r.Kind, SizeRuleNote)
 		}
+		size = SizeSmall
+		if len(covers) > 0 {
+			size = SizeLarge
+		}
+	}
+	switch size {
 	case SizeLarge:
 		if len(covers) == 0 || cover == nil {
 			return "", errors.New("size large needs covers: the live requirement IDs of the repo's approved " +
