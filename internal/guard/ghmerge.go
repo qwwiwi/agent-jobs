@@ -66,16 +66,19 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 		}
 	}
 	var ghRepos []string
-	pending := "" // why every later call of the command cannot be read
+	// Why every later call of the command cannot be read: dirPending where it runs or which GH_REPO it
+	// takes (a call that names its repository, -R or a PR URL, does not depend on it), shellPending what
+	// `gh` itself runs.
+	dirPending, shellPending := "", ""
 	later := func(why string) {
-		if pending == "" {
-			pending = why
+		if dirPending == "" {
+			dirPending = why
 		}
 	}
 	dirs := newMergeDirs(cmd, cwd)
-	if why := sameShellChanges(scripts); why != "" {
-		later(why)
-	}
+	dirWhy, shellWhy := sameShellChanges(scripts)
+	later(dirWhy)
+	shellPending = shellWhy
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
@@ -88,6 +91,14 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 					!v.splitString && v.wrapperUnknown == "" && v.envUnknown == ""
 				if r := unverifiable(sc, c); r != "" && unsure == "" && !git && !quiet {
 					unsure = cannotForm(r)
+				}
+				if g, ok := ghGroup(argv, dyn); ok && !ghGroups[g] && unsure == "" {
+					unsure = "gh " + g + " is no built-in gh command (an alias or an extension, which may run gh pr merge)"
+				}
+				if sc.depth == 0 && git {
+					if why := gitMovesRepo(argv); why != "" {
+						later(why)
+					}
 				}
 				if len(argv) == 0 {
 					// `GH_REPO=o/r` alone sets it for the rest of the command (if exported already).
@@ -102,16 +113,24 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 						later(why)
 					}
 				case sc.depth == 0 && (name == "source" || name == "."):
-					later("source or . runs a file in this shell, which may change its directory or GH_REPO")
-				case sc.depth == 0 && (name == "export" || name == "declare" || name == "typeset"):
+					if shellPending == "" {
+						shellPending = "source or . runs a file in this shell, which may change its directory, GH_REPO or what gh runs"
+					}
+				case sc.depth == 0 && (name == "export" || name == "declare" || name == "typeset" || name == "readonly" || name == "local"):
 					ghRepos = append(ghRepos, envAssigned(argv, dyn, 1, len(argv), later)...)
+				case sc.depth == 0 && name != "gh" && name != "unset" && slices.ContainsFunc(argv[1:], namesRepoEnv):
+					later("GH_REPO, GIT_DIR, GIT_WORK_TREE or GIT_CONFIG set by " + name + ", which the reader does not follow")
 				case name == "gh":
 					call, ok := ghMergeCall(sc, c, v)
 					if !ok {
 						continue
 					}
-					if call.Unsure == "" {
-						call.Unsure = pending
+					switch {
+					case call.Unsure != "":
+					case shellPending != "":
+						call.Unsure = shellPending
+					case call.Repo == "":
+						call.Unsure = dirPending
 					}
 					call.Dirs = slices.Clone(dirs.dirs)
 					call.GHRepos = append(slices.Clone(ghRepos), call.GHRepos...)
@@ -130,8 +149,68 @@ func literalShellCode(c *simpleCmd, argv []string, dyn []bool) bool {
 	if len(argv) == 0 || len(c.nested) == 0 || slices.Contains(dyn, true) || !shells[progName(argv[0])] {
 		return false
 	}
-	_, ok := shellCode(argv)
-	return ok
+	code, ok := shellCode(argv)
+	// `bash -c -e 'code'`: the shell reads options after -c too, and the code is a later word.
+	return ok && !strings.HasPrefix(code, "-") && !strings.HasPrefix(code, "+")
+}
+
+// ghGroups are gh's built-in commands (gh 2.45 `gh help`, and later ones); an alias or extension cannot
+// take their names.
+var ghGroups = map[string]bool{"alias": true, "api": true, "at": true, "attestation": true, "auth": true, "browse": true,
+	"cache": true, "co": true, "codespace": true, "completion": true, "config": true, "cs": true, "ext": true, "extension": true,
+	"extensions": true, "gist": true, "gpg-key": true, "help": true, "issue": true, "label": true, "org": true, "pr": true,
+	"preview": true, "project": true, "release": true, "repo": true, "rs": true, "ruleset": true, "run": true, "search": true,
+	"secret": true, "ssh-key": true, "status": true, "variable": true, "version": true, "workflow": true}
+
+// ghGroup is the literal first positional word of a gh call (ok false when there is none, it is not
+// literal, or a flag before it may take a value).
+func ghGroup(argv []string, dyn []bool) (string, bool) {
+	if len(argv) == 0 || dyn[0] || !isProg(argv[0], "gh") {
+		return "", false
+	}
+	pos, unknown := ghPositional(argv)
+	if unknown != "" || len(pos) == 0 || dyn[pos[0]] {
+		return "", false
+	}
+	return argv[pos[0]], true
+}
+
+// repoEnvNames are the variables that move gh to another repository or change what git reports as its
+// remotes; HOME, XDG_CONFIG_HOME and GH_CONFIG_DIR change the configuration gh and git read (aliases,
+// url.*.insteadOf).
+var repoEnvNames = []string{"GH_REPO", "GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CEILING_DIRECTORIES",
+	"GIT_DISCOVERY_ACROSS_FILESYSTEM", "GH_CONFIG_DIR", "XDG_CONFIG_HOME"}
+
+// namesRepoEnv reports a word naming one of repoEnvNames other than as an expansion ($GH_REPO,
+// ${GH_REPO}): `printf -v GH_REPO`, `read GH_REPO`.
+func namesRepoEnv(w string) bool {
+	for _, n := range repoEnvNames {
+		rest := strings.ReplaceAll(strings.ReplaceAll(w, "${"+n, ""), "$"+n, "")
+		if strings.Contains(rest, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitMovesRepo is why a git command before a gh pr merge may change the repository gh takes ("" = it
+// cannot): a clone, init or worktree, a change of the remotes, any git config call.
+func gitMovesRepo(argv []string) string {
+	g, _ := parseGit(argv)
+	if g.subIdx >= len(argv) {
+		return ""
+	}
+	sub, next := argv[g.subIdx], ""
+	if g.subIdx+1 < len(argv) {
+		next = argv[g.subIdx+1]
+	}
+	switch {
+	case sub == "clone" || sub == "init" || sub == "worktree" || sub == "config" || sub == "submodule":
+	case sub == "remote" && slices.Contains([]string{"add", "rename", "remove", "rm", "set-url", "set-head"}, next):
+	default:
+		return ""
+	}
+	return "git " + sub + " in the command may change the repository or remotes gh takes"
 }
 
 // cdName is a command that changes the shell's directory (chdir as the guard's cdView counts it).
@@ -144,9 +223,9 @@ func cdName(name string) bool {
 // GH_REPO / GIT_DIR / GIT_WORK_TREE inside an eval or trap body (they run in the same shell, a trap at any
 // later point), or a cd or source in a command with a loop or a function (reFuncDef; its body may run
 // again, after the call's text, or before it more than once).
-func sameShellChanges(scripts []*script) string {
+func sameShellChanges(scripts []*script) (dirWhy, shellWhy string) {
 	if len(scripts) == 0 {
-		return ""
+		return "", ""
 	}
 	moves, repeats := false, false
 	for _, sc := range scripts {
@@ -161,6 +240,9 @@ func sameShellChanges(scripts []*script) string {
 						repeats = true
 					}
 				}
+				if slices.ContainsFunc(c.words, namesRepoEnv) {
+					moves = true
+				}
 				if argv := c.words[v.start:]; len(argv) > 0 {
 					switch name := progName(argv[0]); {
 					case name == "for" || name == "select" || name == "function":
@@ -168,20 +250,21 @@ func sameShellChanges(scripts []*script) string {
 					case cdName(name) || name == "source" || name == ".":
 						moves = true
 					case name == "alias":
-						return "an alias, whose text runs where it is used"
+						shellWhy = "an alias, whose text runs where it is used"
 					}
 				}
 			}
 		}
 	}
 	if moves && repeats {
-		return "a cd or source in a command with a loop or a function, which may run it more than once or after the call"
+		dirWhy = "a cd, source or GH_REPO / GIT_* change in a command with a loop or a function, which may run it more " +
+			"than once or before a call written earlier"
+		return dirWhy, shellWhy
 	}
 	var walk func(sc *script, top bool) string
 	walk = func(sc *script, top bool) string {
-		if !top && (strings.Contains(sc.src, "GH_REPO") || strings.Contains(sc.src, "GIT_DIR") ||
-			strings.Contains(sc.src, "GIT_WORK_TREE")) {
-			return "GH_REPO, GIT_DIR or GIT_WORK_TREE inside an eval or trap body"
+		if !top && namesRepoEnv(sc.src) {
+			return "GH_REPO, GIT_DIR, GIT_WORK_TREE or GIT_CONFIG inside an eval or trap body"
 		}
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
@@ -205,7 +288,7 @@ func sameShellChanges(scripts []*script) string {
 		}
 		return ""
 	}
-	return walk(scripts[0], true)
+	return walk(scripts[0], true), shellWhy
 }
 
 // mergeDirs are the candidate directories of the shell while a command is read (GhMerge.Dirs), with the
@@ -229,6 +312,9 @@ func newMergeDirs(cmd, cwd string) *mergeDirs {
 // cd adds the directories cd / pushd / popd argv moves each candidate to; why is set when the target
 // cannot be followed exactly (then the candidates are no longer known).
 func (d *mergeDirs) cd(argv []string, dyn []bool) (why string) {
+	if i := slices.Index(argv, "--"); i > 0 && i+1 < len(argv) && strings.HasPrefix(argv[i+1], "-") {
+		return "a cd to a directory whose name starts with -"
+	}
 	t, ok := d.view.cdTarget(argv, dyn, d.cdpath)
 	switch {
 	case !ok:
@@ -276,6 +362,9 @@ func envAssigned(words []string, dyn []bool, from, to int, unsure func(string)) 
 			repos = append(repos, strings.TrimPrefix(w, "GH_REPO="))
 		case strings.HasPrefix(w, "GIT_DIR=") || strings.HasPrefix(w, "GIT_WORK_TREE="):
 			unsure("GIT_DIR or GIT_WORK_TREE set, which moves gh to another repository")
+		case reAssign.MatchString(w) && (strings.HasPrefix(w, "HOME=") || namesRepoEnv(strings.SplitN(w, "=", 2)[0])):
+			unsure("HOME, GIT_CONFIG*, GH_CONFIG_DIR or XDG_CONFIG_HOME set, which changes the configuration or the " +
+				"repository gh and git read")
 		}
 	}
 	return repos

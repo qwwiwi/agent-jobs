@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -211,9 +212,17 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 		return nil, "the hook input has no absolute cwd", nil
 	}
 	for _, d := range call.Dirs {
+		if _, err := os.Stat(d); err != nil {
+			// The command may create it before the call (git clone, mkdir, ln -s): what is there then is unknown.
+			return nil, fmt.Sprintf("the directory %s does not exist now", d), nil
+		}
+		// Inside a .git directory git has no work tree, gh still finds the repository's remotes.
+		if i := strings.Index(d+"/", "/.git/"); i > 0 {
+			d = d[:i]
+		}
 		_, main, err := ChecklistRepo(d)
 		if err != nil {
-			continue // not a git work tree (or gone): gh has no repository there
+			continue // not a git work tree: gh has no repository there
 		}
 		r, err := g.repo(main)
 		if err != nil {

@@ -67,12 +67,17 @@ func TestMergeGateCdLikeTheShell(t *testing.T) {
 		name, cwd, cmd string
 		want           string
 	}{
-		{"cd in a subshell", parent, "(cd " + elsewhere + "); cd " + name + " && gh pr merge 5", "without --match-head-commit"},
-		{"cd in a branch not taken", parent, "false && cd " + elsewhere + "; cd " + name + " && gh pr merge 5", "without --match-head-commit"},
+		{"cd in a subshell", parent, "(cd " + elsewhere + "); cd " + name + " && gh pr merge 5", MergeGatePrefix},
+		{"cd in a branch not taken", parent, "false && cd " + elsewhere + "; cd " + name + " && gh pr merge 5", MergeGatePrefix},
 		{"HOME set, bare cd", elsewhere, "HOME=" + repo + "; cd; gh pr merge 5", "cannot tell"},
 		{"HOME prefix on cd", elsewhere, "HOME=" + repo + " cd && gh pr merge 5", "cannot tell"},
 		{"CDPATH exported", elsewhere, "export CDPATH=" + parent + "; cd " + name + " && gh pr merge 5", "cannot tell"},
 		{"plain cd to an unrelated directory", parent, "cd " + elsewhere + " && gh pr merge 5", ""},
+		{"cd into .git", parent, "cd " + name + "/.git && gh pr merge 5", "without --match-head-commit"},
+		{"cd to a directory the command creates", elsewhere, "git clone -q " + repo + " " + elsewhere + "/new && cd " +
+			elsewhere + "/new && gh pr merge 5", "cannot tell"},
+		{"cd to a symlink the command creates", elsewhere, "ln -s " + repo + " " + elsewhere + "/l && cd " + elsewhere +
+			"/l && gh pr merge 5", "does not exist now"},
 	} {
 		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)
