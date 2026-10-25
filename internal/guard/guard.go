@@ -701,6 +701,15 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						return protectedBlocked(p)
 					}
 				}
+				if g, ok := parseGit(argv); ok {
+					// git diff --output, archive -o, format-patch's directory: a protected path is no target.
+					outs, _ := gitWriteTargets(argv, g)
+					for _, t := range outs {
+						if p, ok := s.hit(t, true); ok {
+							return protectedBlocked(p)
+						}
+					}
+				}
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
@@ -2230,8 +2239,8 @@ func globBlocked(w string) string {
 		"that may write; the guard does not expand globs (one could resolve to .git). Write the paths out."
 }
 
-// codeGlobBlocked is the reason for a glob in inline code that can name git's config or hooks, a
-// protected path or the agent state (codeGlobReach).
+// codeGlobBlocked is the reason for a `*` pattern in inline code that can name git's config or hooks,
+// a protected path or the agent state (codeGlobReason).
 func codeGlobBlocked(p string) string {
 	return "blocked by guard: the pattern `" + p + "` in inline code can match git's config or hooks, a job's git " +
 		"dir, a protected path or agent-jobs state; the guard does not expand it. Write the paths out."
@@ -2292,10 +2301,10 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 				}
 				name := progName(argv[0])
 				if g, ok := parseGit(argv); ok {
-					// git diff/log/show --output=<file> writes there like a redirection.
-					outs, _ := gitOutputs(g.args)
+					// git diff --output=<file>, archive -o, format-patch -o <dir> write there like a redirection.
+					outs, _ := gitWriteTargets(argv, g)
 					for _, t := range outs {
-						if gitFile(t) || gitDir(t) {
+						if gitFile(t) || inGitDir(t) {
 							return blocked(t)
 						}
 						if hasGlob(reBraceVar.ReplaceAllString(t, "")) {
@@ -2320,12 +2329,12 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 					}
 					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word
 					// the shell does not glob: its `*` is code, as in a script file (noise.go), unless a glob
-					// character in it is unquoted, or the code globs a path the job never writes.
+					// character in it is unquoted, or the code may glob a path the job never writes.
 					if !inlineCode(name, argv, k+1) || c.glob[off+k+1] {
 						return globBlocked(a)
 					}
-					if p := codeGlobReach(a, cfg); p != "" {
-						return codeGlobBlocked(p)
+					if r := codeGlobReason(a, cfg); r != "" {
+						return r
 					}
 				}
 			}

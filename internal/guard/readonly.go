@@ -152,8 +152,12 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		if gitWorktreeWriters[strings.ToLower(g.sub)] {
 			return readOnlyBlocked("`git " + g.sub + "`")
 		}
+		// archive and format-patch write files (format-patch into the worktree by default).
+		if gitFileWriters[strings.ToLower(g.sub)] {
+			return readOnlyBlocked("`git " + g.sub + "` (it writes files)")
+		}
 		// `git diff --output=<file>` writes the file.
-		outs, _ := gitOutputs(g.args)
+		outs, _ := gitWriteTargets(argv, g)
 		for _, t := range outs {
 			if p, ok := s.roHit(t, strings.ContainsAny(t, "$`"), false); ok {
 				return readOnlyBlocked("`git " + g.sub + " --output` on `" + p + "`")

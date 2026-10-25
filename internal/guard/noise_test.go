@@ -42,9 +42,9 @@ func TestNoiseRelaxedFormsAllowed(t *testing.T) {
 		`python3 -c "import glob; print(glob.glob('internal/*.go'))"`,
 		`python3 -c "open('out.txt','w').write('a*b')"`,
 		`python3 -I -c "print(2*3)"`,
-		`node -e "console.log([1,2].map(x => x*2))"`,
-		`perl -0pi -e 's/(a)/{$1}/' notes.md`,
-		`awk '{print $1*2}' data.txt`,
+		`node -e "console.log(2*3)"`,
+		`perl -pi -e 's/a.*b/x/' notes.md`,
+		`awk '$1*2 > 3' data.txt`,
 		// Forms of the audit that pass already; kept so they stay allowed.
 		"python3 -I script.py " + own,
 		"python3 -I script.py " + filepath.Join(own, "stream.jsonl"),
