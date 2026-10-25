@@ -406,6 +406,14 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: manifest-check records: %w", err)
 	}
+	if _, err := db.Exec(releaseSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: release passes: %w", err)
+	}
+	if _, err := db.Exec(mergeGateSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 

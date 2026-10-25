@@ -50,6 +50,9 @@ type hookInput struct {
 	SessionID      *string `json:"session_id"`
 	StopHookActive *bool   `json:"stop_hook_active"`
 	Cwd            *string `json:"cwd"`
+	// ToolName and ToolInput are a PreToolUse event's (the merge hook).
+	ToolName  *string         `json:"tool_name"`
+	ToolInput json.RawMessage `json:"tool_input"`
 }
 
 // readHookInput reads one JSON object (at most MaxHookInputBytes) with a non-empty hook_event_name.

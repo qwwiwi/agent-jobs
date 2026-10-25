@@ -445,6 +445,11 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 				Rows: approvedRows(res.List.Rows), BriefFileSHA256: checklist.SHA256Hex(res.BriefAfter)}); err != nil {
 				return nil, ChecklistView{}, fmt.Errorf("files written; the approval was not stored, so the checklist is not approved: %w", err)
 			}
+			// The merge hook (F9 (b)) matches the gated repository by these names once its work tree is gone.
+			if err := m.RecordGateNames(main); err != nil {
+				res.Warnings = append(res.Warnings, "approved; the remote names for the merge gate were not stored "+
+					"(release_check stores them on a pass, the daemon's backfill at its next start; the merge hook only reads them): "+jobs.RedactPrintable(err.Error(), 200))
+			}
 		}
 		added := 0
 		for _, w := range waivers {

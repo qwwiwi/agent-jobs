@@ -603,10 +603,19 @@ type CoverJob struct {
 // CoverJobs lists the fix and general jobs of repo whose covers were read from checklist id (any
 // version, any status), oldest first.
 func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
-	rows, err := s.db.Query(`SELECT id, kind, status, runner, model, covers, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
-		AND kind IN ('fix','general') ORDER BY created_at, id`, repo)
+	out, err := s.coverJobs(repo, id, "")
 	if err != nil {
 		return nil, fmt.Errorf("cover jobs: %w", err)
+	}
+	return out, nil
+}
+
+// coverJobs is CoverJobs with an extra condition on the jobs row (and, "" = none).
+func (s *Store) coverJobs(repo, id, and string) ([]CoverJob, error) {
+	rows, err := s.db.Query(`SELECT id, kind, status, runner, model, covers, cover_contract FROM jobs WHERE repo_path=? AND cover_contract<>''
+		AND kind IN ('fix','general') `+and+` ORDER BY created_at, id`, repo)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	var out []CoverJob
@@ -614,11 +623,11 @@ func (s *Store) CoverJobs(repo, id string) ([]CoverJob, error) {
 		var j CoverJob
 		var covers, cc string
 		if err := rows.Scan(&j.ID, &j.Kind, &j.Status, &j.Runner, &j.Model, &covers, &cc); err != nil {
-			return nil, fmt.Errorf("cover jobs: %w", err)
+			return nil, err
 		}
 		var c CoverContract
 		if err := json.Unmarshal([]byte(cc), &c); err != nil {
-			return nil, fmt.Errorf("cover jobs: job %s: cover_contract: %w", j.ID, err)
+			return nil, fmt.Errorf("job %s: cover_contract: %w", j.ID, err)
 		}
 		if c.ChecklistID == id {
 			j.Covers = SplitNames(covers)

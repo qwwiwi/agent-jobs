@@ -1607,12 +1607,19 @@ func (v *cdView) cdTarget(argv []string, dyn []bool, cdpath bool) (string, bool)
 	return v.home, v.home != "" // cd alone: HOME
 }
 
+// cdEnv is what a cd in cmd depends on beyond its argument: HOME for `cd` and `~` ("" when the call may
+// set HOME itself), and whether CDPATH or cdable_vars may move a bare relative target.
+func cdEnv(cmd string) (home string, cdpath bool) {
+	if h := os.Getenv("HOME"); filepath.IsAbs(h) && !reHomeSet.MatchString(cmd) {
+		home = filepath.Clean(h)
+	}
+	return home, strings.Contains(cmd, "CDPATH") || os.Getenv("CDPATH") != "" || strings.Contains(cmd, "cdable_vars")
+}
+
 func newCdView(scripts []*script, cmd string, cfg Config) cdView {
 	v := cdView{dirs: []string{cfg.Dir}}
-	if h := os.Getenv("HOME"); filepath.IsAbs(h) && !reHomeSet.MatchString(cmd) {
-		v.home = filepath.Clean(h)
-	}
-	cdpath := strings.Contains(cmd, "CDPATH") || os.Getenv("CDPATH") != "" || strings.Contains(cmd, "cdable_vars")
+	home, cdpath := cdEnv(cmd)
+	v.home = home
 	trailing := trailingPopd(scripts)
 	var targets []string
 	for _, sc := range scripts {
