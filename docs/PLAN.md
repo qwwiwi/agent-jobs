@@ -137,7 +137,7 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 
 ## Wave F: brief-acceptance gate
 
-*Status: approved 2026-10-24; F1–F7, F9 and F10 built (not released), the rest not built.* Owner decisions of 2026-10-24 in [DECISIONS.md](DECISIONS.md); the items that diverge from the reference have a «proposed» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-wave-f). Takes ideas I1 (requirement ledger), I2 (blind acceptance job) and the REDPROOF and placeholder parts of I5 from «Ideas» below.
+*Status: approved 2026-10-24; F1–F8, F9 (a), (b) and (c) and F10 built (not released).* Owner decisions of 2026-10-24 in [DECISIONS.md](DECISIONS.md); the items that diverge from the reference have a «proposed» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-wave-f). Takes ideas I1 (requirement ledger), I2 (blind acceptance job) and the REDPROOF and placeholder parts of I5 from «Ideas» below.
 
 **Goal.** For large work, the owner's words become a numbered checklist that the owner approves once. Every job reports against that checklist, a blind judge checks the code at a given sha against the brief, and merge or deploy happens only at 100% acceptance. Nothing the owner asked for is lost or reinterpreted on the way. The gate is held by hooks and tools, not by the orchestrator's memory.
 
@@ -175,7 +175,7 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 
 **Pack 3.**
 
-- **F8. Kind `briefing`.** Read-only. Input: BRIEF and the draft CHECKLIST. Output: JSON rounds of at most 4 questions `{n, closes[R..], kind, q, recommended, why}`, a `decided[]` list marked ASSUMPTION, and for large features an optional adversarial pass (7 questions). DEVIATIONS F8.
+- **F8. Kind `briefing`.** *Built (not released): kind `briefing`, tools `briefing_start` / `briefing_get`, `changed_since_approval` in `checklist_get` / `checklist_set`; DEVIATIONS #35.* Read-only. Input: BRIEF and the draft CHECKLIST. Output: JSON rounds of at most 4 questions `{n, closes[R..], kind, q, recommended, why}`, a `decided[]` list marked ASSUMPTION, and for large features an optional adversarial pass (7 questions). DEVIATIONS #35.
   - Rules. Each question names the rows it settles (`closes`); one that names none is cut. Anything outside the project that can stall it (payments, hosting, accounts, where data is stored) goes first, in round 1. What can be found out, the job finds out itself; the owner gets only choices, and only of these kinds: cost or dependence on a vendor, what the owner will see, decisions that are expensive to undo, business rules. No question asks for a secret.
   - Owner replies are written back through `checklist_set`. New scope becomes a `G##` row together with a dated BRIEF Addition. A choice between options goes into the Rationale of the `R` row it concerns. A cancellation sets the row to `dropped`, quoting the owner. Every such write bumps the version, and the owner re-approves only the rows that changed.
 

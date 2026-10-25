@@ -8,6 +8,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // GateRunInput is how a gate job runs: the model or complexity, runner and limits; never a brief.
@@ -24,6 +25,13 @@ type GateRunInput struct {
 // SlicingStartInput is slicing_start's input: the repository and how to run; no brief.
 type SlicingStartInput struct {
 	Repo        string `json:"repo" jsonschema:"absolute path of the project's git work tree (brief/BRIEF.md and brief/CHECKLIST.md are read there)"`
+	ChecklistID string `json:"checklist_id,omitempty" jsonschema:"when given, must be the id of the repository's checklist"`
+	GateRunInput
+}
+
+// BriefingStartInput is briefing_start's input: the repository and how to run; no brief.
+type BriefingStartInput struct {
+	Repo        string `json:"repo" jsonschema:"absolute path of the project's git work tree (brief/BRIEF.md and the draft brief/CHECKLIST.md are read there)"`
 	ChecklistID string `json:"checklist_id,omitempty" jsonschema:"when given, must be the id of the repository's checklist"`
 	GateRunInput
 }
@@ -62,6 +70,27 @@ func addSlicingStart(s *sdk.Server, d Deps) {
 	})
 }
 
+func addBriefingStart(s *sdk.Server, d Deps) {
+	addManagerTool(s, d, &sdk.Tool{
+		Name: "briefing_start",
+		Description: "Queue the briefing (Wave F, F8) of the repo's draft checklist, before the owner approves it: a read-only job of " +
+			"kind briefing that gets only brief/BRIEF.md and the checklist rows (read by the daemon now, approved or not; no code, " +
+			"no briefs or reports) and returns the owner's question rounds in a validated JSON block of its final message: rounds " +
+			"of at most 4 questions {n, closes, kind, q, recommended, why}, each closing named checklist rows, of kind " +
+			"cost_or_vendor | owner_visible | costly_to_undo | business_rule, never asking for a secret; decided (the job's " +
+			"ASSUMPTIONs, with the rows they close) and an optional adversarial pass of at most 7 questions. Stored for the " +
+			"checklist id, version and hash; briefing_get reads it. The owner's replies go back through checklist_set. There is " +
+			"no brief: the job's input is the daemon's. A claude job is held to its input by the guard (enforced_blind true); " +
+			"a codex job is not confined (enforced_blind false).",
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in BriefingStartInput) (*sdk.CallToolResult, JobView, error) {
+		j, err := d.Manager.StartGate(gateRequest(jobs.KindBriefing, in.Repo, "", in.ChecklistID, in.GateRunInput))
+		if err != nil {
+			return nil, JobView{}, fmt.Errorf("briefing_start rejected: %w", err)
+		}
+		return nil, view(d.Manager, j), nil
+	})
+}
+
 func addJudgeStart(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "judge_start",
@@ -95,7 +124,7 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 	})
 }
 
-// GateGetInput is slicing_get's and judge_get's input.
+// GateGetInput is slicing_get's, briefing_get's and judge_get's input.
 type GateGetInput struct {
 	Repo        string `json:"repo" jsonschema:"absolute path of the project's git work tree"`
 	ChecklistID string `json:"checklist_id,omitempty" jsonschema:"default: the id of the repository's checklist"`
@@ -145,6 +174,37 @@ func SlicingGet(m *jobs.Manager, repo, id string) (SlicingGetOutput, error) {
 	return out, nil
 }
 
+// BriefingGetOutput is briefing_get's output.
+type BriefingGetOutput struct {
+	ChecklistID string `json:"checklist_id"`
+	// Version and SHA256 are the checklist's as it is now.
+	Version int    `json:"version"`
+	SHA256  string `json:"sha256"`
+	// Current is true when the result was run on that version and hash.
+	Current bool                  `json:"current"`
+	Result  *store.BriefingResult `json:"result"`
+}
+
+// BriefingGet is briefing_get (and `agent-jobs gate briefing`).
+func BriefingGet(m *jobs.Manager, repo, id string) (BriefingGetOutput, error) {
+	top, main, id, err := gateChecklist(m, repo, id)
+	if err != nil {
+		return BriefingGetOutput{}, err
+	}
+	out := BriefingGetOutput{ChecklistID: id}
+	if v, err := currentChecklist(m, top, main); err == nil && v.ID == id {
+		out.Version, out.SHA256 = v.Version, v.SHA256
+	}
+	bv, err := m.BriefingOf(main, id, out.Version, out.SHA256)
+	if err != nil {
+		return BriefingGetOutput{}, err
+	}
+	if bv != nil {
+		out.Current, out.Result = bv.Current, bv.Result
+	}
+	return out, nil
+}
+
 // JudgeGet is judge_get (and `agent-jobs gate verdict`).
 func JudgeGet(m *jobs.Manager, repo, id, sha string) (jobs.VerdictView, error) {
 	_, main, id, err := gateChecklist(m, repo, id)
@@ -170,6 +230,22 @@ func addSlicingGet(s *sdk.Server, d Deps) {
 			return nil, SlicingGetOutput{}, fmt.Errorf("slicing_get: sha does not apply")
 		}
 		out, err := SlicingGet(d.Manager, in.Repo, in.ChecklistID)
+		return nil, out, err
+	})
+}
+
+func addBriefingGet(s *sdk.Server, d Deps) {
+	addManagerTool(s, d, &sdk.Tool{
+		Name: "briefing_get",
+		Description: "The briefing (F8) of the repo's checklist: the latest result for its current version and hash (current true) or " +
+			"else the latest one of the checklist id (an older draft; result null when none): rounds of questions with the rows " +
+			"each closes and the proposed answer, decided (ASSUMPTIONs), adversarial, the job, model and enforced_blind (false " +
+			"when a codex job stored it). Put the rounds to the owner one at a time; write the replies with checklist_set.",
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, BriefingGetOutput, error) {
+		if in.SHA != "" {
+			return nil, BriefingGetOutput{}, fmt.Errorf("briefing_get: sha does not apply")
+		}
+		out, err := BriefingGet(d.Manager, in.Repo, in.ChecklistID)
 		return nil, out, err
 	})
 }

@@ -95,6 +95,8 @@ var toolDefs = []toolDef{
 	{"checklist_set", addChecklistSet},
 	{"slicing_start", addSlicingStart},
 	{"slicing_get", addSlicingGet},
+	{"briefing_start", addBriefingStart},
+	{"briefing_get", addBriefingGet},
 	{"judge_start", addJudgeStart},
 	{"judge_get", addJudgeGet},
 	{"release_check", addReleaseCheck},

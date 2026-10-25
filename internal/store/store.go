@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 	id              TEXT PRIMARY KEY,
 	agent           TEXT NOT NULL,
 	title           TEXT NOT NULL,
-	kind            TEXT NOT NULL CHECK (kind IN ('review','fix','research','general','slicing','judge')),
+	kind            TEXT NOT NULL CHECK (kind IN ('review','fix','research','general','slicing','judge','briefing')),
 	brief           TEXT NOT NULL,
 	repo_path       TEXT NOT NULL DEFAULT '',
 	base_commit     TEXT NOT NULL DEFAULT '',
@@ -425,15 +425,27 @@ func migrateStatusCheck(db *sql.DB) error {
 	return rebuildCheck(db, "status", statusCheckOld, statusCheckNew)
 }
 
-// kindCheckOld / kindCheckNew are the kind CHECK of the jobs table before and after the gate kinds
-// (Wave F: slicing, judge).
+// kindCheckOld / kindCheckGate / kindCheckNew are the kind CHECK of the jobs table before the gate
+// kinds, with the first two (Wave F: slicing, judge) and with briefing (F8).
 const (
-	kindCheckOld = "('review','fix','research','general'))"
-	kindCheckNew = "('review','fix','research','general','slicing','judge'))"
+	kindCheckOld  = "('review','fix','research','general'))"
+	kindCheckGate = "('review','fix','research','general','slicing','judge'))"
+	kindCheckNew  = "('review','fix','research','general','slicing','judge','briefing'))"
 )
 
-// migrateKindCheck rebuilds a jobs table whose kind CHECK predates the gate kinds (rebuildCheck).
-func migrateKindCheck(db *sql.DB) error { return rebuildCheck(db, "kind", kindCheckOld, kindCheckNew) }
+// migrateKindCheck rebuilds a jobs table whose kind CHECK predates a gate kind (rebuildCheck), from
+// whichever earlier CHECK it has.
+func migrateKindCheck(db *sql.DB) error {
+	var q string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'`).Scan(&q); err != nil {
+		return err
+	}
+	old := kindCheckGate
+	if strings.Contains(q, kindCheckOld) {
+		old = kindCheckOld
+	}
+	return rebuildCheck(db, "kind", old, kindCheckNew)
+}
 
 // rebuildCheck rebuilds a jobs table whose what CHECK is still old: same definition (all columns, in
 // order) with the new CHECK, rows copied, index recreated, all in one IMMEDIATE transaction that

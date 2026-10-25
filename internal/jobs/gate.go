@@ -25,17 +25,20 @@ import (
 // Gate kinds (Wave F): read-only jobs whose input the daemon assembles from the repository's brief
 // files, never from an orchestrator brief. KindSlicing is the slicing check before the owner approves a
 // checklist (F3); KindJudge the blind acceptance judge of the code at a commit (F5; named judge, not
-// acceptance, so it never reads like acceptance_cmd, #18).
+// acceptance, so it never reads like acceptance_cmd, #18); KindBriefing the owner's question rounds on
+// the draft checklist (F8).
 const (
-	KindSlicing = "slicing"
-	KindJudge   = "judge"
+	KindSlicing  = "slicing"
+	KindJudge    = "judge"
+	KindBriefing = "briefing"
 )
 
 // gateIDRe is the checklist id a gate job accepts: it reaches the job's prompt outside the data fences.
 var gateIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-// GateKinds are the kinds started only by slicing_start / judge_start; job_start refuses them.
-var GateKinds = []string{KindSlicing, KindJudge}
+// GateKinds are the kinds started only by slicing_start / judge_start / briefing_start; job_start
+// refuses them.
+var GateKinds = []string{KindSlicing, KindJudge, KindBriefing}
 
 // IsGateKind reports a gate kind.
 func IsGateKind(kind string) bool { return slices.Contains(GateKinds, kind) }
@@ -47,8 +50,9 @@ func readOnlyKind(kind string) bool { return kind == "review" || IsGateKind(kind
 
 // Schemas of the gate jobs' JSON blocks.
 const (
-	SlicingSchema = "agent-jobs/slicing/v1"
-	JudgeSchema   = "agent-jobs/judge/v1"
+	SlicingSchema  = "agent-jobs/slicing/v1"
+	JudgeSchema    = "agent-jobs/judge/v1"
+	BriefingSchema = "agent-jobs/briefing/v1"
 )
 
 // Judge verdict values and how a verdict was reached.
@@ -96,7 +100,7 @@ type GateRequest struct {
 
 // StartGate queues a gate job: it reads brief/BRIEF.md and brief/CHECKLIST.md from the work tree
 // (under the checklist lock), redacted, and keeps them with the job as its only input. The slicing
-// check runs on the checklist as it is (approved or not); the judge needs the repository's latest
+// check and the briefing run on the checklist as it is (approved or not, a draft); the judge needs the repository's latest
 // approved checklist and a full commit id of the repository.
 func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	if !IsGateKind(r.Kind) {
@@ -151,7 +155,7 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 		}
 	default:
 		if sha != "" {
-			return nil, errors.New("slicing: sha does not apply (the slicing check reads the brief files only)")
+			return nil, fmt.Errorf("%s: sha does not apply (the %s job reads the brief files only)", r.Kind, r.Kind)
 		}
 	}
 	brief, _ := Redact(string(f.Brief))
@@ -168,8 +172,11 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 		return nil, fmt.Errorf("judge: checklist %s has no live requirements", c.ID)
 	}
 	title := fmt.Sprintf("slicing check %s v%d", c.ID, c.Version)
-	if r.Kind == KindJudge {
+	switch r.Kind {
+	case KindJudge:
 		title = fmt.Sprintf("judge %s v%d @ %s", c.ID, c.Version, sha[:12])
+	case KindBriefing:
+		title = fmt.Sprintf("briefing %s v%d", c.ID, c.Version)
 	}
 	return m.Enqueue(StartRequest{
 		Title: title, Kind: r.Kind, Brief: gateBriefLine(r.Kind, g), Model: r.Model, Complexity: r.Complexity,
@@ -719,16 +726,18 @@ func checkRef(ref GateChecklistRef, g *store.GateInput) error {
 }
 
 // text checks one text field: not longer than maxGateRunes; required ones not empty. It returns the
-// field redacted and on one line.
+// field redacted and on one line: redacted as written first (a PEM block split over lines is caught
+// whole only while its lines are intact), then again once on one line.
 func gateText(what, s string, required bool) (string, error) {
-	s = checklist.NormalizeField(s)
-	if required && s == "" {
+	norm := checklist.NormalizeField(s)
+	if required && norm == "" {
 		return "", fmt.Errorf("%s is empty", what)
 	}
-	if n := utf8.RuneCountInString(s); n > maxGateRunes {
+	if n := utf8.RuneCountInString(norm); n > maxGateRunes {
 		return "", fmt.Errorf("%s is longer than %d characters (%d)", what, maxGateRunes, n)
 	}
 	s, _ = Redact(s)
+	s, _ = Redact(checklist.NormalizeField(s))
 	return s, nil
 }
 
@@ -977,6 +986,19 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 	}
 	fail := func(err error) string { return gateFailPrefix + RedactPrintable(err.Error(), 300) }
 	blind := enforcedBlind(j.Runner)
+	if j.Kind == KindBriefing {
+		// A briefing result never bears on an approval: no checklist lock.
+		o, err := ValidateBriefing(report, j.Gate)
+		if err != nil {
+			return fail(err)
+		}
+		if _, err := st.PutBriefing(token, store.BriefingResult{JobID: j.ID, Repo: j.Gate.Repo, ChecklistID: j.Gate.ChecklistID,
+			Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, Model: j.Model, Runner: j.Runner,
+			EnforcedBlind: blind, Rounds: o.Rounds, Decided: o.Decided, Adversarial: o.Adversarial, CreatedAt: now}); err != nil {
+			return fail(err)
+		}
+		return ""
+	}
 	if j.Kind == KindSlicing {
 		o, err := ValidateSlicing(report, j.Gate)
 		if err != nil {
@@ -1055,10 +1077,14 @@ func (m *Manager) gateVerdict(j *store.Job, status, msg string, res StreamResult
 		return status, msg
 	}
 	var stored bool
-	if j.Kind == KindSlicing {
+	switch j.Kind {
+	case KindSlicing:
 		r, err := m.Store.SlicingByJob(j.ID, j.Attempt)
 		stored = err == nil && r != nil
-	} else {
+	case KindBriefing:
+		r, err := m.Store.BriefingByJob(j.ID, j.Attempt)
+		stored = err == nil && r != nil
+	default:
 		v, err := m.Store.VerdictByJob(j.ID, j.Attempt)
 		stored = err == nil && v != nil
 	}
