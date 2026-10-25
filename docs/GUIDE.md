@@ -280,7 +280,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 
 | tool | what it does |
 |---|---|
-| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*), `skills` (edits to the default skills: `+name`, `-name`), `covers` (checklist requirement IDs the job works on, see *Brief checklist*: needs `repo`, every ID must be a row of its `brief/CHECKLIST.md`, which must be the repository's latest approved checklist, and the covered rows go into the job's prompt whole), `size` (`small` \| `large`, see *Job size*); returns the queued row |
+| `job_start` | queue a job: title, kind, brief, repo, model or complexity (one is required), optional limits, `acceptance_cmd` (needs config `acceptance_allowed`), `owner_waits` (the owner asked for it, see *Owner waits*), `skills` (edits to the default skills: `+name`, `-name`), `covers` (checklist requirement IDs the job works on, see *Brief checklist*: needs `repo`, every ID must be a row of its `brief/CHECKLIST.md`, which must be the repository's latest approved checklist, and the covered rows go into the job's prompt whole), `size` (`small` \| `large`, see *Job size*), `milestone` + `task` (the milestone task the job works on, see [Milestones](#milestones): refused on a blocked or dropped task, the milestone's branch is the default base); returns the queued row |
 | `job_status` | status, turns, cost, time |
 | `job_result` | job-done line, report (capped at 256 KB, regular files only), artifact paths and the acceptance outcome; for a job with `covers` also `requirements` (its `### Requirements` block, `claimed` done lines, missing lines, the commits' `Requirements:` trailer) |
 | `job_list` | recent jobs, filterable by status |
@@ -325,6 +325,59 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
 | `intention_add` | add a goal: `text` (one line, ≤ 500 characters, control characters refused), optional `due` (`YYYY-MM-DD`) and `priority` (low \| normal \| high, default normal); returns it with its id, status `open` |
 | `intention_list` | the goals, oldest first; optional `status` filter (open \| done \| dropped) |
 | `intention_set` | edit a goal in place by `id`: `status` (open \| done \| dropped) and/or `text`; there is no delete, a goal given up is `dropped` |
+
+### Milestones
+
+**Milestones** (orchestrator only), kept in the agent's own job database. The terms, used the same way everywhere:
+
+- **checklist**: the acceptance list of a repository (`brief/CHECKLIST.md`, Wave F); it keeps its name and does not change.
+- **milestone**: a stage of work. A large project is a sequence of milestones (ordered by `order` within a repository).
+- **task**: one step of a milestone, keyed `T1`, `T2`, …, with optional `depends_on` (task keys) and `covers` (requirement IDs).
+- **job**: one run (`job_start`) that works on a task; a task may have several jobs (a rerun, a rework).
+
+**Rule:** a piece of work with more than one task is run as a milestone by default: one `milestone_create` call, then one `job_start(milestone, task)` per ready task. A single job needs no milestone, and no brief or checklist is needed for a milestone. There is no approval step: only `title` and `tasks` are required.
+
+| tool | what it does |
+|---|---|
+| `milestone_create` | `title` (one line, ≤ 200 characters), `tasks` (`[{key, title, depends_on?, covers?}]`, at least one, at most 100) and optional `goal`, `repo` (stored as its main worktree), `branch` (integration branch), `checklist_id` (the id of the repo's `brief/CHECKLIST.md`; `covers` must then be its live rows), `order`, `max_parallel`; returns the tree |
+| `milestone_set` | edit in place by `id`: `title`, `goal`, `branch`, `order`, `max_parallel` (0 removes the cap), `status` (open \| done \| dropped), `close_note`; `tasks` upserts by key (a nil `depends_on` / `covers` keeps the stored list, `[]` clears it; editing a dropped task brings it back); `drop` drops keys. Nothing is deleted. `status: done` is refused while a task is not done or dropped; returns the tree |
+| `milestone_get` | the tree of one milestone (schema below) |
+| `milestone_list` | milestones ordered by repo, then `order`, then creation; filters `status`, `repo`, `checklist_id`, `updated_since` (RFC 3339 or Unix seconds; the change cursor, inclusive); `tree: true` gives every milestone its full tree, so `repo` + `tree` is a whole project in one call |
+
+Writes refuse a dependency on an unknown key or on the task itself, and any cycle (`depends_on has a cycle: T1 -> T3 -> T2 -> T1`); a refused call changes nothing.
+
+**Task status** is derived from the task's jobs, never set by hand, decided in this order: `dropped`; `blocked` (a dependency that is not dropped is not `done`); `running` (a job is queued, running or stopped); `review` (the latest job succeeded and has no outcome yet); `done` (the latest job's outcome is `accepted` or `extended`); `failed` (the latest job failed, timed out or was cancelled, or its outcome is `discarded` or `reworked`); else `ready` (no job yet, or the latest one's outcome is `rerun`). So a task is done when you record `job_outcome(accepted)` for its job; that unblocks the tasks that depend on it.
+
+**Running tasks.** `job_start` takes `milestone` (id) and `task` (key), both or neither. It is refused when the milestone is not open, the task is unknown, `blocked` (the error names the dependencies it waits for) or `dropped`, or `repo` is not the milestone's repository. When the milestone has a `branch` that exists in the repository and `base` is not given, the job starts from that branch. Tasks without dependencies between them run in parallel, within `max_running`; `max_parallel` caps the running jobs of one milestone (1 = one after another: the daemon leaves the next job queued until a slot of the milestone is free). The daemon does not start ready tasks by itself.
+
+**Prior results.** A job on a task with `depends_on` gets a `## Prior results` section in its prompt: for each dependency, its latest job with outcome `accepted` (or `extended`), the job's commit (`refs/agent-jobs/jobs/<id>`, or its worktree's HEAD before cleanup) and diffstat, and the Summary and Findings / Changes of its `report.md`, redacted like `job_result`; about 3 KB per dependency and at most a quarter of `max_brief_bytes` in total, cut with `[... cut by agent-jobs]`. The full redacted report is copied to `<job dir>/prior/<key>/report.md` (mode 400; the guard refuses writes into `prior/`, reads are allowed). A dependency without an accepted job is listed as such.
+
+**updated_at** moves on any change to the milestone, its tasks, or a job attached to it (a job added, its status or its outcome changed, by any code path: database triggers), so a frontend can poll `milestone_list` with `updated_since`.
+
+**Tree** (`milestone_get`, each item of `milestone_list` with `tree`):
+
+```json
+{
+  "id": 3, "title": "Milestones M1", "goal": "store, MCP, prior results", "repo": "/home/me/agent-jobs",
+  "branch": "feature/milestones", "checklist_id": "milestones", "order": 1, "status": "open", "max_parallel": 2,
+  "created_at": "2026-10-25T19:00:00Z", "updated_at": "2026-10-25T19:40:00Z", "closed_at": "", "close_note": "",
+  "tasks": [
+    {"key": "T1", "title": "store", "status": "done", "depends_on": [], "covers": ["R01"],
+     "jobs": [{"id": "261025-190102-ab12", "status": "succeeded", "outcome": "accepted", "model": "opus",
+               "cost_usd": 1.2, "turns": 40, "created_at": "…", "finished_at": "…"}],
+     "created_at": "…", "updated_at": "…"},
+    {"key": "T2", "title": "tools", "status": "ready", "depends_on": ["T1"], "covers": ["R02"], "jobs": [], "created_at": "…", "updated_at": "…"}
+  ],
+  "ready": ["T2"],
+  "progress": {"tasks_done": 1, "tasks_total": 2, "acceptance_met": null, "acceptance_total": 2},
+  "uncovered": ["R03"],
+  "note": ""
+}
+```
+
+Empty optional fields are left out (`goal`, `repo`, `branch`, `checklist_id`, `max_parallel`, `closed_at`, `close_note`, `outcome`, `finished_at`, `uncovered`, `note`, and `ready` when no task is ready: read a missing list as empty). `progress.tasks_total` leaves dropped tasks out. `acceptance_total` counts the union of the tasks' `covers` (milestone tied to a checklist only, else 0); `acceptance_met` counts those the latest judge verdict of that checklist found `met`, and is `null` while there is no verdict. `uncovered` lists the checklist's live rows no task covers; `note` says why the checklist or the verdict could not be read. **List** (`milestone_list`): `{"milestones": [<milestone>, …]}`; without `tree` each item has the milestone fields only (no `tasks`, `ready`, `progress`, `uncovered`).
+
+`agent-jobs milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]` and `agent-jobs milestone --agent A <id> [--json]` print the same, as a table or JSON. The read-only HTTP API serves `GET /v1/milestones` and `GET /v1/milestones/{id}` (see Install and configure).
 
 **Schedules** (orchestrator only), a cron expression in local time plus a prompt, checked by the daemon every minute:
 
@@ -519,6 +572,7 @@ The owner's replies are written back with `checklist_set`: new scope is a `G<nn>
 | Files | `trash_move`, `trash_restore` | none | built |
 | Schedules | `schedule_add`, `schedule_list`, `schedule_set`, `schedule_remove` | none | built, released in 0.4.0 (Wave B) |
 | Own goals | `intention_add`, `intention_list`, `intention_set` | none | built, released in 0.4.0 (Wave B) |
+| Milestones | `milestone_create`, `milestone_set`, `milestone_get`, `milestone_list`; `job_start` `milestone` + `task` | the prior results of its task's dependencies | built (M1; the daemon does not start ready tasks yet) |
 | Owner | `notify_owner` | `notify_owner` | built, released in 0.4.0 (Wave B) |
 | Checks | `check_add`, `check_list`, `check_set`, `check_remove`, `check_mark` | `check_mark` | built, released in 0.4.0 (Wave B) |
 | Owner | `owner_replied` («owner waits» Stop hook) | none | built, released in 0.4.0 (Wave D) |
@@ -638,7 +692,7 @@ systemctl --user restart agent-jobs@my-agent           # the daemon starts the A
 curl -s --unix-socket ~/.agent-jobs/my-agent/http-api.sock -H "Authorization: Bearer $(cat ~/.agent-jobs/my-agent/http-api.token)" http://localhost/v1/health
 ```
 
-- `GET /v1/health`: version, start time, uptime, running and queued counts, `max_running`. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill|effort`: the `job_stats` summary. `GET /v1/stats` covers the last 30 days without `since`; a `since` older than 365 days is 400; at most 200 groups and skills (`groups_truncated`, `skills_truncated`). `GET /v1/schedules?limit=N&cursor=C`: schedules with their next firing, oldest first, pages of 100 by default (max 500); `next_cursor` is the `cursor` of the next page. `GET /v1/skills?since=D&repo=R&limit=N`: the skills rating for a frontend, per skill: status, `stale`, delivered, used, success rate, last used, median cost and `by_repo` (repository folder -> used, success rate), sorted by used count; 30 days by default (max 365), 100 skills by default (max 500); names and numbers only.
+- `GET /v1/health`: version, start time, uptime, running and queued counts, `max_running`. `GET /v1/jobs?status=S&limit=N`: newest jobs first (default 20, max 200; same view as `agent-jobs list --json`). `GET /v1/jobs/{id}`: one job; `?report=1` adds `report.md`, capped at 64 KB (`report_truncated`). `GET /v1/stats?since=D&by=kind|model|skill|effort`: the `job_stats` summary. `GET /v1/stats` covers the last 30 days without `since`; a `since` older than 365 days is 400; at most 200 groups and skills (`groups_truncated`, `skills_truncated`). `GET /v1/schedules?limit=N&cursor=C`: schedules with their next firing, oldest first, pages of 100 by default (max 500); `next_cursor` is the `cursor` of the next page. `GET /v1/skills?since=D&repo=R&limit=N`: the skills rating for a frontend, per skill: status, `stale`, delivered, used, success rate, last used, median cost and `by_repo` (repository folder -> used, success rate), sorted by used count; 30 days by default (max 365), 100 skills by default (max 500); names and numbers only. `GET /v1/milestones?status=S&repo=R&checklist_id=ID&updated_since=T&tree=1`: the milestones, the same JSON as `milestone_list` (the same code builds it), `tree=1` with every milestone's tree, `updated_since` the change cursor (RFC 3339 or Unix seconds); `GET /v1/milestones/{id}`: one milestone's tree, the same JSON as `milestone_get` ([Milestones](#milestones)). The one difference from the MCP tools: `repo` is the repository's folder name, as in `/v1/jobs` (the API returns no paths outside the agent state).
 - On a TCP listener the `Host` header must be `localhost` or a loopback IP literal (`127.x.x.x`, `[::1]`), without a port or with the listener's, else 421 (no name is resolved: a DNS-rebound page cannot reach the API); a unix socket is exempt.
 - Every endpoint needs the token, health included (401 without it or with a wrong one; the scheme `Bearer` is case-insensitive; constant-time compare; the file is read per request, so a rotation takes effect at once, and a token file readable by group or others fails closed). Any method but GET is 405; no endpoint changes state. No CORS headers.
 - Never returned: briefs, schedule prompts or titles derived from them (a job schedule without a title is called `schedule <id>`, and so are the jobs it fires; an older schedule or job whose title starts with `schedule: ` is shown that way too), session ids, env, config, the job dir or the repository path (only the repository's folder name), error texts. A job's error is `error_code` + `error_message`, a schedule's last error `last_error_code` + `last_error_message`, the code one of `launch_failed`, `timeout`, `cancelled`, `guard_refused`, `codex_config_refused`, `delivery_failed`, `processes_survived`, `run_failed`, `unknown` with a fixed message; the text itself is in `agent-jobs status <id>` and the daemon log. Every string field is cut at 200 bytes. `report.md` is read only through the state dir: `jobs`, the job dir and the report are opened without following a symlink, and a report that is not a regular file of the agent user with one link is not read (`report_error`). Only this agent's jobs.

@@ -106,6 +106,20 @@ Details: [Brief checklist, slicing, judge, release check](docs/GUIDE.md#mcp-tool
 
 ---
 
+## Milestones: stages, tasks, jobs
+
+A large project is split into **milestones** (stages of work, ordered per repository), a milestone into **tasks** (`T1`, `T2`, … with optional `depends_on` and `covers`), and each task is worked on by one or more **jobs**. The **checklist** (`brief/CHECKLIST.md`) stays the acceptance list; a milestone may point at it with `checklist_id`, and is fine without it.
+
+- **No ceremony.** A piece of work with more than one task runs as a milestone by default: one `milestone_create` call with a title and the tasks, no approval step, no brief needed. A single job needs no milestone.
+- **Order from dependencies.** `job_start(milestone, task)` is refused while the task is blocked (a dependency is not done yet); tasks without dependencies between them run in parallel, `max_parallel` caps a milestone's running jobs (1 = one after another).
+- **Status from the jobs.** A task is `ready`, `blocked`, `running`, `review` (its job succeeded, no outcome yet), `done` (outcome `accepted`), `failed` or `dropped`, always derived, never set by hand.
+- **Prior results.** A job on a task with `depends_on` gets the accepted results of those tasks in its prompt (commit, diffstat, Summary and Findings of the report, capped) and their full reports in `prior/<key>/report.md`.
+- **Built for a frontend.** `milestone_get` returns the whole tree (tasks, their jobs, ready tasks, progress, acceptance), `milestone_list` with `repo` and `tree` the whole project in one call, `updated_since` is a change cursor; `GET /v1/milestones` and `GET /v1/milestones/{id}` of the read-only HTTP API return the same JSON.
+
+Details, the JSON schema and the endpoints: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones).
+
+---
+
 ## Features at a glance
 
 | feature | what it is | why you want it |
@@ -122,6 +136,7 @@ Details: [Brief checklist, slicing, judge, release check](docs/GUIDE.md#mcp-tool
 | [notify_owner](docs/GUIDE.md#mcp-tools) | a job or the session asks for the owner's attention through the session's own channel | jobs can raise a hand, with rate limits |
 | [Owner waits](docs/GUIDE.md#mcp-tools) | a Stop hook holds the session's turn until it has replied to the owner about a job the owner asked for | the owner always hears back |
 | [Heartbeat](docs/GUIDE.md#install-and-configure) | the daemon wakes the session for its own goals, outside a night window and within a daily cap | the agent moves its goals forward on its own |
+| [Milestones](docs/GUIDE.md#milestones) | stages of work split into tasks with dependencies; jobs attach to tasks, status is derived, prior results flow to the next task | a big project in order, visible as one tree for a frontend |
 | [Intentions](docs/GUIDE.md#mcp-tools) | the agent's own goals: add, list, set status | goals outlive a conversation |
 | [Shared memory (brain)](docs/GUIDE.md#install-and-configure) | memory, task and team tools backed by the team's shared brain; memory notes in every brief | jobs and agents share what they learned |
 | [Read-only HTTP API](docs/GUIDE.md#install-and-configure) | health, jobs, stats, schedules and skills over a unix socket or loopback, token required | build a dashboard without touching the database |
