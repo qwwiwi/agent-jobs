@@ -151,9 +151,12 @@ const ReviewChangedWarning = "WARNING: review job changed the worktree"
 
 // noteReviewChanges appends ReviewChangedWarning to a finished review job whose worktree has commits
 // past the base, staged, unstaged or untracked (not ignored) changes, or whose prepared worktree is
-// gone or inaccessible. Run after the skill links are removed (they are not the job's change).
+// gone or inaccessible. Run after the skill links are removed (they are not the job's change). A codex
+// research job is checked the same way: it is read-only in intent, and under codex_sandbox
+// worktree-full-access no codex sandbox keeps it from writing.
 func (m *Manager) noteReviewChanges(j *store.Job) {
-	if j.Kind != "review" || j.RepoPath == "" {
+	readOnly := j.Kind == "review" || (j.Runner == store.RunnerCodex && j.Kind == "research")
+	if !readOnly || j.RepoPath == "" {
 		return
 	}
 	work := filepath.Join(m.JobDir(j.ID), "work")

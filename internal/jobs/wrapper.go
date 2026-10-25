@@ -61,6 +61,10 @@ type StreamResult struct {
 	Skipped int
 	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
 	Err string
+	// CodexCommands and CodexCommandsFailed count the completed command_execution items and the failed
+	// ones; CodexSandboxError is the first bwrap error among those (codex streams only, issue #81).
+	CodexCommands, CodexCommandsFailed int
+	CodexSandboxError                  string
 }
 
 // program names the runner of a stream result in messages.

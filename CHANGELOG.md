@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- Codex jobs on hosts where codex's sandbox cannot start (#81): a codex job whose stream shows a failed command with a `bwrap:` error (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`), or in which every command failed, now ends `failed` with the cause and the config option, and its final message no longer becomes `report.md`; before, codex completed its turn and the job ended `succeeded` with a report that looked like a real review.
+
+### Added
+- Config `codex_sandbox` (#81): `auto` (default) | `native` | `worktree-full-access`. `auto` keeps the native codex sandbox and probes it once per codex binary (`codex sandbox linux -- true`, Linux only, cached in the process); when bwrap fails there, codex launches are refused with an error naming the option (it never falls back to a weaker containment by itself), any other probe failure is inconclusive and the job runs natively. `native` never probes. `worktree-full-access` runs `codex exec -s danger-full-access` in the job's own worktree, without GitHub tokens, the ssh agent or stored `gh` auth in its environment; `codex_write_allowed` still gates fix/general. Restart-only like `codex_write_allowed`; switching it off on disk applies at the next launch. The post-run worktree check now covers codex research jobs too. `system_doctor` returns `codex_sandbox` (mode, effective sandbox, probe result) and lists a sandbox that cannot start as a problem.
+
 ## [0.5.1] - 2026-10-25
 
 ### Fixed

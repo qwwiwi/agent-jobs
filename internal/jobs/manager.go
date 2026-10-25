@@ -72,6 +72,10 @@ type Manager struct {
 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
+
+	codexProbeMu  sync.Mutex
+	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
+	codexProbeKey string             // the codex binary identity it ran on (codexBinKey)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -611,6 +615,9 @@ type launchPlan struct {
 	bin     string
 	args    []string
 	wrapper []string // run-wrapper options before "--" (--prompt, --fallback-prompt, --fallback-session)
+	// codexFullAccess: a codex job without the codex sandbox (codex_sandbox worktree-full-access); its
+	// environment loses the credentials of codexFullAccessDroppedEnv.
+	codexFullAccess bool
 }
 
 func (m *Manager) launch(j *store.Job, token string) error {
@@ -621,6 +628,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return err
 	}
 	var plan launchPlan
+	var codexSandbox string // a codex job's `codex exec --sandbox` value
 	launchCfg := m.Config()
 	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
@@ -641,6 +649,9 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			return errCodexResume
 		}
 		if err := launchCfg.checkCodexJob(j.Kind); err != nil {
+			return err
+		}
+		if codexSandbox, err = m.codexLaunchSandbox(launchCfg, j.Kind); err != nil {
 			return err
 		}
 	}
@@ -670,8 +681,8 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
 				return err
 			}
-			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort)),
-				wrapper: []string{"--runner", store.RunnerCodex}}
+			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
+				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
@@ -700,6 +711,9 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	containment := "session only"
 	if unit != "" {
 		containment = "scope " + unit
+	}
+	if codexSandbox != "" {
+		containment += ", codex sandbox " + codexSandbox
 	}
 	m.Log.Printf("job %s started pid=%d runner=%s model=%s containment=%s", j.ID, pid, j.Runner, j.Model, containment)
 	return nil
@@ -737,6 +751,9 @@ func (m *Manager) spawn(j *store.Job, token, unit string, plan launchPlan) (int,
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(dir, "work")
 	cmd.Env = m.spawnEnv(unit)
+	if plan.codexFullAccess {
+		cmd.Env = codexFullAccessEnv(cmd.Env, dir)
+	}
 	if IsGateKind(j.Kind) {
 		// claude loads CLAUDE.md from the --add-dir directories (the job dir) with this set, whatever
 		// --setting-sources says: a gate job gets no instructions but its prompt.

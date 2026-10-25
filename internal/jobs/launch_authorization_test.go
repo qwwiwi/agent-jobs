@@ -153,7 +153,7 @@ func TestWrapperRejectsUntrustedLaunchAuthorization(t *testing.T) {
 				}
 				bin, args := m.Cfg.claudeBin(), ClaudeArgs(j, m.JobDir(j.ID))
 				if runner == store.RunnerCodex {
-					bin, args = m.Cfg.codexBin(), CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort))
+					bin, args = m.Cfg.codexBin(), CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort), CodexSandbox(j.Kind))
 				}
 				argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", j.LaunchToken, "--runner", runner, "--", bin}
 				cmd := exec.Command(selfBin, append(argv, args...)...)

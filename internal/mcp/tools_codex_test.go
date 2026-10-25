@@ -3,10 +3,13 @@ package mcp
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -110,5 +113,48 @@ func TestJobStartCodexDailyCap(t *testing.T) {
 	call(t, cs, "system_doctor", map[string]any{}, &doc)
 	if doc.CodexJobsToday != "2/2" {
 		t.Fatalf("doctor: %q", doc.CodexJobsToday)
+	}
+}
+
+// system_doctor shows codex_sandbox: the configured mode, what a codex launch runs in now and the
+// native sandbox probe; a sandbox that cannot start under auto is a problem naming the option, and
+// worktree-full-access runs no probe (issue #81).
+func TestSystemDoctorCodexSandbox(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin // the doctor's guard probe runs the real binary
+	bin := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\necho 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_JOBS_CODEX_BIN", bin)
+	cs := connect(t, mustServer(t, m))
+	var doc SystemDoctorOutput
+	call(t, cs, "system_doctor", map[string]any{}, &doc)
+	s := doc.CodexSandbox
+	if runtime.GOOS != "linux" {
+		if s.Mode != jobs.CodexSandboxModeAuto || s.Effective != jobs.CodexSandboxModeNative || s.Probe == nil ||
+			s.Probe.Result != jobs.CodexProbeSkipped {
+			t.Fatalf("doctor codex_sandbox: %+v", s)
+		}
+		return
+	}
+	if s.Mode != jobs.CodexSandboxModeAuto || s.Effective != "refused" || s.Probe == nil ||
+		s.Probe.Result != jobs.CodexProbeUnavailable || !strings.Contains(s.Probe.Detail, "RTM_NEWADDR") {
+		t.Fatalf("doctor codex_sandbox: %+v", s)
+	}
+	if !slices.ContainsFunc(doc.Problems, func(p string) bool {
+		return strings.Contains(p, `codex_sandbox to "worktree-full-access"`)
+	}) || doc.OK {
+		t.Fatalf("doctor problems: %v", doc.Problems)
+	}
+	// A restart-only key: the server's startup config.
+	m2 := newManager(t)
+	m2.SelfBin = selfBin
+	m2.Cfg.CodexSandboxMode = jobs.CodexSandboxModeWorktreeFullAccess
+	var full SystemDoctorOutput
+	call(t, connect(t, mustServer(t, m2)), "system_doctor", map[string]any{}, &full)
+	if s := full.CodexSandbox; s.Mode != jobs.CodexSandboxModeWorktreeFullAccess || s.Effective != s.Mode || s.Probe != nil || s.Problem != "" {
+		t.Fatalf("doctor codex_sandbox under worktree-full-access: %+v", s)
 	}
 }

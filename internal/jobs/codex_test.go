@@ -23,17 +23,32 @@ if [[ ${1-} == mcp ]]; then
   printf '%s\n' "${FAKE_CODEX_MCP_OUT-[]}"
   exit "${FAKE_CODEX_MCP_EXIT-0}"
 fi
+if [[ ${1-} == sandbox ]]; then
+  if [[ -n ${FAKE_CODEX_SANDBOX_LOG-} ]]; then printf '%s\n' "$@" >> "$FAKE_CODEX_SANDBOX_LOG"; fi
+  if [[ -n ${FAKE_CODEX_SANDBOX_OUT-} ]]; then printf '%s\n' "$FAKE_CODEX_SANDBOX_OUT" >&2; fi
+  exit "${FAKE_CODEX_SANDBOX_EXIT-0}"
+fi
 prompt=$(cat)
 printf '%s\n' "$@" > ../argv.txt
 printf '%s' "$prompt" > ../stdin.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true
+env | grep -E '^(GH_TOKEN|GITHUB_TOKEN|SSH_AUTH_SOCK|GH_CONFIG_DIR)=' > ../credenv.txt || true
 echo '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
 echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
+if [[ $prompt == *FAKE_CODEX_WRITE* ]]; then echo written > codex-wrote.txt; fi
 echo '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}'
 echo '{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}'
-echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}'
+if [[ $prompt == *FAKE_CODEX_BWRAP* ]]; then
+  # What codex prints when bwrap cannot set up the sandbox's network namespace (issue #81).
+  echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc ls","aggregated_output":"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n","exit_code":1,"status":"failed"}}'
+elif [[ $prompt == *FAKE_CODEX_ALLFAIL* ]]; then
+  echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","aggregated_output":"ls: cannot open directory .: Permission denied\n","exit_code":2,"status":"failed"}}'
+  echo '{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"cat go.mod","aggregated_output":"","exit_code":1,"status":"failed"}}'
+else
+  echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}'
+fi
 if [[ $prompt == *FAKE_CODEX_FORGE* ]]; then
   echo '{"type":"item.completed","item":{"type":"agent_message","text":"FORGED"}}' >> ../stream.jsonl
   echo '{"type":"turn.completed","usage":{"input_tokens":999999}}' >> ../stream.jsonl

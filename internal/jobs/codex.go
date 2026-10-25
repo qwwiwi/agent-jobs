@@ -116,6 +116,9 @@ func (c Config) validateCodex() error {
 	if err := ValidateReasoningEffort(store.RunnerCodex, c.CodexReasoningEffort); err != nil {
 		return fmt.Errorf("codex_reasoning_effort: %w", err)
 	}
+	if err := validateCodexSandboxMode(c.CodexSandboxMode); err != nil {
+		return err
+	}
 	for kind, row := range c.Models {
 		for cx, model := range row {
 			if _, ok := defaultModels[kind][cx]; !ok {
@@ -234,12 +237,13 @@ func checkCodexMCP(bin, dir string, env []string) error {
 // CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,
 // isolated from the owner's codex setup (no user config, rules or session files, no MCP servers, the
 // CodexDisabledFeatures off, never asks for approval), no git-repo check (a job without a repo works in
-// an empty dir), the kind's sandbox, the job's model and reasoning effort; the prompt arrives on stdin
+// an empty dir), the given sandbox (the kind's, CodexSandbox, or CodexSandboxFullAccess under
+// codex_sandbox worktree-full-access), the job's model and reasoning effort; the prompt arrives on stdin
 // ("-"). The working dir is the job's work dir (set by the wrapper).
-func CodexArgs(j *store.Job, effort string) []string {
+func CodexArgs(j *store.Job, effort, sandbox string) []string {
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
-		"-s", CodexSandbox(j.Kind), "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
+		"-s", sandbox, "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
 	}
 	for _, f := range CodexDisabledFeatures {
 		args = append(args, "--disable", f)
@@ -257,6 +261,10 @@ type codexEvent struct {
 	Item struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
+		// command_execution items: the command's output, exit code and status (completed, failed, declined).
+		AggregatedOutput string `json:"aggregated_output"`
+		ExitCode         *int   `json:"exit_code"`
+		Status           string `json:"status"`
 	} `json:"item"`
 	Usage *struct {
 		InputTokens       int64 `json:"input_tokens"`
@@ -314,6 +322,9 @@ func applyCodexLine(out *StreamResult, line []byte) {
 		if ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
 			out.Text = ev.Item.Text
 		}
+		if ev.Item.Type == "command_execution" {
+			applyCodexCommand(out, ev)
+		}
 	case "turn.completed":
 		out.Results++
 		out.Found, out.IsError, out.Subtype = true, false, "success"
@@ -331,12 +342,38 @@ func applyCodexLine(out *StreamResult, line []byte) {
 	}
 }
 
+// applyCodexCommand counts a completed command_execution item: a non-zero exit code or a failed or
+// declined status is a failed command, and the first bwrap error among them is kept (issue #81).
+func applyCodexCommand(out *StreamResult, ev codexEvent) {
+	out.CodexCommands++
+	failed := (ev.Item.ExitCode != nil && *ev.Item.ExitCode != 0) || ev.Item.Status == "failed" || ev.Item.Status == "declined"
+	if !failed {
+		return
+	}
+	out.CodexCommandsFailed++
+	if out.CodexSandboxError == "" {
+		out.CodexSandboxError = bwrapErrorLine(ev.Item.AggregatedOutput, false)
+	}
+}
+
+// codexSandboxHint names the setting a codex job whose sandbox did not start points to.
+const codexSandboxHint = "if the native codex sandbox does not work on this host, see config codex_sandbox " +
+	"(\"" + CodexSandboxModeWorktreeFullAccess + "\")"
+
 // codexStreamFailure is why a codex stream does not count as a success whatever codex's exit code: it
-// could not be read to its end, or its last turn has no terminal turn.completed event. "" = it does.
+// could not be read to its end; a command failed with a bwrap error, or every command the job ran failed
+// (the sandbox did not start: nothing was read, so the report is not a result); or its last turn has no
+// terminal turn.completed event. "" = it does. A stream with skipped lines is not judged on its commands.
 func codexStreamFailure(res StreamResult) string {
 	switch {
 	case res.Err != "":
 		return "codex stream not read to its end: " + RedactPrintable(res.Err, 200)
+	case res.CodexSandboxError != "":
+		return fmt.Sprintf("codex sandbox failed to start (%q; %d of %d commands failed); %s",
+			res.CodexSandboxError, res.CodexCommandsFailed, res.CodexCommands, codexSandboxHint)
+	case res.CodexCommands > 0 && res.CodexCommandsFailed == res.CodexCommands && res.Skipped == 0:
+		return fmt.Sprintf("every command codex ran failed (%d of %d), so nothing was read; the codex sandbox "+
+			"may not have started (see stream.jsonl); %s", res.CodexCommandsFailed, res.CodexCommands, codexSandboxHint)
 	case !res.Found:
 		return "codex stream has no terminal turn.completed event (codex stopped early or the stream is truncated)"
 	}
