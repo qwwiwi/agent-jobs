@@ -13,12 +13,19 @@ import (
 )
 
 // Milestones are served in the shapes milestone_list and milestone_get return (jobs.MilestonesView,
-// jobs.MilestoneView, built by the same code); the one difference is repo, which is the folder name of
-// the repository here (the API returns no paths outside the agent state), the full path in MCP.
+// jobs.MilestoneView, built by the same code). The API returns no paths outside the agent state, so repo
+// is the repository's folder name here (the full path in MCP) and a note is a fixed message.
 
-// apiMilestone is v as the API returns it: the repo path cut to its folder name.
+// noteUnreadable replaces a milestone's note on the API: the note is an error text that may hold paths.
+const noteUnreadable = "the checklist or the judge verdict could not be read (see agent-jobs milestone <id>)"
+
+// apiMilestone is v as the API returns it: the repo path cut to its folder name, a note replaced by
+// noteUnreadable.
 func apiMilestone(v jobs.MilestoneView) jobs.MilestoneView {
 	v.Repo = repoName(v.Repo)
+	if v.Note != "" {
+		v.Note = noteUnreadable
+	}
 	return v
 }
 

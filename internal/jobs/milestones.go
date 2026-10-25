@@ -234,7 +234,7 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 	for i, t := range all {
 		idx[t.Key] = i
 	}
-	touched := map[string]bool{}
+	touched, newCovers := map[string]bool{}, map[string]bool{}
 	seen := map[string]bool{}
 	for _, ti := range in {
 		key := strings.TrimSpace(ti.Key)
@@ -268,6 +268,7 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		}
 		if ti.Covers != nil {
 			t.Covers = trimList(*ti.Covers)
+			newCovers[key] = true
 		}
 		touched[key] = true
 	}
@@ -292,7 +293,13 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		if !touched[t.Key] {
 			continue
 		}
-		if err := checkTask(t, idx, live); err != nil {
+		// Covers are checked against the live rows when they are given: stored ones stay valid after a
+		// row is retired, so a title edit or a revived task is not refused for them.
+		rows := live
+		if !newCovers[t.Key] {
+			rows = nil
+		}
+		if err := checkTask(t, idx, rows); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -706,7 +713,11 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 		}
 	}
 	if err != nil {
-		v.Note = "checklist not read: " + RedactPrintable(err.Error(), 200)
+		note := "checklist not read: " + RedactPrintable(err.Error(), 200)
+		if v.Note != "" {
+			note = v.Note + "; " + note
+		}
+		v.Note = note
 	}
 	return v, nil
 }

@@ -125,3 +125,14 @@ func TestMilestonesSameJSONAsMCP(t *testing.T) {
 		t.Fatalf("without token: %d", res.StatusCode)
 	}
 }
+
+// The API never returns a milestone's note text (an error that may hold paths), only a fixed message.
+func TestMilestoneNoteMasked(t *testing.T) {
+	v := apiMilestone(jobs.MilestoneView{Repo: "/srv/private/repo", Note: "checklist not read: /srv/private/repo has no brief/CHECKLIST.md"})
+	if v.Repo != "repo" || v.Note != noteUnreadable || strings.Contains(v.Note, "/srv") {
+		t.Fatalf("api view: %+v", v)
+	}
+	if v := apiMilestone(jobs.MilestoneView{}); v.Note != "" {
+		t.Fatalf("an empty note became %q", v.Note)
+	}
+}

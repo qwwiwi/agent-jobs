@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -328,7 +329,8 @@ func TestMilestonePriorResults(t *testing.T) {
 	_, section, _ := strings.Cut(p, "## Prior results")
 	section, _, _ = strings.Cut(section, "## Checklist")
 	for _, s := range []string{"### T1 · first step", "Accepted job: " + j1.ID, "refs/agent-jobs/jobs/" + j1.ID,
-		"added.txt", "PRIOR_SUMMARY_MARKER", "PRIOR_FINDINGS_MARKER", "[... cut by agent-jobs]", "prior/T1/report.md"} {
+		"added.txt", "PRIOR_SUMMARY_MARKER", "PRIOR_FINDINGS_MARKER", "[... cut by agent-jobs]",
+		"Full report: " + filepath.Join(dir, "prior", "T1", "report.md")} {
 		if !strings.Contains(section, s) {
 			t.Errorf("prior results lack %q:\n%s", s, section)
 		}
@@ -418,5 +420,38 @@ func TestMilestoneChecklistCovers(t *testing.T) {
 	}
 	if got := tree(t, m, v.ID); got.Progress.AcceptanceMet == nil || *got.Progress.AcceptanceMet != 1 || got.Progress.AcceptanceTotal != 1 {
 		t.Fatalf("acceptance after a verdict: %+v", got.Progress)
+	}
+	// R01 is retired: a title edit of the task that covers it still goes through, new covers on it do not.
+	c.Rows[0].Contract = "deferred"
+	if err := os.WriteFile(filepath.Join(repo, filepath.FromSlash(checklist.ChecklistRel)), []byte(checklist.Render(c)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T1", Title: "renamed"}}}); err != nil {
+		t.Fatalf("title edit with a retired cover: %v", err)
+	}
+	if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T1", Covers: deps("R01")}}}); err == nil {
+		t.Fatal("a retired row given as a new cover was accepted")
+	}
+	// Without its checklist the tree still answers, with a note.
+	if err := os.Remove(filepath.Join(repo, filepath.FromSlash(checklist.ChecklistRel))); err != nil {
+		t.Fatal(err)
+	}
+	if got := tree(t, m, v.ID); got.Note == "" || got.Uncovered != nil {
+		t.Fatalf("tree without the checklist: %+v", got)
+	}
+}
+
+// capBytes keeps a cut part within its cap, ends it with the marker and closes a fence it cut through.
+func TestPriorCapBytesClosesFence(t *testing.T) {
+	s := "head\n```\n" + strings.Repeat("diffstat line\n", 100) + "```\ntail\n"
+	out := capBytes(s, 200)
+	if len(out) > 200 || !strings.HasSuffix(out, priorCut) || fenceOpen(out) {
+		t.Fatalf("cut: %d bytes, open fence %v: %q", len(out), fenceOpen(out), out)
+	}
+	if capBytes("short", 200) != "short" {
+		t.Fatal("a short text was cut")
+	}
+	if cut := capBytes(strings.Repeat("я", 300), 101); !utf8.ValidString(cut) || len(cut) > 101 {
+		t.Fatalf("cut through a rune: %q", cut)
 	}
 }
