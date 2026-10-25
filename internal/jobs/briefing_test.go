@@ -353,7 +353,9 @@ func TestValidateBriefingSecretIdentifiers(t *testing.T) {
 	for _, p := range places {
 		for _, bad := range []string{"Paste client_secret here", "Send admin_password", "Send access_token", "Set clientSecret in the panel",
 			"Where is the OpenAI APIKey?", "Put it in OPENAI_API_KEY", "the x-api-key header", "Send the botToken", "the ssh-key2 file",
-			"-----BEGIN PRIVATE KEY-----\n" + pemBody()} {
+			"-----BEGIN PRIVATE KEY-----\n" + pemBody(),
+			"Paste your passPhrase in the reply?", "Send the pAssword", "Which toKen do we use?", "Set clientPassPhrase in the panel",
+			"Send myApiToken", "Put it in PASSPHRASE_FILE", "Send the PASSPHRASE", "Send the dbPassword"} {
 			b := briefingBlock(g)
 			p.field(b)[p.key] = p.pre + bad
 			if _, err := ValidateBriefing(report(b), g); err == nil || !strings.Contains(err.Error(), "asks for a secret") {
@@ -369,6 +371,26 @@ func TestValidateBriefingSecretIdentifiers(t *testing.T) {
 				t.Fatalf("%s %q was refused: %v", p.name, ok, err)
 			}
 		}
+	}
+}
+
+// A secret word in an odd casing (passPhrase) is refused through a real briefing job: the job fails and
+// nothing is stored.
+func TestBriefingJobSecretWordCasingRefused(t *testing.T) {
+	m := newManager(t)
+	j, err := m.StartGate(GateRequest{Kind: KindBriefing, Repo: briefRepo(t), Model: "sonnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := briefingBlock(j.Gate)
+	b["rounds"].([]map[string]any)[0]["questions"].([]map[string]any)[0]["q"] = "Paste your passPhrase in the reply?"
+	gateReport(t, b)
+	j = runToEnd(t, m, j.ID)
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "asks for a secret") {
+		t.Fatalf("status %s error %q", j.Status, j.Error)
+	}
+	if r, _ := m.Store.BriefingByJob(j.ID, j.Attempt); r != nil {
+		t.Fatalf("stored %+v", r)
 	}
 }
 

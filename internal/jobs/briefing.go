@@ -31,19 +31,22 @@ const AssumptionPrefix = "ASSUMPTION:"
 // password, passphrase, token, secret, credential, key (api key, ssh key, ...) and the Russian nouns
 // пароль, токен, ключ, секрет in their case forms, as whole words (any Unicode letter or digit next to
 // them makes another word: «ключевой», «секретарь», "monkey" pass). A briefing never needs them: a
-// credential is set up by the owner out of band, never typed into a reply. It is matched on secretText,
-// so a word of an identifier counts as a word.
-var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?|passwds?|passphrases?|pass\s*words?|tokens?|` +
+// credential is set up by the owner out of band, never typed into a reply. It is matched on both
+// secretForms, so a whole word in any casing and a word of an identifier both count.
+var briefingSecretRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}\p{N}_])(?:passwords?|passwds?|passphrases?|pass\s*words?|pass\s*phrases?|tokens?|` +
 	`secrets?|credentials?|api[\s_-]*keys?|apikeys?|keys?|парол(?:ь|я|ю|ем|е|и|ей|ям|ями|ях)|токен(?:а|у|ом|е|ы|ов|ам|ами|ах)?|` +
 	`ключ(?:а|у|ом|е|и|ей|ам|ами|ах)?|секрет(?:а|у|ом|е|ы|ов|ам|ами|ах)?)(?:$|[^\p{L}\p{N}_])`)
 
-// secretText is s as briefingSecretRe reads it: format characters (zero-width spaces and joiners, soft
-// hyphens) dropped, so they cannot split a word; every Unicode space, connector (_) and dash made an
-// ASCII space; and the words of an identifier split apart: a space goes between a lower-case letter and
-// an upper-case one, between a letter and a digit, and before the last capital of a run followed by a
-// lower-case letter ("clientSecret", "APIKey", "key2" read as "client Secret", "API Key", "key 2"). A
-// word in one case is never split, so "monkey", "tokenizer" and "keyboard" stay whole.
-func secretText(s string) string {
+// secretForms are the two forms of s that briefingSecretRe reads; a text is refused when either hits.
+// Both drop format characters (zero-width spaces and joiners, soft hyphens), so they cannot split a word,
+// and make every Unicode space, connector (_) and dash an ASCII space. The first stops there, so a whole
+// word in any casing is caught ("pAssword", "toKen", "passPhrase", "PASSPHRASE_FILE"). The second also
+// splits the words of an identifier apart: a space goes between a lower-case letter and an upper-case
+// one, between a letter and a digit, and before the last capital of a run followed by a lower-case
+// letter ("clientSecret", "APIKey", "key2", "clientPassPhrase" read as "client Secret", "API Key",
+// "key 2", "client Pass Phrase"). A word in one case is never split, so "monkey", "tokenizer" and
+// "keyboard" stay whole in both forms.
+func secretForms(s string) [2]string {
 	rs := []rune(strings.Map(func(r rune) rune {
 		switch {
 		case unicode.Is(unicode.Cf, r):
@@ -60,7 +63,7 @@ func secretText(s string) string {
 		}
 		b.WriteRune(r)
 	}
-	return b.String()
+	return [2]string{string(rs), b.String()}
 }
 
 // identifierBreak reports whether an identifier's words part between rune p and the rune r after it;
@@ -80,7 +83,7 @@ func identifierBreak(p, r rune, nextLower bool) bool {
 // briefingSecret refuses a briefing text that asks for a secret or names one; checked before redaction,
 // so a masked value cannot hide what the text asks for.
 func briefingSecret(what, s string) error {
-	if briefingSecretRe.MatchString(secretText(s)) {
+	if f := secretForms(s); briefingSecretRe.MatchString(f[0]) || briefingSecretRe.MatchString(f[1]) {
 		return fmt.Errorf("%s asks for a secret or names one (password, token, key and the like are never asked of the owner)", what)
 	}
 	return nil
