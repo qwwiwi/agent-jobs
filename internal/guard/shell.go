@@ -21,6 +21,9 @@ type simpleCmd struct {
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents and words of the here-strings attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
+	// expandingStdin: a here-string, or a here-doc whose body the shell expands or whose end the reader
+	// cannot place (unquoted body with $ or a backtick, a delimiter word with $); its text is not data.
+	expandingStdin bool
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
 	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
@@ -56,8 +59,11 @@ func (p *pipeline) raw() string {
 
 // script is a list of pipelines in execution order (separated by ; && || & newline).
 type script struct {
-	src       string
-	depth     int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
+	src   string
+	depth int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
+	// subst: every level between the command and this script is a command or process substitution
+	// (no `sh -c`, `eval`, trap or runner body on the way).
+	subst     bool
 	pipelines []*pipeline
 	// literalBodies are byte ranges [start, end) of src the shell neither runs nor expands: the bodies of
 	// here-documents with a quoted delimiter (<<'E', <<"E", <<\E), each with its delimiter line.
@@ -142,6 +148,7 @@ func (p *parser) endWord() {
 		}
 	case redirHereString: // its word is checked like a here-doc body
 		p.cmd.heredoc += w + "\n"
+		p.cmd.expandingStdin = true
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
@@ -272,6 +279,9 @@ func (p *parser) readHeredocs() {
 		}
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
+		if !h.exact || (!h.quoted && strings.ContainsAny(body.String(), "$`")) {
+			h.cmd.expandingStdin = true
+		}
 		switch {
 		case h.quoted && h.exact:
 			p.out.literalBodies = append(p.out.literalBodies, [2]int{start, p.i})
@@ -1009,23 +1019,23 @@ func stringEnd(s string, start int) int {
 // parseAll returns src and every script nested in it (substitutions, `sh -c`, `eval`).
 func parseAll(src string) []*script {
 	var out []*script
-	var walk func(s string, depth int) *script
-	walk = func(s string, depth int) *script {
+	var walk func(s string, depth int, subst bool) *script
+	walk = func(s string, depth int, subst bool) *script {
 		if depth > maxNesting {
 			return nil
 		}
 		sc, _ := parseScript(s)
-		sc.depth = depth
+		sc.depth, sc.subst = depth, subst
 		out = append(out, sc)
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				for _, sub := range c.subSources {
-					if child := walk(sub, depth+1); child != nil {
+					if child := walk(sub, depth+1, depth == 0 || subst); child != nil {
 						c.subScripts = append(c.subScripts, child)
 					}
 				}
 				add := func(code string) {
-					if child := walk(code, depth+1); child != nil {
+					if child := walk(code, depth+1, false); child != nil {
 						c.nested = append(c.nested, child)
 					}
 				}
@@ -1061,7 +1071,7 @@ func parseAll(src string) []*script {
 		}
 		return sc
 	}
-	walk(src, 0)
+	walk(src, 0, false)
 	return out
 }
 

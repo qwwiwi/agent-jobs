@@ -741,7 +741,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						}
 					}
 				}
-				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
+				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" && !dataHeredoc(sc, pl, c) {
 					return h.reason()
 				}
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
@@ -1186,7 +1186,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
-		case sc.depth > 0:
+		case sc.depth > 0 && !substGitRead(sc, argv):
 			return cannot(name + " inside a substitution, eval or sh -c")
 		case c.stdin:
 			return cannot("stdin redirect, here-doc or here-string into " + name)
@@ -2291,11 +2291,13 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 				})
-				for _, a := range argv[1:] {
+				for k, a := range argv[1:] {
 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
-					if hasGlob(reBraceVar.ReplaceAllString(a, "")) && !findFilter {
+					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word
+					// the shell does not glob: its `*` is code, as in a script file (noise.go).
+					if hasGlob(reBraceVar.ReplaceAllString(a, "")) && !findFilter && !inlineCode(name, argv, k+1) {
 						return globBlocked(a)
 					}
 				}
