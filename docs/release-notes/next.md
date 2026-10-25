@@ -8,7 +8,7 @@ The heavy Wave F gates were barely exercised (0 judge verdicts, 0 release passes
 
 - **`release_check` can pass for Claude coders.** A Codex judge launched under the read-only Codex sandbox counts as blind by enforcement (that sandbox blocks writes and network, not reads), and the `family` condition counts only succeeded feature jobs, so a failed, cancelled or small coder no longer blocks a judge of its family. The `trace` condition is gone; `covered_by` stays as information.
 - **Waivers survive fix commits.** An owner waiver binds to the checklist id, hash and version and the requirement, not to a commit. `checklist_set` still accepts a waiver's `sha` and ignores it with a warning.
-- **The merge gate warns instead of refusing an unreadable command.** A command whose `gh pr merge` form or target the reader cannot tell runs; the warning reaches the model as hook context (PreToolUse JSON on stdout). A parsed `gh pr merge` in a gated repository without a release pass is still blocked, and so is one into a gated repository whose sha or PR number is a variable: write them literally.
+- **The merge gate warns instead of refusing an unreadable command.** A command whose `gh pr merge` form or target the reader cannot tell runs; the warning reaches the model as hook context (PreToolUse JSON on stdout). A parsed `gh pr merge` in a gated repository without a release pass is still blocked, and so is one into a gated repository with a variable or substitution in any of its words (the sha, the PR number, also `--body "$(cat x)"`): write every word literally.
 - **Requirement lines count as written.** A `done` line no longer needs `ran:` or a `REDPROOF` line; the job prompt's rules are five lines.
 - **Size is optional.** `covers` imply `large`, otherwise `small`; `small` with `covers` is refused; `size_required` stays as a knob, default off.
 - **Quieter brief reminder.** It speaks only before an owner prompt and only while a checklist decision is pending.
@@ -17,3 +17,5 @@ The heavy Wave F gates were barely exercised (0 judge verdicts, 0 release passes
 ## Upgrade notes
 
 Rebuild and install the binary (README «Build and check»), then start a new session so that the MCP server is the new one. No config or hook registration changes. The store rebuilds the waivers table once at the first `Open` (the checklist id joins its key; rows are kept). Waivers stored before keep their sha, which is no longer read.
+
+**Do not roll back across this change.** A binary from before it rebuilds the waivers table to the old key (hash, version, sha, requirement, without the checklist id) and can merge the waivers of two checklist ids that share the same hash, version, sha and requirement into one.
