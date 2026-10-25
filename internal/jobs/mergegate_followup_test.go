@@ -41,3 +41,28 @@ func TestMergeGateFollowUpFalseBlocks(t *testing.T) {
 		}
 	}
 }
+
+// While a repository is gated, a # inside ${…}, a here-document with a $'…' delimiter and a brace
+// expansion before the gh pr subcommand hide no merge.
+func TestMergeGateInertRangesExact(t *testing.T) {
+	m, repo := mergeGateRepo(t)
+	for _, cmd := range []string{
+		"eval ${x:- #}; gh pr merge 5",
+		"eval ${x# #}; gh pr merge 5",
+		"cat <<$'EOF'\nx\nEOF\ngh pr m@(erge) 5",
+		`gh -R {o/r,pr,merge,--subject} pr view --body merge --squash`,
+		`bash -c 'gh -R {o/r,pr,merge,--subject} pr view --body merge --squash'`,
+	} {
+		if r := gateAnswer(t, m, repo, cmd, ""); r == "" {
+			t.Errorf("%q: passed, want refused", cmd)
+		}
+	}
+	for _, tc := range []struct{ cmd, want string }{
+		{"eval ${x:- #}; gh pr merge 5", "cannot tell"},
+		{"cat <<$'EOF'\nx\nEOF\ngh pr m@(erge) 5", "cannot tell"},
+	} {
+		if r := gateAnswer(t, m, repo, tc.cmd, ""); !strings.Contains(r, tc.want) {
+			t.Errorf("%q: %q, want %q", tc.cmd, r, tc.want)
+		}
+	}
+}

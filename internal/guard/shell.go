@@ -79,7 +79,10 @@ type pendingHeredoc struct {
 	delim  string
 	strip  bool
 	quoted bool // quoted delimiter: the body is literal; otherwise substitutions in it run
-	cmd    *simpleCmd
+	// exact: the delimiter word holds no $ (in `<<$'EOF'` the reader's delimiter is not bash's, so the
+	// body's end is not known and no literal-body range is recorded).
+	exact bool
+	cmd   *simpleCmd
 }
 
 type parser struct {
@@ -141,7 +144,7 @@ func (p *parser) endWord() {
 	case redirHereString: // its word is checked like a here-doc body
 		p.cmd.heredoc += w + "\n"
 	case redirHeredoc, redirHeredocStrip:
-		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
+		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
 	p.started, p.dyn, p.bare, p.quoted = false, false, false, false
 	p.redir, p.redirOut, p.redirIn = redirNone, false, false
@@ -270,9 +273,10 @@ func (p *parser) readHeredocs() {
 		}
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
-		if h.quoted {
+		switch {
+		case h.quoted && h.exact:
 			p.out.literalBodies = append(p.out.literalBodies, [2]int{start, p.i})
-		} else { // `$(…)` and backticks in an unquoted here-doc body are executed
+		case !h.quoted: // `$(…)` and backticks in an unquoted here-doc body are executed
 			subs := bodySubstitutions(body.String())
 			p.subs = append(p.subs, subs...)
 			h.cmd.subSources = append(h.cmd.subSources, subs...)
@@ -352,7 +356,9 @@ func (p *parser) run() {
 			} else {
 				p.i += nl
 			}
-			p.out.comments = append(p.out.comments, [2]int{start, p.i})
+			if exactComment(p.src[:start]) {
+				p.out.comments = append(p.out.comments, [2]int{start, p.i})
+			}
 		case c == '\n':
 			p.endPipeline("\n")
 			p.i++
@@ -412,6 +418,14 @@ func (p *parser) run() {
 			p.i++
 		}
 	}
+}
+
+// exactComment reports a # the reader takes as a comment where bash surely does too: before is the
+// source ahead of it. After ${, $'…' or (( the reader's word boundaries may not be bash's (`${x:- #}`,
+// `$'a\' #'`, `(( y= # ))` hold no comment), so no comment range is recorded there.
+func exactComment(before string) bool {
+	return !strings.Contains(before, "${") && !strings.Contains(before, "$'") &&
+		!strings.Contains(strings.ReplaceAll(before, "$((", ""), "((")
 }
 
 func (p *parser) openGroup(sep string) {

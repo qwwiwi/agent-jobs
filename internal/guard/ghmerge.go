@@ -769,7 +769,8 @@ func ghOtherGroup(argv []string, dyn []bool) bool {
 // ghPrHead reads a gh call up to its subcommand: isPr when gh and the group are a literal pr with a
 // subcommand after it (pos are the positions of the group and the subcommand); vague when a word at or
 // before the subcommand is empty or not literal (gh may read another word as the subcommand: it runs
-// `gh pr "" merge` as merge). A dynamic value of -R / --repo / --hostname that is not bare (bare: an
+// `gh pr "" merge` as merge), or holds a brace, glob or tilde outside ${…}, which may expand it into
+// several words (`gh -R {o/r,pr,merge} pr view` runs gh -R o/r pr merge). A dynamic value of -R / --repo / --hostname that is not bare (bare: an
 // expansion outside double quotes, simpleCmd.bare) is one word, the flag's value, whatever it holds:
 // `gh -R "$R" pr view 5` is read; `gh -R $R pr view 5` is vague.
 func ghPrHead(argv []string, dyn, bare []bool) (pos []int, vague, isPr bool) {
@@ -787,8 +788,8 @@ func ghPrHead(argv []string, dyn, bare []bool) (pos []int, vague, isPr bool) {
 			i++ // the separate value word (ghPositional skips it too)
 			a, value = argv[i], true
 		}
-		// A glob character outside ${…} may expand the value into several words (`"$R"*`).
-		if a == "" || dyn[i] && (!value || bare[i] || hasGlob(reParamBraces.ReplaceAllString(a, ""))) {
+		// A brace, glob or tilde outside ${…} may expand any word into several (`"$R"*`, `{o/r,pr,merge}`).
+		if a == "" || strings.ContainsAny(reParamBraces.ReplaceAllString(a, ""), "{[?*~") || dyn[i] && (!value || bare[i]) {
 			vague = true
 		}
 	}
