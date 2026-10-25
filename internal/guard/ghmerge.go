@@ -77,6 +77,7 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	if unsure == "" && len(calls) == 0 || !relaxable(cmd, scripts) {
 		return calls, unsure
 	}
+	// A fresh parse, so the relaxed reading shares no parsed state with the strict one.
 	return readMerges(cmd, cwd, parseAll(cmd), true)
 }
 
@@ -234,13 +235,11 @@ var (
 )
 
 // blankRanges is src with the bytes of the given ranges ([start, end) of src) replaced by spaces.
-func blankRanges(src string, ranges ...[][2]int) string {
+func blankRanges(src string, ranges [][2]int) string {
 	b := []byte(src)
-	for _, rs := range ranges {
-		for _, r := range rs {
-			for i := max(r[0], 0); i < min(r[1], len(b)); i++ {
-				b[i] = ' '
-			}
+	for _, r := range ranges {
+		for i := max(r[0], 0); i < min(r[1], len(b)); i++ {
+			b[i] = ' '
 		}
 	}
 	return string(b)
@@ -647,7 +646,7 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView, relax bool) (GhMerge, bool
 	}
 	merge := slices.Contains(argv[pos[1]:], "merge")
 	if relax {
-		merge = argv[pos[1]] == "merge" || hasGlob(argv[pos[1]])
+		merge = argv[pos[1]] == "merge"
 	}
 	if !vague && !merge {
 		return call, false
@@ -812,7 +811,8 @@ func ghPrHead(argv []string, dyn, bare []bool, relax bool) (pos []int, vague, is
 	for i := 1; i <= pos[1]; i++ {
 		a, value := argv[i], false
 		if relax {
-			value = strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "--hostname=") || strings.HasPrefix(a, "-R") && len(a) > 2
+			// Not an attached -R"$R": an empty $R leaves a bare -R, which takes the next word as its value.
+			value = strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "--hostname=")
 			if (a == "-R" || a == "--repo" || a == "--hostname") && i+1 < pos[1] {
 				i++ // the separate value word (ghPositional skips it too)
 				a, value = argv[i], true

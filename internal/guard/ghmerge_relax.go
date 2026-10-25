@@ -52,8 +52,9 @@ var (
 	// reShellOptionO is a flag cluster with O (`bash -O extglob`, `+O`).
 	reShellOptionO = regexp.MustCompile(`(^|\s)[-+][A-Za-z]*O`)
 	// reUnmodeledWord is, case folded, a word that runs or reads code or changes how it is read (eval,
-	// source, ., case, coproc, alias, shopt, set with an o option such as `set -o` or `set -euo`).
-	reUnmodeledWord = regexp.MustCompile(`(^|[^a-z0-9_-])(eval|source|case|coproc|alias|shopt)([^a-z0-9_-]|$)` +
+	// source, ., case, coproc, alias, shopt, xargs, which rewrites the argv it runs, set with an o option
+	// such as `set -o` or `set -euo`).
+	reUnmodeledWord = regexp.MustCompile(`(^|[^a-z0-9_-])(eval|source|case|coproc|alias|shopt|xargs)([^a-z0-9_-]|$)` +
 		`|(^|[\s;&|(){}])\.([\s;&|(){}]|$)|(^|[^a-z0-9_-])set(\s+\S+)*?\s+[-+][a-z]*o`)
 	// reHeredocWord is the delimiter of a relaxable here-document: a plain name.
 	reHeredocWord = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)

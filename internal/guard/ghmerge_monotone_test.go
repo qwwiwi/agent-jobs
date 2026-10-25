@@ -70,6 +70,16 @@ var mustRefuseMerges = []string{
 	"gh pr view merge $(cat <<'E'\n)\nE\n); gh pr merge 5", "gh pr view merge 2<<'E'\nx\nE\ngh pr merge 5",
 	"gh pr view merge <<'E'\nE\ngh pr merge 5\nE",
 	"gh pr view merge\tx;\tgh pr merge 5", "gh pr view merge ; gh pr merge \"5\"",
+	// An empty or unset value attached to -R leaves a bare -R: gh takes the next word as the repository.
+	`gh -R"$X" pr --repo o/r pr merge 5`,
+	`gh "-R$X" pr --repo o/r pr merge 5`,
+	`gh -R"$X" pr -R o/r pr merge 5 --squash`,
+	`gh -R"$X" pr --repo=o/r pr merge 5 --body merge`,
+	// xargs rewrites the argv it runs.
+	"echo merge | xargs -I% gh pr % 5 --title merge",
+	"echo merge | xargs --replace=% gh pr % 5 --title merge",
+	"echo merge | xargs -I% -- gh pr % 5 --title merge",
+	"echo merge | xargs -I @@ gh pr @@ 5 --body merge",
 }
 
 // mustPassMerges run no gh pr merge: the relaxed reading reports neither a call nor unsure.
@@ -124,10 +134,11 @@ func testStrings(t *testing.T) []string {
 	return out
 }
 
-// The relaxed reading only removes what the strict one reports, and only for a relaxable command: for
-// every input of every test table, a command that is not relaxable is read exactly as strictly, and a
-// command the strict reading passes is passed.
-func TestGhPrMergesRelaxedNeverLooser(t *testing.T) {
+// GhPrMerges's control flow: for every input of every test table, a command that is not relaxable is
+// read exactly as strictly, and a command the strict reading passes stays passed. It checks only where
+// the relaxed reading is taken, not that the relaxed reading misses no merge bash runs (mustRefuseMerges
+// pins known cases of that).
+func TestGhPrMergesStrictUnlessRelaxableAndStrictPassKept(t *testing.T) {
 	inputs := append(testStrings(t), mustRefuseMerges...)
 	inputs = append(inputs, mustPassMerges...)
 	if len(inputs) < 300 {

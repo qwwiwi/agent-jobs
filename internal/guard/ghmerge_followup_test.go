@@ -90,7 +90,6 @@ func TestGhPrMergesQuotedFlagValue(t *testing.T) {
 		`gh -R "$R" pr view 5`,
 		`gh --repo "$R" pr view 5 --json headRefOid`,
 		`gh --repo="$R" pr view 5`,
-		`gh -R"$R" pr view 5`,
 		`gh --hostname "$H" pr list`,
 		`gh -R "$(cat repo)" pr view 5`,
 		`gh -R "o/$R" pr view 5`,
@@ -101,6 +100,8 @@ func TestGhPrMergesQuotedFlagValue(t *testing.T) {
 	for _, cmd := range []string{
 		`gh -R "${R}" pr view 5`,
 		`gh -R $R pr view 5`,
+		`gh -R"$R" pr view 5`, // an empty $R leaves a bare -R, which takes the next word
+		`gh "-R$R" pr view 5`,
 		`gh -R "$R"$S pr view 5`,
 		`gh --repo=$R pr view 5`,
 		`gh -R $(cat repo) pr view 5`,
