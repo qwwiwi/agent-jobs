@@ -105,6 +105,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            later checklist approval gates it again
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
+  milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
+                                           the milestones (milestone_list): by repo, order, creation
+  milestone  --agent A <id> [--json]       one milestone's tree (milestone_get): tasks with their
+                                           derived status and jobs, ready tasks, progress
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
                                            time, delivery (session or job kind), next and last firing
   checks     --agent A [--json]            the agent's dead-man's switch checks (check_* MCP tools):
@@ -210,6 +214,10 @@ func main() {
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
+	case "milestones":
+		err = cmdMilestones(args)
+	case "milestone":
+		err = cmdMilestone(args)
 	case "schedules":
 		err = cmdSchedules(args)
 	case "checks":
