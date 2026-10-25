@@ -56,9 +56,8 @@ func unsureMerge(cmd string) bool {
 	return unsure != "" || slices.ContainsFunc(calls, func(c GhMerge) bool { return c.Unsure != "" })
 }
 
-// An empty or variable word at or before the gh pr subcommand, a gh pr call with the word merge among its
-// arguments, extglob or a shell option that changes how words are read, and a physical cd are never
-// read as no merge.
+// An empty or variable word at or before the gh pr subcommand, extglob or a shell option that changes how
+// words are read, and a physical cd are never read as no merge.
 func TestGhPrMergesWordsAndOptions(t *testing.T) {
 	for _, cmd := range []string{
 		`bash -c 'gh pr "" merge --squash'`,
@@ -80,9 +79,10 @@ func TestGhPrMergesWordsAndOptions(t *testing.T) {
 			t.Errorf("%q: read as sure", cmd)
 		}
 	}
-	// A gh pr call with the literal word merge among its arguments is a merge call.
-	if calls, _ := GhPrMerges("gh pr checkout merge", "/w"); len(calls) != 1 {
-		t.Errorf("gh pr checkout merge: calls %+v, want one", calls)
+	// A literal gh pr head is read by its subcommand: the word merge as a data argument (a branch named
+	// merge) is no merge call (TestGhPrMergesDataArguments).
+	if calls, unsure := GhPrMerges("gh pr checkout merge", "/w"); len(calls) != 0 || unsure != "" {
+		t.Errorf("gh pr checkout merge: calls %+v, unsure %q, want neither", calls, unsure)
 	}
 	for _, cmd := range []string{
 		`set -euo pipefail; gh pr view 5`,
