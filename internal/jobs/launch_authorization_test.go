@@ -210,3 +210,59 @@ func TestDaemonLaunchPersistsEffectiveAuthorization(t *testing.T) {
 		})
 	}
 }
+
+// A codex launch without the codex sandbox (-s danger-full-access) runs only when the launching daemon
+// recorded that sandbox and codex_write_allowed for the attempt; the wrapper refuses an argv whose
+// sandbox was not authorized, or that names more than one (issue #81, L4).
+func TestWrapperChecksCodexSandboxAuthorization(t *testing.T) {
+	full := store.LaunchAuthorization{CodexWriteAllowed: true, CodexSandbox: CodexSandboxFullAccess}
+	for _, c := range []struct {
+		name  string
+		auth  *store.LaunchAuthorization
+		extra []string // appended to the codex argv
+		ok    bool
+	}{
+		{"none recorded", nil, nil, false},
+		{"write only", &store.LaunchAuthorization{CodexWriteAllowed: true}, nil, false},
+		{"sandbox without write", &store.LaunchAuthorization{CodexSandbox: CodexSandboxFullAccess}, nil, false},
+		{"authorized", &full, nil, true},
+		{"second sandbox", &full, []string{"--sandbox", CodexSandboxReadOnly}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newCodexManager(t)
+			j := enqueue(t, m, "review it", codexReview)
+			const token = "current-token"
+			if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			j = get(t, m, j.ID)
+			if c.auth != nil {
+				if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, *c.auth); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.prepare(j, token, m.JobDir(j.ID)); err != nil {
+				t.Fatal(err)
+			}
+			args := append(CodexArgs(j, "high", CodexSandboxFullAccess), c.extra...)
+			argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", token, "--runner", store.RunnerCodex, "--", m.Cfg.codexBin()}
+			cmd := exec.Command(selfBin, append(argv, args...)...)
+			cmd.Dir, cmd.Env = filepath.Join(m.JobDir(j.ID), "work"), m.spawnEnv("")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+			out, err := cmd.CombinedOutput()
+			_, ranErr := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
+			if c.ok {
+				if err != nil || ranErr != nil {
+					t.Fatalf("authorized full-access launch: %v %v\n%s", err, ranErr, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(string(out), "was not authorized by the launching daemon") {
+				t.Fatalf("wrapper not refused: %v\n%s", err, out)
+			}
+			if !os.IsNotExist(ranErr) {
+				t.Fatalf("unauthorized codex ran: %v", ranErr)
+			}
+		})
+	}
+}

@@ -76,6 +76,7 @@ type Manager struct {
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
 	codexProbeKey string             // the codex binary identity it ran on (codexBinKey)
+	codexProbing  chan struct{}      // closed when the probe in flight ends (nil = none)
 }
 
 // Open creates the state dir, loads config, opens the DB and resolves the own binary.
@@ -688,6 +689,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
 		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
+		CodexSandbox:      codexSandbox,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}
@@ -1550,6 +1552,9 @@ func (m *Manager) endedResult(j *store.Job) StreamResult {
 		return StreamResult{Runner: j.Runner}
 	}
 	res.Runner = j.Runner // runner identity belongs to the daemon's job row
+	if j.Runner == store.RunnerCodex {
+		res.CodexRepo = j.RepoPath != "" // so does the repo, as the wrapper read it (codexRepoJob)
+	}
 	return res
 }
 

@@ -25,6 +25,7 @@ if [[ ${1-} == mcp ]]; then
 fi
 if [[ ${1-} == sandbox ]]; then
   if [[ -n ${FAKE_CODEX_SANDBOX_LOG-} ]]; then printf '%s\n' "$@" >> "$FAKE_CODEX_SANDBOX_LOG"; fi
+  if [[ -n ${FAKE_CODEX_SANDBOX_SLEEP-} ]]; then sleep "$FAKE_CODEX_SANDBOX_SLEEP"; fi
   if [[ -n ${FAKE_CODEX_SANDBOX_OUT-} ]]; then printf '%s\n' "$FAKE_CODEX_SANDBOX_OUT" >&2; fi
   exit "${FAKE_CODEX_SANDBOX_EXIT-0}"
 fi
@@ -39,6 +40,13 @@ echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_CODEX_WRITE* ]]; then echo written > codex-wrote.txt; fi
 echo '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}'
+if [[ $prompt == *FAKE_CODEX_NOCMD* ]]; then
+  # What codex 0.162 prints under -s read-only when bwrap cannot start (issue #81): no command item at
+  # all, the bwrap error only in the model's message, and a completed turn.
+  echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"}}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":32710,"cached_input_tokens":24576,"output_tokens":54}}'
+  exit 0
+fi
 echo '{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}'
 if [[ $prompt == *FAKE_CODEX_BWRAP* ]]; then
   # What codex prints when bwrap cannot set up the sandbox's network namespace (issue #81).
@@ -46,6 +54,10 @@ if [[ $prompt == *FAKE_CODEX_BWRAP* ]]; then
 elif [[ $prompt == *FAKE_CODEX_ALLFAIL* ]]; then
   echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","aggregated_output":"ls: cannot open directory .: Permission denied\n","exit_code":2,"status":"failed"}}'
   echo '{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"cat go.mod","aggregated_output":"","exit_code":1,"status":"failed"}}'
+elif [[ $prompt == *FAKE_CODEX_RGMISS* ]]; then
+  # An ordinary non-zero exit (rg finds nothing) next to a command that worked.
+  echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"rg nothing","aggregated_output":"","exit_code":1,"status":"failed"}}'
+  echo '{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"ls","aggregated_output":"go.mod\n","exit_code":0,"status":"completed"}}'
 else
   echo '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls","exit_code":0,"status":"completed"}}'
 fi

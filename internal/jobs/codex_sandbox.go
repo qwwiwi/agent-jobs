@@ -13,17 +13,19 @@ import (
 )
 
 // Codex sandbox selection (issue #81). On some Linux hosts codex's native sandbox cannot start: bwrap
-// dies with "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" (an unprivileged network
-// namespace without the right to set up its loopback, e.g. inside a restricted systemd slice), every
-// command of the job fails, and codex still ends its turn. Config codex_sandbox picks what a codex job
-// runs in:
+// dies with "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" (on Ubuntu 24.04,
+// kernel.apparmor_restrict_unprivileged_userns=1 leaves the user namespace of codex's bundled bwrap
+// without rights; the host fix is an AppArmor profile granting it `userns`), and codex still ends its
+// turn: under read-only with no command item at all, the error only in its final message. Config
+// codex_sandbox picks what a codex job runs in:
 //
 //   - auto (default): the native sandbox, after a cached probe (`codex sandbox linux -- true`); when the
 //     probe shows the sandbox cannot start, codex jobs are refused at launch with an error naming the
 //     option. auto never falls back to a weaker containment by itself.
 //   - native: the native sandbox, never probed or refused (a probe that misjudges the host).
-//   - worktree-full-access: `-s danger-full-access`; the job's own worktree is the only isolation codex
-//     gets (no write or network confinement by codex). The owner opts in explicitly.
+//   - worktree-full-access: `-s danger-full-access`; no write or network confinement by codex, so no
+//     containment at all (the state dir, the shared .git and credential files are open to the job). It
+//     needs codex_write_allowed as well, for every kind; for disposable hosts only.
 const (
 	CodexSandboxModeAuto               = "auto"
 	CodexSandboxModeNative             = "native"
@@ -77,7 +79,11 @@ func validateCodexSandboxMode(mode string) error {
 	return nil
 }
 
-// Test hooks: the probe's command line, timeout and platform.
+// Test hooks: the probe's command line, timeout and platform. The probe does not pass the launch's
+// isolation flags (--ignore-user-config, --ignore-rules, -c overrides; CodexArgs): whether `codex sandbox
+// linux` accepts them is not verified for codex-cli 0.162.1 (`codex sandbox --help` could not be run where
+// this was written), and an unknown flag would turn every probe inconclusive. The probe calls no model and
+// no MCP server, so it needs none of them to stay off the owner's codex setup.
 var (
 	codexProbeArgs    = []string{"sandbox", "linux", "--", "true"}
 	codexProbeTimeout = 15 * time.Second
@@ -156,35 +162,67 @@ func codexBinKey(bin string) string {
 	return fmt.Sprintf("%s|%d|%d|%d|%d", path, id.Dev, id.Ino, id.Size, id.ModTime.UnixNano())
 }
 
-// codexSandboxProbe returns the cached probe of bin, probing once per binary identity.
+// codexProbeRetry is how long an inconclusive probe is reused before it runs again (a timeout or a
+// passing failure must not decide every later launch of the process); ok, unavailable and skipped stay
+// cached for the binary identity.
+var codexProbeRetry = 10 * time.Minute
+
+// codexSandboxProbe returns the cached probe of bin, probing once per binary identity (an inconclusive
+// result again after codexProbeRetry). The probe runs outside codexProbeMu; concurrent callers wait for
+// the one in flight instead of starting their own.
 func (m *Manager) codexSandboxProbe(bin string) CodexSandboxProbe {
 	key := codexBinKey(bin)
-	m.codexProbeMu.Lock()
-	defer m.codexProbeMu.Unlock()
-	if m.codexProbe != nil && m.codexProbeKey == key {
-		return *m.codexProbe
+	for {
+		m.codexProbeMu.Lock()
+		if p := m.codexProbe; p != nil && m.codexProbeKey == key &&
+			(p.Result != CodexProbeInconclusive || time.Since(p.At) < codexProbeRetry) {
+			m.codexProbeMu.Unlock()
+			return *p
+		}
+		if wait := m.codexProbing; wait != nil {
+			m.codexProbeMu.Unlock()
+			<-wait
+			continue
+		}
+		done := make(chan struct{})
+		m.codexProbing = done
+		m.codexProbeMu.Unlock()
+
+		p := probeCodexSandbox(bin, m.jobSpawnEnv())
+		m.codexProbeMu.Lock()
+		m.codexProbe, m.codexProbeKey, m.codexProbing = &p, key, nil
+		m.codexProbeMu.Unlock()
+		close(done)
+		if m.Log != nil {
+			m.Log.Printf("codex sandbox probe (%s): %s %s", bin, p.Result, RedactText(p.Detail))
+		}
+		return p
 	}
-	p := probeCodexSandbox(bin, m.jobSpawnEnv())
-	m.codexProbe, m.codexProbeKey = &p, key
-	if m.Log != nil {
-		m.Log.Printf("codex sandbox probe (%s): %s %s", bin, p.Result, RedactText(p.Detail))
-	}
-	return p
 }
 
-// codexSandboxRefusal is the launch refusal of auto mode when the native sandbox does not start.
+// codexSandboxRefusal is the launch refusal of auto mode when the native sandbox does not start: the
+// host fix first, worktree-full-access as the last resort.
 func codexSandboxRefusal(p CodexSandboxProbe) error {
 	return fmt.Errorf("the native codex sandbox does not start on this host (probe `%s %s`: %s); codex jobs are "+
-		"refused: set config codex_sandbox to %q to run them in their own worktree without the codex sandbox "+
-		"(weaker containment, see README), or run the job on claude",
-		filepath.Base(p.Bin), strings.Join(codexProbeArgs, " "), p.Detail, CodexSandboxModeWorktreeFullAccess)
+		"refused: %s (or run the job on claude)",
+		filepath.Base(p.Bin), strings.Join(codexProbeArgs, " "), p.Detail, codexSandboxHint)
 }
 
+// codexFullAccessRefusal is the refusal of a codex job under worktree-full-access without
+// codex_write_allowed: without the codex sandbox every kind can write anywhere the user can.
+var codexFullAccessRefusal = fmt.Errorf("codex_sandbox %q needs codex_write_allowed true as well: without the "+
+	"codex sandbox a codex job of any kind can write anywhere its user can (see README, «Codex sandbox»)",
+	CodexSandboxModeWorktreeFullAccess)
+
 // codexLaunchSandbox is the `codex exec --sandbox` value of a codex job's launch under cfg, or the
-// refusal of the launch (auto mode, native sandbox unavailable).
+// refusal of the launch (auto mode, native sandbox unavailable; worktree-full-access without
+// codex_write_allowed).
 func (m *Manager) codexLaunchSandbox(cfg Config, kind string) (string, error) {
 	switch cfg.codexSandboxMode() {
 	case CodexSandboxModeWorktreeFullAccess:
+		if !cfg.CodexWriteAllowed {
+			return "", codexFullAccessRefusal
+		}
 		return CodexSandboxFullAccess, nil
 	case CodexSandboxModeNative:
 		return CodexSandbox(kind), nil
@@ -195,12 +233,23 @@ func (m *Manager) codexLaunchSandbox(cfg Config, kind string) (string, error) {
 	return CodexSandbox(kind), nil
 }
 
-// CodexSandboxStatus reports the codex sandbox for system_doctor (it probes when the mode uses the native
-// sandbox and no probe of the current binary is cached).
+// CodexSandboxStatus reports the codex sandbox for system_doctor under the same rule as a launch
+// (authorizedLaunchConfig: worktree-full-access and codex_write_allowed switched off on disk count as
+// off; an unreadable config.json refuses codex jobs). It probes when the mode uses the native sandbox and
+// no usable probe of the current binary is cached.
 func (m *Manager) CodexSandboxStatus() CodexSandboxStatus {
-	cfg := m.Config()
+	cfg, err := m.authorizedLaunchConfig()
+	if err != nil {
+		s := CodexSandboxStatus{Mode: m.Config().codexSandboxMode(), Effective: "refused"}
+		s.Problem = "codex sandbox: codex jobs are refused: " + err.Error()
+		return s
+	}
 	s := CodexSandboxStatus{Mode: cfg.codexSandboxMode(), Effective: CodexSandboxModeNative}
 	if s.Mode == CodexSandboxModeWorktreeFullAccess {
+		if !cfg.CodexWriteAllowed {
+			s.Effective, s.Problem = "refused", "codex sandbox: "+codexFullAccessRefusal.Error()
+			return s
+		}
 		s.Effective = CodexSandboxModeWorktreeFullAccess
 		return s
 	}
@@ -214,7 +263,7 @@ func (m *Manager) CodexSandboxStatus() CodexSandboxStatus {
 		s.Problem = "codex sandbox: " + codexSandboxRefusal(p).Error()
 	} else {
 		s.Problem = fmt.Sprintf("codex sandbox: codex_sandbox is native, but the native sandbox does not start on this "+
-			"host (%s): codex jobs will fail; set codex_sandbox to %q", p.Detail, CodexSandboxModeWorktreeFullAccess)
+			"host (%s): codex jobs will fail; %s", p.Detail, codexSandboxHint)
 	}
 	return s
 }

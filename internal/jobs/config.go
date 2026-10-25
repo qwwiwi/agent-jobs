@@ -76,8 +76,9 @@ type Config struct {
 	CodexWriteAllowed bool `json:"codex_write_allowed"`
 	// CodexSandboxMode is what codex jobs run in (codex_sandbox.go): auto (default: the native codex
 	// sandbox after a cached probe; codex jobs are refused when it cannot start), native (never probed) or
-	// worktree-full-access (`-s danger-full-access` in the job's own worktree, no codex sandbox). Enabling
-	// worktree-full-access needs a daemon restart; turning it off on disk applies at the next launch.
+	// worktree-full-access (`-s danger-full-access` in the job's own worktree, no codex sandbox; needs
+	// CodexWriteAllowed too). Enabling worktree-full-access needs a daemon restart; turning it off on disk
+	// applies at the next launch.
 	CodexSandboxMode string `json:"codex_sandbox"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`

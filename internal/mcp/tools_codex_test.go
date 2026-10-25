@@ -83,6 +83,38 @@ func TestCodexJobViewCostUnknownWhileActive(t *testing.T) {
 	}
 }
 
+// job_status shows the codex sandbox the daemon recorded for the job's launch (issue #81, L4); a codex
+// job not launched yet shows none.
+func TestCodexJobViewSandbox(t *testing.T) {
+	m := newManager(t)
+	now := time.Now()
+	run := &store.Job{ID: "261018-120000-c0d3", Agent: "test", Title: "codex review", Kind: "review", Brief: "b",
+		Status: store.StatusRunning, Model: "gpt-6.1-sol", Runner: store.RunnerCodex, TimeoutMinutes: 45,
+		CreatedAt: now.Add(-time.Hour), StartedAt: &now, LaunchToken: "tok", Attempt: 1}
+	queued := &store.Job{ID: "261018-120000-c0d4", Agent: "test", Title: "codex review", Kind: "review", Brief: "b",
+		Status: store.StatusQueued, Model: "gpt-6.1-sol", Runner: store.RunnerCodex, TimeoutMinutes: 45, CreatedAt: now}
+	for _, j := range []*store.Job{run, queued} {
+		if err := m.Store.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.Store.SetLaunchAuthorization(run.ID, "tok", 1, store.LaunchAuthorization{CodexWriteAllowed: true,
+		CodexSandbox: jobs.CodexSandboxFullAccess}); err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, mustServer(t, m))
+	var st JobView
+	call(t, cs, "job_status", map[string]any{"id": run.ID}, &st)
+	if st.CodexSandbox != jobs.CodexSandboxFullAccess {
+		t.Fatalf("job_status of a launched codex job: codex_sandbox %q", st.CodexSandbox)
+	}
+	st = JobView{}
+	call(t, cs, "job_status", map[string]any{"id": queued.ID}, &st)
+	if st.CodexSandbox != "" {
+		t.Fatalf("job_status of a queued codex job: codex_sandbox %q", st.CodexSandbox)
+	}
+}
+
 // A codex job_start shows codex_jobs_today n/limit; past the cap it is refused, claude jobs still
 // start, and system_doctor shows the count.
 func TestJobStartCodexDailyCap(t *testing.T) {
@@ -144,17 +176,31 @@ func TestSystemDoctorCodexSandbox(t *testing.T) {
 		t.Fatalf("doctor codex_sandbox: %+v", s)
 	}
 	if !slices.ContainsFunc(doc.Problems, func(p string) bool {
-		return strings.Contains(p, `codex_sandbox to "worktree-full-access"`)
+		return strings.Contains(p, "apparmor_restrict_unprivileged_userns") && strings.Contains(p, "last resort")
 	}) || doc.OK {
 		t.Fatalf("doctor problems: %v", doc.Problems)
 	}
-	// A restart-only key: the server's startup config.
-	m2 := newManager(t)
-	m2.SelfBin = selfBin
-	m2.Cfg.CodexSandboxMode = jobs.CodexSandboxModeWorktreeFullAccess
-	var full SystemDoctorOutput
-	call(t, connect(t, mustServer(t, m2)), "system_doctor", map[string]any{}, &full)
-	if s := full.CodexSandbox; s.Mode != jobs.CodexSandboxModeWorktreeFullAccess || s.Effective != s.Mode || s.Probe != nil || s.Problem != "" {
-		t.Fatalf("doctor codex_sandbox under worktree-full-access: %+v", s)
+	// A restart-only key: the server's startup config, and, as at launch, the disk can only take it back
+	// (worktree-full-access or codex_write_allowed off on disk) and an unreadable file refuses.
+	for _, c := range []struct {
+		name, disk, effective string
+		probed, problem       bool
+	}{
+		{"on", `{"codex_sandbox":"worktree-full-access","codex_write_allowed":true}`, jobs.CodexSandboxModeWorktreeFullAccess, false, false},
+		{"mode off on disk", `{"codex_write_allowed":true}`, jobs.CodexSandboxModeNative, true, false}, // probe: no codex here
+		{"write off on disk", `{"codex_sandbox":"worktree-full-access"}`, "refused", false, true},
+		{"invalid on disk", `{"codex_sandbox":`, "refused", false, true},
+	} {
+		m2 := newManager(t)
+		m2.SelfBin = selfBin
+		m2.Cfg.CodexSandboxMode, m2.Cfg.CodexWriteAllowed = jobs.CodexSandboxModeWorktreeFullAccess, true
+		if err := os.WriteFile(filepath.Join(m2.StateDir, "config.json"), []byte(c.disk), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var full SystemDoctorOutput
+		call(t, connect(t, mustServer(t, m2)), "system_doctor", map[string]any{}, &full)
+		if s := full.CodexSandbox; s.Effective != c.effective || (s.Probe != nil) != c.probed || (s.Problem != "") != c.problem {
+			t.Fatalf("%s: doctor codex_sandbox: %+v", c.name, s)
+		}
 	}
 }

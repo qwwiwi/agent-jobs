@@ -559,6 +559,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN cover_contract TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN gate_input TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN size TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE launch_authorizations ADD COLUMN codex_sandbox TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
