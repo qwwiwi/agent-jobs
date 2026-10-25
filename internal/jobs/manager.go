@@ -180,6 +180,10 @@ type StartRequest struct {
 	SizeRule bool
 	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
 	Gate *store.GateInput
+	// Milestone and Task attach the job to a task of a milestone (both or neither): the task must not
+	// be blocked or dropped, and the milestone's branch is the default base.
+	Milestone int64
+	Task      string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -335,6 +339,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := checkGateRequest(r); err != nil {
 		return nil, err
 	}
+	if err := m.milestoneStart(&r); err != nil {
+		return nil, err
+	}
 	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -432,6 +439,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		MilestoneID: r.Milestone, TaskKey: r.Task,
 	}
 	return j, nil
 }
@@ -539,6 +547,15 @@ func (m *Manager) launchQueued() error {
 	for _, j := range queued {
 		if running >= limit {
 			return nil
+		}
+		if j.MilestoneID != 0 {
+			// The milestone's own cap (max_parallel): its job waits for a slot of the milestone.
+			if full, err := m.Store.MilestoneFull(j.MilestoneID); err != nil || full {
+				if err != nil {
+					m.Log.Printf("job %s: milestone slots: %v", j.ID, err)
+				}
+				continue
+			}
 		}
 		token := newToken()
 		// The row is ours (running + token) before anything is created or spawned.

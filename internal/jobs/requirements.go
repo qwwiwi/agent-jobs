@@ -444,6 +444,27 @@ func RequirementsTrailers(values string) []string {
 	return out
 }
 
+// jobHead is the last commit of a repository job: its worktree's HEAD while the worktree is there (and
+// verified as the job's), else refs/agent-jobs/jobs/<id> ("" when neither is there); note says why it
+// could not be read.
+func (m *Manager) jobHead(ctx context.Context, j *store.Job) (head, note string) {
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if fi, err := os.Lstat(work); err == nil && fi.IsDir() {
+		if err := m.verifyWorktree(j, work); err != nil {
+			return "", "the job's worktree is not verified"
+		}
+		h, err := gitCtxOK(ctx, work, "rev-parse", "--verify", "HEAD^{commit}")
+		if err != nil {
+			return "", RedactPrintable(err.Error(), 160)
+		}
+		return h, ""
+	}
+	if h, err := gitCtxOK(ctx, j.RepoPath, "rev-parse", "--verify", "-q", "refs/agent-jobs/jobs/"+j.ID+"^{commit}"); err == nil {
+		return h, ""
+	}
+	return "", ""
+}
+
 // JobRequirementsTrailers returns the «Requirements:» trailer IDs of the job's own commits (base..head;
 // head is the job's worktree HEAD while it is there, else refs/agent-jobs/jobs/<id>), and a note when
 // they could not be read ("" for a job without a repository or without commits).
@@ -453,19 +474,9 @@ func (m *Manager) JobRequirementsTrailers(j *store.Job) ([]string, string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), MergeCheckTimeout)
 	defer cancel()
-	head := ""
-	work := filepath.Join(m.JobDir(j.ID), "work")
-	if fi, err := os.Lstat(work); err == nil && fi.IsDir() {
-		if err := m.verifyWorktree(j, work); err != nil {
-			return nil, "commit trailers not read: the job's worktree is not verified"
-		}
-		h, err := gitCtxOK(ctx, work, "rev-parse", "--verify", "HEAD^{commit}")
-		if err != nil {
-			return nil, "commit trailers not read: " + RedactPrintable(err.Error(), 160)
-		}
-		head = h
-	} else if h, err := gitCtxOK(ctx, j.RepoPath, "rev-parse", "--verify", "-q", "refs/agent-jobs/jobs/"+j.ID+"^{commit}"); err == nil {
-		head = h
+	head, note := m.jobHead(ctx, j)
+	if note != "" {
+		return nil, "commit trailers not read: " + note
 	}
 	if head == "" || head == j.BaseCommit {
 		return nil, ""

@@ -175,11 +175,12 @@ func (m *Manager) ProtectedPaths() []string {
 // GIT_CONFIG_GLOBAL) and <jobdir>/no-hooks (its core.hooksPath), whose 0400/0500 modes do not hold a
 // job back (it owns them and may chmod them; a changed diff.external or a planted hook makes git run
 // a program), and <jobdir>/settings.json and mcp.json (its guard hook, permissions and MCP servers,
-// read again when the job is resumed).
+// read again when the job is resumed), and <jobdir>/prior (the reports of the task's dependencies,
+// read-only for the job).
 func (m *Manager) jobOwnProtected(id string) []string {
 	dir := m.JobDir(id)
 	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir),
-		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json")}
+		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json"), filepath.Join(dir, PriorDir)}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -383,8 +384,8 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	}
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
-	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), cover, check, contract)
+	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s\n\n%s\n",
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), m.PriorResults(j), cover, check, contract)
 	return b.String(), nil
 }
 
@@ -457,6 +458,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 		return fmt.Errorf("create subagent log dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
+		return err
+	}
+	if err := m.writePriorReports(j, dir); err != nil {
 		return err
 	}
 	if err := m.writeGitFiles(dir); err != nil {
