@@ -521,7 +521,7 @@ Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.30
 **Build and check**
 
 ```bash
-go build -ldflags "-X main.version=v0.5.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.5.1" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```
