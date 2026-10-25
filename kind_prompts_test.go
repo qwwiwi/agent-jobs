@@ -6,8 +6,9 @@ import (
 )
 
 // F10: the fix and general checklists keep their reference rows first and add the same executor rules:
-// a REDPROOF line per new test, visible placeholders instead of made-up facts, the Requirements: commit
-// trailer, and a BLOCKED: line in Not done / uncertain for a part the brief does not allow.
+// each new test and how it failed before named in Evidence (no mandatory REDPROOF line format since
+// 2026-10-25), visible placeholders instead of made-up facts, the Requirements: commit trailer, and a
+// BLOCKED: line in Not done / uncertain for a part the brief does not allow.
 func TestWriteKindPromptsExecutorRules(t *testing.T) {
 	first := map[string][]string{
 		"prompts/kind-fix.md": {"- First reproduce the problem with a failing test.",
@@ -26,11 +27,7 @@ func TestWriteKindPromptsExecutorRules(t *testing.T) {
 			t.Errorf("%s: reference rows not kept on lines 3-4", name)
 		}
 		for _, want := range []string{
-			"Red proof:", "write a `REDPROOF` line", "failed before your change", "`REDPROOF R01 · ...`",
-			// ParseRequirements reads proofs only inside the Requirements block: a covered job puts them
-			// there; a job without covers may keep them in Evidence.
-			"put these lines inside the `### Requirements` block", "a proof only in Evidence leaves the requirement claimed",
-			"A job without covers may put its `REDPROOF` lines in Evidence",
+			"In Evidence, name each new test", "failed before your change",
 			"Do not make up a fact", "visible placeholder", "`<<PLACEHOLDER: what is missing>>`", "list each one in Not done / uncertain",
 			"`Requirements: R01, R03i`", "end each commit message with a trailer",
 			"`BLOCKED: <requirement or item> · <why>`", "is `missing` or `partial` in the `### Requirements` block",
@@ -39,8 +36,8 @@ func TestWriteKindPromptsExecutorRules(t *testing.T) {
 				t.Errorf("%s lacks %q", name, want)
 			}
 		}
-		if strings.Contains(s, "line in Evidence that names the test") {
-			t.Errorf("%s still asks every job for its red proof in Evidence", name)
+		if strings.Contains(s, "REDPROOF") {
+			t.Errorf("%s still asks for the REDPROOF line format", name)
 		}
 		if strings.Contains(s, "`## ") {
 			t.Errorf("%s asks for a top-level (##) report section beyond the four of the report contract", name)

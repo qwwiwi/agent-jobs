@@ -17,16 +17,21 @@ func reqBlock(lines ...string) string {
 
 const doneR01 = "- R01 · done · a.go:1 · ran: go test ./... → ok"
 
-// A done line is verified only by an exact REDPROOF marker with real proof content that names that
-// requirement: a look-alike marker, an empty or negative proof, or a proof naming another ID does not
-// verify it.
+// A red proof of R01 is read (informational since 2026-10-25: it no longer decides whether a done line
+// counts) only from an exact REDPROOF marker with real proof content that names that requirement: a
+// look-alike marker, an empty or negative proof, or a proof naming another ID is not one.
 func TestRedProofStrict(t *testing.T) {
 	verified := func(report string) bool {
 		t.Helper()
 		r := ParseRequirements(report, []string{"R01", "R02"})
+		for _, p := range r.RedProofs {
+			if ids, ok := redProof(p); ok && slices.Contains(ids, "R01") {
+				return true
+			}
+		}
 		for _, l := range r.Lines {
 			if l.ID == "R01" {
-				return l.Verified
+				return l.RedProof != ""
 			}
 		}
 		t.Fatalf("no R01 line in %+v", r)
@@ -142,13 +147,16 @@ func TestJobRequirementsTrailersRealTrailersOnly(t *testing.T) {
 
 // One strict ID matcher for validation and extraction: an ID glued to a word character (R01_other,
 // xR01) is not that ID; a Markdown-wrapped or newly listed negative proof (tbd, skipped, pending,
-// missing, n.a., ?) is not a proof; a negative ran: value does not verify a done line.
+// missing, n.a., ?) is not a proof; a negative ran: value names no command. (Informational since
+// 2026-10-25: a done line counts without either.)
 func TestRedProofStrictIDsAndNegatives(t *testing.T) {
 	verified := func(report string) bool {
 		t.Helper()
-		for _, l := range ParseRequirements(report, []string{"R01", "R02"}).Lines {
+		r := ParseRequirements(report, []string{"R01", "R02"})
+		proof := slices.ContainsFunc(r.RedProofs, func(p string) bool { ids, ok := redProof(p); return ok && slices.Contains(ids, "R01") })
+		for _, l := range r.Lines {
 			if l.ID == "R01" {
-				return l.Verified
+				return ranCommand(l.Ran) && (proof || l.RedProof != "")
 			}
 		}
 		t.Fatalf("no R01 line in %q", report)
