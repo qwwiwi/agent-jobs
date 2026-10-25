@@ -118,6 +118,10 @@ const usage = `usage: agent-jobs <command> [flags]
   hook brief-reminder --agent A            UserPromptSubmit hook of the orchestrator session (JSON
                                            on stdin): one line with the size rule and whether the
                                            session's repo has an approved checklist; never blocks
+  hook merge-gate --agent A                PreToolUse hook on Bash of the orchestrator session (JSON
+                                           on stdin): in a repo with an approved checklist, blocks
+                                           gh pr merge (exit 2) unless --match-head-commit <sha> names
+                                           a sha release_check passed on; no-op inside a job
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
@@ -148,8 +152,9 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if reason := refuseInsideJob(cmd, args); reason != "" {
-		// The brief reminder always exits 0: inside a job it ends here, silently, before any state is opened.
-		if cmd == "hook" && len(args) > 0 && args[0] == "brief-reminder" {
+		// The brief reminder always exits 0, and the merge gate is a no-op in a job (a job never merges): inside
+		// a job both end here, silently, before any state is opened.
+		if cmd == "hook" && len(args) > 0 && (args[0] == "brief-reminder" || args[0] == "merge-gate") {
 			os.Exit(0)
 		}
 		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
@@ -1917,6 +1922,9 @@ func cmdDoctor(args []string) error {
 //	hook brief-reminder --agent A
 //	                      UserPromptSubmit hook: prints one reminder line (the size rule, whether the
 //	                      repo at the session's cwd has an approved checklist), for the bound session only
+//	hook merge-gate --agent A
+//	                      PreToolUse hook on Bash: blocks gh pr merge in a repo with an approved checklist
+//	                      unless release_check passed on its --match-head-commit sha (mergeGateHook)
 //
 // Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
 // output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding. The
@@ -1926,6 +1934,9 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	sub := ""
 	if len(args) > 0 {
 		sub = args[0]
+	}
+	if sub == "merge-gate" {
+		return mergeGateHook(args[1:], stdin, stderr, openReadOnly)
 	}
 	if sub == "brief-reminder" {
 		type answer struct {
@@ -1964,8 +1975,8 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return 1
 	}
 	if sub != "stop" && sub != "bind" {
-		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder --agent A (Claude Code Stop / SessionStart / " +
-			"UserPromptSubmit hook, JSON on stdin)"))
+		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder|merge-gate --agent A (Claude Code Stop / " +
+			"SessionStart / UserPromptSubmit / PreToolUse hook, JSON on stdin)"))
 	}
 	fs := flag.NewFlagSet("hook "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -2021,6 +2032,69 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	}
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
 		return fail(err)
+	}
+	return 0
+}
+
+// mergeGateTimeout bounds the merge gate (store reads, git, checklist files): past it the call is blocked.
+const mergeGateTimeout = 5 * time.Second
+
+// mergeGateHook is `hook merge-gate` (Wave F, F9 (b)): exit 0 allows the Bash call, exit 2 blocks it with
+// one line on stderr (Claude Code shows it to the model). A call that does not run `gh pr merge` (and
+// cannot) is allowed before the store is opened; for one that does or may, every error blocks (fail
+// closed): bad flags, an unreadable input, the store, a timeout. A job session (ErrInJobSession) is a
+// no-op, like the job-role refusal in main.
+func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
+	block := func(reason string) int {
+		fmt.Fprintln(stderr, reason)
+		return 2
+	}
+	fs := flag.NewFlagSet("hook merge-gate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	agent := agentFlag(fs)
+	pos, flagErr := parse(fs, args)
+	if flagErr == nil && len(pos) > 0 {
+		flagErr = errors.New("no positional arguments")
+	}
+	in, err := jobs.ParsePreToolUseInput(stdin)
+	if err != nil {
+		return block(jobs.MergeGatePrefix + "unreadable hook input (" + jobs.Printable(err.Error(), 200) + ")")
+	}
+	if in.ToolName != "Bash" || !jobs.MergeGateNeeded(in.Command) {
+		return 0
+	}
+	if flagErr != nil {
+		return block(jobs.MergeGatePrefix + "the hook is misconfigured (" + flagErr.Error() + "); register it as " +
+			"agent-jobs hook merge-gate --agent A")
+	}
+	type answer struct {
+		reason string
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		m, err := opener(*agent)
+		if err != nil {
+			done <- answer{"", err}
+			return
+		}
+		defer m.Close()
+		r, err := m.MergeGate(in.Cwd, in.Command, os.Getenv("GH_REPO"))
+		done <- answer{r, err}
+	}()
+	var a answer
+	select {
+	case a = <-done:
+	case <-time.After(mergeGateTimeout):
+		a.err = fmt.Errorf("no answer within %s", mergeGateTimeout)
+	}
+	switch {
+	case errors.Is(a.err, jobs.ErrInJobSession):
+		return 0
+	case a.err != nil:
+		return block(jobs.MergeGatePrefix + "cannot check the merge (" + jobs.RedactPrintable(a.err.Error(), 300) + ")")
+	case a.reason != "":
+		return block(a.reason)
 	}
 	return 0
 }
