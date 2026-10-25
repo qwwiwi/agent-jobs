@@ -25,10 +25,10 @@ import (
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
 // closed: a void approval never lifts the gate) until the owner retires it (`agent-jobs gate retire`).
 // Another clone of a gated repository (a shared OWNER/REPO remote) is gated with it: the names of a gated
-// repository's remotes are stored (store.GateRepo, at the approval and whenever the hook reads them), so a
-// gated work tree that is gone or moved is still matched by name and never makes other merges unreadable.
-// A gh pr merge written in the Bash command whose target the reader cannot tell is refused while some
-// repository is gated. It reads the store, git remotes and the brief files, and writes only remote names.
+// repository's remotes are stored (store.GateRepo, by checklist_set at the approval and by release_check
+// on a pass), so a gated work tree that is gone or moved is still matched by name and never makes other
+// merges unreadable. A gh pr merge written in the Bash command whose target the reader cannot tell is
+// refused while some repository is gated. It reads the store, git remotes and the brief files only.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
 // `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
@@ -255,8 +255,8 @@ func (g *mergeGate) byRemotes(r *gatedRepo, add func(*gatedRepo)) (string, error
 }
 
 // gatedNames are gated repository r's OWNER/REPO names (cached): those stored for it and those of its
-// remotes now, which are stored too when new. A work tree that is gone, moved or whose remotes are
-// unreadable has its stored names only: it is never a reason to refuse a merge elsewhere.
+// remotes now. A work tree that is gone, moved or whose remotes are unreadable has its stored names only:
+// it is never a reason to refuse a merge elsewhere.
 func (g *mergeGate) gatedNames(r *gatedRepo) ([]string, error) {
 	if r.namesRead {
 		return r.names, nil
@@ -265,19 +265,12 @@ func (g *mergeGate) gatedNames(r *gatedRepo) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	names := rec.Names
+	names := slices.Clone(rec.Names)
 	if live, err := remoteRepoNames(r.main); err == nil {
-		var fresh []string
 		for _, n := range live {
 			if !slices.Contains(names, n) {
-				fresh = append(fresh, n)
+				names = append(names, n)
 			}
-		}
-		if len(fresh) > 0 {
-			names = append(slices.Clone(names), fresh...)
-			// Best effort: the names read now decide this call either way; a failed write is retried by the
-			// next call that reads them.
-			_ = g.m.Store.AddGateRepoNames(r.main, fresh)
 		}
 	}
 	r.names, r.namesRead = names, true
@@ -285,7 +278,8 @@ func (g *mergeGate) gatedNames(r *gatedRepo) ([]string, error) {
 }
 
 // RecordGateNames stores the OWNER/REPO names of main's remotes for the merge hook (checklist_set calls it
-// when it stores an approval), so the hook still knows them once the work tree is gone or moved.
+// when it stores an approval, release_check on a pass; the hook itself opens the store read-only), so the
+// hook still knows them once the work tree is gone or moved.
 func (m *Manager) RecordGateNames(main string) error {
 	names, err := remoteRepoNames(main)
 	if err != nil || len(names) == 0 {

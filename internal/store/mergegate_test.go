@@ -20,6 +20,9 @@ func TestGateRepos(t *testing.T) {
 	if _, err := s.db.Exec(`DROP TABLE merge_gate_repos`); err != nil {
 		t.Fatal(err)
 	}
+	if g, err := s.GateRepoOf("/r"); err != nil || g.Repo != "" {
+		t.Fatalf("no table: %+v %v", g, err)
+	}
 	_ = s.Close()
 	if s, err = Open(path); err != nil {
 		t.Fatalf("migrate: %v", err)

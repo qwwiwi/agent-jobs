@@ -72,6 +72,10 @@ func TestMergeGateEndToEnd(t *testing.T) {
 	if r, err := m.ReleaseCheck(repo, shaA); err != nil || !r.Pass {
 		t.Fatalf("release_check: %+v %v", r, err)
 	}
+	// A pass also stores the repository's remote names for the hook (read-only, it stores none itself).
+	if g, err := m.Store.GateRepoOf(mainWorktree(repo)); err != nil || len(g.Names) != 1 || g.Names[0] != "acme/demo" {
+		t.Fatalf("names after release_check: %+v %v", g, err)
+	}
 	if err := os.WriteFile(filepath.Join(repo, "next.txt"), []byte("next\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

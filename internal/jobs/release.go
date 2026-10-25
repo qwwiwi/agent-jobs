@@ -115,6 +115,9 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 		return out, nil
 	}
+	if err := m.RecordGateNames(out.Repo); err != nil {
+		return nil, fmt.Errorf("release_check passed, but the remote names for the merge hook could not be stored: %w", err)
+	}
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: out.Repo, SHA: out.SHA, ChecklistID: out.ChecklistID,
 		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now()}); err != nil {
 		return nil, fmt.Errorf("release_check passed, but its record for the merge hook could not be stored: %w", err)

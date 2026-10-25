@@ -30,19 +30,15 @@ func gateAnswer(t *testing.T, m *Manager, cwd, cmd, env string) string {
 	return r
 }
 
-// A gated repository whose work tree is gone is still gated by its stored OWNER/REPO names (recorded by
-// the hook when it read them), and never makes a merge in an unrelated repository unreadable.
+// A gated repository whose work tree is gone never makes a merge in an unrelated repository unreadable
+// (its stored names, TestMergeGateRetire, still gate it by name).
 func TestMergeGateWorkTreeGone(t *testing.T) {
 	m, repo := mergeGateRepo(t)
 	plain := newRepo(t)
 	gitT(t, plain, "remote", "add", "origin", "https://github.com/other/repo.git")
-	// The hook reads (and stores) the gated repository's names on a merge it checks.
 	if r := gateAnswer(t, m, plain, "gh pr merge 5 -R acme/demo", ""); !strings.Contains(r, "without --match-head-commit") {
 		t.Fatalf("by name, work tree present: %q", r)
 	}
-	clone := filepath.Join(t.TempDir(), "clone")
-	gitT(t, t.TempDir(), "clone", "-q", repo, clone)
-	gitT(t, clone, "remote", "set-url", "origin", "https://github.com/acme/demo.git")
 	if err := os.RemoveAll(repo); err != nil {
 		t.Fatal(err)
 	}
@@ -53,8 +49,6 @@ func TestMergeGateWorkTreeGone(t *testing.T) {
 		{"unrelated repo", plain, "gh pr merge 5", ""},
 		{"unrelated -R", plain, "gh pr merge 5 -R other/repo", ""},
 		{"not in a repo", t.TempDir(), "gh pr merge 5", ""},
-		{"gone repo by name", plain, "gh pr merge 5 -R Acme/Demo", "its checklist approval is void"},
-		{"clone of the gone repo", clone, "gh pr merge 5", "its checklist approval is void"},
 	} {
 		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)
@@ -130,12 +124,18 @@ func TestMergeGateRetire(t *testing.T) {
 		t.Fatalf("an ungated path: %v", err)
 	}
 	main := mainWorktree(repo)
+	clone := filepath.Join(t.TempDir(), "clone")
+	gitT(t, t.TempDir(), "clone", "-q", repo, clone)
+	gitT(t, clone, "remote", "set-url", "origin", "https://github.com/acme/demo.git")
 	if err := os.RemoveAll(repo); err != nil {
 		t.Fatal(err)
 	}
 	elsewhere := t.TempDir()
-	if r := gateAnswer(t, m, elsewhere, "gh pr merge 5 -R acme/demo", ""); !strings.Contains(r, "its checklist approval is void") {
+	if r := gateAnswer(t, m, elsewhere, "gh pr merge 5 -R Acme/Demo", ""); !strings.Contains(r, "its checklist approval is void") {
 		t.Fatalf("gone, by recorded name: %q", r)
+	}
+	if r := gateAnswer(t, m, clone, "gh pr merge 5", ""); !strings.Contains(r, "its checklist approval is void") {
+		t.Fatalf("clone of the gone repo: %q", r)
 	}
 	if got, err := m.RetireGate(main); err != nil || got != main {
 		t.Fatalf("retire: %q %v", got, err)

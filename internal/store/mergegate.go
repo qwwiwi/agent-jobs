@@ -40,7 +40,9 @@ func (s *Store) GateRepoOf(repo string) (GateRepo, error) {
 	var g GateRepo
 	var names string
 	err := s.db.QueryRow(`SELECT repo, names, retired_seq FROM merge_gate_repos WHERE repo=?`, repo).Scan(&g.Repo, &names, &g.RetiredSeq)
-	if errors.Is(err, sql.ErrNoRows) {
+	// A read-only store (the merge hook's) opened before any read-write Open created the table has no
+	// record: nothing was stored, nothing retired.
+	if errors.Is(err, sql.ErrNoRows) || err != nil && strings.Contains(err.Error(), "no such table: merge_gate_repos") {
 		return GateRepo{}, nil
 	}
 	if err != nil {
