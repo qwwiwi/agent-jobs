@@ -94,6 +94,12 @@ var OrchestratorOnly = []string{
 	"judge_get",
 	// The release check (Wave F, F7): only the session asks whether a commit may ship.
 	"release_check",
+	// Milestones (stages of work, their tasks and jobs): only the session plans and reads them; a job
+	// on a task gets its dependencies' results in its prompt.
+	"milestone_create",
+	"milestone_set",
+	"milestone_get",
+	"milestone_list",
 }
 
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
