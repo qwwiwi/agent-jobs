@@ -483,7 +483,7 @@ CLI читает то же: `agent-jobs gate slicing --agent A --repo PATH [--ch
 **Сборка и проверка**
 
 ```bash
-go build -ldflags "-X main.version=v0.5.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+go build -ldflags "-X main.version=v0.5.1" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
 git config core.hooksPath .githooks   # один раз на клон: pre-push запускает scripts/check.sh
 scripts/check.sh                       # gofmt, go vet, go test
 ```

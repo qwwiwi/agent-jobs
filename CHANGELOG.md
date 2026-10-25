@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-25
+
+### Fixed
+- Merge gate false blocks (post PR #78): the reader reads strictly as before (PR #78) and, only where that reading finds a merge or is unsure and the command is relaxable, relaxed: a `gh pr` call with a literal head is read by its subcommand, so the word merge as a data argument (`gh pr create --title merge`, `gh pr list --label merge`, `gh pr view merge`) is no merge; an extglob-like text in the body of a `<<'WORD'` / `<<"WORD"` here-document (`-m "$(cat <<'EOF' … C++(17) … EOF)"`) no longer makes a command unsure; a quoted variable value of `-R` / `--repo` / `--hostname` before the subcommand (`gh -R "$R" pr view 5`) is one word. Relaxable: outside those here-document bodies the text holds none of `${`, `$[`, `$'`, `$"`, `((`, `[[`, a backtick, `<(`, `>(`, `=(`, an unquoted `#`, `eval`, `source`, `.`, `case`, `coproc`, `alias`, `shopt`, `set` with an o option, `-O` / `+O`, an extglob-like pattern, `<<<`, `<<-` or another here-document form, and its bodies are the ones the reader found (fix loop 2: the relaxations hid merges after `${x:- #}`, `[[ … @(#) ]]`, `(( 1 << "E" ))` and `<<$'EOF'`; comments are no inert range any more). A brace, glob or tilde at or before the `gh pr` subcommand makes the head vague in both readings (`gh -R {o/r,pr,merge,--subject} pr view` runs gh pr merge). Unquoted `$R` and `"$@"` stay unsure, `gh -R "$R" pr merge` stays unsure. Fix loop 3: a value attached to `-R` (`gh -R"$R" pr view 5`) is read strictly (an empty `$R` leaves a bare `-R` that takes the next word), and `xargs` (which rewrites the argv it runs) makes a command not relaxable. So do `sudo`, `doas`, `su` and `runuser`: in a shell mode (`sudo -s`) their argv goes to a root shell that expands `$NAME` in a quoted word again (`DISPLAY=merge sudo -s gh pr '$DISPLAY' 5`). The hook also refuses `go run` of agent-jobs with build flags before the package or a `@version` (`go run -tags x ./cmd/agent-jobs gate retire`, `go run …/cmd/agent-jobs@latest gate retire`).
+
 ## [0.5.0] - 2026-10-25
 
 ### Added
@@ -209,7 +214,8 @@ No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released her
 - File tools (Write/Edit/MultiEdit/NotebookEdit) cannot write inside `.git` or the job's own git dirs (symlinks resolved, `..` rejected).
 - Wrapper starts claude with a scrubbed git environment (job-only global config with the job identity, no system config, hooks/fsmonitor/ssh/credential helper/pager/editor overridden); the daemon's own git calls use the same overrides, and cleanup makes no patch when the repository config names a filter, diff command or textconv.
 
-[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.1.0...v0.3.0

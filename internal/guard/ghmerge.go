@@ -61,16 +61,39 @@ var (
 // reader cannot read whole (longer than its limit, nested deeper than its limit). What makes one call
 // unreadable (a cd it cannot follow, GH_REPO from a variable, GIT_DIR / GIT_WORK_TREE set) is the
 // call's Unsure.
+//
+// The strict reading decides. Only where it finds a merge or is unsure, and the command is relaxable
+// (its words, commands and quoted here-document bodies are surely bash's), the relaxed reading is taken
+// instead: it reads a literal `gh pr` call by its subcommand (the word merge as a data argument makes no
+// merge), sees no extglob in the body of a here-document with a quoted delimiter, and reads a quoted
+// variable value of -R / --repo / --hostname as one word. So it never reports less than the strict
+// reading for a command that is not relaxable.
 func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 	if len(cmd) > maxCommandBytes {
 		return nil, "the command is longer than the reader's limit"
 	}
+	scripts := parseAll(cmd)
+	calls, unsure = readMerges(cmd, cwd, scripts, false)
+	if unsure == "" && len(calls) == 0 || !relaxable(cmd, scripts) {
+		return calls, unsure
+	}
+	// A fresh parse, so the relaxed reading shares no parsed state with the strict one.
+	return readMerges(cmd, cwd, parseAll(cmd), true)
+}
+
+// readMerges is GhPrMerges on the parsed scripts of cmd, the relaxed reading when relax is set.
+func readMerges(cmd, cwd string, scripts []*script, relax bool) (calls []GhMerge, unsure string) {
 	text := mergeText(cmd)
 	mentionsGh := reGhWord.MatchString(text)
 	mentions := mentionsGh || reMergeWord.MatchString(text)
-	scripts := parseAll(cmd)
 	for _, sc := range scripts {
-		if mentionsGh && unsure == "" && reExtglob.MatchString(unquotedText(sc.src)) {
+		src := sc.src
+		if relax {
+			// The shell expands no pattern in a quoted here-document body (an unquoted body's substitutions
+			// are scripts of their own).
+			src = blankRanges(src, sc.literalBodies)
+		}
+		if mentionsGh && unsure == "" && reExtglob.MatchString(unquotedText(src)) {
 			unsure = "an extglob pattern in a command that runs gh (the shell may turn it into gh pr merge)"
 		}
 	}
@@ -109,7 +132,7 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 				git := len(argv) > 0 && !dyn[0] && isGitName(progName(argv[0]))
 				// Merges nothing itself: a gh call of another group or a literal gh pr subcommand other than
 				// merge, or a shell running literal -c code (read as a nested script, where a gh call counts).
-				quiet := (ghOtherGroup(argv, dyn) || ghPrNotMerge(argv, dyn) || literalShellCode(c, argv, dyn)) &&
+				quiet := (ghOtherGroup(argv, dyn) || ghPrNotMerge(argv, dyn, c.bare[v.start:], relax) || literalShellCode(c, argv, dyn)) &&
 					!v.splitString && v.wrapperUnknown == "" && v.envUnknown == ""
 				if r := unverifiable(sc, c); r != "" && unsure == "" && !git && !quiet && mentions {
 					unsure = cannotForm(r)
@@ -160,7 +183,7 @@ func GhPrMerges(cmd, cwd string) (calls []GhMerge, unsure string) {
 				case sc.depth == 0 && name != "gh" && name != "unset" && slices.ContainsFunc(argv[1:], namesRepoEnv):
 					later("GH_REPO, GIT_DIR, GIT_WORK_TREE or GIT_CONFIG set by " + name + ", which the reader does not follow")
 				case name == "gh":
-					call, ok := ghMergeCall(sc, c, v)
+					call, ok := ghMergeCall(sc, c, v, relax)
 					if !ok {
 						continue
 					}
@@ -210,6 +233,17 @@ var (
 	// on the unquoted text of each script (unquotedText): a quoted pattern is no pattern.
 	reExtglob = regexp.MustCompile(`[@?*+!]\(`)
 )
+
+// blankRanges is src with the bytes of the given ranges ([start, end) of src) replaced by spaces.
+func blankRanges(src string, ranges [][2]int) string {
+	b := []byte(src)
+	for _, r := range ranges {
+		for i := max(r[0], 0); i < min(r[1], len(b)); i++ {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
 
 // unquotedText is src without its quoted parts and escaped characters ('…', "…", \c): what is left may
 // hold a glob or extglob pattern the shell expands.
@@ -589,7 +623,8 @@ func shellExpands(w string) bool {
 }
 
 // ghMergeCall reads a gh command as a `gh pr merge` call (ok false for any other gh call).
-func ghMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
+// relax: the relaxed reading (GhPrMerges).
+func ghMergeCall(sc *script, c *simpleCmd, v cmdView, relax bool) (GhMerge, bool) {
 	argv, dyn := c.words[v.start:], c.dyn[v.start:]
 	var call GhMerge
 	pos, unknown := ghPositional(argv)
@@ -601,10 +636,19 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 		call.Unsure = "gh flag " + unknown + " before the subcommand"
 		return call, true
 	}
-	pos, vague, isPr := ghPrHead(argv, dyn)
+	pos, vague, isPr := ghPrHead(argv, dyn, c.bare[v.start:], relax)
 	// A gh pr call with the word merge among its arguments counts as a merge (`gh pr "" merge`, which gh
-	// runs as merge, read with an empty word ignored).
-	if !isPr || !vague && !slices.Contains(argv[pos[1]:], "merge") {
+	// runs as merge, read with an empty word ignored), and so does a vague head. Relaxed, a literal head
+	// is read by its subcommand: the word merge in a data argument after it (a title, a label, a branch)
+	// makes no merge; a subcommand the shell may expand (`gh pr m*`) counts as one.
+	if !isPr {
+		return call, false
+	}
+	merge := slices.Contains(argv[pos[1]:], "merge")
+	if relax {
+		merge = argv[pos[1]] == "merge"
+	}
+	if !vague && !merge {
 		return call, false
 	}
 	switch {
@@ -751,8 +795,12 @@ func ghOtherGroup(argv []string, dyn []bool) bool {
 // ghPrHead reads a gh call up to its subcommand: isPr when gh and the group are a literal pr with a
 // subcommand after it (pos are the positions of the group and the subcommand); vague when a word at or
 // before the subcommand is empty or not literal (gh may read another word as the subcommand: it runs
-// `gh pr "" merge` as merge).
-func ghPrHead(argv []string, dyn []bool) (pos []int, vague, isPr bool) {
+// `gh pr "" merge` as merge), or holds a brace, glob or tilde outside ${…}, which may expand it into
+// several words (`gh -R {o/r,pr,merge} pr view` runs gh -R o/r pr merge). Relaxed (relax), a dynamic
+// value of -R / --repo / --hostname that is not bare (bare: an expansion outside double quotes,
+// simpleCmd.bare) is one word, the flag's value, whatever it holds: `gh -R "$R" pr view 5` is read;
+// `gh -R $R pr view 5` stays vague.
+func ghPrHead(argv []string, dyn, bare []bool, relax bool) (pos []int, vague, isPr bool) {
 	if len(argv) == 0 || dyn[0] || !isProg(argv[0], "gh") {
 		return nil, false, false
 	}
@@ -761,29 +809,43 @@ func ghPrHead(argv []string, dyn []bool) (pos []int, vague, isPr bool) {
 		return nil, false, false
 	}
 	for i := 1; i <= pos[1]; i++ {
-		if dyn[i] || argv[i] == "" {
+		a, value := argv[i], false
+		if relax {
+			// Not an attached -R"$R": an empty $R leaves a bare -R, which takes the next word as its value.
+			value = strings.HasPrefix(a, "--repo=") || strings.HasPrefix(a, "--hostname=")
+			if (a == "-R" || a == "--repo" || a == "--hostname") && i+1 < pos[1] {
+				i++ // the separate value word (ghPositional skips it too)
+				a, value = argv[i], true
+			}
+		}
+		// A brace, glob or tilde outside ${…} may expand any word into several (`"$R"*`, `{o/r,pr,merge}`).
+		if a == "" || strings.ContainsAny(reParamBraces.ReplaceAllString(a, ""), "{[?*~") || dyn[i] && (!value || bare[i]) {
 			vague = true
 		}
 	}
 	return pos, vague, true
 }
 
+// reParamBraces is a ${…} parameter expansion, whose braces are no brace expansion.
+var reParamBraces = regexp.MustCompile(`\$\{[^}]*\}`)
+
 // ghPrNotMerge reports a gh call whose program, group and subcommand are literal, the group pr and the
 // subcommand another than merge, with no word merge among its arguments (`gh pr view "$PR" --json
 // mergeable`): it merges nothing, wherever it is nested (a substitution, sh -c, eval). Its data arguments
-// may be dynamic; a substitution in them is read as a script of its own.
-func ghPrNotMerge(argv []string, dyn []bool) bool {
-	pos, vague, isPr := ghPrHead(argv, dyn)
+// may be dynamic, and relaxed (relax) hold the word merge (`gh pr create --title merge`); a substitution
+// in them is read as a script of its own.
+func ghPrNotMerge(argv []string, dyn, bare []bool, relax bool) bool {
+	pos, vague, isPr := ghPrHead(argv, dyn, bare, relax)
 	if !isPr || vague {
 		return false
 	}
 	sub := argv[pos[1]]
-	return sub != "merge" && !hasGlob(sub) && !slices.Contains(argv[pos[1]+1:], "merge")
+	return sub != "merge" && !hasGlob(sub) && (relax || !slices.Contains(argv[pos[1]+1:], "merge"))
 }
 
 // RunsGateRetire reports a command that runs `agent-jobs gate retire` in a form the reader can read:
 // behind wrappers and env prefixes, in a chain, sh -c, eval or a substitution, by any path, through `go
-// run …/agent-jobs`, or with the program from a variable. A command longer than the reader's limit counts
+// run [build flags] …/agent-jobs[@version]`, or with the program from a variable. A command longer than the reader's limit counts
 // when it holds the word retire.
 func RunsGateRetire(cmd string) bool {
 	if len(cmd) > maxCommandBytes {
@@ -794,23 +856,33 @@ func RunsGateRetire(cmd string) bool {
 			for _, c := range pl.cmds {
 				v := split(c.words)
 				argv, dyn := c.words[v.start:], c.dyn[v.start:]
-				i := 1
+				retire := func(i int) bool { return len(argv) > i+1 && argv[i] == "gate" && argv[i+1] == "retire" }
 				switch {
 				case len(argv) == 0:
-					continue
 				case dyn[0] || progName(argv[0]) == "agent-jobs":
-				case progName(argv[0]) == "go" && len(argv) > 2 && argv[1] == "run" && base(argv[2]) == "agent-jobs":
-					i = 3
-				default:
-					continue
-				}
-				if len(argv) > i+1 && argv[i] == "gate" && argv[i+1] == "retire" {
-					return true
+					if retire(1) {
+						return true
+					}
+				case progName(argv[0]) == "go" && len(argv) > 2 && argv[1] == "run":
+					// `go run [build flags] PACKAGE[@version] ARGS`: any word naming agent-jobs followed by gate
+					// retire (a build flag's value is no package, and never followed by gate retire).
+					for k := 2; k < len(argv); k++ {
+						if goRunsAgentJobs(argv[k]) && retire(k+1) {
+							return true
+						}
+					}
 				}
 			}
 		}
 	}
 	return false
+}
+
+// goRunsAgentJobs reports a go run package word naming agent-jobs: a path or import path whose last
+// element is agent-jobs, with or without @version (`./cmd/agent-jobs`, `…/cmd/agent-jobs@latest`).
+func goRunsAgentJobs(w string) bool {
+	name, _, _ := strings.Cut(base(w), "@")
+	return name == "agent-jobs" || strings.HasPrefix(w, "agent-jobs@") || strings.Contains(w, "/agent-jobs@")
 }
 
 // cannotForm is the form named by a cannot() reason, without the guard's wording around it.

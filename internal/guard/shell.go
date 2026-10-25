@@ -13,8 +13,11 @@ import (
 
 // simpleCmd is one simple command: its words with quotes removed.
 type simpleCmd struct {
-	words   []string
-	dyn     []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
+	words []string
+	dyn   []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
+	// bare[i]: words[i] has an expansion outside double quotes (the shell may split or glob it into
+	// several words); a dyn word that is not bare stays one word.
+	bare    []bool
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents and words of the here-strings attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
@@ -56,6 +59,9 @@ type script struct {
 	src       string
 	depth     int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
 	pipelines []*pipeline
+	// literalBodies are byte ranges [start, end) of src the shell neither runs nor expands: the bodies of
+	// here-documents with a quoted delimiter (<<'E', <<"E", <<\E), each with its delimiter line.
+	literalBodies [][2]int
 }
 
 type redirKind int
@@ -72,7 +78,10 @@ type pendingHeredoc struct {
 	delim  string
 	strip  bool
 	quoted bool // quoted delimiter: the body is literal; otherwise substitutions in it run
-	cmd    *simpleCmd
+	// exact: the delimiter word holds no $ (in `<<$'EOF'` the reader's delimiter is not bash's, so the
+	// body's end is not known and no literal-body range is recorded).
+	exact bool
+	cmd   *simpleCmd
 }
 
 type parser struct {
@@ -86,6 +95,7 @@ type parser struct {
 	word     strings.Builder
 	started  bool
 	dyn      bool // current word contains an expansion
+	bare     bool // current word contains an expansion outside double quotes
 	quoted   bool // current word contains quoting
 	redir    redirKind
 	redirOut bool // the pending redirFile target is written to
@@ -121,6 +131,7 @@ func (p *parser) endWord() {
 	case redirNone:
 		p.cmd.words = append(p.cmd.words, w)
 		p.cmd.dyn = append(p.cmd.dyn, p.dyn)
+		p.cmd.bare = append(p.cmd.bare, p.bare)
 	case redirFile:
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
@@ -132,9 +143,9 @@ func (p *parser) endWord() {
 	case redirHereString: // its word is checked like a here-doc body
 		p.cmd.heredoc += w + "\n"
 	case redirHeredoc, redirHeredocStrip:
-		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, cmd: p.cmd})
+		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
-	p.started, p.dyn, p.quoted = false, false, false
+	p.started, p.dyn, p.bare, p.quoted = false, false, false, false
 	p.redir, p.redirOut, p.redirIn = redirNone, false, false
 }
 
@@ -239,6 +250,7 @@ func (p *parser) substitution() string {
 func (p *parser) readHeredocs() {
 	for _, h := range p.heredocs {
 		var body strings.Builder
+		start := p.i
 		for p.i < len(p.src) {
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			line := p.src[p.i:]
@@ -260,7 +272,10 @@ func (p *parser) readHeredocs() {
 		}
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
-		if !h.quoted { // `$(…)` and backticks in an unquoted here-doc body are executed
+		switch {
+		case h.quoted && h.exact:
+			p.out.literalBodies = append(p.out.literalBodies, [2]int{start, p.i})
+		case !h.quoted: // `$(…)` and backticks in an unquoted here-doc body are executed
 			subs := bodySubstitutions(body.String())
 			p.subs = append(p.subs, subs...)
 			h.cmd.subSources = append(h.cmd.subSources, subs...)
@@ -331,7 +346,7 @@ func (p *parser) run() {
 			lit := p.substitution()
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
-			p.started, p.dyn = true, true
+			p.started, p.dyn, p.bare = true, true, true
 		case c == '#' && !p.started:
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			if nl < 0 {
@@ -390,7 +405,7 @@ func (p *parser) run() {
 			p.redirect()
 		default:
 			if c == '$' {
-				p.dyn = true
+				p.dyn, p.bare = true, true
 			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
@@ -502,7 +517,7 @@ func (p *parser) redirect() {
 	if p.peek(1) == '(' { // process substitution <(...) / >(...)
 		lit := p.substitution()
 		p.word.WriteString(lit)
-		p.started, p.dyn = true, true
+		p.started, p.dyn, p.bare = true, true, true
 		return
 	}
 	if p.started && isDigits(p.word.String()) { // fd number: 2>&1
@@ -559,12 +574,30 @@ func (p *parser) double() {
 		default:
 			if c == '$' {
 				p.dyn = true
+				if splitsQuoted(p.src[p.i+1:]) {
+					p.bare = true
+				}
 			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
 			p.i++
 		}
 	}
+}
+
+// splitsQuoted reports an expansion that gives several words even inside double quotes ("$@",
+// "${a[@]}", "${!p@}"); rest is the text after its $.
+func splitsQuoted(rest string) bool {
+	if strings.HasPrefix(rest, "@") {
+		return true
+	}
+	if !strings.HasPrefix(rest, "{") {
+		return false
+	}
+	if end := strings.IndexByte(rest, '}'); end >= 0 {
+		rest = rest[:end]
+	}
+	return strings.Contains(rest, "@")
 }
 
 const maxNesting = 8
