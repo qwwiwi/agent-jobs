@@ -34,15 +34,28 @@ func substGitRead(sc *script, argv []string) bool {
 }
 
 // gitFileWriters are git subcommands that write files of their own besides stdout: archive with -o,
-// format-patch into -o's directory or the current one. A review job refuses them (readonly.go).
-var gitFileWriters = map[string]bool{"archive": true, "format-patch": true}
+// format-patch into -o's directory or the current one, bundle create its bundle, fast-export and
+// fast-import their marks files. A review job refuses them (readonly.go).
+var gitFileWriters = map[string]bool{
+	"archive": true, "format-patch": true, "bundle": true, "fast-export": true, "fast-import": true,
+}
+
+// gitStreamMarks is the write target gitWriteTargets reports for fast-import --allow-unsafe-features:
+// the export-marks features of the stream on stdin then name files the guard does not see.
+const gitStreamMarks = "--allow-unsafe-features"
+
+// gitUnverifiedTarget reports a git write target the guard cannot check: computed at run time (a
+// variable or a substitution: `-o "$G"`) or named by fast-import's stream (gitStreamMarks).
+func gitUnverifiedTarget(t string) bool { return strings.ContainsAny(t, "$`") || t == gitStreamMarks }
 
 // gitWriteTargets returns the files and directories a git call writes besides stdout, up to `--`:
 // the value of --output in any abbreviation parse-options accepts (`--outp=f`, `--output f`; git diff,
 // log, show and the other diff-family commands), of archive's and format-patch's -o (attached, in a
-// cluster `-vo f`, or separate), of format-patch's --output-directory, and the current directory for
-// format-patch without -o or --stdout. A relative target is joined to the call's -C dirs. found also
-// reports such an option with no value word after it.
+// cluster `-vo f`, or separate), of format-patch's --output-directory, the current directory for
+// format-patch without -o unless the last of --stdout and --no-stdout (`--no-std`) is --stdout, the
+// file of bundle create, and the marks files of fast-export and fast-import (gitMarksTargets). A
+// relative target is joined to the call's -C dirs. found also reports such an option with no value
+// word after it.
 func gitWriteTargets(argv []string, g gitCall) (dests []string, found bool) {
 	sub := strings.ToLower(g.sub)
 	long := []string{"output"}
@@ -65,9 +78,10 @@ func gitWriteTargets(argv []string, g gitCall) (dests []string, found bool) {
 				k++
 				v = g.args[k]
 			}
-		case sub == "format-patch" && longPrefixOf(a, "stdout"):
-			stdout = true
-		case gitFileWriters[sub] && len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.IndexByte(a, 'o') > 0:
+		case sub == "format-patch" && longPrefixOf(a, "stdout", "no-stdout"):
+			// The negation is a prefix of no-stdout (`--no-std`); the last of the two decides.
+			stdout = !strings.HasPrefix(a, "--no-")
+		case (sub == "archive" || sub == "format-patch") && len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.IndexByte(a, 'o') > 0:
 			// A short cluster: the rest after `o` is its value, or the next word.
 			found = true
 			if v = a[strings.IndexByte(a, 'o')+1:]; v == "" && k+1 < len(g.args) {
@@ -82,6 +96,14 @@ func gitWriteTargets(argv []string, g gitCall) (dests []string, found bool) {
 	if sub == "format-patch" && !found && !stdout {
 		dests, found = append(dests, "."), true
 	}
+	var more []string
+	switch sub {
+	case "bundle":
+		more = gitBundleTarget(g.args)
+	case "fast-export", "fast-import":
+		more = gitMarksTargets(sub, g.args)
+	}
+	dests, found = append(dests, more...), found || len(more) > 0
 	// Each -C applies in turn: a relative one below the last, an absolute or `~` one from there.
 	dir := ""
 	for i := 1; i+1 < g.subIdx; i++ {
@@ -97,7 +119,71 @@ func gitWriteTargets(argv []string, g gitCall) (dests []string, found bool) {
 			dests[i] = joinRel(dir, d)
 		}
 	}
+	if sub == "fast-import" && slices.ContainsFunc(g.args, func(a string) bool { return longPrefixOf(a, "allow-unsafe-features") }) {
+		dests, found = append(dests, gitStreamMarks), true
+	}
 	return dests, found
+}
+
+// gitBundleTarget returns the file of `git bundle create [options] <file>`: the first word after
+// create that is no option (`-` is stdout), skipping the value of a separate --version.
+func gitBundleTarget(args []string) []string {
+	if len(args) == 0 || args[0] != "create" {
+		return nil
+	}
+	for k := 1; k < len(args); k++ {
+		a := args[k]
+		switch {
+		case a == "--":
+			if k+1 < len(args) && args[k+1] != "-" {
+				return []string{args[k+1]}
+			}
+			return nil
+		case a == "-":
+			return nil
+		case strings.HasPrefix(a, "-"):
+			if longPrefixOf(a, "version") && !strings.Contains(a, "=") {
+				k++
+			}
+		default:
+			return []string{a}
+		}
+	}
+	return nil
+}
+
+// gitMarksTargets returns the marks files fast-export and fast-import name with --export-marks,
+// --import-marks or fast-import's --import-marks-if-exists (any abbreviation, `=` or a separate
+// value). fast-import reads a relative one below .git/info/fast-import after --relative-marks, which
+// the stream on stdin can turn on too (`feature relative-marks`): a relative file is also returned
+// there (`../../config` is .git/config).
+func gitMarksTargets(sub string, args []string) (dests []string) {
+	names := []string{"export-marks", "import-marks"}
+	if sub == "fast-import" {
+		names = append(names, "import-marks-if-exists")
+	}
+	for k := 0; k < len(args); k++ {
+		a := args[k]
+		if a == "--" {
+			break
+		}
+		if !longPrefixOf(a, names...) {
+			continue
+		}
+		_, v, ok := strings.Cut(a, "=")
+		if !ok && k+1 < len(args) {
+			k++
+			v = args[k]
+		}
+		if v == "" {
+			continue
+		}
+		dests = append(dests, v)
+		if sub == "fast-import" && !filepath.IsAbs(v) && !strings.HasPrefix(v, "~") {
+			dests = append(dests, filepath.Join(".git", "info", "fast-import", v))
+		}
+	}
+	return dests
 }
 
 // joinRel is p below dir, or p itself when it is absolute or starts with `~`.

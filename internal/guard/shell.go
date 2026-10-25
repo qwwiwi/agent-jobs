@@ -400,6 +400,8 @@ func (p *parser) run() {
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.started, p.dyn, p.bare = true, true, true
+		case c == '$' && p.peek(1) == '{' && p.paramExpansion(false):
+			// read as one unit, a blank or `#` in it included
 		case c == '#' && !p.started:
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			if nl < 0 {
@@ -627,6 +629,8 @@ func (p *parser) double() {
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.dyn = true
+		case c == '$' && p.peek(1) == '{' && p.paramExpansion(true):
+			// read as one unit, a quote in it included
 		default:
 			if c == '$' {
 				p.dyn = true
@@ -639,6 +643,155 @@ func (p *parser) double() {
 			p.i++
 		}
 	}
+}
+
+// paramExpansion reads the `${…}` parameter expansion at p.i into the current word as one unit, as
+// bash does: up to the `}` that closes it, so a blank, `#`, `;`, `|` or quote inside is part of the
+// word (in `echo ${x:- #}; cmd` cmd runs). Substitutions inside are recorded like any other. dq: the
+// expansion is inside double quotes. An unterminated one reads nothing and reports false: the caller
+// reads on character by character as before.
+func (p *parser) paramExpansion(dq bool) bool {
+	i, word, raw, glob := p.i, p.word.String(), p.cmd.raw, p.glob
+	nSubs, nSrc, nIn := len(p.subs), len(p.cmd.subSources), len(p.cmd.inputSources)
+	p.word.WriteString("${")
+	p.cmd.raw += "${"
+	p.i += 2
+	if !p.braced(dq) {
+		p.i, p.cmd.raw, p.glob = i, raw, glob
+		p.word.Reset()
+		p.word.WriteString(word)
+		p.subs, p.cmd.subSources, p.cmd.inputSources = p.subs[:nSubs], p.cmd.subSources[:nSrc], p.cmd.inputSources[:nIn]
+		return false
+	}
+	p.started, p.dyn = true, true
+	if !dq || splitsQuoted(p.src[i+1:]) {
+		p.bare = true
+	}
+	// Unquoted, its `{` marked the word as a glob/brace word before; it still does.
+	p.glob = p.glob || !dq
+	return true
+}
+
+// braced reads the inside of a `${…}` from p.i through its closing `}` and reports whether it found
+// it. bash's rules: the first `}` closes (a bare `{` does not nest, `${` does), a backslash escapes,
+// '…' and $'…' quote (inside double quotes too), "…" nests, $(…) and backticks are substitutions.
+// dq: the expansion is inside double quotes (its quotes and backslashes stay in the word, as in bash).
+func (p *parser) braced(dq bool) bool {
+	for p.i < len(p.src) {
+		c := p.src[p.i]
+		switch {
+		case c == '}':
+			p.word.WriteByte(c)
+			p.cmd.raw += "}"
+			p.i++
+			return true
+		case c == '\\':
+			if p.i+1 >= len(p.src) {
+				return false
+			}
+			if dq {
+				p.word.WriteByte(c)
+			}
+			if p.src[p.i+1] != '\n' {
+				p.word.WriteByte(p.src[p.i+1])
+			}
+			p.cmd.raw += p.src[p.i : p.i+2]
+			p.i += 2
+		case c == '\'', c == '$' && p.peek(1) == '\'':
+			if !p.quotedInBraces(dq) {
+				return false
+			}
+		case c == '"':
+			if !p.doubleInBraces() {
+				return false
+			}
+		case c == '$' && p.peek(1) == '{':
+			p.word.WriteString("${")
+			p.cmd.raw += "${"
+			p.i += 2
+			if !p.braced(dq) {
+				return false
+			}
+		case c == '$' && p.peek(1) == '(', c == '`':
+			lit := p.substitution(dq)
+			p.word.WriteString(lit)
+			p.cmd.raw += lit
+		default:
+			if !dq && strings.IndexByte("*?[{", c) >= 0 {
+				p.glob = true
+			}
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		}
+	}
+	return false
+}
+
+// quotedInBraces reads a '…' or a $'…' (where a backslash escapes) inside `${…}` at p.i. dq: the
+// quotes stay in the word.
+func (p *parser) quotedInBraces(dq bool) bool {
+	start := p.i
+	ansi := p.src[p.i] == '$'
+	if ansi {
+		p.i++
+	}
+	end := -1
+	for j := p.i + 1; j < len(p.src); j++ {
+		if ansi && p.src[j] == '\\' {
+			j++
+		} else if p.src[j] == '\'' {
+			end = j
+			break
+		}
+	}
+	if end < 0 {
+		return false
+	}
+	if dq || ansi {
+		p.word.WriteString(p.src[start : end+1])
+	} else {
+		p.word.WriteString(p.src[p.i+1 : end])
+	}
+	p.cmd.raw += "''"
+	p.i = end + 1
+	return true
+}
+
+// doubleInBraces reads a "…" nested inside `${…}` at p.i: a single quote is literal there, `${`
+// nests and substitutions run.
+func (p *parser) doubleInBraces() bool {
+	p.i++
+	for p.i < len(p.src) {
+		c := p.src[p.i]
+		switch {
+		case c == '"':
+			p.i++
+			return true
+		case c == '\\' && p.i+1 < len(p.src) && strings.IndexByte("$`\"\\\n", p.src[p.i+1]) >= 0:
+			if p.src[p.i+1] != '\n' {
+				p.word.WriteByte(p.src[p.i+1])
+			}
+			p.cmd.raw += p.src[p.i : p.i+2]
+			p.i += 2
+		case c == '$' && p.peek(1) == '{':
+			p.word.WriteString("${")
+			p.cmd.raw += "${"
+			p.i += 2
+			if !p.braced(true) {
+				return false
+			}
+		case c == '$' && p.peek(1) == '(', c == '`':
+			lit := p.substitution(true)
+			p.word.WriteString(lit)
+			p.cmd.raw += lit
+		default:
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		}
+	}
+	return false
 }
 
 // splitsQuoted reports an expansion that gives several words even inside double quotes ("$@",

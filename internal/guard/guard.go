@@ -706,6 +706,9 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 					// below): a protected path is no target.
 					outs, _ := gitWriteTargets(argv, g)
 					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
 						if p, ok := s.hit(t, false); ok {
 							return protectedBlocked(p)
 						}
@@ -2302,9 +2305,13 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 				}
 				name := progName(argv[0])
 				if g, ok := parseGit(argv); ok {
-					// git diff --output=<file>, archive -o, format-patch -o <dir> write there like a redirection.
+					// git diff --output=<file>, archive -o, format-patch -o <dir>, bundle create <file> and
+					// marks files write there like a redirection; a target computed at run time is unverifiable.
 					outs, _ := gitWriteTargets(argv, g)
 					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
 						if gitFile(t) || inGitDir(t) {
 							return blocked(t)
 						}

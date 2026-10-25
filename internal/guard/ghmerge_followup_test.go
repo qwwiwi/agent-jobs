@@ -165,6 +165,8 @@ func TestGhPrMergesInertRangesExact(t *testing.T) {
 		`gh -R ~x pr view --body merge`,
 		"eval $'a\\' #'; gh pr merge 5",
 		"eval \"${x:-\" #\"}\"; gh pr merge 5",
+		// The reader takes ${…} as one unit of the word: the blank in it splits nothing.
+		": ${x:- #}; gh pr merge 5",
 	} {
 		if calls, unsure := GhPrMerges(cmd, "/w"); unsure == "" && len(calls) == 0 {
 			t.Errorf("%q: read as no merge", cmd)
@@ -173,11 +175,10 @@ func TestGhPrMergesInertRangesExact(t *testing.T) {
 }
 
 // Known gaps that predate the comment and here-document ranges (the reader passed them before too):
-// the parser splits ${…} at a blank and reads $'EOF' as the delimiter $EOF.
+// the parser reads $'EOF' as the delimiter $EOF.
 func TestGhPrMergesInertRangesKnownGaps(t *testing.T) {
 	t.Skip("known pre-existing gaps of the shell reader, not regressions of the inert ranges")
 	for _, cmd := range []string{
-		": ${x:- #}; gh pr merge 5",
 		"cat <<$'EOF'\nx\nEOF\ngh pr merge 5",
 	} {
 		if calls, unsure := GhPrMerges(cmd, "/w"); unsure == "" && len(calls) == 0 {
