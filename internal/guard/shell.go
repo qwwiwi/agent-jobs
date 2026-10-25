@@ -59,9 +59,8 @@ type script struct {
 	src       string
 	depth     int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
 	pipelines []*pipeline
-	// comments and literalBodies are byte ranges [start, end) of src the shell neither runs nor expands:
-	// its `#` comments and the bodies of here-documents with a quoted delimiter (<<'E', <<"E", <<\E).
-	comments      [][2]int
+	// literalBodies are byte ranges [start, end) of src the shell neither runs nor expands: the bodies of
+	// here-documents with a quoted delimiter (<<'E', <<"E", <<\E), each with its delimiter line.
 	literalBodies [][2]int
 }
 
@@ -349,15 +348,11 @@ func (p *parser) run() {
 			p.cmd.raw += lit
 			p.started, p.dyn, p.bare = true, true, true
 		case c == '#' && !p.started:
-			start := p.i
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			if nl < 0 {
 				p.i = len(p.src)
 			} else {
 				p.i += nl
-			}
-			if exactComment(p.src[:start]) {
-				p.out.comments = append(p.out.comments, [2]int{start, p.i})
 			}
 		case c == '\n':
 			p.endPipeline("\n")
@@ -418,14 +413,6 @@ func (p *parser) run() {
 			p.i++
 		}
 	}
-}
-
-// exactComment reports a # the reader takes as a comment where bash surely does too: before is the
-// source ahead of it. After ${, $'…' or (( the reader's word boundaries may not be bash's (`${x:- #}`,
-// `$'a\' #'`, `(( y= # ))` hold no comment), so no comment range is recorded there.
-func exactComment(before string) bool {
-	return !strings.Contains(before, "${") && !strings.Contains(before, "$'") &&
-		!strings.Contains(strings.ReplaceAll(before, "$((", ""), "((")
 }
 
 func (p *parser) openGroup(sep string) {

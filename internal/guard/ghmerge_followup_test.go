@@ -46,24 +46,25 @@ func TestGhPrMergesDataArguments(t *testing.T) {
 	}
 }
 
-// The shell never glob-expands the body of a here-document or a comment: an extglob-like text there
-// makes no command unsure. Code around them is still read, and a here-document that runs as a script,
-// or an unquoted one whose substitutions run, still counts.
+// The shell never glob-expands the body of a here-document with a quoted delimiter: in a relaxable
+// command (<<'WORD' or <<"WORD") an extglob-like text there makes it no unsure. Code around them is still
+// read, and a here-document that runs as a script, or an unquoted one whose substitutions run, still
+// counts. Comments, <<\WORD and <<- are read strictly (an extglob-like text there stays unsure).
 func TestGhPrMergesHeredocBodiesAndComments(t *testing.T) {
 	for _, cmd := range []string{
 		"gh pr create --title t --body \"$(cat <<'EOF'\n- **(F9)** bold\nEOF\n)\"",
 		"git commit -m \"$(cat <<'EOF'\nfix gh pr merge reader: C++(17)\nEOF\n)\"",
 		"cat > /tmp/x.md <<'EOF'\ngh pr merge docs?(x)\nEOF",
 		"cat > /tmp/x.md <<\"EOF\"\ngh pr merge docs?(x)\nEOF",
-		"cat > /tmp/x.md <<\\EOF\ngh pr merge docs?(x)\nEOF",
-		"cat > /tmp/x.md <<-'EOF'\n\tgh pr merge docs?(x)\n\tEOF",
-		"gh pr view 5 # ok?(x)",
-		"# see gh pr view @(x)\ngh pr view 5",
 		"gh pr view 5 # gh pr merge 5",
 	} {
 		noMerge(t, cmd)
 	}
 	for _, cmd := range []string{
+		"cat > /tmp/x.md <<\\EOF\ngh pr merge docs?(x)\nEOF",
+		"cat > /tmp/x.md <<-'EOF'\n\tgh pr merge docs?(x)\n\tEOF",
+		"gh pr view 5 # ok?(x)",
+		"# see gh pr view @(x)\ngh pr view 5",
 		"cat <<EOF\n$(gh pr merge 5)\nEOF",
 		"cat <<EOF\n`gh pr merge 5`\nEOF",
 		"bash <<'EOF'\ngh pr merge 5\nEOF",
@@ -93,11 +94,12 @@ func TestGhPrMergesQuotedFlagValue(t *testing.T) {
 		`gh --hostname "$H" pr list`,
 		`gh -R "$(cat repo)" pr view 5`,
 		`gh -R "o/$R" pr view 5`,
-		`gh -R "${R}" pr view 5`,
 	} {
 		noMerge(t, cmd)
 	}
+	// ${…} is read strictly (the reader's word boundaries may not be bash's there).
 	for _, cmd := range []string{
+		`gh -R "${R}" pr view 5`,
 		`gh -R $R pr view 5`,
 		`gh -R "$R"$S pr view 5`,
 		`gh --repo=$R pr view 5`,
