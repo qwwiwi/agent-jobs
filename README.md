@@ -156,7 +156,7 @@ Everything below the fold lives in [docs/GUIDE.md](docs/GUIDE.md), unabridged:
 
 - [Why jobs, not subagents](docs/GUIDE.md#why-jobs-not-subagents), with the full benchmark table
 - [How it works](docs/GUIDE.md#how-it-works): components, lifecycle, merge check, amend / stop / resume
-- [Limits](docs/GUIDE.md#limits): defaults and ceilings, model by complexity, reasoning effort, codex runner, acceptance command, kinds
+- [Limits](docs/GUIDE.md#limits): defaults and ceilings, model by complexity, reasoning effort, codex runner, codex sandbox (`codex_sandbox`) and the AppArmor fix for its bwrap, acceptance command, kinds
 - [Report contract](docs/GUIDE.md#report-contract): sections, off-contract reports, secret redaction, brief size
 - [Cleanup and patches](docs/GUIDE.md#cleanup-and-patches): patches, prune, log archive, job stats, estimated cost, ghost processes
 - [Safety](docs/GUIDE.md#safety): the full rule set, and why this is not a sandbox

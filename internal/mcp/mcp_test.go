@@ -58,6 +58,8 @@ func TestMain(m *testing.M) {
 func newManager(t *testing.T) *jobs.Manager {
 	t.Helper()
 	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	// system_doctor probes codex's sandbox: never the host's codex (a missing binary is inconclusive).
+	t.Setenv("AGENT_JOBS_CODEX_BIN", filepath.Join(t.TempDir(), "no-codex"))
 	m, err := jobs.Open("test")
 	if err != nil {
 		t.Fatal(err)

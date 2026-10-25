@@ -131,6 +131,10 @@ func (m *Manager) authorizedLaunchConfig() (Config, error) {
 	active := m.Config()
 	active.CodexWriteAllowed = active.CodexWriteAllowed && disk.CodexWriteAllowed
 	active.AcceptanceAllowed = active.AcceptanceAllowed && disk.AcceptanceAllowed
+	if active.codexSandboxMode() == CodexSandboxModeWorktreeFullAccess && disk.codexSandboxMode() != CodexSandboxModeWorktreeFullAccess {
+		// Running without the codex sandbox is a permission like codex_write_allowed: revoked on disk at once.
+		active.CodexSandboxMode = disk.CodexSandboxMode
+	}
 	return active, nil
 }
 

@@ -88,6 +88,10 @@ type JobView struct {
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
+	// CodexSandbox (codex jobs) is the `codex exec --sandbox` value of the job's latest launch as the
+	// daemon recorded it (read-only, workspace-write, danger-full-access under codex_sandbox
+	// worktree-full-access); empty before launch.
+	CodexSandbox string `json:"codex_sandbox,omitempty"`
 	// AcceptanceCmd is the command the job must pass after claude exits 0 (empty = none).
 	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
 	// Skills are the catalog skills selected at job_start; SkillsDelivered those linked into the work
@@ -125,8 +129,20 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
-		Covers: j.Covers, Size: j.Size,
+		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j),
 	}
+}
+
+// launchCodexSandbox is JobView.CodexSandbox ("" for a claude job, or when it cannot be read).
+func launchCodexSandbox(m *jobs.Manager, j *store.Job) string {
+	if j.Runner != store.RunnerCodex {
+		return ""
+	}
+	sandbox, err := m.Store.LaunchCodexSandbox(j.ID)
+	if err != nil {
+		return ""
+	}
+	return sandbox
 }
 
 // limitsNote is JobView.Limits: "n/a (codex)" for a codex job, "" otherwise.

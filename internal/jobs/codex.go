@@ -78,8 +78,12 @@ func CodexSandbox(kind string) string {
 }
 
 // checkCodexJob refuses a codex job the config does not allow: a workspace-write job (fix/general)
-// unless codex_write_allowed is set, since the guard hook does not run inside codex.
+// unless codex_write_allowed is set, since the guard hook does not run inside codex, and any codex job
+// under codex_sandbox worktree-full-access without codex_write_allowed (no codex sandbox at all).
 func (c Config) checkCodexJob(kind string) error {
+	if c.codexSandboxMode() == CodexSandboxModeWorktreeFullAccess && !c.CodexWriteAllowed {
+		return codexFullAccessRefusal
+	}
 	if CodexSandbox(kind) == CodexSandboxWrite && !c.CodexWriteAllowed {
 		return fmt.Errorf("codex job of kind %s needs the workspace-write sandbox, which is off "+
 			"(codex_write_allowed is false: the guard hook does not run inside codex); "+
@@ -115,6 +119,9 @@ func ValidateReasoningEffort(runner, e string) error {
 func (c Config) validateCodex() error {
 	if err := ValidateReasoningEffort(store.RunnerCodex, c.CodexReasoningEffort); err != nil {
 		return fmt.Errorf("codex_reasoning_effort: %w", err)
+	}
+	if err := validateCodexSandboxMode(c.CodexSandboxMode); err != nil {
+		return err
 	}
 	for kind, row := range c.Models {
 		for cx, model := range row {
@@ -234,12 +241,13 @@ func checkCodexMCP(bin, dir string, env []string) error {
 // CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,
 // isolated from the owner's codex setup (no user config, rules or session files, no MCP servers, the
 // CodexDisabledFeatures off, never asks for approval), no git-repo check (a job without a repo works in
-// an empty dir), the kind's sandbox, the job's model and reasoning effort; the prompt arrives on stdin
+// an empty dir), the given sandbox (the kind's, CodexSandbox, or CodexSandboxFullAccess under
+// codex_sandbox worktree-full-access), the job's model and reasoning effort; the prompt arrives on stdin
 // ("-"). The working dir is the job's work dir (set by the wrapper).
-func CodexArgs(j *store.Job, effort string) []string {
+func CodexArgs(j *store.Job, effort, sandbox string) []string {
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
-		"-s", CodexSandbox(j.Kind), "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
+		"-s", sandbox, "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
 	}
 	for _, f := range CodexDisabledFeatures {
 		args = append(args, "--disable", f)
@@ -257,6 +265,10 @@ type codexEvent struct {
 	Item struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
+		// command_execution items: the command's output, exit code and status (completed, failed, declined).
+		AggregatedOutput string `json:"aggregated_output"`
+		ExitCode         *int   `json:"exit_code"`
+		Status           string `json:"status"`
 	} `json:"item"`
 	Usage *struct {
 		InputTokens       int64 `json:"input_tokens"`
@@ -313,6 +325,10 @@ func applyCodexLine(out *StreamResult, line []byte) {
 		out.Turns++
 		if ev.Item.Type == "agent_message" && strings.TrimSpace(ev.Item.Text) != "" {
 			out.Text = ev.Item.Text
+			out.CodexMessageBwrap = out.CodexMessageBwrap || strings.Contains(ev.Item.Text, "bwrap:")
+		}
+		if ev.Item.Type == "command_execution" {
+			applyCodexCommand(out, ev)
 		}
 	case "turn.completed":
 		out.Results++
@@ -331,16 +347,66 @@ func applyCodexLine(out *StreamResult, line []byte) {
 	}
 }
 
+// applyCodexCommand counts a completed command_execution item: one with exit code 0 and no failed or
+// declined status is a successful command, and the first bwrap error in a failed one's output is kept
+// (issue #81). Other non-zero exits (rg without a match, a failing test) are ordinary evidence.
+func applyCodexCommand(out *StreamResult, ev codexEvent) {
+	out.CodexCommands++
+	failed := ev.Item.ExitCode == nil || *ev.Item.ExitCode != 0 || ev.Item.Status == "failed" || ev.Item.Status == "declined"
+	if !failed {
+		out.CodexCommandsOK++
+		return
+	}
+	if out.CodexSandboxError == "" {
+		out.CodexSandboxError = bwrapErrorLine(ev.Item.AggregatedOutput, false)
+	}
+}
+
+// codexSandboxHint is the fix a codex job whose sandbox did not start points to: the host first (on
+// Ubuntu 24.04 AppArmor keeps codex's bwrap from creating its user namespace), worktree-full-access only
+// as the last resort.
+const codexSandboxHint = "on Ubuntu 24.04 the usual cause is kernel.apparmor_restrict_unprivileged_userns=1: " +
+	"give codex's bwrap an AppArmor profile with `userns` (README, «Troubleshooting: codex sandbox and AppArmor»); config codex_sandbox \"" +
+	CodexSandboxModeWorktreeFullAccess + "\" is the last resort"
+
 // codexStreamFailure is why a codex stream does not count as a success whatever codex's exit code: it
-// could not be read to its end, or its last turn has no terminal turn.completed event. "" = it does.
+// could not be read to its end; a command failed with a bwrap error; its last turn has no terminal
+// turn.completed event; or it is a repo job (CodexRepo) in which not one command ran successfully (the
+// sandbox did not start: nothing was read, so the report is not a result; codex under read-only may
+// show no command item at all then). "" = it does. A stream with skipped lines is not judged on the
+// last rule (a skipped line may be a command that worked). The final message is model text and never
+// decides the verdict; a bwrap error quoted in it is only named in the reason.
 func codexStreamFailure(res StreamResult) string {
 	switch {
 	case res.Err != "":
 		return "codex stream not read to its end: " + RedactPrintable(res.Err, 200)
+	case res.CodexSandboxError != "":
+		return fmt.Sprintf("codex sandbox failed to start (%q); %s", res.CodexSandboxError, codexSandboxHint)
 	case !res.Found:
 		return "codex stream has no terminal turn.completed event (codex stopped early or the stream is truncated)"
+	case res.CodexRepo && res.CodexCommandsOK == 0 && res.Skipped == 0:
+		ran := "0 commands"
+		if res.CodexCommands > 0 {
+			ran = fmt.Sprintf("%d commands, none exited 0", res.CodexCommands)
+		}
+		quoted := ""
+		if res.CodexMessageBwrap {
+			quoted = "; codex's final message (untrusted model text) mentions bwrap"
+		}
+		return fmt.Sprintf("codex ran no command in the repository successfully (%s), so nothing was read; the codex "+
+			"sandbox may not have started%s (see stream.jsonl); %s", ran, quoted, codexSandboxHint)
 	}
 	return ""
+}
+
+// codexRepoJob reports whether the wrapper's job has a repository: the job row's repo path, or, when the
+// row cannot be read, a work/.git (fail closed: the stricter verdict).
+func codexRepoJob(st *store.Store, id, jobDir string) bool {
+	if j, err := st.Get(id); err == nil {
+		return j.RepoPath != ""
+	}
+	_, err := os.Lstat(filepath.Join(jobDir, "work", ".git"))
+	return err == nil
 }
 
 // errCodexResume is the refusal of a resume of a codex job.

@@ -61,6 +61,16 @@ type StreamResult struct {
 	Skipped int
 	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
 	Err string
+	// CodexCommands and CodexCommandsOK count the completed command_execution items and those that
+	// exited 0; CodexSandboxError is the first bwrap error in a failed one's output; CodexRepo is set for
+	// a job with a repository (from the job row, by the wrapper and again by the daemon), where a stream
+	// without one successful command fails (codex streams only, issue #81).
+	CodexCommands, CodexCommandsOK int
+	CodexSandboxError              string
+	CodexRepo                      bool
+	// CodexMessageBwrap: an agent message quotes a bwrap error (untrusted model text: named in the
+	// failure reason, never a verdict by itself).
+	CodexMessageBwrap bool
 }
 
 // program names the runner of a stream result in messages.
@@ -341,8 +351,8 @@ func lockAdmitIfExists(jobDir string) (func(), error) {
 }
 
 // admitted checks, in <state>/jobs.db (jobDir = <state>/jobs/<id>), that the job is still running
-// under this launch token.
-func admitted(jobDir, token string) error {
+// under this launch token and, for a codex job, that its argv's sandbox was authorized (admittedCodex).
+func admitted(jobDir, token string, argv []string) error {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return err
@@ -371,13 +381,105 @@ func admitted(jobDir, token string) error {
 			return errors.New("job already completed this launch")
 		}
 	}
-	if j.Runner == store.RunnerCodex && CodexSandbox(j.Kind) == CodexSandboxWrite {
-		a, err := st.ReadLaunchAuthorization(j.ID, token)
-		if err != nil || !a.CodexWriteAllowed {
-			return errors.New("codex_write_allowed was not authorized by the launching daemon")
+	if j.Runner == store.RunnerCodex {
+		sandbox, err := codexArgvSandbox(argv)
+		if err != nil {
+			return fmt.Errorf("codex command line was not authorized by the launching daemon: %w", err)
 		}
+		return admittedCodex(st, j, token, sandbox)
 	}
 	return nil
+}
+
+// admittedCodex checks a codex launch's sandbox (codexArgvSandbox of its argv) against the launching
+// daemon's authorization: the kind's read-only sandbox needs none; workspace-write needs
+// codex_write_allowed; danger-full-access (codex_sandbox worktree-full-access) needs codex_write_allowed
+// and the recorded sandbox; any other sandbox is refused.
+func admittedCodex(st *store.Store, j *store.Job, token, sandbox string) error {
+	native := CodexSandbox(j.Kind)
+	if sandbox == native && native != CodexSandboxWrite {
+		return nil
+	}
+	a, err := st.ReadLaunchAuthorization(j.ID, token)
+	if native == CodexSandboxWrite && (err != nil || !a.CodexWriteAllowed) {
+		return errors.New("codex_write_allowed was not authorized by the launching daemon")
+	}
+	switch {
+	case sandbox == native:
+		return nil
+	case sandbox == CodexSandboxFullAccess && err == nil && a.CodexWriteAllowed && a.CodexSandbox == CodexSandboxFullAccess:
+		return nil
+	}
+	return fmt.Errorf("codex sandbox %q was not authorized by the launching daemon", sandbox)
+}
+
+// codexArgvSandbox is the sandbox of a codex command line (argv[0] is the binary), read with codex's
+// option boundaries: options end at `--` (what follows is the prompt); `-s X`, `-sX`, `-s=X`,
+// `--sandbox X` and `--sandbox=X` name the sandbox. Only the options CodexArgs builds are known and
+// anything else is an error, since an unknown option may take a value or change the sandbox: a sandbox
+// or approval bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo, --full-auto), a profile,
+// a `-c` / `--config` override of a sandbox or profile key, a value starting with "-", a repeated or
+// missing sandbox, and a positional other than the leading `exec` and the stdin prompt "-".
+func codexArgvSandbox(argv []string) (string, error) {
+	sandbox, seenSandbox := "", false
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			break
+		}
+		if (a == "exec" && i == 1) || (a == "-" && i > 1 && argv[1] == "exec") {
+			continue
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			return "", fmt.Errorf("unexpected codex argument %q", a)
+		}
+		name, value, attached := a, "", false
+		if strings.HasPrefix(a, "--") {
+			if k, v, ok := strings.Cut(a, "="); ok {
+				name, value, attached = k, v, true
+			}
+		} else if len(a) > 2 {
+			name, value, attached = a[:2], strings.TrimPrefix(a[2:], "="), true
+		}
+		switch name {
+		case "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check":
+			if attached {
+				return "", fmt.Errorf("codex option %q takes no value", a)
+			}
+			continue
+		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable":
+		default:
+			return "", fmt.Errorf("codex option %q is not one the daemon passes", a)
+		}
+		if !attached {
+			if i+1 >= len(argv) {
+				return "", fmt.Errorf("codex option %s has no value", name)
+			}
+			i++
+			value = argv[i]
+		}
+		if value == "" || strings.HasPrefix(value, "-") {
+			return "", fmt.Errorf("codex option %s has value %q", name, value)
+		}
+		switch name {
+		case "-s", "--sandbox":
+			if seenSandbox {
+				return "", errors.New("codex sandbox given more than once")
+			}
+			sandbox, seenSandbox = value, true
+		case "-c", "--config":
+			key, _, _ := strings.Cut(value, "=")
+			for _, part := range strings.Split(key, ".") {
+				if part = strings.Trim(part, " \t\"'"); strings.Contains(part, "sandbox") || part == "profile" {
+					return "", fmt.Errorf("codex config override %q changes the sandbox", key)
+				}
+			}
+		}
+	}
+	if !seenSandbox {
+		return "", errors.New("codex sandbox not given")
+	}
+	return sandbox, nil
 }
 
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,
@@ -417,7 +519,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		fmt.Fprintln(os.Stderr, "run-wrapper:", err)
 		return 2
 	}
-	if err := admitted(jobDir, token); err != nil {
+	if err := admitted(jobDir, token, argv); err != nil {
 		unlockAdmit()
 		fmt.Fprintln(os.Stderr, "run-wrapper: refused:", err)
 		return 4
@@ -488,6 +590,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		}
 	}
 	if opts.Runner == store.RunnerCodex {
+		res.CodexRepo = codexRepoJob(st, id, jobDir)
 		writeCodexResultReport(jobDir, res, stderrLog)
 	} else if idleClosed {
 		code, res.IdleReason = finishIdleClosed(jobDir, res, stderrLog)
