@@ -59,6 +59,10 @@ func TestMilestonesRepoIDRoundTrip(t *testing.T) {
 	only("/v1/milestones?repo="+filepath.Base(c), ids[c])
 	only("/v1/milestones?repo="+a, ids[a])
 	f.get(t, "/v1/milestones?repo=proj", http.StatusBadRequest)
+	only("/v1/milestones?repo=proj&repo_id="+repoID, ids[a]) // the id decides, the name only has to agree
+	if list := f.get(t, "/v1/milestones?repo=solo&repo_id="+repoID, http.StatusOK)["milestones"].([]any); len(list) != 0 {
+		t.Fatalf("repo_id and a folder name of different repositories: %v", list)
+	}
 	if list := f.get(t, "/v1/milestones?repo_id=000000000000", http.StatusOK)["milestones"].([]any); len(list) != 0 {
 		t.Fatalf("unknown repo_id: %v", list)
 	}

@@ -264,6 +264,29 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 	}
 }
 
+// writePriorReports replaces what an earlier attempt left in prior/, even a folder made read-only.
+func TestWritePriorReportsReplacesReadOnly(t *testing.T) {
+	m := newManager(t)
+	dir := t.TempDir()
+	old := filepath.Join(dir, PriorDir, "T1")
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "report.md"), []byte("OLD"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(old, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	snap := priorSnapshot{deps: []priorDep{{key: "T1", job: &store.Job{ID: "j"}, report: "NEW"}}}
+	if err := m.writePriorReports(snap, dir); err != nil {
+		t.Fatal(err)
+	}
+	if s := readFile(t, filepath.Join(old, "report.md")); s != "NEW" {
+		t.Fatalf("prior/T1/report.md: %q", s)
+	}
+}
+
 // The prior results section stays within its cap, marker and newlines included, for any limit.
 func TestPriorCapTinyLimits(t *testing.T) {
 	long := "head\n```\n" + strings.Repeat("line\n", 50)

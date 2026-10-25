@@ -227,12 +227,24 @@ func (m *Manager) priorResults(j *store.Job, snap priorSnapshot) string {
 	return capBytes(b.String(), limit)
 }
 
+// removePrior removes the prior folder an earlier attempt left; its folders are made writable first
+// (a job may have changed their mode). Links are removed, never followed.
+func removePrior(p string) error {
+	_ = filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(path, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(p)
+}
+
 // writePriorReports writes <dir>/prior/ from snap, the snapshot the prompt was built from: each
 // dependency's full report.md (redacted) as prior/<key>/report.md, read-only (the guard protects the
 // folder too). What an earlier attempt left there is replaced (a resume refreshes it). A dependency
 // without an accepted job or a readable report gets no file.
 func (m *Manager) writePriorReports(snap priorSnapshot, dir string) error {
-	if err := os.RemoveAll(filepath.Join(dir, PriorDir)); err != nil {
+	if err := removePrior(filepath.Join(dir, PriorDir)); err != nil {
 		return fmt.Errorf("prior results: %w", err)
 	}
 	if snap.err != nil {

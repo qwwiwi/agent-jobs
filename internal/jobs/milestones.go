@@ -886,9 +886,16 @@ func (m *Manager) ListMilestones(ctx context.Context, r MilestoneListRequest) (*
 			repo = main
 		}
 	}
-	// repo_id, or a folder name, names a stored repository; with repo too, both must name the same one.
+	// repo_id, or a folder name, names a stored repository; with repo too, all must name the same one. A
+	// folder name next to a repository already named is only compared with it (never ambiguous).
 	for _, by := range []struct{ id, name string }{{strings.TrimSpace(r.RepoID), ""}, {"", strings.TrimSpace(r.RepoName)}} {
 		if by.id == "" && by.name == "" {
+			continue
+		}
+		if by.name != "" && repo != "" {
+			if filepath.Base(repo) != by.name {
+				return out, nil
+			}
 			continue
 		}
 		found, ok, err := m.milestoneRepoFilter(ctx, by.id, by.name)
