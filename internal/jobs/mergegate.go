@@ -26,10 +26,13 @@ import (
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
 // closed: a void approval never lifts the gate) until the owner retires it (`agent-jobs gate retire`).
 // Another clone of a gated repository (a shared OWNER/REPO remote) is gated with it: the names of a gated
-// repository's remotes are stored (store.GateRepo, by checklist_set at the approval and by release_check
-// on a pass), so a gated work tree that is gone or moved is still matched by name and never makes other
-// merges unreadable. A gh pr merge written in the Bash command whose target the reader cannot tell is
-// refused while some repository is gated. It reads the store, git remotes and the brief files only.
+// repository's remotes are stored (store.GateRepo, by checklist_set at the approval, by release_check on a
+// pass and by the daemon's backfill at its start), so a gated work tree that is gone or moved is still
+// matched by name and never makes other merges unreadable (one without stored names and with unreadable
+// remotes makes a merge by name or in another work tree unsure). A gh pr merge written in the Bash
+// command whose target the reader cannot tell is refused while some repository is gated; a command that
+// runs `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
+// brief files only.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
 // `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches

@@ -10,10 +10,11 @@ import (
 )
 
 // GateRepo is what the merge hook (Wave F, F9 (b)) keeps of a repository with a stored checklist
-// approval: the GitHub OWNER/REPO names of its remotes, recorded when the checklist is approved and
-// added to whenever the hook reads them from the work tree, so a work tree that is gone or moved is still
-// matched by name (and never makes merges elsewhere unreadable); and the owner's retirement (`agent-jobs
-// gate retire`): a repository is out of the gate while its latest approval is not newer than RetiredSeq.
+// approval: the GitHub OWNER/REPO names of its remotes, stored by checklist_set at the approval, by
+// release_check on a pass and by the daemon's backfill at its start (the hook opens the store read-only
+// and only reads them), so a work tree that is gone or moved is still matched by name (and never makes
+// merges elsewhere unreadable); and the owner's retirement (`agent-jobs gate retire`): a repository is
+// out of the gate while its latest approval is not newer than RetiredSeq.
 type GateRepo struct {
 	Repo string
 	// Names are lower-cased OWNER/REPO names, sorted.

@@ -448,7 +448,7 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			// The merge hook (F9 (b)) matches the gated repository by these names once its work tree is gone.
 			if err := m.RecordGateNames(main); err != nil {
 				res.Warnings = append(res.Warnings, "approved; the remote names for the merge gate were not stored "+
-					"(the merge hook stores them when it next reads the work tree): "+jobs.RedactPrintable(err.Error(), 200))
+					"(release_check stores them on a pass, the daemon's backfill at its next start; the merge hook only reads them): "+jobs.RedactPrintable(err.Error(), 200))
 			}
 		}
 		added := 0
