@@ -113,6 +113,14 @@ All numbers below come from read-only sources: `agent-jobs stats`, a read-only (
 
 About 92% of refusals are noise or friction that costs a turn; about 7% blocked something the design means to block. The four noisy rules are the place to cut job turns.
 
+**Relaxed on 2026-10-25** (`internal/guard/noise.go`, [DECISIONS](DECISIONS.md)). An audit job (261025-193139-b348) hit 8 refusals in about 50 calls, 7 of them noise; the same commands written into a script file pass, so these refusals cost turns without closing a path. Three forms are now allowed:
+
+- **A here-doc written out as data** (`cat > notes.md <<'EOF'` … `EOF`, also `tee`): its body is no longer scanned for state-dir paths or globs (rules agent-jobs-state and glob-write). Only when the command is `cat` or `tee` with no wrapper, alone in its pipeline at the top level, with no substitution or process substitution, and every here-doc literal (quoted delimiter, or a body without `$` and backticks; a here-string never). A here-doc into an interpreter or a shell (`python3 - <<'EOF'`, `sh <<'EOF'`), piped on (`cat <<'EOF' | python3 -`), fed to `xargs`, or with an expanding body is still scanned.
+- **Read-only git in a command substitution** (`n=$(git rev-list --count HEAD)`, `echo "$(git log --oneline -3)"`; rule unverifiable-form): `log`, `diff`, `rev-list`, `show`, `rev-parse`, `status`, `ls-files`, `ls-tree`, `merge-base`, `describe`, `shortlog`, `blame`, `diff-tree`, reached through `$(…)` or backticks only (no `eval`, `sh -c` or runner body on the way), with no `-c` configuration and no attached global option. Every other rule checks the nested call as a plain one, and the outer command's own check is unchanged (`diff <(git show …)` and `python3 x.py "$(git …)"` are still refused as a program running git indirectly). git in `eval`, `sh -c` or a runner body, with stdin or `xargs`, and every other subcommand (push, tag, commit, config …) stay refused there, and gh in a substitution stays refused.
+- **Glob characters inside inline code** (`python3 -c`, `perl -e`, `node -e`, the awk program; rule glob-write): the code is one quoted word the shell does not expand, as in a script file. A glob operand (`sed -i … *.go`, `cp x .gi?/hooks/…`) and a literal `.git` config or hooks path are still refused.
+
+Not reproduced on base 76a8950 and therefore not changed: `python3 -I script.py <the job's own folder>` and `git log --all -- <path>` already pass (kept as regression cases in `noise_test.go`). Also seen during this job but not relaxed: a `sed` script that mentions git (`sed -n '/git log/,$p'`; GNU sed's `e` command runs its text) and a quoted glob operand of a script (`python3 x.py 'dir/*.jsonl'`).
+
 ### Per task: the coordinator's subagents vs the coding agent's jobs (Opus, medians)
 
 | | Coordinator, background subagents (7 days, Opus or inherited, n = 334) | Coding agent, jobs (n = 346 with a stream) |
