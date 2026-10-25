@@ -35,7 +35,7 @@ func TestBackfillGateNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	// gone has no names and no remotes: while it is gated, a merge by name is unsure (TestMergeGateNoNamesUnreadable).
-	if r := gateAnswer(t, m, t.TempDir(), "gh pr merge 5 -R other/repo", ""); !strings.Contains(r, "cannot tell") {
+	if r := gateAnswer(t, m, t.TempDir(), "gh pr merge 5 -R other/repo", ""); !strings.Contains(r, unsureWarn) {
 		t.Fatalf("by name while gone is gated without names: %q", r)
 	}
 	if _, err := m.RetireGate(gone); err != nil {

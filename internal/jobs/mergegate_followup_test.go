@@ -27,16 +27,16 @@ func TestMergeGateFollowUpFalseBlocks(t *testing.T) {
 	}
 	for _, tc := range []struct{ cmd, want string }{
 		{`gh pr merge 5 --squash`, "without --match-head-commit"},
-		{`gh pr "" merge`, "cannot tell"},
-		{`gh pr $S 5`, "cannot tell"},
-		{"cat <<EOF\n$(gh pr merge 5)\nEOF", "cannot tell"},
-		{"bash <<'EOF'\ngh pr merge 5\nEOF", "cannot tell"},
-		{"cat > /tmp/m.sh <<'EOF'\ngh pr merge 5\nEOF\nsh < /tmp/m.sh", "cannot tell"},
-		{`gh -R "$R" pr merge 5`, "cannot tell"},
-		{`gh -R $R pr view 5`, "cannot tell"},
-		{"gh pr view 5 # ok?(x)", "cannot tell"},
-		{"[[ x == @(#) ]]; gh pr merge 5", "cannot tell"},
-		{"gh pr view merge ${x:- #}; gh pr merge 5", "blocked"},
+		{`gh pr "" merge`, unsureWarn},
+		{`gh pr $S 5`, unsureWarn},
+		{"cat <<EOF\n$(gh pr merge 5)\nEOF", unsureWarn},
+		{"bash <<'EOF'\ngh pr merge 5\nEOF", unsureWarn},
+		{"cat > /tmp/m.sh <<'EOF'\ngh pr merge 5\nEOF\nsh < /tmp/m.sh", unsureWarn},
+		{`gh -R "$R" pr merge 5`, unsureWarn},
+		{`gh -R $R pr view 5`, unsureWarn},
+		{"gh pr view 5 # ok?(x)", unsureWarn},
+		{"[[ x == @(#) ]]; gh pr merge 5", unsureWarn},
+		{"gh pr view merge ${x:- #}; gh pr merge 5", unsureWarn}, // read strictly: unreadable as a whole, so a warning
 	} {
 		if r := gateAnswer(t, m, repo, tc.cmd, ""); !strings.Contains(r, tc.want) {
 			t.Errorf("%q: %q, want %q", tc.cmd, r, tc.want)
@@ -45,7 +45,7 @@ func TestMergeGateFollowUpFalseBlocks(t *testing.T) {
 }
 
 // While a repository is gated, a # inside ${…}, a here-document with a $'…' delimiter and a brace
-// expansion before the gh pr subcommand hide no merge.
+// expansion before the gh pr subcommand hide no merge: each is refused or, unreadable, warned about.
 func TestMergeGateInertRangesExact(t *testing.T) {
 	m, repo := mergeGateRepo(t)
 	for _, cmd := range []string{
@@ -60,11 +60,30 @@ func TestMergeGateInertRangesExact(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ cmd, want string }{
-		{"eval ${x:- #}; gh pr merge 5", "cannot tell"},
-		{"cat <<$'EOF'\nx\nEOF\ngh pr m@(erge) 5", "cannot tell"},
+		{"eval ${x:- #}; gh pr merge 5", unsureWarn},
+		{"cat <<$'EOF'\nx\nEOF\ngh pr m@(erge) 5", unsureWarn},
 	} {
 		if r := gateAnswer(t, m, repo, tc.cmd, ""); !strings.Contains(r, tc.want) {
 			t.Errorf("%q: %q, want %q", tc.cmd, r, tc.want)
 		}
+	}
+}
+
+// While a repository is gated, a merge the reader cannot read runs (no refusal) with one warning line,
+// and a parsed gh pr merge without a release pass is still refused (owner decision 2026-10-25).
+func TestMergeGateUnreadableRunsParsedBlocked(t *testing.T) {
+	m, repo := mergeGateRepo(t)
+	for _, cmd := range []string{"sh -c 'gh pr merge 5'", `gh pr $M 5`, `gh pr merge 5 --match-head-commit "$SHA"`} {
+		r, err := m.MergeGate(repo, cmd, "")
+		if err != nil || r != "" {
+			t.Fatalf("%q refused: %q %v", cmd, r, err)
+		}
+		a, err := m.MergeGateCheck(repo, cmd, "")
+		if err != nil || a.Refusal != "" || !strings.HasPrefix(a.Warning, unsureWarn) || strings.Contains(a.Warning, "\n") {
+			t.Fatalf("%q: %+v %v", cmd, a, err)
+		}
+	}
+	if r := gateAnswer(t, m, repo, "gh pr merge 5", ""); !strings.HasPrefix(r, MergeGatePrefix) {
+		t.Fatalf("parsed merge without a pass: %q", r)
 	}
 }

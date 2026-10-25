@@ -30,16 +30,20 @@ import (
 // pass and by the daemon's backfill at its start), so a gated work tree that is gone or moved is still
 // matched by name and never makes other merges unreadable (one without stored names and with unreadable
 // remotes makes a merge by name or in another work tree unsure). A gh pr merge written in the Bash
-// command whose target the reader cannot tell is refused while some repository is gated; a command that
-// runs `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
-// brief files only.
+// command whose form or target the reader cannot tell passes with a one-line warning while some
+// repository is gated (owner decision 2026-10-25: only a parsed gh pr merge in a gated repository without
+// a release pass is blocked); a command that runs `agent-jobs gate retire` is always refused
+// (RetireRefusal). It reads the store, git remotes and the brief files only.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
 // `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
 // honest mistakes, it is not a boundary.
 
-// MergeGatePrefix starts the hook's refusal line.
-const MergeGatePrefix = "agent-jobs merge-gate: blocked: "
+// MergeGatePrefix starts the hook's refusal line; MergeGateWarnPrefix its warning line (the command runs).
+const (
+	MergeGatePrefix     = "agent-jobs merge-gate: blocked: "
+	MergeGateWarnPrefix = "agent-jobs merge-gate: warning: "
+)
 
 // fullSHA1Re is the full commit id --match-head-commit must carry (GitHub's ids are sha1).
 var fullSHA1Re = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -118,49 +122,70 @@ type mergeGate struct {
 	all   []*gatedRepo // the gated stored repositories (nil = not read yet)
 }
 
-// MergeGate is the hook's answer for a Bash command run at cwd: a refusal line ("" = allowed). envRepo is
-// GH_REPO of the session's environment. An error (unreadable store or brief files) is returned as is;
-// the caller refuses on it.
+// MergeGateAnswer is the hook's answer: Refusal blocks the command ("" = it runs); Warning is one line
+// for stderr when the command runs although the reader could not tell what it merges.
+type MergeGateAnswer struct {
+	Refusal string
+	Warning string
+}
+
+// MergeGate is the hook's refusal line for a Bash command run at cwd ("" = allowed); see MergeGateCheck.
 func (m *Manager) MergeGate(cwd, command, envRepo string) (string, error) {
+	a, err := m.MergeGateCheck(cwd, command, envRepo)
+	return a.Refusal, err
+}
+
+// MergeGateCheck is the hook's answer for a Bash command run at cwd. envRepo is GH_REPO of the session's
+// environment. An error (unreadable store or brief files) is returned as is; the caller refuses on it.
+func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer, error) {
+	var a MergeGateAnswer
 	calls, unsure := guard.GhPrMerges(command, cwd)
 	if len(calls) == 0 && unsure == "" {
-		return "", nil
+		return a, nil
 	}
 	g := &mergeGate{m: m, repos: map[string]*gatedRepo{}}
+	warn := func(why string) error {
+		w, err := g.warnUnsure(why)
+		if a.Warning == "" {
+			a.Warning = w
+		}
+		return err
+	}
 	if unsure != "" {
-		if r, err := g.refuseUnsure(unsure); r != "" || err != nil {
-			return r, err
+		if err := warn(unsure); err != nil {
+			return MergeGateAnswer{}, err
 		}
 	}
 	for _, call := range calls {
 		if call.Unsure != "" {
-			if r, err := g.refuseUnsure(call.Unsure); r != "" || err != nil {
-				return r, err
+			if err := warn(call.Unsure); err != nil {
+				return MergeGateAnswer{}, err
 			}
 			continue
 		}
 		targets, why, err := g.targets(cwd, call, envRepo)
 		if err != nil {
-			return "", err
+			return MergeGateAnswer{}, err
 		}
 		if why != "" {
-			if r, err := g.refuseUnsure(why); r != "" || err != nil {
-				return r, err
+			if err := warn(why); err != nil {
+				return MergeGateAnswer{}, err
 			}
 			continue
 		}
 		for _, t := range targets {
 			if r, err := g.check(t, call); r != "" || err != nil {
-				return r, err
+				return MergeGateAnswer{Refusal: r}, err
 			}
 		}
 	}
-	return "", nil
+	return a, nil
 }
 
-// refuseUnsure refuses a merge the hook cannot read while some stored repository has an approved
-// checklist ("" when none has: nothing is gated).
-func (g *mergeGate) refuseUnsure(why string) (string, error) {
+// warnUnsure is the warning for a merge the hook cannot read while some stored repository has an
+// approved checklist ("" when none has: nothing is gated). It no longer refuses (owner decision
+// 2026-10-25): an unreadable form blocked harmless commands and caught no defect.
+func (g *mergeGate) warnUnsure(why string) (string, error) {
 	all, err := g.approvedRepos()
 	if err != nil || len(all) == 0 {
 		return "", err
@@ -169,9 +194,9 @@ func (g *mergeGate) refuseUnsure(why string) (string, error) {
 	for _, r := range all {
 		names = append(names, Printable(r.main, 200))
 	}
-	return MergeGatePrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
-		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); write gh pr merge as a plain command with -R " +
-		"OWNER/REPO and --match-head-commit <full sha>.", nil
+	return MergeGateWarnPrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
+		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); not checked: run release_check before merging, and " +
+		"write gh pr merge as a plain command with -R OWNER/REPO and --match-head-commit <full sha> to be checked.", nil
 }
 
 // targets are the gated repositories a call may merge in. A repository the call names (PR URL, -R) is

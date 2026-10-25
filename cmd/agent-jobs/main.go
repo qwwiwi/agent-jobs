@@ -2120,19 +2120,20 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 			"agent-jobs hook merge-gate --agent A")
 	}
 	type answer struct {
-		reason string
-		err    error
+		reason  string
+		warning string
+		err     error
 	}
 	done := make(chan answer, 1)
 	go func() {
 		m, err := opener(*agent)
 		if err != nil {
-			done <- answer{"", err}
+			done <- answer{"", "", err}
 			return
 		}
 		defer m.Close()
-		r, err := m.MergeGate(in.Cwd, in.Command, os.Getenv("GH_REPO"))
-		done <- answer{r, err}
+		r, err := m.MergeGateCheck(in.Cwd, in.Command, os.Getenv("GH_REPO"))
+		done <- answer{r.Refusal, r.Warning, err}
 	}()
 	var a answer
 	select {
@@ -2147,6 +2148,9 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 		return block(jobs.MergeGatePrefix + "cannot check the merge (" + jobs.RedactPrintable(a.err.Error(), 300) + ")")
 	case a.reason != "":
 		return block(a.reason)
+	case a.warning != "":
+		// The command runs; the line is for the transcript (exit 0, so it does not block).
+		fmt.Fprintln(stderr, a.warning)
 	}
 	return 0
 }
