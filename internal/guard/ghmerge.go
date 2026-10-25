@@ -622,6 +622,10 @@ func shellExpands(w string) bool {
 	return hasGlob(w) || strings.HasPrefix(w, "~") || strings.Contains(w, "=~") || strings.Contains(w, ":~")
 }
 
+// DynamicWordUnsure is GhMerge.Unsure for a gh pr merge whose words hold a variable or substitution; the
+// call is still read (its -R, PR URL and directories), only the dynamic words are not.
+const DynamicWordUnsure = "a variable or substitution in the words of gh pr merge"
+
 // ghMergeCall reads a gh command as a `gh pr merge` call (ok false for any other gh call).
 // relax: the relaxed reading (GhPrMerges).
 func ghMergeCall(sc *script, c *simpleCmd, v cmdView, relax bool) (GhMerge, bool) {
@@ -655,7 +659,7 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView, relax bool) (GhMerge, bool
 	case vague:
 		call.Unsure = "an empty word or a variable at or before the gh pr subcommand"
 	case slices.Contains(dyn, true):
-		call.Unsure = "a variable or substitution in the words of gh pr merge"
+		call.Unsure = DynamicWordUnsure
 	case slices.ContainsFunc(argv[1:], shellExpands):
 		call.Unsure = "a glob, brace or tilde in the words of gh pr merge (the shell may expand it into other words)"
 	case sc.depth > 0:

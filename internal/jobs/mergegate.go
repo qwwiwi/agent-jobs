@@ -160,7 +160,7 @@ func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer,
 		}
 	}
 	for _, call := range calls {
-		if call.Unsure != "" && (call.Unsure != dynamicWordUnsure || dynamicWord(call.Repo)) {
+		if call.Unsure != "" && (call.Unsure != guard.DynamicWordUnsure || dynamicWord(call.Repo)) {
 			if err := warn(call.Unsure); err != nil {
 				return MergeGateAnswer{}, err
 			}
@@ -176,6 +176,8 @@ func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer,
 			if call.Unsure != "" {
 				// Only a variable or substitution among the words the target does not depend on (the sha, the PR
 				// number, a flag): the merge runs in this gated repository, so it is refused, not waved through.
+				// Also with a literal sha that has a pass: the call does not tell which word is dynamic, and an
+				// unquoted one may split into flags (`--body $B` with B="x --auto").
 				return MergeGateAnswer{Refusal: dynamicWordRefusal(t)}, nil
 			}
 			if r, err := g.check(t, call); r != "" || err != nil {
@@ -194,21 +196,18 @@ func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer,
 	return a, nil
 }
 
-// dynamicWordUnsure is guard.GhMerge.Unsure for a gh pr merge whose words hold a variable or
-// substitution; the call is still read (its -R, PR URL and directories), only the dynamic words are not.
-const dynamicWordUnsure = "a variable or substitution in the words of gh pr merge"
-
 // dynamicWord reports a word the shell expands ($VAR, ${VAR}, $(…), `…`).
 func dynamicWord(w string) bool {
 	return strings.ContainsAny(w, "$`")
 }
 
 // dynamicWordRefusal refuses a merge in gated repository r whose sha, PR number or another word is a
-// variable or substitution: the hook cannot tell which sha it merges.
+// variable or substitution: the hook cannot tell which sha, PR or flags it merges with.
 func dynamicWordRefusal(r *gatedRepo) string {
 	return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s (a repo with an approved checklist) has a variable or "+
-		"substitution in its words; write the sha (--match-head-commit <full sha>) and the PR number literally so the "+
-		"release_check pass can be checked.", Printable(r.main, 200))
+		"substitution in its words, so the hook cannot tell which sha, PR or flags it merges with, also when the "+
+		"sha has a release_check pass; write every word of gh pr merge literally (no variables or $(...)).",
+		Printable(r.main, 200))
 }
 
 // warnUnsure is the warning for a merge the hook cannot read while some stored repository has an
