@@ -1985,7 +1985,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		sub = args[0]
 	}
 	if sub == "merge-gate" {
-		return mergeGateHook(args[1:], stdin, stderr, openReadOnly)
+		return mergeGateHook(args[1:], stdin, stdout, stderr, openReadOnly)
 	}
 	if sub == "brief-reminder" {
 		type answer struct {
@@ -2092,8 +2092,9 @@ const mergeGateTimeout = 5 * time.Second
 // one line on stderr (Claude Code shows it to the model). A call that does not run `gh pr merge` (and
 // cannot) is allowed before the store is opened; for one that does or may, every error blocks (fail
 // closed): bad flags, an unreadable input, the store, a timeout. A job session (ErrInJobSession) is a
-// no-op, like the job-role refusal in main.
-func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
+// no-op, like the job-role refusal in main. A merge it cannot read runs (exit 0) with a warning as hook
+// JSON on stdout (mergeGateWarningJSON).
+func mergeGateHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
 	block := func(reason string) int {
 		fmt.Fprintln(stderr, reason)
 		return 2
@@ -2149,10 +2150,36 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 	case a.reason != "":
 		return block(a.reason)
 	case a.warning != "":
-		// The command runs; the line is for the transcript (exit 0, so it does not block).
-		fmt.Fprintln(stderr, a.warning)
+		// The command runs (exit 0). Claude Code drops the stderr of a hook that exits 0, so the warning is
+		// hook JSON on stdout (mergeGateWarningJSON).
+		if err := json.NewEncoder(stdout).Encode(mergeGateWarningJSON(a.warning)); err != nil {
+			fmt.Fprintln(stderr, a.warning) // the transcript still has it; the warning never blocks
+		}
 	}
 	return 0
+}
+
+// preToolUseOutput is the PreToolUse hook JSON the merge hook prints with a warning.
+type preToolUseOutput struct {
+	HookSpecificOutput preToolUseSpecific `json:"hookSpecificOutput"`
+	SystemMessage      string             `json:"systemMessage"`
+}
+
+type preToolUseSpecific struct {
+	HookEventName     string `json:"hookEventName"`
+	AdditionalContext string `json:"additionalContext"`
+}
+
+// mergeGateWarningJSON is the hook output for a merge the gate cannot read: hookSpecificOutput's
+// additionalContext is added to the model's context (the form examples/hooks/prefer-jobs-reminder.sh
+// uses, docs/WORKFLOW.md), systemMessage shows the same line to the user. It carries no
+// permissionDecision: "allow" would skip the session's permission prompts for the command, and its
+// permissionDecisionReason is shown to the user only, not to the model.
+func mergeGateWarningJSON(warning string) preToolUseOutput {
+	return preToolUseOutput{
+		HookSpecificOutput: preToolUseSpecific{HookEventName: "PreToolUse", AdditionalContext: warning},
+		SystemMessage:      warning,
+	}
 }
 
 // briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the

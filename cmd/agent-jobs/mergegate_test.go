@@ -73,7 +73,7 @@ func gatedRepo(t *testing.T) (string, string) {
 // `hook merge-gate` exits 0 to allow a Bash call and 2 to block it with one line on stderr: a merge of
 // the passed sha passes, another sha or none is blocked; a call that runs no merge passes before the
 // store is opened (even misconfigured); a merge it cannot check is blocked; a merge it cannot read runs
-// with one warning line (exit 0).
+// with a warning as hook JSON on stdout (exit 0).
 func TestHookMergeGate(t *testing.T) {
 	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
 	t.Setenv("GH_REPO", "")
@@ -103,16 +103,20 @@ func TestHookMergeGate(t *testing.T) {
 		{"merge, no agent", []string{"merge-gate"}, bashEvent(repo, "gh pr merge 5"), 2, "--agent is required"},
 		{"merge, positional", []string{"merge-gate", "--agent", "test", "x"}, bashEvent(repo, "gh pr merge 5"), 2, "misconfigured"},
 		{"bad json", gate, "{", 2, "unreadable hook input"},
-		{"unreadable merge runs with a warning", gate, bashEvent(repo, "sh -c 'gh pr merge 5'"), 0, "warning: cannot tell whether"},
 	} {
 		code, out, errs := run(tc.args, tc.stdin)
 		if code != tc.code || out != "" || (tc.err == "") != (errs == "") || !strings.Contains(errs, tc.err) ||
 			strings.Count(errs, "\n") > 1 {
 			t.Errorf("%s: exit %d, stdout %q, stderr %q", tc.name, code, out, errs)
 		}
-		if errs != "" && !strings.HasPrefix(errs, jobs.MergeGatePrefix) && !(code == 0 && strings.HasPrefix(errs, jobs.MergeGateWarnPrefix)) {
+		if errs != "" && !strings.HasPrefix(errs, jobs.MergeGatePrefix) {
 			t.Errorf("%s: stderr %q", tc.name, errs)
 		}
+	}
+	// An unreadable merge runs with its warning as hook JSON on stdout (TestHookMergeGateWarningIsHookJSON).
+	if code, out, errs := run(gate, bashEvent(repo, "sh -c 'gh pr merge 5'")); code != 0 || errs != "" ||
+		!strings.Contains(out, `"additionalContext":"`+jobs.MergeGateWarnPrefix+"cannot tell whether") {
+		t.Errorf("unreadable merge: exit %d, stdout %q, stderr %q", code, out, errs)
 	}
 }
 
