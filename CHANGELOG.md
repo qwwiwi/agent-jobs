@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- Wave F cuts (owner, 2026-10-25; DECISIONS.md rows of that date): the gates that cost time without catching defects are cut back.
+  - `release_check`: a codex judge launched under the read-only codex sandbox is stored with `enforced_blind` true, and the `family` condition counts only succeeded feature jobs (size large), so claude coders with a codex judge can pass; the `trace` condition is removed (`covered_by` stays informational).
+  - Owner waivers bind to the checklist hash and the requirement, not to a commit: a fix commit keeps them; `checklist_set` `waivers[].sha` is optional and ignored with a warning.
+  - Merge gate: a command the reader cannot read runs with a one-line stderr warning instead of being refused; a parsed `gh pr merge` in a gated repository without a release pass is still blocked.
+  - Requirements block: a `done` line counts without `ran:` or `REDPROOF` (nothing is *claimed*); `prompts/requirements.md` is cut to the five-line format; `kind-fix.md` and `kind-general.md` drop the mandatory `REDPROOF` line format.
+  - Job size is optional: `covers` imply `large`, otherwise `small`; `size_required` stays, default off.
+  - Brief reminder: printed only before an owner prompt (not a `[jobs:` line) and only while a checklist decision is pending; the size rule only with `size_required` on.
+  - `checklist_set approve` no longer needs a slicing result of the exact version (nor a claude one); undecided unmapped quotes of an existing result still block it.
+
 ### Fixed
 - Codex jobs on hosts where codex's sandbox cannot start (#81; on Ubuntu 24.04 the AppArmor default `kernel.apparmor_restrict_unprivileged_userns=1` keeps codex's bundled bwrap from setting up its namespace: `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`). Under `-s read-only` codex 0.162.1 then runs no command at all, quotes the bwrap error in its final message, completes its turn and exits 0, and the job ended `succeeded` with that message as its report. Now a codex job with a repository in whose stream not one command exited 0 ends `failed` («codex ran no command in the repository successfully …»), as does any codex job with a failed command whose output starts with `bwrap:`; the final message no longer becomes `report.md`. The model's message is untrusted text and never decides the verdict (the reason only notes that it mentions bwrap); ordinary non-zero exits next to a successful command, and a job without a repository that runs no command, are not failures. Every such failure, and the launch refusal under `auto`, names the AppArmor host fix first (README «Troubleshooting: codex sandbox and AppArmor», with an example profile) and `worktree-full-access` only as the last resort.
 
