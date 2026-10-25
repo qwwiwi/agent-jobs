@@ -325,19 +325,8 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.runner, j.model, j.blind = store.RunnerCodex, "gpt-5.6-sol", false
 			f.judge(t, j)
 		}},
-		{"a live requirement in no covers", jobs.ReleaseTrace, "trace — in no feature job's covers: R02", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01")
-			f.judge(t, okJudge())
-		}},
-		{"a feature job covering no row of the checklist", jobs.ReleaseTrace, "feature job(s) covering no row of the checklist: coder-",
-			func(t *testing.T, f *releaseFix) {
-				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-				f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R09") // a row since removed from the checklist
-				f.judge(t, okJudge())
-			}},
-		{"a cancelled coder supplies no coverage", jobs.ReleaseTrace, "trace — in no feature job's covers: R02", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01")
-			f.coderStatus(t, store.StatusCancelled, store.RunnerCodex, "gpt-5.6-sol", "R02")
+		{"only a failed coder", jobs.ReleaseFamily, "family — no succeeded feature job (a fix or general job of size large)", func(t *testing.T, f *releaseFix) {
+			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 			f.judge(t, okJudge())
 		}},
 		{"a red manifest-check judged again until green", jobs.ReleaseManifestCheck, "manifest_check — scripts/manifest-check.sh exited 1 (job gate-",
@@ -475,8 +464,8 @@ func TestReleaseCheckWaiverAndNoApproval(t *testing.T) {
 }
 
 // A feature job is a fix or general job of size large (F9 (a)): a same-family coder with covers but size
-// small, or none, is not one, so it neither fails the family condition nor supplies the trace; alone, such
-// coders leave the check without a feature job.
+// small, or none, is not one, so it does not fail the family condition; alone, such coders leave the check
+// without a feature job.
 func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	f := passing(t)
 	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01")
@@ -490,9 +479,26 @@ func TestReleaseCheckFeatureJobsBySizeLarge(t *testing.T) {
 	g.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 	g.judge(t, okJudge())
 	r = g.check(t)
-	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseTrace).OK || condition(r, jobs.ReleaseFamily).OK ||
-		!strings.Contains(r.OwnerLine, "(a feature job is a fix or general job of size large)") {
+	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseFamily).OK ||
+		!strings.Contains(r.OwnerLine, "no succeeded feature job (a fix or general job of size large)") {
 		t.Fatalf("only a small coder: %+v", r)
+	}
+}
+
+// There is no trace condition (owner decision 2026-10-25): a live requirement in no feature job's covers,
+// a feature job covering no row of the checklist and a cancelled coder pass; covers stay informational.
+func TestReleaseCheckNoTraceCondition(t *testing.T) {
+	f := newReleaseFix(t)
+	f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01")
+	f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R09") // a row since removed from the checklist
+	f.coderStatus(t, store.StatusCancelled, store.RunnerCodex, "gpt-5.6-sol", "R02")
+	f.judge(t, okJudge())
+	r := f.check(t)
+	if !r.Pass || r.OwnerLine != "Acceptance: 2 of 2" || condition(r, "trace").Detail != "absent" {
+		t.Fatalf("trace still fails the check: %+v", r)
+	}
+	if len(r.Requirements) != 2 || len(r.Requirements[0].CoveredBy) != 1 || len(r.Requirements[1].CoveredBy) != 0 || len(r.FeatureJobs) != 3 {
+		t.Fatalf("covers not shown: %+v %+v", r.Requirements, r.FeatureJobs)
 	}
 }
 

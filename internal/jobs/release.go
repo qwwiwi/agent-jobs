@@ -25,12 +25,11 @@ const (
 	ReleaseSuspectTests  = "suspect_tests"
 	ReleaseFamily        = "family"
 	ReleaseBlind         = "enforced_blind"
-	ReleaseTrace         = "trace"
 )
 
 // ReleaseConditions lists the conditions in report order.
 var ReleaseConditions = []string{ReleaseApproval, ReleaseManifestCheck, ReleaseVerdict, ReleaseRequirements, ReleaseUnmapped,
-	ReleaseSuspectTests, ReleaseFamily, ReleaseBlind, ReleaseTrace}
+	ReleaseSuspectTests, ReleaseFamily, ReleaseBlind}
 
 // ReleaseCondition is one condition of release_check and whether it holds.
 type ReleaseCondition struct {
@@ -50,7 +49,7 @@ type ReleaseRequirement struct {
 	WaiverQuote string `json:"waiver_quote,omitempty"`
 	// Accepted: met, placeholder on a placeholder-ok row, or waived.
 	Accepted bool `json:"accepted"`
-	// CoveredBy are the succeeded feature jobs whose covers name it.
+	// CoveredBy are the succeeded feature jobs whose covers name it (informational: no condition reads it).
 	CoveredBy []string `json:"covered_by"`
 }
 
@@ -378,51 +377,17 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	// The trace both ways, over the succeeded feature jobs only (a cancelled or failed job delivered
-	// nothing): every live requirement in some succeeded job's covers, and every succeeded job covering
-	// some row of the checklist (a row since deferred or dropped still counts, so a later re-scoping does
-	// not fail the trace for good; only covers naming no row of it at all leave a job idle).
-	var uncovered, idle []string
-	succeeded := 0
+	// The feature jobs and their covers, informational only: the trace condition was cut (owner decision
+	// 2026-10-25), CoveredBy and LiveCovers stay for the owner's view.
 	for _, cj := range coders {
 		fj := ReleaseFeatureJob{ID: cj.ID, Kind: cj.Kind, Status: cj.Status, Family: ModelFamily(cj.Runner, cj.Model),
 			Covers: nonNilSlice(cj.Covers), LiveCovers: []string{}}
-		known := false
 		for _, id := range cj.Covers {
 			if slices.Contains(live, id) {
 				fj.LiveCovers = append(fj.LiveCovers, id)
 			}
-			if _, ok := c.Row(id); ok {
-				known = true
-			}
-		}
-		if cj.Status == store.StatusSucceeded {
-			succeeded++
-			if !known {
-				idle = append(idle, cj.ID)
-			}
 		}
 		out.FeatureJobs = append(out.FeatureJobs, fj)
-	}
-	for _, r := range out.Requirements {
-		if len(r.CoveredBy) == 0 {
-			uncovered = append(uncovered, r.ID)
-		}
-	}
-	var trace []string
-	if succeeded == 0 {
-		trace = append(trace, "no succeeded feature job covers checklist "+c.ID+" (a feature job is a fix or general job of size large)")
-	}
-	if len(uncovered) > 0 {
-		trace = append(trace, "in no feature job's covers: "+strings.Join(uncovered, ", "))
-	}
-	if len(idle) > 0 {
-		trace = append(trace, "feature job(s) covering no row of the checklist: "+strings.Join(idle, ", "))
-	}
-	if len(trace) == 0 {
-		set(ReleaseTrace, true, "%d succeeded feature job(s), every live requirement covered", succeeded)
-	} else {
-		set(ReleaseTrace, false, "%s", strings.Join(trace, "; "))
 	}
 	return out, nil
 }
