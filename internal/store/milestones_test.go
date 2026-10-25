@@ -69,6 +69,10 @@ func TestMilestonesRoundTripOnOldDatabase(t *testing.T) {
 	if list, _ := s.ListMilestones(ctx, MilestoneFilter{Repo: "/r/a", ChecklistID: "c1"}); len(list) != 1 || list[0].ID != a {
 		t.Fatalf("repo + checklist filter: %+v", list)
 	}
+	// Created at the database's clock; set back to the creation times to test the cursor's edge.
+	if _, err := s.db.Exec(`UPDATE milestones SET updated_at = created_at`); err != nil {
+		t.Fatal(err)
+	}
 	since := t0.Add(time.Minute)
 	if list, _ := s.ListMilestones(ctx, MilestoneFilter{UpdatedSince: &since}); len(list) != 2 {
 		t.Fatalf("updated_since includes the equal second: %+v", list)
@@ -135,6 +139,7 @@ func TestMilestoneUpdatedAtFollowsJobs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	rewind() // created at the database's clock
 	if err := s.Insert(milestoneJob("other", 0, "", old)); err != nil {
 		t.Fatal(err)
 	}
@@ -203,5 +208,55 @@ func TestMilestoneFull(t *testing.T) {
 	}
 	if full, _ := s.MilestoneFull(free); full {
 		t.Fatal("a milestone without max_parallel is full")
+	}
+}
+
+// A judge verdict of a milestone's repository and checklist moves its updated_at (acceptance_met reads
+// the latest verdict); a milestone of another repository stays.
+func TestMilestoneUpdatedAtFollowsVerdicts(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	old := time.Now().Add(-time.Hour)
+	tied, err := s.CreateMilestone(&Milestone{Title: "tied", Repo: "/r/a", ChecklistID: "c1"}, []MilestoneTask{{Key: "T1", Title: "x"}}, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := s.CreateMilestone(&Milestone{Title: "other", Repo: "/r/b", ChecklistID: "c1"}, []MilestoneTask{{Key: "T1", Title: "x"}}, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewind := func() {
+		t.Helper()
+		if _, err := s.db.Exec(`UPDATE milestones SET updated_at=?`, old.Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated := func(id int64) int64 {
+		t.Helper()
+		ms, err := s.GetMilestone(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ms.UpdatedAt.Unix()
+	}
+	judge := milestoneJob("judge-1", 0, "", old)
+	judge.Status, judge.LaunchToken, judge.Attempt = StatusRunning, "tok", 1
+	if err := s.Insert(judge); err != nil {
+		t.Fatal(err)
+	}
+	rewind() // the cursor has passed the creation
+	if _, err := s.PutVerdict("tok", JudgeVerdict{JobID: judge.ID, Repo: "/r/a", SHA: "abc", ChecklistID: "c1", Version: 1,
+		ChecklistSHA256: "h", Verdict: map[string]any{"requirements": []any{}}}); err != nil {
+		t.Fatal(err)
+	}
+	if updated(tied) <= old.Unix() {
+		t.Fatal("a verdict of the milestone's checklist did not move updated_at")
+	}
+	if updated(other) != old.Unix() {
+		t.Fatal("a verdict of another repository moved updated_at")
 	}
 }

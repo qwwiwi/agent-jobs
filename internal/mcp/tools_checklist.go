@@ -458,6 +458,13 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			}
 			added++
 		}
+		if res.Brief != nil || res.Checklist != nil || res.Record != nil {
+			// A milestone tied to this checklist shows its rows (uncovered, acceptance): its change cursor moves.
+			if err := m.Store.TouchChecklistMilestones(main, res.List.ID); err != nil {
+				res.Warnings = append(res.Warnings, "the milestones tied to the checklist were not marked changed: "+
+					jobs.RedactPrintable(err.Error(), 200))
+			}
+		}
 		v, err := checklistView(m, top, main, res.List, res.BriefAfter)
 		if err != nil {
 			return nil, ChecklistView{}, err

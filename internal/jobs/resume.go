@@ -690,6 +690,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it; start a new one with %s_start",
 			id, j.Kind, j.Kind)
 	}
+	if err := m.milestoneResumable(j); err != nil {
+		return nil, err
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -974,9 +977,16 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
 		notes = m.LookupMemoryNotes(j)
 	}
-	brief, err := m.BuildPrompt(j, rules, cards, notes)
+	// The prior/ folder is refreshed from the snapshot the fallback prompt's prior results come from.
+	prior := m.priorSnapshot(j)
+	brief, err := m.buildPrompt(j, rules, cards, notes, prior)
 	if err != nil {
 		return launchPlan{}, err
+	}
+	if !IsGateKind(j.Kind) {
+		if err := m.writePriorReports(prior, dir); err != nil {
+			return launchPlan{}, err
+		}
 	}
 	fallback := brief + "\n" + m.previousAttempt(j, dir) + "\n" + update +
 		"\nNote: the previous claude session could not be resumed, so this is a fresh session in the same work " +

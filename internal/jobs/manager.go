@@ -549,11 +549,19 @@ func (m *Manager) launchQueued() error {
 			return nil
 		}
 		if j.MilestoneID != 0 {
-			// The milestone's own cap (max_parallel): its job waits for a slot of the milestone.
-			if full, err := m.Store.MilestoneFull(j.MilestoneID); err != nil || full {
-				if err != nil {
-					m.Log.Printf("job %s: milestone slots: %v", j.ID, err)
-				}
+			// A job on a task is checked again: its milestone may have changed since job_start. It waits for
+			// its dependencies and a slot of the milestone (max_parallel); one that can no longer run (the
+			// milestone closed, the task dropped) is cancelled with the reason.
+			wait, cancel, err := m.milestoneLaunch(context.Background(), j)
+			if err != nil {
+				m.Log.Printf("job %s: milestone check: %v", j.ID, err)
+				continue
+			}
+			if cancel != "" {
+				m.cancelQueued(j, "cancelled before start: "+cancel)
+				continue
+			}
+			if wait {
 				continue
 			}
 		}
@@ -585,6 +593,25 @@ func (m *Manager) launchQueued() error {
 		}
 	}
 	return nil
+}
+
+// cancelQueued ends a queued job that may not start (launchQueued holds the lifecycle lock) as
+// cancelled with reason, as Cancel would.
+func (m *Manager) cancelQueued(j *store.Job, reason string) {
+	unlockAdmit, err := lockAdmitIfExists(m.JobDir(j.ID))
+	if err != nil {
+		m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		return
+	}
+	defer unlockAdmit()
+	if err := m.Store.Finish(j.ID, "", store.StatusCancelled, 0, 0, 0, RedactPrintable(reason, 300), m.Now()); err != nil {
+		if !errors.Is(err, store.ErrImmutable) {
+			m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		}
+		return
+	}
+	m.Log.Printf("job %s %s", j.ID, RedactText(reason))
+	m.settled(j.ID)
 }
 
 // ClaudeArgs is the reference command line (prompt.md arrives on stdin) with a pre-assigned session

@@ -336,6 +336,12 @@ func (m *Manager) readOwnerRules() (string, error) {
 // project cards that match the job's repository, the memory notes, task, the covered requirements (a
 // job with covers, F4), kind checklist, report contract.
 func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes) (string, error) {
+	return m.buildPrompt(j, ownerRules, cards, notes, m.priorSnapshot(j))
+}
+
+// buildPrompt is BuildPrompt with the job's prior results taken from prior, the snapshot its prior/
+// folder is written from.
+func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes, prior priorSnapshot) (string, error) {
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
 		return "", err
@@ -385,7 +391,7 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), m.PriorResults(j), cover, check, contract)
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), m.priorResults(j, prior), cover, check, contract)
 	return b.String(), nil
 }
 
@@ -444,7 +450,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 			m.Log.Printf("job %s: memory notes unavailable: %v", j.ID, notes.Err)
 		}
 	}
-	prompt, err := m.BuildPrompt(j, rules, cards, notes)
+	// One read of the dependencies feeds both the prompt's prior results and the prior/ folder.
+	prior := m.priorSnapshot(j)
+	prompt, err := m.buildPrompt(j, rules, cards, notes, prior)
 	if err != nil {
 		return err
 	}
@@ -460,7 +468,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
 		return err
 	}
-	if err := m.writePriorReports(j, dir); err != nil {
+	if err := m.writePriorReports(prior, dir); err != nil {
 		return err
 	}
 	if err := m.writeGitFiles(dir); err != nil {

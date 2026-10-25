@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -115,10 +117,13 @@ type MilestoneProgress struct {
 // MilestoneView is a milestone as milestone_list returns it; the tree fields (tasks, ready, progress,
 // uncovered) are set by milestone_get and by milestone_list with tree.
 type MilestoneView struct {
-	ID          int64               `json:"id"`
-	Title       string              `json:"title"`
-	Goal        string              `json:"goal,omitempty"`
-	Repo        string              `json:"repo,omitempty"`
+	ID    int64  `json:"id"`
+	Title string `json:"title"`
+	Goal  string `json:"goal,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	// RepoID is a stable opaque id of the repository (MilestoneRepoID), the same in MCP and the HTTP API,
+	// where repo is only its folder name: a frontend filters by it.
+	RepoID      string              `json:"repo_id,omitempty"`
 	Branch      string              `json:"branch,omitempty"`
 	ChecklistID string              `json:"checklist_id,omitempty"`
 	Order       int                 `json:"order"`
@@ -138,18 +143,24 @@ type MilestoneView struct {
 	Note string `json:"note,omitempty"`
 }
 
-// MilestonesView is milestone_list's output.
+// MilestonesView is milestone_list's output. Cursor is the next updated_since: the highest updated_at
+// of all milestones when the list was read, in Unix seconds ("0" without one).
 type MilestonesView struct {
 	Milestones []MilestoneView `json:"milestones"`
+	Cursor     string          `json:"cursor"`
 }
 
 // MilestoneListRequest is milestone_list's filter.
 type MilestoneListRequest struct {
-	Status      string `json:"status,omitempty" jsonschema:"open | done | dropped; default all"`
-	Repo        string `json:"repo,omitempty" jsonschema:"absolute path of a repository: only its milestones (the project view)"`
+	Status string `json:"status,omitempty" jsonschema:"open | done | dropped; default all"`
+	Repo   string `json:"repo,omitempty" jsonschema:"absolute path of a repository: only its milestones (the project view)"`
+	RepoID string `json:"repo_id,omitempty" jsonschema:"repo_id of a repository, as milestone_get returns it: only its milestones"`
+	// RepoName is the folder name of a repository (the HTTP API's repo filter): it must name one
+	// repository of the milestones (ErrAmbiguousRepo otherwise).
+	RepoName    string `json:"-"`
 	ChecklistID string `json:"checklist_id,omitempty" jsonschema:"only the milestones tied to this checklist id"`
 	// UpdatedSince is RFC 3339 or Unix seconds.
-	UpdatedSince string `json:"updated_since,omitempty" jsonschema:"change cursor: only milestones whose updated_at is at or after it (RFC 3339 or Unix seconds)"`
+	UpdatedSince string `json:"updated_since,omitempty" jsonschema:"change cursor: only milestones whose updated_at is at or after it (RFC 3339 or Unix seconds); pass the cursor of the previous answer"`
 	Tree         bool   `json:"tree,omitempty" jsonschema:"true: each milestone with its full tree (tasks, jobs, ready, progress), in order"`
 }
 
@@ -390,6 +401,12 @@ func findCycle(tasks []store.MilestoneTask) string {
 	return ""
 }
 
+// workUsed reports whether a job's outcome means its work was used: accepted, extended, or reworked
+// (taken and changed by hand). Such a job makes its task done and is its prior result.
+func workUsed(outcome string) bool {
+	return outcome == OutcomeAccepted || outcome == OutcomeExtended || outcome == OutcomeReworked
+}
+
 // ownStatus is a task's status from its own jobs (oldest first), dependencies not looked at.
 func ownStatus(jobs []*store.Job) string {
 	for _, j := range jobs {
@@ -405,19 +422,20 @@ func ownStatus(jobs []*store.Job) string {
 	switch {
 	case last.Status == store.StatusSucceeded && last.Outcome == "":
 		return TaskReview
-	case last.Outcome == OutcomeAccepted || last.Outcome == OutcomeExtended:
+	case workUsed(last.Outcome):
 		return TaskDone
 	case last.Status == store.StatusFailed || last.Status == store.StatusTimeout || last.Status == store.StatusCancelled,
-		last.Outcome == OutcomeDiscarded || last.Outcome == OutcomeReworked:
+		last.Outcome == OutcomeDiscarded:
 		return TaskFailed
 	}
 	return TaskReady
 }
 
-// TaskStatuses derives the status of every task: dropped; blocked (a dependency, not dropped, is not
-// done); running (a queued, running or stopped job); review (the latest job succeeded, no outcome yet);
-// done (the latest job's outcome is accepted or extended); failed (the latest job failed, timed out or
-// was cancelled, or its outcome is discarded or reworked); else ready.
+// TaskStatuses derives the status of every task: dropped; running (a queued, running or stopped job);
+// review (the latest job succeeded, no outcome yet); done (the latest job's outcome is accepted,
+// extended or reworked); failed (the latest job failed, timed out or was cancelled, or its outcome is
+// discarded); else blocked when a dependency (not dropped) is not done, else ready. Blocked replaces
+// only ready: a task whose own jobs say more keeps that status.
 func TaskStatuses(tasks []store.MilestoneTask, jobs []*store.Job) map[string]string {
 	byTask := map[string][]*store.Job{}
 	for _, j := range jobs {
@@ -439,7 +457,7 @@ func TaskStatuses(tasks []store.MilestoneTask, jobs []*store.Job) map[string]str
 			return TaskDropped
 		}
 		s := ownStatus(byTask[k])
-		if depth <= len(tasks) { // a cycle (refused on write) cannot recurse forever
+		if s == TaskReady && depth <= len(tasks) { // a cycle (refused on write) cannot recurse forever
 			for _, d := range t.DependsOn {
 				if dt, ok := task[d]; ok && !dt.Dropped && status(d, depth+1) != TaskDone {
 					s = TaskBlocked
@@ -452,6 +470,35 @@ func TaskStatuses(tasks []store.MilestoneTask, jobs []*store.Job) map[string]str
 	}
 	for _, t := range tasks {
 		status(t.Key, 0)
+	}
+	return out
+}
+
+// waitingDeps lists the dependencies of task key that are not done (dropped ones left out), as "T1
+// running": a job on the task starts once the list is empty.
+func waitingDeps(tasks []store.MilestoneTask, jobs []*store.Job, key string) []string {
+	i := slices.IndexFunc(tasks, func(t store.MilestoneTask) bool { return t.Key == key })
+	if i < 0 {
+		return nil
+	}
+	st := TaskStatuses(tasks, jobs)
+	var out []string
+	for _, d := range tasks[i].DependsOn {
+		if s, ok := st[d]; ok && s != TaskDone && s != TaskDropped {
+			out = append(out, d+" "+s)
+		}
+	}
+	return out
+}
+
+// openTasks lists the tasks that are neither done nor dropped, as "T2 ready".
+func openTasks(tasks []store.MilestoneTask, jobs []*store.Job) []string {
+	st := TaskStatuses(tasks, jobs)
+	var out []string
+	for _, t := range tasks {
+		if s := st[t.Key]; s != TaskDone && s != TaskDropped {
+			out = append(out, t.Key+" "+s)
+		}
 	}
 	return out
 }
@@ -506,7 +553,8 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
 }
 
 // SetMilestone edits a milestone in place (milestone_set): its fields, its tasks (upsert by key, drop),
-// its status. Closing it as done is refused while a task is not done or dropped.
+// its status. Closing it as done is refused while a task is not done or dropped; an edit that leaves a
+// done milestone with such a task reopens it.
 func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*MilestoneView, error) {
 	if in.ID <= 0 {
 		return nil, errors.New("id is required")
@@ -592,23 +640,26 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 		if note != "" {
 			next.CloseNote = note
 		}
-		if in.Status != "" && in.Status != ms.Status {
-			if in.Status == store.MilestoneDone {
-				st := TaskStatuses(all, jobs)
-				var open []string
-				for _, t := range all {
-					if s := st[t.Key]; s != TaskDone && s != TaskDropped {
-						open = append(open, t.Key+" "+s)
-					}
-				}
-				if len(open) > 0 {
+		// The resulting state is checked on every edit: done only while every task is done or dropped. A
+		// close as done is refused otherwise; an edit that adds unfinished work to a done milestone (a new
+		// task, a revived one) reopens it.
+		status := ms.Status
+		if in.Status != "" {
+			status = in.Status
+		}
+		if status == store.MilestoneDone {
+			if open := openTasks(all, jobs); len(open) > 0 {
+				if in.Status == store.MilestoneDone {
 					return nil, nil, fmt.Errorf("milestone %d cannot close as done: tasks not done or dropped: %s "+
 						"(drop them, or close the milestone as dropped)", ms.ID, strings.Join(open, ", "))
 				}
+				status = store.MilestoneOpen
 			}
-			next.Status = in.Status
+		}
+		if status != ms.Status {
+			next.Status = status
 			next.ClosedAt = nil
-			if in.Status != store.MilestoneOpen {
+			if status != store.MilestoneOpen {
 				next.ClosedAt = &now
 			}
 		}
@@ -620,11 +671,52 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 	return m.MilestoneTree(ctx, in.ID)
 }
 
+// MilestoneRepoID is the opaque id of a milestone's repository (its stored main worktree): the first 12
+// hex digits of its SHA-256, "" for none. It does not change while the path does not.
+func MilestoneRepoID(repo string) string {
+	if repo == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(repo))
+	return hex.EncodeToString(sum[:6])
+}
+
+// ErrAmbiguousRepo is returned for a repository folder name that names more than one repository.
+var ErrAmbiguousRepo = errors.New("the repo name names more than one repository")
+
+// milestoneRepoFilter resolves repo_id (or, without one, a folder name) to the stored repository path:
+// ok is false when none matches (the list is then empty).
+func (m *Manager) milestoneRepoFilter(ctx context.Context, id, name string) (repo string, ok bool, err error) {
+	repos, err := m.Store.MilestoneRepos(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	var hits []string
+	for _, r := range repos {
+		if (id != "" && MilestoneRepoID(r) == id) || (id == "" && filepath.Base(r) == name) {
+			hits = append(hits, r)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return "", false, nil
+	case 1:
+		return hits[0], true, nil
+	}
+	ids := make([]string, len(hits))
+	for i, r := range hits {
+		ids[i] = MilestoneRepoID(r)
+	}
+	return "", false, fmt.Errorf("%w: %q is the folder of repo_id %s; filter by repo_id", ErrAmbiguousRepo,
+		Printable(name, 80), strings.Join(ids, ", "))
+}
+
 // milestoneView is the row part of a milestone's view.
 func milestoneView(ms *store.Milestone) MilestoneView {
 	return MilestoneView{
-		ID: ms.ID, Title: ms.Title, Goal: ms.Goal, Repo: ms.Repo, Branch: ms.Branch, ChecklistID: ms.ChecklistID,
-		Order: ms.Order, Status: ms.Status, MaxParallel: ms.MaxParallel, CreatedAt: fmtMilestoneTS(&ms.CreatedAt),
+		ID: ms.ID, Title: ms.Title, Goal: ms.Goal, Repo: ms.Repo, RepoID: MilestoneRepoID(ms.Repo), Branch: ms.Branch,
+		ChecklistID: ms.ChecklistID,
+		Order:       ms.Order, Status: ms.Status, MaxParallel: ms.MaxParallel, CreatedAt: fmtMilestoneTS(&ms.CreatedAt),
 		UpdatedAt: fmtMilestoneTS(&ms.UpdatedAt), ClosedAt: fmtMilestoneTS(ms.ClosedAt), CloseNote: ms.CloseNote,
 	}
 }
@@ -780,6 +872,12 @@ func (m *Manager) ListMilestones(ctx context.Context, r MilestoneListRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	// The cursor is read before the list (see Store.MilestoneCursor).
+	cursor, err := m.Store.MilestoneCursor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &MilestonesView{Milestones: []MilestoneView{}, Cursor: fmt.Sprint(cursor)}
 	repo := strings.TrimSpace(r.Repo)
 	if repo != "" {
 		// The stored repo is the main worktree: a path of a linked worktree finds it too; a path that is no
@@ -788,12 +886,25 @@ func (m *Manager) ListMilestones(ctx context.Context, r MilestoneListRequest) (*
 			repo = main
 		}
 	}
+	// repo_id, or a folder name, names a stored repository; with repo too, both must name the same one.
+	for _, by := range []struct{ id, name string }{{strings.TrimSpace(r.RepoID), ""}, {"", strings.TrimSpace(r.RepoName)}} {
+		if by.id == "" && by.name == "" {
+			continue
+		}
+		found, ok, err := m.milestoneRepoFilter(ctx, by.id, by.name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok || (repo != "" && found != repo) {
+			return out, nil
+		}
+		repo = found
+	}
 	list, err := m.Store.ListMilestones(ctx, store.MilestoneFilter{Status: r.Status, Repo: repo,
 		ChecklistID: strings.TrimSpace(r.ChecklistID), UpdatedSince: since})
 	if err != nil {
 		return nil, err
 	}
-	out := &MilestonesView{Milestones: make([]MilestoneView, 0, len(list))}
 	for _, ms := range list {
 		v := milestoneView(ms)
 		if r.Tree {
@@ -843,16 +954,11 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 	if idx < 0 {
 		return fmt.Errorf("task %q is not a task of milestone %d", Printable(r.Task, 40), ms.ID)
 	}
-	switch st := TaskStatuses(tasks, jobs); st[r.Task] {
-	case TaskDropped:
+	if tasks[idx].Dropped {
 		return fmt.Errorf("task %s of milestone %d is dropped", r.Task, ms.ID)
-	case TaskBlocked:
-		var waiting []string
-		for _, d := range tasks[idx].DependsOn {
-			if s := st[d]; s != TaskDone && s != TaskDropped {
-				waiting = append(waiting, d+" "+s)
-			}
-		}
+	}
+	// Its dependencies decide, whatever its own jobs say (a second job on a running task waits too).
+	if waiting := waitingDeps(tasks, jobs, r.Task); len(waiting) > 0 {
 		return fmt.Errorf("task %s of milestone %d is blocked: it waits for %s (a dependency is done once its job's outcome is accepted)",
 			r.Task, ms.ID, strings.Join(waiting, ", "))
 	}
@@ -875,4 +981,54 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 		}
 	}
 	return nil
+}
+
+// milestoneLaunch is the launch check of a queued job on a task (launchQueued), taken again because the
+// milestone may have changed since job_start: wait when the job stays queued this tick (a dependency is
+// not done, or the milestone runs max_parallel jobs); cancel, a reason, when it can no longer run (the
+// milestone is closed, the task dropped or gone). A job of no milestone is not looked at.
+func (m *Manager) milestoneLaunch(ctx context.Context, j *store.Job) (wait bool, cancel string, err error) {
+	if j.MilestoneID == 0 {
+		return false, "", nil
+	}
+	ms, err := m.Store.GetMilestone(ctx, j.MilestoneID)
+	if errors.Is(err, store.ErrMilestoneNotFound) {
+		return false, fmt.Sprintf("milestone %d no longer exists", j.MilestoneID), nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if ms.Status != store.MilestoneOpen {
+		return false, fmt.Sprintf("milestone %d is %s", ms.ID, ms.Status), nil
+	}
+	tasks, err := m.Store.MilestoneTasks(ctx, ms.ID)
+	if err != nil {
+		return false, "", err
+	}
+	i := slices.IndexFunc(tasks, func(t store.MilestoneTask) bool { return t.Key == j.TaskKey })
+	if i < 0 {
+		return false, fmt.Sprintf("task %s is not a task of milestone %d", j.TaskKey, ms.ID), nil
+	}
+	if tasks[i].Dropped {
+		return false, fmt.Sprintf("task %s of milestone %d was dropped", j.TaskKey, ms.ID), nil
+	}
+	jobs, err := m.Store.MilestoneJobs(ctx, ms.ID)
+	if err != nil {
+		return false, "", err
+	}
+	if len(waitingDeps(tasks, jobs, j.TaskKey)) > 0 {
+		return true, "", nil
+	}
+	full, err := m.Store.MilestoneFull(ms.ID)
+	return full, "", err
+}
+
+// milestoneResumable refuses job_resume of a job whose milestone is closed or whose task was dropped: its
+// attempt could never start. A blocked task is no reason: the resumed job waits queued for it.
+func (m *Manager) milestoneResumable(j *store.Job) error {
+	_, cancel, err := m.milestoneLaunch(context.Background(), j)
+	if err != nil || cancel == "" {
+		return err
+	}
+	return fmt.Errorf("job %s cannot be resumed: %s (milestone_set reopens it or brings the task back)", j.ID, cancel)
 }

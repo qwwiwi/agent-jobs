@@ -165,6 +165,8 @@ func TestMilestoneTaskLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.Now = clock
+	// updated_at is stamped by the database's clock, in seconds: the job below is attached in a later one.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second)))
 	onTask := func(key string) func(*StartRequest) {
 		return func(r *StartRequest) { r.Milestone, r.Task = v.ID, key }
 	}
@@ -230,8 +232,8 @@ func TestMilestoneTaskLifecycle(t *testing.T) {
 	}
 }
 
-// ownStatus: the latest job decides; an accepted job that is reworked later, a discarded or a failed
-// latest job make the task failed; rerun leaves it ready.
+// ownStatus: the latest job decides; a discarded or a failed latest job (after an accepted one too) make
+// the task failed; reworked (the work was used, changed by hand) is done like extended; rerun leaves it ready.
 func TestMilestoneOwnStatus(t *testing.T) {
 	job := func(status, outcome string) *store.Job { return &store.Job{Status: status, Outcome: outcome} }
 	for _, c := range []struct {
@@ -243,7 +245,8 @@ func TestMilestoneOwnStatus(t *testing.T) {
 		{[]*store.Job{job(store.StatusSucceeded, "")}, TaskReview},
 		{[]*store.Job{job(store.StatusSucceeded, OutcomeExtended)}, TaskDone},
 		{[]*store.Job{job(store.StatusSucceeded, OutcomeAccepted), job(store.StatusTimeout, "")}, TaskFailed},
-		{[]*store.Job{job(store.StatusSucceeded, OutcomeReworked)}, TaskFailed},
+		{[]*store.Job{job(store.StatusSucceeded, OutcomeReworked)}, TaskDone},
+		{[]*store.Job{job(store.StatusSucceeded, OutcomeDiscarded)}, TaskFailed},
 		{[]*store.Job{job(store.StatusSucceeded, OutcomeRerun)}, TaskReady},
 	} {
 		if got := ownStatus(c.jobs); got != c.want {

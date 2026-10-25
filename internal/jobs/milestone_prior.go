@@ -29,14 +29,37 @@ const (
 	priorCut = "\n[... cut by agent-jobs]\n"
 )
 
-// priorDep is one dependency of a job's task: its key and title, and its latest accepted job.
+// priorDep is one dependency of a job's task: its key and title, its latest accepted job and that job's
+// report as read once (redacted; reportErr when it is not readable).
 type priorDep struct {
 	key, title string
 	job        *store.Job
+	report     string
+	reportErr  error
+}
+
+// priorSnapshot is the one read of a job's dependencies that both the "Prior results" section of its
+// prompt and the files of its prior/ folder are made from, so the two describe the same jobs.
+type priorSnapshot struct {
+	deps []priorDep
+	err  error
+}
+
+// priorSnapshot reads the job's dependencies and their reports once.
+func (m *Manager) priorSnapshot(j *store.Job) priorSnapshot {
+	ctx, cancel := context.WithTimeout(context.Background(), MergeCheckTimeout)
+	defer cancel()
+	deps, err := m.priorDeps(ctx, j)
+	for i := range deps {
+		if deps[i].job != nil {
+			deps[i].report, deps[i].reportErr = m.readPriorReport(deps[i].job.ID)
+		}
+	}
+	return priorSnapshot{deps: deps, err: err}
 }
 
 // priorDeps returns the dependencies of the job's task, in depends_on order, with their latest job whose
-// outcome is accepted (or extended); a dependency without one is listed with a nil job.
+// work was used (accepted, extended, reworked); a dependency without one is listed with a nil job.
 func (m *Manager) priorDeps(ctx context.Context, j *store.Job) ([]priorDep, error) {
 	if j.MilestoneID == 0 || j.TaskKey == "" {
 		return nil, nil
@@ -60,7 +83,7 @@ func (m *Manager) priorDeps(ctx context.Context, j *store.Job) ([]priorDep, erro
 			d.title = tasks[k].Title
 		}
 		for _, dj := range jobs {
-			if dj.TaskKey == key && (dj.Outcome == OutcomeAccepted || dj.Outcome == OutcomeExtended) {
+			if dj.TaskKey == key && workUsed(dj.Outcome) {
 				d.job = dj // oldest first: the last one wins
 			}
 		}
@@ -88,10 +111,14 @@ func (m *Manager) readPriorReport(id string) (string, error) {
 }
 
 // capBytes cuts s to max bytes on a rune boundary, with the cut marker; a ``` fence the cut leaves open
-// is closed, so the rest of the prompt is not read as code.
+// is closed, so the rest of the prompt is not read as code. The result, marker and fence included, is
+// never longer than max: "" when not even the marker fits.
 func capBytes(s string, max int) string {
 	if len(s) <= max {
 		return s
+	}
+	if max < len(priorCut) {
+		return ""
 	}
 	const fence = "\n```"
 	cut := max - len(priorCut) - len(fence)
@@ -126,7 +153,7 @@ func (m *Manager) priorPart(ctx context.Context, d priorDep, dir string) string 
 	fmt.Fprintf(&b, "### %s · %s\n\n", d.key, RedactPrintable(d.title, MaxMilestoneTitleRunes))
 	if d.job == nil {
 		b.WriteString("No accepted job yet.\n\n")
-		return b.String()
+		return capBytes(b.String(), MaxPriorDepBytes)
 	}
 	j := d.job
 	ref := "none (no repository)"
@@ -150,7 +177,7 @@ func (m *Manager) priorPart(ctx context.Context, d priorDep, dir string) string 
 	if diffstat != "" {
 		fmt.Fprintf(&b, "\nDiffstat:\n```\n%s\n```\n", strings.TrimRight(diffstat, "\n"))
 	}
-	report, err := m.readPriorReport(j.ID)
+	report, err := d.report, d.reportErr
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		b.WriteString("\nThe job has no report.md.\n")
@@ -161,7 +188,8 @@ func (m *Manager) priorPart(ctx context.Context, d priorDep, dir string) string 
 		fmt.Fprintf(&b, "Full report: %s\n", filepath.Join(dir, PriorDir, d.key, "report.md"))
 		fmt.Fprintf(&b, "\nSummary:\n%s\n\nFindings / Changes:\n%s\n", secs[0], secs[1])
 	}
-	return capBytes(b.String(), MaxPriorDepBytes) + "\n"
+	b.WriteString("\n")
+	return capBytes(b.String(), MaxPriorDepBytes)
 }
 
 // PriorResults is the "Prior results" section of a job on a task with depends_on: for each dependency
@@ -169,12 +197,19 @@ func (m *Manager) priorPart(ctx context.Context, d priorDep, dir string) string 
 // dependency and in total). "" for a job without dependencies; a failure is written into the section,
 // it never stops the job.
 func (m *Manager) PriorResults(j *store.Job) string {
+	return m.priorResults(j, m.priorSnapshot(j))
+}
+
+// priorResults renders the section from snap; the whole section, its last newline included, is at most
+// a quarter of max_brief_bytes.
+func (m *Manager) priorResults(j *store.Job, snap priorSnapshot) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*MergeCheckTimeout)
 	defer cancel()
-	deps, err := m.priorDeps(ctx, j)
+	limit := m.Config().maxBriefBytes() / 4
+	deps, err := snap.deps, snap.err
 	if err != nil {
 		m.Log.Printf("job %s: prior results: %v", j.ID, err)
-		return "## Prior results\n\nPrior results unavailable: " + RedactPrintable(err.Error(), 200) + "\n\n"
+		return capBytes("## Prior results\n\nPrior results unavailable: "+RedactPrintable(err.Error(), 200)+"\n\n", limit)
 	}
 	if len(deps) == 0 {
 		return ""
@@ -188,25 +223,26 @@ func (m *Manager) PriorResults(j *store.Job) string {
 	for _, d := range deps {
 		b.WriteString(m.priorPart(ctx, d, m.JobDir(j.ID)))
 	}
-	return capBytes(b.String(), m.Config().maxBriefBytes()/4) + "\n"
+	b.WriteString("\n")
+	return capBytes(b.String(), limit)
 }
 
-// writePriorReports copies each dependency's full report.md (redacted) to <dir>/prior/<key>/report.md,
-// read-only (the guard protects the folder too). A dependency without an accepted job or a readable
-// report gets no file.
-func (m *Manager) writePriorReports(j *store.Job, dir string) error {
-	deps, err := m.priorDeps(context.Background(), j)
-	if err != nil || len(deps) == 0 {
+// writePriorReports writes <dir>/prior/ from snap, the snapshot the prompt was built from: each
+// dependency's full report.md (redacted) as prior/<key>/report.md, read-only (the guard protects the
+// folder too). What an earlier attempt left there is replaced (a resume refreshes it). A dependency
+// without an accepted job or a readable report gets no file.
+func (m *Manager) writePriorReports(snap priorSnapshot, dir string) error {
+	if err := os.RemoveAll(filepath.Join(dir, PriorDir)); err != nil {
+		return fmt.Errorf("prior results: %w", err)
+	}
+	if snap.err != nil {
 		return nil // the section in the prompt says what went wrong
 	}
-	for _, d := range deps {
-		if d.job == nil {
+	for _, d := range snap.deps {
+		if d.job == nil || d.reportErr != nil {
 			continue
 		}
-		report, err := m.readPriorReport(d.job.ID)
-		if err != nil {
-			continue
-		}
+		report := d.report
 		sub := filepath.Join(dir, PriorDir, d.key)
 		if err := os.MkdirAll(sub, 0o700); err != nil {
 			return fmt.Errorf("prior results: %w", err)

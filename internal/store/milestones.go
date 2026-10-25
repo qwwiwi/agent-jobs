@@ -56,9 +56,10 @@ type MilestoneTask struct {
 	UpdatedAt   time.Time
 }
 
-// milestonesSchema is applied at the end of every Open, after the jobs columns exist: the tables, the
-// index of the jobs of a milestone, and the triggers that move a milestone's updated_at when a job
-// attached to it is added or changes status or outcome (whichever code path changes the row).
+// milestonesSchema is applied at the end of every Open, after the jobs columns and the gate tables exist:
+// the tables, the index of the jobs of a milestone, and the triggers that move a milestone's updated_at
+// when a job attached to it is added or changes status or outcome (whichever code path changes the row),
+// and when a judge verdict of its repository and checklist is stored (acceptance_met reads the latest).
 const milestonesSchema = `
 CREATE TABLE IF NOT EXISTS milestones (
 	id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,7 +98,17 @@ WHEN NEW.milestone_id IS NOT NULL AND (OLD.status IS NOT NEW.status OR OLD.outco
 BEGIN
 	UPDATE milestones SET updated_at = MAX(updated_at, CAST(strftime('%s','now') AS INTEGER)) WHERE id = NEW.milestone_id;
 END;
+CREATE TRIGGER IF NOT EXISTS gate_verdicts_milestone AFTER INSERT ON gate_verdicts
+BEGIN
+	UPDATE milestones SET updated_at = MAX(updated_at, CAST(strftime('%s','now') AS INTEGER))
+		WHERE repo = NEW.repo AND checklist_id = NEW.checklist_id;
+END;
 `
+
+// sqlNow is the database's clock in Unix seconds. updated_at is stamped with it inside the writing
+// statement, so under the write lock: a write that waited for the lock is not stamped earlier than a
+// write committed before it, and a poller's cursor never passes it.
+const sqlNow = `CAST(strftime('%s','now') AS INTEGER)`
 
 const milestoneCols = `id, title, goal, repo, branch, checklist_id, ord, status, max_parallel, created_at, updated_at, closed_at, close_note`
 
@@ -152,7 +163,7 @@ func (s *Store) CreateMilestone(ms *Milestone, tasks []MilestoneTask, now time.T
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.Exec(`INSERT INTO milestones (title, goal, repo, branch, checklist_id, ord, status, max_parallel,
-		created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ms.Title, ms.Goal, ms.Repo, ms.Branch,
+		created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, MAX(?, `+sqlNow+`))`, ms.Title, ms.Goal, ms.Repo, ms.Branch,
 		nullString(ms.ChecklistID), ms.Order, MilestoneOpen, nullInt(ms.MaxParallel), now.Unix(), now.Unix())
 	if err != nil {
 		return 0, fmt.Errorf("create milestone: %w", err)
@@ -244,6 +255,46 @@ func (s *Store) ListMilestones(ctx context.Context, f MilestoneFilter) ([]*Miles
 	return out, rows.Err()
 }
 
+// MilestoneCursor is the change cursor of milestone_list: the highest updated_at of all milestones (0
+// without one). It is read before the list: a write not committed yet holds the write lock and is
+// stamped at or after it, so updated_since = cursor never misses it (rows of the cursor's second come
+// again).
+func (s *Store) MilestoneCursor(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at), 0) FROM milestones`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("milestone cursor: %w", err)
+	}
+	return n, nil
+}
+
+// MilestoneRepos returns the distinct repositories of the milestones (main worktrees, "" left out).
+func (s *Store) MilestoneRepos(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT repo FROM milestones WHERE repo != '' ORDER BY repo`)
+	if err != nil {
+		return nil, fmt.Errorf("milestone repos: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, fmt.Errorf("milestone repos: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// TouchChecklistMilestones moves updated_at of the milestones tied to checklist id of repo (its main
+// worktree): their uncovered rows and acceptance follow the checklist file, which checklist_set wrote.
+func (s *Store) TouchChecklistMilestones(repo, id string) error {
+	if _, err := s.db.Exec(`UPDATE milestones SET updated_at = MAX(updated_at, `+sqlNow+`) WHERE repo = ? AND checklist_id = ?`,
+		repo, id); err != nil {
+		return fmt.Errorf("touch milestones: %w", err)
+	}
+	return nil
+}
+
 // MilestoneTasks returns the tasks of milestone id in the order they were created.
 func (s *Store) MilestoneTasks(ctx context.Context, id int64) ([]MilestoneTask, error) {
 	return milestoneTasks(ctx, s.db, id)
@@ -299,7 +350,7 @@ type MilestoneEdit func(ms *Milestone, tasks []MilestoneTask, jobs []*Job) (*Mil
 
 // UpdateMilestone applies edit to milestone id in one transaction: the row's editable fields (title,
 // goal, branch, order, status, max_parallel, closed_at, close_note) and the tasks edit returns are
-// written, and updated_at moves to now.
+// written, and updated_at moves to now (the database's clock, read under the write lock; now when later).
 func (s *Store) UpdateMilestone(ctx context.Context, id int64, now time.Time, edit MilestoneEdit) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -336,7 +387,7 @@ func (s *Store) UpdateMilestone(ctx context.Context, id int64, now time.Time, ed
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE milestones SET title=?, goal=?, branch=?, ord=?, status=?, max_parallel=?, closed_at=?,
-		close_note=?, updated_at=MAX(updated_at, ?) WHERE id=?`, next.Title, next.Goal, next.Branch, next.Order, next.Status,
+		close_note=?, updated_at=MAX(updated_at, ?, `+sqlNow+`) WHERE id=?`, next.Title, next.Goal, next.Branch, next.Order, next.Status,
 		nullInt(next.MaxParallel), ts(next.ClosedAt), next.CloseNote, now.Unix(), id); err != nil {
 		return fmt.Errorf("set milestone: %w", err)
 	}
