@@ -9,7 +9,7 @@ import (
 // relaxable reports a command the merge reader may read relaxed (GhPrMerges): one whose words, commands
 // and quoted here-document bodies the shell reader surely reads as bash does. It is read on its own text,
 // apart from the reader: outside the bodies of here-documents with a quoted delimiter it holds none of the
-// forms whose boundaries the reader may misplace (`${`, `$'`, `$"`, `((`, `[[`, a backtick, `<(`, `>(`,
+// forms whose boundaries the reader may misplace (`${`, `$[`, `$'`, `$"`, `((`, `[[`, a backtick, `<(`, `>(`,
 // an array `=(`, an unquoted `#`, `eval`, `source`, `.`, `case`, `coproc`, `alias`, `shopt`, `set` with
 // an o option, a shell's -O / +O, an extglob-like `@( !( +( *( ?(`, a control character but tab and
 // newline), its quotes and parentheses are balanced, and every here-document is `<<'WORD'` or `<<"WORD"`
@@ -46,9 +46,9 @@ func relaxable(cmd string, scripts []*script) bool {
 
 var (
 	// reUnmodeled is a form whose word or command boundaries the shell reader may place elsewhere than
-	// bash: a parameter expansion, ANSI-C or locale quoting, arithmetic, a [[ test, a backtick, process
+	// bash: a parameter expansion, $[ arithmetic, ANSI-C or locale quoting, arithmetic, a [[ test, a backtick, process
 	// substitution, an array assignment, an extglob-like pattern, a here-string or <<-, a control character.
-	reUnmodeled = regexp.MustCompile("\\$\\{|\\$'|\\$\"|\\(\\(|\\[\\[|`|<\\(|>\\(|=\\(|[@?*+!]\\(|<<<|<<-|[\\x00-\\x08\\x0b-\\x1f\\x7f]")
+	reUnmodeled = regexp.MustCompile("\\$\\{|\\$\\[|\\$'|\\$\"|\\(\\(|\\[\\[|`|<\\(|>\\(|=\\(|[@?*+!]\\(|<<<|<<-|[\\x00-\\x08\\x0b-\\x1f\\x7f]")
 	// reShellOptionO is a flag cluster with O (`bash -O extglob`, `+O`).
 	reShellOptionO = regexp.MustCompile(`(^|\s)[-+][A-Za-z]*O`)
 	// reUnmodeledWord is, case folded, a word that runs or reads code or changes how it is read (eval,

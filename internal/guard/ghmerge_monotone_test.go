@@ -38,6 +38,12 @@ var mustRefuseMerges = []string{
 	"ev\\al 'gh pr merge 5'",
 	// Separators, quotes and here-documents around a gh pr call with merge as a data argument.
 	"gh pr view merge \"$(echo ')')\"; gh pr merge 5",
+	// bash 5.2 ends a here-document in $( ) at a line `E)` (with a warning) and runs the lines after it.
+	"gh pr view merge \"$(cat <<'E'\nx\nE)\"\ngh pr merge 5",
+	"gh pr view merge \"$(cat <<'E'\nx\nE)\"\ngh pr merge 5\nE\n)\"",
+	"gh pr view merge $(cat <<'E'\nx\nE)\ngh pr merge 5\nE\n)",
+	"gh pr view merge $[ ' ] ; gh pr merge 5 ; ' ]",
+	"gh pr view merge $[1]; gh pr merge 5",
 	"gh pr view merge \"$(echo \"(\")\"; gh pr merge 5",
 	"gh pr view merge $(echo \\)); gh pr merge 5",
 	"gh pr view merge \"a\\\"b\"; gh pr merge 5",
@@ -163,6 +169,7 @@ func TestRelaxable(t *testing.T) {
 		"sh -c 'cat <<\"E\"\nx\nE'",
 		"echo \"<<'E'\"\nx\nE", "echo \"$(cat <<'E' )\"\nx\nE", "echo \"$(cat <<'E'\n\"\nE\n)\"",
 		"echo $(cat <<'E'\n)\nE\n)",
+		"echo \"$(cat <<'E'\nx\nE)\"", "echo $[1]",
 		"cat <<'E' \"$(echo\n)\"\nx\nE", "cat <<'A' \"$(cat <<'B'\nb\nB\n)\"\na\nA",
 	} {
 		if relaxable(cmd, parseAll(cmd)) {
