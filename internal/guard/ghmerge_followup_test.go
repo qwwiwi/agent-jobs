@@ -167,6 +167,8 @@ func TestGhPrMergesInertRangesExact(t *testing.T) {
 		"eval \"${x:-\" #\"}\"; gh pr merge 5",
 		// The reader takes ${…} as one unit of the word: the blank in it splits nothing.
 		": ${x:- #}; gh pr merge 5",
+		// sh and posix mode end the word at `'}"` and run the merge.
+		`echo "${x:-'}"; gh pr merge 5; : '}"'`,
 	} {
 		if calls, unsure := GhPrMerges(cmd, "/w"); unsure == "" && len(calls) == 0 {
 			t.Errorf("%q: read as no merge", cmd)

@@ -96,6 +96,9 @@ func readMerges(cmd, cwd string, scripts []*script, relax bool) (calls []GhMerge
 		if mentionsGh && unsure == "" && reExtglob.MatchString(unquotedText(src)) {
 			unsure = "an extglob pattern in a command that runs gh (the shell may turn it into gh pr merge)"
 		}
+		if mentions && unsure == "" && sc.vague != "" {
+			unsure = sc.vague
+		}
 	}
 	for _, sc := range scripts {
 		if sc.depth >= maxNesting {

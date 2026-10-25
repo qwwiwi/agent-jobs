@@ -71,6 +71,8 @@ type script struct {
 	// literalBodies are byte ranges [start, end) of src the shell neither runs nor expands: the bodies of
 	// here-documents with a quoted delimiter (<<'E', <<"E", <<\E), each with its delimiter line.
 	literalBodies [][2]int
+	// vague names a form whose words bash and sh read differently (the reader follows bash), or "".
+	vague string
 }
 
 type redirKind int
@@ -651,13 +653,13 @@ func (p *parser) double() {
 // expansion is inside double quotes. An unterminated one reads nothing and reports false: the caller
 // reads on character by character as before.
 func (p *parser) paramExpansion(dq bool) bool {
-	i, word, raw, glob := p.i, p.word.String(), p.cmd.raw, p.glob
+	i, word, raw, glob, vague := p.i, p.word.String(), p.cmd.raw, p.glob, p.out.vague
 	nSubs, nSrc, nIn := len(p.subs), len(p.cmd.subSources), len(p.cmd.inputSources)
 	p.word.WriteString("${")
 	p.cmd.raw += "${"
 	p.i += 2
 	if !p.braced(dq) {
-		p.i, p.cmd.raw, p.glob = i, raw, glob
+		p.i, p.cmd.raw, p.glob, p.out.vague = i, raw, glob, vague
 		p.word.Reset()
 		p.word.WriteString(word)
 		p.subs, p.cmd.subSources, p.cmd.inputSources = p.subs[:nSubs], p.cmd.subSources[:nSrc], p.cmd.inputSources[:nIn]
@@ -676,11 +678,20 @@ func (p *parser) paramExpansion(dq bool) bool {
 // it. bash's rules: the first `}` closes (a bare `{` does not nest, `${` does), a backslash escapes,
 // '…' and $'…' quote (inside double quotes too), "…" nests, $(…) and backticks are substitutions.
 // dq: the expansion is inside double quotes (its quotes and backslashes stay in the word, as in bash).
+//
+// Text after a substitution up to the `}` is also recorded as a script of its own: where the reader
+// closes a $(…) too early (a `)` of a case pattern, a comment or a here-doc body in it), the rest is
+// commands bash runs, not part of the word.
 func (p *parser) braced(dq bool) bool {
+	after := -1 // index just past the first substitution
 	for p.i < len(p.src) {
 		c := p.src[p.i]
 		switch {
 		case c == '}':
+			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
+				p.subs = append(p.subs, rest)
+				p.cmd.subSources = append(p.cmd.subSources, rest)
+			}
 			p.word.WriteByte(c)
 			p.cmd.raw += "}"
 			p.i++
@@ -698,6 +709,10 @@ func (p *parser) braced(dq bool) bool {
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
 		case c == '\'', c == '$' && p.peek(1) == '\'':
+			if dq {
+				// In posix mode and in sh (dash) a single quote in "${x:-…}" is a plain character.
+				p.out.vague = "a single quote inside \"${…}\" (bash reads it as a quote, sh and posix mode do not)"
+			}
 			if !p.quotedInBraces(dq) {
 				return false
 			}
@@ -712,10 +727,20 @@ func (p *parser) braced(dq bool) bool {
 			if !p.braced(dq) {
 				return false
 			}
-		case c == '$' && p.peek(1) == '(', c == '`':
+		case c == '$' && p.peek(1) == '[':
+			// bash nests $[…] (old arithmetic): a `}` in it does not close; the reader does not follow it.
+			p.out.vague = "$[…] inside ${…}"
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		case c == '$' && p.peek(1) == '(', c == '`', !dq && (c == '<' || c == '>') && p.peek(1) == '(':
+			// Unquoted, a process substitution in the word runs too (`${x:-<(cmd)}`).
 			lit := p.substitution(dq)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
+			if after < 0 {
+				after = p.i
+			}
 		default:
 			if !dq && strings.IndexByte("*?[{", c) >= 0 {
 				p.glob = true

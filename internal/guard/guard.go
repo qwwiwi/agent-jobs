@@ -1156,6 +1156,9 @@ var (
 // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
 func checkUnverifiable(scripts []*script, _ string, _ Config) string {
 	for _, sc := range scripts {
+		if sc.vague != "" {
+			return cannot(sc.vague)
+		}
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				if r := unverifiable(sc, c); r != "" {

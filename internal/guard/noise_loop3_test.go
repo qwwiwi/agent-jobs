@@ -68,8 +68,11 @@ func TestNoiseLoop3GitBundleAndMarks(t *testing.T) {
 		{"fast-export export-marks protected", "git fast-export --export-marks=" + db + " HEAD", ""},
 		{"fast-export export-marks variable", `git fast-export --export-marks="$M" HEAD`, "cannot verify the write target"},
 		{"fast-import export-marks hooks", "git fast-import --export-marks=.git/hooks/post-commit", ""},
-		// The stream's own export-marks features name files the guard does not see.
+		// The input stream sets options that write files the guard does not see (`option git
+		// export-pack-edges=<file>`; export-marks features with --allow-unsafe-features).
 		{"fast-import unsafe features", "git fast-import --allow-unsafe-features", "cannot verify the write target"},
+		{"fast-import stream", "cat stream.txt | git fast-import --quiet", "cannot verify the write target"},
+		{"fast-import pack edges", "git fast-import --export-pack-edges=.git/config", "cannot verify the write target"},
 	})
 	runAllowed(t, cfg, []string{
 		"git bundle create repo.bundle HEAD",
@@ -82,7 +85,7 @@ func TestNoiseLoop3GitBundleAndMarks(t *testing.T) {
 	runRefused(t, review, []refusalCase{
 		{"read-only bundle create", "git bundle create x.bundle HEAD", "review job, read-only"},
 		{"read-only fast-export marks", "git fast-export --export-marks=marks HEAD", "review job, read-only"},
-		{"read-only fast-import", "git fast-import --quiet", "review job, read-only"},
+		{"read-only fast-import", "git fast-import --quiet", ""},
 	})
 	// --relative-marks (on the command line or as a feature of the stream) puts a relative marks file
 	// below .git/info/fast-import (a fix job without agent state around its worktree).
@@ -111,6 +114,19 @@ func TestNoiseLoop3ParamExpansionUnit(t *testing.T) {
 		{"substitution in default", "echo ${x:-$(git push origin main)}", ""},
 		{"backticks in default", "echo ${x:- `cat " + db + "`}", "agent-jobs state"},
 		{"substitution in quoted default", `echo "${x:-"$(cat ` + db + `)"}"`, "agent-jobs state"},
+		// Unquoted, a process substitution in the expansion runs.
+		{"process substitution in default", "echo ${x:-<(git push origin main)}", ""},
+		{"output process substitution in default", "echo ${x:->(cat " + db + ")}", "agent-jobs state"},
+		// The reader closes these $(…) at a `)` bash does not: the rest up to `}` is still checked.
+		{"case pattern in substitution", "echo ${x:-$(case a in a) git push origin main;; esac)}", ""},
+		{"comment in substitution", "echo ${x:-$(: # )\ngit push origin main\n)}", ""},
+		{"here-doc in substitution", "echo ${x:-$(cat <<E\n)\nE\ncat " + db + "\n)}", "agent-jobs state"},
+		// sh (dash) and posix mode read a single quote in "${x:-…}" as a plain character: the line
+		// ends the word at `'}"` there and runs the push.
+		{"single quote in quoted expansion", `echo "${x:-'}"; git push origin main; : '}"'`, "cannot verify this form"},
+		// bash nests $[…] in ${…}: `}` and `#` in it are part of the word (bash prints `1 #]}`).
+		{"old arithmetic in expansion", "y=1; echo ${y:-$[ } #]}; git push origin main", "cannot verify this form"},
+		{"single quote in quoted expansion sh -c", `sh -c 'echo "${x:-'"'"'}"; git push origin main; : '"'"'}"'"'"''`, ""},
 	})
 	runAllowed(t, cfg, []string{
 		"echo ${#x}",
@@ -121,6 +137,7 @@ func TestNoiseLoop3ParamExpansionUnit(t *testing.T) {
 		"echo ${x:- #} # a comment",
 		`f=${HOME}/x; echo "$f"`,
 		`echo "${x:-$(git rev-parse HEAD)}"`,
+		"echo ${x:-$(pwd)/out}",
 		"echo ${x:-'}'}",
 	})
 }
