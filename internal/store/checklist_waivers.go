@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -47,6 +48,12 @@ type ChecklistApproval struct {
 	BriefSHA256     string    `json:"brief_sha256"`
 	Quote           string    `json:"quote"`
 	ApprovedAt      time.Time `json:"approved_at"`
+	// Rows are the checklist rows as approved and BriefFileSHA256 the sha256 of the whole BRIEF.md (with
+	// its Additions) at the approval: what a later version is compared with, so the owner re-reads only
+	// the rows that changed (F8). Neither is hashed or checked; both are empty for an approval stored
+	// before they were recorded.
+	Rows            []GateRow `json:"rows,omitempty"`
+	BriefFileSHA256 string    `json:"brief_file_sha256,omitempty"`
 }
 
 // ChecklistInit is the record checklist_init stores for a new checklist id of a repository: the sha256
@@ -99,7 +106,9 @@ CREATE TABLE IF NOT EXISTS checklist_approvals (
 	checklist_sha256 TEXT NOT NULL,
 	brief_sha256     TEXT NOT NULL,
 	quote            TEXT NOT NULL,
-	approved_at      INTEGER NOT NULL
+	approved_at      INTEGER NOT NULL,
+	rows             TEXT NOT NULL DEFAULT '',
+	brief_file_sha256 TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS checklist_approvals_repo ON checklist_approvals(repo, seq);
 CREATE TABLE IF NOT EXISTS checklist_inits (
@@ -111,9 +120,11 @@ CREATE TABLE IF NOT EXISTS checklist_inits (
 );
 `
 
-// waiversMigrations add columns to a checklist_waivers table created before them.
+// waiversMigrations add columns to a checklist_waivers or checklist_approvals table created before them.
 var waiversMigrations = []string{
 	`ALTER TABLE checklist_waivers ADD COLUMN checklist_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE checklist_approvals ADD COLUMN rows TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE checklist_approvals ADD COLUMN brief_file_sha256 TEXT NOT NULL DEFAULT ''`,
 }
 
 // migrateWaiversKey rebuilds a checklist_waivers table created before checklist_version joined its
@@ -197,9 +208,17 @@ func (s *Store) PutApproval(a ChecklistApproval) error {
 	if a.Repo == "" || a.ChecklistID == "" || a.Version < 1 || a.ChecklistSHA256 == "" || a.BriefSHA256 == "" || a.Quote == "" {
 		return ErrApprovalIncomplete
 	}
+	rows := ""
+	if a.Rows != nil {
+		b, err := json.Marshal(a.Rows)
+		if err != nil {
+			return fmt.Errorf("put approval: %w", err)
+		}
+		rows = string(b)
+	}
 	_, err := s.db.Exec(`INSERT INTO checklist_approvals (repo, checklist_id, version, checklist_sha256, brief_sha256, quote,
-		approved_at) VALUES (?,?,?,?,?,?,?)`, a.Repo, a.ChecklistID, a.Version, a.ChecklistSHA256, a.BriefSHA256, a.Quote,
-		a.ApprovedAt.Unix())
+		approved_at, rows, brief_file_sha256) VALUES (?,?,?,?,?,?,?,?,?)`, a.Repo, a.ChecklistID, a.Version, a.ChecklistSHA256,
+		a.BriefSHA256, a.Quote, a.ApprovedAt.Unix(), rows, a.BriefFileSHA256)
 	if err != nil {
 		return fmt.Errorf("put approval: %w", err)
 	}
@@ -210,14 +229,20 @@ func (s *Store) PutApproval(a ChecklistApproval) error {
 func (s *Store) LatestApproval(repo string) (*ChecklistApproval, error) {
 	var a ChecklistApproval
 	var at int64
-	err := s.db.QueryRow(`SELECT seq, repo, checklist_id, version, checklist_sha256, brief_sha256, quote, approved_at
-		FROM checklist_approvals WHERE repo = ? ORDER BY seq DESC LIMIT 1`, repo).Scan(&a.Seq, &a.Repo, &a.ChecklistID, &a.Version,
-		&a.ChecklistSHA256, &a.BriefSHA256, &a.Quote, &at)
+	var rows string
+	err := s.db.QueryRow(`SELECT seq, repo, checklist_id, version, checklist_sha256, brief_sha256, quote, approved_at, rows,
+		brief_file_sha256 FROM checklist_approvals WHERE repo = ? ORDER BY seq DESC LIMIT 1`, repo).Scan(&a.Seq, &a.Repo,
+		&a.ChecklistID, &a.Version, &a.ChecklistSHA256, &a.BriefSHA256, &a.Quote, &at, &rows, &a.BriefFileSHA256)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("latest approval: %w", err)
+	}
+	if rows != "" {
+		if err := json.Unmarshal([]byte(rows), &a.Rows); err != nil {
+			return nil, fmt.Errorf("latest approval %d: rows: %w", a.Seq, err)
+		}
 	}
 	a.ApprovedAt = time.Unix(at, 0).UTC()
 	return &a, nil

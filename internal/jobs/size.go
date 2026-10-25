@@ -17,7 +17,7 @@ const (
 )
 
 // SizeKinds are the kinds that must declare a size: the ones that change code. Every other kind (review,
-// research, the gate kinds slicing and judge, a later briefing) is exempt: it may carry a size, which is
+// research, the gate kinds slicing, judge and briefing) is exempt: it may carry a size, which is
 // stored and never checked.
 var SizeKinds = []string{"fix", "general"}
 

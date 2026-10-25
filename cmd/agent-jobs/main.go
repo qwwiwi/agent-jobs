@@ -91,6 +91,9 @@ const usage = `usage: agent-jobs <command> [flags]
   gate slicing --agent A --repo PATH [--checklist-id ID]
                                            the slicing check (Wave F, F3) of the repo's checklist
                                            as JSON (same as slicing_get): its lists and decisions
+  gate briefing --agent A --repo PATH [--checklist-id ID]
+                                           the briefing (Wave F, F8) of the repo's draft checklist
+                                           as JSON (same as briefing_get): its question rounds
   gate verdict --agent A --repo PATH [--sha S] [--checklist-id ID]
                                            the latest blind judge verdict (Wave F, F5) as JSON
                                            (same as judge_get), with its manifest_check record
@@ -1368,14 +1371,15 @@ func cmdArchive(args []string) error {
 	return aerr
 }
 
-// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get) or `gate verdict` (judge_get);
-// `gate release-check` prints release_check (F7) and exits non-zero unless it passed.
+// cmdGate prints a gate job's stored result (Wave F): `gate slicing` (slicing_get), `gate briefing`
+// (briefing_get) or `gate verdict` (judge_get); `gate release-check` prints release_check (F7) and exits
+// non-zero unless it passed.
 func cmdGate(args []string) error {
 	if len(args) > 0 && args[0] == "release-check" {
 		return cmdReleaseCheck(args[1:])
 	}
-	if len(args) == 0 || (args[0] != "slicing" && args[0] != "verdict") {
-		return errors.New("usage: agent-jobs gate slicing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
+	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
+		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
 			"gate release-check --agent A --repo PATH --sha S")
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
@@ -1396,6 +1400,13 @@ func cmdGate(args []string) error {
 	defer m.Close()
 	if args[0] == "slicing" {
 		out, err := mcp.SlicingGet(m, *repo, *id)
+		if err != nil {
+			return err
+		}
+		return printJSON(out)
+	}
+	if args[0] == "briefing" {
+		out, err := mcp.BriefingGet(m, *repo, *id)
 		if err != nil {
 			return err
 		}
