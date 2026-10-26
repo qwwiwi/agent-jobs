@@ -119,12 +119,13 @@ type gatedRepo struct {
 	id      string
 	version int
 	hash    string
-	// seq is the approval's seq when it is valid now; retired says the owner retired it; shipped is the
-	// sha its release shipped on (#99, mergegate_shipped.go): neither is gated.
-	seq       int64
-	retired   bool
-	shipped   string
-	shippedAt time.Time
+	// seq and approvedAt are the approval's when it is valid now; retired says the owner retired it;
+	// shipped is the sha its release shipped on (#99, mergegate_shipped.go): neither is gated.
+	seq        int64
+	approvedAt time.Time
+	retired    bool
+	shipped    string
+	shippedAt  time.Time
 }
 
 // mergeGate is one hook call: the repositories it has read, by main work tree.
@@ -569,7 +570,7 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 		return voided(reason)
 	}
 	if cur != nil {
-		r.seq = cur.Seq
+		r.seq, r.approvedAt = cur.Seq, cur.ApprovedAt
 	}
 	// Shipped (#99): the daemon saw a pass at this approval on origin's default branch; the pass must still
 	// count (stored, not stale), else the approval gates as before.

@@ -314,3 +314,58 @@ func TestMergeGateShippedIgnoresRewrittenHistory(t *testing.T) {
 		})
 	}
 }
+
+// An unchanged re-approval (the same id, version and hash, a new approval seq) gates again: the pass
+// read before it does not ship it, and the refusal does not name that pass; a pass created at or after
+// the re-approval on the default branch ships it at the next tick.
+func TestMergeGateShippedReapproval(t *testing.T) {
+	m := newManager(t)
+	repo, _, shaX := shippedRepo(t, m)
+	main := mainWorktree(repo)
+	gitT(t, repo, "update-ref", "refs/remotes/origin/main", shaX)
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := m.Store.LatestApproval(main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != first.Seq || g.ShippedSHA != shaX {
+		t.Fatalf("not shipped: %+v %v", g, err)
+	}
+	// Re-approved a minute later with identical content.
+	at := time.Now().Add(time.Minute)
+	again := *first
+	again.Seq, again.ApprovedAt = 0, at
+	if err := m.Store.PutApproval(again); err != nil {
+		t.Fatal(err)
+	}
+	last, err := m.Store.LatestApproval(main)
+	if err != nil || last.Seq == first.Seq || last.ChecklistSHA256 != first.ChecklistSHA256 || last.Version != first.Version {
+		t.Fatalf("re-approval: %+v %v", last, err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != first.Seq {
+		t.Fatalf("re-approval shipped by the pass before it: %+v %v", g, err)
+	}
+	r, err := m.MergeGateCheck(repo, "gh pr merge 8 --match-head-commit "+strings.Repeat("cd", 20), "")
+	if err != nil || !strings.Contains(r.Refusal, "release_check has not passed on") || strings.Contains(r.Refusal, "passed on "+shaX) {
+		t.Fatalf("re-approval not gated, or the refusal names the old pass: %+v %v", r, err)
+	}
+	// A pass at the re-approval on a sha on the default branch ships it.
+	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: main, SHA: shaX, ChecklistID: last.ChecklistID, Version: last.Version,
+		ChecklistSHA256: last.ChecklistSHA256, CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != last.Seq || g.ShippedSHA != shaX {
+		t.Fatalf("pass at the re-approval not shipped: %+v %v", g, err)
+	}
+	if a, err := m.MergeGateCheck(repo, "gh pr merge 8", ""); err != nil || a.Refusal != "" {
+		t.Fatalf("shipped re-approval still gated: %+v %v", a, err)
+	}
+}

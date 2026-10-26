@@ -12,14 +12,15 @@ import (
 )
 
 // A checklist whose release shipped stops gating merges (#99): once release_check passed at the latest
-// approval (its id, version and hash) on a sha that is on the default branch of the repository's origin,
+// approval (its id, version and hash, a pass created at or after it) on a sha that is on the default
+// branch of the repository's origin,
 // the daemon's tick records the approval as shipped (store.GateRepo.ShippedSeq, the sha and when), and
 // the merge hook takes the repository out of the gate like a retirement: later fixes merge under the
 // normal review rule. The tick computes it, not the hook: the hook opens the store read-only and stays
 // cheap, and doctor/status show the stored record. It never lifts the gate on its own: the hook still
 // requires the approval to be the latest and valid (a void approval stays gated), and the pass to be
-// stored and not stale (a newer verdict or a red manifest-check run); a new approval gates the repository
-// again until a pass at it ships in turn. The daemon does not fetch: it reads the remote-tracking ref
+// stored and not stale (a newer verdict or a red manifest-check run); a new approval, also an unchanged
+// re-approval, gates the repository again until a pass at it ships in turn. The daemon does not fetch: it reads the remote-tracking ref
 // in the main work tree (refs/remotes/origin/HEAD, else origin/main, else origin/master), so the merge
 // counts once someone fetched origin there (git fetch, git pull).
 
@@ -142,7 +143,7 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 		}
 	}
 	// Cheap first: without a pass at the approval nothing can ship (no files or git read).
-	passes, err := m.Store.ReleasePassesAt(main, last.ChecklistID, last.Version, last.ChecklistSHA256)
+	passes, err := m.passesSince(main, last.ChecklistID, last.Version, last.ChecklistSHA256, last.ApprovedAt)
 	if err != nil || len(passes) == 0 {
 		return err
 	}
@@ -239,7 +240,7 @@ func gitHistory(dir string, args ...string) (string, error) {
 // shippedPass is a pass of gated repository r that could ship it but has not yet ("" = none): the
 // newest pass at r's approval that still counts. The hook's refusal names it with what lifts the gate.
 func (g *mergeGate) shippedPass(r *gatedRepo) (string, error) {
-	passes, err := g.m.Store.ReleasePassesAt(r.main, r.id, r.version, r.hash)
+	passes, err := g.m.passesSince(r.main, r.id, r.version, r.hash, r.approvedAt)
 	if err != nil {
 		return "", err
 	}
@@ -253,6 +254,23 @@ func (g *mergeGate) shippedPass(r *gatedRepo) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// passesSince are the passes of repository main at the checklist id, version and hash created at or
+// after approvedAt (the approval's time), newest first: a pass from before an unchanged re-approval (the
+// same id, version and hash, a new approval) does not ship it, a pass at or after it does.
+func (m *Manager) passesSince(main, id string, version int, hash string, approvedAt time.Time) ([]store.ReleasePass, error) {
+	passes, err := m.Store.ReleasePassesAt(main, id, version, hash)
+	if err != nil {
+		return nil, err
+	}
+	out := passes[:0]
+	for _, p := range passes {
+		if !p.CreatedAt.Before(approvedAt) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // passCounts reports whether repository r's stored pass on sha at its approval exists and is not stale.
