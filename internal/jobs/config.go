@@ -82,7 +82,9 @@ type Config struct {
 	CodexSandboxMode string `json:"codex_sandbox"`
 	// CodexWriteNetwork lets the commands of codex write jobs (fix/general, workspace-write sandbox) reach
 	// the network, so package installs work (`-c sandbox_workspace_write.network_access=true`, issue #92).
-	// Nil (absent) = on; false keeps them offline. Read-only codex jobs never get network. Like
+	// Only an explicit true turns it on; nil (absent) and false keep them offline. With network the job can
+	// reach anything (and send out what it can read), so it is an owner opt-in. Read-only codex jobs never
+	// get network; worktree-full-access has no codex sandbox and so network whatever this says. Like
 	// codex_write_allowed: enabling needs a daemon restart, switching it off on disk applies at once.
 	CodexWriteNetwork *bool `json:"codex_write_network"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
@@ -208,8 +210,9 @@ const DefaultAutoContinueFraction = 0.5
 // AutoContinueOn reports whether a stopped attempt is continued automatically (auto_continue, default on).
 func (c Config) AutoContinueOn() bool { return c.AutoContinue == nil || *c.AutoContinue }
 
-// CodexWriteNetworkOn reports whether codex write jobs get network (codex_write_network; absent = on).
-func (c Config) CodexWriteNetworkOn() bool { return c.CodexWriteNetwork == nil || *c.CodexWriteNetwork }
+// CodexWriteNetworkOn reports whether codex write jobs get network (codex_write_network; only an explicit
+// true, absent = off).
+func (c Config) CodexWriteNetworkOn() bool { return c.CodexWriteNetwork != nil && *c.CodexWriteNetwork }
 
 // AutoContinueShare returns the automatic continuation's fraction of the original limits.
 func (c Config) AutoContinueShare() float64 {

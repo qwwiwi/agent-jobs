@@ -55,8 +55,9 @@ func jobCommits(t *testing.T, repo string, m *Manager, j *store.Job) []string {
 	return strings.Split(out, "\n")
 }
 
-// A codex write job's commands get the network by default (issue #92: `npm ci` failed with EAI_AGAIN):
-// workspace-write gets CodexNetworkOverride, read-only and full-access never; network false drops it.
+// With network (codex_write_network true) a codex write job's commands can reach it (issue #92: `npm ci`
+// failed with EAI_AGAIN): workspace-write gets CodexNetworkOverride, read-only and full-access never;
+// network false drops it.
 func TestCodexArgsWriteNetwork(t *testing.T) {
 	jobDir := filepath.Join(t.TempDir(), "jobs", "j1")
 	for _, c := range []struct {
@@ -85,14 +86,14 @@ func TestCodexArgsWriteNetwork(t *testing.T) {
 	}
 }
 
-// codex_write_network: absent = on, false = off; at launch a false on disk revokes it from an active
-// config that has it on (like codex_write_allowed), and a true on disk does not grant it to one that has
-// it off.
+// codex_write_network: absent = off (an owner opt-in: with network the job can reach anything), true = on,
+// false = off; at launch a false or absent key on disk revokes it from an active config that has it on
+// (like codex_write_allowed), and a true on disk does not grant it to one that has it off or absent.
 func TestCodexWriteNetworkConfig(t *testing.T) {
-	if !(Config{}).CodexWriteNetworkOn() {
-		t.Fatal("codex_write_network absent is not on")
+	if (Config{}).CodexWriteNetworkOn() {
+		t.Fatal("codex_write_network absent is on")
 	}
-	for body, want := range map[string]bool{`{}`: true, `{"codex_write_network":true}`: true, `{"codex_write_network":false}`: false} {
+	for body, want := range map[string]bool{`{}`: false, `{"codex_write_network":true}`: true, `{"codex_write_network":false}`: false} {
 		c, err := LoadConfig(writeConfigDir(t, body))
 		if err != nil || c.CodexWriteNetworkOn() != want {
 			t.Fatalf("%s: on=%v err=%v, want %v", body, c.CodexWriteNetworkOn(), err, want)
@@ -105,10 +106,12 @@ func TestCodexWriteNetworkConfig(t *testing.T) {
 		disk   string
 		want   bool
 	}{
-		{nil, `{}`, true},
-		{nil, `{"codex_write_network":false}`, false},
+		{nil, `{}`, false},
+		{nil, `{"codex_write_network":true}`, false},
 		{&off, `{"codex_write_network":true}`, false},
-		{&on, `{}`, true},
+		{&on, `{}`, false},
+		{&on, `{"codex_write_network":false}`, false},
+		{&on, `{"codex_write_network":true}`, true},
 	} {
 		m.Cfg.CodexWriteNetwork = c.active
 		writeReloadConfig(t, m, c.disk)
@@ -119,18 +122,19 @@ func TestCodexWriteNetworkConfig(t *testing.T) {
 	}
 }
 
-// The daemon launches a codex fix job with the network override and a review job without; with
-// codex_write_network false the fix job runs offline.
+// The daemon launches a codex fix job without the network override unless codex_write_network is
+// explicitly true: an absent key and false both keep it offline, and a review job never gets it.
 func TestCodexWriteJobNetworkLaunch(t *testing.T) {
+	fix := func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" }
 	for _, c := range []struct {
 		name, config string
 		start        func(*StartRequest)
 		want         bool
 	}{
-		{"fix", `{"codex_write_allowed":true}`, func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" }, true},
-		{"fix offline", `{"codex_write_allowed":true,"codex_write_network":false}`,
-			func(r *StartRequest) { r.Kind, r.Model = "fix", "gpt-6.1-sol" }, false},
-		{"review", `{"codex_write_allowed":true}`, codexReview, false},
+		{"fix absent key", `{"codex_write_allowed":true}`, fix, false},
+		{"fix network true", `{"codex_write_allowed":true,"codex_write_network":true}`, fix, true},
+		{"fix network false", `{"codex_write_allowed":true,"codex_write_network":false}`, fix, false},
+		{"review", `{"codex_write_allowed":true,"codex_write_network":true}`, codexReview, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := newCodexWriteManager(t, c.config)
