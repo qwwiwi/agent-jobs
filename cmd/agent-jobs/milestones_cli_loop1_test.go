@@ -59,12 +59,15 @@ func mcpMilestone(t *testing.T, cs *sdk.ClientSession, tool, raw string) (string
 }
 
 // sameTree compares two milestone trees without what differs between two milestones built alike: the
-// id and the times.
+// id and the times, the tasks' included (the two calls may fall in different seconds).
 func sameTree(t *testing.T, a, b string) bool {
 	t.Helper()
 	norm := func(s string) string {
 		v := decodeTree(t, s)
 		v.ID, v.CreatedAt, v.UpdatedAt, v.ClosedAt = 0, "", "", ""
+		for i := range v.Tasks {
+			v.Tasks[i].CreatedAt, v.Tasks[i].UpdatedAt = "", ""
+		}
 		out, err := json.Marshal(v)
 		if err != nil {
 			t.Fatal(err)
@@ -200,6 +203,8 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 			`{"title": null}`,
 			`{"tasks": [{"key": "T2", "title": "two", "Depends_on": ["T1"]}]}`,
 			`{"drop": null}`,
+			`{"max_parallel": 1.5}`,
+			`{"max_parallel": 2.0}`,
 		} {
 			cli := captureStdoutErr(t, func() error {
 				return cmdMilestoneEdit("set", []string{"--agent", "test", strconv.FormatInt(a, 10), "--input", "-"}, strings.NewReader(raw))
@@ -216,6 +221,7 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 
 	t.Run("[R01] set refuses any id in the input other than the positional one, 0 and null included", func(t *testing.T) {
 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+		cs := milestoneMCP(t)
 		id := newStage(t)
 		pos := strconv.FormatInt(id, 10)
 		before := treeJSON(t, id)
@@ -224,12 +230,18 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 			{`{"id": null, "goal": "changed"}`, "the input's id null is not milestone " + pos},
 			{`{"id": "` + pos + `", "goal": "changed"}`, `the input's id "` + pos + `" is not milestone ` + pos},
 			{`{"id": ` + pos + `.5, "goal": "changed"}`, "is not milestone " + pos},
+			// #93: a float64 rounds this to the positional id; the ids are compared exactly.
+			{`{"id": ` + pos + `.0000000000000001, "goal": "changed"}`, "the input's id " + pos + ".0000000000000001 is not milestone " + pos},
 		} {
 			got := captureStdoutErr(t, func() error {
 				return cmdMilestoneEdit("set", []string{"--agent", "test", pos, "--input", "-"}, strings.NewReader(c.raw))
 			})
 			if got.err == nil || !strings.Contains(got.err.Error(), c.want) || got.stdout != "" {
 				t.Errorf("set %s: error %v, stdout %q, want %q", c.raw, got.err, got.stdout, c.want)
+			}
+			// Parity (#94): milestone_set refuses it too, though its schema sees the id as a float64.
+			if tree, e := mcpMilestone(t, cs, "milestone_set", c.raw); e == "" {
+				t.Errorf("MCP accepted %s:\n%s", c.raw, tree)
 			}
 		}
 		if after := treeJSON(t, id); after != before {
@@ -242,6 +254,46 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 			})
 			if v := decodeTree(t, out); v.ID != id || !strings.Contains(raw, v.Goal) {
 				t.Errorf("set %s:\n%s", raw, out)
+			}
+		}
+	})
+
+	t.Run("[R01] set keeps a positional id above 2^53 exact up to the manager (#93)", func(t *testing.T) {
+		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+		const big = "9007199254740993" // 2^53+1: a float64 makes it 9007199254740992
+		for _, raw := range []string{`{"goal": "changed"}`, `{"id": ` + big + `, "goal": "changed"}`} {
+			got := captureStdoutErr(t, func() error {
+				return cmdMilestoneEdit("set", []string{"--agent", "test", big, "--input", "-"}, strings.NewReader(raw))
+			})
+			if got.err == nil || !strings.Contains(got.err.Error(), "milestone "+big+": ") || got.stdout != "" {
+				t.Errorf("set %s %s: error %v, stdout %q; want the manager's not found for milestone %s", big, raw, got.err, got.stdout, big)
+			}
+		}
+		// The input's id is compared with it exactly: one below is another milestone.
+		got := captureStdoutErr(t, func() error {
+			return cmdMilestoneEdit("set", []string{"--agent", "test", big, "--input", "-"},
+				strings.NewReader(`{"id": 9007199254740992, "goal": "changed"}`))
+		})
+		if got.err == nil || !strings.Contains(got.err.Error(), "the input's id 9007199254740992 is not milestone "+big) {
+			t.Errorf("set %s with the input's id 9007199254740992: error %v", big, got.err)
+		}
+	})
+
+	t.Run("[R01] an input id of the same value in another form is taken, as over MCP (#93)", func(t *testing.T) {
+		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+		cs := milestoneMCP(t)
+		id := newStage(t)
+		pos := strconv.FormatInt(id, 10)
+		for _, n := range []string{pos + ".0", pos + "e0", pos + "0e-1"} {
+			raw := `{"id": ` + n + `, "goal": "goal ` + n + `"}`
+			out := captureStdout(t, func() error {
+				return cmdMilestoneEdit("set", []string{"--agent", "test", pos, "--input", "-"}, strings.NewReader(raw))
+			})
+			if v := decodeTree(t, out); v.ID != id || v.Goal != "goal "+n {
+				t.Errorf("CLI set %s:\n%s", raw, out)
+			}
+			if _, e := mcpMilestone(t, cs, "milestone_set", raw); e != "" {
+				t.Errorf("MCP refused %s: %s", raw, e)
 			}
 		}
 	})

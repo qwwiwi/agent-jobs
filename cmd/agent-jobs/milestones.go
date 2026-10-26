@@ -199,11 +199,11 @@ func cmdMilestoneEdit(op string, args []string, stdin io.Reader) error {
 		return err
 	}
 	// An id in the input is the positional one or refused, whatever its value or type.
-	if v, ok := fields["id"]; ok && v != float64(id) {
+	if v, ok := fields["id"]; ok && !sameMilestoneID(v, id) {
 		b, _ := json.Marshal(v)
 		return fmt.Errorf("the input's id %s is not milestone %d", b, id)
 	}
-	fields["id"] = float64(id)
+	fields["id"] = id
 	if *status != "" {
 		fields["status"] = *status
 	}
@@ -239,13 +239,14 @@ func readInput(name string, stdin io.Reader) ([]byte, error) {
 }
 
 // milestoneArgs reads raw, the tool's JSON input object or only its tasks array, into the tool's
-// arguments as decoded JSON; no input is no arguments. It must be one JSON value: anything after it,
-// even a stray ] or }, is refused.
+// arguments as decoded JSON with numbers as json.Number (their exact text); no input is no arguments.
+// It must be one JSON value: anything after it, even a stray ] or }, is refused.
 func milestoneArgs(raw []byte) (map[string]any, error) {
 	if raw == nil {
 		return map[string]any{}, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
 		return nil, fmt.Errorf("milestone input: %w", err)
@@ -264,12 +265,18 @@ func milestoneArgs(raw []byte) (map[string]any, error) {
 
 // decodeMilestoneArgs validates args against the input schema of tool (the MCP tool's own schema, so the
 // CLI refuses what the tool refuses: unknown or differently cased keys, null where the schema has no
-// null, wrong types) and only then decodes them into in.
+// null, wrong types) and only then decodes them into in. Its numbers are float64 as the server sees
+// them, but an int64 (the positional id) stays exact through both.
 func decodeMilestoneArgs(tool string, args map[string]any, in any) error {
-	if err := mcp.ValidateMilestoneInput(tool, args); err != nil {
+	v, err := floatNumbers(args)
+	if err != nil {
 		return fmt.Errorf("milestone input: %w", err)
 	}
-	b, err := json.Marshal(args)
+	view := v.(map[string]any)
+	if err := mcp.ValidateMilestoneInput(tool, view); err != nil {
+		return fmt.Errorf("milestone input: %w", err)
+	}
+	b, err := json.Marshal(view)
 	if err != nil {
 		return fmt.Errorf("milestone input: %w", err)
 	}
@@ -277,6 +284,45 @@ func decodeMilestoneArgs(tool string, args map[string]any, in any) error {
 		return fmt.Errorf("milestone input: %w", err)
 	}
 	return nil
+}
+
+// floatNumbers is v with every json.Number as the float64 a plain JSON decode gives (out of range is
+// refused, as that decode refuses it); everything else is kept.
+func floatNumbers(v any) (any, error) {
+	switch v := v.(type) {
+	case json.Number:
+		f, err := strconv.ParseFloat(v.String(), 64)
+		if err != nil {
+			return nil, fmt.Errorf("number %s: %w", v, err)
+		}
+		return f, nil
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, e := range v {
+			var err error
+			if out[k], err = floatNumbers(e); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			var err error
+			if out[i], err = floatNumbers(e); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	return v, nil
+}
+
+// sameMilestoneID reports whether v, an id from the input, is exactly id: a number of the same value
+// (1, 1.0 or 1e0 for 1), not one that only rounds to it as a float64 (#93); milestone_set compares alike.
+func sameMilestoneID(v any, id int64) bool {
+	n, ok := v.(json.Number)
+	return ok && mcp.SameMilestoneID(n, id)
 }
 
 func milestoneID(s string) (int64, error) {

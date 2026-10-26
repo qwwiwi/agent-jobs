@@ -3,10 +3,12 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
@@ -63,6 +65,49 @@ func TestMilestoneInputSchemaShared(t *testing.T) {
 		} {
 			if err := ValidateMilestoneInput(c.tool, c.args); err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Errorf("%s %v: %v, want %q", c.tool, c.args, err, c.want)
+			}
+		}
+	})
+}
+
+// #94: milestone_set takes only an id that is exactly the milestone's, though the SDK decodes it as a float64.
+func TestMilestoneSetExactID(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	v, err := m.CreateMilestone(context.Background(), jobs.MilestoneCreate{Title: "Stage", Goal: "keep",
+		Tasks: []jobs.MilestoneTaskInput{{Key: "T1", Title: "one"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := func(id string) (*sdk.CallToolResult, error) {
+		return cs.CallTool(context.Background(), &sdk.CallToolParams{Name: "milestone_set",
+			Arguments: json.RawMessage(`{"id": ` + id + `, "goal": "goal ` + id + `"}`)})
+	}
+	pos := strconv.FormatInt(v.ID, 10)
+
+	t.Run("[R01] an id that only rounds to the milestone's is refused before any change", func(t *testing.T) {
+		for _, id := range []string{pos + ".0000000000000001", "9007199254740993"} {
+			res, err := set(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !res.IsError || !strings.Contains(text(res), "id "+id+" is not exactly a milestone id") {
+				t.Errorf("milestone_set id %s: %s", id, text(res))
+			}
+		}
+		if tree, err := m.MilestoneTree(context.Background(), v.ID); err != nil || tree.Goal != "keep" {
+			t.Fatalf("a refused set changed the milestone: %+v, %v", tree, err)
+		}
+	})
+
+	t.Run("[R01] the same value in another form is taken", func(t *testing.T) {
+		for _, id := range []string{pos, pos + ".0", pos + "e0", pos + "0e-1"} {
+			res, err := set(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.IsError || !strings.Contains(text(res), `"goal":"goal `+id+`"`) {
+				t.Errorf("milestone_set id %s: %s", id, text(res))
 			}
 		}
 	})
