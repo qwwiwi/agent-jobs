@@ -65,7 +65,9 @@ func TestMergeGateShipped(t *testing.T) {
 		t.Fatalf("shipped before the pass sha is on the default branch: %+v %v", g, err)
 	}
 	if r := gate(); !strings.Contains(r, "release_check has not passed on "+unrelated) ||
-		!strings.Contains(r, "passed on "+shaX) || !strings.Contains(r, "git fetch") {
+		!strings.Contains(r, "passed on "+shaX) || !strings.Contains(r, "git fetch") ||
+		!strings.Contains(r, "a squash merge counts only for a branch that was up to date with its base (the identical tree)") ||
+		!strings.Contains(r, "agent-jobs gate retire (owner only)") || strings.Contains(r, "or its squash merge") {
 		t.Fatalf("not shipped: %q", r)
 	}
 

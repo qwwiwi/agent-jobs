@@ -494,9 +494,11 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 		if s, err := g.shippedPass(r); err != nil {
 			return "", err
 		} else if s != "" {
-			shipped = fmt.Sprintf(" release_check passed on %s at this checklist: once that sha (or its squash merge) is "+
-				"on origin's default branch and fetched into %s (git fetch origin), the daemon's next tick marks the checklist "+
-				"shipped and merges are no longer gated.", s, Printable(r.main, 200))
+			shipped = fmt.Sprintf(" release_check passed on %s at this checklist: once that sha is on origin's default "+
+				"branch (a merge commit or a fast forward; a squash merge counts only for a branch that was up to date with "+
+				"its base (the identical tree)) and fetched into %s (git fetch origin), the daemon's next tick marks the "+
+				"checklist shipped and merges are no longer gated; otherwise release_check must pass on a sha on that "+
+				"branch, or the owner lifts the gate with agent-jobs gate retire (owner only).", s, Printable(r.main, 200))
 		}
 		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: release_check has not passed on %s at this checklist; "+
 			"run release_check(repo, sha) first.%s", where, sha, shipped), nil
