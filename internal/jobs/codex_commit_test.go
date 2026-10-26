@@ -425,3 +425,141 @@ func TestCodexCommitMessage(t *testing.T) {
 		t.Fatalf("symlinked message followed: %q", got)
 	}
 }
+
+// preparedCodexFix is a codex fix job on repo, claimed and prepared (worktree and job git files) as the
+// launch leaves it, with m's git identity; it returns the job and its dir.
+func preparedCodexFix(t *testing.T, m *Manager, repo string) (*store.Job, string) {
+	t.Helper()
+	j := enqueue(t, m, "work", codexFix(repo))
+	j.BaseCommit = gitT(t, repo, "rev-parse", "HEAD")
+	const token = "tok"
+	if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	dir := m.JobDir(j.ID)
+	if err := m.prepare(j, token, dir); err != nil {
+		t.Fatal(err)
+	}
+	return j, dir
+}
+
+// writeSized writes n bytes to work/name, or with sparse a file of that size and no data.
+func writeSized(t *testing.T, work, name string, n int64, sparse bool) {
+	t.Helper()
+	p := filepath.Join(work, name)
+	if sparse {
+		if err := os.WriteFile(p, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(p, n); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err := os.WriteFile(p, []byte(strings.Repeat("x", int(n))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The wrapper stages a codex job's changes into the object database shared with the owner's repository
+// only within limits (sol review of #92): too many changed paths, one file too large (by its size, so a
+// sparse file counts in full) or too many bytes in all give no commit, a reason in the line, nothing
+// staged and no blob of the job's files written. Within the limits the commit is made.
+func TestCodexCommitLimits(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		limits codexCommitLimits
+		files  map[string]int64
+		sparse bool
+		reason string // "" = committed
+	}{
+		{"within limits", codexCommitLimits{files: 3, fileBytes: 100, totalBytes: 300},
+			map[string]int64{"a.txt": 100, "b.txt": 100, "tracked.txt": 100}, false, ""},
+		{"file count", codexCommitLimits{files: 3, fileBytes: 100, totalBytes: 1000},
+			map[string]int64{"a.txt": 1, "b.txt": 1, "c.txt": 1, "tracked.txt": 1}, false,
+			"codex commit skipped: 4 changed paths, over the limit of 3"},
+		{"file size", codexCommitLimits{files: 3, fileBytes: 100, totalBytes: 1000},
+			map[string]int64{"a.txt": 10, "big.bin": 101}, false,
+			"codex commit skipped: big.bin has 101 bytes, over the limit of 100 per file"},
+		{"sparse file size", codexCommitMax, map[string]int64{"sparse.bin": codexCommitMax.fileBytes + 1}, true,
+			"codex commit skipped: sparse.bin has 20971521 bytes, over the limit of 20971520 per file"},
+		{"aggregate size", codexCommitLimits{files: 10, fileBytes: 100, totalBytes: 250},
+			map[string]int64{"a.txt": 100, "b.txt": 100, "c.txt": 100}, false,
+			"codex commit skipped: the changed files have 300 bytes, over the limit of 250 in all"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			prev := codexCommitMax
+			codexCommitMax = c.limits
+			t.Cleanup(func() { codexCommitMax = prev })
+			m := newCodexManager(t)
+			m.Cfg.CodexWriteAllowed, m.Cfg.GitName, m.Cfg.GitEmail = true, "Job Bot", "job@example.com"
+			repo := newRepo(t)
+			j, dir := preparedCodexFix(t, m, repo)
+			work := filepath.Join(dir, "work")
+			for name, n := range c.files {
+				writeSized(t, work, name, n, c.sparse)
+			}
+			line := commitCodexWork(dir, j.ID)
+			head := gitT(t, work, "rev-parse", "HEAD")
+			if c.reason == "" {
+				if !strings.HasPrefix(line, "codex commit: committed the job's changes as ") || head == j.BaseCommit {
+					t.Fatalf("commit line %q, HEAD %s", line, head)
+				}
+				return
+			}
+			if line != c.reason {
+				t.Fatalf("commit line %q, want %q", line, c.reason)
+			}
+			if head != j.BaseCommit {
+				t.Fatalf("HEAD moved to %s", head)
+			}
+			if staged := gitT(t, work, "diff", "--cached", "--name-only"); staged != "" {
+				t.Fatalf("staged: %q", staged)
+			}
+			for name := range c.files {
+				blob := gitT(t, work, "hash-object", name)
+				if _, err := git(work, "cat-file", "-e", blob); err == nil {
+					t.Fatalf("blob of %s written to the object database", name)
+				}
+			}
+		})
+	}
+}
+
+// The commit step has one deadline for all of it: past it, no commit and a line saying so.
+func TestCodexCommitDeadline(t *testing.T) {
+	prev := codexCommitTimeout
+	codexCommitTimeout = time.Nanosecond
+	t.Cleanup(func() { codexCommitTimeout = prev })
+	m := newCodexManager(t)
+	m.Cfg.CodexWriteAllowed, m.Cfg.GitName, m.Cfg.GitEmail = true, "Job Bot", "job@example.com"
+	repo := newRepo(t)
+	j, dir := preparedCodexFix(t, m, repo)
+	work := filepath.Join(dir, "work")
+	writeSized(t, work, "a.txt", 10, false)
+	if line := commitCodexWork(dir, j.ID); line != "codex commit skipped: the commit step passed its 1ns deadline" {
+		t.Fatalf("commit line %q", line)
+	}
+	if head := gitT(t, work, "rev-parse", "HEAD"); head != j.BaseCommit {
+		t.Fatalf("HEAD moved to %s", head)
+	}
+}
+
+// statusPaths reads every porcelain v2 entry kind, a rename's source included, paths with spaces kept.
+func TestCodexStatusPaths(t *testing.T) {
+	out := "1 .M N... 100644 100644 100644 aaaa bbbb a dir/file one.txt\x00" +
+		"2 R. N... 100644 100644 100644 aaaa bbbb R100 new name.txt\x00old name.txt\x00" +
+		"u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict.txt\x00" +
+		"? untracked file\x00"
+	got, err := statusPaths(out)
+	want := []string{"a dir/file one.txt", "new name.txt", "old name.txt", "conflict.txt", "untracked file"}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("paths %q, %v; want %q", got, err, want)
+	}
+	for _, bad := range []string{"x what\x00", "1 .M N...\x00", "2 R. N... 100644 100644 100644 aaaa bbbb R100 new.txt"} {
+		if got, err := statusPaths(bad); err == nil {
+			t.Fatalf("%q: no error, paths %q", bad, got)
+		}
+	}
+}

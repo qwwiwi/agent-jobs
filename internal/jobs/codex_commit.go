@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,8 +28,27 @@ const CodexCommitMessageFile = "COMMIT_MSG"
 // codexCommitMessageMax caps the bytes read from CodexCommitMessageFile.
 const codexCommitMessageMax = 8 << 10
 
-// codexCommitTimeout bounds each git command of commitCodexWork.
+// codexCommitTimeout bounds the whole of commitCodexWork: the worktree scan and every git command.
 var codexCommitTimeout = 2 * time.Minute
+
+// codexCommitLimits bound the changes the wrapper stages of a codex write job. `git add` writes every
+// staged file into the object database shared with the owner's repository, so a job that leaves huge
+// (or sparse) files, or a huge number of them, could fill the disk or the memory of the wrapper's git.
+type codexCommitLimits struct {
+	files      int   // changed paths (a rename counts both)
+	fileBytes  int64 // size of one changed file, by Lstat (its content is never read)
+	totalBytes int64 // sum of those sizes
+}
+
+// codexCommitMax are the limits of commitCodexWork; past any of them the job's changes are not committed.
+var codexCommitMax = codexCommitLimits{files: 2000, fileBytes: 20 << 20, totalBytes: 200 << 20}
+
+// codexCommitOutputMax caps the stdout of a commitCodexWork git command other than its status.
+const codexCommitOutputMax = 1 << 20
+
+// codexStatusEntryMax bounds one record of `git status --porcelain=v2 -z`: its header and two paths
+// (a rename's), each at most PATH_MAX.
+const codexStatusEntryMax = 256 + 2*4096
 
 // CodexCommitMessagePath is the commit message file of a codex write job in jobDir, absolute.
 func CodexCommitMessagePath(jobDir string) string {
@@ -37,15 +57,31 @@ func CodexCommitMessagePath(jobDir string) string {
 
 // commitCodexWork commits what a codex write job left in its worktree, once, after the run and after
 // the job's processes are gone: everything is staged (`git add -A`: untracked files too, ignored ones
-// not) and committed with the job's git environment (GitEnv: the job identity, no hooks, fsmonitor or
+// not) when the changes, listed by a status whose output is capped, are within codexCommitMax, and
+// committed with the job's git environment (GitEnv: the job identity, no hooks, fsmonitor or
 // other programs; commit.gpgSign off) on the worktree's admin dir recorded at creation (worktree.json),
 // never through a .git file in work/. The message is the job's CodexCommitMessageFile when it is a
 // regular file with text and without an owner name (config owner_names of <state>, jobDir being
 // <state>/jobs/<id>), else a default. A repository config that names filter or diff drivers (git add
-// would run them here) gets no commit, and neither does a run whose git command fails: the changes then
-// stay uncommitted and Cleanup saves them as patches. It returns what it did, for the wrapper's log
-// ("" = the job has no worktree).
+// would run them here) gets no commit, and neither do changes over the limits, a step past
+// codexCommitTimeout or a git command that fails: the changes then stay uncommitted and Cleanup saves
+// them as patches. It returns what it did, for the wrapper's log ("" = the job has no worktree).
 func commitCodexWork(jobDir, id string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), codexCommitTimeout)
+	defer cancel()
+	line := commitCodexWorkCtx(ctx, jobDir, id)
+	if ctx.Err() == nil {
+		return line
+	}
+	deadline := fmt.Sprintf("the commit step passed its %s deadline", codexCommitTimeout)
+	if strings.HasPrefix(line, "codex commit skipped: ") {
+		return "codex commit skipped: " + deadline
+	}
+	return line + " (" + deadline + ")"
+}
+
+// commitCodexWorkCtx is commitCodexWork with every step bound to ctx.
+func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 	abs := absPath(jobDir)
 	b, err := os.ReadFile(filepath.Join(abs, "worktree.json"))
 	if errors.Is(err, os.ErrNotExist) {
@@ -64,7 +100,7 @@ func commitCodexWork(jobDir, id string) string {
 	}
 	// Before any git command: git runs a submodule's status (and so its filter drivers) with the
 	// submodule's own config and without GitEnv's command-level overrides.
-	if nested, err := nestedGitDir(work); err != nil {
+	if nested, err := nestedGitDir(ctx, work); err != nil {
 		return fmt.Sprintf("codex commit skipped: worktree scan: %v", err)
 	} else if nested != "" {
 		return "codex commit skipped: the worktree holds a nested git repository (" + nested + ")"
@@ -73,23 +109,27 @@ func commitCodexWork(jobDir, id string) string {
 	if err != nil {
 		return fmt.Sprintf("codex commit skipped: git environment: %v", err)
 	}
-	run := func(args ...string) (string, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), codexCommitTimeout)
-		defer cancel()
+	// runCapped runs git with at most limit bytes of stdout: past them the output pipe closes, so git stops.
+	runCapped := func(limit int, args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + info.GitDir, "--work-tree=" + work}, args...)...)
 		cmd.Dir, cmd.Env = work, env
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
+		var stderr bytes.Buffer
+		stdout := &cappedOutput{max: limit}
+		cmd.Stdout, cmd.Stderr = stdout, &limitedWriter{w: &stderr, n: 4 << 10}
+		err := cmd.Run()
+		sub := args[0]
+		for i := 0; i+2 < len(args) && args[i] == "-c"; i += 2 {
+			sub = args[i+2]
+		}
+		if stdout.over {
+			return "", fmt.Errorf("git %s: output over %d bytes", sub, limit)
+		}
 		if err != nil {
-			sub := args[0]
-			for i := 0; i+2 < len(args) && args[i] == "-c"; i += 2 {
-				sub = args[i+2]
-			}
 			return "", fmt.Errorf("git %s: %w: %s", sub, err, Printable(stderr.String(), 200))
 		}
-		return string(out), nil
+		return stdout.buf.String(), nil
 	}
+	run := func(args ...string) (string, error) { return runCapped(codexCommitOutputMax, args...) }
 	cfg, err := run(repoDriversArgs...)
 	if err != nil {
 		return "codex commit skipped: " + err.Error()
@@ -97,12 +137,21 @@ func commitCodexWork(jobDir, id string) string {
 	if drivers := driverKeys([]byte(cfg)); len(drivers) > 0 {
 		return "codex commit skipped: the repository config names filter/diff drivers (" + strings.Join(drivers, ", ") + ")"
 	}
-	status, err := run("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all", "-z")
+	limits := codexCommitMax
+	status, err := runCapped((limits.files+1)*codexStatusEntryMax,
+		"status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=all", "-z")
 	if err != nil {
 		return "codex commit skipped: " + err.Error()
 	}
 	if status == "" {
 		return "codex commit: no changes in the worktree"
+	}
+	paths, err := statusPaths(status)
+	if err != nil {
+		return "codex commit skipped: " + err.Error()
+	}
+	if reason := limits.check(work, paths); reason != "" {
+		return "codex commit skipped: " + reason
 	}
 	if _, err := run("add", "-A"); err != nil {
 		return "codex commit failed, changes left uncommitted: " + err.Error()
@@ -130,10 +179,13 @@ func commitCodexWork(jobDir, id string) string {
 
 // nestedGitDir returns the first `.git` (a dir or a file) below work other than work/.git itself,
 // relative to work and slash-separated, or "". Links are not followed (WalkDir does not).
-func nestedGitDir(work string) (string, error) {
+func nestedGitDir(ctx context.Context, work string) (string, error) {
 	var found string
 	err := filepath.WalkDir(work, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		switch {
@@ -181,4 +233,86 @@ func codexCommitMessage(jobDir, id string, ownerNames []string, namesKnown bool)
 		}
 	}
 	return text
+}
+
+// statusPaths are the paths of `git status --porcelain=v2 -z` output, relative to the worktree: each
+// changed, unmerged or untracked entry's path, and a rename's or copy's source too.
+func statusPaths(out string) ([]string, error) {
+	recs := strings.Split(strings.TrimSuffix(out, "\x00"), "\x00")
+	var paths []string
+	for i := 0; i < len(recs); i++ {
+		rec := recs[i]
+		var fields int // space-separated fields before the path
+		switch {
+		case strings.HasPrefix(rec, "1 "):
+			fields = 8
+		case strings.HasPrefix(rec, "2 "):
+			fields = 9
+		case strings.HasPrefix(rec, "u "):
+			fields = 10
+		case strings.HasPrefix(rec, "? "), strings.HasPrefix(rec, "! "):
+			fields = 1
+		case strings.HasPrefix(rec, "# "):
+			continue
+		default:
+			return nil, fmt.Errorf("git status: unknown entry %q", Printable(rec, 80))
+		}
+		parts := strings.SplitN(rec, " ", fields+1)
+		if len(parts) != fields+1 || parts[fields] == "" {
+			return nil, fmt.Errorf("git status: malformed entry %q", Printable(rec, 80))
+		}
+		paths = append(paths, parts[fields])
+		if rec[0] == '2' {
+			// The source path is the next NUL-separated field.
+			if i++; i >= len(recs) {
+				return nil, errors.New("git status: rename without its source path")
+			}
+			paths = append(paths, recs[i])
+		}
+	}
+	return paths, nil
+}
+
+// check returns why the changed paths (relative to work) are over the limits, or "". Sizes are Lstat
+// sizes, the content is never read: a link counts as itself, a sparse file in full, a deleted path as 0.
+func (l codexCommitLimits) check(work string, paths []string) string {
+	if len(paths) > l.files {
+		return fmt.Sprintf("%d changed paths, over the limit of %d", len(paths), l.files)
+	}
+	var total int64
+	for _, p := range paths {
+		fi, err := os.Lstat(filepath.Join(work, filepath.FromSlash(p)))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Sprintf("cannot stat %s: %v", Printable(p, 200), err)
+		}
+		if fi.IsDir() {
+			continue
+		}
+		if fi.Size() > l.fileBytes {
+			return fmt.Sprintf("%s has %d bytes, over the limit of %d per file", Printable(p, 200), fi.Size(), l.fileBytes)
+		}
+		total += fi.Size()
+	}
+	if total > l.totalBytes {
+		return fmt.Sprintf("the changed files have %d bytes, over the limit of %d in all", total, l.totalBytes)
+	}
+	return ""
+}
+
+// cappedOutput keeps a command's stdout up to max bytes; a write past them fails (exec then closes the
+// pipe, so the command gets EPIPE and stops) and sets over.
+type cappedOutput struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (c *cappedOutput) Write(p []byte) (int, error) {
+	if c.buf.Len()+len(p) > c.max {
+		c.over = true
+		return 0, errors.New("output over its cap")
+	}
+	return c.buf.Write(p)
 }
