@@ -1,6 +1,9 @@
 package guard
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Operands (issue #95): some programs only compile, check, list, read or compare the files and
 // packages their operands name and never run them, so `go test ./cmd/agent-jobs/` or
@@ -34,10 +37,18 @@ func plainPath(w string) bool {
 	return true
 }
 
+// staticArgv reports a command whose words the shell passes as written: no word holds an expansion
+// ($var, ${…}, $(…), backticks) or a glob/brace, and xargs does not add or replace words. Otherwise
+// one word can turn the role of the next (`"$opt" claude` with opt=-exec, `xargs -I OPT go test OPT
+// claude`), so no operand is exempt from the scan.
+func staticArgv(c *simpleCmd, v cmdView) bool {
+	return !slices.Contains(c.dyn, true) && !slices.Contains(c.glob, true) && !slices.Contains(v.wrappers, "xargs")
+}
+
 // operands reports, for each of args (after the program name) of name (progName), whether it is a
 // literal file or package operand that name never runs; nil when name is not known to be such a
-// program or its options are not all understood.
-func operands(name string, args []string, dyn []bool) []bool {
+// program or its options are not all understood. The caller passes only a staticArgv command.
+func operands(name string, args []string) []bool {
 	var ops []bool
 	switch {
 	case name == "go":
@@ -51,14 +62,15 @@ func operands(name string, args []string, dyn []bool) []bool {
 		}
 	}
 	for k := range ops {
-		ops[k] = ops[k] && !dyn[k] && plainPath(args[k])
+		ops[k] = ops[k] && plainPath(args[k])
 	}
 	return ops
 }
 
 // goOperands: `go SUB [flags] operands…` with SUB in goDataSubcommands and no goExecFlags flag; a word
 // without a leading dash is an operand (a package, a file, a value of a flag that runs nothing, or a
-// test binary argument after -args).
+// test binary argument after -args). go build of explicit .go files names its output after the first
+// file (`go build cmd/agent-jobs/main.go` writes ./main, a renamed agent-jobs), so it is no data.
 func goOperands(args []string) []bool {
 	if len(args) == 0 || !goDataSubcommands[args[0]] {
 		return nil
@@ -72,6 +84,9 @@ func goOperands(args []string) []bool {
 				return nil
 			}
 			continue
+		}
+		if args[0] == "build" && strings.HasSuffix(strings.ToLower(a), ".go") {
+			return nil
 		}
 		ops[k] = true
 	}

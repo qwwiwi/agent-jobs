@@ -1304,7 +1304,10 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
 	// arguments is rejected. A literal file or package operand of a program that never runs its
 	// operands is data (`go test ./cmd/agent-jobs/`, `sed -n 1p cmd/agent-jobs/x.go`; see operands).
-	ops := operands(name, argv[1:], dyn[1:])
+	var ops []bool
+	if staticArgv(c, v) {
+		ops = operands(name, argv[1:])
+	}
 	for k, a := range argv[1:] {
 		if k < len(ops) && ops[k] {
 			continue
