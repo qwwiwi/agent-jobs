@@ -5,8 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -202,9 +204,10 @@ func TestLogin(t *testing.T) {
 	}
 }
 
-// Without a timeout binary the module download is still bounded by MANIFEST_DOWNLOAD_TIMEOUT: a go that
-// hangs is stopped after the limit and the script exits 2 with one line.
-func TestRepoManifestCheckDownloadBoundedWithoutTimeout(t *testing.T) {
+// fakeGoBin is a PATH directory with the tools the script needs and a go that runs the given sh body
+// for `go mod download` and fails at once for anything else. No timeout binary is among the tools.
+func fakeGoBin(t *testing.T, download string) string {
+	t.Helper()
 	bin := t.TempDir()
 	for _, tool := range []string{"awk", "cat", "cp", "dirname", "find", "mktemp", "paste", "rm", "sleep", "sort"} {
 		p, err := exec.LookPath(tool)
@@ -215,9 +218,18 @@ func TestRepoManifestCheckDownloadBoundedWithoutTimeout(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(bin, "go"), []byte("#!/bin/sh\nexec sleep 20\n"), 0o755); err != nil {
+	body := "#!/bin/sh\nif [ \"$1 $2\" != 'mod download' ]; then exit 1; fi\n" + download + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	return bin
+}
+
+// runBoundedDownload runs the script with the fake go and a download limit of 1s, and fails the test when
+// the run takes more than 10s or does not end with exit 2 and the timeout line.
+func runBoundedDownload(t *testing.T, download string) {
+	t.Helper()
+	bin := fakeGoBin(t, download)
 	dir := manifestRepo(t, "module example.com/app\n\ngo 1.27\n", manifestTest)
 	start := time.Now()
 	out, code := runRepoManifest(t, dir, []string{"PATH=" + bin, "MANIFEST_DOWNLOAD_TIMEOUT=1"})
@@ -226,5 +238,69 @@ func TestRepoManifestCheckDownloadBoundedWithoutTimeout(t *testing.T) {
 	}
 	if code != 2 || !strings.Contains(out, "manifest-check: go mod download did not finish within 1s") {
 		t.Fatalf("exit %d:\n%s", code, out)
+	}
+}
+
+// Without a timeout binary the module download is still bounded by MANIFEST_DOWNLOAD_TIMEOUT: a go that
+// hangs is stopped after the limit and the script exits 2 with one line.
+func TestRepoManifestCheckDownloadBoundedWithoutTimeout(t *testing.T) {
+	runBoundedDownload(t, "exec sleep 20")
+}
+
+// A download that ignores SIGTERM is killed after a short grace. Its child (here sleep, which inherits
+// the ignored TERM) is not killed, but it does not hold the script's output open either.
+func TestRepoManifestCheckDownloadIgnoringTerm(t *testing.T) {
+	runBoundedDownload(t, "trap '' TERM\nsleep 30")
+}
+
+// A download that outlives the limit is a timeout even when it then exits 0.
+func TestRepoManifestCheckDownloadExpiredExitZero(t *testing.T) {
+	runBoundedDownload(t, "trap '' TERM\nsleep 3\nexit 0")
+}
+
+// A signal to the script stops the download (KILL after the grace when it ignores TERM) and reaps it
+// before the temp dir goes, then exits 2.
+func TestRepoManifestCheckSignalStopsDownload(t *testing.T) {
+	marks := t.TempDir()
+	bin := fakeGoBin(t, "echo $$ >\"$MARKS/go.pid\"\ntrap '' TERM\nsleep 30")
+	dir := manifestRepo(t, "module example.com/app\n\ngo 1.27\n", manifestTest)
+	tmp := t.TempDir()
+	cmd := exec.Command("./scripts/manifest-check.sh")
+	cmd.Dir = dir
+	cmd.Env = append(scrubbedEnv(t), "PATH="+bin, "TMPDIR="+tmp, "MARKS="+marks, "MANIFEST_DOWNLOAD_TIMEOUT=60")
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var b []byte
+	for deadline := time.Now().Add(10 * time.Second); len(b) == 0; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("the fake go did not start")
+		}
+		b, _ = os.ReadFile(filepath.Join(marks, "go.pid"))
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	err = cmd.Wait()
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("took %v after TERM:\n%s", elapsed, out.String())
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 2 {
+		t.Fatalf("want exit 2, got %v:\n%s", err, out.String())
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("the download (pid %d) is still there: %v", pid, err)
+	}
+	if left, err := os.ReadDir(tmp); err != nil || len(left) != 0 {
+		t.Fatalf("temp dir not removed (%v): %v", err, left)
 	}
 }

@@ -23,8 +23,33 @@ if [ $# -eq 0 ]; then
   GOTOOLCHAIN=local
   export GOTOOLCHAIN
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/manifest-repo.XXXXXX") || exit 2
+  # The module download and its watchdog, while they run; a signal stops and reaps both before the
+  # EXIT trap removes the temp dir they use.
+  pid=
+  watchdog=
+  grace=5
+  on_signal() {
+    # Ignore further signals; subshells started from here inherit that, so they are stopped with KILL.
+    trap '' HUP INT TERM
+    if [ -n "$watchdog" ]; then
+      kill -KILL "$watchdog" 2>/dev/null
+      wait "$watchdog"
+    fi
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null
+      (
+        sleep "$grace"
+        kill -KILL "$pid"
+      ) >/dev/null 2>&1 &
+      killer=$!
+      wait "$pid"
+      kill -KILL "$killer" 2>/dev/null
+      wait "$killer"
+    fi
+    exit 2
+  }
   trap 'rm -rf "$tmp"' EXIT
-  trap 'exit 2' HUP INT TERM
+  trap on_signal HUP INT TERM
 
   # Both runs below judge against one copy of the checklist taken before any test runs: a test that
   # edits or removes the working tree's checklist cannot drop a requirement from the second run.
@@ -37,7 +62,10 @@ if [ $# -eq 0 ]; then
 
   # Fetch the modules first, bounded, so a cold cache without network fails here with a clear line
   # (exit 2) instead of as build failures of every package (every requirement MISSING, exit 1).
-  # A watchdog stops the download after the limit, so no timeout(1) is needed.
+  # A watchdog stops the download after the limit (TERM, then KILL after a ${grace}s grace), so no
+  # timeout(1) is needed. Only the go process is signalled: plain sh has no portable way to put it in a
+  # process group of its own (dash turns job control off without a tty). Its output goes to a file, so
+  # a child it leaves behind cannot hold the caller's stdout or stderr open.
   limit=${MANIFEST_DOWNLOAD_TIMEOUT:-300}
   case $limit in
     '' | *[!0-9]*)
@@ -45,7 +73,7 @@ if [ $# -eq 0 ]; then
       exit 2
       ;;
   esac
-  go mod download &
+  go mod download </dev/null >"$tmp/download.log" 2>&1 &
   pid=$!
   (
     trap - EXIT HUP INT TERM
@@ -57,12 +85,20 @@ if [ $# -eq 0 ]; then
     done
     : >"$tmp/timed-out"
     kill "$pid"
+    sleep "$grace"
+    kill -KILL "$pid"
   ) >/dev/null 2>&1 &
   watchdog=$!
   wait "$pid"
   status=$?
+  pid=
+  # Stop the watchdog as soon as the download is reaped, so it cannot signal a reused PID.
   kill "$watchdog" 2>/dev/null
-  if [ "$status" -ne 0 ] && [ -f "$tmp/timed-out" ]; then
+  wait "$watchdog"
+  watchdog=
+  cat "$tmp/download.log" >&2
+  # Past the limit is a timeout whatever the exit status: a download may exit 0 on TERM.
+  if [ -f "$tmp/timed-out" ]; then
     echo "manifest-check: go mod download did not finish within ${limit}s (MANIFEST_DOWNLOAD_TIMEOUT): a cold module cache needs network access to the Go module proxy" >&2
     exit 2
   fi
