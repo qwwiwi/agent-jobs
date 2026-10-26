@@ -62,7 +62,9 @@ func TestMergeGateInertRangesExact(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ cmd, want string }{
-		{"eval ${x:- #}; gh pr merge 5", unsureWarn},
+		// The guard reads ${…} as one word unit, so the # inside it starts no comment and the merge
+		// after it is parsed: refused without a release pass.
+		{"eval ${x:- #}; gh pr merge 5", "without --match-head-commit"},
 		{"cat <<$'EOF'\nx\nEOF\ngh pr m@(erge) 5", unsureWarn},
 	} {
 		if r := gateAnswer(t, m, repo, tc.cmd, ""); !strings.Contains(r, tc.want) {
