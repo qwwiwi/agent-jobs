@@ -563,3 +563,58 @@ func TestCodexStatusPaths(t *testing.T) {
 		}
 	}
 }
+
+// The wrapper commits under the job identity of the launch (<jobdir>/gitconfig, written at prepare from
+// git_name / git_email) as author and committer, over a repository-local user.* and whatever config.json
+// says by then; without both fields of that identity, or without the file, it commits nothing (sol review
+// of #92: the owner's repository-local identity must never sign the job's commit).
+func TestCodexCommitIdentity(t *testing.T) {
+	for _, c := range []struct {
+		name, gitName, gitEmail string
+		removeGitConfig         bool
+		want                    string // author and committer "<name> <email>"; "" = no commit
+	}{
+		{"job identity", "Job Bot", "job@example.com", false, "Job Bot <job@example.com>|Job Bot <job@example.com>"},
+		{"name missing", "", "job@example.com", false, ""},
+		{"email missing", "Job Bot", "", false, ""},
+		{"gitconfig missing", "Job Bot", "job@example.com", true, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newCodexManager(t)
+			m.Cfg.CodexWriteAllowed, m.Cfg.GitName, m.Cfg.GitEmail = true, c.gitName, c.gitEmail
+			repo := newRepo(t)
+			gitT(t, repo, "config", "user.name", "Owner Person")
+			gitT(t, repo, "config", "user.email", "owner@example.com")
+			j, dir := preparedCodexFix(t, m, repo)
+			// config.json changed after the launch does not change the identity of the commit.
+			writeReloadConfig(t, m, `{"git_name":"Later Name","git_email":"later@example.com"}`)
+			if c.removeGitConfig {
+				if err := os.Remove(filepath.Join(dir, gitConfigFile)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			work := filepath.Join(dir, "work")
+			writeSized(t, work, "a.txt", 10, false)
+			line := commitCodexWork(dir, j.ID)
+			head := gitT(t, work, "rev-parse", "HEAD")
+			if c.want == "" {
+				if !strings.HasPrefix(line, "codex commit skipped: ") || !strings.Contains(line, "identity") {
+					t.Fatalf("commit line %q", line)
+				}
+				if head != j.BaseCommit {
+					t.Fatalf("HEAD moved to %s: %s", head, gitT(t, work, "log", "-1", "--format=%an <%ae>|%cn <%ce>"))
+				}
+				if staged := gitT(t, work, "diff", "--cached", "--name-only"); staged != "" {
+					t.Fatalf("staged: %q", staged)
+				}
+				return
+			}
+			if head == j.BaseCommit {
+				t.Fatalf("no commit: %q", line)
+			}
+			if got := gitT(t, work, "log", "-1", "--format=%an <%ae>|%cn <%ce>"); got != c.want {
+				t.Fatalf("author|committer %q, want %q", got, c.want)
+			}
+		})
+	}
+}

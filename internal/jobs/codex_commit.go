@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -58,12 +59,13 @@ func CodexCommitMessagePath(jobDir string) string {
 // commitCodexWork commits what a codex write job left in its worktree, once, after the run and after
 // the job's processes are gone: everything is staged (`git add -A`: untracked files too, ignored ones
 // not) when the changes, listed by a status whose output is capped, are within codexCommitMax, and
-// committed with the job's git environment (GitEnv: the job identity, no hooks, fsmonitor or
-// other programs; commit.gpgSign off) on the worktree's admin dir recorded at creation (worktree.json),
-// never through a .git file in work/. The message is the job's CodexCommitMessageFile when it is a
-// regular file with text and without an owner name (config owner_names of <state>, jobDir being
-// <state>/jobs/<id>), else a default. A repository config that names filter or diff drivers (git add
-// would run them here) gets no commit, and neither do changes over the limits, a step past
+// committed with the job's git environment (GitEnv: no hooks, fsmonitor or other programs;
+// commit.gpgSign off) and the job identity of the launch (codexJobIdentity) as author and committer, on
+// the worktree's admin dir recorded at creation (worktree.json), never through a .git file in work/.
+// The message is the job's CodexCommitMessageFile when it is a regular file with text and without an
+// owner name (config owner_names of <state>, jobDir being <state>/jobs/<id>), else a default. A
+// repository config that names filter or diff drivers (git add would run them here) gets no commit, and
+// neither do a launch without both identity fields, changes over the limits, a step past
 // codexCommitTimeout or a git command that fails: the changes then stay uncommitted and Cleanup saves
 // them as patches. It returns what it did, for the wrapper's log ("" = the job has no worktree).
 func commitCodexWork(jobDir, id string) string {
@@ -105,14 +107,19 @@ func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 	} else if nested != "" {
 		return "codex commit skipped: the worktree holds a nested git repository (" + nested + ")"
 	}
+	// Before GitEnv, which would create a missing gitconfig empty.
+	name, email, err := codexJobIdentity(ctx, abs)
+	if err != nil {
+		return "codex commit skipped: the job's git identity: " + err.Error()
+	}
 	env, err := GitEnv(abs, os.Environ())
 	if err != nil {
 		return fmt.Sprintf("codex commit skipped: git environment: %v", err)
 	}
 	// runCapped runs git with at most limit bytes of stdout: past them the output pipe closes, so git stops.
-	runCapped := func(limit int, args ...string) (string, error) {
+	runCapped := func(limit int, extraEnv []string, args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, "git", append([]string{"--git-dir=" + info.GitDir, "--work-tree=" + work}, args...)...)
-		cmd.Dir, cmd.Env = work, env
+		cmd.Dir, cmd.Env = work, append(slices.Clip(env), extraEnv...)
 		var stderr bytes.Buffer
 		stdout := &cappedOutput{max: limit}
 		cmd.Stdout, cmd.Stderr = stdout, &limitedWriter{w: &stderr, n: 4 << 10}
@@ -129,7 +136,7 @@ func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 		}
 		return stdout.buf.String(), nil
 	}
-	run := func(args ...string) (string, error) { return runCapped(codexCommitOutputMax, args...) }
+	run := func(args ...string) (string, error) { return runCapped(codexCommitOutputMax, nil, args...) }
 	cfg, err := run(repoDriversArgs...)
 	if err != nil {
 		return "codex commit skipped: " + err.Error()
@@ -138,7 +145,7 @@ func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 		return "codex commit skipped: the repository config names filter/diff drivers (" + strings.Join(drivers, ", ") + ")"
 	}
 	limits := codexCommitMax
-	status, err := runCapped((limits.files+1)*codexStatusEntryMax,
+	status, err := runCapped((limits.files+1)*codexStatusEntryMax, nil,
 		"status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=all", "-z")
 	if err != nil {
 		return "codex commit skipped: " + err.Error()
@@ -158,16 +165,12 @@ func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 	}
 	c, cfgErr := LoadConfig(filepath.Dir(filepath.Dir(abs)))
 	msg := codexCommitMessage(abs, id, c.OwnerNames, cfgErr == nil)
-	commit := []string{"-c", "commit.gpgSign=false"}
-	// The job identity (git_name / git_email) also over a repository-local user.*, as the job's own
-	// gitconfig cannot.
-	if c.GitName != "" {
-		commit = append(commit, "-c", "user.name="+c.GitName)
-	}
-	if c.GitEmail != "" {
-		commit = append(commit, "-c", "user.email="+c.GitEmail)
-	}
-	if _, err := run(append(commit, "commit", "-q", "--no-verify", "--cleanup=strip", "-m", msg)...); err != nil {
+	// The launch's job identity as author and committer: the environment beats a repository-local
+	// user.* (and author.* / committer.*), which the job's gitconfig as GIT_CONFIG_GLOBAL cannot.
+	identity := []string{"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email,
+		"GIT_COMMITTER_NAME=" + name, "GIT_COMMITTER_EMAIL=" + email}
+	if _, err := runCapped(codexCommitOutputMax, identity,
+		"-c", "commit.gpgSign=false", "commit", "-q", "--no-verify", "--cleanup=strip", "-m", msg); err != nil {
 		return "codex commit failed, changes left staged: " + err.Error()
 	}
 	head, err := run("rev-parse", "HEAD")
@@ -175,6 +178,48 @@ func commitCodexWorkCtx(ctx context.Context, jobDir, id string) string {
 		return "codex commit made, HEAD unreadable: " + err.Error()
 	}
 	return "codex commit: committed the job's changes as " + strings.TrimSpace(head)
+}
+
+// codexJobIdentity is the job identity of the launch: user.name and user.email of <jobDir>/gitconfig,
+// which prepare wrote from config git_name / git_email and a workspace-write job cannot change (its job
+// dir is not a writable root). Both must be set; a later config.json is not consulted.
+func codexJobIdentity(ctx context.Context, jobDir string) (name, email string, err error) {
+	path := filepath.Join(jobDir, gitConfigFile)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", "", fmt.Errorf("%s is not a regular file", gitConfigFile)
+	}
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_") })
+	env = append(env, "GIT_CONFIG_NOSYSTEM=1")
+	get := func(key string) (string, error) {
+		cmd := exec.CommandContext(ctx, "git", "config", "--file", path, "--get", key)
+		out := &cappedOutput{max: 4 << 10}
+		cmd.Dir, cmd.Env, cmd.Stdout = jobDir, env, out
+		err := cmd.Run()
+		var exit *exec.ExitError
+		switch {
+		case out.over:
+			return "", fmt.Errorf("%s over %d bytes", key, out.max)
+		case errors.As(err, &exit) && exit.ExitCode() == 1: // the key is not set
+			return "", nil
+		case err != nil:
+			return "", fmt.Errorf("read %s from %s: %w", key, gitConfigFile, err)
+		}
+		return strings.TrimSuffix(out.buf.String(), "\n"), nil
+	}
+	if name, err = get("user.name"); err != nil {
+		return "", "", err
+	}
+	if email, err = get("user.email"); err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(email) == "" {
+		return "", "", fmt.Errorf("the launch's %s does not set both user.name and user.email (config git_name / git_email)", gitConfigFile)
+	}
+	return name, email, nil
 }
 
 // nestedGitDir returns the first `.git` (a dir or a file) below work other than work/.git itself,
