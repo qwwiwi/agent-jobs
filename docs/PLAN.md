@@ -206,6 +206,13 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 - Root shell modes (F9 (b)): `sudo -s|-i|--shell|--login` (and the shells of `doas`, `su`, `runuser`) hand their argv to a root shell that expands `$NAME` in a quoted word again; the reader takes `sudo -s gh pr '$M' 5` as written and misses the merge. Such commands are never read relaxed, but the strict reading has the same gap.
 - No deploy gate: the Merge rule covers deploy, but F9 gates only the merge. Until a deploy hook (or a `release_check` call in the project's deploy script) is designed before the build, a deploy of a LARGE task is held only by the orchestrator (soft).
 
+## Wave G: reliability (approved 2026-10-26, not built)
+
+*Status: approved 2026-10-26 (owner, Telegram msg 67973, [DECISIONS.md](DECISIONS.md)); not built.*
+
+- **G1. Unprocessed results surface on their own.** `agent-jobs hook pending --agent A`, registered as a SessionStart hook. Claude Code fires SessionStart with source `startup`, `resume`, `clear` and `compact`, so it also runs right after a compaction. It lists this agent's finished jobs (succeeded, failed, timeout) that have no `job_outcome` yet, newest first, at most 10 lines, as hook `additionalContext`: id, title, status, `finished_at`, and the instruction to read `job_result` and record `job_outcome`. Silent when there are none; fails open (never blocks the session start); read-only on the store. The heartbeat wake reason also counts unprocessed results, so a wake fires while any exist (if heartbeat is enabled). `system_doctor` reports the count and the oldest age of unprocessed results.
+  - Why: a job-done notice delivered during compaction is not delivered again; the outcome field already exists, so «no outcome» is the reliable signal. Incident 2026-10-26: two jobs finished at 23:39 UTC while the orchestrator session was compacting; their notices were lost, the summary still listed them as running, and nothing moved for about 6 hours until the owner asked.
+
 ## Ideas (not approved)
 
 Ideas recorded for later; none is approved or scheduled. Each needs an owner go before work starts.
