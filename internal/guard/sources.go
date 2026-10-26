@@ -325,8 +325,9 @@ func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBo
 			return sourcesExecBlocked("`" + name + "` runs with its working directory in `" + q + "`")
 		}
 		for k, a := range argv[1:] {
-			if q, ok := s.argHit(a, dyn[k+1], false); ok {
-				return sourcesExecBlocked("`" + name + "` is given `" + q + "` (only plain readers are)")
+			// A folder holding them too: `tar -cf x.tar ..` archives the clones.
+			if q, ok := s.argHit(a, dyn[k+1], true); ok {
+				return sourcesExecBlocked("`" + name + "` is given `" + q + "` or a folder holding it (only plain readers are)")
 			}
 		}
 		for _, t := range c.inRedirs {
@@ -371,22 +372,18 @@ func (s *pathScope) copyOut(name string, args []string, inBox *pathScope) string
 		ca := parseCopyArgs(name, args)
 		srcs, dests = ca.srcs, ca.dests
 	case name == "rsync":
-		var ops []string
-		for _, a := range args {
-			if !strings.HasPrefix(a, "-") {
-				ops = append(ops, a)
-			}
-		}
-		if len(ops) < 2 {
+		ca := parseCopyArgs(name, args)
+		if len(ca.dests) == 0 {
 			return ""
 		}
-		srcs, dests = ops[:len(ops)-1], ops[len(ops)-1:]
+		srcs, dests = ca.srcs, append(ca.dests, rsyncWriteDirs(args)...)
 	default:
 		return ""
 	}
 	from := ""
 	for _, a := range srcs {
-		if q, ok := s.hit(a, false); ok {
+		// A folder holding them (`cp -R .. x`) copies them too.
+		if q, ok := s.hit(a, true); ok {
 			from = q
 			break
 		}
@@ -404,6 +401,24 @@ func (s *pathScope) copyOut(name string, args []string, inBox *pathScope) string
 		}
 	}
 	return ""
+}
+
+// rsyncWriteDirs are the folders rsync writes into besides its destination: --backup-dir, --temp-dir
+// (-T), --partial-dir and the batch files of --write-batch / --only-write-batch.
+func rsyncWriteDirs(args []string) []string {
+	var out []string
+	for k := 0; k < len(args); k++ {
+		opt, val, eq := strings.Cut(args[k], "=")
+		switch opt {
+		case "--backup-dir", "--temp-dir", "-T", "--partial-dir", "--write-batch", "--only-write-batch":
+			if !eq && k+1 < len(args) {
+				k++
+				val = args[k]
+			}
+			out = append(out, val)
+		}
+	}
+	return out
 }
 
 // copyOutWrites refuses, in a call that reads the sources or the sandbox (a word, redirection, here-doc or
@@ -440,9 +455,23 @@ func (s *pathScope) copyOutWrites(scripts []*script, inBox *pathScope) string {
 					continue
 				}
 				argv, dyn := c.words[v.start:], c.dyn[v.start:]
-				for _, k := range readerOutputFiles(progName(argv[0]), argv[1:]) {
+				name := progName(argv[0])
+				for _, k := range readerOutputFiles(name, argv[1:]) {
 					if r := into(optValueOf(argv[k+1]), dyn[k+1]); r != "" {
 						return r
+					}
+				}
+				// A copier's destination too: `cp /dev/stdin x < sources/...` copies what it reads.
+				if destCopiers[name] || name == "rsync" {
+					ca := parseCopyArgs(name, argv[1:])
+					dests := ca.dests
+					if name == "rsync" {
+						dests = append(dests, rsyncWriteDirs(argv[1:])...)
+					}
+					for _, d := range dests {
+						if r := into(d, s.namesDynamic(d, c)); r != "" {
+							return r
+						}
 					}
 				}
 			}
@@ -463,6 +492,9 @@ func (s *pathScope) callReads(scripts []*script) string {
 					if q, ok := s.argHit(w, c.dyn[k], false); ok {
 						return q
 					}
+					if q, ok := s.globHit(w); ok {
+						return q
+					}
 				}
 				for _, t := range c.inRedirs {
 					if q, ok := s.hit(t, false); ok {
@@ -476,6 +508,50 @@ func (s *pathScope) callReads(scripts []*script) string {
 		}
 	}
 	return ""
+}
+
+// maxGlobMatches bounds the files a glob word is expanded to by globHit.
+const maxGlobMatches = 1000
+
+// globHit expands a glob word (`../source[s]/x`) against each directory the call may be in, as the shell
+// would, and reports a match inside a protected folder.
+func (s *pathScope) globHit(w string) (string, bool) {
+	if !strings.ContainsAny(w, "*?[") {
+		return "", false
+	}
+	exp, ok := s.expandHome(w)
+	if !ok {
+		return "", false
+	}
+	pats := []string{exp}
+	if !filepath.IsAbs(exp) {
+		pats = pats[:0]
+		for _, d := range s.dirs {
+			pats = append(pats, d+"/"+exp)
+		}
+	}
+	for _, p := range pats {
+		matches, _ := filepath.Glob(p)
+		for i, m := range matches {
+			if i >= maxGlobMatches {
+				return w + " (too many matches to check)", true
+			}
+			if q, ok := s.hit(m, false); ok {
+				return q, true
+			}
+		}
+	}
+	return "", false
+}
+
+// namesDynamic reports a word of c that holds an expansion.
+func (s *pathScope) namesDynamic(w string, c *simpleCmd) bool {
+	for k, x := range c.words {
+		if x == w && c.dyn[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // devSink reports a redirection target that keeps output on the terminal or drops it.
@@ -656,8 +732,13 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 	}
 	dirs := slices.Clone(s.dirs)
 	var trees []string // --git-dir / --work-tree values
+	bare, hidden := false, s.dynamic != ""
 	for k := 1; k < g.subIdx && k < len(argv); k++ {
 		opt, val, eq := strings.Cut(argv[k], "=")
+		if opt == "--bare" {
+			bare = true
+			continue
+		}
 		if opt != "-C" && opt != "--git-dir" && opt != "--work-tree" {
 			if gitValueOpts[argv[k]] {
 				k++
@@ -674,6 +755,9 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 		if dyn[k] && s.namesProtected(val) {
 			return sourcesExecBlocked("`git " + opt + " " + val + "` may point git at the sources")
 		}
+		if opt == "-C" && dyn[k] {
+			hidden = true
+		}
 		if opt != "-C" {
 			if q, ok := s.hit(val, false); ok {
 				return sourcesExecBlocked("`git " + opt + "` points git at `" + q + "`")
@@ -686,6 +770,7 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 			if s.namesProtected(val) {
 				return sourcesExecBlocked("`git -C " + val + "` may point git at the sources")
 			}
+			hidden = true
 			continue
 		}
 		for i, d := range dirs {
@@ -695,6 +780,11 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 				dirs[i] = filepath.Clean(d + "/" + exp)
 			}
 		}
+	}
+	// In a directory the guard cannot follow, a git dir given explicitly (--bare, --git-dir, --work-tree)
+	// may be a folder inside a clone that safe.bareRepository does not cover.
+	if hidden && (bare || len(trees) > 0) {
+		return sourcesExecBlocked("`git` with --bare, --git-dir or --work-tree after a cd or -C the guard cannot follow")
 	}
 	onClone := false
 	for _, d := range dirs {
@@ -709,6 +799,9 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 				}
 				onClone = true
 			}
+		}
+		if onClone && bare {
+			return sourcesExecBlocked("`git --bare` on a clone: git works on a clone's own repository only")
 		}
 		for _, t := range trees {
 			opt, v, _ := strings.Cut(t, " ")

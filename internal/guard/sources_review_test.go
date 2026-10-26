@@ -90,6 +90,23 @@ func TestSourcesReviewBlockers(t *testing.T) {
 			"git archive --remote=../sources/lib HEAD",
 		})
 	})
+	t.Run("[G02] cross-review: --bare, hidden directories, ancestors, rsync operands, stdin copies, globs", func(t *testing.T) {
+		refused(t, []string{
+			"git -C ../sources/lib --bare log -p",
+			"cd ../sources/lib && git --bare diff HEAD~ HEAD",
+			"cd \"$X\" && git --git-dir=. log -p",
+			"git -C \"$X\" --bare log -p",
+			"cp -R .. ../tmp/jd",
+			"tar -cf ../tmp/x.tar ..",
+			"rsync -a ../ ../tmp/jd",
+			"rsync -a ../sources/lib/ ../tmp/x --exclude ../sandbox/z",
+			"rsync -a --backup-dir=../tmp/b ../sources/lib/ ../sandbox/lib/",
+			"cp /dev/stdin ../tmp/x.sh < ../sources/lib/install.sh",
+			"cat ../sources/lib/install.sh | cp /dev/stdin ../tmp/x.sh",
+			"cat ../source[s]/lib/install.sh > ../tmp/x.sh",
+			"cat ../sources/li?/install.sh > ../tmp/x.sh",
+		})
+	})
 	t.Run("[G02] reading the clones and the sandbox route stay allowed", func(t *testing.T) {
 		user := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
 		for _, c := range []string{

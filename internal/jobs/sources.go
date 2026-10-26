@@ -553,9 +553,13 @@ func (m *Manager) prefetchJob(j *store.Job) {
 	if m.sourcesCloned(j) {
 		return
 	}
-	queued := func() bool {
+	// left reports a job that, by its row, is no longer this queued attempt; a failed read is not proof.
+	left := func() (bool, error) {
 		cur, err := m.Store.Get(j.ID)
-		return err == nil && cur.Status == store.StatusQueued && cur.Attempt == j.Attempt
+		if err != nil {
+			return false, err
+		}
+		return cur.Status != store.StatusQueued || cur.Attempt != j.Attempt, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sourceCloneTimeout)
 	defer cancel()
@@ -569,7 +573,7 @@ func (m *Manager) prefetchJob(j *store.Job) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if !queued() {
+				if gone, _ := left(); gone {
 					cancel()
 					return
 				}
@@ -588,7 +592,10 @@ func (m *Manager) prefetchJob(j *store.Job) {
 				Err: "cannot prepare the clones: " + RedactPrintable(err.Error(), 200)})
 		}
 	}
-	if !queued() {
+	if gone, err := left(); err != nil || gone {
+		if err != nil {
+			m.Log.Printf("job %s: sources: read the job: %v (cloned again next tick)", j.ID, err)
+		}
 		return // cancelled meanwhile: nothing launches it
 	}
 	if err := writeJSON(filepath.Join(dir, sourcesResultFile), res); err != nil {
