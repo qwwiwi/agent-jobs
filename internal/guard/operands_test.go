@@ -56,7 +56,7 @@ func TestCheckOperandsAreData(t *testing.T) {
 		{"sed posix script before -e", `POSIXLY_CORRECT=1 sed s/x/claude/e -e p f`, true},
 		{"sed abbreviated option", `sed --expr=s/x/claude/e f`, true},
 		{"sed -- script", `sed -n -- s/x/claude/e f`, true},
-		{"sed -f file", `sed -f prog.sed cmd/agent-jobs/x.go`, false},
+		{"sed -f file", `sed -f prog.sed cmd/agent-jobs/x.go`, true}, // the script file may hold an e command
 		{"sed -i suffix", `sed -i.bak -e s/a/b/ cmd/agent-jobs/x.go`, false},
 		{"sed unknown option", `sed --unknown cmd/agent-jobs/x.go`, true},
 		{"sed operand from variable", `sed -n 1p "$F/agent-jobs"`, true},

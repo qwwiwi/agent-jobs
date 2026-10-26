@@ -1,7 +1,6 @@
 package guard
 
 import (
-	"regexp"
 	"slices"
 	"strings"
 )
@@ -58,36 +57,78 @@ var goEnvRuns = map[string]bool{
 	"GOFLAGS": true, "CC": true, "CXX": true, "FC": true, "AR": true, "GCCGO": true, "PKG_CONFIG": true,
 }
 
-// goFlagsExec reports a GOFLAGS value carrying one of goExecFlags.
+// goFlagsExec reports a GOFLAGS value carrying one of goExecFlags, or a quote or a backslash: go
+// splits GOFLAGS into fields with its own quoting rules (`'-o=x'` is the field -o=x), which the guard
+// does not follow, so such a value counts as one with an exec flag.
 func goFlagsExec(val string) bool {
+	if strings.ContainsAny(val, `'"\`) {
+		return true
+	}
 	return slices.ContainsFunc(strings.Fields(val), func(f string) bool {
 		flag, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
 		return strings.HasPrefix(f, "-") && goExecFlags[flag]
 	})
 }
 
-// goEnvSetters set an environment variable from a NAME=value argument (go via `go env -w`, which
-// persists it for later calls).
-var goEnvSetters = map[string]bool{"export": true, "declare": true, "typeset": true, "local": true, "readonly": true, "go": true}
+// goEnvSetters set an environment variable from a NAME=value argument; so does `go env -w`, which
+// persists it for later calls (goEnv). Other go arguments such as `go test … -args GOFLAGS=x` are none.
+var goEnvSetters = map[string]bool{"export": true, "declare": true, "typeset": true, "local": true, "readonly": true}
 
-// goEnv (issue #96) rejects a goEnvRuns assignment whose value names git/gh, a shell or an agent
-// (`GOFLAGS=-toolexec=agent-jobs go test ./...`, `CC=claude go build`), in front of a command, under
-// env, on its own (exported later or with set -a) or as an argument of export/declare/go env -w. A
-// GOFLAGS value with a goExecFlags flag is allowed only in front of go itself, where staticArgv sees
-// it: set elsewhere it would turn a later `go build ./cmd/agent-jobs` into a renamed agent build.
+// goEnvChanged (issues #95, #96) reports a call that sets GOFLAGS or GOENV for its go commands in a
+// form the guard does not read: a word naming GOENV (a file of go settings), a word naming GOFLAGS
+// other than a literal `GOFLAGS=value` (an appended `GOFLAGS+=`, a dynamic value, a bare name given
+// to read, printf -v or export), a dynamic word given to a variable setter (`export "GOFL$x=…"`), or
+// `.`/`source` of a file or a declare -n name reference (localVars). The variable lives on for the
+// later commands of the call and the next loop iterations, so no go operand of the call is data.
+func goEnvChanged(scripts []*script) bool {
+	if _, all := localVars(scripts, "", false); all {
+		return true
+	}
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				v := split(c.words)
+				setter := false
+				if v.start < len(c.words) {
+					name, args := progName(c.words[v.start]), c.words[v.start+1:]
+					setter = varSetters[name] || name == "printf" && (printfTarget(args) != "" || len(args) > 0 && c.dyn[v.start+1])
+				}
+				for i, w := range c.words {
+					if setter && i > v.start && c.dyn[i] || strings.Contains(w, "GOENV") ||
+						strings.Contains(w, "GOFLAGS") && (c.dyn[i] || !strings.HasPrefix(w, "GOFLAGS=")) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// goEnv (issue #96) rejects a goEnvRuns assignment (`=` or `+=`) whose value names git/gh, a shell or
+// an agent (`GOFLAGS=-toolexec=agent-jobs go test ./...`, `CC=claude go build`), in front of a command,
+// under env, on its own (exported later or with set -a) or as an argument of export/declare/go env -w.
+// A GOFLAGS value with a goExecFlags flag is allowed only in front of go itself, where staticArgv sees
+// it: set elsewhere it would turn a later `go build ./cmd/agent-jobs` into a renamed agent build. go
+// env -w keeps GOFLAGS for later calls, so there a dynamic value is rejected too.
 func goEnv(c *simpleCmd, v cmdView) string {
 	isGo, setter := false, false
 	if v.start < len(c.words) {
 		name := progName(c.words[v.start])
-		isGo, setter = name == "go", goEnvSetters[name]
+		isGo = name == "go"
+		setter = goEnvSetters[name] || isGo && v.start+1 < len(c.words) && c.words[v.start+1] == "env"
 	}
 	for i, w := range c.words {
 		if i == v.start && !setter {
 			break
 		}
 		key, val, ok := strings.Cut(w, "=")
+		key = strings.TrimSuffix(key, "+")
 		if !ok || !goEnvRuns[key] {
 			continue
+		}
+		if isGo && i > v.start && key == "GOFLAGS" && c.dyn[i] {
+			return "go env -w GOFLAGS from a variable or substitution"
 		}
 		if execName(progName(val)) || reMention.MatchString(val) || (c.dyn[i] && mentionsExec(val)) {
 			return "Go environment " + key + " running git/gh, a shell or an agent"
@@ -153,14 +194,19 @@ var sedNoValue = map[string]bool{
 	"null-data": true, "debug": true, "sandbox": true, "follow-symlinks": true, "in-place": true, "line-length": true,
 }
 
-// sedOperands: the input files of sed. The script (an -e/--expression value, or the first non-option
-// word unless an -e/-f option comes before it) is no operand: `s/x/agent-jobs/e` runs a command. With
-// POSIXLY_CORRECT sed stops at the first non-option word (`sed SCRIPT -e x f` takes SCRIPT, not x),
-// so that word stays the script. An option sed is not known to take, or a long option abbreviation,
-// fails closed (nil).
-func sedOperands(args []string) []bool {
-	ops := make([]bool, len(args))
-	script, positional := -1, []int{} // script: index of the first -e/-f option
+// sedArgs parses the arguments of sed: ops marks its input files, scripts are its script texts (the
+// -e/--expression values, and the first non-option word unless an -e option comes before it). With
+// POSIXLY_CORRECT sed stops at the first non-option word (`sed SCRIPT -e x f` takes SCRIPT, not x), so
+// that word stays a script. ok is false for an option sed is not known to take, a long option
+// abbreviation or a script file (-f/--file), whose text the guard does not see.
+func sedArgs(args []string) (ops []bool, scripts []string, ok bool) {
+	ops = make([]bool, len(args))
+	script, positional := -1, []int{} // script: index of the first -e option
+	next := func(k int) {             // the script given as the word after option k
+		if k+1 < len(args) {
+			scripts = append(scripts, args[k+1])
+		}
+	}
 	for k := 0; k < len(args); k++ {
 		a := args[k]
 		switch {
@@ -169,17 +215,20 @@ func sedOperands(args []string) []bool {
 				positional = append(positional, k)
 			}
 		case strings.HasPrefix(a, "--"):
-			opt, _, eq := strings.Cut(a[2:], "=")
+			opt, val, eq := strings.Cut(a[2:], "=")
 			switch {
-			case opt == "expression" || opt == "file":
+			case opt == "expression":
 				if script < 0 {
 					script = k
 				}
-				if !eq {
-					k++ // the value is the next word
+				if eq {
+					scripts = append(scripts, val)
+				} else {
+					next(k)
+					k++
 				}
-			case !sedNoValue[opt] || (eq && opt != "in-place" && opt != "line-length"):
-				return nil
+			case opt == "file" || !sedNoValue[opt] || (eq && opt != "in-place" && opt != "line-length"):
+				return nil, nil, false
 			case opt == "line-length" && !eq:
 				k++
 			}
@@ -190,16 +239,24 @@ func sedOperands(args []string) []bool {
 				case 'n', 'E', 'r', 's', 'u', 'z':
 				case 'i':
 					break short // the rest is the backup suffix
-				case 'e', 'f', 'l':
-					if script < 0 && a[i] != 'l' {
+				case 'e':
+					if script < 0 {
 						script = k
 					}
+					if i == len(a)-1 {
+						next(k)
+						k++
+					} else {
+						scripts = append(scripts, a[i+1:])
+					}
+					break short
+				case 'l':
 					if i == len(a)-1 {
 						k++ // the value is the next word
 					}
 					break short
-				default:
-					return nil
+				default: // -f: a script file
+					return nil, nil, false
 				}
 			}
 		default:
@@ -207,26 +264,205 @@ func sedOperands(args []string) []bool {
 		}
 	}
 	if len(positional) > 0 && (script < 0 || positional[0] < script) {
-		positional = positional[1:] // the script
+		scripts = append(scripts, args[positional[0]])
+		positional = positional[1:]
 	}
 	for _, k := range positional {
 		ops[k] = true
 	}
+	return ops, scripts, true
+}
+
+// sedOperands: the input files of sed; nil when a script may hold an e command or an s///e flag
+// (sedCommandEs), when a script comes from a file or when sed's options are not all understood. Both
+// run the input lines as commands, so an input file named after an agent is no data then.
+func sedOperands(args []string) []bool {
+	ops, scripts, ok := sedArgs(args)
+	if !ok || slices.ContainsFunc(scripts, func(sc string) bool { return len(sedCommandEs(sc, true)) > 0 }) {
+		return nil
+	}
 	return ops
 }
 
-// reSedExec finds sed's e command or s///e flag: an `e` after an address (or its I/M flag), a `!`, a
-// separator, a closing delimiter or a blank. The text after it, to the end of the line, is a shell
-// command; it may follow without a blank (`sed 1eagent-jobs f`), so reMention alone does not see it.
-var reSedExec = regexp.MustCompile(`(^|[0-9$/,!~;{}IM\s])e`)
-
-// sedExecMention reports a sed script word in which an e command runs git/gh, a shell or an agent.
-func sedExecMention(w string) bool {
-	for _, m := range reSedExec.FindAllStringIndex(w, -1) {
-		cmd, _, _ := strings.Cut(strings.TrimLeft(w[m[1]:], " \t"), "\n")
-		if f := strings.Fields(cmd); len(f) > 0 && execName(progName(f[0])) || reMention.MatchString(cmd) {
-			return true
+// sedExecMention (issue #96) reports a sed call whose e command may run git/gh, a shell or an agent:
+// the text after an e that may be a command, to the end of its line, names one. The text may follow
+// the e without a blank (`sed 1eagent-jobs f`), so reMention alone does not see it. For a static argv
+// only the script texts count, and an e inside a regex or a replacement is no command (`sed
+// 's/eclaude/ok/' f`); otherwise (a dynamic word, an unknown option, -f) every e of every word counts.
+func sedExecMention(args []string, static bool) bool {
+	words, parse := args, false
+	if static {
+		if _, scripts, ok := sedArgs(args); ok {
+			words, parse = scripts, true
+		}
+	}
+	for _, w := range words {
+		for _, k := range sedCommandEs(w, parse) {
+			cmd, _, _ := strings.Cut(strings.TrimLeft(w[k+1:], " \t"), "\n")
+			if f := strings.Fields(cmd); len(f) > 0 && execName(progName(f[0])) || reMention.MatchString(cmd) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// sedCommandEs returns the indices of the e letters of a sed script that may be an e command or an
+// s///e flag: every e outside sedDataSpans. An e in an address regex or a replacement is no command;
+// one in a label, a file name, a comment or a/i/c text still counts (a false positive only drops the
+// operand exemption or rejects a rare script). Without parse every e counts.
+func sedCommandEs(script string, parse bool) []int {
+	var spans [][2]int
+	if parse {
+		spans = sedDataSpans(script)
+	}
+	var out []int
+	for k := 0; k < len(script); k++ {
+		if script[k] == 'e' && !slices.ContainsFunc(spans, func(sp [2]int) bool { return k >= sp[0] && k < sp[1] }) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// sedDataSpans returns the byte ranges [start, end) of a sed script that sed reads as a regex or a
+// replacement (an address /re/ or \cREc, the two parts of s and y); nil when the reader does not
+// understand the script (an unknown command, a/i/c text with a backslash, s///w, an unterminated
+// regex), so that every e counts. Text it skips (labels, comments, file names, a/i/c text, an e
+// command) holds no span, and it only resynchronises at the end of a line, so a span never covers
+// text that sed reads as commands.
+func sedDataSpans(s string) [][2]int {
+	var spans [][2]int
+	i := 0
+	blank := func() {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+	}
+	digits := func() {
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+	}
+	// delimited reads the text from i to the unescaped delimiter d, records it and steps past d.
+	delimited := func(d byte) bool {
+		start := i
+		for ; i < len(s); i++ {
+			switch s[i] {
+			case '\\':
+				i++ // the escaped character, a newline too
+			case '\n':
+				return false
+			case d:
+				spans = append(spans, [2]int{start, i})
+				i++
+				return true
+			}
+		}
+		return false
+	}
+	// address reads one address; present is false when none starts at i.
+	address := func() (present, ok bool) {
+		if i >= len(s) {
+			return false, true
+		}
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			digits()
+			if i < len(s) && s[i] == '~' {
+				i++
+				digits()
+			}
+		case c == '$':
+			i++
+		case c == '/' || c == '\\':
+			i++
+			d := byte('/')
+			if c == '\\' {
+				if i >= len(s) || s[i] == '\n' || s[i] == '\\' {
+					return true, false
+				}
+				d = s[i]
+				i++
+			}
+			if !delimited(d) {
+				return true, false
+			}
+			for i < len(s) && (s[i] == 'I' || s[i] == 'M') {
+				i++
+			}
+		default:
+			return false, true
+		}
+		return true, true
+	}
+	for {
+		for i < len(s) && strings.IndexByte(" \t\n;", s[i]) >= 0 {
+			i++
+		}
+		if i >= len(s) {
+			return spans
+		}
+		present, ok := address()
+		if !ok {
+			return nil
+		}
+		if blank(); present && i < len(s) && s[i] == ',' {
+			i++
+			blank()
+			if i < len(s) && (s[i] == '+' || s[i] == '~') {
+				i++
+				digits()
+			} else if present, ok := address(); !present || !ok {
+				return nil
+			}
+		}
+		blank()
+		for i < len(s) && s[i] == '!' {
+			i++
+			blank()
+		}
+		if i >= len(s) {
+			return nil
+		}
+		c := s[i]
+		i++
+		switch {
+		case c == '{' || c == '}':
+			continue
+		case strings.IndexByte("=dDgGhHnNpPxzF", c) >= 0:
+		case strings.IndexByte("lqQL", c) >= 0:
+			blank()
+			digits()
+		case c == 's' || c == 'y':
+			if i >= len(s) || s[i] == '\n' || s[i] == '\\' {
+				return nil
+			}
+			d := s[i]
+			i++
+			if !delimited(d) || !delimited(d) {
+				return nil
+			}
+			for c == 's' && i < len(s) && strings.IndexByte("gpiImMe0123456789", s[i]) >= 0 {
+				i++
+			}
+		case c == 'b' || c == 't' || c == 'T' || c == ':':
+			blank()
+			for i < len(s) && strings.IndexByte(" \t\n;", s[i]) < 0 {
+				i++
+			}
+		case strings.IndexByte("#aicerRwWv", c) >= 0: // the rest of the line is text, a file or a command
+			line, _, _ := strings.Cut(s[i:], "\n")
+			if strings.IndexByte("aic", c) >= 0 && strings.Contains(line, `\`) {
+				return nil
+			}
+			i += len(line)
+		default:
+			return nil
+		}
+		blank()
+		if i < len(s) && strings.IndexByte("\n;}#", s[i]) < 0 {
+			return nil
+		}
+	}
 }

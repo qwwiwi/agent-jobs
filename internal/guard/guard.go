@@ -1308,15 +1308,19 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	// arguments is rejected. A literal file or package operand of a program that never runs its
 	// operands is data (`go test ./cmd/agent-jobs/`, `sed -n 1p cmd/agent-jobs/x.go`; see operands).
 	var ops []bool
-	if staticArgv(c, v) {
+	static := staticArgv(c, v)
+	if static && !(name == "go" && sc.goEnvSet) {
 		ops = operands(name, argv[1:])
+	}
+	if name == "sed" && sedExecMention(argv[1:], static) {
+		return cannot("sed running git/gh, a shell or an agent indirectly")
 	}
 	for k, a := range argv[1:] {
 		if k < len(ops) && ops[k] {
 			continue
 		}
 		if b := progName(a); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
-			(dyn[k+1] && mentionsExec(a)) || (name == "sed" && sedExecMention(a)) {
+			(dyn[k+1] && mentionsExec(a)) {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
 		}
 	}
