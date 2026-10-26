@@ -24,4 +24,16 @@ go vet ./...
 echo "== go test"
 go test -count=1 ./...
 
+# The judge's manifest-check (examples/manifest-check/README.md): every live requirement needs a passing
+# tagged test. A checkout without a checklist has nothing to check; the judge's run writes the approved one.
+echo "== manifest-check"
+if [ -f brief/CHECKLIST.md ]; then
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  go test -count=1 -json ./... > "$tmp/go-test.json" || true # failing tests are reported by the go test step
+  scripts/manifest-check.sh "$tmp/go-test.json"
+else
+  echo "skipped: no brief/CHECKLIST.md"
+fi
+
 echo "check.sh: OK"
