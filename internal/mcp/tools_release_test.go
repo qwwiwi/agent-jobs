@@ -209,7 +209,8 @@ func TestReleaseCheckPasses(t *testing.T) {
 	r := f.check(t)
 	if !r.Pass || r.OwnerLine != "Acceptance: 2 of 2" || r.Accepted != 2 || r.Live != 2 || len(r.Mismatches) != 0 ||
 		r.ChecklistID != f.v.ID || r.Version != f.v.Version || r.ChecklistSHA256 != f.v.SHA256 || r.SHA != f.head ||
-		r.ManifestCheck == nil || r.ManifestCheck.ExitCode != 0 || r.Verdicts != 1 || r.JudgeFamily != "anthropic" {
+		r.ManifestCheck == nil || r.ManifestCheck.ExitCode != 0 || r.Verdicts != 1 || r.JudgeFamily != "anthropic" ||
+		r.SameFamily || !slices.Equal(r.CoderFamilies, []string{"openai"}) {
 		t.Fatalf("release_check: %+v", r)
 	}
 	if len(r.Conditions) != len(jobs.ReleaseConditions) {
@@ -313,20 +314,14 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.suspect = []string{"TestLogin passes without a login"}
 			f.judge(t, j)
 		}},
-		{"a coder of the judge's family, started after the verdict", jobs.ReleaseFamily, "family — the judge (anthropic", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			f.judge(t, okJudge())
-			f.coder(t, store.RunnerClaude, "sonnet", "R02") // the verdict's stored snapshot does not know it
-		}},
+		// The family cases ("a coder of the judge's family, started after the verdict", "only a failed
+		// coder") pass now (owner decision 2026-10-26, msg 68041: family is informational); they moved to
+		// TestReleaseCheckFamilyInformational with that expectation.
 		{"judge not blind by enforcement", jobs.ReleaseBlind, "enforced_blind — the judge (runner codex)", func(t *testing.T, f *releaseFix) {
 			f.coder(t, store.RunnerClaude, "sonnet", "R01", "R02")
 			j := okJudge()
 			j.runner, j.model, j.blind = store.RunnerCodex, "gpt-5.6-sol", false
 			f.judge(t, j)
-		}},
-		{"only a failed coder", jobs.ReleaseFamily, "family — no succeeded feature job (a fix or general job with covers, size not small)", func(t *testing.T, f *releaseFix) {
-			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			f.judge(t, okJudge())
 		}},
 		{"a red manifest-check judged again until green", jobs.ReleaseManifestCheck, "manifest_check — scripts/manifest-check.sh exited 1 (job gate-",
 			func(t *testing.T, f *releaseFix) {
@@ -482,18 +477,19 @@ func TestReleaseCheckWaiverSurvivesFixCommit(t *testing.T) {
 }
 
 // A feature job is a fix or general job with covers whose size is not small (F9 (a)): one queued before
-// sizes (none recorded) counts, so a same-family one fails the family condition; a small one does not;
-// alone, small coders leave the check without a feature job.
+// sizes (none recorded) counts, so a same-family one is reported as same_family; a small one does not;
+// alone, small coders leave the check without a feature job. Since the owner decision 2026-10-26 (msg
+// 68041: family is informational) neither fails the check: the expectations below were "fails" before.
 func TestReleaseCheckFeatureJobsBySize(t *testing.T) {
 	f := passing(t)
 	small := f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
 	r := f.check(t)
-	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small {
+	if !r.Pass || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].ID == small || r.SameFamily {
 		t.Fatalf("small coder counted: %+v", r)
 	}
 	unsized := f.coderSized(t, "", store.StatusSucceeded, store.RunnerClaude, "opus", "R02")
 	r = f.check(t)
-	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, unsized) || len(r.FeatureJobs) != 2 {
+	if !r.Pass || !r.SameFamily || !strings.Contains(r.FamilyNote, unsized) || len(r.FeatureJobs) != 2 {
 		t.Fatalf("a same-family coder without a recorded size not counted: %+v", r)
 	}
 
@@ -501,8 +497,8 @@ func TestReleaseCheckFeatureJobsBySize(t *testing.T) {
 	g.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 	g.judge(t, okJudge())
 	r = g.check(t)
-	if r.Pass || len(r.FeatureJobs) != 0 || condition(r, jobs.ReleaseFamily).OK ||
-		!strings.Contains(r.OwnerLine, "no succeeded feature job (a fix or general job with covers, size not small)") {
+	if !r.Pass || len(r.FeatureJobs) != 0 || r.SameFamily || len(r.CoderFamilies) != 0 ||
+		!strings.Contains(r.FamilyNote, "no succeeded feature job covers checklist") {
 		t.Fatalf("only a small coder: %+v", r)
 	}
 }
@@ -524,26 +520,59 @@ func TestReleaseCheckNoTraceCondition(t *testing.T) {
 	}
 }
 
-// The family condition counts only the succeeded feature jobs (owner decision 2026-10-25): a failed or
-// cancelled claude feature job and a claude coder of size small do not fail it under a claude judge; a
-// succeeded claude feature job does.
+// The reported families count only the succeeded feature jobs (owner decision 2026-10-25): a failed or
+// cancelled claude feature job and a claude coder of size small do not make a claude judge same_family; a
+// succeeded claude feature job does. It used to fail the check; since the owner decision 2026-10-26 (msg
+// 68041: family is informational) it passes with same_family reported.
 func TestReleaseCheckFamilyCountsSucceededFeatureJobsOnly(t *testing.T) {
 	f := passing(t)
 	f.coderStatus(t, store.StatusFailed, store.RunnerClaude, "sonnet", "R02")
 	f.coderStatus(t, store.StatusCancelled, store.RunnerClaude, "opus", "R01")
 	f.coderSized(t, jobs.SizeSmall, store.StatusSucceeded, store.RunnerClaude, "opus", "R01")
-	if r := f.check(t); !r.Pass || !condition(r, jobs.ReleaseFamily).OK {
-		t.Fatalf("failed, cancelled or small coders fail the family: %+v", r)
+	if r := f.check(t); !r.Pass || r.SameFamily || !slices.Equal(r.CoderFamilies, []string{"openai"}) {
+		t.Fatalf("failed, cancelled or small coders counted in the families: %+v", r)
 	}
 	same := f.coder(t, store.RunnerClaude, "sonnet", "R01")
 	r := f.check(t)
-	if fam := condition(r, jobs.ReleaseFamily); r.Pass || fam.OK || !strings.Contains(fam.Detail, same) {
-		t.Fatalf("a succeeded same-family feature job passes the family condition: %+v", r)
+	if !r.Pass || !r.SameFamily || !strings.Contains(r.FamilyNote, same) || !slices.Equal(r.CoderFamilies, []string{"openai", "anthropic"}) {
+		t.Fatalf("a succeeded same-family feature job: %+v", r)
+	}
+}
+
+// The former family failures of TestReleaseCheckFailsEachCondition pass now (owner decision 2026-10-26,
+// msg 68041: the judge is a separate blind job of any model; family is informational), the family
+// reported in judge_family, coder_families, same_family and family_note.
+func TestReleaseCheckFamilyInformational(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(t *testing.T, f *releaseFix)
+		same bool
+		note string
+	}{
+		{"a coder of the judge's family, started after the verdict", func(t *testing.T, f *releaseFix) {
+			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			f.judge(t, okJudge())
+			f.coder(t, store.RunnerClaude, "sonnet", "R02") // the verdict's stored snapshot does not know it
+		}, true, "judge anthropic (model opus) shares its family with coder job(s) coder-"},
+		{"only a failed coder", func(t *testing.T, f *releaseFix) {
+			f.coderStatus(t, store.StatusFailed, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
+			f.judge(t, okJudge())
+		}, false, "no succeeded feature job covers checklist"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReleaseFix(t)
+			tc.set(t, f)
+			r := f.check(t)
+			if !r.Pass || r.OwnerLine != "Acceptance: 2 of 2" || r.SameFamily != tc.same || r.JudgeFamily != "anthropic" ||
+				!strings.Contains(r.FamilyNote, tc.note) || condition(r, "family").Detail != "absent" {
+				t.Fatalf("%s: %+v", tc.name, r)
+			}
+		})
 	}
 }
 
 // Claude coders and a codex judge launched under the read-only codex sandbox (stored enforced_blind true)
-// pass: the family differs and the judge counts as blind.
+// pass: the judge counts as blind (the family differs, information only since 2026-10-26).
 func TestReleaseCheckClaudeCodersCodexJudgePass(t *testing.T) {
 	f := newReleaseFix(t)
 	f.coder(t, store.RunnerClaude, "opus", "R01", "R02")
@@ -604,5 +633,64 @@ func TestReleaseCheckWaiverBoundToChecklistID(t *testing.T) {
 	}
 	if r := f.check(t); !r.Pass || !r.Requirements[0].Waived || r.Requirements[0].WaiverQuote != "quote 0" {
 		t.Fatalf("own waiver: %+v", r.Requirements)
+	}
+}
+
+// The judge is a separate blind job of any model, its family informational (owner decision 2026-10-26,
+// msg 68041): claude coders and a blind claude judge pass when every row is met, the family reported as
+// information. Every other condition still fails the same setup: a judge not blind by enforcement, no
+// verdict, a partial row, a red manifest-check, a live requirement the verdict leaves out.
+func TestReleaseCheckSameFamilyBlindJudgePasses(t *testing.T) {
+	f := newReleaseFix(t)
+	coder := f.coder(t, store.RunnerClaude, "opus", "R01", "R02")
+	f.judge(t, okJudge())
+	r := f.check(t)
+	if !r.Pass || r.OwnerLine != "Acceptance: 2 of 2" {
+		t.Fatalf("claude coders, blind claude judge: %+v", r)
+	}
+	if r.JudgeFamily != "anthropic" || !r.SameFamily || !slices.Equal(r.CoderFamilies, []string{"anthropic"}) ||
+		!strings.Contains(r.FamilyNote, coder) || len(r.FeatureJobs) != 1 || r.FeatureJobs[0].Family != "anthropic" {
+		t.Fatalf("family not reported: %+v", r)
+	}
+
+	for _, tc := range []struct {
+		name string
+		cond string
+		line string
+		j    func() (judged, bool) // the judge's records, and whether to store them
+	}{
+		{"not blind by enforcement", jobs.ReleaseBlind, "enforced_blind — the judge (runner claude) was not blind", func() (judged, bool) {
+			j := okJudge()
+			j.blind = false
+			return j, true
+		}},
+		{"no verdict", jobs.ReleaseVerdict, "verdict — no judge verdict", func() (judged, bool) { return judged{}, false }},
+		{"partial row", jobs.ReleaseRequirements, "R01 — partial: NOTE_R01", func() (judged, bool) {
+			j := okJudge()
+			j.verdicts = map[string]string{"R01": "partial", "R02": "placeholder"}
+			return j, true
+		}},
+		{"red manifest-check", jobs.ReleaseManifestCheck, "manifest_check — scripts/manifest-check.sh exited 1", func() (judged, bool) {
+			j := okJudge()
+			j.exit = 1
+			return j, true
+		}},
+		{"a live requirement the verdict leaves out", jobs.ReleaseRequirements, "R02 — the verdict lists it 0 times", func() (judged, bool) {
+			j := okJudge()
+			j.verdicts = map[string]string{"R01": "met"}
+			return j, true
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReleaseFix(t)
+			f.coder(t, store.RunnerClaude, "opus", "R01", "R02")
+			if j, ok := tc.j(); ok {
+				f.judge(t, j)
+			}
+			r := f.check(t)
+			if c := condition(r, tc.cond); r.Pass || c.OK || !strings.Contains(r.OwnerLine, tc.line) {
+				t.Fatalf("%s: pass %v, %s %+v, owner line %q", tc.name, r.Pass, tc.cond, c, r.OwnerLine)
+			}
+		})
 	}
 }

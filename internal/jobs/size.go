@@ -37,8 +37,8 @@ const SizeRuleNote = "size: small for a fix or a single job; large for a new pro
 //   - fix / general with size large (given or inferred): covers must be non-empty, and every covered row
 //     a live requirement (an R, Ri or G row with contract live). This holds whether size_required is on
 //     or off.
-//   - fix / general with size small: no covers (a job with covers is a feature job, which the judge's
-//     family check counts: store.FeatureJobs).
+//   - fix / general with size small: no covers (a job with covers is a feature job, whose model family
+//     the judge's verdict and release_check report as information: store.FeatureJobs).
 func (m *Manager) checkSize(r StartRequest, covers []string, cover *store.CoverContract) (string, error) {
 	size := strings.TrimSpace(r.Size)
 	if size != "" && size != SizeSmall && size != SizeLarge {

@@ -186,10 +186,10 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 }
 
 // familyCoders selects the coders a judge's model family is compared with, the one rule of
-// JudgeFamilyWarning, the verdict's snapshot (gateStep) and release_check's family condition: feature
-// are the feature jobs of checklist id in repo (store.FeatureJobs: fix and general jobs with covers of
-// it, size not small), family those of them that succeeded (owner decision 2026-10-25: a failed or
-// cancelled coder delivered no feature).
+// JudgeFamilyNote, the verdict's snapshot (gateStep) and release_check's reported families (information
+// only, owner decision 2026-10-26): feature are the feature jobs of checklist id in repo
+// (store.FeatureJobs: fix and general jobs with covers of it, size not small), family those of them that
+// succeeded (owner decision 2026-10-25: a failed or cancelled coder delivered no feature).
 func familyCoders(st *store.Store, repo, id string) (feature, family []store.CoverJob, err error) {
 	feature, err = st.FeatureJobs(repo, id)
 	if err != nil {
@@ -203,12 +203,12 @@ func familyCoders(st *store.Store, repo, id string) (feature, family []store.Cov
 	return feature, family, nil
 }
 
-// JudgeFamilyWarning is judge_start's warning ("" = none) when the queued judge j runs on the model
-// family of a coder of its checklist (familyCoders, the rule of same_family in gateStep and of
-// release_check's family condition): its verdict will be stored with same_family true, which
-// release_check (F7) does not take. The default judge model is a claude model, so a judge without an
-// explicit gpt-* model of work a claude job coded gets it.
-func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
+// JudgeFamilyNote is judge_start's note ("" = none) when the queued judge j runs on the model family of a
+// coder of its checklist (familyCoders, the rule of same_family in gateStep and in release_check): its
+// verdict will be stored with same_family true. It is information, not a warning: the judge's
+// independence is that it is a separate blind job of any model, and release_check (F7) does not read
+// the family (owner decision 2026-10-26, msg 68041).
+func (m *Manager) JudgeFamilyNote(j *store.Job) (string, error) {
 	if j.Kind != KindJudge || j.Gate == nil {
 		return "", nil
 	}
@@ -227,9 +227,8 @@ func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
 		return "", nil
 	}
 	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of succeeded coder job(s) %s of "+
-		"checklist %s: its verdict will be stored with same_family true; a cross-family verdict needs a judge of a family no "+
-		"succeeded coder job shares (a gpt-* model runs on codex, blind under the read-only codex sandbox)", family, j.Model,
-		strings.Join(ids, ", "), j.Gate.ChecklistID), nil
+		"checklist %s: its verdict will be stored with same_family true, as information only (the judge is a separate blind "+
+		"job; release_check does not read the family)", family, j.Model, strings.Join(ids, ", "), j.Gate.ChecklistID), nil
 }
 
 // gateBriefLine is the brief column of a gate job: a description for job lists, never put in its prompt.
@@ -1075,7 +1074,8 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 		}
 	}
 	// A snapshot of the coders as they are now (familyCoders): a coder job that ends later does not
-	// change the stored flags, so release_check (F7) recomputes them with the same selection.
+	// change the stored flags, so release_check (F7) recomputes them with the same selection. The flags
+	// are information only (owner decision 2026-10-26).
 	v.SameFamily = slices.Contains(v.CoderFamilies, v.JudgeFamily)
 	v.FamilyDiffers = len(v.CoderFamilies) > 0 && !v.SameFamily
 	if _, err := st.PutVerdict(token, v); err != nil {

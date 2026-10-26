@@ -44,9 +44,10 @@ func TestJudgeIgnoresReplaceRefs(t *testing.T) {
 	}
 }
 
-// judge_start warns when any succeeded coder of the checklist shares the judge's family, as same_family
+// judge_start notes (information only, owner decision 2026-10-26) when any succeeded coder of the
+// checklist shares the judge's family, as same_family
 // is set: mixed coders do not hide it.
-func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
+func TestJudgeFamilyNoteMixedCoders(t *testing.T) {
 	m := newManager(t)
 	repo, sha := gateRepo(t)
 	approveBrief(t, m, repo)
@@ -66,7 +67,7 @@ func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
 		if model != "sonnet" {
 			share = "codex-ok"
 		}
-		w, err := m.JudgeFamilyWarning(j)
+		w, err := m.JudgeFamilyNote(j)
 		if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, share) {
 			t.Fatalf("judge %s of mixed coders: %q %v", model, w, err)
 		}

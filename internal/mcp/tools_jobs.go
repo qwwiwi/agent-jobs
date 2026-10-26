@@ -82,6 +82,9 @@ type JobView struct {
 	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
 	// config.json did not load, or the daemon runs another version (restart the session).
 	Warnings []string `json:"warnings,omitempty"`
+	// Notes (judge_start only): information that needs no action, such as the judge sharing a coder's
+	// model family (owner decision 2026-10-26: the family does not fail release_check).
+	Notes []string `json:"notes,omitempty"`
 	// CodexJobsToday (job_start of a codex job only): codex jobs of this agent in the last 24 hours
 	// against the daily cap, "n/limit".
 	CodexJobsToday string `json:"codex_jobs_today,omitempty"`

@@ -98,9 +98,10 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 			"approved checklist: a read-only job that gets BRIEF.md in full, the checklist rows (ID, brief quote, contract, rationale) and a " +
 			"copy of the files at sha (no git history, no agent settings or instructions, no job briefs, reports or diffs), assembled " +
 			"by the daemon. It returns met | partial | missing | placeholder | cannot_check per live requirement with evidence in a " +
-			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
-			"judge of the model family of a coder (a succeeded fix or general job with covers of the checklist, size not small) " +
-			"is stored but flagged (same_family; warnings says so at the start). A claude judge is blind by enforcement (the " +
+			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family. The " +
+			"judge may run on any model: its independence is that it is a separate blind job, not its model family; a judge of the " +
+			"family of a coder (a succeeded fix or general job with covers of the checklist, size not small) is stored with " +
+			"same_family true as information only (notes says so at the start). A claude judge is blind by enforcement (the " +
 			"guard's read allowlist, enforced_blind true); a codex judge is held by the read-only codex sandbox, which stops " +
 			"writes and network, not reads (enforced_blind true under that sandbox, false under codex_sandbox " +
 			"worktree-full-access). Before the judge starts, its wrapper runs the repository's scripts/manifest-check.sh (F6) in a " +
@@ -114,12 +115,12 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 			return nil, JobView{}, fmt.Errorf("judge_start rejected: %w", err)
 		}
 		v := view(d.Manager, j)
-		w, err := d.Manager.JudgeFamilyWarning(j)
+		n, err := d.Manager.JudgeFamilyNote(j)
 		if err != nil {
-			w = "the coders' model families could not be read: " + err.Error()
+			n = "the coders' model families could not be read: " + err.Error()
 		}
-		if w != "" {
-			v.Warnings = append(v.Warnings, w)
+		if n != "" {
+			v.Notes = append(v.Notes, n)
 		}
 		v.Warnings = append(v.Warnings, d.Manager.ManifestCheckWarnings(j)...)
 		return nil, v, nil
@@ -260,7 +261,7 @@ func addJudgeGet(s *sdk.Server, d Deps) {
 			"verdict, how and evidence, the commands run, unmapped_brief, extra_scope, suspect_tests, the judge model and family, " +
 			"enforced_blind (true for a claude judge held by the guard and for a codex one under the read-only codex sandbox), " +
 			"the families of the coders (the succeeded fix and general jobs with covers of the checklist, size not small) with " +
-			"family_differs / same_family (a snapshot taken when the verdict was stored; release_check, F7, recomputes them), and " +
+			"family_differs / same_family (information only; a snapshot taken when the verdict was stored), and " +
 			"current (the verdict is for the latest approved checklist), and manifest_check: the record of the run of " +
 			"scripts/manifest-check.sh the judge's wrapper made at sha before the judge started (exit_code, duration_sec, the " +
 			"output tail).",
@@ -296,9 +297,10 @@ func addReleaseCheck(s *sdk.Server, d Deps) {
 			"exits 0), verdict (a judge verdict for sha at the approved checklist id and version; every verdict for them must agree), " +
 			"requirements (each live requirement met, placeholder on a placeholder-ok row, or judged and carrying an owner waiver " +
 			"bound to this checklist id, hash and version and the requirement, not to a commit), unmapped_brief and suspect_tests " +
-			"(empty), family (the judge's model family differs from that of every succeeded feature job, recomputed now; a feature " +
-			"job is a fix or general job of the repo whose covers name the checklist id and whose size is not small), " +
-			"enforced_blind (true). feature_jobs and covered_by list the feature jobs and their covers, informational only. " +
+			"(empty), enforced_blind (true). The judge may run on any model, the coders' too: judge_family, coder_families (of " +
+			"the succeeded feature jobs, recomputed now; a feature job is a fix or general job of the repo whose covers name the " +
+			"checklist id and whose size is not small), same_family and family_note are information, not a condition. " +
+			"feature_jobs and covered_by list the feature jobs and their covers, informational only. " +
 			"owner_line is " +
 			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason».",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ReleaseCheckInput) (*sdk.CallToolResult, jobs.ReleaseCheckResult, error) {

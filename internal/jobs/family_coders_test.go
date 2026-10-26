@@ -49,9 +49,9 @@ func TestFamilyCodersSelection(t *testing.T) {
 	}
 }
 
-// judge_start's warning uses the same coders as release_check: a succeeded large claude coder and a
-// failed codex coder warn a claude judge, not a codex one.
-func TestJudgeFamilyWarningSucceededCodersOnly(t *testing.T) {
+// judge_start's family note (information only, owner decision 2026-10-26) uses the same coders as
+// release_check: a succeeded large claude coder and a failed codex coder note a claude judge, not a codex one.
+func TestJudgeFamilyNoteSucceededCodersOnly(t *testing.T) {
 	m := newManager(t)
 	repo, sha := gateRepo(t)
 	approveBrief(t, m, repo)
@@ -59,13 +59,13 @@ func TestJudgeFamilyWarningSucceededCodersOnly(t *testing.T) {
 	insertCoder(t, m, repo, "codex-failed", store.StatusFailed, SizeLarge, store.RunnerCodex, "gpt-5.6-sol", "R01")
 	for _, tc := range []struct {
 		model string
-		want  string // a coder id in the warning ("" = no warning)
+		want  string // a coder id in the note ("" = no note)
 	}{{"gpt-5.6-sol", ""}, {"sonnet", "claude-ok"}} {
 		j, err := m.StartGate(GateRequest{Kind: KindJudge, Repo: repo, SHA: sha, Model: tc.model})
 		if err != nil {
 			t.Fatal(err)
 		}
-		w, err := m.JudgeFamilyWarning(j)
+		w, err := m.JudgeFamilyNote(j)
 		if err != nil || tc.want == "" && w != "" || tc.want != "" && (!strings.Contains(w, tc.want) || strings.Contains(w, "codex-failed")) {
 			t.Errorf("judge %s: %q %v", tc.model, w, err)
 		}
