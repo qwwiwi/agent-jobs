@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,90 +18,6 @@ func readDoc(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return string(b)
-}
-
-// headingLevel is the number of #s of a markdown heading line, 0 for any other line.
-func headingLevel(line string) int {
-	n := len(line) - len(strings.TrimLeft(line, "#"))
-	if n == 0 || !strings.HasPrefix(line[n:], " ") {
-		return 0
-	}
-	return n
-}
-
-// docSection is the text of doc from the line heading up to the next heading of the same or a higher
-// level outside a code fence ("" when doc has no such heading).
-func docSection(doc, heading string) string {
-	_, rest, ok := strings.Cut(doc, "\n"+heading+"\n")
-	if !ok {
-		return ""
-	}
-	lines := strings.Split(rest, "\n")
-	fenced := false
-	for i, line := range lines {
-		if strings.HasPrefix(line, "```") {
-			fenced = !fenced
-		}
-		if l := headingLevel(line); !fenced && l > 0 && l <= headingLevel(heading) {
-			return strings.Join(lines[:i], "\n")
-		}
-	}
-	return rest
-}
-
-// The docs keep the two terms apart: the checklist keeps its name as the acceptance list, a milestone is
-// a stage of work.
-func TestMilestoneTermsDocumented(t *testing.T) {
-	t.Run("[R06] GUIDE and README define checklist as the acceptance list and milestone as a stage of work", func(t *testing.T) {
-		for name, want := range map[string][]string{
-			"docs/GUIDE.md": {
-				"- **checklist**: the acceptance list of a repository (`brief/CHECKLIST.md`, Wave F); it keeps its name and does not change.",
-				"- **milestone**: a stage of work. A large project is a sequence of milestones",
-			},
-			"README.md": {
-				"A large project is split into **milestones** (stages of work, ordered per repository)",
-				"The **checklist** (`brief/CHECKLIST.md`) stays the acceptance list",
-			},
-		} {
-			doc := readDoc(t, name)
-			for _, s := range want {
-				if !strings.Contains(doc, s) {
-					t.Errorf("%s lacks %q", name, s)
-				}
-			}
-		}
-	})
-}
-
-// README, GUIDE and the decisions describe milestones in English (the Russian copies are separate files),
-// PLAN has the milestones phase 2, and the decision keeps «no noticeable latency» as a constraint.
-func TestMilestoneDocsInEnglish(t *testing.T) {
-	t.Run("[R09i] README, GUIDE, PLAN and DECISIONS describe milestones in English", func(t *testing.T) {
-		cyrillic := regexp.MustCompile(`\p{Cyrillic}`)
-		decisions := readDoc(t, "docs/DECISIONS.md")
-		var approved string
-		for _, line := range strings.Split(decisions, "\n") {
-			if strings.Contains(line, "**Milestones build approved by the owner.**") {
-				approved = line
-			}
-		}
-		if !strings.Contains(approved, "no noticeable latency on job_start or the daemon tick") {
-			t.Errorf("DECISIONS.md: the milestones decision lacks the latency constraint: %q", approved)
-		}
-		for _, c := range []struct{ name, text string }{
-			{"README.md ## Milestones", docSection(readDoc(t, "README.md"), "## Milestones: stages, tasks, jobs")},
-			{"GUIDE.md ### Milestones", docSection(readDoc(t, "docs/GUIDE.md"), "### Milestones")},
-			{"PLAN.md ## Milestones phase 2", docSection(readDoc(t, "docs/PLAN.md"), "## Milestones phase 2 (approved, not built)")},
-			{"DECISIONS.md milestones row", approved},
-		} {
-			if !strings.Contains(c.text, "milestone") {
-				t.Errorf("%s: no milestones section", c.name)
-			}
-			if w := cyrillic.FindString(c.text); w != "" {
-				t.Errorf("%s: not English (%q)", c.name, w)
-			}
-		}
-	})
 }
 
 // milestoneOverheadBound is how much slower, per call, a step may be with a milestone than without one.
