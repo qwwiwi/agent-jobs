@@ -58,6 +58,10 @@ func TestSystemDoctor(t *testing.T) {
 	if out.Queue.ConfiguredMaxRunning != jobs.DefaultMaxRunningPerAgent {
 		t.Fatalf("doctor queue: %+v", out.Queue)
 	}
+	// No stored approval: merge_gate is an empty list, not null.
+	if out.MergeGate == nil || len(out.MergeGate) != 0 {
+		t.Fatalf("doctor merge_gate: %+v", out.MergeGate)
+	}
 	if err := os.WriteFile(m.Cfg.OwnerRulesPath, []byte("- rule\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

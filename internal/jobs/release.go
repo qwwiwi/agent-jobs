@@ -99,6 +99,9 @@ type ReleaseCheckResult struct {
 	Mismatches    []string             `json:"mismatches"`
 	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …».
 	OwnerLine string `json:"owner_line"`
+	// approvalSeq is the seq of the approval the check read (once) and checked: its pass ships only that
+	// approval (#99), also when the checklist is re-approved before the pass is stored.
+	approvalSeq int64
 }
 
 // maxReleaseReason bounds one mismatch reason.
@@ -124,7 +127,8 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return nil, fmt.Errorf("release_check passed, but the remote names for the merge hook could not be stored: %w", err)
 	}
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: out.Repo, SHA: out.SHA, ChecklistID: out.ChecklistID,
-		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now()}); err != nil {
+		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now(),
+		ApprovalSeq: out.approvalSeq}); err != nil {
 		return nil, fmt.Errorf("release_check passed, but its record for the merge hook could not be stored: %w", err)
 	}
 	return out, nil
@@ -192,6 +196,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return out, nil
 	}
 	set(ReleaseApproval, true, "checklist %s version %d approved, hash unchanged", c.ID, c.Version)
+	out.approvalSeq = last.Seq
 	live := c.LiveIDs()
 	if len(live) == 0 {
 		set(ReleaseRequirements, false, "the checklist has no live requirements")

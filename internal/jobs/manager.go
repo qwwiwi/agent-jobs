@@ -283,8 +283,13 @@ func (m *Manager) spawnEnv(unit string) []string {
 }
 
 func git(dir string, args ...string) (string, error) {
+	return gitEnv(dir, daemonGitEnv(), args...)
+}
+
+// gitEnv is git with environment env.
+func gitEnv(dir string, env []string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
@@ -506,6 +511,11 @@ func (m *Manager) Tick() error {
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
 	// docker call may take up to containerCmdTimeout.
 	m.retryContainerCleanups()
+	// A checklist whose release shipped stops gating merges (#99): recorded here for the merge hook,
+	// which opens the store read-only.
+	if serr := m.MarkShippedGates(); serr != nil {
+		err = errors.Join(err, fmt.Errorf("merge gate shipped: %w", serr))
+	}
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {
