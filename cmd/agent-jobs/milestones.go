@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strconv"
@@ -55,8 +58,12 @@ func cmdMilestones(args []string) error {
 	return w.Flush()
 }
 
-// cmdMilestone is `agent-jobs milestone <id>`: milestone_get as text or JSON.
+// cmdMilestone is `agent-jobs milestone <id>`: milestone_get as text or JSON; `milestone create` and
+// `milestone set` are milestone_create and milestone_set (cmdMilestoneEdit).
 func cmdMilestone(args []string) error {
+	if len(args) > 0 && (args[0] == "create" || args[0] == "set") {
+		return cmdMilestoneEdit(args[0], args[1:], os.Stdin)
+	}
 	fs := flag.NewFlagSet("milestone", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	asJSON := fs.Bool("json", false, "print the tree as JSON (same as milestone_get)")
@@ -67,9 +74,9 @@ func cmdMilestone(args []string) error {
 	if len(rest) != 1 {
 		return errors.New("usage: agent-jobs milestone --agent A <id> [--json]")
 	}
-	id, err := strconv.ParseInt(rest[0], 10, 64)
-	if err != nil || id <= 0 {
-		return fmt.Errorf("milestone id %q must be a positive number", rest[0])
+	id, err := milestoneID(rest[0])
+	if err != nil {
+		return err
 	}
 	m, err := open(*agent)
 	if err != nil {
@@ -129,6 +136,132 @@ func cmdMilestone(args []string) error {
 		fmt.Printf("note: %s\n", v.Note)
 	}
 	return nil
+}
+
+const milestoneEditUsage = "usage: agent-jobs milestone create --agent A --input F|- [--title T]\n" +
+	"       agent-jobs milestone set --agent A <id> [--input F|-] [--title T] [--status S] [--close-note N]"
+
+// cmdMilestoneEdit is `agent-jobs milestone create` (op "create", milestone_create) and `agent-jobs
+// milestone set <id>` (op "set", milestone_set): the same manager calls, so the same validation, and the
+// same JSON tree on stdout. --input is a file ("-" = stdin) with the tool's JSON input, or with only
+// its tasks array; the flags set single fields over it.
+func cmdMilestoneEdit(op string, args []string, stdin io.Reader) error {
+	fs := flag.NewFlagSet("milestone "+op, flag.ContinueOnError)
+	agent := agentFlag(fs)
+	input := fs.String("input", "", "JSON file (- = stdin): the milestone_"+op+" input object, or only its tasks array")
+	title := fs.String("title", "", "the milestone's title (over the input's)")
+	status := new(string)
+	closeNote := new(string)
+	if op == "set" {
+		status = fs.String("status", "", "open|done|dropped (over the input's)")
+		closeNote = fs.String("close-note", "", "one line (over the input's)")
+	}
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if (op == "create" && (len(pos) != 0 || *input == "")) || (op == "set" && len(pos) != 1) {
+		return errors.New(milestoneEditUsage)
+	}
+	var raw []byte
+	if *input != "" {
+		if raw, err = readInput(*input, stdin); err != nil {
+			return err
+		}
+	}
+	ctx := context.Background()
+	if op == "create" {
+		var in jobs.MilestoneCreate
+		if err := decodeMilestoneInput(raw, &in, &in.Tasks); err != nil {
+			return err
+		}
+		if *title != "" {
+			in.Title = *title
+		}
+		m, err := open(*agent)
+		if err != nil {
+			return err
+		}
+		defer m.Close()
+		v, err := m.CreateMilestone(ctx, in)
+		if err != nil {
+			return err
+		}
+		return printJSON(v)
+	}
+	id, err := milestoneID(pos[0])
+	if err != nil {
+		return err
+	}
+	var in jobs.MilestoneSet
+	if raw != nil {
+		if err := decodeMilestoneInput(raw, &in, &in.Tasks); err != nil {
+			return err
+		}
+	}
+	if in.ID != 0 && in.ID != id {
+		return fmt.Errorf("the input's id %d is not milestone %d", in.ID, id)
+	}
+	in.ID = id
+	if *title != "" {
+		in.Title = *title
+	}
+	if *status != "" {
+		in.Status = *status
+	}
+	if *closeNote != "" {
+		in.CloseNote = *closeNote
+	}
+	m, err := open(*agent)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	v, err := m.SetMilestone(ctx, in)
+	if err != nil {
+		return err
+	}
+	return printJSON(v)
+}
+
+// readInput reads the file name, or stdin for "-".
+func readInput(name string, stdin io.Reader) ([]byte, error) {
+	if name == "-" {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+		return b, nil
+	}
+	return os.ReadFile(name)
+}
+
+// decodeMilestoneInput decodes raw into in (a JSON object: the tool's input) or into tasks (a JSON
+// array: only the tasks). Unknown fields and trailing data are refused, as the tool's input schema
+// refuses them.
+func decodeMilestoneInput(raw []byte, in any, tasks *[]jobs.MilestoneTaskInput) error {
+	raw = bytes.TrimSpace(raw)
+	var target any = in
+	if len(raw) > 0 && raw[0] == '[' {
+		target = tasks
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(target); err != nil {
+		return fmt.Errorf("milestone input: %w", err)
+	}
+	if dec.More() {
+		return errors.New("milestone input: more than one JSON value")
+	}
+	return nil
+}
+
+func milestoneID(s string) (int64, error) {
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("milestone id %q must be a positive number", s)
+	}
+	return id, nil
 }
 
 // jobSkills renders a job's skills for the JOBS column: one list when the skills selected at job_start

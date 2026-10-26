@@ -116,6 +116,7 @@ A large project is split into **milestones** (stages of work, ordered per reposi
 - **Skills planned once.** Each task may carry `skills` (the `+name` / `-name` edits of `job_start`), chosen in `milestone_create` for the whole stage; a `job_start` on the task gets them unless it gives its own, and the tree shows the plan and what each job got. The optional `hook skills-picker` asks for them there, not at every job.
 - **Prior results.** A job on a task with `depends_on` gets the accepted results of those tasks in its prompt (commit, diffstat, Summary and Findings of the report, capped) and their full reports in `prior/<key>/report.md`.
 - **Built for a frontend.** `milestone_get` returns the whole tree (tasks, their jobs, ready tasks, progress, acceptance), `milestone_list` with `repo` and `tree` the whole project in one call, and its `cursor` is the next `updated_since`; `GET /v1/milestones` and `GET /v1/milestones/{id}` of the read-only HTTP API return the same JSON.
+- **Same on the command line.** `agent-jobs milestone create --input tasks.json --title T`, `milestone set <id> --input edit.json`, `milestone <id>` and `milestones` call the same code as the MCP tools and print the same JSON.
 
 Details, the JSON schema and the endpoints: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones).
 

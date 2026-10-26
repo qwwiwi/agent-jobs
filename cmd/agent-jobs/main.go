@@ -109,6 +109,13 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the milestones (milestone_list): by repo, order, creation
   milestone  --agent A <id> [--json]       one milestone's tree (milestone_get): tasks with their
                                            derived status and jobs, ready tasks, progress
+  milestone create --agent A --input F|- [--title T]
+                                           create a milestone with its tasks (milestone_create): F
+                                           holds its JSON input or only the tasks array ("-" = stdin);
+                                           prints the tree as JSON
+  milestone set --agent A <id> [--input F|-] [--title T] [--status S] [--close-note N]
+                                           edit a milestone (milestone_set): F as for create, the
+                                           flags over it; prints the tree as JSON
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
                                            time, delivery (session or job kind), next and last firing
   checks     --agent A [--json]            the agent's dead-man's switch checks (check_* MCP tools):
