@@ -541,7 +541,7 @@ An invalid block fails the job (`gate result rejected: …`) and stores nothing:
   "checklist": {"id": "shop", "version": 3, "sha256": "<checklist sha256>"},
   "sha": "<full commit id>",
   "ran": [{"cmd": "go test ./...", "result": "ok"}],
-  "could_not_run": ["<command · why>"],
+  "could_not_run": [{"cmd": "<command>", "why": "<why not run>"}],
   "requirements": [{"id": "R01", "verdict": "met|partial|missing|placeholder|cannot_check", "how": "ran|read",
                     "evidence": ["internal/x/x.go:42", "TestLogin"], "note": "<optional>"}],
   "unmapped_brief": ["<brief quote no requirement covers>"],
