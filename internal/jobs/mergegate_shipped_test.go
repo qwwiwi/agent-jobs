@@ -30,7 +30,7 @@ func shippedRepo(t *testing.T, m *Manager) (repo, shaA, shaX string) {
 		t.Fatalf("approval: %+v %v", last, err)
 	}
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: mainWorktree(repo), SHA: shaX, ChecklistID: last.ChecklistID,
-		Version: last.Version, ChecklistSHA256: last.ChecklistSHA256, CreatedAt: time.Now()}); err != nil {
+		Version: last.Version, ChecklistSHA256: last.ChecklistSHA256, CreatedAt: time.Now(), ApprovalSeq: last.Seq}); err != nil {
 		t.Fatal(err)
 	}
 	gitT(t, repo, "update-ref", "refs/remotes/origin/main", shaA)
@@ -127,7 +127,7 @@ func TestMergeGateShipped(t *testing.T) {
 		t.Fatalf("shipped record without its pass: %q", r)
 	}
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: main, SHA: shaX, ChecklistID: last.ChecklistID,
-		Version: last.Version, ChecklistSHA256: last.ChecklistSHA256, CreatedAt: time.Now()}); err != nil {
+		Version: last.Version, ChecklistSHA256: last.ChecklistSHA256, CreatedAt: time.Now(), ApprovalSeq: last.Seq}); err != nil {
 		t.Fatal(err)
 	}
 	if r := gate(); r != "" {
@@ -218,7 +218,7 @@ func TestMergeGateShippedRecheck(t *testing.T) {
 	pass := func(sha, verdict string) {
 		t.Helper()
 		if err := m.Store.PutReleasePass(store.ReleasePass{Repo: main, SHA: sha, ChecklistID: last.ChecklistID, Version: last.Version,
-			ChecklistSHA256: last.ChecklistSHA256, VerdictJob: verdict, CreatedAt: time.Now()}); err != nil {
+			ChecklistSHA256: last.ChecklistSHA256, VerdictJob: verdict, CreatedAt: time.Now(), ApprovalSeq: last.Seq}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -318,8 +318,8 @@ func TestMergeGateShippedIgnoresRewrittenHistory(t *testing.T) {
 }
 
 // An unchanged re-approval (the same id, version and hash, a new approval seq) gates again: the pass
-// read before it does not ship it, and the refusal does not name that pass; a pass created at or after
-// the re-approval on the default branch ships it at the next tick.
+// at the approval before it does not ship it, and the refusal does not name that pass; a pass at the
+// re-approval on the default branch ships it at the next tick.
 func TestMergeGateShippedReapproval(t *testing.T) {
 	m := newManager(t)
 	repo, _, shaX := shippedRepo(t, m)
@@ -358,7 +358,7 @@ func TestMergeGateShippedReapproval(t *testing.T) {
 	}
 	// A pass at the re-approval on a sha on the default branch ships it.
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: main, SHA: shaX, ChecklistID: last.ChecklistID, Version: last.Version,
-		ChecklistSHA256: last.ChecklistSHA256, CreatedAt: at}); err != nil {
+		ChecklistSHA256: last.ChecklistSHA256, CreatedAt: at, ApprovalSeq: last.Seq}); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Tick(); err != nil {
@@ -422,8 +422,8 @@ func TestMergeGateShippedOnlyValidLatest(t *testing.T) {
 }
 
 // The hook honours a shipped record only for the approval it names: after an unchanged re-approval (a
-// new seq, the same id, version and hash) the record of the earlier approval, whose pass is still stored
-// and counts at the same hash, lifts nothing.
+// new seq, the same id, version and hash) the record of the earlier approval lifts nothing, also once
+// release_check passed on its sha at the re-approval (a pass that counts, not yet shipped by a tick).
 func TestMergeGateShippedSeqMustMatch(t *testing.T) {
 	m := newManager(t)
 	repo, _, shaX := shippedRepo(t, m)
@@ -447,9 +447,16 @@ func TestMergeGateShippedSeqMustMatch(t *testing.T) {
 	if err != nil || last.Seq == first.Seq || last.ChecklistSHA256 != first.ChecklistSHA256 {
 		t.Fatalf("re-approval: %+v %v", last, err)
 	}
-	// The earlier approval's pass counts at the current id, version and hash (what passCounts reads).
-	if ok, err := m.passCounts(&gatedRepo{main: main, id: last.ChecklistID, version: last.Version, hash: last.ChecklistSHA256},
-		shaX); err != nil || !ok {
+	// The earlier approval's pass does not count for the re-approval; a pass at the re-approval does.
+	r := &gatedRepo{main: main, id: last.ChecklistID, version: last.Version, hash: last.ChecklistSHA256, seq: last.Seq}
+	if ok, err := m.passCounts(r, shaX); err != nil || ok {
+		t.Fatalf("the earlier approval's pass counts: %v %v", ok, err)
+	}
+	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: main, SHA: shaX, ChecklistID: last.ChecklistID, Version: last.Version,
+		ChecklistSHA256: last.ChecklistSHA256, CreatedAt: time.Now(), ApprovalSeq: last.Seq}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := m.passCounts(r, shaX); err != nil || !ok {
 		t.Fatalf("pass does not count: %v %v", ok, err)
 	}
 	if a, err := m.MergeGateCheck(repo, "gh pr merge 8", ""); err != nil || a.Refusal == "" {
@@ -458,4 +465,113 @@ func TestMergeGateShippedSeqMustMatch(t *testing.T) {
 	if views, err := m.MergeGates(); err != nil || len(views) != 1 || views[0].State != MergeGateGated {
 		t.Fatalf("view: %+v %v", views, err)
 	}
+}
+
+// releasedRepo is gateRepo with an approved checklist, a GitHub origin, a succeeded codex feature job and
+// a judge's verdict at the head sha, so release_check passes there; origin's default branch is at the
+// head. Nothing is stored as a pass yet.
+func releasedRepo(t *testing.T) (m *Manager, repo, sha string) {
+	t.Helper()
+	m = acceptanceManager(t, "")
+	repo, sha = gateRepo(t)
+	gitT(t, repo, "remote", "add", "origin", "git@github.com:Acme/Demo.git")
+	approveBrief(t, m, repo)
+	if err := m.Store.Insert(&store.Job{ID: "cx-shipped", Agent: m.Agent, Title: "codex coder", Kind: "general", Brief: "b",
+		RepoPath: mainWorktree(repo), Status: store.StatusSucceeded, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: time.Now(),
+		Size: SizeLarge, CoverContract: &store.CoverContract{ChecklistID: "demo", Version: 2}, Covers: []string{"R01", "R02", "R03i"}}); err != nil {
+		t.Fatal(err)
+	}
+	if j := runToEnd(t, m, judgeJob(t, m, repo, sha).ID); j.Status != store.StatusSucceeded {
+		t.Fatalf("judge: %s %s", j.Status, j.Error)
+	}
+	gitT(t, repo, "update-ref", "refs/remotes/origin/main", sha)
+	gitT(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	return m, repo, sha
+}
+
+// releaseCheckAt runs release_check on sha with the clock at the given time (the pass's created_at).
+func releaseCheckAt(t *testing.T, m *Manager, repo, sha string, now func() time.Time) {
+	t.Helper()
+	orig := m.Now
+	m.Now = now
+	defer func() { m.Now = orig }()
+	if r, err := m.ReleaseCheck(repo, sha); err != nil || !r.Pass {
+		t.Fatalf("release_check: %+v %v", r, err)
+	}
+}
+
+// reapprove stores an unchanged re-approval (the same id, version and hash, a new seq) at the given time.
+func reapprove(t *testing.T, m *Manager, main string, at time.Time) *store.ChecklistApproval {
+	t.Helper()
+	first, err := m.Store.LatestApproval(main)
+	if err != nil || first == nil {
+		t.Fatalf("approval: %+v %v", first, err)
+	}
+	again := *first
+	again.Seq, again.ApprovedAt = 0, at
+	if err := m.Store.PutApproval(again); err != nil {
+		t.Fatal(err)
+	}
+	last, err := m.Store.LatestApproval(main)
+	if err != nil || last.Seq == first.Seq || last.ChecklistSHA256 != first.ChecklistSHA256 || last.Version != first.Version {
+		t.Fatalf("re-approval: %+v %v", last, err)
+	}
+	return last
+}
+
+// assertShippedAt ticks and checks the stored shipped record names seq (0 = nothing shipped).
+func assertShippedAt(t *testing.T, m *Manager, main string, seq int64, what string) {
+	t.Helper()
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != seq {
+		t.Fatalf("%s: shipped %+v, want seq %d (%v)", what, g, seq, err)
+	}
+}
+
+// A pass binds to the approval release_check evaluated, not to a time: release_check passed at T+0.1s,
+// the checklist was re-approved unchanged at T+0.9s (the same second, as both are stored), and the next
+// tick does not ship the re-approval on that pass, nor does the refusal name it; release_check at the
+// re-approval ships it.
+func TestMergeGateShippedSameSecondReapproval(t *testing.T) {
+	m, repo, sha := releasedRepo(t)
+	main := mainWorktree(repo)
+	at := time.Now().Add(time.Hour).Truncate(time.Second)
+	releaseCheckAt(t, m, repo, sha, func() time.Time { return at.Add(100 * time.Millisecond) })
+	last := reapprove(t, m, main, at.Add(900*time.Millisecond))
+	assertShippedAt(t, m, main, 0, "same-second re-approval")
+	r, err := m.MergeGateCheck(repo, "gh pr merge 8 --match-head-commit "+strings.Repeat("cd", 20), "")
+	if err != nil || !strings.Contains(r.Refusal, "release_check has not passed on") || strings.Contains(r.Refusal, "passed on "+sha) {
+		t.Fatalf("re-approval not gated, or the refusal names the pass before it: %+v %v", r, err)
+	}
+	releaseCheckAt(t, m, repo, sha, func() time.Time { return at.Add(2 * time.Second) })
+	assertShippedAt(t, m, main, last.Seq, "release_check at the re-approval")
+}
+
+// An overlapping release_check: it read the approval, the checklist was re-approved unchanged before it
+// stored its pass (stamped after the re-approval). The pass is of the approval it evaluated, so it does
+// not ship the re-approval; release_check at the re-approval ships it.
+func TestMergeGateShippedOverlappingReleaseCheck(t *testing.T) {
+	m, repo, sha := releasedRepo(t)
+	main := mainWorktree(repo)
+	at := time.Now().Add(time.Hour)
+	var last *store.ChecklistApproval
+	// release_check reads the clock once, for the pass it stores after every condition was read.
+	releaseCheckAt(t, m, repo, sha, func() time.Time {
+		if last == nil {
+			last = reapprove(t, m, main, at)
+		}
+		return at.Add(time.Minute)
+	})
+	if last == nil {
+		t.Fatal("release_check stored its pass without reading the clock")
+	}
+	assertShippedAt(t, m, main, 0, "re-approval during release_check")
+	r, err := m.MergeGateCheck(repo, "gh pr merge 8 --match-head-commit "+strings.Repeat("cd", 20), "")
+	if err != nil || !strings.Contains(r.Refusal, "release_check has not passed on") || strings.Contains(r.Refusal, "passed on "+sha) {
+		t.Fatalf("re-approval not gated, or the refusal names the overlapping pass: %+v %v", r, err)
+	}
+	releaseCheckAt(t, m, repo, sha, func() time.Time { return at.Add(2 * time.Minute) })
+	assertShippedAt(t, m, main, last.Seq, "release_check at the re-approval")
 }

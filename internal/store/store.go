@@ -415,6 +415,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: release passes: %w", err)
 	}
+	for _, alter := range releaseColumns {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: release passes: %w", err)
+		}
+	}
 	if _, err := db.Exec(mergeGateSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)

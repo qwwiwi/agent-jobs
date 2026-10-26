@@ -12,13 +12,13 @@ import (
 )
 
 // A checklist whose release shipped stops gating merges (#99): once release_check passed at the latest
-// approval (its id, version and hash; a pass created at or after it) on a sha that is on the default
-// branch of the repository's origin, the daemon's tick records the approval as shipped
-// (store.GateRepo.ShippedSeq, the sha and when), and the merge hook takes the repository out of the gate
-// like a retirement: later fixes merge under the normal review rule. The tick computes it, not the hook:
-// the hook opens the store read-only and stays cheap, and doctor/status show the stored record. It never
-// lifts the gate on its own: the hook still requires the approval to be the latest and valid (a void
-// approval stays gated), and the pass to be stored and not stale (a newer verdict or a red
+// approval (its id, version and hash, checked at that approval: the pass's ApprovalSeq is its seq) on a
+// sha that is on the default branch of the repository's origin, the daemon's tick records the approval
+// as shipped (store.GateRepo.ShippedSeq, the sha and when), and the merge hook takes the repository out
+// of the gate like a retirement: later fixes merge under the normal review rule. The tick computes it,
+// not the hook: the hook opens the store read-only and stays cheap, and doctor/status show the stored
+// record. It never lifts the gate on its own: the hook still requires the approval to be the latest and
+// valid (a void approval stays gated), and the pass to be stored and not stale (a newer verdict or a red
 // manifest-check run); a new approval, also an unchanged re-approval, gates the repository again until a
 // pass at it ships in turn. The daemon does not fetch: it reads the remote-tracking ref in the main work
 // tree (refs/remotes/origin/HEAD, else origin/main, else origin/master), so the merge counts once
@@ -136,14 +136,14 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 	if last.Seq == rec.ShippedSeq {
 		// Shipped already, while its pass still counts; a pass dropped or stale since (release_check ran
 		// again) is re-read below: another pass of the approval may have shipped.
-		ok, err := m.passCounts(&gatedRepo{main: main, id: last.ChecklistID, version: last.Version, hash: last.ChecklistSHA256},
-			rec.ShippedSHA)
+		ok, err := m.passCounts(&gatedRepo{main: main, id: last.ChecklistID, version: last.Version, hash: last.ChecklistSHA256,
+			seq: last.Seq}, rec.ShippedSHA)
 		if err != nil || ok {
 			return err
 		}
 	}
 	// Cheap first: without a pass at the approval nothing can ship (no files or git read).
-	passes, err := m.passesSince(main, last.ChecklistID, last.Version, last.ChecklistSHA256, last.ApprovedAt)
+	passes, err := m.passesAt(main, last.ChecklistID, last.Version, last.ChecklistSHA256, last.Seq)
 	if err != nil || len(passes) == 0 {
 		return err
 	}
@@ -240,7 +240,7 @@ func gitHistory(dir string, args ...string) (string, error) {
 // shippedPass is a pass of gated repository r that could ship it but has not yet ("" = none): the
 // newest pass at r's approval that still counts. The hook's refusal names it with what lifts the gate.
 func (g *mergeGate) shippedPass(r *gatedRepo) (string, error) {
-	passes, err := g.m.passesSince(r.main, r.id, r.version, r.hash, r.approvedAt)
+	passes, err := g.m.passesAt(r.main, r.id, r.version, r.hash, r.seq)
 	if err != nil {
 		return "", err
 	}
@@ -256,27 +256,32 @@ func (g *mergeGate) shippedPass(r *gatedRepo) (string, error) {
 	return "", nil
 }
 
-// passesSince are the passes of repository main at the checklist id, version and hash created at or
-// after approvedAt (the approval's time), newest first: a pass from before an unchanged re-approval (the
-// same id, version and hash, a new approval) does not ship it, a pass at or after it does.
-func (m *Manager) passesSince(main, id string, version int, hash string, approvedAt time.Time) ([]store.ReleasePass, error) {
+// passesAt are the passes of repository main at the checklist id, version and hash that release_check
+// checked at approval seq (store.ReleasePass.ApprovalSeq), newest first: a pass of the approval before an
+// unchanged re-approval (the same id, version and hash, a new seq) does not ship it, whenever it was
+// stored, nor does a pass stored before the seq was recorded (0).
+func (m *Manager) passesAt(main, id string, version int, hash string, seq int64) ([]store.ReleasePass, error) {
+	if seq == 0 {
+		return nil, nil
+	}
 	passes, err := m.Store.ReleasePassesAt(main, id, version, hash)
 	if err != nil {
 		return nil, err
 	}
 	out := passes[:0]
 	for _, p := range passes {
-		if !p.CreatedAt.Before(approvedAt) {
+		if p.ApprovalSeq == seq {
 			out = append(out, p)
 		}
 	}
 	return out, nil
 }
 
-// passCounts reports whether repository r's stored pass on sha at its approval exists and is not stale.
+// passCounts reports whether repository r's stored pass on sha at its approval (its id, version, hash
+// and seq) exists and is not stale.
 func (m *Manager) passCounts(r *gatedRepo, sha string) (bool, error) {
 	p, err := m.Store.ReleasePassed(r.main, sha, r.id, r.version, r.hash)
-	if err != nil || p == nil {
+	if err != nil || p == nil || r.seq == 0 || p.ApprovalSeq != r.seq {
 		return false, err
 	}
 	stale, err := m.passStale(r, p)
