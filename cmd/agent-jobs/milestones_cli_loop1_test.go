@@ -59,12 +59,15 @@ func mcpMilestone(t *testing.T, cs *sdk.ClientSession, tool, raw string) (string
 }
 
 // sameTree compares two milestone trees without what differs between two milestones built alike: the
-// id and the times.
+// id and the times, the tasks' included (the two calls may fall in different seconds).
 func sameTree(t *testing.T, a, b string) bool {
 	t.Helper()
 	norm := func(s string) string {
 		v := decodeTree(t, s)
 		v.ID, v.CreatedAt, v.UpdatedAt, v.ClosedAt = 0, "", "", ""
+		for i := range v.Tasks {
+			v.Tasks[i].CreatedAt, v.Tasks[i].UpdatedAt = "", ""
+		}
 		out, err := json.Marshal(v)
 		if err != nil {
 			t.Fatal(err)
