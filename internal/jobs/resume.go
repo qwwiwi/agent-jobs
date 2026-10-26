@@ -693,6 +693,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if err := m.milestoneResumable(j); err != nil {
 		return nil, err
 	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -798,6 +801,9 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 	if IsGateKind(j.Kind) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it (cancel it and start a new one)",
 			id, j.Kind)
+	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; cancel it and start a new job without them", id, err)
 	}
 	if j.Attempt > 0 {
 		err = m.Store.AmendContext(id, "\n\n"+strings.TrimSpace(context))

@@ -72,6 +72,7 @@ Approved by the owner on 2026-10-17 as part of the full mandate (see [DECISIONS.
 Not in the current release scope; kept in the plan with its description.
 
 - **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. To be built switched off; turning it on (real money) needs its own owner «да». *Status: deferred by the owner 2026-10-18, not built (see [DECISIONS.md](DECISIONS.md)): «we will do it later»; it stays in the plan, not in the current release. Only a `billing` column exists, always `subscription`.*
+- **G02 sources (repositories cloned read-only into the job folder, their code run only in docker).** *Status: deferred by the owner 2026-10-26 (see [DECISIONS.md](DECISIONS.md)): built on the milestones branch, switched off before release because the text-parsing guard could still be bypassed; every entry point refuses a non-empty sources list and the daemon never clones. To be rebuilt as a separate task on OS-level isolation.*
 
 ## Wave E: borrowed ideas (planned; E2 approved and built)
 

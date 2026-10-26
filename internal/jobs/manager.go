@@ -360,6 +360,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
+	if err := refuseSources(r.Sources); err != nil {
+		if r.plannedSources {
+			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
+				"it without them, or clear them with milestone_set sources: [])", err, r.Task, r.Milestone)
+		}
+		return nil, err
+	}
 	sources, err := ValidateSources(r.Sources)
 	if err != nil {
 		return nil, err
@@ -593,6 +600,11 @@ func (m *Manager) launchQueued() error {
 	}
 	limit := m.Config().MaxRunningJobs()
 	for _, j := range queued {
+		if err := refuseSources(j.Sources); err != nil {
+			// G02 is deferred: a stored job with sources never starts and nothing clones them.
+			m.cancelQueued(j, "cancelled before start: "+err.Error())
+			continue
+		}
 		if running >= limit {
 			return nil
 		}

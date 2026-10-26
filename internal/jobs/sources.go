@@ -27,6 +27,12 @@ import (
 // starts, so the job studies a local copy instead of the GitHub API or website. Their code never runs on
 // the host (the guard, internal/guard/sources.go); a job runs it only in a throwaway docker container
 // that mounts a copy under sandbox/.
+//
+// G02 is deferred (owner decision 2026-10-26, docs/DECISIONS.md): the text-parsing guard could still be
+// bypassed, so every entry point refuses a non-empty sources list (refuseSources) and the daemon never
+// clones until G02 is rebuilt on OS-level isolation. The guard and clone code stay, unused.
+var ErrSourcesDisabled = errors.New("sources is disabled until OS-level isolation lands (G02 deferred, owner decision 2026-10-26)")
+
 const (
 	// SourcesDir is the folder of the job dir that holds the clones, sources/<name>.
 	SourcesDir = "sources"
@@ -308,6 +314,15 @@ func SourceName(u string) string {
 	return name
 }
 
+// refuseSources refuses a non-empty sources list while G02 is deferred (ErrSourcesDisabled); an empty or
+// absent list passes.
+func refuseSources(in []string) error {
+	if len(in) > 0 {
+		return ErrSourcesDisabled
+	}
+	return nil
+}
+
 // ValidateSources checks the sources of a job or task: at most MaxJobSources, each a plain https git URL
 // (ValidateSourceURL), duplicates dropped, folder names (SourceName) unique. nil stays nil (not given).
 func ValidateSources(in []string) ([]string, error) {
@@ -533,6 +548,9 @@ func (m *Manager) cloneSources(ctx context.Context, j *store.Job, dir string) ([
 	if len(j.Sources) == 0 {
 		return nil, nil
 	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, err
+	}
 	root := filepath.Join(dir, SourcesDir)
 	if err := removeTree(root); err != nil {
 		return nil, fmt.Errorf("sources: %w", err)
@@ -585,6 +603,9 @@ func (m *Manager) prefetchSources() {
 		return
 	}
 	for _, j := range queued {
+		if refuseSources(j.Sources) != nil {
+			continue // G02 is deferred: launchQueued cancels the job, nothing is cloned
+		}
 		if at, ok := m.sourcesRetryAt.Load(j.ID); ok && m.Now().Before(at.(time.Time)) {
 			continue
 		}

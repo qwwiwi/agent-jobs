@@ -120,6 +120,7 @@ func withLocalRemote(t *testing.T, remotes map[string]string) {
 }
 
 func TestSourcesCloneIntoJobDir(t *testing.T) {
+	t.Skip(g02Off + "the daemon no longer clones")
 	m := newManager(t)
 	// The clones are read-only: the job folders are removed the way prune does before TempDir's cleanup.
 	t.Cleanup(func() { _ = removeTree(filepath.Join(m.StateDir, "jobs")) })
@@ -211,6 +212,7 @@ func TestSourcesCloneIntoJobDir(t *testing.T) {
 }
 
 func TestMilestoneTaskSources(t *testing.T) {
+	t.Skip(g02Off + "milestone_create and milestone_edit refuse planned sources")
 	m := newManager(t)
 	ctx := context.Background()
 	t.Run("[G02] sources are planned per task and shown in the tree; a task job inherits them", func(t *testing.T) {

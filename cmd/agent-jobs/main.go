@@ -505,9 +505,12 @@ func cmdStart(args []string) error {
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
 	var sources multi
-	fs.Var(&sources, "source", "an https git URL cloned read-only into the job folder as sources/<name> before it starts (repeatable)")
+	fs.Var(&sources, "source", "disabled until OS-level isolation lands (G02 deferred): any value is refused")
 	if _, err := parse(fs, args); err != nil {
 		return err
+	}
+	if len(sources) > 0 {
+		return jobs.ErrSourcesDisabled // refused before the store is opened (Enqueue refuses it too)
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
 	if len(sources) > 0 {

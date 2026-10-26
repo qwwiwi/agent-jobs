@@ -10,6 +10,7 @@ import (
 // not name it, and a job on the task inherits each one independently: a nil job_start field takes the
 // task's plan, a given list (also []) replaces it.
 func TestMilestoneTaskSkillsAndSources(t *testing.T) {
+	t.Skip(g02Off + "milestone_create and milestone_edit refuse planned sources")
 	ctx := context.Background()
 	t.Run("[G01][G02] skills and sources are planned and inherited independently", func(t *testing.T) {
 		m, _ := skillsManager(t)

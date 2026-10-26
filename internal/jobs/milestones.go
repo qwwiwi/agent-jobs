@@ -56,7 +56,7 @@ type MilestoneTaskInput struct {
 	Covers    *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
 	Skills    *[]string `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
 	// Sources (G02) are planned like covers: nil keeps the stored list, empty clears it.
-	Sources *[]string `json:"sources,omitempty" jsonschema:"https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
+	Sources *[]string `json:"sources,omitempty" jsonschema:"currently DISABLED (G02 deferred, owner decision 2026-10-26: the text-parsing guard could still be bypassed; it returns with OS-level isolation): a non-empty list is refused, an empty or absent one changes nothing. When enabled: https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
 }
 
 // MilestoneCreate is milestone_create's input.
@@ -290,6 +290,9 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		}
 		t.Dropped = false
 		if ti.Sources != nil {
+			if err := refuseSources(*ti.Sources); err != nil {
+				return nil, nil, fmt.Errorf("task %s: %w", key, err)
+			}
 			if t.Sources, err = ValidateSources(*ti.Sources); err != nil {
 				return nil, nil, fmt.Errorf("task %s: %w", key, err)
 			}

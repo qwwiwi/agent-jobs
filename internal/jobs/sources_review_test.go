@@ -110,6 +110,7 @@ func TestSourcesEmbeddedBareRepo(t *testing.T) {
 }
 
 func TestSourcesCodexRefused(t *testing.T) {
+	t.Skip(g02Off + "job_start and milestone_create refuse sources before the codex check")
 	m := newCodexManager(t)
 	const url = "https://github.com/a/lib"
 	t.Run("[G02] a codex job with sources is refused: the guard does not run inside codex", func(t *testing.T) {
@@ -152,6 +153,7 @@ func slowClone(t *testing.T) (started chan string, calls *atomic.Int32) {
 }
 
 func TestSourcesCloneOutsideLock(t *testing.T) {
+	t.Skip(g02Off + "the daemon no longer clones")
 	m := newManager(t)
 	t.Cleanup(func() { _ = removeTree(filepath.Join(m.StateDir, "jobs")) })
 	t.Run("[G02] a slow clone holds neither cancel nor another tick, and the cancel ends it", func(t *testing.T) {
@@ -305,6 +307,7 @@ func dockerRemoved(logPath, id string) bool {
 }
 
 func TestSourcesContainersRemoved(t *testing.T) {
+	t.Skip(g02Off + "job_start refuses sources, so no job runs with them")
 	t.Run("[G02] the job's containers (and only them) are removed with docker rm -f", func(t *testing.T) {
 		logPath := fakeDocker(t)
 		if err := removeJobContainers("261026-1"); err != nil {

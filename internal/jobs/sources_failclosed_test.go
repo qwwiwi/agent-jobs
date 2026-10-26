@@ -42,10 +42,7 @@ func readLog(t *testing.T, p string) string {
 func TestSourcesContainerCleanupPending(t *testing.T) {
 	t.Run("[G02] a failed container cleanup leaves containers.pending; a later tick retries it out of the lock", func(t *testing.T) {
 		m := newManager(t)
-		j := enqueue(t, m, "look at lib", func(r *StartRequest) {
-			r.Kind = "research"
-			r.Sources = []string{"https://github.com/a/lib"}
-		})
+		j := storedJobWithSources(t, m) // job_start refuses sources while G02 is deferred
 		if err := m.Store.Finish(j.ID, "", store.StatusCancelled, 0, 0, 0, "test", m.Now()); err != nil {
 			t.Fatal(err)
 		}
@@ -142,6 +139,7 @@ func TestSourcesInternalNets(t *testing.T) {
 }
 
 func TestSourcesPrefetchBackoff(t *testing.T) {
+	t.Skip(g02Off + "the daemon no longer clones")
 	t.Run("[G02] a failed sources.json write backs off instead of cloning again every tick", func(t *testing.T) {
 		m := newManager(t)
 		t.Cleanup(func() { _ = removeTree(filepath.Join(m.StateDir, "jobs")) })
