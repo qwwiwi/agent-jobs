@@ -1080,7 +1080,7 @@ var dataReaders = map[string]bool{
 var dataSubcommands = map[string]map[string]bool{
 	"brew":    {"install": true, "info": true, "search": true, "list": true},
 	"apt-get": {"install": true},
-	"go":      {"get": true, "install": true},
+	"go":      {"get": true}, // not install: a git, gh or agent-jobs binary in GOBIN shadows the real one (#96)
 	"pip":     {"install": true},
 	"pip3":    {"install": true},
 	"npm":     {"install": true},
@@ -1206,6 +1206,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 			return cannot("glob/brace in the command or its wrappers: " + w)
 		}
 	}
+	if r := goEnv(c, v); r != "" {
+		return cannot(r)
+	}
 	if v.start >= len(c.words) {
 		return ""
 	}
@@ -1313,7 +1316,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 			continue
 		}
 		if b := progName(a); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
-			(dyn[k+1] && mentionsExec(a)) {
+			(dyn[k+1] && mentionsExec(a)) || (name == "sed" && sedExecMention(a)) {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
 		}
 	}

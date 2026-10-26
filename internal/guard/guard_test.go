@@ -405,7 +405,8 @@ func TestCheckFailClosedAllowlist(t *testing.T) {
 		{"touch git", "touch git", false},
 		{"apt-get install git", "apt-get install git", false},
 		{"go get git", "go get github.com/x/git", false},
-		{"go install gh", "go install github.com/cli/cli/v2/cmd/gh@latest", false},
+		{"go install gh", "go install github.com/cli/cli/v2/cmd/gh@latest", true}, // a gh in GOBIN shadows the real one (#96)
+		{"go install tool", "go install golang.org/x/tools/cmd/goimports@latest", false},
 		{"pip install git", "pip install gitpython git", false},
 		{"npm install gh", "npm install gh", false},
 		{"python script file", "python3 tool.py git", false},

@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -40,9 +41,62 @@ func plainPath(w string) bool {
 // staticArgv reports a command whose words the shell passes as written: no word holds an expansion
 // ($var, ${…}, $(…), backticks) or a glob/brace, and xargs does not add or replace words. Otherwise
 // one word can turn the role of the next (`"$opt" claude` with opt=-exec, `xargs -I OPT go test OPT
-// claude`), so no operand is exempt from the scan.
+// claude`), so no operand is exempt from the scan. A GOFLAGS assignment with a goExecFlags flag
+// before the command (`GOFLAGS=-o=x go build ./cmd/agent-jobs`) counts as that flag on the command.
 func staticArgv(c *simpleCmd, v cmdView) bool {
+	for _, w := range c.words[:v.start] {
+		if val, ok := strings.CutPrefix(w, "GOFLAGS="); ok && goFlagsExec(val) {
+			return false
+		}
+	}
 	return !slices.Contains(c.dyn, true) && !slices.Contains(c.glob, true) && !slices.Contains(v.wrappers, "xargs")
+}
+
+// goEnvRuns are the environment variables through which go runs a program: GOFLAGS (-exec,
+// -toolexec, -vettool) and the cgo tools.
+var goEnvRuns = map[string]bool{
+	"GOFLAGS": true, "CC": true, "CXX": true, "FC": true, "AR": true, "GCCGO": true, "PKG_CONFIG": true,
+}
+
+// goFlagsExec reports a GOFLAGS value carrying one of goExecFlags.
+func goFlagsExec(val string) bool {
+	return slices.ContainsFunc(strings.Fields(val), func(f string) bool {
+		flag, _, _ := strings.Cut(strings.TrimLeft(f, "-"), "=")
+		return strings.HasPrefix(f, "-") && goExecFlags[flag]
+	})
+}
+
+// goEnvSetters set an environment variable from a NAME=value argument (go via `go env -w`, which
+// persists it for later calls).
+var goEnvSetters = map[string]bool{"export": true, "declare": true, "typeset": true, "local": true, "readonly": true, "go": true}
+
+// goEnv (issue #96) rejects a goEnvRuns assignment whose value names git/gh, a shell or an agent
+// (`GOFLAGS=-toolexec=agent-jobs go test ./...`, `CC=claude go build`), in front of a command, under
+// env, on its own (exported later or with set -a) or as an argument of export/declare/go env -w. A
+// GOFLAGS value with a goExecFlags flag is allowed only in front of go itself, where staticArgv sees
+// it: set elsewhere it would turn a later `go build ./cmd/agent-jobs` into a renamed agent build.
+func goEnv(c *simpleCmd, v cmdView) string {
+	isGo, setter := false, false
+	if v.start < len(c.words) {
+		name := progName(c.words[v.start])
+		isGo, setter = name == "go", goEnvSetters[name]
+	}
+	for i, w := range c.words {
+		if i == v.start && !setter {
+			break
+		}
+		key, val, ok := strings.Cut(w, "=")
+		if !ok || !goEnvRuns[key] {
+			continue
+		}
+		if execName(progName(val)) || reMention.MatchString(val) || (c.dyn[i] && mentionsExec(val)) {
+			return "Go environment " + key + " running git/gh, a shell or an agent"
+		}
+		if key == "GOFLAGS" && goFlagsExec(val) && (!isGo || i >= v.start) {
+			return "GOFLAGS with -exec, -toolexec, -vettool or -o outside a go command; pass the flag to go"
+		}
+	}
+	return ""
 }
 
 // operands reports, for each of args (after the program name) of name (progName), whether it is a
@@ -159,4 +213,20 @@ func sedOperands(args []string) []bool {
 		ops[k] = true
 	}
 	return ops
+}
+
+// reSedExec finds sed's e command or s///e flag: an `e` after an address (or its I/M flag), a `!`, a
+// separator, a closing delimiter or a blank. The text after it, to the end of the line, is a shell
+// command; it may follow without a blank (`sed 1eagent-jobs f`), so reMention alone does not see it.
+var reSedExec = regexp.MustCompile(`(^|[0-9$/,!~;{}IM\s])e`)
+
+// sedExecMention reports a sed script word in which an e command runs git/gh, a shell or an agent.
+func sedExecMention(w string) bool {
+	for _, m := range reSedExec.FindAllStringIndex(w, -1) {
+		cmd, _, _ := strings.Cut(strings.TrimLeft(w[m[1]:], " \t"), "\n")
+		if f := strings.Fields(cmd); len(f) > 0 && execName(progName(f[0])) || reMention.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
 }
