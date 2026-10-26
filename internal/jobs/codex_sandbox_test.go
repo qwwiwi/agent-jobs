@@ -50,7 +50,7 @@ func TestCodexLaunchSandboxPerMode(t *testing.T) {
 			t.Fatalf("%q/%s: %q, %v; want %q", c.mode, c.kind, got, err, c.want)
 		}
 		j := &store.Job{Kind: c.kind, Model: "gpt-6.1-sol"}
-		if s := argSandbox(CodexArgs(j, "high", got)); s != c.want {
+		if s := argSandbox(CodexArgs(j, "high", got, t.TempDir(), false)); s != c.want {
 			t.Fatalf("%q/%s: codex argv -s %q, want %q", c.mode, c.kind, s, c.want)
 		}
 	}

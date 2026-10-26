@@ -283,8 +283,13 @@ func (m *Manager) spawnEnv(unit string) []string {
 }
 
 func git(dir string, args ...string) (string, error) {
+	return gitEnv(dir, daemonGitEnv(), args...)
+}
+
+// gitEnv is git with environment env.
+func gitEnv(dir string, env []string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
@@ -506,6 +511,11 @@ func (m *Manager) Tick() error {
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
 	// docker call may take up to containerCmdTimeout.
 	m.retryContainerCleanups()
+	// A checklist whose release shipped stops gating merges (#99): recorded here for the merge hook,
+	// which opens the store read-only.
+	if serr := m.MarkShippedGates(); serr != nil {
+		err = errors.Join(err, fmt.Errorf("merge gate shipped: %w", serr))
+	}
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {
@@ -764,6 +774,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	var plan launchPlan
 	var codexSandbox string // a codex job's `codex exec --sandbox` value
+	var codexNetwork bool   // a codex write job's network (CodexNetworkOverride)
 	launchCfg := m.Config()
 	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
@@ -789,6 +800,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		if codexSandbox, err = m.codexLaunchSandbox(launchCfg, j.Kind); err != nil {
 			return err
 		}
+		codexNetwork = codexSandbox == CodexSandboxWrite && launchCfg.CodexWriteNetworkOn()
 	}
 	if j.Attempt > 1 {
 		p, err := m.prepareResume(j, token)
@@ -816,7 +828,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
 				return err
 			}
-			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
+			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox, m.JobDir(j.ID), codexNetwork),
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
 	}
@@ -824,6 +836,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
 		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
 		CodexSandbox:      codexSandbox,
+		CodexNetwork:      codexNetwork,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}

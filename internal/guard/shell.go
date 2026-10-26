@@ -74,6 +74,9 @@ type script struct {
 	literalBodies [][2]int
 	// vague names a form whose words bash and sh read differently (the reader follows bash), or "".
 	vague string
+	// goEnvSet: some command of the call sets GOFLAGS or GOENV in a form the guard cannot read (see
+	// goEnvChanged), so no go operand anywhere in the call is data.
+	goEnvSet bool
 }
 
 type redirKind int
@@ -1348,6 +1351,10 @@ func parseAll(src string) []*script {
 		return sc
 	}
 	walk(src, 0, false)
+	set := goEnvChanged(out)
+	for _, sc := range out {
+		sc.goEnvSet = set
+	}
 	return out
 }
 

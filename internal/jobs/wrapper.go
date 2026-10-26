@@ -382,11 +382,54 @@ func admitted(jobDir, token string, argv []string) error {
 		}
 	}
 	if j.Runner == store.RunnerCodex {
-		sandbox, err := codexArgvSandbox(argv)
+		ca, err := codexArgvSandbox(argv)
+		if err == nil {
+			err = admittedCodexAddDirs(abs, ca.sandbox, ca.addDirs)
+		}
+		if err == nil {
+			err = admittedCodexNetwork(st, j, token, ca)
+		}
 		if err != nil {
 			return fmt.Errorf("codex command line was not authorized by the launching daemon: %w", err)
 		}
-		return admittedCodex(st, j, token, sandbox)
+		return admittedCodex(st, j, token, ca.sandbox)
+	}
+	return nil
+}
+
+// admittedCodexNetwork checks a codex launch's CodexNetworkOverride against the launching daemon's
+// authorization: only under workspace-write and only when the launch recorded network for this attempt.
+func admittedCodexNetwork(st *store.Store, j *store.Job, token string, ca codexArgv) error {
+	if !ca.network {
+		return nil
+	}
+	if ca.sandbox != CodexSandboxWrite {
+		return fmt.Errorf("codex network override under sandbox %q", ca.sandbox)
+	}
+	if a, err := st.ReadLaunchAuthorization(j.ID, token); err != nil || !a.CodexNetwork {
+		return errors.New("codex network was not recorded for this launch")
+	}
+	return nil
+}
+
+// admittedCodexAddDirs checks a codex launch's extra writable roots (`--add-dir`) against what CodexArgs
+// builds (issue #92): none, or under workspace-write exactly one, the job's own progress folder, which
+// must be a real directory (a symlink there would widen the root to its target).
+func admittedCodexAddDirs(jobDir, sandbox string, addDirs []string) error {
+	if len(addDirs) == 0 {
+		return nil
+	}
+	want := codexProgressRoot(sandbox, jobDir)
+	if want == "" || len(addDirs) > 1 {
+		return fmt.Errorf("codex writable roots %q under sandbox %q", addDirs, sandbox)
+	}
+	// Absolute only: codex resolves a relative root against its own working dir, not the wrapper's.
+	if got := addDirs[0]; !filepath.IsAbs(got) || filepath.Clean(got) != want {
+		return fmt.Errorf("codex writable root %q is not the job's progress folder", got)
+	}
+	fi, err := os.Lstat(want)
+	if err != nil || !fi.IsDir() {
+		return fmt.Errorf("codex writable root %q is not a real directory", addDirs[0])
 	}
 	return nil
 }
@@ -413,15 +456,27 @@ func admittedCodex(st *store.Store, j *store.Job, token, sandbox string) error {
 	return fmt.Errorf("codex sandbox %q was not authorized by the launching daemon", sandbox)
 }
 
+// codexArgv is what codexArgvSandbox reads from a codex command line.
+type codexArgv struct {
+	sandbox string   // the --sandbox value
+	addDirs []string // the --add-dir values (extra writable roots)
+	network bool     // CodexNetworkOverride is given
+}
+
 // codexArgvSandbox is the sandbox of a codex command line (argv[0] is the binary), read with codex's
 // option boundaries: options end at `--` (what follows is the prompt); `-s X`, `-sX`, `-s=X`,
-// `--sandbox X` and `--sandbox=X` name the sandbox. Only the options CodexArgs builds are known and
-// anything else is an error, since an unknown option may take a value or change the sandbox: a sandbox
-// or approval bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo, --full-auto), a profile,
-// a `-c` / `--config` override of a sandbox or profile key, a value starting with "-", a repeated or
-// missing sandbox, and a positional other than the leading `exec` and the stdin prompt "-".
-func codexArgvSandbox(argv []string) (string, error) {
-	sandbox, seenSandbox := "", false
+// `--sandbox X` and `--sandbox=X` name the sandbox; `--add-dir X` values (extra writable roots) are
+// returned for admittedCodexAddDirs, and CodexNetworkOverride, the one sandbox key override admitted
+// (once, exactly as CodexArgs writes it), for admittedCodexNetwork. Only the options CodexArgs builds
+// are known and anything else is an error, since an unknown option may take a value or change the
+// sandbox: a sandbox or approval bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo,
+// --full-auto), a profile, any other `-c` / `--config` override of a sandbox or profile key, a value
+// starting with "-", a repeated or missing sandbox, and a positional other than the leading `exec` and
+// the stdin prompt "-".
+func codexArgvSandbox(argv []string) (codexArgv, error) {
+	var out codexArgv
+	seenSandbox := false
+	fail := func(err error) (codexArgv, error) { return codexArgv{}, err }
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--" {
@@ -431,7 +486,7 @@ func codexArgvSandbox(argv []string) (string, error) {
 			continue
 		}
 		if !strings.HasPrefix(a, "-") || a == "-" {
-			return "", fmt.Errorf("unexpected codex argument %q", a)
+			return fail(fmt.Errorf("unexpected codex argument %q", a))
 		}
 		name, value, attached := a, "", false
 		if strings.HasPrefix(a, "--") {
@@ -444,42 +499,48 @@ func codexArgvSandbox(argv []string) (string, error) {
 		switch name {
 		case "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check":
 			if attached {
-				return "", fmt.Errorf("codex option %q takes no value", a)
+				return fail(fmt.Errorf("codex option %q takes no value", a))
 			}
 			continue
-		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable":
+		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable", "--add-dir":
 		default:
-			return "", fmt.Errorf("codex option %q is not one the daemon passes", a)
+			return fail(fmt.Errorf("codex option %q is not one the daemon passes", a))
 		}
 		if !attached {
 			if i+1 >= len(argv) {
-				return "", fmt.Errorf("codex option %s has no value", name)
+				return fail(fmt.Errorf("codex option %s has no value", name))
 			}
 			i++
 			value = argv[i]
 		}
 		if value == "" || strings.HasPrefix(value, "-") {
-			return "", fmt.Errorf("codex option %s has value %q", name, value)
+			return fail(fmt.Errorf("codex option %s has value %q", name, value))
 		}
 		switch name {
 		case "-s", "--sandbox":
 			if seenSandbox {
-				return "", errors.New("codex sandbox given more than once")
+				return fail(errors.New("codex sandbox given more than once"))
 			}
-			sandbox, seenSandbox = value, true
+			out.sandbox, seenSandbox = value, true
 		case "-c", "--config":
+			if value == CodexNetworkOverride && !out.network {
+				out.network = true
+				continue
+			}
 			key, _, _ := strings.Cut(value, "=")
 			for _, part := range strings.Split(key, ".") {
 				if part = strings.Trim(part, " \t\"'"); strings.Contains(part, "sandbox") || part == "profile" {
-					return "", fmt.Errorf("codex config override %q changes the sandbox", key)
+					return fail(fmt.Errorf("codex config override %q changes the sandbox", key))
 				}
 			}
+		case "--add-dir":
+			out.addDirs = append(out.addDirs, value)
 		}
 	}
 	if !seenSandbox {
-		return "", errors.New("codex sandbox not given")
+		return fail(errors.New("codex sandbox not given"))
 	}
-	return sandbox, nil
+	return out, nil
 }
 
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,
@@ -594,6 +655,13 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		}
 	}
 	if opts.Runner == store.RunnerCodex {
+		// A codex write job cannot commit inside its sandbox (codex_commit.go): its changes are committed
+		// here, once nothing of the job runs any more. Under danger-full-access the job commits itself.
+		if ca, err := codexArgvSandbox(argv); err == nil && ca.sandbox == CodexSandboxWrite && !sw.Incomplete() {
+			if line := commitCodexWork(jobDir, id); line != "" {
+				fmt.Fprintln(stderrLog, "run-wrapper:", line)
+			}
+		}
 		res.CodexRepo = codexRepoJob(st, id, jobDir)
 		writeCodexResultReport(jobDir, res, stderrLog)
 	} else if idleClosed {
@@ -865,12 +933,16 @@ func TempEnv(env []string, dir string) []string {
 
 // ensureJobTmp creates the job's temp dir (0700) if it is missing and returns its absolute path. The
 // job can write its folder: anything there but a real directory (a symlink) is refused.
-func ensureJobTmp(jobDir string) (string, error) {
+func ensureJobTmp(jobDir string) (string, error) { return ensureJobSubdir(jobDir, JobTmpDir) }
+
+// ensureJobSubdir creates the folder name (0700) in the job dir if it is missing and returns its
+// absolute path; anything there but a real directory (a symlink) is refused.
+func ensureJobSubdir(jobDir, name string) (string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return "", err
 	}
-	p := filepath.Join(abs, JobTmpDir)
+	p := filepath.Join(abs, name)
 	if err := os.Mkdir(p, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return "", err
 	}

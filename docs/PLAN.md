@@ -217,7 +217,7 @@ Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)). A design to be specifi
 
 ## Milestones phase 2 (approved, not built)
 
-Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)); starts after the milestones MVP merges (PR #88, branch `feature/milestones`, not on main yet).
+Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)); builds on the milestones MVP (PR #88, released in 0.6.0).
 
 - An automatic capstone task «judge + release_check» when a milestone has a checklist.
 - Waves and the maximum parallelism shown in `milestone_get` (a tool of the milestones MVP, PR #88).

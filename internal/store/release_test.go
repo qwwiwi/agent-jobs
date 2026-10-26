@@ -67,3 +67,49 @@ func TestReleasePasses(t *testing.T) {
 		t.Fatalf("approval repos: %v %v", repos, err)
 	}
 }
+
+// A pass keeps the seq of the approval release_check checked (#99). A release_passes table created
+// before approval_seq is read as 0 by a read-only store (the merge hook's) and gets the column on Open,
+// its old rows keeping 0.
+func TestReleasePassApprovalSeq(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DROP TABLE release_passes`, `CREATE TABLE release_passes (repo TEXT NOT NULL, sha TEXT NOT NULL,
+		checklist_id TEXT NOT NULL, version INTEGER NOT NULL, checklist_sha256 TEXT NOT NULL, verdict_job TEXT NOT NULL,
+		created_at INTEGER NOT NULL, PRIMARY KEY (repo, sha, checklist_id, version, checklist_sha256))`,
+		`INSERT INTO release_passes VALUES ('/r', 'old', 'demo', 2, 'h', 'j0', 100)`} {
+		if _, err := s.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = s.Close()
+	ro, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := ro.ReleasePassed("/r", "old", "demo", 2, "h"); err != nil || p == nil || p.ApprovalSeq != 0 || p.VerdictJob != "j0" {
+		t.Fatalf("old table, read-only: %+v %v", p, err)
+	}
+	if ps, err := ro.ReleasePassesAt("/r", "demo", 2, "h"); err != nil || len(ps) != 1 || ps[0].ApprovalSeq != 0 {
+		t.Fatalf("old table, read-only list: %+v %v", ps, err)
+	}
+	_ = ro.Close()
+	if s, err = Open(path); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	defer s.Close()
+	if err := s.PutReleasePass(ReleasePass{Repo: "/r", SHA: "new", ChecklistID: "demo", Version: 2, ChecklistSHA256: "h",
+		CreatedAt: time.Unix(200, 0), ApprovalSeq: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := s.ReleasePassed("/r", "new", "demo", 2, "h"); err != nil || p == nil || p.ApprovalSeq != 7 {
+		t.Fatalf("pass: %+v %v", p, err)
+	}
+	ps, err := s.ReleasePassesAt("/r", "demo", 2, "h")
+	if err != nil || len(ps) != 2 || ps[0].SHA != "new" || ps[0].ApprovalSeq != 7 || ps[1].SHA != "old" || ps[1].ApprovalSeq != 0 {
+		t.Fatalf("passes: %+v %v", ps, err)
+	}
+}

@@ -415,9 +415,21 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: release passes: %w", err)
 	}
+	for _, alter := range releaseColumns {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: release passes: %w", err)
+		}
+	}
 	if _, err := db.Exec(mergeGateSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)
+	}
+	for _, alter := range mergeGateColumns {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)
+		}
 	}
 	if _, err := db.Exec(milestonesSchema); err != nil {
 		_ = db.Close()
@@ -585,6 +597,7 @@ var migrations = []string{
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_sandbox TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN milestone_id INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE launch_authorizations ADD COLUMN codex_network INTEGER NOT NULL DEFAULT 0`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
