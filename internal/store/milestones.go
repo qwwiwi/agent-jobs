@@ -51,9 +51,12 @@ type MilestoneTask struct {
 	Title       string
 	DependsOn   []string
 	Covers      []string
-	Dropped     bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Skills are the task's planned skills edits (job_start's syntax: name, +name, -name; G01): a job
+	// started on the task without skills of its own gets them. nil = none planned.
+	Skills    []string
+	Dropped   bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 	// Sources are the git URLs planned for the task's jobs (G02; sources.go stores them).
 	Sources []string
 }
@@ -93,6 +96,13 @@ CREATE INDEX IF NOT EXISTS milestones_updated ON milestones(updated_at);
 CREATE INDEX IF NOT EXISTS jobs_milestone ON jobs(milestone_id);
 `
 
+// milestoneMigrations add columns to the milestone tables created before them, in order (run after
+// milestonesSchema and the triggers, at the end of Open; a duplicate column is skipped).
+var milestoneMigrations = []string{
+	// G01: a task's planned skills edits (JoinNames; '' = none planned).
+	`ALTER TABLE milestone_tasks ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
+}
+
 // milestoneStamp is the updated_at of a milestone write: the database's clock in Unix seconds, but never
 // below the highest updated_at of all milestones. It is taken inside the writing statement, so under the
 // write lock, and never from a caller's clock: a write is stamped at or after every write committed
@@ -100,8 +110,8 @@ CREATE INDEX IF NOT EXISTS jobs_milestone ON jobs(milestone_id);
 // whatever a Go clock said or when the database clock steps back.
 const milestoneStamp = `MAX(CAST(strftime('%s','now') AS INTEGER), (SELECT COALESCE(MAX(updated_at), 0) FROM milestones))`
 
-// milestoneTriggers move a milestone's updated_at when a job attached to it is added or changes status
-// or outcome (whichever code path changes the row), and when a judge verdict of its repository and
+// milestoneTriggers move a milestone's updated_at when a job attached to it is added or changes status,
+// outcome or delivered skills (the tree shows them, G01; whichever code path changes the row), and when a judge verdict of its repository and
 // checklist is stored (acceptance_met reads the latest). They are replaced on every Open
 // (migrateMilestoneTriggers), so a database keeps no older stamp.
 const milestoneTriggers = `
@@ -112,8 +122,9 @@ CREATE TRIGGER jobs_milestone_insert AFTER INSERT ON jobs WHEN NEW.milestone_id 
 BEGIN
 	UPDATE milestones SET updated_at = ` + milestoneStamp + ` WHERE id = NEW.milestone_id;
 END;
-CREATE TRIGGER jobs_milestone_update AFTER UPDATE OF status, outcome ON jobs
-WHEN NEW.milestone_id IS NOT NULL AND (OLD.status IS NOT NEW.status OR OLD.outcome IS NOT NEW.outcome)
+CREATE TRIGGER jobs_milestone_update AFTER UPDATE OF status, outcome, skills_delivered ON jobs
+WHEN NEW.milestone_id IS NOT NULL AND (OLD.status IS NOT NEW.status OR OLD.outcome IS NOT NEW.outcome
+	OR OLD.skills_delivered IS NOT NEW.skills_delivered)
 BEGIN
 	UPDATE milestones SET updated_at = ` + milestoneStamp + ` WHERE id = NEW.milestone_id;
 END;
@@ -216,10 +227,11 @@ func (s *Store) CreateMilestone(ms *Milestone, tasks []MilestoneTask, now time.T
 }
 
 func upsertTask(tx *sql.Tx, id int64, t MilestoneTask, now time.Time) error {
-	if _, err := tx.Exec(`INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, dropped, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(milestone_id, key) DO UPDATE SET title=excluded.title,
-		depends_on=excluded.depends_on, covers=excluded.covers, dropped=excluded.dropped, updated_at=excluded.updated_at`,
-		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), t.Dropped, now.Unix(), now.Unix()); err != nil {
+	if _, err := tx.Exec(`INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(milestone_id, key) DO UPDATE SET title=excluded.title,
+		depends_on=excluded.depends_on, covers=excluded.covers, skills=excluded.skills, dropped=excluded.dropped,
+		updated_at=excluded.updated_at`,
+		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), JoinNames(t.Skills), t.Dropped, now.Unix(), now.Unix()); err != nil {
 		return fmt.Errorf("write task %s: %w", t.Key, err)
 	}
 	return writeTaskSources(tx, id, t)
@@ -332,7 +344,7 @@ func (s *Store) MilestoneTasks(ctx context.Context, id int64) ([]MilestoneTask, 
 }
 
 func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, error) {
-	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, dropped, created_at, updated_at
+	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at
 		FROM milestone_tasks WHERE milestone_id = ? ORDER BY rowid`, id)
 	if err != nil {
 		return nil, fmt.Errorf("milestone tasks: %w", err)
@@ -341,12 +353,12 @@ func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, 
 	var out []MilestoneTask
 	for rows.Next() {
 		var t MilestoneTask
-		var deps, covers string
+		var deps, covers, skills string
 		var created, updated int64
-		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &t.Dropped, &created, &updated); err != nil {
+		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &skills, &t.Dropped, &created, &updated); err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
-		t.DependsOn, t.Covers = SplitNames(deps), SplitNames(covers)
+		t.DependsOn, t.Covers, t.Skills = SplitNames(deps), SplitNames(covers), SplitNames(skills)
 		t.CreatedAt, t.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 		out = append(out, t)
 	}

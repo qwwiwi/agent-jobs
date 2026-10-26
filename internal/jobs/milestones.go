@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
+	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -26,6 +27,7 @@ const (
 	MaxMilestoneTasks      = 100
 	MaxTaskDeps            = 50
 	MaxTaskCovers          = 50
+	MaxTaskSkills          = 20
 )
 
 // Derived task statuses (TaskStatus), in the order they are decided.
@@ -45,13 +47,14 @@ var MilestoneStatuses = []string{store.MilestoneOpen, store.MilestoneDone, store
 // reTaskKey is a task key: T1, T2, … or any short name without spaces or commas.
 var reTaskKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`)
 
-// MilestoneTaskInput is one task of milestone_create, or one upsert of milestone_set: a nil DependsOn
-// or Covers keeps the stored value of an existing task (none for a new one), an empty list clears it.
+// MilestoneTaskInput is one task of milestone_create, or one upsert of milestone_set: a nil DependsOn,
+// Covers or Skills keeps the stored value of an existing task (none for a new one), an empty list clears it.
 type MilestoneTaskInput struct {
 	Key       string    `json:"key" jsonschema:"task key, unique in the milestone: T1, T2, ..."`
 	Title     string    `json:"title,omitempty" jsonschema:"one line; required for a new task"`
 	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles"`
 	Covers    *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
+	Skills    *[]string `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
 	// Sources (G02) are planned like covers: nil keeps the stored list, empty clears it.
 	Sources *[]string `json:"sources,omitempty" jsonschema:"https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
 }
@@ -93,15 +96,21 @@ type MilestoneJobView struct {
 	Turns       int     `json:"turns"`
 	CreatedAt   string  `json:"created_at"`
 	FinishedAt  string  `json:"finished_at,omitempty"`
+	// Skills are the catalog skills selected for the job at job_start, SkillsDelivered those linked
+	// into its work dir for its latest attempt.
+	Skills          []string `json:"skills,omitempty"`
+	SkillsDelivered []string `json:"skills_delivered,omitempty"`
 }
 
 // MilestoneTaskView is one task in the milestone tree, with its derived status and its jobs (oldest first).
 type MilestoneTaskView struct {
-	Key       string             `json:"key"`
-	Title     string             `json:"title"`
-	Status    string             `json:"status"`
-	DependsOn []string           `json:"depends_on"`
-	Covers    []string           `json:"covers"`
+	Key       string   `json:"key"`
+	Title     string   `json:"title"`
+	Status    string   `json:"status"`
+	DependsOn []string `json:"depends_on"`
+	Covers    []string `json:"covers"`
+	// Skills are the task's planned skills edits ([] = none planned: its jobs get their defaults).
+	Skills    []string           `json:"skills"`
 	Jobs      []MilestoneJobView `json:"jobs"`
 	CreatedAt string             `json:"created_at"`
 	UpdatedAt string             `json:"updated_at"`
@@ -292,6 +301,9 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 			t.Covers = trimList(*ti.Covers)
 			newCovers[key] = true
 		}
+		if ti.Skills != nil {
+			t.Skills = trimEdits(*ti.Skills)
+		}
 		touched[key] = true
 	}
 	for _, key := range drop {
@@ -336,6 +348,18 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 	return all, changed, nil
 }
 
+// trimEdits trims skills edits and drops blank ones, keeping order and repeats: edits apply in order
+// (+a, -a, +a ends with a), as job_start applies them.
+func trimEdits(in []string) []string {
+	out := []string{}
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func trimList(in []string) []string {
 	out := []string{}
 	for _, s := range in {
@@ -347,8 +371,13 @@ func trimList(in []string) []string {
 }
 
 func checkTask(t store.MilestoneTask, idx map[string]int, live []string) error {
-	if len(t.DependsOn) > MaxTaskDeps || len(t.Covers) > MaxTaskCovers {
-		return fmt.Errorf("task %s: at most %d depends_on and %d covers", t.Key, MaxTaskDeps, MaxTaskCovers)
+	if len(t.DependsOn) > MaxTaskDeps || len(t.Covers) > MaxTaskCovers || len(t.Skills) > MaxTaskSkills {
+		return fmt.Errorf("task %s: at most %d depends_on, %d covers and %d skills", t.Key, MaxTaskDeps, MaxTaskCovers, MaxTaskSkills)
+	}
+	for _, s := range t.Skills {
+		if strings.Contains(s, ",") || containsControl(s) || utf8.RuneCountInString(s) > 100 {
+			return fmt.Errorf("task %s: skill %q must be a skill name, +name or -name", t.Key, Printable(s, 40))
+		}
 	}
 	for _, d := range t.DependsOn {
 		if d == t.Key {
@@ -514,6 +543,26 @@ func openTasks(tasks []store.MilestoneTask, jobs []*store.Job) []string {
 	return out
 }
 
+// checkTaskSkills checks the planned skills given in the task inputs against the skill catalog, the way
+// job_start checks its edits: an unknown or deprecated name is refused (with close names). The budget
+// is not checked here: it depends on the job's kind, and job_start checks it. Stored plans are not
+// checked again: a job_start on the task does.
+func (m *Manager) checkTaskSkills(in []MilestoneTaskInput) error {
+	for _, ti := range in {
+		if ti.Skills == nil {
+			continue
+		}
+		edits := trimEdits(*ti.Skills)
+		if len(edits) == 0 {
+			continue
+		}
+		if _, err := m.Catalog().Select("", "", edits, skills.Budget{}); err != nil {
+			return fmt.Errorf("task %s skills: %w", strings.TrimSpace(ti.Key), err)
+		}
+	}
+	return nil
+}
+
 // CreateMilestone validates and stores a milestone with its tasks (milestone_create) and returns its tree.
 func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*MilestoneView, error) {
 	title, err := oneLine("title", in.Title, MaxMilestoneTitleRunes, true)
@@ -550,6 +599,9 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
 	}
 	_, tasks, err := applyTasks(nil, in.Tasks, nil, live)
 	if err != nil {
+		return nil, err
+	}
+	if err := m.checkTaskSkills(in.Tasks); err != nil {
 		return nil, err
 	}
 	ms := &store.Milestone{Title: title, Goal: goal, Repo: repo, Branch: branch, ChecklistID: id, Order: in.Order}
@@ -605,6 +657,9 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 	}
 	if in.MaxParallel != nil && *in.MaxParallel < 0 {
 		return nil, errors.New("max_parallel must be 0 (no cap) or more")
+	}
+	if err := m.checkTaskSkills(in.Tasks); err != nil {
+		return nil, err
 	}
 	var live []string
 	if cur.ChecklistID != "" && len(in.Tasks) > 0 {
@@ -765,6 +820,7 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 		byTask[j.TaskKey] = append(byTask[j.TaskKey], MilestoneJobView{
 			ID: j.ID, Status: j.Status, Outcome: j.Outcome, Model: j.Model, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
 			Turns: j.Turns, CreatedAt: fmtMilestoneTS(&j.CreatedAt), FinishedAt: fmtMilestoneTS(j.FinishedAt),
+			Skills: j.Skills, SkillsDelivered: j.SkillsDelivered,
 		})
 	}
 	p := &MilestoneProgress{}
@@ -772,7 +828,7 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 	v.Tasks, v.Ready = []MilestoneTaskView{}, []string{}
 	for _, t := range tasks {
 		tv := MilestoneTaskView{Key: t.Key, Title: t.Title, Status: st[t.Key], DependsOn: nonNilList(t.DependsOn),
-			Covers: nonNilList(t.Covers), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
+			Covers: nonNilList(t.Covers), Skills: nonNilList(t.Skills), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
 			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt), Sources: nonNilList(t.Sources)}
 		if tv.Jobs == nil {
 			tv.Jobs = []MilestoneJobView{}
@@ -939,8 +995,10 @@ func (m *Manager) ListMilestones(ctx context.Context, r MilestoneListRequest) (*
 }
 
 // milestoneStart checks job_start on a task of a milestone and fills in the request: the milestone is
-// open, the task exists and is neither blocked nor dropped, a repo given is the milestone's, and the
-// milestone's branch is the default base when it resolves in the repo.
+// open, the task exists and is neither blocked nor dropped, a repo given is the milestone's, the
+// milestone's branch is the default base when it resolves in the repo, and the task's planned skills
+// are the job's skills edits when job_start gives none (nil: an empty list is the defaults, and a
+// skills: none brief line opts out of both).
 func (m *Manager) milestoneStart(r *StartRequest) error {
 	if r.Milestone == 0 && r.Task == "" {
 		return nil
@@ -1003,6 +1061,9 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 		if _, err := git(r.RepoPath, "rev-parse", "--verify", "-q", "refs/heads/"+ms.Branch+"^{commit}"); err == nil {
 			r.Base = ms.Branch
 		}
+	}
+	if plan := tasks[idx].Skills; r.Skills == nil && len(plan) > 0 && !skills.BriefDeclinesSkills(r.Brief) {
+		r.Skills, r.plannedSkills = slices.Clone(plan), true
 	}
 	return nil
 }

@@ -29,7 +29,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
 | `size` | `small` or `large`; pass it on every `fix` and `general` job (review and research jobs are exempt). `small`: a fix or a single job. `large`: a new project, or a feature with more than 5 requirements, several jobs or more than a day of work; it needs `repo` and `covers` naming only live requirement IDs of the repo's approved, unchanged `brief/CHECKLIST.md`, otherwise the call is rejected. While config `size_required` is off (the default until the owner turns it on) a missing size is logged and allowed; once it is on, a `fix` or `general` job without it is rejected |
 | `milestone`, `task` | optional, together: the milestone id and task key (`T1`, …) the job works on. Refused when the task is `blocked` (a dependency is not done) or `dropped`; the milestone's `branch` is the default `base`. A task with `depends_on` gets the accepted results of those tasks in its prompt (`## Prior results`, full reports in `prior/<key>/report.md`) |
-| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults |
+| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults. On a milestone task, leave `skills` out: the job gets the task's planned skills (giving them replaces the plan for this job) |
 
 job_start returns the id at once; the daemon starts the job within a minute, at most `max_running` at a time per agent (config.json, default two). Do not poll it in a loop: wait for the job-done line.
 
@@ -54,14 +54,14 @@ Inside a job:
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
 | `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
-| `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, covers?}]`), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel` |
+| `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, covers?, skills?}]`), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel`; a task's `skills` are the `job_start` skills edits its jobs get |
 | `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; any edit of a done milestone while a task is not done or dropped reopens it) |
 | `milestone_get` | the tree: each task's derived status (blocked, running, review, done, failed, ready, dropped) and jobs, `ready` keys, progress |
 | `milestone_list` | by repo and order; `repo` + `tree: true` is the whole project in one call; pass the returned `cursor` as the next `updated_since` |
 
 ## Milestones
 
-A piece of work with more than one task runs as a milestone by default; a single job needs none, and no brief or checklist is required. Create it with its tasks in one `milestone_create` call, then start one job per key in `ready` with `job_start(milestone, task)`; independent tasks run in parallel (`max_parallel` caps them). A task is done when you record `job_outcome(accepted)` for its job, which unblocks the tasks that depend on it. Task status is never set by hand.
+A piece of work with more than one task runs as a milestone by default; a single job needs none, and no brief or checklist is required. Create it with its tasks in one `milestone_create` call, then start one job per key in `ready` with `job_start(milestone, task)`; independent tasks run in parallel (`max_parallel` caps them). Choose skills once, for the whole milestone: look the catalog up with `skill_list` while writing `milestone_create` and give each task its `skills` (or `[]` for the defaults); then start its jobs without `skills`, and they get the task's plan. A task is done when you record `job_outcome(accepted)` for its job, which unblocks the tasks that depend on it. Task status is never set by hand.
 
 ## Change a job's course
 

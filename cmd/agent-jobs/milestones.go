@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -104,7 +105,7 @@ func cmdMilestone(args []string) error {
 	}
 	fmt.Printf("tasks %d/%d done%s · ready: %s\n", p.TasksDone, p.TasksTotal, acc, strings.Join(v.Ready, ", "))
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "TASK\tSTATUS\tDEPENDS\tJOBS\tTITLE")
+	fmt.Fprintln(w, "TASK\tSTATUS\tDEPENDS\tSKILLS\tJOBS\tTITLE")
 	for _, t := range v.Tasks {
 		var js []string
 		for _, j := range t.Jobs {
@@ -112,10 +113,11 @@ func cmdMilestone(args []string) error {
 			if j.Outcome != "" {
 				s += "/" + j.Outcome
 			}
+			s += jobSkills(j.Skills, j.SkillsDelivered)
 			js = append(js, s)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.Key, t.Status, dash(strings.Join(t.DependsOn, ",")),
-			dash(strings.Join(js, "; ")), t.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.Key, t.Status, dash(strings.Join(t.DependsOn, ",")),
+			dash(strings.Join(t.Skills, ",")), dash(strings.Join(js, "; ")), t.Title)
 	}
 	if err := w.Flush(); err != nil {
 		return err
@@ -127,6 +129,25 @@ func cmdMilestone(args []string) error {
 		fmt.Printf("note: %s\n", v.Note)
 	}
 	return nil
+}
+
+// jobSkills renders a job's skills for the JOBS column: one list when the skills selected at job_start
+// and those linked for its latest attempt match, both labelled when they differ (a repository-owned
+// skill is selected but not linked), so neither the selection nor the delivery is lost.
+func jobSkills(selected, delivered []string) string {
+	if len(selected) == 0 && len(delivered) == 0 {
+		return ""
+	}
+	if slices.Equal(slices.Sorted(slices.Values(selected)), slices.Sorted(slices.Values(delivered))) {
+		return " [" + strings.Join(selected, ",") + "]"
+	}
+	none := func(s []string) string {
+		if len(s) == 0 {
+			return "none"
+		}
+		return strings.Join(s, ",")
+	}
+	return " [selected " + none(selected) + "; delivered " + none(delivered) + "]"
 }
 
 func dash(s string) string {

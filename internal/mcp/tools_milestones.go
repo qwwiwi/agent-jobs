@@ -17,7 +17,8 @@ func addMilestoneCreate(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "milestone_create",
 		Description: "Create a milestone (a stage of work) with its tasks in one call and return its tree. Only title and tasks " +
-			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys) and covers (requirement IDs). " +
+			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys), covers (requirement IDs) and " +
+			"skills (job_start's skills edits, planned once here: a job_start on the task without skills gets them). " +
 			"Run its tasks with job_start(milestone, task): a task waits (blocked) until every task it depends on is done " +
 			"(its job's outcome accepted), independent tasks run in parallel (max_parallel caps them, 1 = one after another). " +
 			"A job on a task with depends_on gets a \"Prior results\" section with those tasks' accepted jobs.",
@@ -49,7 +50,7 @@ func addMilestoneGet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "milestone_get",
 		Description: "The full tree of one milestone: its fields; each task with its derived status (dropped, blocked, running, " +
-			"review, done, failed, ready), depends_on, covers and jobs; ready (the keys a job can start on now); progress " +
+			"review, done, failed, ready), depends_on, covers, planned skills and jobs (each with the skills it got); ready (the keys a job can start on now); progress " +
 			"(tasks done of total, dropped left out; acceptance met of total covered, from the latest judge verdict, null without " +
 			"one); uncovered (live checklist rows no task covers, when tied to a checklist).",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in MilestoneGetInput) (*sdk.CallToolResult, jobs.MilestoneView, error) {

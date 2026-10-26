@@ -184,12 +184,15 @@ type StartRequest struct {
 	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
 	Gate *store.GateInput
 	// Milestone and Task attach the job to a task of a milestone (both or neither): the task must not
-	// be blocked or dropped, and the milestone's branch is the default base.
+	// be blocked or dropped, and the milestone's branch is the default base. Without Skills (nil) the
+	// job gets the task's planned skills (G01).
 	Milestone int64
 	Task      string
 	// Sources are https git URLs cloned read-only into the job folder before it starts (G02); nil = not
 	// given (a task job then takes its task's planned sources), empty = none.
 	Sources []string
+	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
+	plannedSkills bool
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -440,6 +443,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 	} else if r.Gate == nil {
 		selected, err = m.selectSkills(r.Kind, repo, r.Skills)
+		if err != nil && r.plannedSkills {
+			return nil, fmt.Errorf("%w (the skills planned for task %s of milestone %d: give job_start skills of its own, "+
+				"or change the plan with milestone_set)", err, r.Task, r.Milestone)
+		}
 		if err != nil {
 			return nil, err
 		}
