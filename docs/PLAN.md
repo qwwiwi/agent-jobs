@@ -74,11 +74,11 @@ Not in the current release scope; kept in the plan with its description.
 - **API-credit fallback.** When the subscription's weekly window is nearly used up, jobs may run on API credit, only with explicit consent and a cap. To be built switched off; turning it on (real money) needs its own owner «да». *Status: deferred by the owner 2026-10-18, not built (see [DECISIONS.md](DECISIONS.md)): «we will do it later»; it stays in the plan, not in the current release. Only a `billing` column exists, always `subscription`.*
 - **G02 sources (repositories cloned read-only into the job folder, their code run only in docker).** *Status: deferred by the owner 2026-10-26 (see [DECISIONS.md](DECISIONS.md)): built on the milestones branch, switched off before release because the text-parsing guard could still be bypassed; every entry point refuses a non-empty sources list and the daemon never clones. To be rebuilt as a separate task on OS-level isolation.*
 
-## Wave E: borrowed ideas (planned; E2 approved and built)
+## Wave E: borrowed ideas (planned; E2 approved and built, E1 approved)
 
-Each item waits for a separate owner go (E2 has it, see [DECISIONS.md](DECISIONS.md)); it is not part of the current mandate (see [DECISIONS.md](DECISIONS.md)). Items that diverge from the reference have a «proposed, not approved» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-not-approved-wave-e). Sources are open-source projects from the 2026-10-17 market scan. The Codex runner and schedules, also seen in those projects, are already in Wave B; Wave E does not change them.
+Each item waits for a separate owner go (E2 and E1 have it, see [DECISIONS.md](DECISIONS.md)); it is not part of the current mandate (see [DECISIONS.md](DECISIONS.md)). Items that diverge from the reference have a «proposed, not approved» entry in [DEVIATIONS.md](DEVIATIONS.md#proposed-not-approved-wave-e). Sources are open-source projects from the 2026-10-17 market scan. The Codex runner and schedules, also seen in those projects, are already in Wave B; Wave E does not change them.
 
-- **E1. Subscription limit: wait for the reset and resume.** Keep the last rate-limit event; hold new launches when the window is near its limit; on a usage-limit error wait for the reset + 60 s + jitter and resume the same session (needs E2). Why: subscription windows, not dollar budgets, stop overnight jobs; `--max-budget-usd` is a client-side estimate, not a subscription cap. Source: arbab. Related: Wave D API-credit fallback (E1 waits, the fallback pays). Priority: high. DEVIATIONS E1.
+- **E1. Subscription limit: wait for the reset and resume.** Keep the last rate-limit event; hold new launches when the window is near its limit; on a usage-limit error wait for the reset + 60 s + jitter and resume the same session (needs E2). Why: subscription windows, not dollar budgets, stop overnight jobs; `--max-budget-usd` is a client-side estimate, not a subscription cap. Source: arbab. Related: Wave D API-credit fallback (E1 waits, the fallback pays). Priority: high. DEVIATIONS E1. **Status: approved by the owner 2026-10-25 (hold launches on the 5 h / 7 d quota windows, resume after the reset); ships before v1.0.0 P4, high priority ([DECISIONS.md](DECISIONS.md)). Not built.**
 - **E2. True session resume.** Assign `--session-id` before launch and drop `--no-session-persistence`, so `job_resume` continues the same claude session instead of starting a fresh job from the saved patches. Why: a timed-out or killed job keeps its context, including turns that produced no commit. Source: agent-dispatch. Related: Wave B Resume (patch carry-over stays as the fallback). Priority: high. **Status: approved by the owner as a priority and built in v0.3.0 (stop, resume, amend; see Done); DEVIATIONS #15.**
 - **E3. Structured outcome.** Next to `report.md`, a machine-readable outcome (via `--json-schema`): status `done | partial | blocked`, changed files, checks with their exit codes, a not-verified list. Why: the orchestrator can triage without reading the report, and a job cannot claim a pass the outcome does not show. Source: arbab (fixed report schema), agent-dispatch (`STATUS: done|partial|blocked`). Related: the report contract (Done, PR #1); Wave D Progress section. Priority: high. DEVIATIONS E3.
 - **E4. Verify by exit codes.** Check results are taken from tool exit codes in `stream.jsonl`, never from the model's summary; optionally a separate read-only verify job (no edit tools) runs the checks after a fix. Why: a report is a claim; exit codes are evidence. Source: arbab (verify / probe role). Related: Wave D `acceptance_cmd`. Priority: medium-high. DEVIATIONS E4.
@@ -121,9 +121,9 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 
 **Milestones.**
 - **P1. Plugin skeleton + MCP + skill.** Manifest, MCP server registration, the `agent-jobs` skill. *Acceptance:* on a machine that already has the daemon, one install command makes the MCP job tools and the skill appear in a new Claude Code session, and `job_start` / `job_status` / `job_result` work end to end. Removing the plugin removes them.
-- **P2. Context feed hooks + asyncRewake.** *Acceptance:* a job that finishes, fails or waits shows up in the next prompt's `additionalContext` once per job transition and receiving session (the same transition may reach another session once, and is never repeated to the same one), as a compact summary with a size cap. An idle session is woken by `asyncRewake` when a job ends, on the supported versions and clients that P2 lists. With the hooks off or failing, Claude Code still works and nothing is reported twice. Loss and replay are checked explicitly: (1) events that occur while the hooks are disabled or failing are retained and delivered after recovery, once; (2) when more events are pending than the summary cap allows, the overflow is not dropped: the summary says how many remain and they arrive in later prompts, once each; (3) a job that completes between a rewake and the next-prompt delivery is reported once, not twice and not zero times. Before the build, the behaviour is checked against the current Claude Code hook and plugin docs (`UserPromptSubmit`, `asyncRewake` and its timeout limits, `experimental.monitors`), and the supported versions, clients and watcher lifecycle are recorded.
+- **P2. Context feed hooks + asyncRewake.** *Acceptance:* a job that finishes, fails or waits shows up in the next prompt's `additionalContext` once per job transition and receiving session (the same transition may reach another session once, and is never repeated to the same one), as a compact summary with a size cap. An idle session is woken by `asyncRewake` when a job ends, on the supported versions and clients that P2 lists. With the hooks off or failing, Claude Code still works and nothing is reported twice. Loss and replay are checked explicitly: (1) events that occur while the hooks are disabled or failing are retained and delivered after recovery, once; (2) when more events are pending than the summary cap allows, the overflow is not dropped: the summary says how many remain and they arrive in later prompts, once each; (3) a job that completes between a rewake and the next-prompt delivery is reported once, not twice and not zero times. Before the build, the behaviour is checked against the current Claude Code hook and plugin docs (`UserPromptSubmit`, `asyncRewake` and its timeout limits, `experimental.monitors`), and the supported versions, clients and watcher lifecycle are recorded. In tmux mode the job-done line is never typed over the owner's unsent draft in the input box: the injector waits and retries until the box is empty, and the line is delivered once (owner 2026-10-25, [DECISIONS.md](DECISIONS.md)).
 - **P3. Daemon installer for Linux and macOS + doctor.** *Acceptance:* install, upgrade and uninstall are idempotent on Linux (user service) and macOS (launchd), and an upgrade never kills running jobs. `doctor` on a fresh install reports green; on a broken install (no daemon, stale binary, missing hook) it names the problem and the fix.
-- **P4. Clean-machine acceptance.** On a fresh user account with only Claude Code installed, it is checked in three modes: the terminal CLI, the desktop app, and a tmux session. *Acceptance:* in each mode, one install command, a test job, its result in the orchestrator's context without manual polling (tmux: a pushed job-done line; terminal and desktop: the summary on the next prompt or a rewake). No private names in config, logs or prompts.
+- **P4. Clean-machine acceptance.** Starts only after Wave E1 has shipped (owner 2026-10-25). On a fresh user account with only Claude Code installed, it is checked in three modes: the terminal CLI, the desktop app, and a tmux session. *Acceptance:* in each mode, one install command, a test job, its result in the orchestrator's context without manual polling (tmux: a pushed job-done line; terminal and desktop: the summary on the next prompt or a rewake). No private names in config, logs or prompts.
 - **P5. Docs + release v1.0.0.** *Acceptance:* the README and the docs describe the plugin install as the primary path and the manual install as the alternative, with a migration note for v0.x. The CHANGELOG entry is written, the conformance check is published, and v1.0.0 is tagged after the owner's go.
 
 **Open questions.**
@@ -207,9 +207,28 @@ Intended delivery path. Each item below is verified in P2 against the supported 
 - Root shell modes (F9 (b)): `sudo -s|-i|--shell|--login` (and the shells of `doas`, `su`, `runuser`) hand their argv to a root shell that expands `$NAME` in a quoted word again; the reader takes `sudo -s gh pr '$M' 5` as written and misses the merge. Such commands are never read relaxed, but the strict reading has the same gap.
 - No deploy gate: the Merge rule covers deploy, but F9 gates only the merge. Until a deploy hook (or a `release_check` call in the project's deploy script) is designed before the build, a deploy of a LARGE task is held only by the orchestrator (soft).
 
-## Ideas (not approved)
+## Semi-auto checklist mode (approved, not built)
 
-Ideas recorded for later; none is approved or scheduled. Each needs an owner go before work starts.
+Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)). A design to be specified before the build; the proposal:
+
+- Scope: a checklist whose work touches no hard gate (money/billing, auth, prod DB, payment config, gateway/model config, destructive ops, mass sends). If any row touches one, the checklist needs an explicit owner approval, quoted verbatim, as today.
+- The agent still shows the checklist to the owner, with the hard-gate verdict and the end of the window. If the owner does not object within the 30-minute act-with-veto window (approved by the owner; making it configurable is a proposal), the checklist counts as approved; `checklist_set` records it as a veto-window approval (shown at, window, no objection), distinct from an explicit one.
+- Any owner objection or question stops the window; a change to a hashed field (F1) restarts it. The merge rule (100% acceptance) is unchanged.
+
+## Milestones phase 2 (approved, not built)
+
+Owner decision 2026-10-25 ([DECISIONS.md](DECISIONS.md)); starts after the milestones MVP merges (PR #88, branch `feature/milestones`, not on main yet).
+
+- An automatic capstone task «judge + release_check» when a milestone has a checklist.
+- Waves and the maximum parallelism shown in `milestone_get` (a tool of the milestones MVP, PR #88).
+- Gates as task dependencies: `gate:owner`, `gate:timer`, `gate:ci`.
+- A one-line milestone progress for the owner («stage 4/5, acceptance 6/8») via `notify_owner`.
+- A Prior-results handoff format: Decided / Rejected / Risks / Files / Remaining.
+- Daemon auto-start of ready tasks (already intended).
+
+## Ideas
+
+Ideas recorded for later; none is approved or scheduled unless it is marked approved. Each needs an owner go before work starts.
 
 - I1. Requirement ledger: for a feature, the owner's own words are saved untouched and broken into numbered requirements (R01..Rn); every report marks each of them done / partial / missing / placeholder; dropping one is the owner's call; later changes are added on, and the original text stays as it was. *Taken into Wave F (F1, F2, F4), approved 2026-10-24.*
   - Why: no part of the request disappears or changes meaning unnoticed. Lives in: the orchestrator's brief habit and the report contract.
@@ -228,7 +247,19 @@ Ideas recorded for later; none is approved or scheduled. Each needs an owner go 
 - I8. Allow `Monitor` in jobs once its command goes through the same guard checks as a Bash command (and a WebSocket monitor is refused or checked). Today it is refused: it runs its own command outside the Bash guard (CONFORMANCE U1).
   - Why: job history shows jobs reaching for `Monitor` (11 calls) and `ScheduleWakeup` (12) to wait for builds; a checked `Monitor` would give them a native wait. `ScheduleWakeup` stays refused (the daemon owns a job's lifetime). Lives in: `internal/guard/toolallow.go`, `internal/jobs/prepare.go`. Source: Codex review of the U1 fix, 2026-10-18.
 
-Not taken: a local HTML dashboard (agent-first API instead), a shared working tree for parallel writers (we isolate each job in a worktree), prompt-only safety (we keep the guard), update checks over the network on every start.
+Approved for later waves (owner 2026-10-25, [DECISIONS.md](DECISIONS.md); not scheduled):
+
+- `job_signal` (stuck | needs_input | checkpoint, rate limited), together with E6.
+- A stall detector: the stream is silent for N minutes → a signal or a stop.
+- Protected files and a diff-size flag on the job-done line.
+- Safe outputs: typed write requests that the session applies (as in gh-aw).
+- A «Ruling:» log and an Assumptions section in job reports.
+- A Review Focus section in briefs.
+- A threat-detection pass before ship.
+- A circuit breaker.
+- A CI/review → auto-amend loop (large, later).
+
+Not taken: a local HTML dashboard (agent-first API instead), a shared working tree for parallel writers (we isolate each job in a worktree), prompt-only safety (we keep the guard), update checks over the network on every start. Skipped by the owner 2026-10-25: two-way Telegram into the session (the gateway's job, DEVIATIONS #4), a merge queue with bisection, «CI unknown = block», discovered-from links, Interfaces Consumes/Produces, per-row checklist hashes (for now), a backend over `claude --bg` (a spike after v1).
 
 ## Conformance check against the reference after every wave
 

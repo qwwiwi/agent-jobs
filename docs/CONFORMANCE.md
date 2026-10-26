@@ -23,7 +23,7 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | «the new daemon finds the exit-code file on the next tick» | 1:1 | `internal/jobs/manager.go:877-882` (`readExitCode`), `:535` (pid adopted from `wrapper.json`) |
 | Checklist review: «real bugs with file:line, the consequence and a minimal fix; verified findings kept apart from suspicions» | deviation (the reference row is kept, much is added; Finding U6 → #21) | `prompts/kind-review.md:3-12` |
 | Checklist fix: «reproduce with a failing test, then the minimal change, tests, a local commit» | 1:1 | `prompts/kind-fix.md:3-4` |
-| Checklist research: «only primary sources … verified kept apart from inferred» | 1:1 | `prompts/kind-research.md:3-4` |
+| Checklist research: «only primary sources … verified kept apart from inferred» | deviation (#37), reference rows kept on lines 3-4 | `prompts/kind-research.md:3-7` |
 | Checklist general: «state what counts as done, and prove it at the end» | 1:1 | `prompts/kind-general.md:3-4` |
 | Defaults / ceilings 80/200 turns, $10/$50, 45/180 min | 1:1 | `internal/jobs/config.go:24-29` |
 | «A request above a ceiling is rejected, not silently cut down» | 1:1 | `internal/jobs/manager.go:151` (`limits rejected (not clamped)`) |
