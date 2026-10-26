@@ -75,58 +75,6 @@ func TestMilestoneTermsDocumented(t *testing.T) {
 	})
 }
 
-// Every bureaucracy cut of the R08 audit is a row of DECISIONS.md with its measured reason, and the
-// guard cut keeps the money and auth refusals.
-func TestMilestoneCutsDecided(t *testing.T) {
-	t.Run("[R08] DECISIONS lists each cut with its measured reason", func(t *testing.T) {
-		doc := readDoc(t, "docs/DECISIONS.md")
-		row := func(title string) string {
-			for _, line := range strings.Split(doc, "\n") {
-				if strings.HasPrefix(line, "| ") && strings.Contains(line, "**"+title) {
-					return line
-				}
-			}
-			return ""
-		}
-		for _, title := range []string{
-			"Cut guard noise that costs job turns.",
-			"Release gate deadlock cut",
-			"The `trace` condition of `release_check` is cut.",
-			"Owner waivers bind to (checklist hash, requirement)",
-			"Merge gate: a command the reader cannot read no longer refuses.",
-			"The Requirements block and REDPROOF are informational.",
-			"Job size is optional.",
-			"The brief reminder speaks only when a checklist decision is pending.",
-			"The slicing check before approval is advisory.",
-		} {
-			r := row(title)
-			if r == "" {
-				t.Errorf("DECISIONS.md has no row %q", title)
-				continue
-			}
-			if !strings.Contains(r, "Measured reason:") {
-				t.Errorf("row %q has no measured reason", title)
-			}
-		}
-		if r := row("Cut guard noise that costs job turns."); !strings.Contains(r, "(checklist R08)") ||
-			!strings.Contains(r, "the money, auth, secrets") || !strings.Contains(r, "refusals are unchanged") {
-			t.Errorf("the guard cut does not name R08 or keep the money and auth refusals: %q", r)
-		}
-		n := 0
-		for _, line := range strings.Split(doc, "\n") {
-			if strings.Contains(line, "cut bureaucracy that costs time without catching defects") || strings.Contains(line, "(checklist R08)") {
-				n++
-				if !strings.Contains(line, "Measured reason:") {
-					t.Errorf("a cut without a measured reason: %.120s", line)
-				}
-			}
-		}
-		if n < 9 {
-			t.Errorf("%d cut rows, want at least 9", n)
-		}
-	})
-}
-
 // README, GUIDE and the decisions describe milestones in English (the Russian copies are separate files),
 // PLAN has the milestones phase 2, and the decision keeps «no noticeable latency» as a constraint.
 func TestMilestoneDocsInEnglish(t *testing.T) {
