@@ -371,3 +371,91 @@ func TestMergeGateShippedReapproval(t *testing.T) {
 		t.Fatalf("shipped re-approval still gated: %+v %v", a, err)
 	}
 }
+
+// The tick records nothing while the latest approval is not valid now, although a pass at it is on the
+// default branch: a hand-edited checklist (void), or a work tree whose checklist is another version than
+// the latest approval. The stored record is checked, not only the hook (which voids it anyway). Once the
+// work tree matches the approval again, the same tick ships it.
+func TestMergeGateShippedOnlyValidLatest(t *testing.T) {
+	for _, how := range []string{"hand edit", "other version"} {
+		t.Run(how, func(t *testing.T) {
+			m := newManager(t)
+			repo, _, shaX := shippedRepo(t, m)
+			main := mainWorktree(repo)
+			gitT(t, repo, "update-ref", "refs/remotes/origin/main", shaX)
+			p := checklist.ChecklistPath(repo)
+			orig, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			edited := strings.Replace(string(orig), "RATIONALE_MARKER", "edited by hand", 1)
+			if how == "other version" {
+				edited = strings.Replace(string(orig), "- version: 2", "- version: 3", 1)
+			}
+			if edited == string(orig) {
+				t.Fatal("the checklist edit changed nothing")
+			}
+			if err := os.WriteFile(p, []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != 0 || g.ShippedSHA != "" {
+				t.Fatalf("void approval recorded as shipped: %+v %v", g, err)
+			}
+			if err := os.WriteFile(p, orig, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			last, err := m.Store.LatestApproval(main)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != last.Seq || g.ShippedSHA != shaX {
+				t.Fatalf("valid again, not shipped: %+v %v", g, err)
+			}
+		})
+	}
+}
+
+// The hook honours a shipped record only for the approval it names: after an unchanged re-approval (a
+// new seq, the same id, version and hash) the record of the earlier approval, whose pass is still stored
+// and counts at the same hash, lifts nothing.
+func TestMergeGateShippedSeqMustMatch(t *testing.T) {
+	m := newManager(t)
+	repo, _, shaX := shippedRepo(t, m)
+	main := mainWorktree(repo)
+	first, err := m.Store.LatestApproval(main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.MarkGateShipped(main, first.Seq, shaX, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if a, err := m.MergeGateCheck(repo, "gh pr merge 8", ""); err != nil || a.Refusal != "" {
+		t.Fatalf("shipped record of the latest approval, still gated: %+v %v", a, err)
+	}
+	again := *first
+	again.Seq, again.ApprovedAt = 0, time.Now().Add(time.Minute)
+	if err := m.Store.PutApproval(again); err != nil {
+		t.Fatal(err)
+	}
+	last, err := m.Store.LatestApproval(main)
+	if err != nil || last.Seq == first.Seq || last.ChecklistSHA256 != first.ChecklistSHA256 {
+		t.Fatalf("re-approval: %+v %v", last, err)
+	}
+	// The earlier approval's pass counts at the current id, version and hash (what passCounts reads).
+	if ok, err := m.passCounts(&gatedRepo{main: main, id: last.ChecklistID, version: last.Version, hash: last.ChecklistSHA256},
+		shaX); err != nil || !ok {
+		t.Fatalf("pass does not count: %v %v", ok, err)
+	}
+	if a, err := m.MergeGateCheck(repo, "gh pr merge 8", ""); err != nil || a.Refusal == "" {
+		t.Fatalf("a shipped record of an earlier approval lifted the gate: %+v %v", a, err)
+	}
+	if views, err := m.MergeGates(); err != nil || len(views) != 1 || views[0].State != MergeGateGated {
+		t.Fatalf("view: %+v %v", views, err)
+	}
+}
