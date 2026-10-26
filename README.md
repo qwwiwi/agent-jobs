@@ -100,7 +100,7 @@ For a large task (a new project, or a feature with more than 5 requirements, sev
 5. **Owner approval.** `checklist_set approve` stores the approval with the owner's words, bound to a hash of the rows and the brief. Any later edit voids it.
 6. **Jobs check themselves against the rows.** Each feature job is started with `covers` (the row IDs it works on; `size: large` is then implied). The daemon writes the covered rows verbatim into the job's prompt. The job reports one line per requirement with its status and evidence (`R01 · done · file:line, the test`); a missing line is listed.
 7. **Blind judge.** `judge_start` gives a read-only job a copy of the code at a commit, without history, diffs or reports. Before the judge starts, its wrapper runs the repository's `scripts/manifest-check.sh` on a separate copy of that commit (this needs config `acceptance_allowed: true`) and hands the judge the output. The judge returns a verdict per live requirement.
-8. **Release only at 100%.** `release_check` passes only when every live requirement is met (or a placeholder on a `placeholder-ok` row, or waived by the owner for that requirement of the approved checklist; a later fix commit keeps the waiver), the manifest check exited 0, no brief quote is left uncovered and no test is suspect, and the judge was blind by enforcement. A Claude judge is held to its input by the guard; a Codex judge counts as blind when it ran under the read-only Codex sandbox (it blocks writes and network, not reads). The judge may share the coders' model family: its independence is that it is a separate blind job, and the family is reported as information only. It tells the owner «Acceptance: N of M». The optional `merge-gate` hook blocks a `gh pr merge` it can read in the session for an approved repository unless it names a head commit (`--match-head-commit`) on which that check passed; a command it cannot read runs with a warning. It is a guard rail, not a boundary (a `gh api` merge or the web UI pass by it).
+8. **Release only at 100%.** `release_check` passes only when every live requirement is met (or a placeholder on a `placeholder-ok` row, or waived by the owner for that requirement of the approved checklist; a later fix commit keeps the waiver), the manifest check exited 0, no brief quote is left uncovered and no test is suspect, and the judge was blind by enforcement. A Claude judge is held to its input by the guard; a Codex judge counts as blind when it ran under the read-only Codex sandbox (it blocks writes and network, not reads). The judge may share the coders' model family: its independence is that it is a separate blind job, and the family is reported as information only. It tells the owner «Acceptance: N of M». The optional `merge-gate` hook blocks a `gh pr merge` it can read in the session for an approved repository unless it names a head commit (`--match-head-commit`) on which that check passed; a command it cannot read runs with a warning. Once a checklist's release shipped (the commit `release_check` passed at is on origin's default branch), the hook stops gating the repository until the next approval. It is a guard rail, not a boundary (a `gh api` merge or the web UI pass by it).
 
 Details: [Brief checklist, slicing, judge, release check](docs/GUIDE.md#mcp-tools) and [docs/PLAN.md](docs/PLAN.md) (Wave F).
 
@@ -118,7 +118,28 @@ A large project is split into **milestones** (stages of work, ordered per reposi
 - **Built for a frontend.** `milestone_get` returns the whole tree (tasks, their jobs, ready tasks, progress, acceptance), `milestone_list` with `repo` and `tree` the whole project in one call, and its `cursor` is the next `updated_since`; `GET /v1/milestones` and `GET /v1/milestones/{id}` of the read-only HTTP API return the same JSON.
 - **Same on the command line.** `agent-jobs milestone create --input tasks.json --title T`, `milestone set <id> --input edit.json`, `milestone <id>` and `milestones` call the same code as the MCP tools and print the same JSON.
 
+One call creates the stage; then the session starts a job per ready task (`job_start` with `milestone` and `task`), here T1 first, T2 once T1 is done:
+
+```json
+{"title": "Auth v2", "repo": "/home/me/src/project", "max_parallel": 2, "tasks": [
+  {"key": "T1", "title": "Sessions table"},
+  {"key": "T2", "title": "Login API", "depends_on": ["T1"]},
+  {"key": "T3", "title": "Docs for the login API", "depends_on": ["T2"]}]}
+```
+
 Details, the JSON schema and the endpoints: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones).
+
+---
+
+## Codex jobs that write code
+
+A job on a `gpt-*` model runs on `codex exec` and is read-only by default (review, research, judging). With `codex_write_allowed: true` in `config.json` (your opt-in; turning it on needs a daemon restart) codex `fix` and `general` jobs may write code in their worktree, inside codex's `workspace-write` sandbox:
+
+- **The wrapper commits.** The sandbox keeps the repository's git dirs read-only, so the job leaves its changes in `work/` and its message in `<job dir>/progress/COMMIT_MSG`; after the run the wrapper makes one local commit with the job's git identity, no hooks and no signing. Limits: 2000 changed paths, 20 MiB per file, 200 MiB in all, a nested-repository scan of at most 200000 entries, one 2-minute deadline; over any of them there is no commit and the changes stay as patches.
+- **No network unless you say so.** `codex_write_network: true` lets the job's commands reach the network (package installs); it is off by default, and read-only codex jobs never get it.
+- **Still no guard.** The codex sandbox is the only containment of a codex job; the session reads the report, checks the diff and ships, as with every job.
+
+Details: [docs/GUIDE.md, Limits](docs/GUIDE.md#limits) (codex runner, commits and network, `codex_sandbox`).
 
 ---
 
@@ -142,7 +163,7 @@ Details, the JSON schema and the endpoints: [docs/GUIDE.md, Milestones](docs/GUI
 | [Intentions](docs/GUIDE.md#mcp-tools) | the agent's own goals: add, list, set status | goals outlive a conversation |
 | [Shared memory (brain)](docs/GUIDE.md#install-and-configure) | memory, task and team tools backed by the team's shared brain; memory notes in every brief | jobs and agents share what they learned |
 | [Read-only HTTP API](docs/GUIDE.md#install-and-configure) | health, jobs, stats, schedules and skills over a unix socket or loopback, token required | build a dashboard without touching the database |
-| [Codex runner](docs/GUIDE.md#limits) | a `gpt-*` model runs the job on `codex exec`; read-only by default, with a daily cap | a second model family for reviews and judging, with its own limits (a Codex judge under the read-only sandbox counts as blind for `release_check`) |
+| [Codex runner](docs/GUIDE.md#limits) | a `gpt-*` model runs the job on `codex exec`; read-only by default, with a daily cap; with `codex_write_allowed` fix and general jobs [write code](#codex-jobs-that-write-code) and the wrapper commits it | a second model family for reviews and judging, with its own limits (a Codex judge under the read-only sandbox counts as blind for `release_check`) |
 | [Brief flow](#large-tasks-from-one-brief-to-a-checked-release) | brief, checklist, briefing, slicing check, approval, covers, judge, release check, merge gate | large tasks from one brief, released only at 100% |
 | [Doctor, logs, activity](docs/GUIDE.md#mcp-tools) | `system_doctor`, `system_logs`, `activity_report`, `agent-jobs doctor procs` | see what is wrong before it bites |
 | [Trash](docs/GUIDE.md#mcp-tools) | reversible deletion inside configured roots: `trash_move`, `trash_restore` | delete without `rm` |
