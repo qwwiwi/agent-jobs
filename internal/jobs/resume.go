@@ -987,7 +987,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
 		notes = m.LookupMemoryNotes(j)
 	}
-	brief, err := m.buildPrompt(j, rules, cards, notes, prior)
+	brief, err := m.buildPrompt(j, rules, cards, notes, prior, m.sourcesOnDisk(j))
 	if err != nil {
 		return launchPlan{}, err
 	}

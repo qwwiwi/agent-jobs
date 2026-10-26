@@ -27,6 +27,9 @@ const (
 	RuleSubagentLimit    = "subagent-limit"
 	RuleSubagentEscape   = "subagent-isolation"
 	RuleSubagentLog      = "subagent-log"
+	RuleSourcesWrite     = "sources-write"
+	RuleSourcesExec      = "sources-exec"
+	RuleDockerSandbox    = "docker-sandbox"
 	RuleOther            = "other"
 	refusalPrefixGuard   = "blocked by guard: "
 	refusalPrefixSubagnt = "agent-jobs guard: "
@@ -39,6 +42,9 @@ var ruleMarkers = []struct{ phrase, rule string }{
 	{"a job does not write inside a .git directory", RuleGitDirWrite},
 	{"is git's config, hooks or $GIT_DIR", RuleGitDirWrite},
 	{"agent-jobs state", RuleAgentJobsState},
+	{"the job's sources (the read-only clones", RuleSourcesWrite},
+	{"code of the job's sources never runs on the host", RuleSourcesExec},
+	{"docker runs only the sandbox form", RuleDockerSandbox},
 	{"guard cannot verify this form", RuleUnverifiable},
 	{"fetches and runs a package by name", RulePackageRunner},
 	{"starts a nested agent", RuleNestedAgent},

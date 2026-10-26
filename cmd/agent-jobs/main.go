@@ -345,6 +345,9 @@ func runGuard(args []string, stdin io.Reader) int {
 	readOnly := fs.String("read-only", "", "the worktree of a review job: no tool call writes inside it")
 	var readAllow multi
 	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
+	var sources multi
+	fs.Var(&sources, "sources", "the job's cloned sources dir: read-only, its code never runs on the host (repeatable)")
+	sandbox := fs.String("sandbox", "", "the job's sandbox dir: its copies run only in docker run --rm with one -v mount from it")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -366,6 +369,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
 		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
+		Sources: sources, Sandbox: *sandbox,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -489,10 +493,15 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	var sources multi
+	fs.Var(&sources, "source", "an https git URL cloned read-only into the job folder as sources/<name> before it starts (repeatable)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
+	if len(sources) > 0 {
+		r.Sources = sources
+	}
 	switch {
 	case *brief != "":
 		r.Brief = *brief
@@ -605,6 +614,9 @@ func cmdStatus(args []string) error {
 		if j.SkillsNote != "" {
 			fmt.Printf("           %s\n", j.SkillsNote)
 		}
+	}
+	if len(j.Sources) > 0 {
+		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if j.AcceptanceCmd != "" {

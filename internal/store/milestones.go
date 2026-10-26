@@ -54,6 +54,8 @@ type MilestoneTask struct {
 	Dropped     bool
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	// Sources are the git URLs planned for the task's jobs (G02; sources.go stores them).
+	Sources []string
 }
 
 // milestonesSchema is applied at the end of every Open, after the jobs columns and the gate tables exist:
@@ -220,7 +222,7 @@ func upsertTask(tx *sql.Tx, id int64, t MilestoneTask, now time.Time) error {
 		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), t.Dropped, now.Unix(), now.Unix()); err != nil {
 		return fmt.Errorf("write task %s: %w", t.Key, err)
 	}
-	return nil
+	return writeTaskSources(tx, id, t)
 }
 
 // GetMilestone returns one milestone (ErrMilestoneNotFound when there is none).
@@ -348,7 +350,12 @@ func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, 
 		t.CreatedAt, t.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// One connection: the rows are closed before the sources are read.
+	_ = rows.Close()
+	return out, fillTaskSources(ctx, q, id, out)
 }
 
 // MilestoneJobs returns the jobs attached to milestone id, oldest first.

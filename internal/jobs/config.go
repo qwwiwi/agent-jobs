@@ -132,6 +132,9 @@ type Config struct {
 	KeepRawReports bool `json:"keep_raw_reports"`
 	// MaxBriefBytes is the largest brief job_start accepts. 0 = DefaultMaxBriefBytes (32 KB).
 	MaxBriefBytes int `json:"max_brief_bytes"`
+	// SourcesMaxMB is the size cap of one source clone (G02): a clone past it is aborted and the job told.
+	// 0 = DefaultSourcesMaxMB (500).
+	SourcesMaxMB int `json:"sources_max_mb"`
 	// BriefWarnFiles: a brief naming more files than this gets a size_warning. 0 = DefaultBriefWarnFiles (40).
 	BriefWarnFiles int `json:"brief_warn_files"`
 	// BriefWarnHeadings: a brief with more "## " headings than this gets a size_warning (it likely asks
@@ -501,6 +504,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if err := c.validateAcceptance(); err != nil {
 		return c, err
+	}
+	if c.SourcesMaxMB < 0 {
+		return c, errors.New("config.json: sources_max_mb must be 0 (default) or positive")
 	}
 	if c.MaxBriefBytes < 0 || c.BriefWarnFiles < 0 || c.BriefWarnHeadings < 0 {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")

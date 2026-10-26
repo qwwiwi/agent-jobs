@@ -112,6 +112,8 @@ type JobView struct {
 	Task      string `json:"task,omitempty"`
 	// Waiting is why a queued job of a task does not start yet ("waiting for T1 (failed)"; omitted otherwise).
 	Waiting string `json:"waiting,omitempty"`
+	// Sources are the git URLs cloned read-only into the job folder before it starts (G02).
+	Sources []string `json:"sources,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -135,7 +137,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Milestone: j.MilestoneID, Task: j.TaskKey,
-		Waiting: m.MilestoneWaiting(context.Background(), j),
+		Waiting: m.MilestoneWaiting(context.Background(), j), Sources: j.Sources,
 	}
 }
 
@@ -198,6 +200,7 @@ type JobStartInput struct {
 	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); stored on the job. Fix and general jobs declare it; review, research and the gate kinds are exempt. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job is refused when config size_required is on, otherwise logged and allowed"`
 	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
 	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
+	Sources         []string `json:"sources,omitempty" jsonschema:"https git URLs (no ssh, file or local paths, no credentials) the daemon shallow-clones read-only into the job folder as sources/<name> before the job starts (no submodules, hooks or LFS; size cap config sources_max_mb, default 500 MB). A failed clone is reported in the job's brief and the job still starts. The job reads the local copy; it runs that code only in docker run --rm with a copy under sandbox/ mounted (the guard refuses running it on the host). Omitted on a milestone task: the task's planned sources; an empty list: none"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. See skill_list"`
 }
 
@@ -218,7 +221,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
-			Milestone: in.Milestone, Task: in.Task,
+			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)

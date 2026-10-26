@@ -187,6 +187,9 @@ type StartRequest struct {
 	// be blocked or dropped, and the milestone's branch is the default base.
 	Milestone int64
 	Task      string
+	// Sources are https git URLs cloned read-only into the job folder before it starts (G02); nil = not
+	// given (a task job then takes its task's planned sources), empty = none.
+	Sources []string
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -345,6 +348,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
+	sources, err := ValidateSources(r.Sources)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) > 0 && r.Gate != nil {
+		return nil, errors.New("a gate job gets nothing but its input: no sources")
+	}
 	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -442,7 +452,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task,
+		MilestoneID: r.Milestone, TaskKey: r.Task, Sources: sources,
 	}
 	return j, nil
 }

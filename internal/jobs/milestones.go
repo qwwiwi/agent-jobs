@@ -52,6 +52,8 @@ type MilestoneTaskInput struct {
 	Title     string    `json:"title,omitempty" jsonschema:"one line; required for a new task"`
 	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles"`
 	Covers    *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
+	// Sources (G02) are planned like covers: nil keeps the stored list, empty clears it.
+	Sources *[]string `json:"sources,omitempty" jsonschema:"https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
 }
 
 // MilestoneCreate is milestone_create's input.
@@ -105,6 +107,8 @@ type MilestoneTaskView struct {
 	UpdatedAt string             `json:"updated_at"`
 	// Waiting is why the task's queued job does not start yet ("waiting for T1 (failed)"), "" when none waits.
 	Waiting string `json:"waiting,omitempty"`
+	// Sources are the git URLs planned for the task's jobs (G02).
+	Sources []string `json:"sources"`
 }
 
 // MilestoneProgress counts the done tasks (dropped ones left out) and, for a milestone tied to a
@@ -276,6 +280,11 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 			t.Title = title
 		}
 		t.Dropped = false
+		if ti.Sources != nil {
+			if t.Sources, err = ValidateSources(*ti.Sources); err != nil {
+				return nil, nil, fmt.Errorf("task %s: %w", key, err)
+			}
+		}
 		if ti.DependsOn != nil {
 			t.DependsOn = trimList(*ti.DependsOn)
 		}
@@ -764,7 +773,7 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 	for _, t := range tasks {
 		tv := MilestoneTaskView{Key: t.Key, Title: t.Title, Status: st[t.Key], DependsOn: nonNilList(t.DependsOn),
 			Covers: nonNilList(t.Covers), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
-			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt)}
+			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt), Sources: nonNilList(t.Sources)}
 		if tv.Jobs == nil {
 			tv.Jobs = []MilestoneJobView{}
 		}
@@ -968,6 +977,9 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 	}
 	if tasks[idx].Dropped {
 		return fmt.Errorf("task %s of milestone %d is dropped", r.Task, ms.ID)
+	}
+	if r.Sources == nil {
+		r.Sources = tasks[idx].Sources // planned at milestone_create; job_start's own list wins
 	}
 	// Its dependencies decide, whatever its own jobs say (a second job on a running task waits too).
 	if waiting := waitingDeps(tasks, jobs, r.Task); len(waiting) > 0 {

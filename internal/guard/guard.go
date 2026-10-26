@@ -91,6 +91,12 @@ type Config struct {
 	// a command or redirection word it cannot expand ($VAR, a substitution). A path under a top-level
 	// name that does not exist (`/api/v1` in a pattern) cannot be read and is not refused.
 	ReadAllow []string
+	// Sources are the job's cloned repositories (<jobdir>/sources, G02): read-only for the job, and their
+	// code never runs on the host (sources.go). Empty = no sources.
+	Sources []string
+	// Sandbox is <jobdir>/sandbox (G02), where a job copies a clone to run it: its code never runs on the
+	// host either, and a copy below it is the only path a `docker run` may mount. "" = docker refused.
+	Sandbox string
 	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
 	// paths its own folders).
 	readAllowScope bool
@@ -474,6 +480,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
+		if sourcesFileWrite(p, cfg) {
+			return sourcesWriteBlocked(tool + " into `" + p + "`")
+		}
 	}
 	if len(cfg.Protected) > 0 {
 		links := &inodeSet{forms: protectedForms(cfg.Protected)}
@@ -810,8 +819,13 @@ func Check(cmd string, cfg Config) string {
 		return rootBlocked(p)
 	}
 	scripts := parseAll(cmd)
+	// A job with sources (G02) may run one docker command, the sandbox form, as the whole call: its
+	// arguments after the image run inside the container, so the host checks below do not apply to them.
+	if r, handled := dockerSandbox(scripts, cfg); handled {
+		return r
+	}
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkSourcesWrite, checkSourcesExec, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -1827,9 +1841,14 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 		}
 		name := progName(argv[0])
 		if outOfScopeTools[name] {
+			sandbox := ""
+			if name == "docker" && cfg.Sandbox != "" {
+				sandbox = " The one exception is the sources sandbox: a single `docker run --rm ... -v <sandbox>/<copy>:/src " +
+					"<image> <command>` as the whole Bash command (the Sources section of the brief)."
+			}
 			return "blocked by guard: `" + name + "` starts processes outside the job's cgroup scope (service manager, " +
 				"session bus, scheduler, terminal multiplexer, process manager, container, ssh or namespace); a job runs " +
-				"its processes itself, inside its scope."
+				"its processes itself, inside its scope." + sandbox
 		}
 		if name == "systemctl" {
 			for _, a := range argv[1:] {

@@ -170,6 +170,8 @@ type Job struct {
 	// MilestoneID and TaskKey attach the job to a task of a milestone (0 and "" for none).
 	MilestoneID int64
 	TaskKey     string
+	// Sources are the https git URLs cloned read-only into <jobdir>/sources before the job starts (G02).
+	Sources []string
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -424,6 +426,10 @@ func Open(path string) (*Store, error) {
 	if err := migrateMilestoneTriggers(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: milestone triggers: %w", err)
+	}
+	if err := migrateSources(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: sources: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -705,7 +711,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -770,7 +776,7 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -791,7 +797,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate string
+	var skills, delivered, covers, coverContract, gate, sources string
 	var milestone sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
@@ -802,7 +808,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey)
+		&milestone, &j.TaskKey, &sources)
 	if err != nil {
 		return nil, err
 	}
@@ -819,7 +825,7 @@ func scanJob(r scanner) (*Job, error) {
 		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)
-	j.MilestoneID = milestone.Int64
+	j.MilestoneID, j.Sources = milestone.Int64, SplitNames(sources)
 	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {

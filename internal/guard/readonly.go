@@ -37,6 +37,15 @@ func readOnlyBlocked(what string) string {
 		"Read, search and run tests; write notes into the job directory, not the repository."
 }
 
+// roBlocked is the refusal of a write the read-only check found: into the review job's worktree, or
+// into the job's sources (G02).
+func (s *pathScope) roBlocked(what string) string {
+	if s.sources {
+		return sourcesWriteBlocked(what)
+	}
+	return readOnlyBlocked(what)
+}
+
 // readOnlyFile reports a file tool path inside the read-only worktree (the worktree as given or with
 // symlinks resolved).
 func readOnlyFile(p string, cfg Config) bool {
@@ -66,7 +75,8 @@ func (s *pathScope) roHit(w string, dyn, tree bool) (string, bool) {
 	if s.over() {
 		return w, true
 	}
-	if dyn && strings.ContainsAny(strings.NewReplacer("${HOME}", "", "$HOME", "").Replace(w), "$`") {
+	if dyn && strings.ContainsAny(strings.NewReplacer("${HOME}", "", "$HOME", "").Replace(w), "$`") &&
+		(!s.sources || s.namesProtected(w)) {
 		return w + " (expanded at run time)", true
 	}
 	exp, ok := s.expandHome(w)
@@ -126,7 +136,7 @@ func (s *pathScope) readOnlyScripts(scripts []*script) string {
 						continue
 					}
 					if p, ok := s.roHit(t, k < len(c.outDyn) && c.outDyn[k], false); ok {
-						return readOnlyBlocked("redirection to `" + p + "`")
+						return s.roBlocked("redirection to `" + p + "`")
 					}
 				}
 				v := split(c.words)
@@ -149,17 +159,17 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 	name := progName(argv[0])
 	args, adyn := argv[1:], dyn[1:]
 	if g, ok := parseGit(argv); ok {
-		if gitWorktreeWriters[strings.ToLower(g.sub)] {
-			return readOnlyBlocked("`git " + g.sub + "`")
+		if gitWorktreeWriters[strings.ToLower(g.sub)] && (!s.sources || s.pointsInside(args, adyn)) {
+			return s.roBlocked("`git " + g.sub + "`")
 		}
 		return ""
 	}
-	if r := inlineInterp(name, args, c, piped); r != "" {
-		return readOnlyBlocked(r)
+	if r := inlineInterp(name, args, c, piped); r != "" && (!s.sources || s.pointsInside(args, adyn)) {
+		return s.roBlocked(r)
 	}
 	check := func(w string, d, tree bool) string {
 		if p, ok := s.roWord(w, d, tree); ok {
-			return readOnlyBlocked("`" + name + "` on `" + p + "`")
+			return s.roBlocked("`" + name + "` on `" + p + "`")
 		}
 		return ""
 	}
@@ -193,14 +203,14 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		script := sedScriptArgs(argv)
 		for k := 1; k < len(argv); k++ {
 			if script[k] && reSedWrite.MatchString(argv[k]) {
-				return readOnlyBlocked("a `sed` script with a w command or flag")
+				return s.roBlocked("a `sed` script with a w command or flag")
 			}
 		}
 		if !inPlace(name, args) {
 			return ""
 		}
 		if xargs {
-			return readOnlyBlocked("`xargs sed -i`")
+			return s.roBlocked("`xargs sed -i`")
 		}
 		for k := 1; k < len(argv); k++ {
 			if _, notFile := script[k]; notFile || strings.HasPrefix(argv[k], "-") {
@@ -213,13 +223,13 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		return ""
 	case name == "perl" || name == "ruby" || awks[name]:
 		if awks[name] && awkWrites(args) {
-			return readOnlyBlocked("an `" + name + "` program writing a file or running a command")
+			return s.roBlocked("an `" + name + "` program writing a file or running a command")
 		}
 		if !inPlace(name, args) {
 			return ""
 		}
 		if xargs {
-			return readOnlyBlocked("`xargs " + name + " -i`")
+			return s.roBlocked("`xargs " + name + " -i`")
 		}
 		for _, k := range operands("") {
 			if r := check(args[k], adyn[k], false); r != "" {
@@ -238,7 +248,7 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		return ""
 	case destCopiers[name]:
 		if xargs {
-			return readOnlyBlocked("`xargs " + name + "`")
+			return s.roBlocked("`xargs " + name + "`")
 		}
 		// Destinations and sources lose their position in argv: roHit refuses any of them holding `$`.
 		ca := parseCopyArgs(name, args)
@@ -262,7 +272,7 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		return ""
 	case name == "rsync":
 		if xargs {
-			return readOnlyBlocked("`xargs rsync`")
+			return s.roBlocked("`xargs rsync`")
 		}
 		var ops []int
 		for _, k := range operands("eBfT") {
@@ -298,7 +308,7 @@ func (s *pathScope) readOnlyCmd(argv []string, dyn []bool, c *simpleCmd, piped, 
 		return ""
 	}
 	if xargs {
-		return readOnlyBlocked("`xargs " + name + "`")
+		return s.roBlocked("`xargs " + name + "`")
 	}
 	ops := operands(vs)
 	if (name == "chmod" || name == "chown" || name == "chgrp") && len(ops) > 0 &&
@@ -412,7 +422,7 @@ func (s *pathScope) readOnlyFind(args []string, adyn []bool) string {
 		switch {
 		case a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls":
 			if p, ok := inTree(); ok {
-				return readOnlyBlocked("`find " + a + "` under `" + p + "`")
+				return s.roBlocked("`find " + a + "` under `" + p + "`")
 			}
 		case findExec[a]:
 			end := k + 1
