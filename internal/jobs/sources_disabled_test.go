@@ -81,18 +81,40 @@ func TestSourcesDisabledMilestones(t *testing.T) {
 			t.Fatalf("milestones after the refusal: %d %v", len(all), err)
 		}
 	})
-	t.Run("[G02 off] milestone_edit refuses planned sources; an empty list still clears them", func(t *testing.T) {
-		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "S", Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "study", Sources: deps()}}})
+	t.Run("[G02 off] milestone_edit refuses planned sources; an omitted list keeps legacy ones, an empty list clears them", func(t *testing.T) {
+		legacy := "https://github.com/a/lib"
+		id, err := m.Store.CreateMilestone(&store.Milestone{Title: "legacy", Status: store.MilestoneOpen},
+			[]store.MilestoneTask{{Key: "T1", Title: "study", Sources: []string{legacy}}}, m.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{
-			{Key: "T1", Sources: deps("https://github.com/a/lib")}}})
+		sourcesOf := func(what string) []string {
+			t.Helper()
+			tasks, err := m.Store.MilestoneTasks(ctx, id)
+			if err != nil || len(tasks) != 1 {
+				t.Fatalf("%s: tasks %+v %v", what, tasks, err)
+			}
+			return tasks[0].Sources
+		}
+		_, err = m.SetMilestone(ctx, MilestoneSet{ID: id, Tasks: []MilestoneTaskInput{
+			{Key: "T1", Sources: deps("https://github.com/a/other")}}})
 		refusedSources(t, "milestone_edit", err)
-		tasks, err := m.Store.MilestoneTasks(ctx, v.ID)
-		if err != nil || len(tasks) != 1 || len(tasks[0].Sources) != 0 {
-			t.Fatalf("task after the refusal: %+v %v", tasks, err)
+		if got := sourcesOf("after the refusal"); len(got) != 1 || got[0] != legacy {
+			t.Fatalf("sources after the refusal: %v", got)
+		}
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: id, Tasks: []MilestoneTaskInput{
+			{Key: "T1", Title: "study more"}}}); err != nil {
+			t.Fatalf("milestone_edit without sources: %v", err)
+		}
+		if got := sourcesOf("sources omitted"); len(got) != 1 || got[0] != legacy {
+			t.Fatalf("omitted sources did not keep the stored ones: %v", got)
+		}
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: id, Tasks: []MilestoneTaskInput{
+			{Key: "T1", Sources: deps()}}}); err != nil {
+			t.Fatalf("milestone_edit with sources: []: %v", err)
+		}
+		if got := sourcesOf("sources: []"); len(got) != 0 {
+			t.Fatalf("sources: [] did not clear the stored ones: %v", got)
 		}
 	})
 	t.Run("[G02 off] a job on a task with stored planned sources is refused; sources: [] runs it without", func(t *testing.T) {
@@ -135,6 +157,55 @@ func TestSourcesDisabledResumeAmend(t *testing.T) {
 			t.Fatalf("job is %s after the refused resume", got.Status)
 		}
 	})
+}
+
+// A legacy job row with sources that stopped at its turn limit or timed out is not auto-continued:
+// queueResume refuses it before anything is requeued, and the job keeps its status with the reason.
+func TestSourcesDisabledAutoContinue(t *testing.T) {
+	for _, c := range []struct{ why, status string }{
+		{stopTurnLimit, store.StatusFailed},
+		{stopTimeout, store.StatusTimeout},
+	} {
+		t.Run("[G02 off] "+c.why+": a job with sources is not requeued", func(t *testing.T) {
+			m := newManager(t)
+			j, err := m.newJob(StartRequest{Title: "old", Kind: "research", Brief: "look at lib", Model: "sonnet"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := m.Now().Add(-time.Minute)
+			j.Sources = []string{"https://github.com/a/lib"}
+			j.Status, j.Attempt, j.StartedAt, j.Turns = c.status, 1, &started, 7
+			if err := m.Store.Insert(j); err != nil {
+				t.Fatal(err)
+			}
+			dir := m.JobDir(j.ID)
+			if err := os.MkdirAll(filepath.Join(dir, "work"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte("task"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			unlock, err := m.lock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.autoContinue(j.ID, c.why)
+			unlock()
+			got := get(t, m, j.ID)
+			if got.Status != c.status || got.Attempt != 1 {
+				t.Fatalf("job is %s attempt %d after the auto-continue: %q", got.Status, got.Attempt, got.Error)
+			}
+			if !strings.Contains(got.Error, "not auto-continued: ") || !strings.Contains(got.Error, "sources is disabled until OS-level isolation lands") {
+				t.Fatalf("no disabled reason on the job: %q", got.Error)
+			}
+			if queued, err := m.Store.ListByStatus(store.StatusQueued); err != nil || len(queued) != 0 {
+				t.Fatalf("queued jobs: %d %v", len(queued), err)
+			}
+			if atts, err := m.Store.Attempts(j.ID); err != nil || len(atts) != 0 {
+				t.Fatalf("attempts archived: %+v %v", atts, err)
+			}
+		})
+	}
 }
 
 func TestSourcesDisabledDaemonNeverClones(t *testing.T) {

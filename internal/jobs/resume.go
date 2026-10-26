@@ -720,9 +720,13 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 
 // queueResume checks that the attempt of j (stopped, timed out or failed, after it ran) can be
 // resumed and queues the next attempt with the update; limits: see resumeLimits. The caller holds
-// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it.
+// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it, so the
+// sources refusal here guards every path that requeues a job that ran.
 func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	id := j.ID
+	if err := refuseSources(j.Sources); err != nil {
+		return fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Runner == store.RunnerCodex {
 		return fmt.Errorf("job %s: %w", id, errCodexResume)
 	}
