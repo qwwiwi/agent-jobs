@@ -192,7 +192,9 @@ func treeBytes(p string) int64 {
 	return n
 }
 
-// makeReadOnly makes every file under p 0444 and every directory 0555 (symlinks left alone).
+// makeReadOnly takes the write bits off every file under p and makes every directory 0555 (symlinks left
+// alone). Execute bits stay, so a sandbox copy keeps its scripts runnable inside the container; on the
+// host the guard refuses running them.
 func makeReadOnly(p string) error {
 	return filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -202,7 +204,11 @@ func makeReadOnly(p string) error {
 		case d.IsDir():
 			return os.Chmod(path, 0o555)
 		case d.Type().IsRegular():
-			return os.Chmod(path, 0o444)
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			return os.Chmod(path, fi.Mode().Perm()&0o555)
 		}
 		return nil
 	})
@@ -372,12 +378,19 @@ func renderSources(dir string, res []sourceResult) string {
 			fmt.Fprintf(&b, "- %s → %s (commit %s, %.1f MB)\n", r.URL, r.Path, r.Commit, float64(r.Bytes)/(1<<20))
 		}
 	}
-	fmt.Fprintf(&b, "\nNever run their code on the host: the guard refuses executing a file under sources/ or sandbox/, and "+
-		"a package install, build or test run with its working directory or a path there. To run it, copy the clone into "+
-		"%s and run it in a throwaway container that sees only the copy (no host env, secrets or other host dirs):\n\n"+
-		"```\ncp -r %s/<name> %s/<name>\ndocker run --rm --network none -v %s/<name>:/src -w /src <image> <command>\n```\n\n"+
-		"Only this form is allowed: the docker run is the whole Bash command; --rm; exactly one -v, from a folder below "+
-		"sandbox/; no -e/--env/--env-file, --privileged, --cap-add, --device, -p, --mount or host namespaces; network none "+
-		"or bridge (bridge only to fetch dependencies).\n\n", box, root, box, box)
+	uid, gid := os.Getuid(), os.Getgid()
+	fmt.Fprintf(&b, "\nNever run their code on the host: only plain readers (cat, grep, head, ls, find, git log, ...) may "+
+		"be given a path under sources/ or sandbox/; the guard refuses running a file there, and an interpreter, package "+
+		"install, build or test run pointed at or working there. To run it, copy the clone into %s (each as a separate "+
+		"Bash command) and run it in a throwaway container that sees only the copy, with no host env, secrets, network "+
+		"or other host dirs:\n\n"+
+		"```\ncp -R %s/<name> %s/<name>\nchmod -R u+w %s/<name>\n"+
+		"docker run --rm --network none --user %d:%d --cap-drop ALL --security-opt no-new-privileges "+
+		"-v %s/<name>:/src -w /src <image> sh -c 'HOME=/tmp <command>'\n```\n\n"+
+		"Only this form is allowed: the docker run is the whole Bash command, spelled `docker`; --rm, --network none, "+
+		"--user %d:%d, --cap-drop ALL and --security-opt no-new-privileges are required; exactly one -v, from a folder "+
+		"below sandbox/; no -e/--env/--env-file, --privileged, --cap-add, --device, -p, --mount or host namespaces. "+
+		"With no network, dependencies the code needs must already be in the copy or the image.\n\n",
+		box, root, box, box, uid, gid, box, uid, gid)
 	return b.String()
 }

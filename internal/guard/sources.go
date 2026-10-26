@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -15,20 +16,22 @@ import (
 //
 //   - checkSourcesWrite: the review read-only check (readonly.go) with the sources as the protected
 //     tree: redirections, in-place editors, tree writers, copier destinations, extractors into it.
-//   - checkSourcesExec: a file under sources/ or sandbox/ run as a program; a runner (shell, interpreter,
-//     package manager, build or test tool, an exec wrapper) whose working directory is in or above them,
-//     that follows a cd the guard cannot resolve, that is given a path there (also inside an option
-//     value or a `:`-separated list), or that reads its program from such a file or a pipe stage naming
-//     one; find -exec over them; `awk -f` / `sed -f` with a program there; an environment assignment
-//     whose value names them (PATH, LD_PRELOAD, PYTHONPATH, ...); a copy out of sources/ to anywhere but
-//     sandbox/ (cp, install, ln, rsync).
-//   - dockerSandbox: `docker run` is allowed only as the whole Bash command, with --rm, exactly one
-//     `-v <sandbox>/<copy>:<dst>[:ro|rw]` and an allowlist of options; no env, no host namespaces or
-//     network, no privileges, devices, ports, --mount or detaching.
+//   - checkSourcesExec: only plain readers and file utilities (sourceReaders) are given a path under
+//     sources/ or sandbox/, run there, or read a pipe, redirection or here-doc naming them; a file there
+//     never runs as a program; a runner (shell, interpreter, package manager, build or test tool, exec
+//     wrapper) never runs above them, after a cd the guard cannot resolve, or given an ancestor of them;
+//     git never works inside sandbox/ (a container may have written its config); no environment
+//     assignment names them (PATH, LD_PRELOAD, PYTHONPATH, ...); a copy, move or link out of them lands
+//     only inside sandbox/.
+//   - dockerSandbox: `docker run` is allowed only as the whole Bash command, spelled `docker`, with --rm,
+//     --network none, --user <the job's uid>:<gid>, --cap-drop ALL, --security-opt no-new-privileges,
+//     exactly one `-v <sandbox>/<copy>:<dst>[:ro|rw]` and an allowlist of other options: no env, no host
+//     namespaces or network, no privileges, devices, ports, --mount or detaching.
 //
 // Residual gaps (not resolved): a copy made by a program the guard does not read as a copier (tar, git
-// clone of the local path, cat > file, code in an interpreter) and run from there; a script the job writes
-// itself; a symlink swapped in by a process the job left running between the check and docker's mount.
+// clone of the local path, code in an interpreter) and run from there; a script the job writes itself; a
+// symlink swapped in by a process the job left running between the check and docker's mount; docker's
+// own client config (~/.docker, DOCKER_HOST) as the job's environment sets it.
 
 // sourcesWriteBlocked is the refusal of a write into the job's sources.
 func sourcesWriteBlocked(what string) string {
@@ -36,20 +39,24 @@ func sourcesWriteBlocked(what string) string {
 		" would write there. Read them; to change or run code, copy the clone into the job's sandbox dir."
 }
 
+// sandboxRecipe is the docker form the guard allows, as the refusals show it.
+const sandboxRecipe = "`docker run --rm --network none --user <uid>:<gid> --cap-drop ALL --security-opt " +
+	"no-new-privileges -v <sandbox>/<name>:/src -w /src <image> <command>`"
+
 // sourcesExecBlocked is the refusal of running cloned code on the host.
 func sourcesExecBlocked(what string) string {
-	return "blocked by guard: code of the job's sources never runs on the host: " + what + ". Copy the clone into the " +
-		"job's sandbox dir and run it in a throwaway container, as the whole Bash command: `docker run --rm --network " +
-		"none -v <sandbox>/<name>:/src -w /src <image> <command>` (the Sources section of the brief)."
+	return "blocked by guard: code of the job's sources never runs on the host: " + what + ". Read the clone with " +
+		"Read, Grep or plain readers (cat, grep, head, ls, find, git log); to run it, copy it into the job's sandbox " +
+		"dir and run it in a throwaway container, as the whole Bash command: " + sandboxRecipe +
+		" (the Sources section of the brief)."
 }
 
 // dockerBlocked is the refusal of a docker call outside the sandbox form.
 func dockerBlocked(what string) string {
-	return "blocked by guard: docker runs only the sandbox form (" + what + "): the whole Bash command is `docker run " +
-		"--rm [--network none|bridge] -v <sandbox>/<copy>:<dst>[:ro] [-w dir] [-i] [--memory, --cpus, --pids-limit, " +
-		"--cap-drop, --security-opt no-new-privileges, --read-only, --tmpfs, --user, --entrypoint, --init, --pull, " +
-		"--platform] <image> [command...]`, with exactly one mount, a copy below the job's sandbox dir, and no env, " +
-		"variables, substitutions, redirections or globs."
+	return "blocked by guard: docker runs only the sandbox form (" + what + "): the whole Bash command is " +
+		sandboxRecipe + ", with the job's own numeric uid, exactly one mount (a copy below the job's sandbox dir), " +
+		"optionally -i, -t, --read-only, --init, -w, --memory, --memory-swap, --cpus, --pids-limit, --tmpfs, " +
+		"--entrypoint, --pull, --platform, and no env, variables, substitutions, redirections, globs or tildes."
 }
 
 // namesProtected reports a word that mentions a protected folder by name (`$D/sources/x`).
@@ -62,10 +69,11 @@ func (s *pathScope) namesProtected(w string) bool {
 	return false
 }
 
-// cwdInside reports a directory the call may run in that is, is inside or holds a protected folder.
-func (s *pathScope) cwdInside() (string, bool) {
+// cwdHit reports a directory the call may run in that is or is inside a protected folder, or, with
+// tree, also one that holds one.
+func (s *pathScope) cwdHit(tree bool) (string, bool) {
 	for _, d := range s.dirs {
-		if q, ok := s.match([]string{d, s.resolve(d)}, true); ok {
+		if q, ok := s.match([]string{d, s.resolve(d)}, tree); ok {
 			return q, true
 		}
 	}
@@ -100,7 +108,7 @@ func (s *pathScope) argHit(a string, dyn, tree bool) (string, bool) {
 
 // pointsInside reports a command running in or above a protected folder or given a path there.
 func (s *pathScope) pointsInside(args []string, dyn []bool) bool {
-	if _, ok := s.cwdInside(); ok {
+	if _, ok := s.cwdHit(true); ok {
 		return true
 	}
 	for k, a := range args {
@@ -133,6 +141,39 @@ func sourcesFileWrite(p string, cfg Config) bool {
 	return len(cfg.Sources) > 0 && inJobGitDir(p, cfg.Sources)
 }
 
+// sourceReaders are the only programs given a path under sources/ or sandbox/, run there, or fed from
+// there: they read files or manage them and never run what they read. Left out on purpose: sed and awk
+// (`e`, system()), tar (--to-command, -I), sort (--compress-program), less (preprocessors), editors.
+var sourceReaders = map[string]bool{
+	"cat": true, "tac": true, "head": true, "tail": true, "grep": true, "egrep": true, "fgrep": true, "rg": true,
+	"ls": true, "tree": true, "find": true, "wc": true, "stat": true, "file": true, "du": true, "diff": true,
+	"cmp": true, "comm": true, "uniq": true, "cut": true, "tr": true, "nl": true, "od": true, "hexdump": true,
+	"xxd": true, "strings": true, "md5sum": true, "sha1sum": true, "sha256sum": true, "sha512sum": true,
+	"b2sum": true, "cksum": true, "jq": true, "realpath": true, "readlink": true, "dirname": true, "basename": true,
+	"test": true, "[": true, "[[": true, "echo": true, "printf": true, "true": true, "false": true, "cloc": true,
+	"tokei": true, "scc": true, "column": true, "fold": true, "fmt": true, "iconv": true, "base64": true,
+	"zcat": true, "git": true, "cp": true, "rsync": true, "mv": true, "ln": true, "rm": true, "rmdir": true,
+	"mkdir": true, "chmod": true, "touch": true, "cd": true, "pushd": true, "popd": true, "pwd": true,
+}
+
+// readerRuns reports a reader option that runs a program: rsync's remote shell, rg's preprocessor, find's
+// actions.
+func readerRuns(name string, args []string) bool {
+	switch name {
+	case "rsync":
+		return slices.ContainsFunc(args, func(a string) bool {
+			opt, _, _ := strings.Cut(a, "=")
+			return opt == "--rsh" || opt == "--rsync-path" || opt == "-e" ||
+				(len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a, 'e'))
+		})
+	case "rg":
+		return slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--pre") })
+	case "find":
+		return findActs(args)
+	}
+	return false
+}
+
 // sourceRunners run code they are pointed at: a script, a project directory or its build file, a test
 // suite. Shells and interpreters (shells, stdinInterpreter) and execRunners count too.
 var sourceRunners = map[string]bool{
@@ -154,12 +195,15 @@ var sourceRunners = map[string]bool{
 	"rake": true, "rails": true, "rspec": true, "composer": true, "phpunit": true, "mix": true, "rebar3": true,
 	"nix": true, "nix-shell": true, "nix-build": true, "direnv": true, "docker-compose": true, "conan": true,
 	"vcpkg": true, "rscript": true, "deno": true, "bun": true, "node": true, "nodejs": true, "busybox": true,
+	"awk": true, "gawk": true, "mawk": true, "nawk": true, "sed": true, "gdb": true, "vim": true, "vi": true,
+	"nvim": true, "emacs": true, "m4": true, "ipython": true, "jupyter": true, "pwsh": true, "octave": true,
 }
 
-// isSourceRunner reports a program that may run code of a path or directory it is given.
+// isSourceRunner reports a program that may run code of a directory it runs in or is given an ancestor of.
 func isSourceRunner(name string) bool {
 	return sourceRunners[name] || shells[name] || stdinInterpreter(name) || execRunners[name] ||
-		strings.HasPrefix(name, "pip") || strings.HasPrefix(name, "ld-linux") || strings.HasPrefix(name, "ld.so")
+		strings.HasPrefix(name, "pip") || strings.HasPrefix(name, "ld-linux") || strings.HasPrefix(name, "ld.so") ||
+		strings.HasPrefix(name, "qemu-")
 }
 
 // assignBuiltins take NAME=value arguments that set the environment of later commands.
@@ -174,102 +218,29 @@ func checkSourcesExec(scripts []*script, _ string, cfg Config) string {
 	rc := cfg
 	rc.Protected = roots
 	s := newPathScope(scripts, rc)
-	src := cfg
-	src.Protected = cfg.Sources
-	inSources := newPathScope(scripts, src)
-	box := cfg
-	box.Protected = []string{cfg.Sandbox}
-	inBox := newPathScope(scripts, box)
-	r := s.sourcesExecScripts(scripts, inSources, inBox, cfg.Sandbox != "")
-	if s.expired || inSources.expired || inBox.expired {
+	var inBox *pathScope
+	if cfg.Sandbox != "" {
+		box := cfg
+		box.Protected = []string{cfg.Sandbox}
+		inBox = newPathScope(scripts, box)
+	}
+	r := s.sourcesExecScripts(scripts, inBox)
+	if s.expired || (inBox != nil && inBox.expired) {
 		return "blocked by guard: the command is too complex to verify against the job's sources within the guard's " +
 			"time budget; split it."
 	}
 	return r
 }
 
-func (s *pathScope) sourcesExecScripts(scripts []*script, inSources, inBox *pathScope, hasBox bool) string {
+func (s *pathScope) sourcesExecScripts(scripts []*script, inBox *pathScope) string {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
 				if s.over() {
 					return ""
 				}
-				v := split(c.words)
-				for k, w := range c.words[:min(v.start, len(c.words))] {
-					if reAssign.MatchString(w) {
-						if q, ok := s.argHit(w, c.dyn[k], false); ok {
-							return sourcesExecBlocked("the assignment `" + w + "` points the environment at `" + q + "`")
-						}
-					}
-				}
-				if v.start >= len(c.words) {
-					continue
-				}
-				argv, dyn := c.words[v.start:], c.dyn[v.start:]
-				name := progName(argv[0])
-				if strings.Contains(argv[0], "/") {
-					if q, ok := s.hit(argv[0], false); ok {
-						return sourcesExecBlocked("`" + argv[0] + "` runs `" + q + "`")
-					}
-				}
-				if assignBuiltins[name] {
-					for k, a := range argv[1:] {
-						if strings.Contains(a, "=") {
-							if q, ok := s.argHit(a, dyn[k+1], false); ok {
-								return sourcesExecBlocked("`" + name + " " + a + "` points the environment at `" + q + "`")
-							}
-						}
-					}
-				}
-				if r := s.copyOut(name, argv[1:], inSources, inBox, hasBox); r != "" {
+				if r := s.sourcesExecCmd(c, pl.cmds[:i], inBox); r != "" {
 					return r
-				}
-				switch {
-				case name == "find" && findActs(argv[1:]):
-					for k, a := range argv[1:] {
-						if q, ok := s.argHit(a, dyn[k+1], true); ok {
-							return sourcesExecBlocked("`find` with an action runs over `" + q + "`")
-						}
-					}
-				case awks[name] || name == "sed":
-					for k := 1; k+1 < len(argv); k++ {
-						if argv[k] == "-f" || argv[k] == "--file" {
-							if q, ok := s.argHit(argv[k+1], dyn[k+1], false); ok {
-								return sourcesExecBlocked("`" + name + " -f` runs the program `" + q + "`")
-							}
-						}
-					}
-				}
-				wrapped := slices.ContainsFunc(v.wrappers, func(w string) bool { return w == "xargs" })
-				if !isSourceRunner(name) && !wrapped {
-					continue
-				}
-				if q, ok := s.cwdInside(); ok {
-					return sourcesExecBlocked("`" + name + "` runs with its working directory in or above `" + q + "`")
-				}
-				if s.dynamic != "" {
-					return sourcesExecBlocked("`" + name + "` runs after `cd " + s.dynamic + "`, which the guard cannot follow")
-				}
-				for k, a := range argv[1:] {
-					if q, ok := s.argHit(a, dyn[k+1], true); ok {
-						return sourcesExecBlocked("`" + name + "` is given `" + q + "`")
-					}
-				}
-				for _, t := range c.inRedirs {
-					if q, ok := s.hit(t, false); ok {
-						return sourcesExecBlocked("`" + name + "` reads its input from `" + q + "`")
-					}
-				}
-				if s.namesProtected(c.heredoc) {
-					return sourcesExecBlocked("`" + name + "` reads a here-doc naming the sources")
-				}
-				for _, feeder := range pl.cmds[:i] {
-					for k, w := range feeder.words {
-						if q, ok := s.argHit(w, feeder.dyn[k], false); ok {
-							return sourcesExecBlocked("`" + name + "` reads a pipe fed with `" + q + "`")
-						}
-					}
 				}
 			}
 		}
@@ -277,12 +248,98 @@ func (s *pathScope) sourcesExecScripts(scripts []*script, inSources, inBox *path
 	return ""
 }
 
-// copyOut refuses a copy out of the sources to anywhere but the sandbox (cp, install, ln, rsync): code
-// copied elsewhere would run on the host past the checks.
-func (s *pathScope) copyOut(name string, args []string, inSources, inBox *pathScope, hasBox bool) string {
+// sourcesExecCmd checks one command; feeders are the earlier stages of its pipeline.
+func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, inBox *pathScope) string {
+	v := split(c.words)
+	for k, w := range c.words[:min(v.start, len(c.words))] {
+		if reAssign.MatchString(w) {
+			if q, ok := s.argHit(w, c.dyn[k], false); ok {
+				return sourcesExecBlocked("the assignment `" + w + "` points the environment at `" + q + "`")
+			}
+		}
+	}
+	if v.start >= len(c.words) {
+		return ""
+	}
+	argv, dyn := c.words[v.start:], c.dyn[v.start:]
+	name := progName(argv[0])
+	if strings.Contains(argv[0], "/") || dyn[0] {
+		if q, ok := s.argHit(argv[0], dyn[0], false); ok {
+			return sourcesExecBlocked("`" + argv[0] + "` runs `" + q + "`")
+		}
+	}
+	if assignBuiltins[name] {
+		for k, a := range argv[1:] {
+			if strings.Contains(a, "=") {
+				if q, ok := s.argHit(a, dyn[k+1], false); ok {
+					return sourcesExecBlocked("`" + name + " " + a + "` points the environment at `" + q + "`")
+				}
+			}
+		}
+	}
+	if r := s.copyOut(name, argv[1:], inBox); r != "" {
+		return r
+	}
+	// git reads the config of the repository it works in: a sandbox copy's may come from a container.
+	if _, isGit := parseGit(argv); isGit && inBox != nil {
+		if q, ok := inBox.cwdHit(false); ok {
+			return sourcesExecBlocked("`git` runs in `" + q + "`, whose git config a container may have written")
+		}
+		for k, a := range argv[1:] {
+			if q, ok := inBox.argHit(a, dyn[k+1], false); ok {
+				return sourcesExecBlocked("`git` works on `" + q + "`, whose git config a container may have written")
+			}
+		}
+	}
+	reader := sourceReaders[name] && !readerRuns(name, argv[1:])
+	if !reader {
+		if q, ok := s.cwdHit(false); ok {
+			return sourcesExecBlocked("`" + name + "` runs with its working directory in `" + q + "`")
+		}
+		for k, a := range argv[1:] {
+			if q, ok := s.argHit(a, dyn[k+1], false); ok {
+				return sourcesExecBlocked("`" + name + "` is given `" + q + "` (only plain readers are)")
+			}
+		}
+		for _, t := range c.inRedirs {
+			if q, ok := s.hit(t, false); ok {
+				return sourcesExecBlocked("`" + name + "` reads its input from `" + q + "`")
+			}
+		}
+		if s.namesProtected(c.heredoc) {
+			return sourcesExecBlocked("`" + name + "` reads a here-doc naming the sources")
+		}
+		for _, f := range feeders {
+			for k, w := range f.words {
+				if q, ok := s.argHit(w, f.dyn[k], false); ok {
+					return sourcesExecBlocked("`" + name + "` reads a pipe fed with `" + q + "`")
+				}
+			}
+		}
+	}
+	if !isSourceRunner(name) && !slices.Contains(v.wrappers, "xargs") {
+		return ""
+	}
+	if q, ok := s.cwdHit(true); ok {
+		return sourcesExecBlocked("`" + name + "` runs with its working directory above `" + q + "`")
+	}
+	if s.dynamic != "" {
+		return sourcesExecBlocked("`" + name + "` runs after `cd " + s.dynamic + "`, which the guard cannot follow")
+	}
+	for k, a := range argv[1:] {
+		if q, ok := s.argHit(a, dyn[k+1], true); ok {
+			return sourcesExecBlocked("`" + name + "` is given `" + q + "` or a folder holding it")
+		}
+	}
+	return ""
+}
+
+// copyOut refuses a copy, move or link out of the sources or the sandbox to anywhere but the sandbox (cp,
+// install, ln, mv, rsync): code copied elsewhere would run on the host past the checks.
+func (s *pathScope) copyOut(name string, args []string, inBox *pathScope) string {
 	var srcs, dests []string
 	switch {
-	case destCopiers[name] && name != "mv":
+	case destCopiers[name]:
 		ca := parseCopyArgs(name, args)
 		srcs, dests = ca.srcs, ca.dests
 	case name == "rsync":
@@ -301,7 +358,7 @@ func (s *pathScope) copyOut(name string, args []string, inSources, inBox *pathSc
 	}
 	from := ""
 	for _, a := range srcs {
-		if q, ok := inSources.hit(a, false); ok {
+		if q, ok := s.hit(a, false); ok {
 			from = q
 			break
 		}
@@ -310,7 +367,10 @@ func (s *pathScope) copyOut(name string, args []string, inSources, inBox *pathSc
 		return ""
 	}
 	for _, d := range dests {
-		if _, ok := inBox.hit(d, false); !ok || !hasBox {
+		if inBox == nil {
+			return sourcesExecBlocked("`" + name + "` copies `" + from + "` to `" + d + "` (there is no sandbox dir)")
+		}
+		if _, ok := inBox.hit(d, false); !ok {
 			return sourcesExecBlocked("`" + name + "` copies `" + from + "` to `" + d + "`, outside the sandbox dir " +
 				"(a copy of cloned code goes only there)")
 		}
@@ -327,14 +387,17 @@ var (
 	// dockerValues are the docker run options taking a value that the sandbox form allows (checked by
 	// dockerValue): long ones as `--opt v` or `--opt=v`, short ones as `-x v`.
 	dockerValues = map[string]string{"--network": "network", "--net": "network", "-v": "volume", "--volume": "volume",
-		"-w": "", "--workdir": "", "-u": "", "--user": "", "-m": "", "--memory": "", "--memory-swap": "", "--cpus": "",
-		"--pids-limit": "", "--cap-drop": "", "--security-opt": "security", "--entrypoint": "", "--pull": "pull",
-		"--platform": "", "--tmpfs": ""}
+		"-w": "", "--workdir": "", "-u": "user", "--user": "user", "-m": "", "--memory": "", "--memory-swap": "",
+		"--cpus": "", "--pids-limit": "", "--cap-drop": "capdrop", "--security-opt": "security", "--entrypoint": "",
+		"--pull": "pull", "--platform": "", "--tmpfs": ""}
+	// reDockerUser is --user <uid>:<gid>, both numeric.
+	reDockerUser = regexp.MustCompile(`^([0-9]+):([0-9]+)$`)
 )
 
 // dockerSandbox decides a Bash call that is a single docker command when the job has a sandbox dir
-// (handled): "" allows the sandbox form, anything else is refused. A docker call inside a longer command
-// is not handled here: the scope check refuses docker there as before.
+// (handled): "" allows the sandbox form, anything else is refused. Only the word `docker` itself (found on
+// PATH) counts: a program named docker elsewhere (`./docker`, `sandbox/x/docker`) is not handled here and
+// is refused by the scope check, as is docker inside a longer command.
 func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 	if cfg.Sandbox == "" || len(scripts) == 0 || scripts[0].depth != 0 || len(scripts[0].pipelines) != 1 ||
 		len(scripts[0].pipelines[0].cmds) != 1 {
@@ -343,7 +406,7 @@ func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 	pl := scripts[0].pipelines[0]
 	c := pl.cmds[0]
 	v := split(c.words)
-	if v.start >= len(c.words) || progName(c.words[v.start]) != "docker" {
+	if v.start >= len(c.words) || c.words[v.start] != "docker" {
 		return "", false
 	}
 	switch {
@@ -360,14 +423,15 @@ func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 		return dockerBlocked("only `docker run`, without global options"), true
 	}
 	argv := c.words[2:]
-	rm, volumes, image := false, 0, -1
+	seen := map[string]bool{}
+	volumes, image := 0, -1
 	for k := 0; k < len(argv) && image < 0; k++ {
 		a := argv[k]
 		switch {
 		case a == "--":
 			image = k + 1
 		case dockerFlags[a]:
-			rm = rm || a == "--rm"
+			seen[a] = true
 		case strings.HasPrefix(a, "-"):
 			opt, val, eq := strings.Cut(a, "=")
 			kind, ok := dockerValues[opt]
@@ -384,6 +448,7 @@ func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 			if r := dockerValue(kind, val, cfg); r != "" {
 				return dockerBlocked(r), true
 			}
+			seen[kind] = true
 			if kind == "volume" {
 				volumes++
 			}
@@ -392,8 +457,16 @@ func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 		}
 	}
 	switch {
-	case !rm:
+	case !seen["--rm"]:
 		return dockerBlocked("--rm is required: the container is thrown away"), true
+	case !seen["network"]:
+		return dockerBlocked("--network none is required"), true
+	case !seen["user"]:
+		return dockerBlocked("--user <uid>:<gid> with the job's own uid is required"), true
+	case !seen["capdrop"]:
+		return dockerBlocked("--cap-drop ALL is required"), true
+	case !seen["security"]:
+		return dockerBlocked("--security-opt no-new-privileges is required"), true
 	case volumes != 1:
 		return dockerBlocked("exactly one -v mount, the copy below the sandbox dir"), true
 	case image < 0 || image >= len(argv) || !reDockerImage.MatchString(argv[image]):
@@ -406,8 +479,18 @@ func dockerSandbox(scripts []*script, cfg Config) (string, bool) {
 func dockerValue(kind, val string, cfg Config) string {
 	switch kind {
 	case "network":
-		if val != "none" && val != "bridge" {
-			return "network `" + val + "` (only none or bridge)"
+		if val != "none" {
+			return "network `" + val + "` (only none: a container network reaches the host's other interfaces)"
+		}
+	case "user":
+		m := reDockerUser.FindStringSubmatch(val)
+		if m == nil || m[1] != strconv.Itoa(os.Getuid()) || m[1] == "0" || m[2] == "0" {
+			return "--user `" + val + "` (the job's own numeric uid:gid, " + strconv.Itoa(os.Getuid()) + ":" +
+				strconv.Itoa(os.Getgid()) + "; never root, so the copy gets no root-owned or setuid files)"
+		}
+	case "capdrop":
+		if val != "ALL" && val != "all" {
+			return "--cap-drop `" + val + "` (only ALL)"
 		}
 	case "pull":
 		if val != "always" && val != "missing" && val != "never" {

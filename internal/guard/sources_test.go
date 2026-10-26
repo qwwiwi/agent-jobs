@@ -3,6 +3,7 @@ package guard
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -130,13 +131,16 @@ func TestSourcesHostExecution(t *testing.T) {
 func TestSourcesDockerSandbox(t *testing.T) {
 	jobDir, cfg := sourcesSetup(t)
 	box := filepath.Join(jobDir, "sandbox")
+	user := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
+	// base is the required part of the sandbox form; each refused case adds one thing to it.
+	base := "docker run --rm --network none --user " + user + " --cap-drop ALL --security-opt no-new-privileges"
+	mount := " -v " + box + "/lib:/src"
 	t.Run("[G02] the sandbox recipe is allowed", func(t *testing.T) {
 		for _, c := range []string{
-			"docker run --rm --network none -v " + box + "/lib:/src -w /src node:22 sh -c 'npm ci && npm test'",
-			"docker run --rm --network=none --volume=" + box + "/lib:/src:ro alpine ls -la /src",
-			"docker run --rm -i --memory 2g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges " +
-				"--read-only --tmpfs /tmp -v " + box + "/lib:/src -w /src python:3.12 python -m pytest",
-			"docker run --rm --network bridge -v " + box + "/lib:/src -w /src golang:1.23 go test ./...",
+			base + mount + " -w /src node:22 sh -c 'HOME=/tmp npm ci && npm test'",
+			"docker run --rm --network=none --user=" + user + " --cap-drop=ALL --security-opt=no-new-privileges --volume=" +
+				box + "/lib:/src:ro alpine ls -la /src",
+			base + " -i --memory 2g --cpus 2 --pids-limit 512 --read-only --tmpfs /tmp" + mount + " -w /src python:3.12 python -m pytest",
 		} {
 			if r := Check(c, cfg); r != "" {
 				t.Errorf("%q: refused: %s", c, r)
@@ -146,51 +150,118 @@ func TestSourcesDockerSandbox(t *testing.T) {
 	t.Run("[G02] docker mounts and flags beyond a sandbox copy are refused", func(t *testing.T) {
 		for _, c := range []string{
 			// mounts
-			"docker run --rm -v " + jobDir + "/sources/lib:/src alpine ls",
-			"docker run --rm -v " + box + ":/src alpine ls",
-			"docker run --rm -v " + box + "/home-link:/src alpine ls",
-			"docker run --rm -v " + box + "/lib/../..:/src alpine ls",
-			"docker run --rm -v /:/host alpine ls",
-			"docker run --rm -v " + jobDir + "/work:/src alpine ls",
-			"docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine ls",
-			"docker run --rm -v " + box + "/lib:/src -v " + jobDir + "/work:/w alpine ls",
-			"docker run --rm -v myvolume:/src alpine ls",
-			"docker run --rm -v lib:/src alpine ls",
-			"docker run --rm --mount type=bind,src=" + box + "/lib,dst=/src alpine ls",
-			"docker run --rm --volumes-from other alpine ls",
-			"docker run --rm -v " + box + "/lib:/src:z alpine ls",
-			"docker run --rm alpine ls",
+			base + " -v " + jobDir + "/sources/lib:/src alpine ls",
+			base + " -v " + box + ":/src alpine ls",
+			base + " -v " + box + "/home-link:/src alpine ls",
+			base + " -v " + box + "/lib/../..:/src alpine ls",
+			base + " -v /:/host alpine ls",
+			base + " -v " + jobDir + "/work:/src alpine ls",
+			base + " -v /var/run/docker.sock:/var/run/docker.sock alpine ls",
+			base + mount + " -v " + jobDir + "/work:/w alpine ls",
+			base + " -v myvolume:/src alpine ls",
+			base + " -v lib:/src alpine ls",
+			base + " --mount type=bind,src=" + box + "/lib,dst=/src alpine ls",
+			base + " --volumes-from other" + mount + " alpine ls",
+			base + " -v " + box + "/lib:/src:z alpine ls",
+			base + " alpine ls",
 			// env and secrets
-			"docker run --rm -e TOKEN=x -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --env TOKEN -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --env-file .env -v " + box + "/lib:/src alpine ls",
-			"TOKEN=x docker run --rm -v " + box + "/lib:/src alpine ls",
-			// privileges, host namespaces
-			"docker run --rm --privileged -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --network host -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --net=host -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --network container:x -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --pid host -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --cap-add SYS_ADMIN -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --device /dev/kvm -v " + box + "/lib:/src alpine ls",
-			"docker run --rm --security-opt seccomp=unconfined -v " + box + "/lib:/src alpine ls",
-			"docker run --rm -p 8080:80 -v " + box + "/lib:/src alpine ls",
-			// not throwaway, not the sole command, other subcommands
-			"docker run -v " + box + "/lib:/src alpine ls",
-			"docker run --rm -d -v " + box + "/lib:/src alpine sleep 100",
-			"docker --context other run --rm -v " + box + "/lib:/src alpine ls",
+			base + " -e TOKEN=x" + mount + " alpine ls",
+			base + " --env TOKEN" + mount + " alpine ls",
+			base + " --env=TOKEN" + mount + " alpine ls",
+			base + " --env-file .env" + mount + " alpine ls",
+			"TOKEN=x " + base + mount + " alpine ls",
+			// privileges, root, host namespaces and network
+			base + " --privileged" + mount + " alpine ls",
+			"docker run --rm --network host --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network bridge --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --net=host --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network container:x --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network none --user 0:0 --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network none --user root --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network none --user " + user + " --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm --network none --user " + user + " --cap-drop ALL" + mount + " alpine ls",
+			base + " --pid host" + mount + " alpine ls",
+			base + " --cap-add SYS_ADMIN" + mount + " alpine ls",
+			base + " --device /dev/kvm" + mount + " alpine ls",
+			base + " --security-opt seccomp=unconfined" + mount + " alpine ls",
+			base + " -p 8080:80" + mount + " alpine ls",
+			// not throwaway, not the sole command, not the docker on PATH, other subcommands
+			"docker run --network none --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			base + " -d" + mount + " alpine sleep 100",
+			"docker --context other" + strings.TrimPrefix(base, "docker") + mount + " alpine ls",
 			"docker exec x sh",
 			"docker build ../sandbox/lib",
-			"docker run --rm -v " + box + "/lib:/src alpine ls > out.txt",
-			"cd .. && docker run --rm -v " + box + "/lib:/src alpine ls",
-			"docker run --rm -v " + box + "/lib:/src alpine sh -c \"$(cat ~/.secrets/x)\"",
-			"docker run --rm -v $HOME:/src alpine ls",
-			"docker run --rm -v " + box + "/*:/src alpine ls",
-			"timeout 60 docker run --rm -v " + box + "/lib:/src alpine ls",
-			"podman run --rm -v " + box + "/lib:/src alpine ls",
+			base + mount + " alpine ls > out.txt",
+			"cd .. && " + base + mount + " alpine ls",
+			base + mount + " alpine sh -c \"$(cat ~/.secrets/x)\"",
+			base + " -v $HOME:/src alpine ls",
+			base + " -v " + box + "/*:/src alpine ls",
+			"timeout 60 " + base + mount + " alpine ls",
+			"podman" + strings.TrimPrefix(base, "docker") + mount + " alpine ls",
+			"./" + base + mount + " alpine ls",
+			"../sandbox/lib/" + base + mount + " alpine ls",
+			"../sources/lib/" + base + mount + " alpine ls",
+			"DOCKER" + strings.TrimPrefix(base, "docker") + mount + " alpine ls",
 		} {
 			if r := Check(c, cfg); r == "" {
 				t.Errorf("%q: allowed, want refused", c)
+			}
+		}
+	})
+}
+
+// Fix loop 1 (review of d009a6c): cloned code reaches the host past a sandbox copy, git in a copy, and
+// programs outside the runner list.
+func TestSourcesHostExecutionLoop1(t *testing.T) {
+	_, cfg := sourcesSetup(t)
+	t.Run("[G02] copies out of the sandbox, git in a copy and non-reader programs are refused", func(t *testing.T) {
+		for _, c := range []string{
+			"cp -r ../sandbox/lib ../tmp/x",
+			"cp -r ../sources/lib ../sandbox/x && cp -r ../sandbox/x ../tmp/x && bash ../tmp/x/install.sh",
+			"mv ../sandbox/lib ../tmp/lib",
+			"rsync -a ../sandbox/lib/ ../tmp/lib/",
+			"ln -s ../sandbox/lib ../tmp/l",
+			"git -C ../sandbox/lib diff",
+			"cd ../sandbox/lib && git log -p",
+			"git --git-dir=../sandbox/lib/.git log",
+			"awk -f../sources/lib/x.awk data",
+			"awk --file=../sources/lib/x.awk data",
+			"sed -f../sources/lib/x.sed data",
+			"sed e ../sources/lib/install.sh",
+			"awk '{system($0)}' ../sources/lib/install.sh",
+			"gawk -E ../sources/lib/x.awk",
+			"gdb -batch -ex run ../sources/lib/bin/tool",
+			"vim -S ../sources/lib/x.vim",
+			"m4 ../sources/lib/x.m4",
+			"qemu-x86_64 ../sources/lib/bin/tool",
+			"sort --compress-program=../sources/lib/bin/tool ../sources/lib/setup.py",
+			"rg --pre ../sources/lib/bin/tool main ../sources/lib",
+			"rsync -e ../sources/lib/bin/tool a b:c",
+			"tar -I ../sources/lib/bin/tool -cf ../tmp/x.tar ../tmp",
+			"cd ../sources/lib && ./bin/tool",
+			"cd ../sources/lib && tool",
+			"python3 tools/analyze.py ../sources/lib",
+		} {
+			if r := Check(c, cfg); r == "" {
+				t.Errorf("%q: allowed, want refused", c)
+			}
+		}
+	})
+	t.Run("[G02] readers fed from the sources stay allowed", func(t *testing.T) {
+		for _, c := range []string{
+			"find ../sources/lib -name '*.py' | xargs wc -l",
+			"cat ../sources/lib/setup.py | wc -l",
+			"rg -n main ../sources/lib",
+			"cd ../sources/lib && grep -rn main .",
+			"git -C ../sources/lib log --oneline -1",
+			"chmod -R u+w ../sandbox/lib",
+			"cp -R ../sources/lib ../sandbox/lib3",
+			"diff -r ../sources/lib ../sandbox/lib",
+		} {
+			if r := Check(c, cfg); r != "" {
+				t.Errorf("%q: refused: %s", c, r)
 			}
 		}
 	})

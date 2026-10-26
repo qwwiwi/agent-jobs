@@ -156,15 +156,15 @@ func TestSourcesCloneIntoJobDir(t *testing.T) {
 				t.Fatalf("%s writable: %v %v", p, fi.Mode(), err)
 			}
 		}
-		if fi, _ := os.Stat(filepath.Join(dir, "install.sh")); fi.Mode().Perm()&0o111 != 0 {
-			t.Fatalf("install.sh executable: %v", fi.Mode())
+		if fi, _ := os.Stat(filepath.Join(dir, "install.sh")); fi.Mode().Perm() != 0o555 {
+			t.Fatalf("install.sh: mode %v, want r-xr-xr-x (no write bits, exec bit kept for the sandbox copy)", fi.Mode())
 		}
 		if out, err := git(dir, "rev-list", "--count", "HEAD"); err != nil || out != "1" {
 			t.Fatalf("not a shallow clone of one commit: %q %v", out, err)
 		}
 		prompt, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "prompt.md"))
 		for _, want := range []string{"## Sources", url + " → " + dir, "missing.git", "not cloned",
-			"do not study their code through the GitHub API or website", "docker run --rm"} {
+			"do not study their code through the GitHub API or website", "docker run --rm --network none --user"} {
 			if !strings.Contains(string(prompt), want) {
 				t.Errorf("prompt lacks %q:\n%s", want, prompt)
 			}
