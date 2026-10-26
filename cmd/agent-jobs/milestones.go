@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -112,12 +113,7 @@ func cmdMilestone(args []string) error {
 			if j.Outcome != "" {
 				s += "/" + j.Outcome
 			}
-			// The skills a job got: those linked for its latest attempt, else those selected at job_start.
-			if got := j.SkillsDelivered; len(got) > 0 {
-				s += " [" + strings.Join(got, ",") + "]"
-			} else if len(j.Skills) > 0 {
-				s += " [selected " + strings.Join(j.Skills, ",") + "]"
-			}
+			s += jobSkills(j.Skills, j.SkillsDelivered)
 			js = append(js, s)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.Key, t.Status, dash(strings.Join(t.DependsOn, ",")),
@@ -133,6 +129,25 @@ func cmdMilestone(args []string) error {
 		fmt.Printf("note: %s\n", v.Note)
 	}
 	return nil
+}
+
+// jobSkills renders a job's skills for the JOBS column: one list when the skills selected at job_start
+// and those linked for its latest attempt match, both labelled when they differ (a repository-owned
+// skill is selected but not linked), so neither the selection nor the delivery is lost.
+func jobSkills(selected, delivered []string) string {
+	if len(selected) == 0 && len(delivered) == 0 {
+		return ""
+	}
+	if slices.Equal(slices.Sorted(slices.Values(selected)), slices.Sorted(slices.Values(delivered))) {
+		return " [" + strings.Join(selected, ",") + "]"
+	}
+	none := func(s []string) string {
+		if len(s) == 0 {
+			return "none"
+		}
+		return strings.Join(s, ",")
+	}
+	return " [selected " + none(selected) + "; delivered " + none(delivered) + "]"
 }
 
 func dash(s string) string {

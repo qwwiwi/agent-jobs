@@ -12,7 +12,7 @@ import (
 )
 
 // G01 on the command line: `agent-jobs milestone <id>` shows each task's planned skills and, per job,
-// the skills it got (linked, else selected).
+// the skills it got: one list when selected and delivered match, both labelled when they differ.
 func TestMilestoneCLISkills(t *testing.T) {
 	t.Run("[G01] milestone shows planned and delivered skills", func(t *testing.T) {
 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
@@ -34,10 +34,18 @@ func TestMilestoneCLISkills(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		for id, delivered := range map[string][]string{"job-a": {"golang"}, "job-b": nil} {
-			if err := m.Store.Insert(&store.Job{ID: id, Agent: "test", Title: "t", Kind: "fix", Brief: "b", Status: store.StatusQueued,
+		// job-c: golang is repository-owned, so only extra is linked; both lists must stay visible.
+		for _, j := range []struct {
+			id                  string
+			selected, delivered []string
+		}{
+			{"job-a", []string{"golang"}, []string{"golang"}},
+			{"job-b", []string{"golang"}, nil},
+			{"job-c", []string{"golang", "extra"}, []string{"extra"}},
+		} {
+			if err := m.Store.Insert(&store.Job{ID: j.id, Agent: "test", Title: "t", Kind: "fix", Brief: "b", Status: store.StatusQueued,
 				Model: "opus", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1, CreatedAt: time.Now(), MilestoneID: v.ID, TaskKey: "T1",
-				Skills: []string{"golang"}, SkillsDelivered: delivered}); err != nil {
+				Skills: j.selected, SkillsDelivered: j.delivered}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -54,7 +62,8 @@ func TestMilestoneCLISkills(t *testing.T) {
 			}
 		}
 		if !strings.Contains(out, "SKILLS") || !strings.Contains(t1, "+golang,-legacy") || !strings.Contains(t1, "job-a queued [golang]") ||
-			!strings.Contains(t1, "job-b queued [selected golang]") || strings.Contains(t2, "golang") {
+			!strings.Contains(t1, "job-b queued [selected golang; delivered none]") ||
+			!strings.Contains(t1, "job-c queued [selected golang,extra; delivered extra]") || strings.Contains(t2, "golang") {
 			t.Fatalf("milestone output:\n%s", out)
 		}
 	})
