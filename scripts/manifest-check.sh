@@ -8,7 +8,7 @@
 #
 # Usage: scripts/manifest-check.sh [go-test-json-file]   (see the reference script)
 # Environment: MANIFEST_CHECKLIST, MANIFEST_GO_TEST_ARGS (passed on); MANIFEST_DOWNLOAD_TIMEOUT, the
-#   seconds `go mod download` may take with a cold module cache (default 300; needs `timeout`).
+#   seconds `go mod download` may take with a cold module cache (default 300).
 # Exit: as the reference script; 2 also when the modules cannot be downloaded (a cold module cache
 #   needs network access to the Go module proxy, proxy.golang.org unless GOPROXY says otherwise).
 #
@@ -22,15 +22,50 @@ if [ $# -eq 0 ]; then
   # Never fetch another Go toolchain: the installed go must satisfy go.mod.
   GOTOOLCHAIN=local
   export GOTOOLCHAIN
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/manifest-repo.XXXXXX") || exit 2
+  trap 'rm -rf "$tmp"' EXIT
+  trap 'exit 2' HUP INT TERM
+
+  # Both runs below judge against one copy of the checklist taken before any test runs: a test that
+  # edits or removes the working tree's checklist cannot drop a requirement from the second run.
+  checklist=${MANIFEST_CHECKLIST:-brief/CHECKLIST.md}
+  if [ -f "$checklist" ]; then
+    cp "$checklist" "$tmp/CHECKLIST.md" || exit 2
+    MANIFEST_CHECKLIST=$tmp/CHECKLIST.md
+    export MANIFEST_CHECKLIST
+  fi
+
   # Fetch the modules first, bounded, so a cold cache without network fails here with a clear line
   # (exit 2) instead of as build failures of every package (every requirement MISSING, exit 1).
+  # A watchdog stops the download after the limit, so no timeout(1) is needed.
   limit=${MANIFEST_DOWNLOAD_TIMEOUT:-300}
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$limit" go mod download
-  else
-    go mod download
-  fi
+  case $limit in
+    '' | *[!0-9]*)
+      echo "manifest-check: MANIFEST_DOWNLOAD_TIMEOUT must be a whole number of seconds, not '$limit'" >&2
+      exit 2
+      ;;
+  esac
+  go mod download &
+  pid=$!
+  (
+    trap - EXIT HUP INT TERM
+    i=0
+    while [ "$i" -lt "$limit" ]; do
+      sleep 1
+      kill -0 "$pid" 2>/dev/null || exit 0
+      i=$((i + 1))
+    done
+    : >"$tmp/timed-out"
+    kill "$pid"
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid"
   status=$?
+  kill "$watchdog" 2>/dev/null
+  if [ "$status" -ne 0 ] && [ -f "$tmp/timed-out" ]; then
+    echo "manifest-check: go mod download did not finish within ${limit}s (MANIFEST_DOWNLOAD_TIMEOUT): a cold module cache needs network access to the Go module proxy" >&2
+    exit 2
+  fi
   if [ "$status" -ne 0 ]; then
     echo "manifest-check: go mod download failed (exit $status): a cold module cache needs network access to the Go module proxy" >&2
     exit 2
@@ -60,4 +95,5 @@ if [ $# -eq 0 ]; then
   fi
 fi
 
-exec /bin/sh "$root/examples/manifest-check/manifest-check.sh" "$@"
+/bin/sh "$root/examples/manifest-check/manifest-check.sh" "$@"
+exit $?
