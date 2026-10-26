@@ -757,9 +757,11 @@ func (l *JudgeNotRun) UnmarshalJSON(data []byte) error {
 }
 
 // gateEntries decodes the JSON list data into *l, one entry at a time; an entry's error names the list
-// and the entry's position. null leaves *l as it is.
+// and the entry's position. null sets *l to nil, as plain slice decoding does, so a later null clears
+// an earlier list under a duplicate key.
 func gateEntries[T any, L ~[]T](data []byte, what string, l *L, entry func(json.RawMessage) (T, error)) error {
 	if string(bytes.TrimSpace(data)) == "null" {
+		*l = nil
 		return nil
 	}
 	var raws []json.RawMessage

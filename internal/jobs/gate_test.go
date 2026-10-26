@@ -424,6 +424,15 @@ func TestValidateJudgeCouldNotRunShapes(t *testing.T) {
 			t.Fatalf("%s: %v", want, err)
 		}
 	}
+	// A later null clears an earlier list under a duplicate key, as plain slice decoding does.
+	for want, c := range map[string][2]string{
+		"could_not_run is missing": {ran, `[], "could_not_run": null`},
+		"ran is missing":           {`[], "ran": null`, `[]`},
+	} {
+		if _, _, err := ValidateJudge(block(c[0], c[1]), g); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("duplicate key, %s: %v", want, err)
+		}
+	}
 }
 
 // The gate kinds take no orchestrator input: job_start (Enqueue without the daemon's input) refuses
