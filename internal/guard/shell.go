@@ -370,6 +370,7 @@ func isDigits(s string) bool {
 func (p *parser) run() {
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == ' ' || c == '\t':
 			p.endWord()
@@ -397,6 +398,9 @@ func (p *parser) run() {
 			p.i += end + 2
 		case c == '"':
 			p.double()
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+			p.started, p.dyn, p.bare = true, true, true
 		case c == '$' && p.peek(1) == '(', c == '`':
 			lit := p.substitution(false)
 			p.word.WriteString(lit)
@@ -616,6 +620,7 @@ func (p *parser) double() {
 	p.started, p.quoted = true, true
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == '"':
 			p.i++
@@ -626,6 +631,9 @@ func (p *parser) double() {
 			}
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+			p.dyn = true
 		case c == '$' && p.peek(1) == '(', c == '`':
 			lit := p.substitution(true)
 			p.word.WriteString(lit)
@@ -674,6 +682,22 @@ func (p *parser) paramExpansion(dq bool) bool {
 	return true
 }
 
+// pid reads `$$` at p.i into the word: bash reads it as one token (the PID), so a `{` right after it
+// is a plain character and does not start a ${…} (in `echo $${x:-;cmd;}` cmd runs).
+func (p *parser) pid() {
+	p.word.WriteString("$$")
+	p.cmd.raw += "$$"
+	p.i += 2
+}
+
+// continuedDollar marks the script vague at a `$` before a backslash-newline: bash joins the lines
+// first, so `$\` + newline + `{` or `$` is a ${…} or $$ the reader does not see.
+func (p *parser) continuedDollar() {
+	if p.peek(0) == '$' && p.peek(1) == '\\' && p.peek(2) == '\n' {
+		p.out.vague = "a $ before a backslash-newline (bash joins the lines first)"
+	}
+}
+
 // braced reads the inside of a `${…}` from p.i through its closing `}` and reports whether it found
 // it. bash's rules: the first `}` closes (a bare `{` does not nest, `${` does), a backslash escapes,
 // '…' and $'…' quote (inside double quotes too), "…" nests, $(…) and backticks are substitutions.
@@ -683,9 +707,13 @@ func (p *parser) paramExpansion(dq bool) bool {
 // closes a $(…) too early (a `)` of a case pattern, a comment or a here-doc body in it), the rest is
 // commands bash runs, not part of the word.
 func (p *parser) braced(dq bool) bool {
+	if strings.IndexByte(" \t\n|", p.peek(0)) >= 0 {
+		p.out.vague = "${ cmd; } or ${| cmd; } (bash 5.3 runs it as a command substitution)"
+	}
 	after := -1 // index just past the first substitution
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == '}':
 			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
@@ -708,6 +736,8 @@ func (p *parser) braced(dq bool) bool {
 			}
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
 		case c == '\'', c == '$' && p.peek(1) == '\'':
 			if !p.quotedInBraces(dq) {
 				return false
@@ -792,6 +822,7 @@ func (p *parser) doubleInBraces() bool {
 	after := -1
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == '"':
 			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
@@ -800,6 +831,8 @@ func (p *parser) doubleInBraces() bool {
 			}
 			p.i++
 			return true
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
 		case c == '$' && p.peek(1) == '[':
 			p.out.vague = "$[…] inside ${…}"
 			p.word.WriteByte(c)
