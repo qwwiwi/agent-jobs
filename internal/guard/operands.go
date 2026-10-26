@@ -328,9 +328,9 @@ func sedCommandEs(script string, parse bool) []int {
 // sedDataSpans returns the byte ranges [start, end) of a sed script that sed reads as a regex or a
 // replacement (an address /re/ or \cREc, the two parts of s and y); nil when the reader does not
 // understand the script (an unknown command, a/i/c text with a backslash, s///w, an unterminated
-// regex), so that every e counts. Text it skips (labels, comments, file names, a/i/c text, an e
-// command) holds no span, and it only resynchronises at the end of a line, so a span never covers
-// text that sed reads as commands.
+// regex, a regex with an unescaped [), so that every e counts. Text it skips (labels, comments, file
+// names, a/i/c text, an e command) holds no span, and it only resynchronises at the end of a line, so
+// a span never covers text that sed reads as commands.
 func sedDataSpans(s string) [][2]int {
 	var spans [][2]int
 	i := 0
@@ -344,8 +344,10 @@ func sedDataSpans(s string) [][2]int {
 			i++
 		}
 	}
-	// delimited reads the text from i to the unescaped delimiter d, records it and steps past d.
-	delimited := func(d byte) bool {
+	// delimited reads the text from i to the unescaped delimiter d, records it and steps past d. In a
+	// regex, sed reads a delimiter inside a bracket expression as data (`s/[/]/x/`); the reader does
+	// not follow bracket expressions, so a regex with an unescaped [ fails.
+	delimited := func(d byte, regex bool) bool {
 		start := i
 		for ; i < len(s); i++ {
 			switch s[i] {
@@ -357,6 +359,10 @@ func sedDataSpans(s string) [][2]int {
 				spans = append(spans, [2]int{start, i})
 				i++
 				return true
+			case '[':
+				if regex {
+					return false
+				}
 			}
 		}
 		return false
@@ -385,7 +391,7 @@ func sedDataSpans(s string) [][2]int {
 				d = s[i]
 				i++
 			}
-			if !delimited(d) {
+			if !delimited(d, true) {
 				return true, false
 			}
 			for i < len(s) && (s[i] == 'I' || s[i] == 'M') {
@@ -440,7 +446,7 @@ func sedDataSpans(s string) [][2]int {
 			}
 			d := s[i]
 			i++
-			if !delimited(d) || !delimited(d) {
+			if !delimited(d, c == 's') || !delimited(d, false) {
 				return nil
 			}
 			for c == 's' && i < len(s) && strings.IndexByte("gpiImMe0123456789", s[i]) >= 0 {
