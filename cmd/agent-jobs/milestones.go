@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/mcp"
 )
 
 // cmdMilestones is `agent-jobs milestones`: milestone_list as a table or JSON.
@@ -169,14 +170,18 @@ func cmdMilestoneEdit(op string, args []string, stdin io.Reader) error {
 			return err
 		}
 	}
+	fields, err := milestoneArgs(raw)
+	if err != nil {
+		return err
+	}
+	if *title != "" {
+		fields["title"] = *title
+	}
 	ctx := context.Background()
 	if op == "create" {
 		var in jobs.MilestoneCreate
-		if err := decodeMilestoneInput(raw, &in, &in.Tasks); err != nil {
+		if err := decodeMilestoneArgs("milestone_create", fields, &in); err != nil {
 			return err
-		}
-		if *title != "" {
-			in.Title = *title
 		}
 		m, err := open(*agent)
 		if err != nil {
@@ -193,24 +198,21 @@ func cmdMilestoneEdit(op string, args []string, stdin io.Reader) error {
 	if err != nil {
 		return err
 	}
-	var in jobs.MilestoneSet
-	if raw != nil {
-		if err := decodeMilestoneInput(raw, &in, &in.Tasks); err != nil {
-			return err
-		}
+	// An id in the input is the positional one or refused, whatever its value or type.
+	if v, ok := fields["id"]; ok && v != float64(id) {
+		b, _ := json.Marshal(v)
+		return fmt.Errorf("the input's id %s is not milestone %d", b, id)
 	}
-	if in.ID != 0 && in.ID != id {
-		return fmt.Errorf("the input's id %d is not milestone %d", in.ID, id)
-	}
-	in.ID = id
-	if *title != "" {
-		in.Title = *title
-	}
+	fields["id"] = float64(id)
 	if *status != "" {
-		in.Status = *status
+		fields["status"] = *status
 	}
 	if *closeNote != "" {
-		in.CloseNote = *closeNote
+		fields["close_note"] = *closeNote
+	}
+	var in jobs.MilestoneSet
+	if err := decodeMilestoneArgs("milestone_set", fields, &in); err != nil {
+		return err
 	}
 	m, err := open(*agent)
 	if err != nil {
@@ -236,22 +238,43 @@ func readInput(name string, stdin io.Reader) ([]byte, error) {
 	return os.ReadFile(name)
 }
 
-// decodeMilestoneInput decodes raw into in (a JSON object: the tool's input) or into tasks (a JSON
-// array: only the tasks). Unknown fields and trailing data are refused, as the tool's input schema
-// refuses them.
-func decodeMilestoneInput(raw []byte, in any, tasks *[]jobs.MilestoneTaskInput) error {
-	raw = bytes.TrimSpace(raw)
-	var target any = in
-	if len(raw) > 0 && raw[0] == '[' {
-		target = tasks
+// milestoneArgs reads raw, the tool's JSON input object or only its tasks array, into the tool's
+// arguments as decoded JSON; no input is no arguments. It must be one JSON value: anything after it,
+// even a stray ] or }, is refused.
+func milestoneArgs(raw []byte) (map[string]any, error) {
+	if raw == nil {
+		return map[string]any{}, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(target); err != nil {
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("milestone input: %w", err)
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("milestone input: more than one JSON value, or data after it")
+	}
+	switch v := v.(type) {
+	case map[string]any:
+		return v, nil
+	case []any:
+		return map[string]any{"tasks": v}, nil
+	}
+	return nil, errors.New("milestone input: must be a JSON object (the tool's input) or array (only its tasks)")
+}
+
+// decodeMilestoneArgs validates args against the input schema of tool (the MCP tool's own schema, so the
+// CLI refuses what the tool refuses: unknown or differently cased keys, null where the schema has no
+// null, wrong types) and only then decodes them into in.
+func decodeMilestoneArgs(tool string, args map[string]any, in any) error {
+	if err := mcp.ValidateMilestoneInput(tool, args); err != nil {
 		return fmt.Errorf("milestone input: %w", err)
 	}
-	if dec.More() {
-		return errors.New("milestone input: more than one JSON value")
+	b, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("milestone input: %w", err)
+	}
+	if err := json.Unmarshal(b, in); err != nil {
+		return fmt.Errorf("milestone input: %w", err)
 	}
 	return nil
 }

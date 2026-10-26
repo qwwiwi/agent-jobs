@@ -15,7 +15,8 @@ type MilestoneGetInput struct {
 
 func addMilestoneCreate(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
-		Name: "milestone_create",
+		Name:        "milestone_create",
+		InputSchema: milestoneSchemas["milestone_create"].schema,
 		Description: "Create a milestone (a stage of work) with its tasks in one call and return its tree. Only title and tasks " +
 			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys), covers (requirement IDs) and " +
 			"skills (job_start's skills edits, planned once here: a job_start on the task without skills gets them). " +
@@ -33,7 +34,8 @@ func addMilestoneCreate(s *sdk.Server, d Deps) {
 
 func addMilestoneSet(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
-		Name: "milestone_set",
+		Name:        "milestone_set",
+		InputSchema: milestoneSchemas["milestone_set"].schema,
 		Description: "Edit a milestone in place and return its tree: title, goal, branch, order, max_parallel, status " +
 			"(open | done | dropped), close_note; tasks to add or edit by key; keys to drop. Nothing is deleted. Closing as done " +
 			"is refused while a task is not done or dropped. Task status is derived from its jobs, never set here.",

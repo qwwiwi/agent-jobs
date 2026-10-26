@@ -106,7 +106,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
 			stdin, want string
 		}{
 			{[]string{"--input", "-"}, `{"title": "no tasks"}`, "task"},
-			{[]string{"--input", "-"}, `{"title": "x", "tasks": [{"key": "T1", "title": "a"}], "approve": true}`, `unknown field "approve"`},
+			{[]string{"--input", "-"}, `{"title": "x", "tasks": [{"key": "T1", "title": "a"}], "approve": true}`, `milestone_create input schema: validating root: unexpected additional properties ["approve"]`},
 			{[]string{"--input", "-"}, `{"title": "x", "tasks": [{"key": "T1", "title": "a"}]} {}`, "more than one JSON value"},
 			{nil, "", "usage: agent-jobs milestone create"},
 		} {
