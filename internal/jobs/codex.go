@@ -299,27 +299,42 @@ func codexPreamble(pre string, j *store.Job, jobDir string) (string, error) {
 		"the report's Progress section is your record."
 	if codexProgressWritable(j) {
 		path := CodexProgressPath(jobDir)
+		dir := filepath.Dir(path)
 		rule = fmt.Sprintf("- Keep `%s` at `%s` up to date after each meaningful step: what is done, what is next, "+
-			"what not to redo. It is the one path outside `work/` your sandbox lets you write; the rest of the job "+
-			"directory is read-only. Write it with a shell heredoc (`cat > %s <<'EOF'`).", ProgressFile, path, path)
+			"what not to redo. Its folder is the one path outside `work/` your sandbox lets you write; the rest of the job "+
+			"directory is read-only. Write it with a shell heredoc (`cat > %s <<'EOF'`).\n"+
+			"- You cannot commit: the repository's git directory is read-only in your sandbox (`git add` and `git commit` "+
+			"fail). Leave your changes in `work/` and write the commit message to `%s`; when you have finished, the "+
+			"wrapper stages everything in `work/` that is not ignored (`git add -A`) and makes one commit with that message.",
+			ProgressFile, path, path, filepath.Join(dir, CodexCommitMessageFile))
 	}
 	return pre[:start] + rule + pre[end:], nil
 }
+
+// CodexNetworkOverride is the `-c` override that lets commands under codex's workspace-write sandbox
+// reach the network (issue #92: `npm ci` failed with EAI_AGAIN): key network_access of codex's
+// sandbox_workspace_write table (codex-cli 0.162.1). Read-only codex jobs never get it; under
+// danger-full-access codex confines no network anyway.
+const CodexNetworkOverride = "sandbox_workspace_write.network_access=true"
 
 // CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,
 // isolated from the owner's codex setup (no user config, rules or session files, no MCP servers, the
 // CodexDisabledFeatures off, never asks for approval), no git-repo check (a job without a repo works in
 // an empty dir), the given sandbox (the kind's, CodexSandbox, or CodexSandboxFullAccess under
 // codex_sandbox worktree-full-access), under workspace-write the job's progress folder in jobDir as the
-// one extra writable root (codexProgressRoot), the job's model and reasoning effort; the prompt arrives
-// on stdin ("-"). The working dir is the job's work dir (set by the wrapper).
-func CodexArgs(j *store.Job, effort, sandbox, jobDir string) []string {
+// one extra writable root (codexProgressRoot) and, with network, CodexNetworkOverride, the job's model
+// and reasoning effort; the prompt arrives on stdin ("-"). The working dir is the job's work dir (set by
+// the wrapper).
+func CodexArgs(j *store.Job, effort, sandbox, jobDir string, network bool) []string {
 	args := []string{
 		"exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
 		"-s", sandbox, "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
 	}
 	if root := codexProgressRoot(sandbox, jobDir); root != "" {
 		args = append(args, "--add-dir", root)
+	}
+	if network && sandbox == CodexSandboxWrite {
+		args = append(args, "-c", CodexNetworkOverride)
 	}
 	for _, f := range CodexDisabledFeatures {
 		args = append(args, "--disable", f)

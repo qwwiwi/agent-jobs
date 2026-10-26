@@ -42,7 +42,7 @@ func TestCodexArgsProgressDirWritable(t *testing.T) {
 		if got := CodexSandbox(c.kind); c.sandbox != CodexSandboxFullAccess && got != c.sandbox {
 			t.Fatalf("%s: sandbox %q, want %q", c.kind, got, c.sandbox)
 		}
-		args := CodexArgs(&store.Job{Kind: c.kind, Model: "gpt-6.1-sol"}, "high", c.sandbox, jobDir)
+		args := CodexArgs(&store.Job{Kind: c.kind, Model: "gpt-6.1-sol"}, "high", c.sandbox, jobDir, false)
 		if got := argAddDirs(args); !slices.Equal(got, c.want) {
 			t.Fatalf("%s/%s: --add-dir %q, want %q (argv %q)", c.kind, c.sandbox, got, c.want, args)
 		}
@@ -83,7 +83,8 @@ func TestCodexPromptNamesProgressPath(t *testing.T) {
 			want := c.want
 			if j.Runner == store.RunnerCodex && CodexSandbox(j.Kind) == CodexSandboxWrite {
 				path := CodexProgressPath(m.JobDir(j.ID))
-				want = []string{"`" + path + "`", "cat > " + path + " <<'EOF'"}
+				want = []string{"`" + path + "`", "cat > " + path + " <<'EOF'",
+					"You cannot commit", "`" + CodexCommitMessagePath(m.JobDir(j.ID)) + "`"}
 			}
 			for _, s := range want {
 				if !strings.Contains(p, s) {
@@ -201,7 +202,7 @@ func TestWrapperChecksCodexAddDir(t *testing.T) {
 			if c.setup != nil {
 				c.setup(t, dir)
 			}
-			args := CodexArgs(j, "high", CodexSandbox(j.Kind), dir)
+			args := CodexArgs(j, "high", CodexSandbox(j.Kind), dir, false)
 			if c.extra != nil {
 				var kept []string
 				for i := 0; i < len(args); i++ {

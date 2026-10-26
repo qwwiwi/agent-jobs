@@ -632,10 +632,19 @@ func driverKey(k string) bool {
 // followed (an included file reports the scope of the file that includes it). The daemon owner's
 // global/system config (e.g. filter.lfs) is not the job's and does not count.
 func repoDrivers(work string) ([]string, error) {
-	out, err := gitRaw(work, "config", "--list", "--show-scope", "--name-only", "--includes", "-z")
+	out, err := gitRaw(work, repoDriversArgs...)
 	if err != nil {
 		return nil, err
 	}
+	return driverKeys(out), nil
+}
+
+// repoDriversArgs lists the config keys with their scopes for driverKeys.
+var repoDriversArgs = []string{"config", "--list", "--show-scope", "--name-only", "--includes", "-z"}
+
+// driverKeys returns the driver keys (driverKey) of scope local or worktree in the output of
+// `git` repoDriversArgs.
+func driverKeys(out []byte) []string {
 	f := strings.Split(string(out), "\x00")
 	var keys []string
 	for i := 0; i+1 < len(f); i += 2 {
@@ -644,7 +653,7 @@ func repoDrivers(work string) ([]string, error) {
 			keys = append(keys, k)
 		}
 	}
-	return keys, nil
+	return keys
 }
 
 // keepWithDrivers is the cleanup of a job whose repository config names filter/diff drivers: any
