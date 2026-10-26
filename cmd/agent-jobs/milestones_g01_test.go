@@ -14,7 +14,7 @@ import (
 // G01 on the command line: `agent-jobs milestone <id>` shows each task's planned skills and, per job,
 // the skills it got: one list when selected and delivered match, both labelled when they differ.
 func TestMilestoneCLISkills(t *testing.T) {
-	t.Run("[G01] milestone shows planned and delivered skills", func(t *testing.T) {
+	t.Run("[G01][R01] milestone <id> shows the tree with planned and delivered skills", func(t *testing.T) {
 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
 		m, err := jobs.Open("test")
 		if err != nil {

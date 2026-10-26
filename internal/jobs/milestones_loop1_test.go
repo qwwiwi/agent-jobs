@@ -19,71 +19,73 @@ import (
 // milestone was closed is cancelled with the reason; job_resume refuses a job of a dropped task and
 // queues one of a blocked task, which then waits too.
 func TestMilestoneLaunchRechecks(t *testing.T) {
-	m := newManager(t)
-	ctx := context.Background()
-	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next"}, {Key: "T3", Title: "side"}, {Key: "T4", Title: "later"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "other", Tasks: []MilestoneTaskInput{{Key: "T1", Title: "x"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	onTask := func(id int64, key string) func(*StartRequest) {
-		return func(r *StartRequest) { r.Milestone, r.Task = id, key }
-	}
-	j2 := enqueue(t, m, "do T2", onTask(v.ID, "T2"))
-	j3 := enqueue(t, m, "do T3", onTask(v.ID, "T3"))
-	j4 := enqueue(t, m, "do other T1", onTask(other.ID, "T1"))
-	j5 := enqueue(t, m, "do T4", onTask(v.ID, "T4"))
-	if _, err := m.Stop(j5.ID, ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}},
-		Drop: []string{"T3", "T4"}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.SetMilestone(ctx, MilestoneSet{ID: other.ID, Status: store.MilestoneDropped}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	if j := get(t, m, j2.ID); j.Status != store.StatusQueued {
-		t.Errorf("job of a task blocked after job_start: %s %q, want queued", j.Status, j.Error)
-	}
-	if j := get(t, m, j3.ID); j.Status != store.StatusCancelled || !strings.Contains(j.Error, "T3") || !strings.Contains(j.Error, "dropped") {
-		t.Errorf("job of a dropped task: %s %q, want cancelled with the reason", j.Status, j.Error)
-	}
-	if j := get(t, m, j4.ID); j.Status != store.StatusCancelled || !strings.Contains(j.Error, "is dropped") {
-		t.Errorf("job of a closed milestone: %s %q, want cancelled with the reason", j.Status, j.Error)
-	}
-	if _, err := m.Resume(j5.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "dropped") {
-		t.Errorf("resume of a job of a dropped task: %v", err)
-	}
-	// A blocked task's job is resumed and waits queued too.
-	if _, err := m.Stop(j2.ID, ""); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := m.Resume(j2.ID, "go on", Limits{}); err != nil {
-		t.Fatalf("resume of a job of a blocked task: %v", err)
-	}
-	if err := m.Tick(); err != nil {
-		t.Fatal(err)
-	}
-	if j := get(t, m, j2.ID); j.Status != store.StatusQueued {
-		t.Fatalf("resumed job of a blocked task: %s, want queued", j.Status)
-	}
-	// Once its dependency is done, it starts.
-	j1 := enqueue(t, m, "do T1", onTask(v.ID, "T1"))
-	runToEnd(t, m, j1.ID)
-	if err := m.SetOutcome(j1.ID, OutcomeAccepted, ""); err != nil {
-		t.Fatal(err)
-	}
-	if j := runToEnd(t, m, j2.ID); j.Status != store.StatusSucceeded {
-		t.Fatalf("job after its dependency is done: %s %q", j.Status, j.Error)
-	}
+	t.Run("[R03] a queued job waits at launch while its task is blocked", func(t *testing.T) {
+		m := newManager(t)
+		ctx := context.Background()
+		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next"}, {Key: "T3", Title: "side"}, {Key: "T4", Title: "later"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		other, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "other", Tasks: []MilestoneTaskInput{{Key: "T1", Title: "x"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		onTask := func(id int64, key string) func(*StartRequest) {
+			return func(r *StartRequest) { r.Milestone, r.Task = id, key }
+		}
+		j2 := enqueue(t, m, "do T2", onTask(v.ID, "T2"))
+		j3 := enqueue(t, m, "do T3", onTask(v.ID, "T3"))
+		j4 := enqueue(t, m, "do other T1", onTask(other.ID, "T1"))
+		j5 := enqueue(t, m, "do T4", onTask(v.ID, "T4"))
+		if _, err := m.Stop(j5.ID, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}},
+			Drop: []string{"T3", "T4"}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: other.ID, Status: store.MilestoneDropped}); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		if j := get(t, m, j2.ID); j.Status != store.StatusQueued {
+			t.Errorf("job of a task blocked after job_start: %s %q, want queued", j.Status, j.Error)
+		}
+		if j := get(t, m, j3.ID); j.Status != store.StatusCancelled || !strings.Contains(j.Error, "T3") || !strings.Contains(j.Error, "dropped") {
+			t.Errorf("job of a dropped task: %s %q, want cancelled with the reason", j.Status, j.Error)
+		}
+		if j := get(t, m, j4.ID); j.Status != store.StatusCancelled || !strings.Contains(j.Error, "is dropped") {
+			t.Errorf("job of a closed milestone: %s %q, want cancelled with the reason", j.Status, j.Error)
+		}
+		if _, err := m.Resume(j5.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "dropped") {
+			t.Errorf("resume of a job of a dropped task: %v", err)
+		}
+		// A blocked task's job is resumed and waits queued too.
+		if _, err := m.Stop(j2.ID, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Resume(j2.ID, "go on", Limits{}); err != nil {
+			t.Fatalf("resume of a job of a blocked task: %v", err)
+		}
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		if j := get(t, m, j2.ID); j.Status != store.StatusQueued {
+			t.Fatalf("resumed job of a blocked task: %s, want queued", j.Status)
+		}
+		// Once its dependency is done, it starts.
+		j1 := enqueue(t, m, "do T1", onTask(v.ID, "T1"))
+		runToEnd(t, m, j1.ID)
+		if err := m.SetOutcome(j1.ID, OutcomeAccepted, ""); err != nil {
+			t.Fatal(err)
+		}
+		if j := runToEnd(t, m, j2.ID); j.Status != store.StatusSucceeded {
+			t.Fatalf("job after its dependency is done: %s %q", j.Status, j.Error)
+		}
+	})
 }
 
 // Blocked replaces only ready: a task whose dependency is not done keeps running, review or done when
@@ -113,20 +115,22 @@ func TestMilestoneBlockedOnlyOverReady(t *testing.T) {
 
 // A job whose dependency's latest used job is reworked gets it as its prior result.
 func TestMilestonePriorTakesReworked(t *testing.T) {
-	m := newManager(t)
-	v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	j1 := enqueue(t, m, "do T1", func(r *StartRequest) { r.Milestone, r.Task = v.ID, "T1" })
-	runToEnd(t, m, j1.ID)
-	if err := m.SetOutcome(j1.ID, OutcomeReworked, ""); err != nil {
-		t.Fatal(err)
-	}
-	if s := m.PriorResults(&store.Job{ID: "x", MilestoneID: v.ID, TaskKey: "T2"}); !strings.Contains(s, "Used job "+j1.ID+" (outcome reworked: fixed by hand after the job; this ref does not contain the fix) · ref: ") {
-		t.Fatalf("prior results without the reworked job:\n%s", s)
-	}
+	t.Run("[R04] a reworked dependency's report is the prior result", func(t *testing.T) {
+		m := newManager(t)
+		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		j1 := enqueue(t, m, "do T1", func(r *StartRequest) { r.Milestone, r.Task = v.ID, "T1" })
+		runToEnd(t, m, j1.ID)
+		if err := m.SetOutcome(j1.ID, OutcomeReworked, ""); err != nil {
+			t.Fatal(err)
+		}
+		if s := m.PriorResults(&store.Job{ID: "x", MilestoneID: v.ID, TaskKey: "T2"}); !strings.Contains(s, "Used job "+j1.ID+" (outcome reworked: fixed by hand after the job; this ref does not contain the fix) · ref: ") {
+			t.Fatalf("prior results without the reworked job:\n%s", s)
+		}
+	})
 }
 
 // Adding unfinished work to a done milestone reopens it; closing as done with an unfinished task is
@@ -166,45 +170,47 @@ func TestMilestoneDoneReopensOnNewWork(t *testing.T) {
 // lock), and milestone_list returns the cursor to pass as the next updated_since: the highest
 // updated_at, so the latest change is in the next answer.
 func TestMilestoneCursorStampedInSQL(t *testing.T) {
-	m := newManager(t)
-	ctx := context.Background()
-	start := time.Now().Truncate(time.Second)
-	past := start.Add(-time.Hour)
-	clock := m.Now
-	m.Now = func() time.Time { return past } // a stamp taken long before the write
-	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{{Key: "T1", Title: "a"}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "b"}); err != nil {
-		t.Fatal(err)
-	}
-	m.Now = clock
-	at, err := time.Parse(time.RFC3339, v.UpdatedAt)
-	if err != nil || at.Before(start) {
-		t.Fatalf("updated_at %s, want the time of the write (at or after %s)", v.UpdatedAt, start.UTC().Format(time.RFC3339))
-	}
-	list, err := m.ListMilestones(ctx, MilestoneListRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, _ := json.Marshal(list)
-	var out map[string]any
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatal(err)
-	}
-	cursor, _ := out["cursor"].(string)
-	if cursor != "" {
-		if c, err := ParseMilestoneCursor(cursor); err != nil || !c.Equal(at) {
-			t.Fatalf("cursor %q, want updated_at %s", cursor, v.UpdatedAt)
+	t.Run("[R10] the change cursor is stamped in SQL and returned by the list", func(t *testing.T) {
+		m := newManager(t)
+		ctx := context.Background()
+		start := time.Now().Truncate(time.Second)
+		past := start.Add(-time.Hour)
+		clock := m.Now
+		m.Now = func() time.Time { return past } // a stamp taken long before the write
+		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{{Key: "T1", Title: "a"}}})
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	if cursor == "" {
-		t.Fatalf("milestone_list has no cursor: %s", b)
-	}
-	if again, err := m.ListMilestones(ctx, MilestoneListRequest{UpdatedSince: cursor}); err != nil || len(again.Milestones) != 1 {
-		t.Fatalf("list since the cursor: %+v %v", again, err)
-	}
+		if v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "b"}); err != nil {
+			t.Fatal(err)
+		}
+		m.Now = clock
+		at, err := time.Parse(time.RFC3339, v.UpdatedAt)
+		if err != nil || at.Before(start) {
+			t.Fatalf("updated_at %s, want the time of the write (at or after %s)", v.UpdatedAt, start.UTC().Format(time.RFC3339))
+		}
+		list, err := m.ListMilestones(ctx, MilestoneListRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal(list)
+		var out map[string]any
+		if err := json.Unmarshal(b, &out); err != nil {
+			t.Fatal(err)
+		}
+		cursor, _ := out["cursor"].(string)
+		if cursor != "" {
+			if c, err := ParseMilestoneCursor(cursor); err != nil || !c.Equal(at) {
+				t.Fatalf("cursor %q, want updated_at %s", cursor, v.UpdatedAt)
+			}
+		}
+		if cursor == "" {
+			t.Fatalf("milestone_list has no cursor: %s", b)
+		}
+		if again, err := m.ListMilestones(ctx, MilestoneListRequest{UpdatedSince: cursor}); err != nil || len(again.Milestones) != 1 {
+			t.Fatalf("list since the cursor: %+v %v", again, err)
+		}
+	})
 }
 
 // The prompt's prior results and the prior/ folder come from one read of the dependencies: a resumed
@@ -313,64 +319,66 @@ func TestPriorCapTinyLimits(t *testing.T) {
 // The docs show the JSON the code returns: the tree example leaves out empty omitempty fields and names
 // repo_id, the list carries a cursor, and the task status rules match TaskStatuses.
 func TestMilestoneDocsMatchCode(t *testing.T) {
-	guide, err := os.ReadFile("../../docs/GUIDE.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	readme, err := os.ReadFile("../../README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, rest, ok := strings.Cut(string(guide), "**Tree** (`milestone_get`")
-	_, rest, ok2 := strings.Cut(rest, "```json\n")
-	block, _, ok3 := strings.Cut(rest, "```")
-	if !ok || !ok2 || !ok3 {
-		t.Fatal("GUIDE.md has no tree example")
-	}
-	var ex map[string]any
-	if err := json.Unmarshal([]byte(block), &ex); err != nil {
-		t.Fatalf("the tree example is not JSON: %v", err)
-	}
-	omit := func(v any) map[string]bool {
-		out := map[string]bool{}
-		rt := reflect.TypeOf(v)
-		for i := 0; i < rt.NumField(); i++ {
-			name, opts, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
-			out[name] = strings.Contains(opts, "omitempty")
+	t.Run("[R10] the JSON schema in GUIDE matches the code", func(t *testing.T) {
+		guide, err := os.ReadFile("../../docs/GUIDE.md")
+		if err != nil {
+			t.Fatal(err)
 		}
-		return out
-	}
-	check := func(what string, obj map[string]any, fields map[string]bool) {
-		for k, val := range obj {
-			o, known := fields[k]
-			if !known {
-				t.Errorf("%s: %q is not a field of the code", what, k)
+		readme, err := os.ReadFile("../../README.md")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, rest, ok := strings.Cut(string(guide), "**Tree** (`milestone_get`")
+		_, rest, ok2 := strings.Cut(rest, "```json\n")
+		block, _, ok3 := strings.Cut(rest, "```")
+		if !ok || !ok2 || !ok3 {
+			t.Fatal("GUIDE.md has no tree example")
+		}
+		var ex map[string]any
+		if err := json.Unmarshal([]byte(block), &ex); err != nil {
+			t.Fatalf("the tree example is not JSON: %v", err)
+		}
+		omit := func(v any) map[string]bool {
+			out := map[string]bool{}
+			rt := reflect.TypeOf(v)
+			for i := 0; i < rt.NumField(); i++ {
+				name, opts, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+				out[name] = strings.Contains(opts, "omitempty")
 			}
-			if s, isStr := val.(string); o && isStr && s == "" {
-				t.Errorf("%s: %q is shown empty but is left out when empty", what, k)
+			return out
+		}
+		check := func(what string, obj map[string]any, fields map[string]bool) {
+			for k, val := range obj {
+				o, known := fields[k]
+				if !known {
+					t.Errorf("%s: %q is not a field of the code", what, k)
+				}
+				if s, isStr := val.(string); o && isStr && s == "" {
+					t.Errorf("%s: %q is shown empty but is left out when empty", what, k)
+				}
 			}
 		}
-	}
-	check("tree", ex, omit(MilestoneView{}))
-	if _, ok := ex["repo_id"]; !ok {
-		t.Error("the tree example lacks repo_id")
-	}
-	for _, task := range ex["tasks"].([]any) {
-		tm := task.(map[string]any)
-		check("task", tm, omit(MilestoneTaskView{}))
-		for _, j := range tm["jobs"].([]any) {
-			check("job", j.(map[string]any), omit(MilestoneJobView{}))
+		check("tree", ex, omit(MilestoneView{}))
+		if _, ok := ex["repo_id"]; !ok {
+			t.Error("the tree example lacks repo_id")
 		}
-	}
-	if !strings.Contains(string(guide), `{"milestones": [<milestone>, …], "cursor": "`) {
-		t.Error("GUIDE.md's list shape lacks the cursor")
-	}
-	for name, text := range map[string]string{"GUIDE.md": string(guide), "README.md": string(readme)} {
-		if !regexp.MustCompile("`done` \\([^)]*`accepted`, `extended` or `reworked`").MatchString(text) {
-			t.Errorf("%s: done is not accepted, extended or reworked", name)
+		for _, task := range ex["tasks"].([]any) {
+			tm := task.(map[string]any)
+			check("task", tm, omit(MilestoneTaskView{}))
+			for _, j := range tm["jobs"].([]any) {
+				check("job", j.(map[string]any), omit(MilestoneJobView{}))
+			}
 		}
-		if strings.Contains(text, "or its outcome is `discarded` or `reworked`") {
-			t.Errorf("%s: reworked still counts as failed", name)
+		if !strings.Contains(string(guide), `{"milestones": [<milestone>, …], "cursor": "`) {
+			t.Error("GUIDE.md's list shape lacks the cursor")
 		}
-	}
+		for name, text := range map[string]string{"GUIDE.md": string(guide), "README.md": string(readme)} {
+			if !regexp.MustCompile("`done` \\([^)]*`accepted`, `extended` or `reworked`").MatchString(text) {
+				t.Errorf("%s: done is not accepted, extended or reworked", name)
+			}
+			if strings.Contains(text, "or its outcome is `discarded` or `reworked`") {
+				t.Errorf("%s: reworked still counts as failed", name)
+			}
+		}
+	})
 }
