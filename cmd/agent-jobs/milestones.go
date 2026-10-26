@@ -104,7 +104,7 @@ func cmdMilestone(args []string) error {
 	}
 	fmt.Printf("tasks %d/%d done%s · ready: %s\n", p.TasksDone, p.TasksTotal, acc, strings.Join(v.Ready, ", "))
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "TASK\tSTATUS\tDEPENDS\tJOBS\tTITLE")
+	fmt.Fprintln(w, "TASK\tSTATUS\tDEPENDS\tSKILLS\tJOBS\tTITLE")
 	for _, t := range v.Tasks {
 		var js []string
 		for _, j := range t.Jobs {
@@ -112,10 +112,16 @@ func cmdMilestone(args []string) error {
 			if j.Outcome != "" {
 				s += "/" + j.Outcome
 			}
+			// The skills a job got: those linked for its latest attempt, else those selected at job_start.
+			if got := j.SkillsDelivered; len(got) > 0 {
+				s += " [" + strings.Join(got, ",") + "]"
+			} else if len(j.Skills) > 0 {
+				s += " [selected " + strings.Join(j.Skills, ",") + "]"
+			}
 			js = append(js, s)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.Key, t.Status, dash(strings.Join(t.DependsOn, ",")),
-			dash(strings.Join(js, "; ")), t.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.Key, t.Status, dash(strings.Join(t.DependsOn, ",")),
+			dash(strings.Join(t.Skills, ",")), dash(strings.Join(js, "; ")), t.Title)
 	}
 	if err := w.Flush(); err != nil {
 		return err

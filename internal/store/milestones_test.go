@@ -282,3 +282,96 @@ func TestMilestoneUpdatedAtFollowsVerdicts(t *testing.T) {
 		t.Fatal("a verdict of another repository moved updated_at")
 	}
 }
+
+// G01: a database whose milestone_tasks table predates the skills column gains it on Open (a migration
+// appended at the end); a task's planned skills round-trip through create and update.
+func TestMilestoneTaskSkillsColumn(t *testing.T) {
+	t.Run("[G01] planned task skills survive an older milestones table", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "jobs.db")
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The table as feature/milestones created it, before the skills column.
+		if _, err := s.db.Exec(`DROP TABLE milestone_tasks; CREATE TABLE milestone_tasks (
+			milestone_id INTEGER NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, depends_on TEXT NOT NULL DEFAULT '',
+			covers TEXT NOT NULL DEFAULT '', dropped INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL, PRIMARY KEY (milestone_id, key));
+			INSERT INTO milestones (title, status, created_at, updated_at) VALUES ('old', 'open', 1, 1);
+			INSERT INTO milestone_tasks (milestone_id, key, title, created_at, updated_at) VALUES (1, 'T1', 'old task', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		_ = s.Close()
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		ctx := context.Background()
+		tasks, err := s.MilestoneTasks(ctx, 1)
+		if err != nil || len(tasks) != 1 || tasks[0].Skills != nil {
+			t.Fatalf("old task: %+v %v", tasks, err)
+		}
+		id, err := s.CreateMilestone(&Milestone{Title: "new"}, []MilestoneTask{
+			{Key: "T1", Title: "one", Skills: []string{"+golang", "-legacy"}}, {Key: "T2", Title: "two"}}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tasks, _ = s.MilestoneTasks(ctx, id); fmt.Sprint(tasks[0].Skills) != "[+golang -legacy]" || tasks[1].Skills != nil {
+			t.Fatalf("round trip: %+v", tasks)
+		}
+		if err := s.UpdateMilestone(ctx, id, time.Now(), func(ms *Milestone, tasks []MilestoneTask, _ []*Job) (*Milestone, []MilestoneTask, error) {
+			tasks[1].Skills = []string{"drafty"}
+			return ms, tasks[1:], nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if tasks, _ = s.MilestoneTasks(ctx, id); fmt.Sprint(tasks[1].Skills) != "[drafty]" {
+			t.Fatalf("after update: %+v", tasks)
+		}
+	})
+}
+
+// G01: the tree shows the skills each job got, so recording them moves the milestone's updated_at (the
+// poller's cursor sees a job's delivered skills before the job ends); writing the same list again does not.
+func TestMilestoneUpdatedAtFollowsDelivery(t *testing.T) {
+	t.Run("[G01] skills_delivered moves updated_at", func(t *testing.T) {
+		s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		ctx := context.Background()
+		old := time.Unix(1770000000, 0)
+		id, err := s.CreateMilestone(&Milestone{Title: "m"}, []MilestoneTask{{Key: "T1", Title: "one"}}, old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Insert(milestoneJob("j1", id, "T1", old)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Claim("j1", "tok", old); err != nil {
+			t.Fatal(err)
+		}
+		updatedAfter := func(what string, do func() error) int64 {
+			t.Helper()
+			if _, err := s.db.Exec(`UPDATE milestones SET updated_at=? WHERE id=?`, old.Unix(), id); err != nil {
+				t.Fatal(err)
+			}
+			if err := do(); err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+			ms, err := s.GetMilestone(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return ms.UpdatedAt.Unix()
+		}
+		deliver := func() error { return s.SetSkillsDelivered("j1", "tok", []string{"golang"}, "") }
+		if updatedAfter("deliver", deliver) <= old.Unix() {
+			t.Fatal("recording delivered skills did not move updated_at")
+		}
+		if updatedAfter("deliver again", deliver) != old.Unix() {
+			t.Fatal("the same delivered skills moved updated_at")
+		}
+	})
+}

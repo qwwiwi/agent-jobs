@@ -15,7 +15,7 @@ import (
 // Milestones are served in the shapes milestone_list and milestone_get return (jobs.MilestonesView,
 // jobs.MilestoneView, built by the same code). The API returns no paths outside the agent state, so repo
 // is the repository's folder name here (the full path in MCP; repo_id is the same in both and is what a
-// frontend filters by) and a note is a fixed message. Text fields are capped at MaxFieldBytes.
+// frontend filters by) and a note is a fixed message. Text fields (skill names too) are capped at MaxFieldBytes.
 
 // noteUnreadable replaces a milestone's note on the API: the note is an error text that may hold paths.
 const noteUnreadable = "the checklist or the judge verdict could not be read (see agent-jobs milestone <id>)"
@@ -37,13 +37,14 @@ func apiMilestone(v jobs.MilestoneView) jobs.MilestoneView {
 	}
 	for i, t := range tasks {
 		t.Key, t.Title, t.Status = capField(t.Key), capField(t.Title), capField(t.Status)
-		t.DependsOn, t.Covers = capList(t.DependsOn), capList(t.Covers)
+		t.DependsOn, t.Covers, t.Skills = capList(t.DependsOn), capList(t.Covers), capList(t.Skills)
 		js := t.Jobs
 		if js != nil {
 			t.Jobs = make([]jobs.MilestoneJobView, len(js))
 		}
 		for k, j := range js {
 			j.ID, j.Status, j.Outcome, j.Model = capField(j.ID), capField(j.Status), capField(j.Outcome), capField(j.Model)
+			j.Skills, j.SkillsDelivered = capList(j.Skills), capList(j.SkillsDelivered)
 			t.Jobs[k] = j
 		}
 		v.Tasks[i] = t

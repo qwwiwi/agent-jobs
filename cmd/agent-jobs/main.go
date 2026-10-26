@@ -132,6 +132,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            on stdin): in a repo with an approved checklist, blocks
                                            gh pr merge (exit 2) unless --match-head-commit <sha> names
                                            a sha release_check passed on; no-op inside a job
+  hook skills-picker                       PreToolUse hook on milestone_create and job_start of the
+                                           orchestrator session (JSON on stdin): asks for skills once
+                                           per milestone (tasks without a skills list), not on
+                                           job_start of a task; never blocks, reads no state
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
@@ -162,9 +166,7 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if reason := refuseInsideJob(cmd, args); reason != "" {
-		// The brief reminder always exits 0, and the merge gate is a no-op in a job (a job never merges): inside
-		// a job both end here, silently, before any state is opened.
-		if cmd == "hook" && len(args) > 0 && (args[0] == "brief-reminder" || args[0] == "merge-gate") {
+		if silentInsideJob(cmd, args) {
 			os.Exit(0)
 		}
 		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
@@ -1970,6 +1972,13 @@ func cmdDoctor(args []string) error {
 	return nil
 }
 
+// silentInsideJob reports whether a command refused inside a job ends there silently with exit 0: the
+// brief reminder and the skills picker always exit 0, and the merge gate is a no-op in a job (a job never
+// merges); they end before any state is opened.
+func silentInsideJob(cmd string, args []string) bool {
+	return cmd == "hook" && len(args) > 0 && (args[0] == "brief-reminder" || args[0] == "merge-gate" || args[0] == "skills-picker")
+}
+
 // runHook serves the hooks of the orchestrator session (Claude Code hook JSON on stdin):
 //
 //	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds, only
@@ -1982,6 +1991,8 @@ func cmdDoctor(args []string) error {
 //	hook merge-gate --agent A
 //	                      PreToolUse hook on Bash: blocks gh pr merge in a repo with an approved checklist
 //	                      unless release_check passed on its --match-head-commit sha (mergeGateHook)
+//	hook skills-picker    PreToolUse hook on milestone_create and job_start: adds context asking for the
+//	                      tasks' skills once per milestone (skillsPickerHook); always exits 0
 //
 // Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
 // output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding. The
@@ -1994,6 +2005,9 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	}
 	if sub == "merge-gate" {
 		return mergeGateHook(args[1:], stdin, stderr, openReadOnly)
+	}
+	if sub == "skills-picker" {
+		return skillsPickerHook(args[1:], stdin, stdout, stderr)
 	}
 	if sub == "brief-reminder" {
 		type answer struct {
@@ -2032,7 +2046,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return 1
 	}
 	if sub != "stop" && sub != "bind" {
-		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder|merge-gate --agent A (Claude Code Stop / " +
+		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder|merge-gate|skills-picker --agent A (Claude Code Stop / " +
 			"SessionStart / UserPromptSubmit / PreToolUse hook, JSON on stdin)"))
 	}
 	fs := flag.NewFlagSet("hook "+sub, flag.ContinueOnError)
@@ -2186,6 +2200,44 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 	}
 	defer m.Close()
 	return m.BriefReminder(in)
+}
+
+// skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
+// nothing when it has none. It reads only its input (no state; --agent is accepted and not needed) and
+// always exits 0: an error goes to stderr and the call goes on.
+func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	agentFlag(fs)
+	pos, err := parse(fs, args)
+	if err == nil && len(pos) > 0 {
+		err = errors.New("no positional arguments")
+	}
+	var msg string
+	if err == nil {
+		msg, err = jobs.SkillsPicker(stdin)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", jobs.Printable(err.Error(), 300), "(no reminder)")
+		return 0
+	}
+	if msg == "" {
+		return 0
+	}
+	type specific struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	}
+	b, err := json.Marshal(struct {
+		HookSpecificOutput specific `json:"hookSpecificOutput"`
+	}{specific{"PreToolUse", msg}})
+	if err == nil {
+		_, err = fmt.Fprintln(stdout, string(b))
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+	}
+	return 0
 }
 
 // openReadOnly is open for the brief reminder: the existing state for reads only (jobs.OpenReadOnly),

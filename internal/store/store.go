@@ -425,6 +425,12 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: milestone triggers: %w", err)
 	}
+	for _, alter := range milestoneMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: milestones: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
