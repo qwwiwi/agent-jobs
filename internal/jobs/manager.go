@@ -73,6 +73,10 @@ type Manager struct {
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
 
+	// prefetching is set while the daemon's background clone run (prefetchInBackground) is on; prefetchWG
+	// waits for it.
+	prefetching atomic.Bool
+	prefetchWG  sync.WaitGroup
 	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
 	beforeClaim func(*store.Job)
 
@@ -193,6 +197,8 @@ type StartRequest struct {
 	Sources []string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
+	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
+	plannedSources bool
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -370,6 +376,15 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(sources) > 0 && runner == store.RunnerCodex {
+		// The guard keeps cloned code off the host; codex runs its own sandbox, without the guard.
+		msg := "sources need the guard, which does not run inside codex: start a claude job for them"
+		if r.plannedSources {
+			msg += fmt.Sprintf(" (the sources planned for task %s of milestone %d: give job_start sources: [] to "+
+				"run it on codex without them)", r.Task, r.Milestone)
+		}
+		return nil, errors.New(msg)
+	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
 		return nil, err
@@ -470,6 +485,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 // notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
 	m.RefreshDaemonConfig()
+	// Sources are cloned outside the lifecycle lock (prefetchSources): in the background in the daemon,
+	// inline in a manual tick (none while a daemon runs: it clones them).
+	if m.daemonLockHeld {
+		m.prefetchInBackground()
+	} else if d, derr := m.ReadDaemonInfo(); derr != nil || !alive(d.PID) {
+		m.prefetchSources()
+	}
 	err := m.tickLocked()
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
@@ -584,6 +606,9 @@ func (m *Manager) launchQueued() error {
 			if wait != "" {
 				continue
 			}
+		}
+		if needsClone(j) && !m.sourcesCloned(j) {
+			continue // its sources are cloned outside the lifecycle lock (prefetchSources); it starts once they are
 		}
 		if m.beforeClaim != nil {
 			m.beforeClaim(j)

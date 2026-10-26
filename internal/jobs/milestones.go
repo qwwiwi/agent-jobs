@@ -1038,6 +1038,7 @@ func (m *Manager) milestoneStart(r *StartRequest) error {
 	}
 	if r.Sources == nil {
 		r.Sources = tasks[idx].Sources // planned at milestone_create; job_start's own list wins
+		r.plannedSources = len(r.Sources) > 0
 	}
 	// Its dependencies decide, whatever its own jobs say (a second job on a running task waits too).
 	if waiting := waitingDeps(tasks, jobs, r.Task); len(waiting) > 0 {

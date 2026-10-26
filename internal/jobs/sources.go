@@ -3,9 +3,12 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -16,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -34,11 +38,133 @@ const (
 	DefaultSourcesMaxMB = 500
 	// maxSourceURLBytes caps one source URL.
 	maxSourceURLBytes = 500
-	// sourceCloneTimeout bounds one clone.
-	sourceCloneTimeout = 10 * time.Minute
 	// sourcePollInterval is how often a running clone's size is measured.
 	sourcePollInterval = 500 * time.Millisecond
 )
+
+const (
+	// sourcesResultFile (<jobdir>/sources.json) keeps the outcome of a queued job's clones until its launch
+	// writes the brief; the daemon writes it before the job runs.
+	sourcesResultFile = "sources.json"
+	// sourcesLockFile (<jobdir>/sources.lock) is held while a job's sources are cloned: one clone at a time.
+	sourcesLockFile = "sources.lock"
+	// maxCloneDepth bounds the folder depth of a clone: prune's chmodTree reaches maxChmodDepth levels below
+	// the folder it removes (the job dir or a parent), so a deeper read-only clone could not be removed.
+	maxCloneDepth = maxChmodDepth - 8
+	// sourceLookupTimeout bounds the DNS lookup of a source host.
+	sourceLookupTimeout = 30 * time.Second
+	// containerCmdTimeout bounds each docker call that removes a job's containers.
+	containerCmdTimeout = 20 * time.Second
+)
+
+// sourceCloneTimeout bounds all the clones of one job together (a variable for tests).
+var sourceCloneTimeout = 10 * time.Minute
+
+// cloneOne clones one source (cloneSource; tests replace it).
+var cloneOne = cloneSource
+
+// sourceLookup resolves a source host (tests replace it).
+var sourceLookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+// internalNets are address ranges, besides loopback, private, link-local, multicast and unspecified ones,
+// that a source host may not resolve to: shared address space (CGNAT, the tailnet), "this network" and
+// broadcast.
+var internalNets = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("255.255.255.255/32")}
+
+// publicAddr reports an address a clone may connect to: none of loopback, private (RFC 1918, fc00::/7),
+// link-local (169.254/16, fe80::/10), multicast, unspecified or internalNets, also IPv4-mapped.
+func publicAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	if !a.IsValid() || a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
+		a.IsInterfaceLocalMulticast() || a.IsMulticast() || a.IsUnspecified() {
+		return false
+	}
+	return !slices.ContainsFunc(internalNets, func(p netip.Prefix) bool { return p.Contains(a) })
+}
+
+// sourcePin resolves the host of an https remote and returns git's http.curloptResolve value for it
+// (host:443:address): every address the host resolves to must be public (publicAddr), and the clone then
+// connects to the vetted one only, so a DNS answer that changes between the check and the connection
+// (rebinding) cannot point it at the host or the tailnet. An IPv4 address is preferred.
+func sourcePin(ctx context.Context, remote string) (string, error) {
+	u, err := url.Parse(remote)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("no host in %q", Printable(remote, 80))
+	}
+	host := u.Hostname()
+	ctx, cancel := context.WithTimeout(ctx, sourceLookupTimeout)
+	defer cancel()
+	addrs, err := sourceLookup(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve %s: %v", host, err)
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("%s resolves to no address", host)
+	}
+	pick := netip.Addr{}
+	for _, a := range addrs {
+		if !publicAddr(a) {
+			return "", fmt.Errorf("not cloned: %s resolves to %s, an internal address (loopback, private, link-local, "+
+				"shared 100.64/10, multicast or unspecified)", host, a)
+		}
+		if a = a.Unmap(); !pick.IsValid() || (a.Is4() && !pick.Is4()) {
+			pick = a
+		}
+	}
+	if pick.Is4() {
+		return host + ":443:" + pick.String(), nil
+	}
+	return host + ":443:[" + pick.String() + "]", nil
+}
+
+// cloneArgs is git's command line for a clone of remote into target: depth 1, one branch, no tags, no
+// submodules, an empty template and hooks path, symlinks as plain files, objects checked, no credential
+// helper, no http redirect followed and, with pin, the host pinned to its vetted address.
+func cloneArgs(tmpl, remote, target, pin string) []string {
+	args := []string{"-c", "core.hooksPath=" + tmpl, "-c", "core.symlinks=false", "-c", "core.fsmonitor=false",
+		"-c", "submodule.recurse=false", "-c", "transfer.fsckObjects=true", "-c", "credential.helper=",
+		"-c", "http.followRedirects=false"}
+	if pin != "" {
+		args = append(args, "-c", "http.curloptResolve="+pin)
+	}
+	return append(args, "clone", "--quiet", "--depth", "1", "--single-branch", "--no-tags", "--no-recurse-submodules",
+		"--template="+tmpl, "--", remote, target)
+}
+
+// removeJobContainers removes the job's sandbox containers (named aj-<job id>-..., guard.ContainerPrefix)
+// with `docker rm -f`, whatever state they are in: `--rm` ends a container only when it exits, and killing
+// the job kills only the docker client. Without docker on PATH nothing happens; errors are logged.
+func removeJobContainers(jobID string, logf func(string, ...any)) {
+	bin, err := exec.LookPath("docker")
+	if err != nil {
+		return
+	}
+	prefix := guard.ContainerPrefix(jobID)
+	ctx, cancel := context.WithTimeout(context.Background(), containerCmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "ps", "-a", "--filter", "name="+prefix, "--format", "{{.Names}}").Output()
+	if err != nil {
+		logf("job %s: list sandbox containers: %v", jobID, err)
+		return
+	}
+	var names []string
+	for _, n := range strings.Fields(string(out)) {
+		if strings.HasPrefix(n, prefix) {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), containerCmdTimeout)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, bin, append([]string{"rm", "-f"}, names...)...).CombinedOutput(); err != nil {
+		logf("job %s: remove sandbox containers %v: %v: %s", jobID, names, err, RedactPrintable(string(out), 200))
+	}
+}
 
 var (
 	// reSourceHost is a DNS name of two or more labels whose last label is letters only: no IP literal,
@@ -194,7 +320,8 @@ func treeBytes(p string) int64 {
 
 // makeReadOnly takes the write bits off every file under p and makes every directory 0555 (symlinks left
 // alone). Execute bits stay, so a sandbox copy keeps its scripts runnable inside the container; on the
-// host the guard refuses running them.
+// host the guard refuses running them. A folder more than maxCloneDepth levels below p is an error: prune
+// could not make it writable again to remove it.
 func makeReadOnly(p string) error {
 	return filepath.WalkDir(p, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -202,6 +329,9 @@ func makeReadOnly(p string) error {
 		}
 		switch {
 		case d.IsDir():
+			if rel, _ := filepath.Rel(p, path); rel != "." && strings.Count(rel, string(filepath.Separator))+1 > maxCloneDepth {
+				return fmt.Errorf("the clone is more than %d folders deep (prune could not remove it)", maxCloneDepth)
+			}
 			return os.Chmod(path, 0o555)
 		case d.Type().IsRegular():
 			fi, err := d.Info()
@@ -214,10 +344,11 @@ func makeReadOnly(p string) error {
 	})
 }
 
-// cloneSource shallow-clones url into target: depth 1, one branch, no tags, no submodules, an empty
-// template and hooks path (no hooks), symlinks checked out as plain files, objects checked, no
-// configured filter. The clone is aborted past maxBytes. home holds the clone's HOME and template and
-// is removed. A failure leaves nothing at target.
+// cloneSource shallow-clones url into target (cloneArgs): depth 1, one branch, no tags, no submodules, an
+// empty template and hooks path (no hooks), symlinks checked out as plain files, objects checked, no
+// configured filter, no redirect followed; an https host is resolved first and pinned to its vetted public
+// address (sourcePin). The clone is aborted past maxBytes or when ctx ends (the job's clone deadline, a
+// cancel). home holds the clone's HOME and template and is removed. A failure leaves nothing at target.
 func cloneSource(ctx context.Context, u, target string, maxBytes int64, home string) sourceResult {
 	res := sourceResult{URL: u, Name: filepath.Base(target), Path: target}
 	fail := func(msg string) sourceResult {
@@ -235,13 +366,15 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
 		return fail("cannot prepare the clone: " + err.Error())
 	}
 	remote, protocols := sourceRemote(u)
-	ctx, cancel := context.WithTimeout(ctx, sourceCloneTimeout)
+	pin := ""
+	if strings.HasPrefix(remote, "https://") {
+		if pin, err = sourcePin(ctx, remote); err != nil {
+			return fail(err.Error())
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git",
-		"-c", "core.hooksPath="+tmpl, "-c", "core.symlinks=false", "-c", "core.fsmonitor=false",
-		"-c", "submodule.recurse=false", "-c", "transfer.fsckObjects=true", "-c", "credential.helper=",
-		"clone", "--quiet", "--depth", "1", "--single-branch", "--no-tags", "--no-recurse-submodules",
-		"--template="+tmpl, "--", remote, target)
+	cmd := exec.CommandContext(ctx, "git", cloneArgs(tmpl, remote, target, pin)...)
 	cmd.Dir, cmd.Env = tmp, sourceEnv(tmp, protocols)
 	var stderr bytes.Buffer
 	cmd.Stderr = &limitedWriter{w: &stderr, n: 4 << 10}
@@ -273,7 +406,7 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
 	case over:
 		return fail(capMsg)
 	case ctx.Err() != nil:
-		return fail(fmt.Sprintf("clone aborted after %s", sourceCloneTimeout))
+		return fail(cloneStopped(ctx))
 	case err != nil:
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
@@ -308,10 +441,19 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// cloneStopped says why a clone ended with its context: the job's clone deadline, or the job left the queue.
+func cloneStopped(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("clone aborted: the job's clones passed their %s deadline", sourceCloneTimeout)
+	}
+	return "clone aborted: the job left the queue"
+}
+
 // cloneSources clones the job's sources into <dir>/sources/<name> (what an earlier attempt left there is
-// replaced) and creates <dir>/sandbox; sources/ itself is then read-only. A failed clone is reported in
+// replaced) and creates <dir>/sandbox; sources/ itself is then read-only. ctx bounds all the clones
+// together: once it ends, the sources not cloned yet are reported as such. A failed clone is reported in
 // the result, never an error: the job starts anyway and its brief says what is missing.
-func (m *Manager) cloneSources(j *store.Job, dir string) ([]sourceResult, error) {
+func (m *Manager) cloneSources(ctx context.Context, j *store.Job, dir string) ([]sourceResult, error) {
 	if len(j.Sources) == 0 {
 		return nil, nil
 	}
@@ -330,7 +472,11 @@ func (m *Manager) cloneSources(j *store.Job, dir string) ([]sourceResult, error)
 	}
 	var out []sourceResult
 	for _, u := range j.Sources {
-		r := cloneSource(context.Background(), u, filepath.Join(root, SourceName(u)), m.Config().sourcesMaxBytes(), home)
+		target := filepath.Join(root, SourceName(u))
+		r := sourceResult{URL: u, Name: SourceName(u), Path: target, Err: cloneStopped(ctx)}
+		if ctx.Err() == nil {
+			r = cloneOne(ctx, u, target, m.Config().sourcesMaxBytes(), home)
+		}
 		if r.Err != "" {
 			m.Log.Printf("job %s: source %s: %s", j.ID, u, r.Err)
 		}
@@ -340,6 +486,134 @@ func (m *Manager) cloneSources(j *store.Job, dir string) ([]sourceResult, error)
 		return nil, fmt.Errorf("sources: %w", err)
 	}
 	return out, nil
+}
+
+// needsClone reports a job whose sources are cloned before it starts: one with sources on its first
+// attempt (a resume finds the first attempt's clones, sourcesOnDisk).
+func needsClone(j *store.Job) bool { return len(j.Sources) > 0 && j.Attempt == 0 }
+
+// sourcesCloned reports a job whose clones are made (sources.json written).
+func (m *Manager) sourcesCloned(j *store.Job) bool {
+	_, err := os.Lstat(filepath.Join(m.JobDir(j.ID), sourcesResultFile))
+	return err == nil
+}
+
+// prefetchSources clones the sources of the queued jobs that need clones (needsClone) and have none yet,
+// outside the lifecycle lock: a clone takes up to sourceCloneTimeout, and cancel, collect, schedules and
+// checks never wait for it. launchQueued starts such a job once its sources.json is there. The daemon
+// runs it in the background (prefetchInBackground), a manual tick inline.
+func (m *Manager) prefetchSources() {
+	queued, err := m.Store.ListByStatus(store.StatusQueued)
+	if err != nil {
+		m.Log.Printf("sources: list queued jobs: %v", err)
+		return
+	}
+	for _, j := range queued {
+		if needsClone(j) && !m.sourcesCloned(j) {
+			m.prefetchJob(j)
+		}
+	}
+}
+
+// prefetchInBackground runs prefetchSources in a goroutine, one run at a time per daemon.
+func (m *Manager) prefetchInBackground() {
+	if !m.prefetching.CompareAndSwap(false, true) {
+		return
+	}
+	m.prefetchWG.Add(1)
+	go func() {
+		defer m.prefetchWG.Done()
+		defer m.prefetching.Store(false)
+		m.prefetchSources()
+	}()
+}
+
+// WaitPrefetch waits for a background clone run (prefetchInBackground) to end.
+func (m *Manager) WaitPrefetch() { m.prefetchWG.Wait() }
+
+// prefetchJob clones a queued job's sources under <jobdir>/sources.lock (another tick or daemon skips the
+// job meanwhile) within sourceCloneTimeout for all of them, and writes sources.json unless the job left the
+// queue: a job cancelled meanwhile ends its clone (its row is read every sourcePollInterval).
+func (m *Manager) prefetchJob(j *store.Job) {
+	dir := m.JobDir(j.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		m.Log.Printf("job %s: sources: %v", j.ID, err)
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dir, sourcesLockFile), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		m.Log.Printf("job %s: sources: %v", j.ID, err)
+		return
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return // cloned by another tick right now
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	if m.sourcesCloned(j) {
+		return
+	}
+	queued := func() bool {
+		cur, err := m.Store.Get(j.ID)
+		return err == nil && cur.Status == store.StatusQueued && cur.Attempt == j.Attempt
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sourceCloneTimeout)
+	defer cancel()
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		t := time.NewTicker(sourcePollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !queued() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	res, err := m.cloneSources(ctx, j, dir)
+	cancel()
+	<-watched
+	if err != nil {
+		// The job is not held in the queue for it: it starts and its brief says why nothing was cloned.
+		m.Log.Printf("job %s: %v", j.ID, err)
+		res = res[:0]
+		for _, u := range j.Sources {
+			res = append(res, sourceResult{URL: u, Name: SourceName(u), Path: filepath.Join(dir, SourcesDir, SourceName(u)),
+				Err: "cannot prepare the clones: " + RedactPrintable(err.Error(), 200)})
+		}
+	}
+	if !queued() {
+		return // cancelled meanwhile: nothing launches it
+	}
+	if err := writeJSON(filepath.Join(dir, sourcesResultFile), res); err != nil {
+		m.Log.Printf("job %s: sources: %v", j.ID, err)
+	}
+}
+
+// clonedSources reads the outcome of the job's clones (sources.json), which prefetchJob wrote before the
+// launch; the job has not run yet, so the file is the daemon's.
+func (m *Manager) clonedSources(j *store.Job) ([]sourceResult, error) {
+	if len(j.Sources) == 0 {
+		return nil, nil
+	}
+	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), sourcesResultFile))
+	if err != nil {
+		return nil, fmt.Errorf("sources: the clones were not made before the launch: %w", err)
+	}
+	var res []sourceResult
+	if err := json.Unmarshal(b, &res); err != nil {
+		return nil, fmt.Errorf("sources: %s: %w", sourcesResultFile, err)
+	}
+	if len(res) != len(j.Sources) || slices.ContainsFunc(res, func(r sourceResult) bool { return !slices.Contains(j.Sources, r.URL) }) {
+		return nil, fmt.Errorf("sources: %s does not match the job's sources", sourcesResultFile)
+	}
+	return res, nil
 }
 
 // sourcesOnDisk describes the sources an earlier attempt cloned (a resume, BuildPrompt): no clone runs.
@@ -359,6 +633,7 @@ func (m *Manager) sourcesOnDisk(j *store.Job) []sourceResult {
 // renderSources is the "## Sources" section of a job with sources: where each clone is (or why it is
 // not), the rule to read the local copy, and the sandbox recipe. "" for a job without sources.
 func renderSources(dir string, res []sourceResult) string {
+	id := filepath.Base(dir)
 	if len(res) == 0 {
 		return ""
 	}
@@ -381,16 +656,20 @@ func renderSources(dir string, res []sourceResult) string {
 	uid, gid := os.Getuid(), os.Getgid()
 	fmt.Fprintf(&b, "\nNever run their code on the host: only plain readers (cat, grep, head, ls, find, git log, ...) may "+
 		"be given a path under sources/ or sandbox/; the guard refuses running a file there, and an interpreter, package "+
-		"install, build or test run pointed at or working there. To run it, copy the clone into %s (each as a separate "+
+		"install, build or test run pointed at or working there. git works on a clone only at its root (git -C "+
+		"sources/<name> log); a source file is never linked (ln, cp -l), and a command that reads sources/ or sandbox/ "+
+		"writes files (>, -o) only inside sandbox/. To run it, copy the clone into %s (each as a separate "+
 		"Bash command) and run it in a throwaway container that sees only the copy, with no host env, secrets, network "+
 		"or other host dirs:\n\n"+
 		"```\ncp -R %s/<name> %s/<name>\nchmod -R u+w %s/<name>\n"+
-		"docker run --rm --network none --user %d:%d --cap-drop ALL --security-opt no-new-privileges "+
-		"-v %s/<name>:/src -w /src <image> sh -c 'HOME=/tmp <command>'\n```\n\n"+
-		"Only this form is allowed: the docker run is the whole Bash command, spelled `docker`; --rm, --network none, "+
-		"--user %d:%d, --cap-drop ALL and --security-opt no-new-privileges are required; exactly one -v, from a folder "+
+		"docker run --rm --name aj-%s-<suffix> --memory 2g --pids-limit 512 --cpus 2 --network none --user %d:%d "+
+		"--cap-drop ALL --security-opt no-new-privileges -v %s/<name>:/src -w /src <image> sh -c 'HOME=/tmp <command>'\n```\n\n"+
+		"Only this form is allowed: the docker run is the whole Bash command, spelled `docker`; --rm, --name "+
+		"aj-%s-<suffix> (the container is removed when the job ends), --memory (up to 16g), --pids-limit (up to 4096), "+
+		"--cpus (up to 16), --network none, --user %d:%d, --cap-drop ALL and --security-opt no-new-privileges are "+
+		"required; exactly one -v, from a folder "+
 		"below sandbox/; no -e/--env/--env-file, --privileged, --cap-add, --device, -p, --mount or host namespaces. "+
 		"With no network, dependencies the code needs must already be in the copy or the image.\n\n",
-		box, root, box, box, uid, gid, box, uid, gid)
+		box, root, box, box, id, uid, gid, box, id, uid, gid)
 	return b.String()
 }

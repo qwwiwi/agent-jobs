@@ -471,8 +471,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if _, err := ensureJobTmp(dir); err != nil {
 		return fmt.Errorf("create job temp dir: %w", err)
 	}
-	// The sources are cloned before the prompt is built: it says where each clone is, or why it is not.
-	sources, err := m.cloneSources(j, dir)
+	// The sources were cloned while the job was queued (prefetchSources, outside the lifecycle lock): the
+	// prompt says where each clone is, or why it is not.
+	sources, err := m.clonedSources(j)
 	if err != nil {
 		return err
 	}

@@ -164,7 +164,7 @@ func TestSourcesCloneIntoJobDir(t *testing.T) {
 		}
 		prompt, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "prompt.md"))
 		for _, want := range []string{"## Sources", url + " → " + dir, "missing.git", "not cloned",
-			"do not study their code through the GitHub API or website", "docker run --rm --network none --user"} {
+			"do not study their code through the GitHub API or website", "docker run --rm --name aj-" + j.ID + "-<suffix> --memory 2g --pids-limit 512 --cpus 2 --network none --user"} {
 			if !strings.Contains(string(prompt), want) {
 				t.Errorf("prompt lacks %q:\n%s", want, prompt)
 			}

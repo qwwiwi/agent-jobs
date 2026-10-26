@@ -574,6 +574,10 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
 		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record)
 	}
+	// A sandbox container is not in the job's process group: it goes with the job (G02).
+	if j, err := st.Get(id); err == nil && len(j.Sources) > 0 {
+		removeJobContainers(id, func(f string, a ...any) { fmt.Fprintf(stderrLog, "run-wrapper: "+f+"\n", a...) })
+	}
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before trusted completion says the job is over (a markerless orphan could otherwise start a nested job
 	// once the session leader is gone; it also leaves no ghost preview servers or browsers).
@@ -962,7 +966,7 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
 		"GIT_TERMINAL_PROMPT=0",
 	)
-	overrides := gitOverrides(hooks)
+	overrides := append(gitOverrides(hooks), jobGitOverrides...)
 	out = append(out, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))
 	for i, kv := range overrides {
 		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
@@ -988,6 +992,12 @@ func gitOverrides(hooks string) [][2]string {
 		{"core.editor", "true"},
 	}
 }
+
+// jobGitOverrides are set for the job's git only, after gitOverrides (the daemon's own git works in bare
+// repositories it finds by their path): git never takes a folder for a bare repository by itself, so one
+// laid out inside a cloned source (sources/<name>/x with HEAD, objects, refs and a config with a diff
+// textconv, G02) cannot run its programs on the host. A bare repository works with --git-dir or GIT_DIR.
+var jobGitOverrides = [][2]string{{"safe.bareRepository", "explicit"}}
 
 // ensureGitFiles creates an empty read-only gitconfig and an empty read-only hooks dir when missing.
 func ensureGitFiles(cfg, hooks string) error {

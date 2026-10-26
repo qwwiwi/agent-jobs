@@ -1896,10 +1896,11 @@ func TestWrapperScrubsGitEnv(t *testing.T) {
 	abs, _ := filepath.Abs(dir)
 	want := []string{
 		"EDITOR=true", "GIT_CONFIG_GLOBAL=" + filepath.Join(abs, "gitconfig"), "GIT_CONFIG_NOSYSTEM=1",
-		"GIT_EDITOR=true", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "PAGER=cat", "VISUAL=true", "GIT_CONFIG_COUNT=6",
+		"GIT_EDITOR=true", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "PAGER=cat", "VISUAL=true", "GIT_CONFIG_COUNT=7",
 	}
 	for i, kv := range [][2]string{{"core.hooksPath", filepath.Join(abs, "no-hooks")}, {"core.fsmonitor", "false"},
-		{"core.sshCommand", "false"}, {"credential.helper", ""}, {"core.pager", "cat"}, {"core.editor", "true"}} {
+		{"core.sshCommand", "false"}, {"credential.helper", ""}, {"core.pager", "cat"}, {"core.editor", "true"},
+		{"safe.bareRepository", "explicit"}} {
 		want = append(want, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
 	}
 	slices.Sort(want)

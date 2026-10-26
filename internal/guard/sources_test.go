@@ -136,6 +136,7 @@ func TestSourcesDockerSandbox(t *testing.T) {
 	base := "docker run --rm --name aj-j-1 --memory 2g --pids-limit 512 --cpus 2 --network none --user " + user +
 		" --cap-drop ALL --security-opt no-new-privileges"
 	mount := " -v " + box + "/lib:/src"
+	lim := " --name aj-j-1 --memory 2g --pids-limit 512 --cpus 2"
 	t.Run("[G02] the sandbox recipe is allowed", func(t *testing.T) {
 		for _, c := range []string{
 			base + mount + " -w /src node:22 sh -c 'HOME=/tmp npm ci && npm test'",
@@ -173,23 +174,23 @@ func TestSourcesDockerSandbox(t *testing.T) {
 			"TOKEN=x " + base + mount + " alpine ls",
 			// privileges, root, host namespaces and network
 			base + " --privileged" + mount + " alpine ls",
-			"docker run --rm --network host --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network bridge --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network host --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network bridge --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
 			"docker run --rm --net=host --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network container:x --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network none --user 0:0 --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network none --user root --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network none --user " + user + " --security-opt no-new-privileges" + mount + " alpine ls",
-			"docker run --rm --network none --user " + user + " --cap-drop ALL" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network container:x --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network none --user 0:0 --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network none --user root --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network none --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network none --user " + user + " --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run --rm" + lim + " --network none --user " + user + " --cap-drop ALL" + mount + " alpine ls",
 			base + " --pid host" + mount + " alpine ls",
 			base + " --cap-add SYS_ADMIN" + mount + " alpine ls",
 			base + " --device /dev/kvm" + mount + " alpine ls",
 			base + " --security-opt seccomp=unconfined" + mount + " alpine ls",
 			base + " -p 8080:80" + mount + " alpine ls",
 			// not throwaway, not the sole command, not the docker on PATH, other subcommands
-			"docker run --network none --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
+			"docker run" + lim + " --network none --user " + user + " --cap-drop ALL --security-opt no-new-privileges" + mount + " alpine ls",
 			base + " -d" + mount + " alpine sleep 100",
 			"docker --context other" + strings.TrimPrefix(base, "docker") + mount + " alpine ls",
 			"docker exec x sh",
