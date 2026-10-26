@@ -185,16 +185,34 @@ func (m *Manager) StartGate(r GateRequest) (*store.Job, error) {
 	})
 }
 
+// familyCoders selects the coders a judge's model family is compared with, the one rule of
+// JudgeFamilyWarning, the verdict's snapshot (gateStep) and release_check's family condition: feature
+// are the feature jobs of checklist id in repo (store.FeatureJobs: fix and general jobs with covers of
+// it, size not small), family those of them that succeeded (owner decision 2026-10-25: a failed or
+// cancelled coder delivered no feature).
+func familyCoders(st *store.Store, repo, id string) (feature, family []store.CoverJob, err error) {
+	feature, err = st.FeatureJobs(repo, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, c := range feature {
+		if c.Status == store.StatusSucceeded {
+			family = append(family, c)
+		}
+	}
+	return feature, family, nil
+}
+
 // JudgeFamilyWarning is judge_start's warning ("" = none) when the queued judge j runs on the model
-// family of any coder job of its checklist (the fix and general jobs whose covers name it), the rule of
-// same_family in gateStep: its verdict will be stored with same_family true, which release_check (F7)
-// does not take. The default judge model is a claude model, so a judge without an explicit gpt-* model
-// of work a claude job coded gets it.
+// family of a coder of its checklist (familyCoders, the rule of same_family in gateStep and of
+// release_check's family condition): its verdict will be stored with same_family true, which
+// release_check (F7) does not take. The default judge model is a claude model, so a judge without an
+// explicit gpt-* model of work a claude job coded gets it.
 func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
 	if j.Kind != KindJudge || j.Gate == nil {
 		return "", nil
 	}
-	coders, err := m.Store.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
+	_, coders, err := familyCoders(m.Store, j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return "", err
 	}
@@ -208,10 +226,10 @@ func (m *Manager) JudgeFamilyWarning(j *store.Job) (string, error) {
 	if len(ids) == 0 {
 		return "", nil
 	}
-	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of coder job(s) %s of checklist %s: "+
-		"its verdict will be stored with same_family true; a cross-family verdict needs a judge of a family no coder job "+
-		"shares (a gpt-* model runs on codex, stored with enforced_blind false)", family, j.Model, strings.Join(ids, ", "),
-		j.Gate.ChecklistID), nil
+	return fmt.Sprintf("the judge runs on the %s model family (model %s), the family of succeeded coder job(s) %s of "+
+		"checklist %s: its verdict will be stored with same_family true; a cross-family verdict needs a judge of a family no "+
+		"succeeded coder job shares (a gpt-* model runs on codex, blind under the read-only codex sandbox)", family, j.Model,
+		strings.Join(ids, ", "), j.Gate.ChecklistID), nil
 }
 
 // gateBriefLine is the brief column of a gate job: a description for job lists, never put in its prompt.
@@ -350,7 +368,7 @@ var GateRuntimeReads = []string{"/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib
 // and with symlinks resolved, the claude project dirs of its work dir (its session's transcript and
 // tool results, which claude has the model read back; none when claude's name for the dir cannot be
 // known in advance) and GateRuntimeReads. The guard holds a claude job to it; a codex job runs its own
-// tools (enforced_blind false, ticket 684).
+// tools, held only by the codex sandbox (enforcedBlind; reads are not confined, ticket 684).
 func (m *Manager) gateReadAllow(j *store.Job) []string {
 	if !IsGateKind(j.Kind) {
 		return nil
@@ -985,7 +1003,15 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 			res.AfterEnd)
 	}
 	fail := func(err error) string { return gateFailPrefix + RedactPrintable(err.Error(), 300) }
-	blind := enforcedBlind(j.Runner)
+	sandbox := ""
+	if j.Runner == store.RunnerCodex {
+		// The sandbox this attempt's launch chose, from the protected launch record (none readable = not
+		// blind, fail closed).
+		if a, err := st.ReadLaunchAuthorization(id, token); err == nil {
+			sandbox = a.CodexSandbox
+		}
+	}
+	blind := enforcedBlind(j.Runner, sandbox)
 	if j.Kind == KindBriefing {
 		// A briefing result never bears on an approval: no checklist lock.
 		o, err := ValidateBriefing(report, j.Gate)
@@ -1038,7 +1064,7 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 		Version: j.Gate.Version, ChecklistSHA256: j.Gate.ChecklistSHA256, JudgeModel: j.Model, JudgeRunner: j.Runner,
 		JudgeFamily: ModelFamily(j.Runner, j.Model), EnforcedBlind: blind, ManifestCheck: mc, Counts: counts, Verdict: o,
 		CreatedAt: now}
-	coders, err := st.CoverJobs(j.Gate.Repo, j.Gate.ChecklistID)
+	_, coders, err := familyCoders(st, j.Gate.Repo, j.Gate.ChecklistID)
 	if err != nil {
 		return fail(err)
 	}
@@ -1048,8 +1074,8 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 			v.CoderFamilies = append(v.CoderFamilies, f)
 		}
 	}
-	// A snapshot of the cover jobs as they are now: a coder job started later does not change the stored
-	// flags, so release_check (F7) recomputes them from the cover jobs.
+	// A snapshot of the coders as they are now (familyCoders): a coder job that ends later does not
+	// change the stored flags, so release_check (F7) recomputes them with the same selection.
 	v.SameFamily = slices.Contains(v.CoderFamilies, v.JudgeFamily)
 	v.FamilyDiffers = len(v.CoderFamilies) > 0 && !v.SameFamily
 	if _, err := st.PutVerdict(token, v); err != nil {
@@ -1058,10 +1084,15 @@ func gateStep(st *store.Store, id, token string, res StreamResult, lockDir strin
 	return ""
 }
 
-// enforcedBlind reports whether a gate job of runner is held to its input by the guard: claude's tool
-// calls pass the guard's read allowlist; codex runs its own tools with no OS confinement of reads
-// (ticket 684), so its gate results are stored with enforced_blind false.
-func enforcedBlind(runner string) bool { return runner != store.RunnerCodex }
+// enforcedBlind reports whether a gate job of runner, launched under the codex sandbox value sandbox
+// (codex only), counts as held to its input: claude's tool calls pass the guard's read allowlist; a codex
+// job counts when its launch ran it under the read-only codex sandbox (owner decision 2026-10-25: that
+// sandbox stops writes and network, not reads (ticket 684), and is accepted as enforcement so a codex
+// judge can pass release_check against claude coders). Any other codex sandbox (worktree-full-access,
+// none recorded) is not blind.
+func enforcedBlind(runner, sandbox string) bool {
+	return runner != store.RunnerCodex || sandbox == CodexSandboxReadOnly
+}
 
 // gateVerdict fails a succeeded gate job whose result was rejected or not stored by this attempt (fail
 // closed): a result an earlier attempt of the job stored does not count for a later one.
@@ -1200,9 +1231,10 @@ type UnmappedDecision struct {
 
 // SlicingGate is checklist_set's slicing rule (F3), checked before anything is written. Decisions are
 // taken only on the unmapped quotes of the slicing results for the checklist's version and hash after
-// the call (all of them: a re-run does not drop a quote an earlier run listed); an approval needs at
-// least one such result (one for an older version or hash does not count) and a decision, stored or
-// given now, for each unmapped quote of every one of them. It returns the decisions to store.
+// the call (all of them: a re-run does not drop a quote an earlier run listed). The slicing check is
+// advisory for an approval (owner decision 2026-10-25): without such a result, or with only codex ones,
+// approve is not refused; when results exist, an approval needs a decision, stored or given now, for
+// each unmapped quote of every one of them. It returns the decisions to store.
 func (m *Manager) SlicingGate(main, id string, version int, hash string, approve bool, given []UnmappedDecision,
 	now time.Time) ([]store.SlicingDecision, int, error) {
 	if !approve && len(given) == 0 {
@@ -1213,23 +1245,15 @@ func (m *Manager) SlicingGate(main, id string, version int, hash string, approve
 		return nil, 0, err
 	}
 	if len(rs) == 0 {
-		what := "approve"
-		if !approve {
-			what = "unmapped_decisions"
+		if len(given) == 0 {
+			return nil, 0, nil // approve without a slicing check: advisory, not required
 		}
-		return nil, 0, fmt.Errorf("%s: no slicing check of checklist %s version %d (sha256 %s): run slicing_start on this version "+
-			"and let it finish (a result for an older version or another hash does not count)", what, id, version, hash)
+		return nil, 0, fmt.Errorf("unmapped_decisions: no slicing check of checklist %s version %d (sha256 %s) lists unmapped quotes "+
+			"to decide (a result for an older version or another hash does not count)", id, version, hash)
 	}
 	jobs := make([]string, 0, len(rs))
 	for _, r := range rs {
 		jobs = append(jobs, r.JobID)
-	}
-	if approve && !slices.ContainsFunc(rs, func(r *store.SlicingResult) bool { return r.EnforcedBlind }) {
-		// A codex result (no OS confinement of its reads, ticket 684) adds its unmapped quotes, but never
-		// stands for the slicing check an approval needs.
-		return nil, 0, fmt.Errorf("approve: no slicing check of checklist %s version %d (sha256 %s) was held to its input by the "+
-			"guard (enforced_blind true; jobs %s are not): a codex result does not count toward the approval; run slicing_start "+
-			"with a claude model", id, version, hash, strings.Join(jobs, ", "))
 	}
 	var out []store.SlicingDecision
 	var quotes []string

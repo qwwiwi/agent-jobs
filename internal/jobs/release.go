@@ -25,12 +25,11 @@ const (
 	ReleaseSuspectTests  = "suspect_tests"
 	ReleaseFamily        = "family"
 	ReleaseBlind         = "enforced_blind"
-	ReleaseTrace         = "trace"
 )
 
 // ReleaseConditions lists the conditions in report order.
 var ReleaseConditions = []string{ReleaseApproval, ReleaseManifestCheck, ReleaseVerdict, ReleaseRequirements, ReleaseUnmapped,
-	ReleaseSuspectTests, ReleaseFamily, ReleaseBlind, ReleaseTrace}
+	ReleaseSuspectTests, ReleaseFamily, ReleaseBlind}
 
 // ReleaseCondition is one condition of release_check and whether it holds.
 type ReleaseCondition struct {
@@ -45,20 +44,18 @@ type ReleaseRequirement struct {
 	// Verdict is the judge's ("" = none).
 	Verdict       string `json:"verdict"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
-	// Waived: an owner waiver bound to this checklist hash and version and this sha covers it.
+	// Waived: an owner waiver bound to this checklist hash and version covers it (any sha).
 	Waived      bool   `json:"waived,omitempty"`
 	WaiverQuote string `json:"waiver_quote,omitempty"`
 	// Accepted: met, placeholder on a placeholder-ok row, or waived.
 	Accepted bool `json:"accepted"`
-	// CoveredBy are the succeeded feature jobs whose covers name it.
+	// CoveredBy are the succeeded feature jobs whose covers name it (informational: no condition reads it).
 	CoveredBy []string `json:"covered_by"`
 }
 
 // ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository started
-// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36): only a succeeded one
-// counts for the trace, whose source stays its covers. The family condition counts every fix or general
-// job with covers of the checklist, of any size and any status (a failed coder may have commits in the
-// sha).
+// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36). The family condition
+// counts only the succeeded ones (owner decision 2026-10-25).
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
@@ -270,17 +267,11 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	waivers, err := m.Store.Waivers(main, hash, c.Version)
+	waivers, err := m.Store.Waivers(main, c.ID, hash, c.Version)
 	if err != nil {
 		return nil, err
 	}
-	coders, err := m.Store.FeatureJobs(main, c.ID)
-	if err != nil {
-		return nil, err
-	}
-	// The family condition counts every job that coded against the checklist (any size): a same-family
-	// coder of size small still saw the code the judge reads.
-	anyCoders, err := m.Store.CoverJobs(main, c.ID)
+	coders, familyOf, err := familyCoders(m.Store, main, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +280,10 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		row, _ := c.Row(id)
 		r := ReleaseRequirement{ID: id, PlaceholderOK: row.PlaceholderOK, CoveredBy: []string{}}
 		for _, w := range waivers {
-			if w.SHA == sha && w.Requirement == id {
+			// Bound to the checklist id, hash and version (Waivers) and the requirement, not to a commit
+			// (owner decision 2026-10-25): a fix commit after the waiver does not void it. Waivers lists the
+			// oldest first, so the newest quote is the one kept.
+			if w.Requirement == id {
 				r.Waived, r.WaiverQuote = true, RedactPrintable(w.Quote, 300)
 			}
 		}
@@ -356,15 +350,19 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		set(ReleaseBlind, false, "no verdict")
 	} else {
 		out.JudgeFamily = ModelFamily(latest.JudgeRunner, latest.JudgeModel)
+		// Only the succeeded feature jobs count (familyCoders, owner decision 2026-10-25): a failed,
+		// cancelled or small coder delivered no feature, and counting it deadlocked claude coders against
+		// every judge.
 		var same []string
-		for _, cj := range anyCoders {
+		for _, cj := range familyOf {
 			if ModelFamily(cj.Runner, cj.Model) == out.JudgeFamily {
 				same = append(same, cj.ID)
 			}
 		}
 		switch {
-		case len(coders) == 0:
-			set(ReleaseFamily, false, "no feature job (a fix or general job of size large) covers checklist %s, so no coder family to differ from", c.ID)
+		case len(familyOf) == 0:
+			set(ReleaseFamily, false, "no succeeded feature job (a fix or general job with covers, size not small) covers checklist "+
+				"%s, so no coder family to differ from", c.ID)
 		case len(same) > 0:
 			set(ReleaseFamily, false, "the judge (%s, model %s) shares its family with coder job(s) %s", out.JudgeFamily,
 				latest.JudgeModel, strings.Join(same, ", "))
@@ -378,51 +376,17 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	// The trace both ways, over the succeeded feature jobs only (a cancelled or failed job delivered
-	// nothing): every live requirement in some succeeded job's covers, and every succeeded job covering
-	// some row of the checklist (a row since deferred or dropped still counts, so a later re-scoping does
-	// not fail the trace for good; only covers naming no row of it at all leave a job idle).
-	var uncovered, idle []string
-	succeeded := 0
+	// The feature jobs and their covers, informational only: the trace condition was cut (owner decision
+	// 2026-10-25), CoveredBy and LiveCovers stay for the owner's view.
 	for _, cj := range coders {
 		fj := ReleaseFeatureJob{ID: cj.ID, Kind: cj.Kind, Status: cj.Status, Family: ModelFamily(cj.Runner, cj.Model),
 			Covers: nonNilSlice(cj.Covers), LiveCovers: []string{}}
-		known := false
 		for _, id := range cj.Covers {
 			if slices.Contains(live, id) {
 				fj.LiveCovers = append(fj.LiveCovers, id)
 			}
-			if _, ok := c.Row(id); ok {
-				known = true
-			}
-		}
-		if cj.Status == store.StatusSucceeded {
-			succeeded++
-			if !known {
-				idle = append(idle, cj.ID)
-			}
 		}
 		out.FeatureJobs = append(out.FeatureJobs, fj)
-	}
-	for _, r := range out.Requirements {
-		if len(r.CoveredBy) == 0 {
-			uncovered = append(uncovered, r.ID)
-		}
-	}
-	var trace []string
-	if succeeded == 0 {
-		trace = append(trace, "no succeeded feature job covers checklist "+c.ID+" (a feature job is a fix or general job of size large)")
-	}
-	if len(uncovered) > 0 {
-		trace = append(trace, "in no feature job's covers: "+strings.Join(uncovered, ", "))
-	}
-	if len(idle) > 0 {
-		trace = append(trace, "feature job(s) covering no row of the checklist: "+strings.Join(idle, ", "))
-	}
-	if len(trace) == 0 {
-		set(ReleaseTrace, true, "%d succeeded feature job(s), every live requirement covered", succeeded)
-	} else {
-		set(ReleaseTrace, false, "%s", strings.Join(trace, "; "))
 	}
 	return out, nil
 }

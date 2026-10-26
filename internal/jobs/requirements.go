@@ -35,9 +35,8 @@ type RequirementLine struct {
 	Evidence string `json:"evidence,omitempty"`
 	Ran      string `json:"ran,omitempty"`
 	RedProof string `json:"redproof,omitempty"`
-	// Verified: a «done» line whose «ran:» names a command (ranCommand) and with a red proof of this ID
-	// that shows failing evidence (its own REDPROOF field or a REDPROOF line of the block; see redProof);
-	// a «done» line without either is claimed, not done.
+	// Verified: the line says «done». Ran and RedProof are informational (owner decision 2026-10-25): a
+	// «done» line counts without them, so no line is claimed any more.
 	Verified bool `json:"verified"`
 }
 
@@ -49,7 +48,8 @@ type Requirements struct {
 	// RedProofs are the block's REDPROOF lines that are proofs (one per new test that failed before the
 	// code); one without failing evidence (redEvidence) is left out.
 	RedProofs []string `json:"redproofs,omitempty"`
-	// Claimed are the IDs of «done» lines without a «ran:» or without a REDPROOF.
+	// Claimed is kept for the JSON shape and stays empty: since 2026-10-25 a «done» line counts without
+	// «ran:» or REDPROOF (owner decision; the strict parse cost time and caught no defect).
 	Claimed []string `json:"claimed,omitempty"`
 	// MissingLines are covered IDs the block has no line for; Uncovered are lines for IDs not covered.
 	MissingLines []string `json:"missing_lines,omitempty"`
@@ -331,18 +331,14 @@ func ParseRequirements(report string, covers []string) Requirements {
 		return r
 	}
 	r.Block = true
-	proved := map[string]bool{}
 	for _, raw := range lines {
 		l := stripItem(strings.Trim(raw, "`"))
 		if l == "" {
 			continue
 		}
 		if redProofRe.MatchString(l) {
-			if ids, ok := redProof(l); ok {
+			if _, ok := redProof(l); ok {
 				r.RedProofs = append(r.RedProofs, l)
-				for _, id := range ids {
-					proved[id] = true
-				}
 			}
 			continue
 		}
@@ -378,12 +374,8 @@ func ParseRequirements(report string, covers []string) Requirements {
 	for i := range r.Lines {
 		l := &r.Lines[i]
 		seen[l.ID] = true
-		if l.Status == "done" {
-			l.Verified = ranCommand(l.Ran) && (l.RedProof != "" || proved[l.ID])
-			if !l.Verified && !slices.Contains(r.Claimed, l.ID) {
-				r.Claimed = append(r.Claimed, l.ID)
-			}
-		}
+		// A done line counts as it is: «ran:» and REDPROOF are shown, never required.
+		l.Verified = l.Status == "done"
 		if !slices.Contains(covers, l.ID) && !slices.Contains(r.Uncovered, l.ID) {
 			r.Uncovered = append(r.Uncovered, l.ID)
 		}

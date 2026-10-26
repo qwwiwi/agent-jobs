@@ -93,10 +93,11 @@ func (s *Store) ApprovalRepos() ([]string, error) {
 }
 
 // FeatureJobs lists the feature jobs of checklist id in repo (Wave F, F7 / F9 (a)): the fix and general
-// jobs started with size large whose covers were read from checklist id (any version, any status),
-// oldest first.
+// jobs whose covers were read from checklist id (any version, any status) and whose size is not small:
+// large, or none recorded (a job queued before sizes; job_start now refuses small with covers), oldest
+// first.
 func (s *Store) FeatureJobs(repo, id string) ([]CoverJob, error) {
-	all, err := s.coverJobs(repo, id, `AND size='large'`)
+	all, err := s.coverJobs(repo, id, `AND size<>'small'`)
 	if err != nil {
 		return nil, fmt.Errorf("feature jobs: %w", err)
 	}

@@ -29,17 +29,24 @@ import (
 // repository's remotes are stored (store.GateRepo, by checklist_set at the approval, by release_check on a
 // pass and by the daemon's backfill at its start), so a gated work tree that is gone or moved is still
 // matched by name and never makes other merges unreadable (one without stored names and with unreadable
-// remotes makes a merge by name or in another work tree unsure). A gh pr merge written in the Bash
-// command whose target the reader cannot tell is refused while some repository is gated; a command that
-// runs `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
+// remotes makes a merge by name or in another work tree unsure, never one into an identified gated
+// repository: that one is still checked). A gh pr merge written in the Bash command whose form or target
+// the reader cannot tell passes with a one-line warning while some repository is gated (owner decision
+// 2026-10-25: only a parsed gh pr merge in a gated repository without a release pass is blocked); a
+// merge whose target resolves to a gated repository and whose only unreadable part is a variable or
+// substitution word (the sha, the PR number) is refused: write them literally. A command that runs
+// `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
 // brief files only.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
 // `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
 // honest mistakes, it is not a boundary.
 
-// MergeGatePrefix starts the hook's refusal line.
-const MergeGatePrefix = "agent-jobs merge-gate: blocked: "
+// MergeGatePrefix starts the hook's refusal line; MergeGateWarnPrefix its warning line (the command runs).
+const (
+	MergeGatePrefix     = "agent-jobs merge-gate: blocked: "
+	MergeGateWarnPrefix = "agent-jobs merge-gate: warning: "
+)
 
 // fullSHA1Re is the full commit id --match-head-commit must carry (GitHub's ids are sha1).
 var fullSHA1Re = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -118,49 +125,95 @@ type mergeGate struct {
 	all   []*gatedRepo // the gated stored repositories (nil = not read yet)
 }
 
-// MergeGate is the hook's answer for a Bash command run at cwd: a refusal line ("" = allowed). envRepo is
-// GH_REPO of the session's environment. An error (unreadable store or brief files) is returned as is;
-// the caller refuses on it.
+// MergeGateAnswer is the hook's answer: Refusal blocks the command ("" = it runs); Warning is one line
+// for stderr when the command runs although the reader could not tell what it merges.
+type MergeGateAnswer struct {
+	Refusal string
+	Warning string
+}
+
+// MergeGate is the hook's refusal line for a Bash command run at cwd ("" = allowed); see MergeGateCheck.
 func (m *Manager) MergeGate(cwd, command, envRepo string) (string, error) {
+	a, err := m.MergeGateCheck(cwd, command, envRepo)
+	return a.Refusal, err
+}
+
+// MergeGateCheck is the hook's answer for a Bash command run at cwd. envRepo is GH_REPO of the session's
+// environment. An error (unreadable store or brief files) is returned as is; the caller refuses on it.
+func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer, error) {
+	var a MergeGateAnswer
 	calls, unsure := guard.GhPrMerges(command, cwd)
 	if len(calls) == 0 && unsure == "" {
-		return "", nil
+		return a, nil
 	}
 	g := &mergeGate{m: m, repos: map[string]*gatedRepo{}}
+	warn := func(why string) error {
+		w, err := g.warnUnsure(why)
+		if a.Warning == "" {
+			a.Warning = w
+		}
+		return err
+	}
 	if unsure != "" {
-		if r, err := g.refuseUnsure(unsure); r != "" || err != nil {
-			return r, err
+		if err := warn(unsure); err != nil {
+			return MergeGateAnswer{}, err
 		}
 	}
 	for _, call := range calls {
-		if call.Unsure != "" {
-			if r, err := g.refuseUnsure(call.Unsure); r != "" || err != nil {
-				return r, err
+		if call.Unsure != "" && (call.Unsure != guard.DynamicWordUnsure || dynamicWord(call.Repo)) {
+			if err := warn(call.Unsure); err != nil {
+				return MergeGateAnswer{}, err
 			}
 			continue
 		}
+		// Every identified target is checked, also when another candidate is unreadable (why): an
+		// unreadable other repository never lifts the gate of a known one.
 		targets, why, err := g.targets(cwd, call, envRepo)
 		if err != nil {
-			return "", err
-		}
-		if why != "" {
-			if r, err := g.refuseUnsure(why); r != "" || err != nil {
-				return r, err
-			}
-			continue
+			return MergeGateAnswer{}, err
 		}
 		for _, t := range targets {
+			if call.Unsure != "" {
+				// Only a variable or substitution among the words the target does not depend on (the sha, the PR
+				// number, a flag): the merge runs in this gated repository, so it is refused, not waved through.
+				// Also with a literal sha that has a pass: the call does not tell which word is dynamic, and an
+				// unquoted one may split into flags (`--body $B` with B="x --auto").
+				return MergeGateAnswer{Refusal: dynamicWordRefusal(t)}, nil
+			}
 			if r, err := g.check(t, call); r != "" || err != nil {
-				return r, err
+				return MergeGateAnswer{Refusal: r}, err
+			}
+		}
+		if call.Unsure != "" && why == "" {
+			why = call.Unsure
+		}
+		if why != "" {
+			if err := warn(why); err != nil {
+				return MergeGateAnswer{}, err
 			}
 		}
 	}
-	return "", nil
+	return a, nil
 }
 
-// refuseUnsure refuses a merge the hook cannot read while some stored repository has an approved
-// checklist ("" when none has: nothing is gated).
-func (g *mergeGate) refuseUnsure(why string) (string, error) {
+// dynamicWord reports a word the shell expands ($VAR, ${VAR}, $(…), `…`).
+func dynamicWord(w string) bool {
+	return strings.ContainsAny(w, "$`")
+}
+
+// dynamicWordRefusal refuses a merge in gated repository r whose sha, PR number or another word is a
+// variable or substitution: the hook cannot tell which sha, PR or flags it merges with.
+func dynamicWordRefusal(r *gatedRepo) string {
+	return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s (a repo with an approved checklist) has a variable or "+
+		"substitution in its words, so the hook cannot tell which sha, PR or flags it merges with, also when the "+
+		"sha has a release_check pass; write every word of gh pr merge literally (no variables or $(...)).",
+		Printable(r.main, 200))
+}
+
+// warnUnsure is the warning for a merge the hook cannot read while some stored repository has an
+// approved checklist ("" when none has: nothing is gated). It no longer refuses (owner decision
+// 2026-10-25): an unreadable form blocked harmless commands and caught no defect.
+func (g *mergeGate) warnUnsure(why string) (string, error) {
 	all, err := g.approvedRepos()
 	if err != nil || len(all) == 0 {
 		return "", err
@@ -169,19 +222,25 @@ func (g *mergeGate) refuseUnsure(why string) (string, error) {
 	for _, r := range all {
 		names = append(names, Printable(r.main, 200))
 	}
-	return MergeGatePrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
-		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); write gh pr merge as a plain command with -R " +
-		"OWNER/REPO and --match-head-commit <full sha>.", nil
+	return MergeGateWarnPrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
+		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); not checked: run release_check before merging, and " +
+		"write gh pr merge as a plain command with -R OWNER/REPO and --match-head-commit <full sha> to be checked.", nil
 }
 
 // targets are the gated repositories a call may merge in. A repository the call names (PR URL, -R) is
 // the one gh uses; without one, every candidate counts (each GH_REPO value and every directory the call
 // may run in, guard.GhMerge.Dirs), since the reader cannot tell which one gh takes. why is set when a
-// candidate cannot be read.
+// candidate cannot be read; out still holds every gated repository identified (the caller checks them
+// before it warns about why).
 func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out []*gatedRepo, why string, err error) {
 	add := func(r *gatedRepo) {
 		if r.gated && !slices.Contains(out, r) {
 			out = append(out, r)
+		}
+	}
+	unsure := func(w string) {
+		if why == "" {
+			why = w
 		}
 	}
 	named := []string{call.Repo}
@@ -194,7 +253,8 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 		}
 		name := gitHubRepoName(n)
 		if name == "" {
-			return nil, fmt.Sprintf("repository %q is not OWNER/REPO", n), nil
+			unsure(fmt.Sprintf("repository %q is not OWNER/REPO", n))
+			continue
 		}
 		all, err := g.approvedRepos()
 		if err != nil {
@@ -209,15 +269,18 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 				add(r)
 			}
 		}
-		if why, err := g.unknownNames(); why != "" || err != nil {
-			return nil, why, err
+		w, err := g.unknownNames()
+		if err != nil {
+			return nil, "", err
 		}
+		unsure(w)
 	}
 	if call.Repo != "" {
-		return out, "", nil
+		return out, why, nil
 	}
 	if cwd == "" || !filepath.IsAbs(cwd) {
-		return nil, "the hook input has no absolute cwd", nil
+		unsure("the hook input has no absolute cwd")
+		return out, why, nil
 	}
 	skipped := 0
 	for _, d := range call.Dirs {
@@ -229,7 +292,8 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 				skipped++
 				continue
 			}
-			return nil, fmt.Sprintf("the directory %s does not exist now", d), nil
+			unsure(fmt.Sprintf("the directory %s does not exist now", d))
+			continue
 		}
 		// Inside a .git directory git has no work tree, gh still finds the repository's remotes.
 		if i := strings.Index(d+"/", "/.git/"); i > 0 {
@@ -248,17 +312,20 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 			continue
 		}
 		// Another clone of a gated repository merges the same pull requests: match it by its remotes.
-		if why, err := g.byRemotes(r, add); why != "" || err != nil {
-			return nil, why, err
+		w, err := g.byRemotes(r, add)
+		if err != nil {
+			return nil, "", err
 		}
-		if why, err := g.unknownNames(); why != "" || err != nil {
-			return nil, why, err
+		unsure(w)
+		if w, err = g.unknownNames(); err != nil {
+			return nil, "", err
 		}
+		unsure(w)
 	}
 	if skipped > 0 && skipped == len(call.Dirs) {
-		return nil, "every directory the call may run in is missing now (the command may create it before the call)", nil
+		unsure("every directory the call may run in is missing now (the command may create it before the call)")
 	}
-	return out, "", nil
+	return out, why, nil
 }
 
 // byRemotes adds every gated repository that shares an OWNER/REPO name with work tree r (not gated

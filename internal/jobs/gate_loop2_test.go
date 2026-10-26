@@ -44,11 +44,10 @@ func TestJudgeIgnoresReplaceRefs(t *testing.T) {
 	}
 }
 
-// judge_start warns when any coder of the checklist shares the judge's family, as same_family is set:
-// mixed coders do not hide it.
+// judge_start warns when any succeeded coder of the checklist shares the judge's family, as same_family
+// is set: mixed coders do not hide it.
 func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
 	m := newManager(t)
-	m.Cfg.CodexWriteAllowed = true // a codex fix job
 	repo, sha := gateRepo(t)
 	approveBrief(t, m, repo)
 	judge := func(model string) *store.Job {
@@ -59,23 +58,16 @@ func TestJudgeFamilyWarningMixedCoders(t *testing.T) {
 		}
 		return j
 	}
-	claude := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	codex := enqueue(t, m, "build it too", func(r *StartRequest) {
-		r.Kind, r.RepoPath, r.Covers, r.Model = "fix", repo, []string{"R01"}, "gpt-5.6-sol"
-	})
-	for _, c := range []*store.Job{claude, codex} {
-		if err := m.Cancel(c.ID); err != nil {
-			t.Fatal(err)
-		}
-	}
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "opus", "R01")
+	insertCoder(t, m, repo, "codex-ok", store.StatusSucceeded, SizeLarge, store.RunnerCodex, "gpt-5.6-sol", "R01")
 	for _, model := range []string{"sonnet", "gpt-5.6-sol"} {
 		j := judge(model)
-		share := claude
+		share := "claude-ok"
 		if model != "sonnet" {
-			share = codex
+			share = "codex-ok"
 		}
 		w, err := m.JudgeFamilyWarning(j)
-		if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, share.ID) {
+		if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, share) {
 			t.Fatalf("judge %s of mixed coders: %q %v", model, w, err)
 		}
 	}
@@ -191,8 +183,9 @@ func TestCodexGateResultEventsCounted(t *testing.T) {
 	}
 }
 
-// A codex slicing result never counts toward the approval: approve needs a result the guard held to
-// its input (enforced_blind true) for the version and hash.
+// The slicing check is advisory (owner decision 2026-10-25): approve passes with no result and with a
+// codex result only (enforced_blind false); a result's undecided unmapped quote, codex or not, still
+// needs an owner decision.
 func TestCodexSlicingDoesNotCountForApproval(t *testing.T) {
 	m := newManager(t)
 	repo := briefRepo(t)
@@ -205,17 +198,21 @@ func TestCodexSlicingDoesNotCountForApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	g := j.Gate
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err != nil {
+		t.Fatalf("approve without a slicing result: %v", err)
+	}
 	if _, err := m.Store.PutSlicing("tok-"+j.ID, store.SlicingResult{JobID: j.ID, Repo: g.Repo, ChecklistID: g.ChecklistID,
-		Version: g.Version, ChecklistSHA256: g.ChecklistSHA256, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: m.Now()}); err != nil {
+		Version: g.Version, ChecklistSHA256: g.ChecklistSHA256, Model: "gpt-5.6-sol", Runner: store.RunnerCodex, CreatedAt: m.Now(),
+		Unmapped: []store.Quote{{Quote: "a quote no row covers"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err == nil ||
-		!strings.Contains(err.Error(), "enforced_blind") {
-		t.Fatalf("approve on a codex slicing result only: %v", err)
+		!strings.Contains(err.Error(), "without an owner decision") {
+		t.Fatalf("approve with an undecided quote of a codex result: %v", err)
 	}
-	putSlicing(t, m, repo)
-	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, nil, m.Now()); err != nil {
-		t.Fatalf("approve with a claude result: %v", err)
+	given := []UnmappedDecision{{Unmapped: "a quote no row covers", Quote: "out of scope"}}
+	if _, _, err := m.SlicingGate(main, g.ChecklistID, g.Version, g.ChecklistSHA256, true, given, m.Now()); err != nil {
+		t.Fatalf("approve on a codex slicing result only, quote decided: %v", err)
 	}
 }
 

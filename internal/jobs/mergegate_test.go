@@ -53,12 +53,20 @@ func TestMergeGateEndToEnd(t *testing.T) {
 	}
 	gate := func(cwd, cmd, env string) string {
 		t.Helper()
-		r, err := m.MergeGate(cwd, cmd, env)
+		a, err := m.MergeGateCheck(cwd, cmd, env)
 		if err != nil {
 			t.Fatalf("%s: %v", cmd, err)
 		}
+		r := a.Refusal
 		if strings.Contains(r, "\n") || (r != "" && !strings.HasPrefix(r, MergeGatePrefix)) {
 			t.Fatalf("%s: not one refusal line: %q", cmd, r)
+		}
+		if r == "" {
+			// A merge the reader cannot read runs with one warning line.
+			r = a.Warning
+			if strings.Contains(r, "\n") || (r != "" && !strings.HasPrefix(r, MergeGateWarnPrefix)) {
+				t.Fatalf("%s: not one warning line: %q", cmd, r)
+			}
 		}
 		return r
 	}
@@ -109,10 +117,13 @@ func TestMergeGateEndToEnd(t *testing.T) {
 		{"not in a repo", elsewhere, "gh pr merge 5", "", ""},
 		{"disable auto", repo, "gh pr merge 5 --disable-auto", "", ""},
 		{"no merge", repo, "gh pr view 5 && git log", "", ""},
-		{"sh -c", elsewhere, "sh -c 'gh pr merge 5'", "", "cannot tell whether this command runs gh pr merge"},
-		{"variable sha", repo, `gh pr merge 5 --match-head-commit "$SHA"`, "", "cannot tell"},
-		{"subcommand from a variable", elsewhere, `gh pr $M 5`, "", "cannot tell"},
-		{"GIT_DIR", elsewhere, "GIT_DIR=" + repo + "/.git " + merge + shaA, "", "cannot tell"},
+		{"sh -c", elsewhere, "sh -c 'gh pr merge 5'", "", MergeGateWarnPrefix + "cannot tell whether this command runs gh pr merge"},
+		{"variable sha", repo, `gh pr merge 5 --match-head-commit "$SHA"`, "", "write every word of gh pr merge literally"},
+		// A substitution in any word is refused, also with a literal sha that has a pass: an unquoted one
+		// may split into flags (--auto, -R), which the hook cannot see.
+		{"A with a substituted body", repo, merge + shaA + ` --body "$(cat x)"`, "", "write every word of gh pr merge literally (no variables or $(...))"},
+		{"subcommand from a variable", elsewhere, `gh pr $M 5`, "", unsureWarn},
+		{"GIT_DIR", elsewhere, "GIT_DIR=" + repo + "/.git " + merge + shaA, "", unsureWarn},
 		{"another clone without flag", clone, "gh pr merge 5", "", "without --match-head-commit"},
 		{"another clone, A", clone, merge + shaA, "", ""},
 		{"git about merge, not gated", elsewhere, "git diff $(git merge-base main HEAD)", "", ""},

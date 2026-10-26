@@ -45,10 +45,10 @@ func TestOpenMigratesOldWaiverKey(t *testing.T) {
 		if err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='checklist_waivers'`).Scan(&def); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(def, "PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)") {
+		if !strings.Contains(def, "PRIMARY KEY (repo, checklist_id, checklist_sha256, checklist_version, sha, requirement)") {
 			t.Fatalf("old key kept: %s", def)
 		}
-		old, err := s.Waivers("/r", "h1", 0)
+		old, err := s.Waivers("/r", "demo", "h1", 0)
 		if err != nil || len(old) != 1 || old[0].Quote != "old quote" || old[0].ChecklistID != "demo" {
 			t.Fatalf("old row: %+v %v", old, err)
 		}
@@ -60,10 +60,54 @@ func TestOpenMigratesOldWaiverKey(t *testing.T) {
 			}
 		}
 		for _, v := range []int{0, 2, 3} {
-			if w, err := s.Waivers("/r", "h1", v); err != nil || len(w) != 1 {
+			if w, err := s.Waivers("/r", "demo", "h1", v); err != nil || len(w) != 1 {
 				t.Fatalf("version %d: %+v %v", v, w, err)
 			}
 		}
 		_ = s.Close()
+	}
+}
+
+// versionKeyWaiversSchema is checklist_waivers with the versioned key, before checklist_id joined it.
+const versionKeyWaiversSchema = `CREATE TABLE checklist_waivers (
+	repo              TEXT NOT NULL,
+	checklist_id      TEXT NOT NULL,
+	checklist_sha256  TEXT NOT NULL,
+	checklist_version INTEGER NOT NULL DEFAULT 0,
+	sha               TEXT NOT NULL,
+	requirement       TEXT NOT NULL,
+	quote             TEXT NOT NULL,
+	created_at        INTEGER NOT NULL,
+	PRIMARY KEY (repo, checklist_sha256, checklist_version, sha, requirement)
+)`
+
+// A table with the versioned key is rebuilt with the checklist id in the key: its rows keep their id,
+// and a waiver of another id with the same hash, version, sha and requirement no longer replaces them.
+func TestOpenMigratesWaiverKeyToChecklistID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jobs.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(versionKeyWaiversSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO checklist_waivers VALUES ('/r','a','h1',2,'s1','R01','quote a',1)`); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.PutWaiver(Waiver{Repo: "/r", ChecklistID: "b", ChecklistSHA256: "h1", ChecklistVersion: 2, SHA: "s1",
+		Requirement: "R01", Quote: "quote b", CreatedAt: time.Unix(2, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]string{"a": "quote a", "b": "quote b"} {
+		if w, err := s.Waivers("/r", id, "h1", 2); err != nil || len(w) != 1 || w[0].Quote != want {
+			t.Fatalf("id %s: %+v %v", id, w, err)
+		}
 	}
 }

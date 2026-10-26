@@ -40,8 +40,8 @@ func TestSizeStoredAndLogged(t *testing.T) {
 		t.Errorf("small not logged: %q", logs.String())
 	}
 	none := enqueue(t, m, "b", func(r *StartRequest) { r.SizeRule = true })
-	if get(t, m, none.ID).Size != "" || !strings.Contains(logs.String(), "job "+none.ID+" (general): queued without size") {
-		t.Errorf("missing size not logged: %q", logs.String())
+	if get(t, m, none.ID).Size != SizeSmall || !strings.Contains(logs.String(), "job "+none.ID+" (general): size small") {
+		t.Errorf("missing size not inferred as small: %q", logs.String())
 	}
 	review := enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "review"; r.Size = SizeLarge; r.SizeRule = true })
 	if get(t, m, review.ID).Size != SizeLarge || strings.Contains(logs.String(), review.ID) {
@@ -56,7 +56,8 @@ func TestSizeStoredAndLogged(t *testing.T) {
 }
 
 // With size_required on, job_start (SizeRule) refuses a fix or general job without size; read-only
-// kinds and callers without the rule (schedules, gate jobs) are not held to it. Off, it is allowed.
+// kinds and callers without the rule (schedules, gate jobs) are not held to it. Off (the default), the
+// size is inferred.
 func TestSizeRequired(t *testing.T) {
 	m := newManager(t)
 	m.Cfg.SizeRequired = true
@@ -71,16 +72,15 @@ func TestSizeRequired(t *testing.T) {
 	var logs bytes.Buffer
 	m.Log = log.New(&logs, "", 0)
 	fired := enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix" }) // a schedule's firing: no SizeRule
-	// The exempt job is logged as exempt, not as if size_required were off.
-	if s := logs.String(); !strings.Contains(s, "job "+fired.ID+" (fix): queued without size (size_required is on; exempt") ||
-		strings.Contains(s, "size_required is off") {
+	// The exempt job gets the inferred size (small: no covers).
+	if s := logs.String(); !strings.Contains(s, "job "+fired.ID+" (fix): size small") || get(t, m, fired.ID).Size != SizeSmall {
 		t.Errorf("exempt job's log: %q", s)
 	}
 	enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix"; r.Size = SizeSmall; r.SizeRule = true })
 	m.Cfg.SizeRequired = false
 	logs.Reset()
 	off := enqueue(t, m, "b", func(r *StartRequest) { r.Kind = "fix"; r.SizeRule = true })
-	if s := logs.String(); !strings.Contains(s, "job "+off.ID+" (fix): queued without size (size_required is off)") {
+	if s := logs.String(); !strings.Contains(s, "job "+off.ID+" (fix): size small") {
 		t.Errorf("size_required off, log: %q", s)
 	}
 }
@@ -131,5 +131,37 @@ func TestSizeLarge(t *testing.T) {
 	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "fix", Brief: "b", Model: "sonnet", Size: SizeLarge,
 		Covers: []string{"R01"}}); err == nil || !strings.Contains(err.Error(), "covers need a repo") {
 		t.Errorf("large without a repo: %v", err)
+	}
+}
+
+// Without a size, a fix or general job's size is inferred (owner decision 2026-10-25): large with covers
+// (held to the large rules: only live requirements), small without; size_required is off by default.
+func TestSizeInferredFromCovers(t *testing.T) {
+	m := newManager(t)
+	if m.Config().SizeRequired {
+		t.Fatal("size_required is on by default")
+	}
+	repo := sizeRepo(t, m)
+	for _, kind := range SizeKinds {
+		withCovers := enqueue(t, m, "b", func(r *StartRequest) {
+			r.Kind, r.RepoPath, r.Covers, r.SizeRule = kind, repo, []string{"R01", "R03i"}, true
+		})
+		if got := get(t, m, withCovers.ID).Size; got != SizeLarge {
+			t.Errorf("%s with covers: size %q, want large", kind, got)
+		}
+		plain := enqueue(t, m, "b", func(r *StartRequest) { r.Kind, r.RepoPath, r.SizeRule = kind, repo, true })
+		if got := get(t, m, plain.ID).Size; got != SizeSmall {
+			t.Errorf("%s without covers: size %q, want small", kind, got)
+		}
+		if _, err := m.Enqueue(StartRequest{Title: "t", Kind: kind, Brief: "b", Model: "sonnet", RepoPath: repo,
+			Covers: []string{"R04"}, SizeRule: true}); err == nil || !strings.Contains(err.Error(), "only live requirements") {
+			t.Errorf("%s inferred large with a deferred cover: %v", kind, err)
+		}
+	}
+	// An explicit size small takes no covers (a job with covers is a feature job, counted by the family
+	// check): refused, whatever size_required says.
+	if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "fix", Brief: "b", Model: "sonnet", RepoPath: repo,
+		Covers: []string{"R01"}, Size: SizeSmall, SizeRule: true}); err == nil || !strings.Contains(err.Error(), "size small takes no covers") {
+		t.Errorf("explicit small with covers: %v", err)
 	}
 }

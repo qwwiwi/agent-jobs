@@ -57,10 +57,10 @@ func addSlicingStart(s *sdk.Server, d Deps) {
 			"brief/BRIEF.md and the checklist rows (read by the daemon now, no code, no briefs or reports) and returns unmapped " +
 			"(brief passages no row points to), half (passages a row covers in part) and invented (rows with nothing in the " +
 			"brief behind them) in a validated JSON " +
-			"block of its final message, stored for the checklist id, version and hash. checklist_set approve needs a result for " +
-			"the current version and an owner decision on every unmapped quote of every result for it. There is no brief: the " +
-			"job's input is the daemon's. A claude job is held to its input by the guard (enforced_blind true); a codex job is " +
-			"not confined (enforced_blind false).",
+			"block of its final message, stored for the checklist id, version and hash. The check is advisory: checklist_set " +
+			"approve does not need a result, but while a result for the current version lists an unmapped quote without an owner " +
+			"decision, approve is refused. There is no brief: the job's input is the daemon's. A claude job is held to its input " +
+			"by the guard (enforced_blind true); a codex job is held by the read-only codex sandbox, which stops writes and network, not reads (enforced_blind true under that sandbox, false under codex_sandbox worktree-full-access).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in SlicingStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.StartGate(gateRequest(jobs.KindSlicing, in.Repo, "", in.ChecklistID, in.GateRunInput))
 		if err != nil {
@@ -81,7 +81,7 @@ func addBriefingStart(s *sdk.Server, d Deps) {
 			"ASSUMPTIONs, with the rows they close) and an optional adversarial pass of at most 7 questions. Stored for the " +
 			"checklist id, version and hash; briefing_get reads it. The owner's replies go back through checklist_set. There is " +
 			"no brief: the job's input is the daemon's. A claude job is held to its input by the guard (enforced_blind true); " +
-			"a codex job is not confined (enforced_blind false).",
+			"a codex job is held by the read-only codex sandbox, which stops writes and network, not reads (enforced_blind true under that sandbox, false under codex_sandbox worktree-full-access).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in BriefingStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.StartGate(gateRequest(jobs.KindBriefing, in.Repo, "", in.ChecklistID, in.GateRunInput))
 		if err != nil {
@@ -99,9 +99,11 @@ func addJudgeStart(s *sdk.Server, d Deps) {
 			"copy of the files at sha (no git history, no agent settings or instructions, no job briefs, reports or diffs), assembled " +
 			"by the daemon. It returns met | partial | missing | placeholder | cannot_check per live requirement with evidence in a " +
 			"validated JSON block of its final message, stored by repo, sha, checklist id and version, judge model and family; a " +
-			"judge of a coder's model family is stored but flagged (same_family; warnings says so at the start). A claude judge " +
-			"is blind by enforcement (the guard's read allowlist, enforced_blind true); a codex judge is not confined " +
-			"(enforced_blind false). Before the judge starts, its wrapper runs the repository's scripts/manifest-check.sh (F6) in a " +
+			"judge of the model family of a coder (a succeeded fix or general job with covers of the checklist, size not small) " +
+			"is stored but flagged (same_family; warnings says so at the start). A claude judge is blind by enforcement (the " +
+			"guard's read allowlist, enforced_blind true); a codex judge is held by the read-only codex sandbox, which stops " +
+			"writes and network, not reads (enforced_blind true under that sandbox, false under codex_sandbox " +
+			"worktree-full-access). Before the judge starts, its wrapper runs the repository's scripts/manifest-check.sh (F6) in a " +
 			"separate checkout of sha (the job's containment, a scrubbed environment, no guard) and gives the judge its output; the " +
 			"exit code and output tail are stored with the job and sha. It needs config acceptance_allowed true and the script at " +
 			"sha: without either the job fails before the judge starts and nothing is recorded (warnings says so at the start). " +
@@ -224,7 +226,8 @@ func addSlicingGet(s *sdk.Server, d Deps) {
 		Description: "The slicing check (F3) of the repo's checklist: the latest result for its current version and hash (summary.current " +
 			"true) or else the latest one (an older version: it does not count for the approval), its three lists (unmapped, half, " +
 			"invented), the union of the unmapped quotes of every result for that version and hash (unmapped; summary.results counts " +
-			"them), the owner's decisions and the quotes still undecided, and enforced_blind (false when a codex job stored it).",
+			"them), the owner's decisions and the quotes still undecided, and enforced_blind (false for a codex job run outside " +
+			"the read-only codex sandbox).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, SlicingGetOutput, error) {
 		if in.SHA != "" {
 			return nil, SlicingGetOutput{}, fmt.Errorf("slicing_get: sha does not apply")
@@ -240,7 +243,7 @@ func addBriefingGet(s *sdk.Server, d Deps) {
 		Description: "The briefing (F8) of the repo's checklist: the latest result for its current version and hash (current true) or " +
 			"else the latest one of the checklist id (an older draft; result null when none): rounds of questions with the rows " +
 			"each closes and the proposed answer, decided (ASSUMPTIONs), adversarial, the job, model and enforced_blind (false " +
-			"when a codex job stored it). Put the rounds to the owner one at a time; write the replies with checklist_set.",
+			"for a codex job run outside the read-only codex sandbox). Put the rounds to the owner one at a time; write the replies with checklist_set.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in GateGetInput) (*sdk.CallToolResult, BriefingGetOutput, error) {
 		if in.SHA != "" {
 			return nil, BriefingGetOutput{}, fmt.Errorf("briefing_get: sha does not apply")
@@ -255,7 +258,8 @@ func addJudgeGet(s *sdk.Server, d Deps) {
 		Name: "judge_get",
 		Description: "The latest stored verdict of the judge (F5) for the repo's checklist (for sha when given): per requirement " +
 			"verdict, how and evidence, the commands run, unmapped_brief, extra_scope, suspect_tests, the judge model and family, " +
-			"enforced_blind (true for a claude judge held by the guard, false for a codex one), the coders' families with " +
+			"enforced_blind (true for a claude judge held by the guard and for a codex one under the read-only codex sandbox), " +
+			"the families of the coders (the succeeded fix and general jobs with covers of the checklist, size not small) with " +
 			"family_differs / same_family (a snapshot taken when the verdict was stored; release_check, F7, recomputes them), and " +
 			"current (the verdict is for the latest approved checklist), and manifest_check: the record of the run of " +
 			"scripts/manifest-check.sh the judge's wrapper made at sha before the judge started (exit_code, duration_sec, the " +
@@ -290,11 +294,12 @@ func addReleaseCheck(s *sdk.Server, d Deps) {
 			"when every condition holds, and a missing, unreadable or ambiguous record fails its condition: approval (the latest " +
 			"owner approval exists and the checklist hash is unchanged), manifest_check (the judge's manifest-check record for sha " +
 			"exits 0), verdict (a judge verdict for sha at the approved checklist id and version; every verdict for them must agree), " +
-			"requirements (each live requirement met, placeholder on a placeholder-ok row, or carrying an owner waiver bound to this " +
-			"hash and sha), unmapped_brief and suspect_tests (empty), family (the judge's model family differs from every coder's, " +
-			"recomputed now), enforced_blind (true), trace (every live requirement is in some feature job's covers and every feature " +
-			"job covers one; a feature job is a fix or general job of the repo started with size large whose covers name the " +
-			"checklist id). owner_line is " +
+			"requirements (each live requirement met, placeholder on a placeholder-ok row, or judged and carrying an owner waiver " +
+			"bound to this checklist id, hash and version and the requirement, not to a commit), unmapped_brief and suspect_tests " +
+			"(empty), family (the judge's model family differs from that of every succeeded feature job, recomputed now; a feature " +
+			"job is a fix or general job of the repo whose covers name the checklist id and whose size is not small), " +
+			"enforced_blind (true). feature_jobs and covered_by list the feature jobs and their covers, informational only. " +
+			"owner_line is " +
 			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason».",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ReleaseCheckInput) (*sdk.CallToolResult, jobs.ReleaseCheckResult, error) {
 		out, err := ReleaseCheck(d.Manager, in.Repo, in.SHA)
