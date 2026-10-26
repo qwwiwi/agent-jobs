@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -222,33 +224,72 @@ func codexJobIdentity(ctx context.Context, jobDir string) (name, email string, e
 	return name, email, nil
 }
 
-// nestedGitDir returns the first `.git` (a dir or a file) below work other than work/.git itself,
-// relative to work and slash-separated, or "". Links are not followed (WalkDir does not).
+// codexScanBatch is how many entries of a directory nestedGitDir reads at a time.
+var codexScanBatch = 256
+
+// codexScanMax caps the entries nestedGitDir visits in all; past it the job's changes are not committed.
+var codexScanMax = 200000
+
+// nestedGitDir returns the first `.git` (a dir, a file or a link) it meets below work other than
+// work/.git itself, which it does not look into, relative to work and slash-separated, or "". Links are
+// not followed. It reads each directory codexScanBatch entries at a time, checks ctx before each batch and
+// fails past codexScanMax entries in all, so a job that left millions of entries in one directory costs
+// the wrapper neither its memory nor time past the commit deadline.
 func nestedGitDir(ctx context.Context, work string) (string, error) {
-	var found string
-	err := filepath.WalkDir(work, func(p string, d os.DirEntry, err error) error {
+	// A directory still to read: its name and its parent's, nil being work (names, not whole paths, so
+	// the pending ones cost at most a name each).
+	type dir struct {
+		parent *dir
+		name   string
+	}
+	var rel func(d *dir) string
+	rel = func(d *dir) string {
+		if d == nil {
+			return ""
+		}
+		return path.Join(rel(d.parent), d.name)
+	}
+	visited := 0
+	pending := []*dir{nil} // depth first
+	// read reads directory d: the nested .git it holds, if any; its subdirectories go to pending.
+	read := func(d *dir) (string, error) {
+		f, err := os.Open(filepath.Join(work, filepath.FromSlash(rel(d))))
 		if err != nil {
-			return err
+			return "", err
 		}
-		if err := ctx.Err(); err != nil {
-			return err
+		defer f.Close()
+		for {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			entries, err := f.ReadDir(codexScanBatch)
+			for _, e := range entries {
+				if visited++; visited > codexScanMax {
+					return "", fmt.Errorf("over the limit of %d entries", codexScanMax)
+				}
+				switch {
+				case e.Name() == ".git" && d == nil: // work/.git itself
+				case e.Name() == ".git":
+					return path.Join(rel(d), e.Name()), nil
+				case e.IsDir(): // a link to a directory is not one
+					pending = append(pending, &dir{parent: d, name: e.Name()})
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				return "", nil
+			} else if err != nil {
+				return "", err
+			}
 		}
-		switch {
-		case d.Name() != ".git":
-			return nil
-		case filepath.Dir(p) == work && d.IsDir():
-			return filepath.SkipDir
-		case filepath.Dir(p) == work:
-			return nil
+	}
+	for len(pending) > 0 {
+		d := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if found, err := read(d); err != nil || found != "" {
+			return found, err
 		}
-		rel, err := filepath.Rel(work, p)
-		if err != nil {
-			return err
-		}
-		found = filepath.ToSlash(rel)
-		return filepath.SkipAll
-	})
-	return found, err
+	}
+	return "", nil
 }
 
 // codexCommitMessage is the commit message of a codex write job: its CodexCommitMessageFile (a regular

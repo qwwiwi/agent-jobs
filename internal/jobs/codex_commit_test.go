@@ -1,6 +1,9 @@
 package jobs
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -543,6 +546,96 @@ func TestCodexCommitDeadline(t *testing.T) {
 	}
 	if head := gitT(t, work, "rev-parse", "HEAD"); head != j.BaseCommit {
 		t.Fatalf("HEAD moved to %s", head)
+	}
+}
+
+// The nested-repository scan reads the worktree in bounded batches and visits at most codexScanMax
+// entries in all (sol review of #92: WalkDir read and sorted a whole directory before any check, so a job
+// that left millions of entries in one directory could exhaust the wrapper's memory): a directory with
+// more entries than that gives no commit, a reason in the line and nothing staged.
+func TestCodexCommitScanBudget(t *testing.T) {
+	prevMax, prevBatch := codexScanMax, codexScanBatch
+	codexScanMax, codexScanBatch = 50, 8
+	t.Cleanup(func() { codexScanMax, codexScanBatch = prevMax, prevBatch })
+	m := newCodexManager(t)
+	m.Cfg.CodexWriteAllowed, m.Cfg.GitName, m.Cfg.GitEmail = true, "Job Bot", "job@example.com"
+	repo := newRepo(t)
+	j, dir := preparedCodexFix(t, m, repo)
+	work := filepath.Join(dir, "work")
+	if err := os.Mkdir(filepath.Join(work, "many"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		writeSized(t, work, filepath.Join("many", fmt.Sprintf("f%03d.txt", i)), 1, false)
+	}
+	const want = "codex commit skipped: worktree scan: over the limit of 50 entries"
+	if line := commitCodexWork(dir, j.ID); line != want {
+		t.Fatalf("commit line %q, want %q", line, want)
+	}
+	if head := gitT(t, work, "rev-parse", "HEAD"); head != j.BaseCommit {
+		t.Fatalf("HEAD moved to %s", head)
+	}
+	if staged := gitT(t, work, "diff", "--cached", "--name-only"); staged != "" {
+		t.Fatalf("staged: %q", staged)
+	}
+}
+
+// cancelAfter is a context whose Err is nil for its first n calls and context.Canceled after them.
+type cancelAfter struct {
+	context.Context
+	n int
+}
+
+func (c *cancelAfter) Err() error {
+	if c.n--; c.n < 0 {
+		return context.Canceled
+	}
+	return nil
+}
+
+// The scan checks its context before each batch it reads: cancelled in the middle of a directory it
+// stops at once, with the context's error, and does not go on to the nested .git it would find later.
+// Not cancelled, batches of one entry find a .git below subdirectories, never look into work/.git and
+// do not follow links.
+func TestCodexNestedGitDirScan(t *testing.T) {
+	prevBatch := codexScanBatch
+	codexScanBatch = 1
+	t.Cleanup(func() { codexScanBatch = prevBatch })
+	mkdirs := func(root string, dirs ...string) {
+		for _, d := range dirs {
+			if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(d)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	work := t.TempDir()
+	mkdirs(work, ".git/inner/.git", "a/b/.git", "c")
+	if err := os.Symlink(filepath.Join(work, "a"), filepath.Join(work, "c", "link")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := nestedGitDir(context.Background(), work); got != "a/b/.git" || err != nil {
+		t.Fatalf("nestedGitDir = %q, %v; want a/b/.git", got, err)
+	}
+	if err := os.RemoveAll(filepath.Join(work, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := nestedGitDir(context.Background(), work); got != "" || err != nil {
+		t.Fatalf("nestedGitDir without a/ = %q, %v; want none (work/.git not looked into, c/link not followed)", got, err)
+	}
+
+	// work2: many/ (one entry at the top) holds ten files and sub/.git. The checks: the top's one batch
+	// and its end, then many/'s first batch; the fourth check, in the middle of many/, cancels.
+	work2 := t.TempDir()
+	mkdirs(work2, "many/sub/.git")
+	for i := range 10 {
+		writeSized(t, work2, filepath.Join("many", fmt.Sprintf("f%d.txt", i)), 1, false)
+	}
+	ctx := &cancelAfter{Context: context.Background(), n: 3}
+	if got, err := nestedGitDir(ctx, work2); got != "" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled scan = %q, %v; want context.Canceled", got, err)
+	}
+	if ctx.n != -1 {
+		t.Fatalf("the scan checked its context %d times past the cancellation, want it to stop at once", -1-ctx.n)
 	}
 }
 
