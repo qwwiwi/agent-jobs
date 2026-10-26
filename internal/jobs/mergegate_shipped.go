@@ -3,6 +3,7 @@ package jobs
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -181,13 +182,13 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 // refs/remotes/origin/HEAD (what origin names its default branch), else origin/main, else origin/master;
 // an error when none is there (nothing fetched).
 func originDefaultRef(dir string) (string, error) {
-	if ref, err := git(dir, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil && strings.HasPrefix(ref, "refs/remotes/origin/") {
-		if _, err := git(dir, noReplace, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
+	if ref, err := gitHistory(dir, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil && strings.HasPrefix(ref, "refs/remotes/origin/") {
+		if _, err := gitHistory(dir, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
 			return ref, nil
 		}
 	}
 	for _, ref := range []string{"refs/remotes/origin/main", "refs/remotes/origin/master"} {
-		if _, err := git(dir, noReplace, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
+		if _, err := gitHistory(dir, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
 			return ref, nil
 		}
 	}
@@ -197,13 +198,13 @@ func originDefaultRef(dir string) (string, error) {
 // shippedOn reports whether sha is on ref in work tree dir: an ancestor of it (a merge commit, a fast
 // forward), or a commit on ref that sha does not reach has sha's exact tree (a squash or rebase merge of
 // a branch that was up to date with its base). Anything unreadable (a sha not in the object store) is
-// not shipped. Replace refs are ignored (noReplace, as release_check reads the sha): they cannot fake
-// the ancestry or the tree.
+// not shipped. History is read as committed (gitHistory): neither a replace ref nor a grafts file can
+// fake the ancestry or the tree.
 func shippedOn(dir, sha, ref string) bool {
 	if !commitSHARe.MatchString(sha) {
 		return false
 	}
-	_, err := git(dir, noReplace, "merge-base", "--is-ancestor", sha, ref)
+	_, err := gitHistory(dir, "merge-base", "--is-ancestor", sha, ref)
 	if err == nil {
 		return true
 	}
@@ -211,11 +212,11 @@ func shippedOn(dir, sha, ref string) bool {
 	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
 		return false
 	}
-	tree, err := git(dir, noReplace, "rev-parse", "-q", "--verify", sha+"^{tree}")
+	tree, err := gitHistory(dir, "rev-parse", "-q", "--verify", sha+"^{tree}")
 	if err != nil || tree == "" {
 		return false
 	}
-	out, err := git(dir, noReplace, "log", "--format=%T", ref, "^"+sha)
+	out, err := gitHistory(dir, "log", "--format=%T", ref, "^"+sha)
 	if err != nil {
 		return false
 	}
@@ -225,6 +226,14 @@ func shippedOn(dir, sha, ref string) bool {
 		}
 	}
 	return false
+}
+
+// gitHistory is git for the shipped check's history reads in work tree dir, which see the commits as
+// they are: replace refs are ignored (noReplace, as release_check reads the sha) and so is a grafts file
+// (<git dir>/info/grafts rewrites a commit's parents, which --no-replace-objects leaves in effect):
+// GIT_GRAFT_FILE names an empty file, set after daemonGitEnv dropped the inherited GIT_* variables.
+func gitHistory(dir string, args ...string) (string, error) {
+	return gitEnv(dir, append(daemonGitEnv(), "GIT_GRAFT_FILE="+os.DevNull), append([]string{noReplace}, args...)...)
 }
 
 // shippedPass is a pass of gated repository r that could ship it but has not yet ("" = none): the

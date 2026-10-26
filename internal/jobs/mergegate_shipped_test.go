@@ -273,3 +273,44 @@ func TestMergeGateShippedRecheck(t *testing.T) {
 		t.Fatalf("shipped again, still gated: %+v %v", a, err)
 	}
 }
+
+// History that git rewrites in the main work tree does not ship: a grafts file (.git/info/grafts) or a
+// replace ref that makes the unmerged pass sha X a parent of origin/main's tip is ignored, so X is still
+// not on the default branch (another tree there, no ancestry).
+func TestMergeGateShippedIgnoresRewrittenHistory(t *testing.T) {
+	for _, how := range []string{"grafts", "replace"} {
+		t.Run(how, func(t *testing.T) {
+			m := newManager(t)
+			repo, shaA, shaX := shippedRepo(t, m)
+			main := mainWorktree(repo)
+			tip := gitT(t, repo, "commit-tree", "-p", shaA, "-m", "unrelated fix", gitT(t, repo, "rev-parse", shaA+"^{tree}"))
+			gitT(t, repo, "update-ref", "refs/remotes/origin/main", tip)
+			switch how {
+			case "grafts":
+				info := filepath.Join(gitT(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info")
+				if err := os.MkdirAll(info, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(info, "grafts"), []byte(tip+" "+shaX+"\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "replace":
+				fake := gitT(t, repo, "commit-tree", "-p", shaX, "-m", "unrelated fix", gitT(t, repo, "rev-parse", shaA+"^{tree}"))
+				gitT(t, repo, "replace", tip, fake)
+			}
+			// The rewrite is in effect for a plain git read: X looks like an ancestor of origin/main.
+			if _, err := git(repo, "merge-base", "--is-ancestor", shaX, "refs/remotes/origin/main"); err != nil {
+				t.Fatalf("%s not in effect: %v", how, err)
+			}
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			if g, err := m.Store.GateRepoOf(main); err != nil || g.ShippedSeq != 0 || g.ShippedSHA != "" {
+				t.Fatalf("shipped through %s: %+v %v", how, g, err)
+			}
+			if a, err := m.MergeGateCheck(repo, "gh pr merge 8", ""); err != nil || a.Refusal == "" {
+				t.Fatalf("not gated: %+v %v", a, err)
+			}
+		})
+	}
+}

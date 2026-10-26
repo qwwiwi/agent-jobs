@@ -283,8 +283,13 @@ func (m *Manager) spawnEnv(unit string) []string {
 }
 
 func git(dir string, args ...string) (string, error) {
+	return gitEnv(dir, daemonGitEnv(), args...)
+}
+
+// gitEnv is git with environment env.
+func gitEnv(dir string, env []string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError

@@ -430,8 +430,10 @@ func checkGateWork(work string) error {
 }
 
 // noReplace is git's global option that reads the objects as they are: a replace ref (refs/replace/*)
-// could swap the commit, tree or blobs a gate job is given while its result keeps the sha. Grafts only
-// change a commit's parents, which no gate job reads (the judge gets the tree, no history).
+// could swap the commit, tree or blobs a gate job is given while its result keeps the sha. It leaves a
+// grafts file (<git dir>/info/grafts) in effect, which rewrites a commit's parents: harmless where only
+// the tree is read (the judge gets the tree, no history), but a history read must also ignore it
+// (gitHistory, the shipped check of #99).
 const noReplace = "--no-replace-objects"
 
 // treeEntry is a file or symlink of the tree at a sha.
