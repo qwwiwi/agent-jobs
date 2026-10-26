@@ -134,6 +134,11 @@ func TestSourcesReviewBlockers(t *testing.T) {
 			"cp -R ../sources/lib ../sandbox/lib",
 			"cp -a ../sources/lib ../sandbox/lib4",
 			"chmod -R u+w ../sandbox/lib",
+			"cat > ../PROGRESS.md <<'EOF'\n- grep in sources/lib done, copy in ../sandbox/lib\nEOF",
+			"echo '- read ../sources/lib/install.sh' >> ../PROGRESS.md",
+			"go test ./... > ../tmp/test.log 2>&1",
+			"git diff > ../tmp/d.patch",
+			"git log --oneline -3",
 			"docker run --rm --name aj-j-test --memory 2g --pids-limit 512 --cpus 2 --network none --user " + user +
 				" --cap-drop ALL --security-opt no-new-privileges -v " + box + "/lib:/src -w /src alpine sh -c 'HOME=/tmp ls'",
 		} {

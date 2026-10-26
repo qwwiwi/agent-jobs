@@ -27,6 +27,12 @@ import (
 //     move or link out of them lands only inside sandbox/, and a source file is never linked (linksOut: a
 //     hard link is the clone's inode); in a call that reads them every output redirection and reader
 //     output file lands inside sandbox/ (copyOutWrites).
+//   - Fail-closed for forms the guard cannot resolve statically, instead of a list of refused spellings: a
+//     copier given a source path takes only a whitelist of options (copierOpts), ln never names one; a
+//     call that writes outside sandbox/ has no variable, substitution, glob, brace or ~user in a path
+//     position or input redirection (unresolvedIn); git's -C, --git-dir and --work-tree are never expanded
+//     at run time, an explicit --git-dir or --work-tree is the whole call and exists outside the sources
+//     with its symlinks resolved (gitDirOutside), and git never shares a call with a link maker.
 //   - dockerSandbox: `docker run` is allowed only as the whole Bash command, spelled `docker`, with --rm,
 //     --name aj-<job id>-<suffix> (the daemon removes the job's containers when it ends), --memory,
 //     --pids-limit and --cpus within caps, --network none, --user <the job's uid>:<gid>, --cap-drop ALL,
@@ -35,8 +41,8 @@ import (
 //     detaching.
 //
 // Residual gaps (not resolved; closing them needs OS confinement of the job, not a command reader): a copy
-// made by a program that reads the sources through a path the guard cannot see (code in an interpreter
-// that builds the path at run time) or writes it through an option the guard does not know; the model
+// made by a program that is not a plain reader or copier and reads the sources through a path built at run
+// time inside its own code (an interpreter's string operations, not a shell expansion); the model
 // itself retyping code it read into a file (Write tool) and running it; a script the job writes itself; a
 // symlink swapped in by a process the job left running between the check and docker's mount; docker's
 // own client config (~/.docker, DOCKER_HOST) as the job's environment sets it.
@@ -252,13 +258,15 @@ func (s *pathScope) sourcesExecScripts(scripts []*script, src, inBox *pathScope)
 	if r := s.copyOutWrites(scripts, inBox); r != "" {
 		return r
 	}
+	call := gitShape{whole: len(scripts) == 1 && len(scripts[0].pipelines) == 1 && len(scripts[0].pipelines[0].cmds) == 1,
+		links: callLinks(scripts)}
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for i, c := range pl.cmds {
 				if s.over() {
 					return ""
 				}
-				if r := s.sourcesExecCmd(c, pl.cmds[:i], src, inBox); r != "" {
+				if r := s.sourcesExecCmd(c, pl.cmds[:i], src, inBox, call); r != "" {
 					return r
 				}
 			}
@@ -267,8 +275,41 @@ func (s *pathScope) sourcesExecScripts(scripts []*script, src, inBox *pathScope)
 	return ""
 }
 
+// gitShape is what gitSources needs to know of the whole call: git is its only command (whole), or a
+// command of it may make a link (links, callLinks).
+type gitShape struct{ whole, links bool }
+
+// callLinks reports a call that may make a link a git dir could go through: ln or link, cp with
+// -s/--symbolic-link, or a word other than git's naming a symlink (os.symlink, ...).
+func callLinks(scripts []*script) bool {
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				argv := argvOf(c.words)
+				if len(argv) == 0 {
+					continue
+				}
+				name := progName(argv[0])
+				switch {
+				case name == "ln" || name == "link":
+					return true
+				case name == "cp" && slices.ContainsFunc(argv[1:], func(a string) bool {
+					return shortHas(a, 's') || strings.HasPrefix(a, "--sy")
+				}):
+					return true
+				case !isGitName(name) && slices.ContainsFunc(c.words, func(w string) bool {
+					return strings.Contains(strings.ToLower(w), "symlink")
+				}):
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // sourcesExecCmd checks one command; feeders are the earlier stages of its pipeline.
-func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBox *pathScope) string {
+func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBox *pathScope, call gitShape) string {
 	v := split(c.words)
 	for k, w := range c.words[:min(v.start, len(c.words))] {
 		if reAssign.MatchString(w) {
@@ -296,7 +337,7 @@ func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBo
 			}
 		}
 	}
-	if r := src.linksOut(name, argv[1:]); r != "" {
+	if r := src.linksOut(name, argv[1:], dyn[1:]); r != "" {
 		return r
 	}
 	if r := s.copyOut(name, argv[1:], inBox); r != "" {
@@ -304,7 +345,7 @@ func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBo
 	}
 	g, isGit := parseGit(argv)
 	if isGit {
-		if r := src.gitSources(g, argv, dyn); r != "" {
+		if r := src.gitSources(g, argv, dyn, call); r != "" {
 			return r
 		}
 	}
@@ -335,7 +376,8 @@ func (s *pathScope) sourcesExecCmd(c *simpleCmd, feeders []*simpleCmd, src, inBo
 				return sourcesExecBlocked("`" + name + "` reads its input from `" + q + "`")
 			}
 		}
-		if s.namesProtected(c.heredoc) {
+		// tee only writes its here-doc to a file; a runner or another program may act on what it names.
+		if name != "tee" && s.namesProtected(c.heredoc) {
 			return sourcesExecBlocked("`" + name + "` reads a here-doc naming the sources")
 		}
 		for _, f := range feeders {
@@ -428,6 +470,15 @@ func rsyncWriteDirs(args []string) []string {
 // redirection takes the output of commands the reader does not tie to it. /dev/null, /dev/stdout,
 // /dev/stderr and descriptor duplications (`2>&1`) stay allowed.
 func (s *pathScope) copyOutWrites(scripts []*script, inBox *pathScope) string {
+	if to := s.callWritesOutside(scripts, inBox); to != "" {
+		if w := s.unresolvedIn(scripts); w != "" {
+			return "blocked by guard: the call writes `" + to + "` outside the sandbox dir and the guard cannot resolve `" +
+				w + "` (a variable, substitution, glob, brace or ~user), so it could read the job's sources: in a job with " +
+				"sources the guard is fail-closed for such forms. Write the paths out literally or split the call. Read the " +
+				"sources with plain readers on literal paths; to run them, copy the clone with `cp -R <sources>/<name> " +
+				"<sandbox>/<name>` and run it, as the whole Bash command, with " + sandboxRecipe + "."
+		}
+	}
 	from := s.callReads(scripts)
 	if from == "" {
 		return ""
@@ -480,15 +531,21 @@ func (s *pathScope) copyOutWrites(scripts []*script, inBox *pathScope) string {
 	return ""
 }
 
-// callReads returns a sources or sandbox path the call reads or works in ("" = none).
+// callReads returns a sources or sandbox path the call reads or works in ("" = none): a path operand or
+// input redirection resolving there (globs expanded). Here-doc and here-string bodies and the arguments of
+// echo and printf are text, not reads (the substitutions in them are scripts of their own and checked).
 func (s *pathScope) callReads(scripts []*script) string {
 	if q, ok := s.cwdHit(false); ok {
 		return q
 	}
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
-			for _, c := range pl.cmds {
+			for i, c := range pl.cmds {
+				text := textArgs(c, i == len(pl.cmds)-1)
 				for k, w := range c.words {
+					if k >= text {
+						break
+					}
 					if q, ok := s.argHit(w, c.dyn[k], false); ok {
 						return q
 					}
@@ -500,14 +557,132 @@ func (s *pathScope) callReads(scripts []*script) string {
 					if q, ok := s.hit(t, false); ok {
 						return q
 					}
-				}
-				if s.namesProtected(c.heredoc) {
-					return "a here-doc naming them"
+					if q, ok := s.globHit(t); ok {
+						return q
+					}
 				}
 			}
 		}
 	}
 	return ""
+}
+
+// textArgs returns the index of the first word of c that is printed text, not a path: the arguments of
+// echo and printf as the last stage of their pipeline (len(c.words) for any other command: what echo
+// pipes into xargs or a shell is not just text).
+func textArgs(c *simpleCmd, last bool) int {
+	v := split(c.words)
+	if last && v.start < len(c.words) {
+		if name := progName(c.words[v.start]); name == "echo" || name == "printf" {
+			return v.start + 1
+		}
+	}
+	return len(c.words)
+}
+
+// callWritesOutside returns an output of the call that does not land inside the sandbox dir ("" = none):
+// an output redirection other than /dev/null, stdout, stderr or a descriptor duplication, a reader's output
+// file (readerOutputFiles), a copier's destination, a tee file, dd of= or sort -o. A target expanded at run
+// time is outside.
+func (s *pathScope) callWritesOutside(scripts []*script, inBox *pathScope) string {
+	outside := func(t string, dyn bool) bool { return !devSink(t) && (dyn || !inBox.allInside(t)) }
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for _, c := range pl.cmds {
+				for i, t := range c.outRedirs {
+					if !(i < len(c.outDup) && c.outDup[i]) && outside(t, i < len(c.outDyn) && c.outDyn[i]) {
+						return t
+					}
+				}
+				v := split(c.words)
+				if v.start >= len(c.words) {
+					continue
+				}
+				argv, dyn := c.words[v.start:], c.dyn[v.start:]
+				name := progName(argv[0])
+				for _, k := range readerOutputFiles(name, argv[1:]) {
+					if t := optValueOf(argv[k+1]); outside(t, dyn[k+1]) {
+						return t
+					}
+				}
+				var dests []string
+				switch name {
+				case "cp", "install", "ln", "mv", "rsync":
+					dests = parseCopyArgs(name, argv[1:]).dests
+					if name == "rsync" {
+						dests = append(dests, rsyncWriteDirs(argv[1:])...)
+					}
+				case "tee":
+					dests = slices.DeleteFunc(slices.Clone(argv[1:]), func(a string) bool { return strings.HasPrefix(a, "-") })
+				case "dd":
+					for _, a := range argv[1:] {
+						if t, ok := strings.CutPrefix(a, "of="); ok {
+							dests = append(dests, t)
+						}
+					}
+				case "sort":
+					for k, a := range argv[1:] {
+						if t, ok := strings.CutPrefix(a, "--output="); ok {
+							dests = append(dests, t)
+						} else if (a == "-o" || a == "--output") && k+2 < len(argv) {
+							dests = append(dests, argv[k+2])
+						} else if strings.HasPrefix(a, "-o") && len(a) > 2 {
+							dests = append(dests, a[2:])
+						}
+					}
+				}
+				for _, d := range dests {
+					if outside(d, s.namesDynamic(d, c)) {
+						return d
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// unresolvedIn returns the first word of the call in a path position that the guard cannot resolve
+// statically (unresolvedWord), input redirections included ("" = none). Printed text (textArgs) and
+// assignments are not paths: what a substitution in them runs is a script of the call and checked here.
+func (s *pathScope) unresolvedIn(scripts []*script) string {
+	for _, sc := range scripts {
+		for _, pl := range sc.pipelines {
+			for i, c := range pl.cmds {
+				v := split(c.words)
+				text := textArgs(c, i == len(pl.cmds)-1)
+				assigns := v.start < len(c.words) && assignBuiltins[progName(c.words[v.start])]
+				for k, w := range c.words {
+					if k >= text {
+						break
+					}
+					if (k < v.start && reAssign.MatchString(w)) || (assigns && k > v.start && strings.Contains(w, "=")) {
+						continue
+					}
+					if s.unresolvedWord(w, c.dyn[k]) {
+						return w
+					}
+				}
+				for _, t := range c.inRedirs {
+					if s.unresolvedWord(t, false) {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// unresolvedWord reports a word the guard cannot resolve statically: an expansion ($VAR, $(...),
+// backticks), a glob or brace (`*`, `?`, `[`, `{a,b}`, `{1..3}`; bash's own globbing, extglob and options
+// differ from any expansion the guard could do), or a tilde of an unknown home (`~user`, `~+`).
+func (s *pathScope) unresolvedWord(w string, dyn bool) bool {
+	if dyn || strings.ContainsAny(w, "$`") || hasGlob(w) {
+		return true
+	}
+	_, ok := s.expandHome(w)
+	return !ok
 }
 
 // maxGlobMatches bounds the files a glob word is expanded to by globHit.
@@ -647,31 +822,83 @@ func readerOutputFiles(name string, args []string) []int {
 	return out
 }
 
-// linksOut refuses a link of a file under the sources (ln, cp -l/-s, rsync --link-dest): a hard link is
-// the clone's own inode, so `chmod u+w` and a write through the link change the clone, and a symlink
-// leads a write in the sandbox back to it. A copy into the sandbox (cp -R) is a real copy.
-func (s *pathScope) linksOut(name string, args []string) string {
-	if s == nil {
+// copierOpts are the options a copier takes in a call where one of its words reaches the sources: short
+// letters (also bundled) and long options (a trailing `=` takes an attached value, required). The set is
+// a whitelist, fail-closed: none takes a separate value, so no option can swallow `--` or an operand and
+// hide a link option behind it (`cp -S -- -l src dst`, -S eating `--`); anything else (-l, -s, -S, -b, -u,
+// -t, --link-dest, abbreviations, an unknown letter in a bundle) is refused.
+var copierOpts = map[string]struct {
+	short string
+	long  []string
+}{
+	"cp": {"RrapvfnTPL", []string{"--recursive", "--archive", "--preserve", "--preserve=", "--no-preserve=",
+		"--no-dereference", "--dereference", "--verbose", "--force", "--no-clobber", "--no-target-directory"}},
+	"rsync":   {"arvn", []string{"--archive", "--recursive", "--verbose", "--dry-run", "--exclude="}},
+	"install": {"", nil},
+}
+
+// unsafeCopyOpt returns the first option of a copier (copierOpts) outside its safe set ("" = none).
+func unsafeCopyOpt(name string, args []string) string {
+	safe := copierOpts[name]
+	for _, a := range args {
+		switch {
+		case a == "--":
+			return ""
+		case a == "-" || !strings.HasPrefix(a, "-"):
+		case strings.HasPrefix(a, "--"):
+			if !slices.ContainsFunc(safe.long, func(o string) bool {
+				if strings.HasSuffix(o, "=") {
+					return strings.HasPrefix(a, o) && len(a) > len(o)
+				}
+				return a == o
+			}) {
+				return a
+			}
+		default:
+			for _, r := range a[1:] {
+				if !strings.ContainsRune(safe.short, r) {
+					return a
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// linksOut refuses a link of the sources and a copy of them with an option the guard does not know: ln
+// (or link) with any operand under sources/ or naming it (a symlink's target is taken from its own
+// folder) is refused outright; cp, rsync and install given a path there take only copierOpts. A hard
+// link is the clone's own inode, so `chmod u+w` and a write through the link change the clone, and a
+// symlink leads a write in the sandbox back to it. A copy into the sandbox (cp -R) is a real copy.
+func (s *pathScope) linksOut(name string, args []string, dyn []bool) string {
+	_, copier := copierOpts[name]
+	link := name == "ln" || name == "link"
+	if s == nil || !copier && !link {
 		return ""
 	}
-	var srcs []string
-	switch name {
-	case "ln":
-		srcs = parseCopyArgs(name, args).srcs
-	case "cp":
-		if cpLinks(args) {
-			srcs = parseCopyArgs(name, args).srcs
+	from := ""
+	for k, a := range args {
+		if q, ok := s.argHit(a, dyn[k], true); ok {
+			from = q
+			break
 		}
-	case "rsync":
-		if slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--link-dest") }) {
-			srcs = args
+		if link && s.namesProtected(a) {
+			from = a
+			break
 		}
 	}
-	for _, a := range srcs {
-		if q, ok := s.hit(a, false); ok {
-			return sourcesExecBlocked("`" + name + "` links `" + q + "`: a link of a cloned file lets a write through it " +
-				"change the clone; copy it with cp -R instead")
-		}
+	switch {
+	case from == "":
+		return ""
+	case link:
+		return sourcesExecBlocked("`" + name + "` links `" + from + "`: a link of a cloned file lets a write through it " +
+			"change the clone; copy it with cp -R instead")
+	}
+	if opt := unsafeCopyOpt(name, args); opt != "" {
+		return sourcesExecBlocked("`" + name + " " + opt + "` on `" + from + "`: a copy of the sources takes only " +
+			"known-safe options (cp: -R -r -a -p -v -f -n -T -P -L, --recursive, --archive, --preserve[=...], " +
+			"--no-preserve=...; rsync: -a -r -v -n, --exclude=...; install: none), as an option the guard does not " +
+			"know may link to the clone; copy it with `cp -R <sources>/<name> <sandbox>/<name>`")
 	}
 	return ""
 }
@@ -679,32 +906,6 @@ func (s *pathScope) linksOut(name string, args []string) string {
 // shortHas reports a short-option word (`-nO`) holding the option letter c.
 func shortHas(w string, c rune) bool {
 	return len(w) > 1 && w[0] == '-' && w[1] != '-' && strings.ContainsRune(w[1:], c)
-}
-
-// cpLinks reports cp options that link instead of copying: -l/--link, -s/--symbolic-link (also in a short
-// cluster and as a long-option abbreviation).
-func cpLinks(args []string) bool {
-	for _, a := range args {
-		switch {
-		case a == "--":
-			return false
-		case strings.HasPrefix(a, "--"):
-			key, _, _ := strings.Cut(a, "=")
-			if (len(key) > 2 && strings.HasPrefix("--link", key)) || (len(key) > 3 && strings.HasPrefix("--symbolic-link", key)) {
-				return true
-			}
-		case strings.HasPrefix(a, "-") && len(a) > 1:
-			for k := 1; k < len(a); k++ {
-				if a[k] == 'l' || a[k] == 's' {
-					return true
-				}
-				if a[k] == 'S' || a[k] == 't' {
-					break
-				}
-			}
-		}
-	}
-	return false
 }
 
 // gitReads are the git subcommands that may work on a clone under sources/ or be given a path there: they
@@ -723,9 +924,13 @@ var gitReads = map[string]bool{
 // programs (a diff textconv), so the working directory, each -C in turn, --git-dir and --work-tree are
 // followed; --git-dir and --work-tree never point into the sources, nor go with a clone. On a clone, or
 // given a path under sources/, only gitReads run, without --output or grep's pager (-O).
-func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
+func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool, call gitShape) string {
 	if s == nil {
 		return ""
+	}
+	if call.links {
+		return sourcesExecBlocked("`git` in a call that makes a link: git may follow it into the sources; make the " +
+			"link and run git in separate Bash calls")
 	}
 	if s.dynamic != "" && s.namesProtected(s.dynamic) {
 		return sourcesExecBlocked("`git` runs after `cd " + s.dynamic + "`, which the guard cannot follow")
@@ -752,11 +957,10 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 			k++
 			val = argv[k]
 		}
-		if dyn[k] && s.namesProtected(val) {
-			return sourcesExecBlocked("`git " + opt + " " + val + "` may point git at the sources")
-		}
-		if opt == "-C" && dyn[k] {
-			hidden = true
+		// Fail-closed: a value expanded at run time may name a folder inside a clone in any spelling.
+		if dyn[k] {
+			return sourcesExecBlocked("`git " + opt + " " + val + "`: the guard cannot resolve a value expanded at run " +
+				"time, which may point git at a folder inside the sources; write the path out")
 		}
 		if opt != "-C" {
 			if q, ok := s.hit(val, false); ok {
@@ -808,10 +1012,8 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 			if onClone {
 				return sourcesExecBlocked("`git " + opt + "` with a clone: git works on a clone's own repository only")
 			}
-			if exp, ok := s.expandHome(v); ok && !filepath.IsAbs(exp) {
-				if q, hit := s.match([]string{filepath.Clean(d + "/" + exp), s.resolve(d + "/" + exp)}, false); hit {
-					return sourcesExecBlocked("`git " + opt + "` points git at `" + q + "`")
-				}
+			if r := s.gitDirOutside(d, opt, v, call); r != "" {
+				return r
 			}
 		}
 	}
@@ -834,6 +1036,33 @@ func (s *pathScope) gitSources(g gitCall, argv []string, dyn []bool) string {
 		if a == "--output" || (sub == "grep" && (shortHas(argv[k], 'O') || strings.HasPrefix("--open-files-in-pager", a) && len(a) > 3)) {
 			return sourcesExecBlocked("`git " + g.sub + " " + argv[k] + "` on the sources writes a file or runs a pager")
 		}
+	}
+	return ""
+}
+
+// gitDirOutside checks an explicit --git-dir or --work-tree value v of git run in d (fail-closed): it is
+// allowed only as the whole Bash call (no other command could swap in a link before git opens it) and
+// when the path exists now and, with its symlinks resolved on disk, lies outside the sources.
+func (s *pathScope) gitDirOutside(d, opt, v string, call gitShape) string {
+	if !call.whole {
+		return sourcesExecBlocked("`git " + opt + "` in a call with other commands: in a job with sources git takes " +
+			"an explicit " + opt + " only as the whole Bash command")
+	}
+	exp, ok := s.expandHome(v)
+	if !ok {
+		return sourcesExecBlocked("`git " + opt + " " + v + "`: the guard cannot resolve the path")
+	}
+	p := exp
+	if !filepath.IsAbs(p) {
+		p = d + "/" + p
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return sourcesExecBlocked("`git " + opt + " " + v + "`: the path does not exist (or cannot be resolved), so the " +
+			"guard cannot tell where git would go; in a job with sources git takes only an existing " + opt)
+	}
+	if q, hit := s.match([]string{filepath.Clean(p), s.resolve(p), real}, false); hit {
+		return sourcesExecBlocked("`git " + opt + "` points git at `" + q + "`")
 	}
 	return ""
 }
