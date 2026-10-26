@@ -764,6 +764,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	var plan launchPlan
 	var codexSandbox string // a codex job's `codex exec --sandbox` value
+	var codexNetwork bool   // a codex write job's network (CodexNetworkOverride)
 	launchCfg := m.Config()
 	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
@@ -789,6 +790,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		if codexSandbox, err = m.codexLaunchSandbox(launchCfg, j.Kind); err != nil {
 			return err
 		}
+		codexNetwork = codexSandbox == CodexSandboxWrite && launchCfg.CodexWriteNetworkOn()
 	}
 	if j.Attempt > 1 {
 		p, err := m.prepareResume(j, token)
@@ -816,7 +818,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
 				return err
 			}
-			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
+			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox, m.JobDir(j.ID), codexNetwork),
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
 	}
@@ -824,6 +826,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
 		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
 		CodexSandbox:      codexSandbox,
+		CodexNetwork:      codexNetwork,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}

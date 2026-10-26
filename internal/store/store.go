@@ -585,6 +585,7 @@ var migrations = []string{
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_sandbox TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN milestone_id INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE launch_authorizations ADD COLUMN codex_network INTEGER NOT NULL DEFAULT 0`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
