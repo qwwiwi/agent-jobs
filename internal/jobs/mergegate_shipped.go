@@ -12,17 +12,17 @@ import (
 )
 
 // A checklist whose release shipped stops gating merges (#99): once release_check passed at the latest
-// approval (its id, version and hash, a pass created at or after it) on a sha that is on the default
-// branch of the repository's origin,
-// the daemon's tick records the approval as shipped (store.GateRepo.ShippedSeq, the sha and when), and
-// the merge hook takes the repository out of the gate like a retirement: later fixes merge under the
-// normal review rule. The tick computes it, not the hook: the hook opens the store read-only and stays
-// cheap, and doctor/status show the stored record. It never lifts the gate on its own: the hook still
-// requires the approval to be the latest and valid (a void approval stays gated), and the pass to be
-// stored and not stale (a newer verdict or a red manifest-check run); a new approval, also an unchanged
-// re-approval, gates the repository again until a pass at it ships in turn. The daemon does not fetch: it reads the remote-tracking ref
-// in the main work tree (refs/remotes/origin/HEAD, else origin/main, else origin/master), so the merge
-// counts once someone fetched origin there (git fetch, git pull).
+// approval (its id, version and hash; a pass created at or after it) on a sha that is on the default
+// branch of the repository's origin, the daemon's tick records the approval as shipped
+// (store.GateRepo.ShippedSeq, the sha and when), and the merge hook takes the repository out of the gate
+// like a retirement: later fixes merge under the normal review rule. The tick computes it, not the hook:
+// the hook opens the store read-only and stays cheap, and doctor/status show the stored record. It never
+// lifts the gate on its own: the hook still requires the approval to be the latest and valid (a void
+// approval stays gated), and the pass to be stored and not stale (a newer verdict or a red
+// manifest-check run); a new approval, also an unchanged re-approval, gates the repository again until a
+// pass at it ships in turn. The daemon does not fetch: it reads the remote-tracking ref in the main work
+// tree (refs/remotes/origin/HEAD, else origin/main, else origin/master), so the merge counts once
+// someone fetched origin there (git fetch, git pull).
 
 // Merge-gate states of a repository with a stored approval (MergeGateView.State).
 const (
