@@ -29,4 +29,6 @@ Before a judge job (`judge_start`) starts its model, the job's wrapper writes th
    With a file argument it reads `go test -json` output from it; without one it runs `go test -json ./...` itself (`MANIFEST_GO_TEST_ARGS` changes the arguments, `MANIFEST_CHECKLIST` the checklist path).
 3. It can also be a fix or general job's `acceptance_cmd` (`scripts/manifest-check.sh`), so a job does not finish green with an untested requirement.
 
+agent-jobs itself is wired this way: its `scripts/manifest-check.sh` runs this reference script. Before it, the script sets `GOTOOLCHAIN=local` and runs `go mod download` (at most `MANIFEST_DOWNLOAD_TIMEOUT` seconds, default 300): the judge's throwaway `HOME` starts with cold Go caches, so the modules come from the Go module proxy and need network access; without it the script exits 2 with one line instead of reporting every requirement missing. It then runs only the top-level tests whose body holds a requirement tag, and the whole suite only when that run leaves a live requirement missing.
+
 For another language, keep the contract and change how the passing tests are read: what matters is the list of test names that passed in this run.
