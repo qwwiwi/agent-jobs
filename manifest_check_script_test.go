@@ -71,6 +71,25 @@ func TestRepoManifestCheckRunsReference(t *testing.T) {
 	}
 }
 
+// Only the tagged tests run first: an untagged failing test does not run. A tag the scan misses (here
+// in a package-level variable) is found by the whole suite, which runs when the tagged run leaves a
+// requirement missing.
+func TestRepoManifestCheckTaggedTestsFirst(t *testing.T) {
+	failing := manifestTest + "\nfunc TestUntagged(t *testing.T) { t.Fatal(\"must not run\") }\n"
+	out, code := runRepoManifest(t, manifestRepo(t, "module example.com/app\n\ngo 1.27\n", failing), nil)
+	if code != 0 || !strings.Contains(out, "manifest-check: go test exit 0") || strings.Contains(out, "whole suite") {
+		t.Fatalf("tagged run: exit %d:\n%s", code, out)
+	}
+
+	hidden := "package app\n\nimport \"testing\"\n\nvar loginName = \"[R01] login works\"\n\n" +
+		"func TestLogin(t *testing.T) { t.Run(loginName, func(t *testing.T) {}) }\n\n" +
+		"func TestOther(t *testing.T) {\n\tt.Run(\"[R02] other\", func(t *testing.T) {})\n}\n"
+	out, code = runRepoManifest(t, manifestRepo(t, "module example.com/app\n\ngo 1.27\n", hidden), nil)
+	if code != 0 || !strings.Contains(out, "running the whole suite") || !strings.Contains(out, "ok       R01  TestLogin/[R01]_login_works") {
+		t.Fatalf("fallback: exit %d:\n%s", code, out)
+	}
+}
+
 // Modules that cannot be fetched (a cold cache without network; here the proxy is off) fail fast with
 // exit 2 and one line, not as build failures that read as missing requirements; with a go test -json
 // file the script fetches nothing.
