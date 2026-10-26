@@ -35,7 +35,7 @@ func newInputSchema[T any]() *inputSchema {
 }
 
 // ValidateMilestoneInput validates args, the arguments of tool (milestone_create or milestone_set) as
-// decoded JSON (objects as map[string]any, numbers as float64), against the tool's input schema, as the
+// decoded JSON (objects as map[string]any, numbers as float64 or int64), against the tool's input schema, as the
 // server does before it calls the manager.
 func ValidateMilestoneInput(tool string, args map[string]any) error {
 	s, ok := milestoneSchemas[tool]
