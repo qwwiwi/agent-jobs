@@ -33,7 +33,7 @@ if [ $# -eq 0 ]; then
     trap '' HUP INT TERM
     if [ -n "$watchdog" ]; then
       kill -KILL "$watchdog" 2>/dev/null
-      wait "$watchdog"
+      wait "$watchdog" 2>/dev/null
     fi
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null
@@ -44,7 +44,7 @@ if [ $# -eq 0 ]; then
       killer=$!
       wait "$pid"
       kill -KILL "$killer" 2>/dev/null
-      wait "$killer"
+      wait "$killer" 2>/dev/null
     fi
     exit 2
   }
@@ -92,9 +92,10 @@ if [ $# -eq 0 ]; then
   wait "$pid"
   status=$?
   pid=
-  # Stop the watchdog as soon as the download is reaped, so it cannot signal a reused PID.
+  # Stop the watchdog as soon as the download is reaped, so it cannot signal a reused PID. dash reports a
+  # waited-for job killed by a signal ("Terminated") on the shell's stderr: that is expected here.
   kill "$watchdog" 2>/dev/null
-  wait "$watchdog"
+  wait "$watchdog" 2>/dev/null
   watchdog=
   cat "$tmp/download.log" >&2
   # Past the limit is a timeout whatever the exit status: a download may exit 0 on TERM.

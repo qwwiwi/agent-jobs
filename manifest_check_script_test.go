@@ -108,13 +108,20 @@ const manifestTest = "package app\n\nimport \"testing\"\n\nfunc TestLogin(t *tes
 	"\tt.Run(\"[R01] login works\", func(t *testing.T) {})\n}\n"
 
 // agent-jobs' own scripts/manifest-check.sh fetches the modules, then runs the reference check, which
-// runs go test itself: a passing tagged test is exit 0.
+// runs go test itself: a passing tagged test is exit 0. Stopping the download's watchdog is quiet (dash
+// reports a waited-for job killed by a signal, "Terminated", unless told otherwise).
 func TestRepoManifestCheckRunsReference(t *testing.T) {
 	dir := manifestRepo(t, "module example.com/app\n\ngo 1.27\n", manifestTest)
 	out, code := runRepoManifest(t, dir, nil)
 	if code != 0 || !strings.Contains(out, "ok       R01  TestLogin/[R01]_login_works") ||
-		!strings.Contains(out, "manifest-check: 1 of 1 live requirements have a passing tagged test") {
+		!strings.Contains(out, "manifest-check: 1 of 1 live requirements have a passing tagged test") ||
+		!strings.Contains(out, "manifest-check: go test exit 0") {
 		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	for _, noise := range []string{"Terminated", "Killed"} {
+		if strings.Contains(out, noise) {
+			t.Errorf("output holds %q:\n%s", noise, out)
+		}
 	}
 }
 
