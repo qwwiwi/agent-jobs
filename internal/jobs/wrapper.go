@@ -382,11 +382,36 @@ func admitted(jobDir, token string, argv []string) error {
 		}
 	}
 	if j.Runner == store.RunnerCodex {
-		sandbox, err := codexArgvSandbox(argv)
+		sandbox, addDirs, err := codexArgvSandbox(argv)
+		if err == nil {
+			err = admittedCodexAddDirs(abs, sandbox, addDirs)
+		}
 		if err != nil {
 			return fmt.Errorf("codex command line was not authorized by the launching daemon: %w", err)
 		}
 		return admittedCodex(st, j, token, sandbox)
+	}
+	return nil
+}
+
+// admittedCodexAddDirs checks a codex launch's extra writable roots (`--add-dir`) against what CodexArgs
+// builds (issue #92): none, or under workspace-write exactly one, the job's own progress folder, which
+// must be a real directory (a symlink there would widen the root to its target).
+func admittedCodexAddDirs(jobDir, sandbox string, addDirs []string) error {
+	if len(addDirs) == 0 {
+		return nil
+	}
+	want := codexProgressRoot(sandbox, jobDir)
+	if want == "" || len(addDirs) > 1 {
+		return fmt.Errorf("codex writable roots %q under sandbox %q", addDirs, sandbox)
+	}
+	// Absolute only: codex resolves a relative root against its own working dir, not the wrapper's.
+	if got := addDirs[0]; !filepath.IsAbs(got) || filepath.Clean(got) != want {
+		return fmt.Errorf("codex writable root %q is not the job's progress folder", got)
+	}
+	fi, err := os.Lstat(want)
+	if err != nil || !fi.IsDir() {
+		return fmt.Errorf("codex writable root %q is not a real directory", addDirs[0])
 	}
 	return nil
 }
@@ -415,13 +440,15 @@ func admittedCodex(st *store.Store, j *store.Job, token, sandbox string) error {
 
 // codexArgvSandbox is the sandbox of a codex command line (argv[0] is the binary), read with codex's
 // option boundaries: options end at `--` (what follows is the prompt); `-s X`, `-sX`, `-s=X`,
-// `--sandbox X` and `--sandbox=X` name the sandbox. Only the options CodexArgs builds are known and
-// anything else is an error, since an unknown option may take a value or change the sandbox: a sandbox
-// or approval bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo, --full-auto), a profile,
-// a `-c` / `--config` override of a sandbox or profile key, a value starting with "-", a repeated or
-// missing sandbox, and a positional other than the leading `exec` and the stdin prompt "-".
-func codexArgvSandbox(argv []string) (string, error) {
+// `--sandbox X` and `--sandbox=X` name the sandbox; `--add-dir X` values (extra writable roots) are
+// returned for admittedCodexAddDirs. Only the options CodexArgs builds are known and anything else is
+// an error, since an unknown option may take a value or change the sandbox: a sandbox or approval
+// bypass flag (--dangerously-bypass-approvals-and-sandbox, --yolo, --full-auto), a profile, a `-c` /
+// `--config` override of a sandbox or profile key, a value starting with "-", a repeated or missing
+// sandbox, and a positional other than the leading `exec` and the stdin prompt "-".
+func codexArgvSandbox(argv []string) (string, []string, error) {
 	sandbox, seenSandbox := "", false
+	var addDirs []string
 	for i := 1; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--" {
@@ -431,7 +458,7 @@ func codexArgvSandbox(argv []string) (string, error) {
 			continue
 		}
 		if !strings.HasPrefix(a, "-") || a == "-" {
-			return "", fmt.Errorf("unexpected codex argument %q", a)
+			return "", nil, fmt.Errorf("unexpected codex argument %q", a)
 		}
 		name, value, attached := a, "", false
 		if strings.HasPrefix(a, "--") {
@@ -444,42 +471,44 @@ func codexArgvSandbox(argv []string) (string, error) {
 		switch name {
 		case "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check":
 			if attached {
-				return "", fmt.Errorf("codex option %q takes no value", a)
+				return "", nil, fmt.Errorf("codex option %q takes no value", a)
 			}
 			continue
-		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable":
+		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable", "--add-dir":
 		default:
-			return "", fmt.Errorf("codex option %q is not one the daemon passes", a)
+			return "", nil, fmt.Errorf("codex option %q is not one the daemon passes", a)
 		}
 		if !attached {
 			if i+1 >= len(argv) {
-				return "", fmt.Errorf("codex option %s has no value", name)
+				return "", nil, fmt.Errorf("codex option %s has no value", name)
 			}
 			i++
 			value = argv[i]
 		}
 		if value == "" || strings.HasPrefix(value, "-") {
-			return "", fmt.Errorf("codex option %s has value %q", name, value)
+			return "", nil, fmt.Errorf("codex option %s has value %q", name, value)
 		}
 		switch name {
 		case "-s", "--sandbox":
 			if seenSandbox {
-				return "", errors.New("codex sandbox given more than once")
+				return "", nil, errors.New("codex sandbox given more than once")
 			}
 			sandbox, seenSandbox = value, true
 		case "-c", "--config":
 			key, _, _ := strings.Cut(value, "=")
 			for _, part := range strings.Split(key, ".") {
 				if part = strings.Trim(part, " \t\"'"); strings.Contains(part, "sandbox") || part == "profile" {
-					return "", fmt.Errorf("codex config override %q changes the sandbox", key)
+					return "", nil, fmt.Errorf("codex config override %q changes the sandbox", key)
 				}
 			}
+		case "--add-dir":
+			addDirs = append(addDirs, value)
 		}
 	}
 	if !seenSandbox {
-		return "", errors.New("codex sandbox not given")
+		return "", nil, errors.New("codex sandbox not given")
 	}
-	return sandbox, nil
+	return sandbox, addDirs, nil
 }
 
 // RunWrapper runs claude with prompt.md on stdin, stdout→stream.jsonl, stderr→stderr.log,
@@ -865,12 +894,16 @@ func TempEnv(env []string, dir string) []string {
 
 // ensureJobTmp creates the job's temp dir (0700) if it is missing and returns its absolute path. The
 // job can write its folder: anything there but a real directory (a symlink) is refused.
-func ensureJobTmp(jobDir string) (string, error) {
+func ensureJobTmp(jobDir string) (string, error) { return ensureJobSubdir(jobDir, JobTmpDir) }
+
+// ensureJobSubdir creates the folder name (0700) in the job dir if it is missing and returns its
+// absolute path; anything there but a real directory (a symlink) is refused.
+func ensureJobSubdir(jobDir, name string) (string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return "", err
 	}
-	p := filepath.Join(abs, JobTmpDir)
+	p := filepath.Join(abs, name)
 	if err := os.Mkdir(p, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return "", err
 	}

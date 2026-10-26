@@ -360,6 +360,9 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if err != nil {
 		return "", err
 	}
+	if pre, err = codexPreamble(pre, j, m.JobDir(j.ID)); err != nil {
+		return "", err
+	}
 	sub, err := template("prompts/subagents.md")
 	if err != nil {
 		return "", err
@@ -470,6 +473,11 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	}
 	if _, err := ensureJobTmp(dir); err != nil {
 		return fmt.Errorf("create job temp dir: %w", err)
+	}
+	if codexProgressWritable(j) {
+		if _, err := ensureJobSubdir(dir, CodexProgressDir); err != nil {
+			return fmt.Errorf("create codex progress dir: %w", err)
+		}
 	}
 	// The sources were cloned while the job was queued (prefetchSources, outside the lifecycle lock): the
 	// prompt says where each clone is, or why it is not.

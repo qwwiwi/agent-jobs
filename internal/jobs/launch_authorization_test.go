@@ -153,7 +153,7 @@ func TestWrapperRejectsUntrustedLaunchAuthorization(t *testing.T) {
 				}
 				bin, args := m.Cfg.claudeBin(), ClaudeArgs(j, m.JobDir(j.ID))
 				if runner == store.RunnerCodex {
-					bin, args = m.Cfg.codexBin(), CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort), CodexSandbox(j.Kind))
+					bin, args = m.Cfg.codexBin(), CodexArgs(j, m.Cfg.reasoningEffort(j.ReasoningEffort), CodexSandbox(j.Kind), m.JobDir(j.ID))
 				}
 				argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", j.LaunchToken, "--runner", runner, "--", bin}
 				cmd := exec.Command(selfBin, append(argv, args...)...)
@@ -244,7 +244,7 @@ func TestWrapperChecksCodexSandboxAuthorization(t *testing.T) {
 			if err := m.prepare(j, token, m.JobDir(j.ID)); err != nil {
 				t.Fatal(err)
 			}
-			args := append(CodexArgs(j, "high", CodexSandboxFullAccess), c.extra...)
+			args := append(CodexArgs(j, "high", CodexSandboxFullAccess, m.JobDir(j.ID)), c.extra...)
 			argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", token, "--runner", store.RunnerCodex, "--", m.Cfg.codexBin()}
 			cmd := exec.Command(selfBin, append(argv, args...)...)
 			cmd.Dir, cmd.Env = filepath.Join(m.JobDir(j.ID), "work"), m.spawnEnv("")
@@ -290,7 +290,8 @@ func TestWrapperRefusesCodexSandboxBypass(t *testing.T) {
 		{"-sX and --sandbox=X", []string{"exec", "-sread-only", "--sandbox=danger-full-access", "-"}, false},
 		{"no sandbox, -s only after --", []string{"exec", "--", "-sread-only"}, false},
 		{"value swallowing a flag", []string{"exec", "-s", "read-only", "-m", "--yolo", "-"}, false},
-		{"unknown option", []string{"exec", "-s", "read-only", "--add-dir", "/", "-"}, false},
+		{"unknown option", []string{"exec", "-s", "read-only", "--cd", "/", "-"}, false},
+		{"writable root on read-only", []string{"exec", "-s", "read-only", "--add-dir", "/", "-"}, false},
 		{"-s X", []string{"exec", "-s", "read-only", "-"}, true},
 		{"-sX", []string{"exec", "-sread-only", "-"}, true},
 		{"--sandbox X", []string{"exec", "--sandbox", "read-only", "-"}, true},
@@ -310,7 +311,7 @@ func TestWrapperRefusesCodexSandboxBypass(t *testing.T) {
 			}
 			args := c.args
 			if args == nil {
-				args = CodexArgs(j, "high", CodexSandbox(j.Kind))
+				args = CodexArgs(j, "high", CodexSandbox(j.Kind), m.JobDir(j.ID))
 			}
 			argv := []string{"run-wrapper", m.JobDir(j.ID), "--token", token, "--runner", store.RunnerCodex, "--", m.Cfg.codexBin()}
 			cmd := exec.Command(selfBin, append(argv, args...)...)

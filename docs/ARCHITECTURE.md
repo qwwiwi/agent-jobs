@@ -193,9 +193,12 @@ A job runs on `codex exec` instead of `claude -p` when its model starts with `gp
 ```
 codex exec --json --ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check \
   -s read-only|workspace-write -c 'approval_policy="never"' -c 'mcp_servers={}' \
+  [--add-dir <jobdir>/progress]  # workspace-write only (issue #92)
   --disable apps --disable browser_use … --disable hooks \
   -m M -c model_reasoning_effort=E - < prompt.md
 ```
+
+Progress file (issue #92): `workspace-write` makes only the work dir (and the temp dirs) writable, so the preamble's `<jobdir>/PROGRESS.md` cannot be written by a codex job. A write kind (fix, general) therefore gets `<jobdir>/progress/` (`CodexProgressDir`, created by `prepare` as a real 0700 directory) as its one extra writable root, and `codexPreamble` swaps the preamble's progress bullet for one naming `<jobdir>/progress/PROGRESS.md` (`CodexProgressPath`); a read-only kind gets no root and a bullet saying it keeps no progress file. The wrapper (`codexArgvSandbox`, `admittedCodexAddDirs`) admits `--add-dir` only once, only under `workspace-write`, only as exactly that folder's absolute path, and only when it is a real directory. Codex jobs are never auto-continued and get no stop report, so the daemon does not read this file; it is for the orchestrator.
 
 Isolation: a codex job never inherits the owner's codex setup. `--ignore-user-config` drops `~/.codex/config.toml` (and with it the owner's MCP servers, apps, plugins, profiles and approval settings), `--ignore-rules` drops the owner's rules files, `--ephemeral` writes no session files, `approval_policy="never"` keeps it non-interactive, `mcp_servers={}` leaves no MCP server, and `--disable <f>` turns off every feature in `CodexDisabledFeatures` (`internal/jobs/codex.go`: `apps`, `browser_use`, `browser_use_external`, `browser_use_full_cdp_access`, `computer_use`, `image_generation`, `multi_agent`, `plugins`, `plugin_sharing`, `remote_plugin`, `skill_mcp_dependency_install`, `daemon_auto_start`, `in_app_local_automation`, `goals`, `realtime_conversation`, `worktrees`, `hooks`). An inherited write-capable MCP tool, app or plugin would act outside the shell sandbox; without them the sandbox is the whole containment. The exact command line was run by hand on codex-cli 0.162.1: it authenticates, and the stray MCP transport error seen without these flags is gone. Model and effort still come from the job (`-m`, `-c model_reasoning_effort=…`).
 
