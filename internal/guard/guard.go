@@ -1302,8 +1302,13 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	// Any other program (find -exec, flock, trap 'git push' EXIT, python -c, awk system(), vim -c '!…',
 	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
-	// arguments is rejected.
+	// arguments is rejected. A literal file or package operand of a program that never runs its
+	// operands is data (`go test ./cmd/agent-jobs/`, `sed -n 1p cmd/agent-jobs/x.go`; see operands).
+	ops := operands(name, argv[1:], dyn[1:])
 	for k, a := range argv[1:] {
+		if k < len(ops) && ops[k] {
+			continue
+		}
 		if b := progName(a); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
 			(dyn[k+1] && mentionsExec(a)) {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
