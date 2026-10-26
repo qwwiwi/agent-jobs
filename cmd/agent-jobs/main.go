@@ -1975,6 +1975,9 @@ func cmdDoctor(args []string) error {
 	for _, r := range rep.DeadRows {
 		fmt.Printf("row   %s  pid %d  %s  (%s)\n", r.ID, r.PID, r.Reason, r.Title)
 	}
+	for _, id := range rep.PendingContainers {
+		fmt.Printf("containers %s  sandbox containers not removed yet (containers.pending; retried every tick)\n", id)
+	}
 	for _, g := range rep.Ghosts {
 		state := ""
 		switch {

@@ -82,6 +82,9 @@ func TestSourcesEmbeddedBareRepo(t *testing.T) {
 			t.Fatal(res.Err)
 		}
 		jobDir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(jobDir, SourcesDir), 0o700); err != nil { // a job with sources
+			t.Fatal(err)
+		}
 		env, err := GitEnv(jobDir, os.Environ())
 		if err != nil {
 			t.Fatal(err)
@@ -304,7 +307,9 @@ func dockerRemoved(logPath, id string) bool {
 func TestSourcesContainersRemoved(t *testing.T) {
 	t.Run("[G02] the job's containers (and only them) are removed with docker rm -f", func(t *testing.T) {
 		logPath := fakeDocker(t)
-		removeJobContainers("261026-1", func(string, ...any) {})
+		if err := removeJobContainers("261026-1"); err != nil {
+			t.Fatal(err)
+		}
 		if !dockerRemoved(logPath, "261026-1") {
 			b, _ := os.ReadFile(logPath)
 			t.Fatalf("docker log:\n%s", b)
@@ -315,7 +320,9 @@ func TestSourcesContainersRemoved(t *testing.T) {
 	})
 	t.Run("[G02] no docker on PATH: removing is a no-op", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		removeJobContainers("261026-2", func(string, ...any) {})
+		if err := removeJobContainers("261026-2"); err != nil {
+			t.Fatal(err)
+		}
 	})
 	t.Run("[G02] a cancelled job and a finished job with sources get their containers removed", func(t *testing.T) {
 		m := newManager(t)
@@ -329,6 +336,10 @@ func TestSourcesContainersRemoved(t *testing.T) {
 		}
 		waitFor(t, "running", 15*time.Second, func() bool { return get(t, m, j.ID).Status == store.StatusRunning })
 		if err := m.Cancel(j.ID); err != nil {
+			t.Fatal(err)
+		}
+		// Settle marks the cleanup; the next tick removes the containers outside the lifecycle lock.
+		if err := m.Tick(); err != nil {
 			t.Fatal(err)
 		}
 		if !dockerRemoved(logPath, j.ID) {

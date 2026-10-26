@@ -79,7 +79,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		Name: "system_doctor",
 		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue " +
 			"(configured_max_running is the value of config.json as this MCP server last loaded it, reloaded when the file changes; the daemon's active cap is max_running in /v1/health), " +
-			"processes that outlived their job or session and running rows with a dead pid (doctor procs, report only: " +
+			"processes that outlived their job or session and running rows with a dead pid, and jobs whose sandbox " +
+			"containers are not removed yet (pending_containers, each a problem) (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
 			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
@@ -103,6 +104,10 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.Procs, err = m.DoctorProcs(false); err != nil {
 			return nil, out, fmt.Errorf("doctor procs: %w", err)
+		}
+		for _, id := range out.Procs.PendingContainers {
+			out.Problems = append(out.Problems, "job "+id+": sandbox containers not removed yet (containers.pending; docker "+
+				"failed, retried every tick)")
 		}
 		if out.Undelivered, err = m.UndeliveredNotifications(); err != nil {
 			out.Problems = append(out.Problems, "owner notifications: "+err.Error())

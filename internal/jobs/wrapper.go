@@ -576,7 +576,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	}
 	// A sandbox container is not in the job's process group: it goes with the job (G02).
 	if j, err := st.Get(id); err == nil && len(j.Sources) > 0 {
-		removeJobContainers(id, func(f string, a ...any) { fmt.Fprintf(stderrLog, "run-wrapper: "+f+"\n", a...) })
+		cleanupContainers(jobDir, id, func(f string, a ...any) { fmt.Fprintf(stderrLog, "run-wrapper: "+f+"\n", a...) })
 	}
 	// Nothing the job started may outlive it: every other process of the wrapper's session goes now,
 	// before trusted completion says the job is over (a markerless orphan could otherwise start a nested job
@@ -966,7 +966,10 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
 		"GIT_TERMINAL_PROMPT=0",
 	)
-	overrides := append(gitOverrides(hooks), jobGitOverrides...)
+	overrides := gitOverrides(hooks)
+	if fi, err := os.Lstat(filepath.Join(abs, SourcesDir)); err == nil && fi.IsDir() {
+		overrides = append(overrides, jobGitOverrides...)
+	}
 	out = append(out, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))
 	for i, kv := range overrides {
 		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
@@ -997,6 +1000,8 @@ func gitOverrides(hooks string) [][2]string {
 // repositories it finds by their path): git never takes a folder for a bare repository by itself, so one
 // laid out inside a cloned source (sources/<name>/x with HEAD, objects, refs and a config with a diff
 // textconv, G02) cannot run its programs on the host. A bare repository works with --git-dir or GIT_DIR.
+// Only for a job with sources (<jobdir>/sources, made before the job starts): elsewhere it would break git
+// run inside a .git folder or a bare repository for every job.
 var jobGitOverrides = [][2]string{{"safe.bareRepository", "explicit"}}
 
 // ensureGitFiles creates an empty read-only gitconfig and an empty read-only hooks dir when missing.

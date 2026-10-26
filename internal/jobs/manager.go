@@ -77,6 +77,9 @@ type Manager struct {
 	// waits for it.
 	prefetching atomic.Bool
 	prefetchWG  sync.WaitGroup
+	// sourcesRetryAt holds, per job id, when clones that could not record their outcome are tried again
+	// (time.Time, sourcesRetryBackoff after the failure).
+	sourcesRetryAt sync.Map
 	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
 	beforeClaim func(*store.Job)
 
@@ -493,6 +496,9 @@ func (m *Manager) Tick() error {
 		m.prefetchSources()
 	}
 	err := m.tickLocked()
+	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
+	// docker call may take up to containerCmdTimeout.
+	m.retryContainerCleanups()
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {

@@ -55,6 +55,9 @@ const (
 	sourceLookupTimeout = 30 * time.Second
 	// containerCmdTimeout bounds each docker call that removes a job's containers.
 	containerCmdTimeout = 20 * time.Second
+	// sourcesRetryBackoff is how long a queued job's clones wait after sources.json could not be written or its
+	// row read: they are not made again every tick.
+	sourcesRetryBackoff = time.Minute
 )
 
 // sourceCloneTimeout bounds all the clones of one job together (a variable for tests).
@@ -69,10 +72,12 @@ var sourceLookup = func(ctx context.Context, host string) ([]netip.Addr, error) 
 }
 
 // internalNets are address ranges, besides loopback, private, link-local, multicast and unspecified ones,
-// that a source host may not resolve to: shared address space (CGNAT, the tailnet), "this network" and
-// broadcast.
+// that a source host may not resolve to: shared address space (CGNAT, the tailnet), "this network",
+// benchmarking (198.18/15), reserved and broadcast (240/4), and the IPv6 forms that embed an IPv4 address
+// a gateway may route to (NAT64 64:ff9b::/96, 6to4 2002::/16).
 var internalNets = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("0.0.0.0/8"),
-	netip.MustParsePrefix("255.255.255.255/32")}
+	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("2002::/16")}
 
 // publicAddr reports an address a clone may connect to: none of loopback, private (RFC 1918, fc00::/7),
 // link-local (169.254/16, fe80::/10), multicast, unspecified or internalNets, also IPv4-mapped.
@@ -108,7 +113,7 @@ func sourcePin(ctx context.Context, remote string) (string, error) {
 	for _, a := range addrs {
 		if !publicAddr(a) {
 			return "", fmt.Errorf("not cloned: %s resolves to %s, an internal address (loopback, private, link-local, "+
-				"shared 100.64/10, multicast or unspecified)", host, a)
+				"shared 100.64/10, multicast, reserved or unspecified)", host, a)
 		}
 		if a = a.Unmap(); !pick.IsValid() || (a.Is4() && !pick.Is4()) {
 			pick = a
@@ -134,21 +139,26 @@ func cloneArgs(tmpl, remote, target, pin string) []string {
 		"--template="+tmpl, "--", remote, target)
 }
 
+// containersPendingFile (<jobdir>/containers.pending) marks a job whose sandbox containers are still to be
+// removed: settle writes it (no docker call under the lifecycle lock), a cleanup that fails leaves it, and
+// each tick retries it out of the lock (retryContainerCleanups) until docker has removed them.
+const containersPendingFile = "containers.pending"
+
 // removeJobContainers removes the job's sandbox containers (named aj-<job id>-..., guard.ContainerPrefix)
 // with `docker rm -f`, whatever state they are in: `--rm` ends a container only when it exits, and killing
-// the job kills only the docker client. Without docker on PATH nothing happens; errors are logged.
-func removeJobContainers(jobID string, logf func(string, ...any)) {
+// the job kills only the docker client. Without docker on PATH there is nothing to remove. Each docker call
+// is bounded by containerCmdTimeout.
+func removeJobContainers(jobID string) error {
 	bin, err := exec.LookPath("docker")
 	if err != nil {
-		return
+		return nil
 	}
 	prefix := guard.ContainerPrefix(jobID)
 	ctx, cancel := context.WithTimeout(context.Background(), containerCmdTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, "ps", "-a", "--filter", "name="+prefix, "--format", "{{.Names}}").Output()
 	if err != nil {
-		logf("job %s: list sandbox containers: %v", jobID, err)
-		return
+		return fmt.Errorf("list sandbox containers: %w", err)
 	}
 	var names []string
 	for _, n := range strings.Fields(string(out)) {
@@ -157,12 +167,78 @@ func removeJobContainers(jobID string, logf func(string, ...any)) {
 		}
 	}
 	if len(names) == 0 {
-		return
+		return nil
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), containerCmdTimeout)
 	defer cancel()
 	if out, err := exec.CommandContext(ctx, bin, append([]string{"rm", "-f"}, names...)...).CombinedOutput(); err != nil {
-		logf("job %s: remove sandbox containers %v: %v: %s", jobID, names, err, RedactPrintable(string(out), 200))
+		return fmt.Errorf("remove sandbox containers %v: %w: %s", names, err, RedactPrintable(string(out), 200))
+	}
+	return nil
+}
+
+// markContainersPending writes the job's containers.pending marker; a job without a folder never ran a
+// container (the mount is a folder of the job dir), so it needs none.
+func markContainersPending(dir string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return writeFileReplace(filepath.Join(dir, containersPendingFile), nil)
+}
+
+// cleanupContainers removes the job's sandbox containers and reports success: a failure is logged and
+// leaves containers.pending in dir (the daemon retries it every tick), a success removes the marker.
+func cleanupContainers(dir, jobID string, logf func(string, ...any)) bool {
+	if err := removeJobContainers(jobID); err != nil {
+		logf("job %s: %v (retried every tick)", jobID, err)
+		if merr := markContainersPending(dir); merr != nil {
+			logf("job %s: write %s: %v", jobID, containersPendingFile, merr)
+		}
+		return false
+	}
+	if err := os.Remove(filepath.Join(dir, containersPendingFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		logf("job %s: remove %s: %v", jobID, containersPendingFile, err)
+	}
+	return true
+}
+
+// PendingContainerCleanups lists the jobs whose sandbox containers are still to be removed
+// (containers.pending), sorted.
+func (m *Manager) PendingContainerCleanups() ([]string, error) {
+	marks, err := filepath.Glob(filepath.Join(m.StateDir, "jobs", "*", containersPendingFile))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(marks))
+	for _, p := range marks {
+		ids = append(ids, filepath.Base(filepath.Dir(p)))
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// retryContainerCleanups removes the containers of the jobs marked containers.pending, outside the
+// lifecycle lock (Tick). A job queued or running again (a resume) keeps its marker until it ends: its
+// wrapper and settle remove its containers then. The pass stops at the first failure: docker is likely
+// down and each call may wait containerCmdTimeout; the rest are retried next tick.
+func (m *Manager) retryContainerCleanups() {
+	ids, err := m.PendingContainerCleanups()
+	if err != nil {
+		m.Log.Printf("sandbox containers: list pending cleanups: %v", err)
+		return
+	}
+	for _, id := range ids {
+		j, err := m.Store.Get(id)
+		switch {
+		case err != nil && !errors.Is(err, store.ErrNotFound):
+			m.Log.Printf("job %s: sandbox containers: read the job: %v (retried next tick)", id, err)
+			continue
+		case err == nil && (j.Status == store.StatusRunning || j.Status == store.StatusQueued):
+			continue
+		}
+		if !cleanupContainers(m.JobDir(id), id, m.Log.Printf) {
+			return
+		}
 	}
 }
 
@@ -509,10 +585,18 @@ func (m *Manager) prefetchSources() {
 		return
 	}
 	for _, j := range queued {
+		if at, ok := m.sourcesRetryAt.Load(j.ID); ok && m.Now().Before(at.(time.Time)) {
+			continue
+		}
 		if needsClone(j) && !m.sourcesCloned(j) {
 			m.prefetchJob(j)
 		}
 	}
+}
+
+// sourcesBackOff has the job's clones wait sourcesRetryBackoff: their outcome could not be recorded.
+func (m *Manager) sourcesBackOff(j *store.Job) {
+	m.sourcesRetryAt.Store(j.ID, m.Now().Add(sourcesRetryBackoff))
 }
 
 // prefetchInBackground runs prefetchSources in a goroutine, one run at a time per daemon.
@@ -594,13 +678,17 @@ func (m *Manager) prefetchJob(j *store.Job) {
 	}
 	if gone, err := left(); err != nil || gone {
 		if err != nil {
-			m.Log.Printf("job %s: sources: read the job: %v (cloned again next tick)", j.ID, err)
+			m.Log.Printf("job %s: sources: read the job: %v (cloned again in %s)", j.ID, err, sourcesRetryBackoff)
+			m.sourcesBackOff(j)
 		}
 		return // cancelled meanwhile: nothing launches it
 	}
 	if err := writeJSON(filepath.Join(dir, sourcesResultFile), res); err != nil {
-		m.Log.Printf("job %s: sources: %v", j.ID, err)
+		m.Log.Printf("job %s: sources: %v (cloned again in %s)", j.ID, err, sourcesRetryBackoff)
+		m.sourcesBackOff(j)
+		return
 	}
+	m.sourcesRetryAt.Delete(j.ID)
 }
 
 // clonedSources reads the outcome of the job's clones (sources.json), which prefetchJob wrote before the
@@ -665,7 +753,9 @@ func renderSources(dir string, res []sourceResult) string {
 		"be given a path under sources/ or sandbox/; the guard refuses running a file there, and an interpreter, package "+
 		"install, build or test run pointed at or working there. git works on a clone only at its root (git -C "+
 		"sources/<name> log); a source file is never linked (ln, cp -l), and a command that reads sources/ or sandbox/ "+
-		"writes files (>, -o) only inside sandbox/. To run it, copy the clone into %s (each as a separate "+
+		"writes files (>, -o) only inside sandbox/. The guard is fail-closed: a call that writes outside sandbox/ "+
+		"takes no variable, substitution, glob or brace in a path, and cp takes only plain copy options (-R, -a, "+
+		"-p); write paths out literally. To run it, copy the clone into %s (each as a separate "+
 		"Bash command) and run it in a throwaway container that sees only the copy, with no host env, secrets, network "+
 		"or other host dirs:\n\n"+
 		"```\ncp -R %s/<name> %s/<name>\nchmod -R u+w %s/<name>\n"+
