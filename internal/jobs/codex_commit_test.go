@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -287,6 +288,92 @@ func TestCodexWriteJobCommittedByWrapper(t *testing.T) {
 			t.Fatalf("a filter driver ran: %v", err)
 		}
 	})
+}
+
+// A nested repository the job lays out in work/ never makes the wrapper's git recurse into it: git runs a
+// submodule's status with the submodule's own config and without the command-level overrides, so a filter
+// driver there would run outside the sandbox. The wrapper finds the nested .git before any git command and
+// commits nothing, both for a new nested repository and for one in a submodule path of the repository.
+func TestCodexCommitSkipsNestedRepository(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		sub  bool // the repository has a submodule at sub/ (its worktree has an empty sub/)
+	}{
+		{"new nested repository", false},
+		{"submodule path", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newCodexManager(t)
+			m.Cfg.CodexWriteAllowed = true
+			repo := newRepo(t)
+			if c.sub {
+				subRepo := newRepo(t)
+				head := gitT(t, subRepo, "rev-parse", "HEAD")
+				gitT(t, repo, "update-index", "--add", "--cacheinfo", "160000,"+head+",sub")
+				gitT(t, repo, "commit", "-qm", "add submodule")
+			}
+			j := enqueue(t, m, "work", codexFix(repo))
+			j.BaseCommit = gitT(t, repo, "rev-parse", "HEAD")
+			const token = "tok"
+			if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			j = get(t, m, j.ID)
+			dir := m.JobDir(j.ID)
+			if err := m.prepare(j, token, dir); err != nil {
+				t.Fatal(err)
+			}
+			work := filepath.Join(dir, "work")
+			// What the job does in its sandbox: a repository at sub/ whose config names a clean filter for
+			// every file, a file in it, and a changed file in the outer worktree.
+			nested := filepath.Join(work, "sub")
+			if err := os.MkdirAll(nested, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(t.TempDir(), "driver-ran")
+			if err := os.WriteFile(filepath.Join(nested, "f.txt"), []byte("nested\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{{"init", "-q"}, {"add", "f.txt"},
+				{"-c", "user.name=J", "-c", "user.email=j@example.com", "commit", "-qm", "nested"}} {
+				cmd := exec.Command("git", append([]string{"-C", nested}, args...)...)
+				cmd.Env = daemonGitEnv()
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v %s", args, err, out)
+				}
+			}
+			// The filter after the commit; f.txt then only stat-dirty, so a status in sub/ cleans it.
+			f, err := os.OpenFile(filepath.Join(nested, ".git", "config"), os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = f.WriteString("[filter \"x\"]\n\tclean = touch " + marker + "; cat\n")
+			_ = f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(nested, ".git", "info", "attributes"), []byte("* filter=x\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			later := time.Now().Add(time.Minute)
+			if err := os.Chtimes(filepath.Join(nested, "f.txt"), later, later); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(work, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			line := commitCodexWork(dir, j.ID)
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Errorf("the nested repository's filter ran in the wrapper: %v", err)
+			}
+			if !strings.Contains(line, "codex commit skipped: the worktree holds a nested git repository (sub/.git)") {
+				t.Fatalf("commit line %q", line)
+			}
+			if got := gitT(t, work, "rev-parse", "HEAD"); got != j.BaseCommit {
+				t.Fatalf("HEAD moved to %s", got)
+			}
+		})
+	}
 }
 
 // The commit message is the job's file unless it is a link, empty, names an owner or the owner names are

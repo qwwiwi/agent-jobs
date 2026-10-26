@@ -62,6 +62,13 @@ func commitCodexWork(jobDir, id string) string {
 	if err != nil {
 		return fmt.Sprintf("codex commit skipped: worktree.json: %v", err)
 	}
+	// Before any git command: git runs a submodule's status (and so its filter drivers) with the
+	// submodule's own config and without GitEnv's command-level overrides.
+	if nested, err := nestedGitDir(work); err != nil {
+		return fmt.Sprintf("codex commit skipped: worktree scan: %v", err)
+	} else if nested != "" {
+		return "codex commit skipped: the worktree holds a nested git repository (" + nested + ")"
+	}
 	env, err := GitEnv(abs, os.Environ())
 	if err != nil {
 		return fmt.Sprintf("codex commit skipped: git environment: %v", err)
@@ -90,7 +97,7 @@ func commitCodexWork(jobDir, id string) string {
 	if drivers := driverKeys([]byte(cfg)); len(drivers) > 0 {
 		return "codex commit skipped: the repository config names filter/diff drivers (" + strings.Join(drivers, ", ") + ")"
 	}
-	status, err := run("status", "--porcelain", "--untracked-files=all", "-z")
+	status, err := run("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=all", "-z")
 	if err != nil {
 		return "codex commit skipped: " + err.Error()
 	}
@@ -119,6 +126,32 @@ func commitCodexWork(jobDir, id string) string {
 		return "codex commit made, HEAD unreadable: " + err.Error()
 	}
 	return "codex commit: committed the job's changes as " + strings.TrimSpace(head)
+}
+
+// nestedGitDir returns the first `.git` (a dir or a file) below work other than work/.git itself,
+// relative to work and slash-separated, or "". Links are not followed (WalkDir does not).
+func nestedGitDir(work string) (string, error) {
+	var found string
+	err := filepath.WalkDir(work, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.Name() != ".git":
+			return nil
+		case filepath.Dir(p) == work && d.IsDir():
+			return filepath.SkipDir
+		case filepath.Dir(p) == work:
+			return nil
+		}
+		rel, err := filepath.Rel(work, p)
+		if err != nil {
+			return err
+		}
+		found = filepath.ToSlash(rel)
+		return filepath.SkipAll
+	})
+	return found, err
 }
 
 // codexCommitMessage is the commit message of a codex write job: its CodexCommitMessageFile (a regular
