@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -72,18 +73,39 @@ var r08Cuts = []cutCheck{
 		}
 	}},
 	{"Owner waivers bind to (checklist hash, requirement)", func(t *testing.T) {
-		// release_check reads the waivers by repo, checklist id, hash and version: a waiver stored with the
-		// sha of an older commit still covers its requirement.
+		// release_check at a newer commit still takes a waiver stored with the sha of an older one.
 		m := newManager(t)
-		if err := m.Store.PutWaiver(store.Waiver{Repo: "/r", ChecklistID: "demo", ChecklistSHA256: "h1", ChecklistVersion: 2,
-			SHA: strings.Repeat("a", 40), Requirement: "R01", Quote: "waive R01", CreatedAt: m.Now()}); err != nil {
+		repo := sizeRepo(t, m)
+		older := gitT(t, repo, "rev-parse", "HEAD")
+		first, err := m.ReleaseCheck(repo, older)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if ws, err := m.Store.Waivers("/r", "demo", "h1", 2); err != nil || len(ws) != 1 || ws[0].Requirement != "R01" {
-			t.Errorf("waiver of an older sha: %+v %v", ws, err)
+		if err := m.Store.PutWaiver(store.Waiver{Repo: first.Repo, ChecklistID: first.ChecklistID, ChecklistSHA256: first.ChecklistSHA256,
+			ChecklistVersion: first.Version, SHA: older, Requirement: "R01", Quote: "waive R01", CreatedAt: m.Now()}); err != nil {
+			t.Fatal(err)
 		}
-		if ws, err := m.Store.Waivers("/r", "demo", "h2", 3); err != nil || len(ws) != 0 {
-			t.Errorf("a new checklist version kept the waiver: %+v %v", ws, err)
+		if err := os.WriteFile(filepath.Join(repo, "fix.go"), []byte("package main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitT(t, repo, "add", "fix.go")
+		gitT(t, repo, "commit", "-qm", "a fix after the waiver")
+		newer := gitT(t, repo, "rev-parse", "HEAD")
+		if newer == older {
+			t.Fatal("no new commit")
+		}
+		r, err := m.ReleaseCheck(repo, newer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waived := map[string]string{}
+		for _, req := range r.Requirements {
+			if req.Waived {
+				waived[req.ID] = req.WaiverQuote
+			}
+		}
+		if len(waived) != 1 || waived["R01"] != "waive R01" {
+			t.Errorf("release_check at %s after a waiver at %s: waived %v, want only R01\n%+v", newer, older, waived, r.Requirements)
 		}
 	}},
 	{"Merge gate: a command the reader cannot read no longer refuses.", func(t *testing.T) {
