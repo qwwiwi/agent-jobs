@@ -1061,7 +1061,7 @@ func checkStateReadIn(scripts []*script, cfg Config) string {
 						return reason
 					}
 				}
-				if reason := r.text(c.heredoc, at); reason != "" {
+				if reason := r.text(c.heredoc, at); reason != "" && !dataHeredoc(sc, pl, c) {
 					return reason
 				}
 				// xargs runs its command on what earlier stages print: a stage naming an ancestor of the

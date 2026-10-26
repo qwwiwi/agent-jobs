@@ -17,10 +17,16 @@ type simpleCmd struct {
 	dyn   []bool // dyn[i]: words[i] contains an expansion ($, `, substitution) the guard cannot resolve
 	// bare[i]: words[i] has an expansion outside double quotes (the shell may split or glob it into
 	// several words); a dyn word that is not bare stays one word.
-	bare    []bool
+	bare []bool
+	// glob[i]: words[i] has a glob or brace character (`*?[{`) outside quotes: the shell may expand
+	// it into other words, more of them too.
+	glob    []bool
 	raw     string // source text with single-quoted content removed (for `$?` detection)
 	heredoc string // bodies of the here-documents and words of the here-strings attached to this command
 	stdin   bool   // input redirected: `<file`, `<&fd`, here-doc or here-string
+	// expandingStdin: a here-string, or a here-doc whose body the shell expands or whose end the reader
+	// cannot place (unquoted body with $ or a backtick, a delimiter word with $); its text is not data.
+	expandingStdin bool
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
 	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
@@ -57,12 +63,17 @@ func (p *pipeline) raw() string {
 
 // script is a list of pipelines in execution order (separated by ; && || & newline).
 type script struct {
-	src       string
-	depth     int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
+	src   string
+	depth int // 0 = the command itself; >0 = inside a substitution, `sh -c`, `eval`
+	// subst: every level between the command and this script is a command or process substitution
+	// (no `sh -c`, `eval`, trap or runner body on the way).
+	subst     bool
 	pipelines []*pipeline
 	// literalBodies are byte ranges [start, end) of src the shell neither runs nor expands: the bodies of
 	// here-documents with a quoted delimiter (<<'E', <<"E", <<\E), each with its delimiter line.
 	literalBodies [][2]int
+	// vague names a form whose words bash and sh read differently (the reader follows bash), or "".
+	vague string
 }
 
 type redirKind int
@@ -98,6 +109,7 @@ type parser struct {
 	dyn      bool // current word contains an expansion
 	bare     bool // current word contains an expansion outside double quotes
 	quoted   bool // current word contains quoting
+	glob     bool // current word contains an unquoted `*?[{`
 	redir    redirKind
 	redirOut bool // the pending redirFile target is written to
 	redirIn  bool // the pending redirFile source is read (`<`, `<>`, `<<<`)
@@ -134,6 +146,7 @@ func (p *parser) endWord() {
 		p.cmd.words = append(p.cmd.words, w)
 		p.cmd.dyn = append(p.cmd.dyn, p.dyn)
 		p.cmd.bare = append(p.cmd.bare, p.bare)
+		p.cmd.glob = append(p.cmd.glob, p.glob)
 	case redirFile:
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
@@ -145,10 +158,11 @@ func (p *parser) endWord() {
 		}
 	case redirHereString: // its word is checked like a here-doc body
 		p.cmd.heredoc += w + "\n"
+		p.cmd.expandingStdin = true
 	case redirHeredoc, redirHeredocStrip:
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
-	p.started, p.dyn, p.bare, p.quoted = false, false, false, false
+	p.started, p.dyn, p.bare, p.quoted, p.glob = false, false, false, false, false
 	p.redir, p.redirOut, p.redirIn, p.redirDup = redirNone, false, false, false
 }
 
@@ -218,8 +232,8 @@ func matchParen(s string, open int) int {
 }
 
 // substitution consumes `$(...)`, `<(...)`, `>(...)` or a backtick block starting at p.i,
-// records its inner source and returns the literal text.
-func (p *parser) substitution() string {
+// records its inner source and returns the literal text. dq: the block is inside double quotes.
+func (p *parser) substitution(dq bool) string {
 	start := p.i
 	if p.src[p.i] == '`' {
 		end := p.i + 1
@@ -229,7 +243,7 @@ func (p *parser) substitution() string {
 			}
 			end++
 		}
-		inner := p.src[start+1 : min(end, len(p.src))]
+		inner := backtickText(p.src[start+1:min(end, len(p.src))], dq)
 		p.subs = append(p.subs, inner)
 		p.cmd.subSources = append(p.cmd.subSources, inner)
 		p.i = min(end+1, len(p.src))
@@ -250,19 +264,30 @@ func (p *parser) substitution() string {
 	return p.src[start:end]
 }
 
+// backtickText is the command a backtick block runs: bash removes the backslash of \\, \` and \$
+// (and of \" inside double quotes) before it parses the text, so an escaped backtick pair inside a
+// backtick block opens a substitution of its own (echo `git log \`git push\` HEAD` runs git push).
+// Any other backslash stays.
+func backtickText(raw string, dq bool) string {
+	if !strings.Contains(raw, `\`) {
+		return raw
+	}
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) && (strings.IndexByte("\\`$", raw[i+1]) >= 0 || dq && raw[i+1] == '"') {
+			i++
+		}
+		b.WriteByte(raw[i])
+	}
+	return b.String()
+}
+
 func (p *parser) readHeredocs() {
 	for _, h := range p.heredocs {
 		var body strings.Builder
 		start := p.i
 		for p.i < len(p.src) {
-			nl := strings.IndexByte(p.src[p.i:], '\n')
-			line := p.src[p.i:]
-			if nl >= 0 {
-				line = p.src[p.i : p.i+nl]
-				p.i += nl + 1
-			} else {
-				p.i = len(p.src)
-			}
+			line := p.heredocLine(!h.quoted)
 			cmp := line
 			if h.strip {
 				cmp = strings.TrimLeft(line, "\t")
@@ -275,6 +300,11 @@ func (p *parser) readHeredocs() {
 		}
 		h.cmd.heredoc += body.String()
 		h.cmd.stdin = true
+		// A backslash in an unquoted body is processed by bash (`\$`, a joined line), so its text is not
+		// the data written either.
+		if !h.exact || (!h.quoted && strings.ContainsAny(p.src[start:p.i], "$`\\")) {
+			h.cmd.expandingStdin = true
+		}
 		switch {
 		case h.quoted && h.exact:
 			p.out.literalBodies = append(p.out.literalBodies, [2]int{start, p.i})
@@ -287,6 +317,31 @@ func (p *parser) readHeredocs() {
 	p.heredocs = nil
 }
 
+// heredocLine reads the next here-doc line from p.i. join: the delimiter is unquoted, and bash then
+// removes each backslash-newline before it compares the line with the delimiter (`EO\` + `F` ends
+// <<EOF and the lines after it run as commands), as in the body it expands; `\\` is one escaped
+// backslash and joins nothing.
+func (p *parser) heredocLine(join bool) string {
+	var line strings.Builder
+	for p.i < len(p.src) {
+		nl := strings.IndexByte(p.src[p.i:], '\n')
+		part := p.src[p.i:]
+		if nl >= 0 {
+			part = p.src[p.i : p.i+nl]
+			p.i += nl + 1
+		} else {
+			p.i = len(p.src)
+		}
+		n := len(part) - len(strings.TrimRight(part, `\`))
+		if !join || n%2 == 0 || nl < 0 {
+			line.WriteString(part)
+			break
+		}
+		line.WriteString(part[:len(part)-1])
+	}
+	return line.String()
+}
+
 // bodySubstitutions returns the command substitutions of an unquoted here-doc body.
 func bodySubstitutions(body string) []string {
 	q := &parser{src: body, cmd: &simpleCmd{}}
@@ -295,7 +350,7 @@ func bodySubstitutions(body string) []string {
 		case body[q.i] == '\\':
 			q.i += 2
 		case body[q.i] == '$' && q.peek(1) == '(', body[q.i] == '`':
-			q.substitution()
+			q.substitution(false)
 		default:
 			q.i++
 		}
@@ -318,6 +373,7 @@ func isDigits(s string) bool {
 func (p *parser) run() {
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == ' ' || c == '\t':
 			p.endWord()
@@ -345,11 +401,16 @@ func (p *parser) run() {
 			p.i += end + 2
 		case c == '"':
 			p.double()
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+			p.started, p.dyn, p.bare = true, true, true
 		case c == '$' && p.peek(1) == '(', c == '`':
-			lit := p.substitution()
+			lit := p.substitution(false)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.started, p.dyn, p.bare = true, true, true
+		case c == '$' && p.peek(1) == '{' && p.paramExpansion(false):
+			// read as one unit, a blank or `#` in it included
 		case c == '#' && !p.started:
 			nl := strings.IndexByte(p.src[p.i:], '\n')
 			if nl < 0 {
@@ -409,6 +470,9 @@ func (p *parser) run() {
 		default:
 			if c == '$' {
 				p.dyn, p.bare = true, true
+			}
+			if strings.IndexByte("*?[{", c) >= 0 {
+				p.glob = true
 			}
 			p.word.WriteByte(c)
 			p.cmd.raw += string(c)
@@ -518,7 +582,7 @@ func sourceFeederWords(src string, over func() bool) (words []string) {
 
 func (p *parser) redirect() {
 	if p.peek(1) == '(' { // process substitution <(...) / >(...)
-		lit := p.substitution()
+		lit := p.substitution(false)
 		p.word.WriteString(lit)
 		p.started, p.dyn, p.bare = true, true, true
 		return
@@ -560,6 +624,7 @@ func (p *parser) double() {
 	p.started, p.quoted = true, true
 	for p.i < len(p.src) {
 		c := p.src[p.i]
+		p.continuedDollar()
 		switch {
 		case c == '"':
 			p.i++
@@ -570,11 +635,16 @@ func (p *parser) double() {
 			}
 			p.cmd.raw += p.src[p.i : p.i+2]
 			p.i += 2
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+			p.dyn = true
 		case c == '$' && p.peek(1) == '(', c == '`':
-			lit := p.substitution()
+			lit := p.substitution(true)
 			p.word.WriteString(lit)
 			p.cmd.raw += lit
 			p.dyn = true
+		case c == '$' && p.peek(1) == '{' && p.paramExpansion(true):
+			// read as one unit, a quote in it included
 		default:
 			if c == '$' {
 				p.dyn = true
@@ -587,6 +657,218 @@ func (p *parser) double() {
 			p.i++
 		}
 	}
+}
+
+// paramExpansion reads the `${…}` parameter expansion at p.i into the current word as one unit, as
+// bash does: up to the `}` that closes it, so a blank, `#`, `;`, `|` or quote inside is part of the
+// word (in `echo ${x:- #}; cmd` cmd runs). Substitutions inside are recorded like any other. dq: the
+// expansion is inside double quotes. An unterminated one reads nothing and reports false: the caller
+// reads on character by character as before.
+func (p *parser) paramExpansion(dq bool) bool {
+	i, word, raw, glob, vague := p.i, p.word.String(), p.cmd.raw, p.glob, p.out.vague
+	nSubs, nSrc, nIn := len(p.subs), len(p.cmd.subSources), len(p.cmd.inputSources)
+	p.word.WriteString("${")
+	p.cmd.raw += "${"
+	p.i += 2
+	if !p.braced(dq) {
+		p.i, p.cmd.raw, p.glob, p.out.vague = i, raw, glob, vague
+		p.word.Reset()
+		p.word.WriteString(word)
+		p.subs, p.cmd.subSources, p.cmd.inputSources = p.subs[:nSubs], p.cmd.subSources[:nSrc], p.cmd.inputSources[:nIn]
+		return false
+	}
+	p.started, p.dyn = true, true
+	if !dq || splitsQuoted(p.src[i+1:]) {
+		p.bare = true
+	}
+	// Unquoted, its `{` marked the word as a glob/brace word before; it still does.
+	p.glob = p.glob || !dq
+	return true
+}
+
+// pid reads `$$` at p.i into the word: bash reads it as one token (the PID), so a `{` right after it
+// is a plain character and does not start a ${…} (in `echo $${x:-;cmd;}` cmd runs).
+func (p *parser) pid() {
+	p.word.WriteString("$$")
+	p.cmd.raw += "$$"
+	p.i += 2
+}
+
+// continuedDollar marks the script vague at a `$` before a backslash-newline: bash joins the lines
+// first, so `$\` + newline + `{` or `$` is a ${…} or $$ the reader does not see.
+func (p *parser) continuedDollar() {
+	if p.peek(0) == '$' && p.peek(1) == '\\' && p.peek(2) == '\n' {
+		p.out.vague = "a $ before a backslash-newline (bash joins the lines first)"
+	}
+}
+
+// braced reads the inside of a `${…}` from p.i through its closing `}` and reports whether it found
+// it. bash's rules: the first `}` closes (a bare `{` does not nest, `${` does), a backslash escapes,
+// '…' and $'…' quote (inside double quotes too), "…" nests, $(…) and backticks are substitutions.
+// dq: the expansion is inside double quotes (its quotes and backslashes stay in the word, as in bash).
+//
+// Text after a substitution up to the `}` is also recorded as a script of its own: where the reader
+// closes a $(…) too early (a `)` of a case pattern, a comment or a here-doc body in it), the rest is
+// commands bash runs, not part of the word.
+func (p *parser) braced(dq bool) bool {
+	if strings.IndexByte(" \t\n|", p.peek(0)) >= 0 {
+		p.out.vague = "${ cmd; } or ${| cmd; } (bash 5.3 runs it as a command substitution)"
+	}
+	after := -1 // index just past the first substitution
+	for p.i < len(p.src) {
+		c := p.src[p.i]
+		p.continuedDollar()
+		switch {
+		case c == '}':
+			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
+				p.subs = append(p.subs, rest)
+				p.cmd.subSources = append(p.cmd.subSources, rest)
+			}
+			p.word.WriteByte(c)
+			p.cmd.raw += "}"
+			p.i++
+			return true
+		case c == '\\':
+			if p.i+1 >= len(p.src) {
+				return false
+			}
+			if dq {
+				p.word.WriteByte(c)
+			}
+			if p.src[p.i+1] != '\n' {
+				p.word.WriteByte(p.src[p.i+1])
+			}
+			p.cmd.raw += p.src[p.i : p.i+2]
+			p.i += 2
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+		case c == '\'', c == '$' && p.peek(1) == '\'':
+			if !p.quotedInBraces(dq) {
+				return false
+			}
+		case c == '"':
+			if !p.doubleInBraces() {
+				return false
+			}
+		case c == '$' && p.peek(1) == '{':
+			p.word.WriteString("${")
+			p.cmd.raw += "${"
+			p.i += 2
+			if !p.braced(dq) {
+				return false
+			}
+		case c == '$' && p.peek(1) == '[':
+			// bash nests $[…] (old arithmetic): a `}` in it does not close; the reader does not follow it.
+			p.out.vague = "$[…] inside ${…}"
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		case c == '$' && p.peek(1) == '(', c == '`', !dq && (c == '<' || c == '>') && p.peek(1) == '(':
+			// Unquoted, a process substitution in the word runs too (`${x:-<(cmd)}`).
+			lit := p.substitution(dq)
+			p.word.WriteString(lit)
+			p.cmd.raw += lit
+			if after < 0 {
+				after = p.i
+			}
+		default:
+			if !dq && strings.IndexByte("*?[{", c) >= 0 {
+				p.glob = true
+			}
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		}
+	}
+	return false
+}
+
+// quotedInBraces reads a '…' or a $'…' (where a backslash escapes) inside `${…}` at p.i. dq: the
+// quotes stay in the word.
+func (p *parser) quotedInBraces(dq bool) bool {
+	start := p.i
+	ansi := p.src[p.i] == '$'
+	if ansi {
+		p.i++
+	}
+	end := -1
+	for j := p.i + 1; j < len(p.src); j++ {
+		if ansi && p.src[j] == '\\' {
+			j++
+		} else if p.src[j] == '\'' {
+			end = j
+			break
+		}
+	}
+	if end < 0 {
+		return false
+	}
+	// In posix mode and in sh (dash) a single quote in "${x:-…}" is a plain character: with a `}`,
+	// quote, backslash or expansion between the quotes the two readings end the word apart.
+	if dq && strings.ContainsAny(p.src[p.i+1:end], "}\"\\$`") {
+		p.out.vague = "a single quote inside \"${…}\" (bash reads it as a quote, sh and posix mode do not)"
+	}
+	if dq || ansi {
+		p.word.WriteString(p.src[start : end+1])
+	} else {
+		p.word.WriteString(p.src[p.i+1 : end])
+	}
+	p.cmd.raw += "''"
+	p.i = end + 1
+	return true
+}
+
+// doubleInBraces reads a "…" nested inside `${…}` at p.i: a single quote is literal there, `${`
+// nests and substitutions run. As in braced, the text after a substitution up to the closing quote
+// is also recorded as a script, and $[…] makes the script vague.
+func (p *parser) doubleInBraces() bool {
+	p.i++
+	after := -1
+	for p.i < len(p.src) {
+		c := p.src[p.i]
+		p.continuedDollar()
+		switch {
+		case c == '"':
+			if rest := p.src[max(after, 0):p.i]; after >= 0 && strings.TrimSpace(rest) != "" {
+				p.subs = append(p.subs, rest)
+				p.cmd.subSources = append(p.cmd.subSources, rest)
+			}
+			p.i++
+			return true
+		case c == '$' && p.peek(1) == '$':
+			p.pid()
+		case c == '$' && p.peek(1) == '[':
+			p.out.vague = "$[…] inside ${…}"
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		case c == '\\' && p.i+1 < len(p.src) && strings.IndexByte("$`\"\\\n", p.src[p.i+1]) >= 0:
+			if p.src[p.i+1] != '\n' {
+				p.word.WriteByte(p.src[p.i+1])
+			}
+			p.cmd.raw += p.src[p.i : p.i+2]
+			p.i += 2
+		case c == '$' && p.peek(1) == '{':
+			p.word.WriteString("${")
+			p.cmd.raw += "${"
+			p.i += 2
+			if !p.braced(true) {
+				return false
+			}
+		case c == '$' && p.peek(1) == '(', c == '`':
+			lit := p.substitution(true)
+			p.word.WriteString(lit)
+			p.cmd.raw += lit
+			if after < 0 {
+				after = p.i
+			}
+		default:
+			p.word.WriteByte(c)
+			p.cmd.raw += string(c)
+			p.i++
+		}
+	}
+	return false
 }
 
 // splitsQuoted reports an expansion that gives several words even inside double quotes ("$@",
@@ -1013,23 +1295,23 @@ func stringEnd(s string, start int) int {
 // parseAll returns src and every script nested in it (substitutions, `sh -c`, `eval`).
 func parseAll(src string) []*script {
 	var out []*script
-	var walk func(s string, depth int) *script
-	walk = func(s string, depth int) *script {
+	var walk func(s string, depth int, subst bool) *script
+	walk = func(s string, depth int, subst bool) *script {
 		if depth > maxNesting {
 			return nil
 		}
 		sc, _ := parseScript(s)
-		sc.depth = depth
+		sc.depth, sc.subst = depth, subst
 		out = append(out, sc)
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				for _, sub := range c.subSources {
-					if child := walk(sub, depth+1); child != nil {
+					if child := walk(sub, depth+1, depth == 0 || subst); child != nil {
 						c.subScripts = append(c.subScripts, child)
 					}
 				}
 				add := func(code string) {
-					if child := walk(code, depth+1); child != nil {
+					if child := walk(code, depth+1, false); child != nil {
 						c.nested = append(c.nested, child)
 					}
 				}
@@ -1065,7 +1347,7 @@ func parseAll(src string) []*script {
 		}
 		return sc
 	}
-	walk(src, 0)
+	walk(src, 0, false)
 	return out
 }
 

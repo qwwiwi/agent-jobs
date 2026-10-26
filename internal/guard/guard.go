@@ -713,6 +713,19 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						return protectedBlocked(p)
 					}
 				}
+				if g, ok := parseGit(argv); ok {
+					// git diff --output, archive -o, format-patch's directory (new files in it, nothing
+					// below): a protected path is no target.
+					outs, _ := gitWriteTargets(argv, g)
+					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
+						if p, ok := s.hit(t, false); ok {
+							return protectedBlocked(p)
+						}
+					}
+				}
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
@@ -753,7 +766,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						}
 					}
 				}
-				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
+				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" && !dataHeredoc(sc, pl, c) {
 					return h.reason()
 				}
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
@@ -1160,6 +1173,9 @@ var (
 // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
 func checkUnverifiable(scripts []*script, _ string, _ Config) string {
 	for _, sc := range scripts {
+		if sc.vague != "" {
+			return cannot(sc.vague)
+		}
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				if r := unverifiable(sc, c); r != "" {
@@ -1203,7 +1219,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
-		case sc.depth > 0:
+		case sc.depth > 0 && !substGitRead(sc, argv):
 			return cannot(name + " inside a substitution, eval or sh -c")
 		case c.stdin:
 			return cannot("stdin redirect, here-doc or here-string into " + name)
@@ -2252,6 +2268,13 @@ func globBlocked(w string) string {
 		"that may write; the guard does not expand globs (one could resolve to .git). Write the paths out."
 }
 
+// codeGlobBlocked is the reason for a `*` pattern in inline code that can name git's config or hooks,
+// a protected path or the agent state (codeGlobReason).
+func codeGlobBlocked(p string) string {
+	return "blocked by guard: the pattern `" + p + "` in inline code can match git's config or hooks, a job's git " +
+		"dir, a protected path or agent-jobs state; the guard does not expand it. Write the paths out."
+}
+
 // dotGlobOn reports a command that makes globs match dot files (`.git`): bash `shopt -s dotglob`,
 // a GLOBIGNORE assignment (bash then matches dot files), zsh `setopt globdots` / `set -o globdots`
 // (zsh option names ignore case and underscores).
@@ -2282,7 +2305,7 @@ func dotGlobOn(c *simpleCmd, argv []string) bool {
 // cd/pushd/ln/cp/mv/tee/install/rsync. Globs are not evaluated: any glob/brace word in a redirection
 // target or in an argument of a non-reader is rejected (fail closed), as is turning on dotglob/globdots.
 // git itself is checked by the config allowlist instead.
-func checkGitFiles(scripts []*script, _ string, _ Config) string {
+func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 	blocked := func(p string) string {
 		return "blocked by guard: `" + p + "` is git's config, hooks or $GIT_DIR; a job does not write there " +
 			"(git would run programs from it)."
@@ -2306,6 +2329,22 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 					continue
 				}
 				name := progName(argv[0])
+				if g, ok := parseGit(argv); ok {
+					// git diff --output=<file>, archive -o, format-patch -o <dir>, bundle create <file> and
+					// marks files write there like a redirection; a target computed at run time is unverifiable.
+					outs, _ := gitWriteTargets(argv, g)
+					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
+						if gitFile(t) || inGitDir(t) {
+							return blocked(t)
+						}
+						if hasGlob(reBraceVar.ReplaceAllString(t, "")) {
+							return globBlocked(t)
+						}
+					}
+				}
 				if isGitName(name) || gitFileReaders[name] {
 					continue
 				}
@@ -2313,12 +2352,22 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 				})
-				for _, a := range argv[1:] {
+				off := len(c.words) - len(argv)
+				for k, a := range argv[1:] {
 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
-					if hasGlob(reBraceVar.ReplaceAllString(a, "")) && !findFilter {
+					if !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter {
+						continue
+					}
+					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word
+					// the shell does not glob: its `*` is code, as in a script file (noise.go), unless a glob
+					// character in it is unquoted, or the code may glob a path the job never writes.
+					if !inlineCode(name, argv, k+1) || c.glob[off+k+1] {
 						return globBlocked(a)
+					}
+					if r := codeGlobReason(a, cfg); r != "" {
+						return r
 					}
 				}
 			}

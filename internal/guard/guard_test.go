@@ -223,7 +223,9 @@ func TestCheckFixLoop2(t *testing.T) {
 		{"commit -F /dev/stdin", "git commit -F /dev/stdin", true},
 		{"identity in heredoc substitution", "cat <<EOF\n$(git -c user.name=Foreign commit -m x)\nEOF", true},
 		{"quoted heredoc body is data", "cat <<'EOF'\n$(git push)\nEOF", false},
-		{"git in substitution", `echo "$(git rev-parse HEAD)"`, true},
+		// 2026-10-25 (noise.go): a read-only git call in a command substitution is checked as a plain call.
+		{"read-only git in substitution", `echo "$(git rev-parse HEAD)"`, false},
+		{"push in substitution", `echo "$(git push)"`, true},
 		{"gh in backticks", "echo `gh pr create`", true},
 		{"git in process substitution", "diff <(git show HEAD:a) a", true},
 		{"eval with git", `eval "git status"`, true},
