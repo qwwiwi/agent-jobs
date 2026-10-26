@@ -371,7 +371,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
 		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
-		Sources: sources, Sandbox: *sandbox,
+		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob),
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -383,6 +383,15 @@ func runGuard(args []string, stdin io.Reader) int {
 		return 2 // exit 2 = block the tool call, stderr goes back to the model
 	}
 	return 0
+}
+
+// guardJobID is the job id the guard names sandbox containers by: the job marker the wrapper sets,
+// else the daemon's --subagent-job.
+func guardJobID(subagentJob string) string {
+	if id, ok := jobs.InsideJob(); ok && id != "" {
+		return id
+	}
+	return subagentJob
 }
 
 // parse parses flags allowing positional args before or after them.

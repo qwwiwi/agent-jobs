@@ -30,7 +30,7 @@ func sourcesSetup(t *testing.T) (jobDir string, cfg Config) {
 		t.Fatal(err)
 	}
 	cfg = Config{Dir: filepath.Join(jobDir, "work"), Sources: []string{filepath.Join(jobDir, "sources")},
-		Sandbox: filepath.Join(jobDir, "sandbox")}
+		Sandbox: filepath.Join(jobDir, "sandbox"), JobID: "j"}
 	return jobDir, cfg
 }
 
@@ -133,14 +133,15 @@ func TestSourcesDockerSandbox(t *testing.T) {
 	box := filepath.Join(jobDir, "sandbox")
 	user := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
 	// base is the required part of the sandbox form; each refused case adds one thing to it.
-	base := "docker run --rm --network none --user " + user + " --cap-drop ALL --security-opt no-new-privileges"
+	base := "docker run --rm --name aj-j-1 --memory 2g --pids-limit 512 --cpus 2 --network none --user " + user +
+		" --cap-drop ALL --security-opt no-new-privileges"
 	mount := " -v " + box + "/lib:/src"
 	t.Run("[G02] the sandbox recipe is allowed", func(t *testing.T) {
 		for _, c := range []string{
 			base + mount + " -w /src node:22 sh -c 'HOME=/tmp npm ci && npm test'",
-			"docker run --rm --network=none --user=" + user + " --cap-drop=ALL --security-opt=no-new-privileges --volume=" +
-				box + "/lib:/src:ro alpine ls -la /src",
-			base + " -i --memory 2g --cpus 2 --pids-limit 512 --read-only --tmpfs /tmp" + mount + " -w /src python:3.12 python -m pytest",
+			"docker run --rm --name=aj-j-ls --memory=512m --pids-limit=64 --cpus=0.5 --network=none --user=" + user +
+				" --cap-drop=ALL --security-opt=no-new-privileges --volume=" + box + "/lib:/src:ro alpine ls -la /src",
+			base + " -i --read-only --tmpfs /tmp" + mount + " -w /src python:3.12 python -m pytest",
 		} {
 			if r := Check(c, cfg); r != "" {
 				t.Errorf("%q: refused: %s", c, r)

@@ -97,6 +97,9 @@ type Config struct {
 	// Sandbox is <jobdir>/sandbox (G02), where a job copies a clone to run it: its code never runs on the
 	// host either, and a copy below it is the only path a `docker run` may mount. "" = docker refused.
 	Sandbox string
+	// JobID is the job's id (G02): a sandbox container is named aj-<JobID>-<suffix>, so the daemon removes
+	// it when the job ends. "" = docker refused.
+	JobID string
 	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
 	// paths its own folders).
 	readAllowScope bool

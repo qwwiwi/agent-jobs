@@ -24,6 +24,7 @@ type simpleCmd struct {
 	// outRedirs are the targets of output redirections (`>f`, `>>f`, `>|f`, `&>f`, `<>f`, `2>&1` gives "1").
 	outRedirs []string
 	outDyn    []bool // outDyn[i]: outRedirs[i] contains an expansion
+	outDup    []bool // outDup[i]: outRedirs[i] is a file descriptor duplicated (`>&2`, `2>&1`, `>&-`), no file
 	// inRedirs are the sources of input redirections and here-strings (`<f`, `<>f`, `<<<w`).
 	inRedirs []string
 	// feeds retain the commands of a compound pipeline stage; inputSources retain
@@ -100,6 +101,7 @@ type parser struct {
 	redir    redirKind
 	redirOut bool // the pending redirFile target is written to
 	redirIn  bool // the pending redirFile source is read (`<`, `<>`, `<<<`)
+	redirDup bool // the pending redirFile is `>&w` / `<&w`: a digit or `-` w names a descriptor
 	heredocs []pendingHeredoc
 	paren    int             // current `( … )` depth
 	sep      string          // separator that ended the previous pipeline
@@ -136,6 +138,7 @@ func (p *parser) endWord() {
 		if p.redirOut {
 			p.cmd.outRedirs = append(p.cmd.outRedirs, w)
 			p.cmd.outDyn = append(p.cmd.outDyn, p.dyn)
+			p.cmd.outDup = append(p.cmd.outDup, p.redirDup && !p.dyn && (isDigits(w) || w == "-"))
 		}
 		if p.redirIn {
 			p.cmd.inRedirs = append(p.cmd.inRedirs, w)
@@ -146,7 +149,7 @@ func (p *parser) endWord() {
 		p.heredocs = append(p.heredocs, pendingHeredoc{delim: w, strip: p.redir == redirHeredocStrip, quoted: p.quoted, exact: !p.dyn, cmd: p.cmd})
 	}
 	p.started, p.dyn, p.bare, p.quoted = false, false, false, false
-	p.redir, p.redirOut, p.redirIn = redirNone, false, false
+	p.redir, p.redirOut, p.redirIn, p.redirDup = redirNone, false, false, false
 }
 
 func (p *parser) endCmd() {
@@ -546,6 +549,7 @@ func (p *parser) redirect() {
 		}
 	} else if p.peek(0) == '>' || p.peek(0) == '&' || p.peek(0) == '|' {
 		out = out || p.peek(0) == '>' // `<>file` opens it for writing too
+		p.redirDup = p.peek(0) == '&'
 		p.i++
 	}
 	p.redir, p.redirOut, p.redirIn = kind, out, op == '<' && kind == redirFile
