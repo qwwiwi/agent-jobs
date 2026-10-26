@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math/big"
 	"os"
 	"slices"
 	"strconv"
@@ -320,14 +319,10 @@ func floatNumbers(v any) (any, error) {
 }
 
 // sameMilestoneID reports whether v, an id from the input, is exactly id: a number of the same value
-// (1, 1.0 or 1e0 for 1), not one that only rounds to it as a float64 (#93).
+// (1, 1.0 or 1e0 for 1), not one that only rounds to it as a float64 (#93); milestone_set compares alike.
 func sameMilestoneID(v any, id int64) bool {
 	n, ok := v.(json.Number)
-	if !ok {
-		return false
-	}
-	r, ok := new(big.Rat).SetString(n.String())
-	return ok && r.IsInt() && r.Num().IsInt64() && r.Num().Int64() == id
+	return ok && mcp.SameMilestoneID(n, id)
 }
 
 func milestoneID(s string) (int64, error) {

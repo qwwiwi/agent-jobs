@@ -1,7 +1,10 @@
 package mcp
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"math/big"
 
 	"github.com/google/jsonschema-go/jsonschema"
 
@@ -32,6 +35,30 @@ func newInputSchema[T any]() *inputSchema {
 		panic(fmt.Sprintf("input schema of %T: %v", *new(T), err))
 	}
 	return &inputSchema{schema: s, resolved: r}
+}
+
+// SameMilestoneID reports whether n, an id from a milestone tool's input, is exactly id: a number of the
+// same value (1, 1.0 or 1e0 for 1), not one that only rounds to it as a float64 (#93, #94).
+func SameMilestoneID(n json.Number, id int64) bool {
+	r, ok := new(big.Rat).SetString(n.String())
+	return ok && r.IsInt() && r.Num().IsInt64() && r.Num().Int64() == id
+}
+
+// exactMilestoneID refuses raw, a milestone_set call's arguments, unless their id is exactly id, the one
+// the SDK decoded through a float64 (#94): 1.0000000000000001 is not milestone 1, and 2^53+1 is not 2^53.
+func exactMilestoneID(raw json.RawMessage, id int64) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var args map[string]any
+	if err := dec.Decode(&args); err != nil {
+		return fmt.Errorf("milestone_set arguments: %w", err)
+	}
+	n, ok := args["id"].(json.Number)
+	if !ok || !SameMilestoneID(n, id) {
+		b, _ := json.Marshal(args["id"])
+		return fmt.Errorf("milestone_set: id %s is not exactly a milestone id (it reads as %d)", b, id)
+	}
+	return nil
 }
 
 // ValidateMilestoneInput validates args, the arguments of tool (milestone_create or milestone_set) as

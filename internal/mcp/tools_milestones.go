@@ -39,7 +39,11 @@ func addMilestoneSet(s *sdk.Server, d Deps) {
 		Description: "Edit a milestone in place and return its tree: title, goal, branch, order, max_parallel, status " +
 			"(open | done | dropped), close_note; tasks to add or edit by key; keys to drop. Nothing is deleted. Closing as done " +
 			"is refused while a task is not done or dropped. Task status is derived from its jobs, never set here.",
-	}, func(ctx context.Context, _ *sdk.CallToolRequest, in jobs.MilestoneSet) (*sdk.CallToolResult, jobs.MilestoneView, error) {
+	}, func(ctx context.Context, req *sdk.CallToolRequest, in jobs.MilestoneSet) (*sdk.CallToolResult, jobs.MilestoneView, error) {
+		// The SDK validated and decoded the id as a float64; the raw arguments keep its exact text.
+		if err := exactMilestoneID(req.Params.Arguments, in.ID); err != nil {
+			return nil, jobs.MilestoneView{}, err
+		}
 		v, err := d.Manager.SetMilestone(ctx, in)
 		if err != nil {
 			return nil, jobs.MilestoneView{}, err

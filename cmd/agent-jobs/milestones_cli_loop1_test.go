@@ -218,6 +218,7 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 
 	t.Run("[R01] set refuses any id in the input other than the positional one, 0 and null included", func(t *testing.T) {
 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+		cs := milestoneMCP(t)
 		id := newStage(t)
 		pos := strconv.FormatInt(id, 10)
 		before := treeJSON(t, id)
@@ -234,6 +235,10 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 			})
 			if got.err == nil || !strings.Contains(got.err.Error(), c.want) || got.stdout != "" {
 				t.Errorf("set %s: error %v, stdout %q, want %q", c.raw, got.err, got.stdout, c.want)
+			}
+			// Parity (#94): milestone_set refuses it too, though its schema sees the id as a float64.
+			if tree, e := mcpMilestone(t, cs, "milestone_set", c.raw); e == "" {
+				t.Errorf("MCP accepted %s:\n%s", c.raw, tree)
 			}
 		}
 		if after := treeJSON(t, id); after != before {
