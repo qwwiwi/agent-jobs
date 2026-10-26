@@ -608,6 +608,9 @@ func cmdStatus(args []string) error {
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
 		}
+		if err := printMergeGates(m); err != nil {
+			return err
+		}
 		if err := printUndelivered(m); err != nil {
 			return err
 		}
@@ -727,6 +730,19 @@ func printHTTPAPI(m *jobs.Manager) {
 	default:
 		fmt.Println(c.Detail)
 	}
+}
+
+// printMergeGates is the merge gate part of `status` without a job id: one line per repository with a
+// stored checklist approval (gated, void, retired, or shipped with its sha, #99).
+func printMergeGates(m *jobs.Manager) error {
+	views, err := m.MergeGates()
+	if err != nil {
+		return err
+	}
+	for _, v := range views {
+		fmt.Printf("merge gate: %s\n", jobs.MergeGateText(v))
+	}
+	return nil
 }
 
 // printUndelivered is the end of `status` without a job id: notify_owner notifications of the last

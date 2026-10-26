@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
@@ -25,6 +26,8 @@ import (
 // approved is not gated; one whose approval is void now (the checklist or brief edited by hand or gone, a
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
 // closed: a void approval never lifts the gate) until the owner retires it (`agent-jobs gate retire`).
+// One whose valid latest approval shipped (#99: release_check passed at it on a sha now on origin's
+// default branch, recorded by the daemon's tick, mergegate_shipped.go) is not gated until a new approval.
 // Another clone of a gated repository (a shared OWNER/REPO remote) is gated with it: the names of a gated
 // repository's remotes are stored (store.GateRepo, by checklist_set at the approval, by release_check on a
 // pass and by the daemon's backfill at its start), so a gated work tree that is gone or moved is still
@@ -116,6 +119,12 @@ type gatedRepo struct {
 	id      string
 	version int
 	hash    string
+	// seq is the approval's seq when it is valid now; retired says the owner retired it; shipped is the
+	// sha its release shipped on (#99, mergegate_shipped.go): neither is gated.
+	seq       int64
+	retired   bool
+	shipped   string
+	shippedAt time.Time
 }
 
 // mergeGate is one hook call: the repositories it has read, by main work tree.
@@ -478,29 +487,24 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 		return "", err
 	}
 	if p == nil {
+		// A pass on another sha (the checklist's release) lifts the gate once it is on origin's default
+		// branch: say so, a later fix PR is the usual case here.
+		shipped := ""
+		if s, err := g.shippedPass(r); err != nil {
+			return "", err
+		} else if s != "" {
+			shipped = fmt.Sprintf(" release_check passed on %s at this checklist: once that sha (or its squash merge) is "+
+				"on origin's default branch and fetched into %s (git fetch origin), the daemon's next tick marks the checklist "+
+				"shipped and merges are no longer gated.", s, Printable(r.main, 200))
+		}
 		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: release_check has not passed on %s at this checklist; "+
-			"run release_check(repo, sha) first.", where, sha), nil
+			"run release_check(repo, sha) first.%s", where, sha, shipped), nil
 	}
 	// Evidence stored after the pass that release_check would fail on: a newer verdict for the sha, or a
 	// red manifest-check run. The pass then no longer counts until release_check runs again.
-	stale := ""
-	if red, err := g.m.Store.RedManifestCheck(r.main, sha, r.id, r.version, r.hash); err != nil {
-		return "", err
-	} else if red != nil {
-		stale = fmt.Sprintf("manifest-check of job %s exited %d after it", red.JobID, red.ExitCode)
-	}
-	vs, err := g.m.Store.VerdictsAt(r.main, r.id, r.version, sha)
+	stale, err := g.m.passStale(r, p)
 	if err != nil {
 		return "", err
-	}
-	latest := ""
-	for _, v := range vs {
-		if v.ChecklistSHA256 == r.hash {
-			latest = v.JobID
-		}
-	}
-	if stale == "" && latest != p.VerdictJob {
-		stale = fmt.Sprintf("the latest verdict for the sha is of job %s, the pass read job %s", latest, p.VerdictJob)
 	}
 	if stale != "" {
 		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: the release_check pass on %s is stale (%s); run "+
@@ -511,9 +515,9 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 
 // repo reads the checklist state of a main work tree (cached), without the checklist lock like the
 // brief reminder: a read that races a checklist_set can misjudge one call. A repository never approved,
-// or retired by the owner since its latest approval, is not gated; one approved once stays gated (void
-// when its checklist is not approved now, also when the file or the work tree is gone); a store error is
-// returned.
+// or retired by the owner since its latest approval, or whose valid latest approval shipped (#99), is
+// not gated; one approved once stays gated (void when its checklist is not approved now, also when the
+// file or the work tree is gone, and also when it shipped); a store error is returned.
 func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if r, ok := g.repos[main]; ok {
 		return r, nil
@@ -523,12 +527,13 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 		return nil, err
 	}
 	r := &gatedRepo{main: main}
+	var rec store.GateRepo
 	if last != nil {
-		rec, err := g.m.Store.GateRepoOf(main)
-		if err != nil {
+		if rec, err = g.m.Store.GateRepoOf(main); err != nil {
 			return nil, err
 		}
 		if last.Seq <= rec.RetiredSeq {
+			r.retired = true
 			g.repos[main] = r // retired: out of the gate until it is approved again
 			return r, nil
 		}
@@ -555,13 +560,29 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if err != nil {
 		return voided(checklist.ChecklistRel + " does not parse: " + err.Error())
 	}
-	approved, hash, reason, _, err := g.m.ChecklistStatus(main, c, f.Brief)
+	approved, hash, reason, cur, err := g.m.ChecklistStatus(main, c, f.Brief)
 	if err != nil {
 		return nil, err
 	}
 	r.id, r.version, r.hash = c.ID, c.Version, hash
 	if !approved {
 		return voided(reason)
+	}
+	if cur != nil {
+		r.seq = cur.Seq
+	}
+	// Shipped (#99): the daemon saw a pass at this approval on origin's default branch; the pass must still
+	// count (stored, not stale), else the approval gates as before.
+	if cur != nil && rec.ShippedSeq == cur.Seq && rec.ShippedSHA != "" {
+		ok, err := g.m.passCounts(r, rec.ShippedSHA)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			r.shipped, r.shippedAt = rec.ShippedSHA, rec.ShippedAt
+			g.repos[main] = r
+			return r, nil
+		}
 	}
 	r.gated = true
 	g.repos[main] = r

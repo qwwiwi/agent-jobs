@@ -74,6 +74,28 @@ func (s *Store) ReleasePassed(repo, sha, checklistID string, version int, hash s
 	return &p, nil
 }
 
+// ReleasePassesAt lists the passes of repo at the checklist id, version and hash, newest first.
+func (s *Store) ReleasePassesAt(repo, checklistID string, version int, hash string) ([]ReleasePass, error) {
+	rows, err := s.db.Query(`SELECT repo, sha, checklist_id, version, checklist_sha256, verdict_job, created_at FROM release_passes
+		WHERE repo=? AND checklist_id=? AND version=? AND checklist_sha256=? ORDER BY created_at DESC, sha`, repo, checklistID,
+		version, hash)
+	if err != nil {
+		return nil, fmt.Errorf("release passes: %w", err)
+	}
+	defer rows.Close()
+	var out []ReleasePass
+	for rows.Next() {
+		var p ReleasePass
+		var at int64
+		if err := rows.Scan(&p.Repo, &p.SHA, &p.ChecklistID, &p.Version, &p.ChecklistSHA256, &p.VerdictJob, &at); err != nil {
+			return nil, fmt.Errorf("release passes: %w", err)
+		}
+		p.CreatedAt = time.Unix(at, 0).UTC()
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ApprovalRepos lists the repositories with a stored checklist approval (any checklist), sorted.
 func (s *Store) ApprovalRepos() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT repo FROM checklist_approvals ORDER BY repo`)

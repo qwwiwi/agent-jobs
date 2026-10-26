@@ -506,6 +506,11 @@ func (m *Manager) Tick() error {
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
 	// docker call may take up to containerCmdTimeout.
 	m.retryContainerCleanups()
+	// A checklist whose release shipped stops gating merges (#99): recorded here for the merge hook,
+	// which opens the store read-only.
+	if serr := m.MarkShippedGates(); serr != nil {
+		err = errors.Join(err, fmt.Errorf("merge gate shipped: %w", serr))
+	}
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {
