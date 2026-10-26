@@ -72,7 +72,8 @@ func gatedRepo(t *testing.T) (string, string) {
 
 // `hook merge-gate` exits 0 to allow a Bash call and 2 to block it with one line on stderr: a merge of
 // the passed sha passes, another sha or none is blocked; a call that runs no merge passes before the
-// store is opened (even misconfigured); a merge it cannot check is blocked.
+// store is opened (even misconfigured); a merge it cannot check is blocked; a merge it cannot read runs
+// with a warning as hook JSON on stdout (exit 0).
 func TestHookMergeGate(t *testing.T) {
 	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
 	t.Setenv("GH_REPO", "")
@@ -111,6 +112,11 @@ func TestHookMergeGate(t *testing.T) {
 		if errs != "" && !strings.HasPrefix(errs, jobs.MergeGatePrefix) {
 			t.Errorf("%s: stderr %q", tc.name, errs)
 		}
+	}
+	// An unreadable merge runs with its warning as hook JSON on stdout (TestHookMergeGateWarningIsHookJSON).
+	if code, out, errs := run(gate, bashEvent(repo, "sh -c 'gh pr merge 5'")); code != 0 || errs != "" ||
+		!strings.Contains(out, `"additionalContext":"`+jobs.MergeGateWarnPrefix+"cannot tell whether") {
+		t.Errorf("unreadable merge: exit %d, stdout %q, stderr %q", code, out, errs)
 	}
 }
 

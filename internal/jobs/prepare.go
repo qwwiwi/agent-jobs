@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -175,11 +176,12 @@ func (m *Manager) ProtectedPaths() []string {
 // GIT_CONFIG_GLOBAL) and <jobdir>/no-hooks (its core.hooksPath), whose 0400/0500 modes do not hold a
 // job back (it owns them and may chmod them; a changed diff.external or a planted hook makes git run
 // a program), and <jobdir>/settings.json and mcp.json (its guard hook, permissions and MCP servers,
-// read again when the job is resumed).
+// read again when the job is resumed), and <jobdir>/prior (the reports of the task's dependencies,
+// read-only for the job).
 func (m *Manager) jobOwnProtected(id string) []string {
 	dir := m.JobDir(id)
 	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir),
-		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json")}
+		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json"), filepath.Join(dir, PriorDir)}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -249,8 +251,20 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	if readOnlyKind(j.Kind) {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
 	}
-	return m.settings(j.Kind, m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), m.gateReadAllow(j), gitDirs...),
-		skillDenyRules(protected)...)
+	guardCmd := m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), m.gateReadAllow(j), gitDirs...)
+	deny := skillDenyRules(protected)
+	if len(j.Sources) == 0 {
+		return m.settings(j.Kind, guardCmd, deny...)
+	}
+	// A job with sources (G02): file tools never write its clones, and the guard is told the clones (no
+	// write, no host execution) and the sandbox dir, whose copies are the only mounts of a `docker run`.
+	src, box := filepath.Join(m.JobDir(j.ID), SourcesDir), filepath.Join(m.JobDir(j.ID), SandboxDir)
+	guardCmd += " --sources " + shellQuote(src) + " --sandbox " + shellQuote(box)
+	s := m.settings(j.Kind, guardCmd, append(deny, skillDenyRules([]string{src})...)...)
+	// docker stays refused by the guard except the sandbox form, which the prefix rule would deny too.
+	perms := s["permissions"].(map[string]any)
+	perms["deny"] = slices.DeleteFunc(perms["deny"].([]string), func(r string) bool { return r == "Bash(docker:*)" })
+	return s
 }
 
 // GuardHookTimeout is the guard hook's timeout in seconds. Claude Code lets a tool call run when its
@@ -335,6 +349,13 @@ func (m *Manager) readOwnerRules() (string, error) {
 // project cards that match the job's repository, the memory notes, task, the covered requirements (a
 // job with covers, F4), kind checklist, report contract.
 func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes) (string, error) {
+	return m.buildPrompt(j, ownerRules, cards, notes, m.priorSnapshot(j), m.sourcesOnDisk(j))
+}
+
+// buildPrompt is BuildPrompt with the job's prior results taken from prior, the snapshot its prior/
+// folder is written from, and its sources section from sources (the clones of this or an earlier attempt).
+func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes, prior priorSnapshot,
+	sources []sourceResult) (string, error) {
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
 		return "", err
@@ -383,8 +404,9 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	}
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
-	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), cover, check, contract)
+	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s%s\n\n%s\n",
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSources(m.JobDir(j.ID), sources),
+		m.priorResults(j, prior), cover, check, contract)
 	return b.String(), nil
 }
 
@@ -443,20 +465,31 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 			m.Log.Printf("job %s: memory notes unavailable: %v", j.ID, notes.Err)
 		}
 	}
-	prompt, err := m.BuildPrompt(j, rules, cards, notes)
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create job dir: %w", err)
 	}
 	if _, err := ensureJobTmp(dir); err != nil {
 		return fmt.Errorf("create job temp dir: %w", err)
 	}
+	// The sources were cloned while the job was queued (prefetchSources, outside the lifecycle lock): the
+	// prompt says where each clone is, or why it is not.
+	sources, err := m.clonedSources(j)
+	if err != nil {
+		return err
+	}
+	// One read of the dependencies feeds both the prompt's prior results and the prior/ folder.
+	prior := m.priorSnapshot(j)
+	prompt, err := m.buildPrompt(j, rules, cards, notes, prior, sources)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(m.SubagentLogPath(j.ID)), 0o700); err != nil {
 		return fmt.Errorf("create subagent log dir: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
+		return err
+	}
+	if err := m.writePriorReports(prior, dir); err != nil {
 		return err
 	}
 	if err := m.writeGitFiles(dir); err != nil {

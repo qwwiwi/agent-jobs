@@ -89,8 +89,7 @@ func TestCoversInjectedIntoPrompt(t *testing.T) {
 		"- R01 · live · «a login page with | a pipe»",
 		"checklist demo, version 2",
 		"### Requirements",
-		"REDPROOF R01",
-		"ran:",
+		"- R01 · done|partial|missing · evidence",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt lacks %q", want)

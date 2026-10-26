@@ -10,21 +10,33 @@ import (
 	"testing"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/testutil"
 )
 
 const acceptanceScript = "scripts/acceptance-clean-clone.sh"
 
 // acceptanceRun runs the acceptance script with a minimal environment (go and git on PATH, a temp
-// HOME, no agent-jobs variables) plus extra; argv0 is prepended when given (a fake wrapper).
+// HOME, no agent-jobs variables) plus extra; argv0 is prepended when given (a fake wrapper). The
+// script runs from a temp repository of its own (scriptRepo), so the tests pass in a plain copy of
+// the tree without .git, as the judge runs them.
 func acceptanceRun(t *testing.T, extra []string, argv0 []string, args ...string) (string, int) {
 	t.Helper()
-	script, err := filepath.Abs(acceptanceScript)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := acceptanceCmd(t, script, extra, argv0, args...)
+	cmd := acceptanceCmd(t, scriptRepo(t), extra, argv0, args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), exitCode(t, err)
+}
+
+// scriptRepo commits this tree's acceptance script into a new temp git repository and returns the
+// script's path there: the script resolves its REF (HEAD) in the repository it lives in.
+func scriptRepo(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "repo")
+	script := filepath.Join(dir, acceptanceScript)
+	copyFile(t, acceptanceScript, script, 0o755)
+	gitIn(t, dir, "init", "-q", "-b", "main")
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "-qm", "fixture")
+	return script
 }
 
 // exitCode is the exit status of a finished command (a start failure fails the test).
@@ -55,15 +67,9 @@ func acceptanceCmd(t *testing.T, script string, extra []string, argv0 []string, 
 	if len(g) != 3 {
 		t.Fatalf("go env: %q", goEnv)
 	}
-	// A short TMPDIR: the daemon's unix sockets live under it (the script refuses a long one).
-	tmp, err := os.MkdirTemp("", "aj")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = exec.Command("chmod", "-R", "u+w", tmp).Run()
-		_ = os.RemoveAll(tmp)
-	})
+	// A short TMPDIR: the daemon's unix sockets live under it (the script refuses a long one), and
+	// the caller's TMPDIR may be long (a job's is <state>/jobs/<id>/tmp).
+	tmp := testutil.ShortTempDir(t)
 	argv := append(append(append([]string{}, argv0...), "bash", script), args...)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append([]string{

@@ -551,6 +551,13 @@ func (m *Manager) settled(id string) {
 	if j, err := m.Store.Get(id); err == nil {
 		m.spawnedGroupAlive(j) // a group that ended with the job is forgotten right away
 		m.acceptanceGroupAlive(j)
+		if len(j.Sources) > 0 {
+			// Its sandbox containers end with it, however it ended (G02); the wrapper removes them too. No
+			// docker call under the lifecycle lock: the marker has the tick remove them outside it.
+			if err := markContainersPending(m.JobDir(id)); err != nil {
+				m.Log.Printf("job %s: write %s: %v", id, containersPendingFile, err)
+			}
+		}
 	}
 	m.recordDirSize(id)
 	m.recordStatsOf(id)

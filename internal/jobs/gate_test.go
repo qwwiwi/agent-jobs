@@ -203,7 +203,7 @@ func TestGateVerdictFailsClosed(t *testing.T) {
 
 // The judge end to end: it needs the approved checklist; its work dir is the files at the sha only (no
 // .git, no brief files, no link out of the tree); the verdict is stored with the judge's family and the
-// coders' (feature jobs with covers of the checklist), same_family flagged.
+// coders' (the succeeded feature jobs with covers of the checklist, familyCoders), same_family flagged.
 func TestJudgeJobEndToEnd(t *testing.T) {
 	m := acceptanceManager(t, "")
 	t.Setenv("AGENT_JOBS_TEST_SECRET", "s3cr3t")
@@ -212,9 +212,11 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 		t.Fatalf("judge of an unapproved checklist: %v", err)
 	}
 	approveBrief(t, m, repo)
-	// The coders: a claude fix job with covers of this checklist, and a codex one (inserted as stored).
-	coder := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	if err := m.Cancel(coder.ID); err != nil {
+	// The coders: a succeeded claude feature job, a cancelled claude fix job with covers of this checklist
+	// (not counted), and a codex one queued before sizes (inserted as stored, size none).
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "opus", "R01")
+	cancelled := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
+	if err := m.Cancel(cancelled.ID); err != nil {
 		t.Fatal(err)
 	}
 	cx := &store.Job{ID: "cx1", Agent: m.Agent, Title: "codex coder", Kind: "general", Brief: "b", RepoPath: mainWorktree(repo),
@@ -265,7 +267,7 @@ func TestJudgeJobEndToEnd(t *testing.T) {
 		t.Fatalf("no verdict: %v", err)
 	}
 	if v.SHA != sha || v.Version != 2 || v.JudgeFamily != "anthropic" || v.JudgeModel != "sonnet" || !v.SameFamily || v.FamilyDiffers ||
-		!slices.Equal(v.CoderFamilies, []string{"anthropic", "openai"}) || !slices.Equal(v.CoderJobs, []string{coder.ID, "cx1"}) ||
+		!slices.Equal(v.CoderFamilies, []string{"anthropic", "openai"}) || !slices.Equal(v.CoderJobs, []string{"claude-ok", "cx1"}) ||
 		v.Counts["met"] != 3 || v.ManifestCheck == nil {
 		t.Fatalf("verdict: %+v", v)
 	}
@@ -357,6 +359,79 @@ func TestValidateJudgeRules(t *testing.T) {
 	o, counts, err := ValidateJudge(report(b), g)
 	if err != nil || counts["missing"] != 1 || strings.Contains(o.Requirements[1].Evidence[0], secret) {
 		t.Fatalf("missing / redaction: %v %+v", err, o)
+	}
+}
+
+// could_not_run takes a plain string or an object {cmd, why} (the shape judge job 261026-123048-b4d0
+// wrote and the prompt invites); an object is stored as "cmd: why", so the stored list stays strings.
+// ran takes its documented object {cmd, result} and, likewise, a plain string as the command.
+func TestValidateJudgeCouldNotRunShapes(t *testing.T) {
+	g := &store.GateInput{ChecklistID: "demo", Version: 2, ChecklistSHA256: strings.Repeat("a", 64), SHA: strings.Repeat("b", 40),
+		Live: []string{"R01"}}
+	block := func(ran, couldNotRun string) string {
+		return "## Findings / Changes\n```json\n{\n" +
+			`  "schema": "agent-jobs/judge/v1",` + "\n" +
+			`  "checklist": {"id": "demo", "version": 2, "sha256": "` + g.ChecklistSHA256 + `"},` + "\n" +
+			`  "sha": "` + g.SHA + `",` + "\n" +
+			`  "ran": ` + ran + ",\n" +
+			`  "could_not_run": ` + couldNotRun + ",\n" +
+			`  "requirements": [{"id": "R01", "verdict": "met", "how": "ran", "evidence": ["main.go:1"], "note": ""}],` + "\n" +
+			`  "unmapped_brief": [], "extra_scope": [], "suspect_tests": []` + "\n}\n```\n"
+	}
+	ran := `[{"cmd": "go test ./internal/jobs/", "result": "ok"}]`
+	// The exact could_not_run of the failed run.
+	failed := `[{"cmd": "go test ./cmd/agent-jobs/", "why": "the job guard refused ..."}]`
+	stored := func(o *JudgeOutput) string {
+		raw, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	o, _, err := ValidateJudge(block(ran, failed), g)
+	if err != nil {
+		t.Fatalf("could_not_run objects refused: %v", err)
+	}
+	if s := stored(o); !strings.Contains(s, `"could_not_run":["go test ./cmd/agent-jobs/: the job guard refused ..."]`) {
+		t.Fatalf("could_not_run objects stored as %s", s)
+	}
+	o, _, err = ValidateJudge(block(ran, `["make e2e · needs a network", {"cmd": "go test ./cmd/", "why": "guard"}]`), g)
+	if err != nil {
+		t.Fatalf("could_not_run strings refused: %v", err)
+	}
+	if s := stored(o); !strings.Contains(s, `"could_not_run":["make e2e · needs a network","go test ./cmd/: guard"]`) {
+		t.Fatalf("could_not_run strings stored as %s", s)
+	}
+	o, _, err = ValidateJudge(block(`["go vet ./...", {"cmd": "go build ./...", "result": "ok"}]`, `[]`), g)
+	if err != nil {
+		t.Fatalf("ran with a plain string refused: %v", err)
+	}
+	if s := stored(o); !strings.Contains(s, `"ran":[{"cmd":"go vet ./...","result":""},{"cmd":"go build ./...","result":"ok"}]`) ||
+		!strings.Contains(s, `"could_not_run":[]`) {
+		t.Fatalf("ran stored as %s", s)
+	}
+	for want, c := range map[string][2]string{
+		"could_not_run 1: why is empty":          {ran, `[{"cmd": "go test ./cmd/agent-jobs/"}]`},
+		"could_not_run 2: cmd is empty":          {ran, `["x · y", {"cmd": " ", "why": "guard"}]`},
+		`unknown field "reason"`:                 {ran, `[{"cmd": "go test", "why": "guard", "reason": "x"}]`},
+		"could_not_run 1: a string or an object": {ran, `[42]`},
+		"could_not_run is missing":               {ran, `null`},
+		"ran 1: a string or an object":           {`[["go test"]]`, `[]`},
+		`unknown field "output"`:                 {`[{"cmd": "go test", "output": "ok"}]`, `[]`},
+		"ran 1 cmd is empty":                     {`[""]`, `[]`},
+	} {
+		if _, _, err := ValidateJudge(block(c[0], c[1]), g); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: %v", want, err)
+		}
+	}
+	// A later null clears an earlier list under a duplicate key, as plain slice decoding does.
+	for want, c := range map[string][2]string{
+		"could_not_run is missing": {ran, `[], "could_not_run": null`},
+		"ran is missing":           {`[], "ran": null`, `[]`},
+	} {
+		if _, _, err := ValidateJudge(block(c[0], c[1]), g); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("duplicate key, %s: %v", want, err)
+		}
 	}
 }
 

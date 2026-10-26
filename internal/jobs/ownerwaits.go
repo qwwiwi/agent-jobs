@@ -53,6 +53,8 @@ type hookInput struct {
 	// ToolName and ToolInput are a PreToolUse event's (the merge hook).
 	ToolName  *string         `json:"tool_name"`
 	ToolInput json.RawMessage `json:"tool_input"`
+	// Prompt is a UserPromptSubmit event's (the brief reminder).
+	Prompt *string `json:"prompt"`
 }
 
 // readHookInput reads one JSON object (at most MaxHookInputBytes) with a non-empty hook_event_name.

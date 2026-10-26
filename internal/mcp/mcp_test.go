@@ -20,6 +20,7 @@ import (
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/store"
+	"github.com/qwwiwi/agent-jobs/internal/testutil"
 )
 
 var selfBin string // built agent-jobs binary
@@ -57,7 +58,8 @@ func TestMain(m *testing.M) {
 // newManager opens a real manager (real SQLite store) under a temp AGENT_JOBS_HOME.
 func newManager(t *testing.T) *jobs.Manager {
 	t.Helper()
-	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	// A short home: the daemon's unix sockets (brain.sock) live in the state dir below it.
+	t.Setenv("AGENT_JOBS_HOME", testutil.ShortTempDir(t))
 	// system_doctor probes codex's sandbox: never the host's codex (a missing binary is inconclusive).
 	t.Setenv("AGENT_JOBS_CODEX_BIN", filepath.Join(t.TempDir(), "no-codex"))
 	m, err := jobs.Open("test")

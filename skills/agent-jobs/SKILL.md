@@ -1,6 +1,6 @@
 ---
 name: agent-jobs
-description: Run long work as background agent-jobs (one-shot `claude -p` jobs with their own worktree, limits and report) through the agent-jobs MCP tools job_start, job_status, job_result, job_list, job_cancel, job_stop, job_resume, job_amend. Use when deciding whether to do a task yourself, hand it to a subagent, or start a job; when starting a job (a model or a complexity is mandatory); when a job needs new context or a changed plan (amend, stop and resume, or cancel); when a "[jobs:job-done]" line arrives; and when reading or verifying a job's report.
+description: Run long work as background agent-jobs (one-shot `claude -p` jobs with their own worktree, limits and report) through the agent-jobs MCP tools job_start, job_status, job_result, job_list, job_cancel, job_stop, job_resume, job_amend, and milestone_create / milestone_get / milestone_set / milestone_list for work of several tasks. Use when deciding whether to do a task yourself, hand it to a subagent, or start a job; when starting a job (a model or a complexity is mandatory); when a job needs new context or a changed plan (amend, stop and resume, or cancel); when a "[jobs:job-done]" line arrives; and when reading or verifying a job's report.
 ---
 
 # agent-jobs: background jobs for this agent
@@ -27,8 +27,9 @@ The main session only talks, decides and checks. Anything longer than a few step
 | `model` **or** `complexity` | mandatory, one of them. `complexity` is `light`, `normal` or `hard` and picks the model by kind. With neither, job_start is rejected: there is no default and no classifier |
 | `repo`, `base` | optional: the job gets a git worktree of `repo` at `base` (default HEAD). Without a repo it works in an empty directory |
 | `max_turns`, `max_budget_usd`, `timeout_minutes` | optional. Defaults 80 / $10 / 45 min; ceilings 200 / $50 / 180. Above a ceiling the call is rejected, never cut down |
-| `size` | `small` or `large`; pass it on every `fix` and `general` job (review and research jobs are exempt). `small`: a fix or a single job. `large`: a new project, or a feature with more than 5 requirements, several jobs or more than a day of work; it needs `repo` and `covers` naming only live requirement IDs of the repo's approved, unchanged `brief/CHECKLIST.md`, otherwise the call is rejected. While config `size_required` is off (the default until the owner turns it on) a missing size is logged and allowed; once it is on, a `fix` or `general` job without it is rejected |
-| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults |
+| `size` | optional: `small` or `large` (review and research jobs are exempt). Omitted on a `fix` or `general` job, it is `large` when the job has `covers` and `small` otherwise. `large` needs `repo` and `covers` naming only live requirement IDs of the repo's approved, unchanged `brief/CHECKLIST.md`, otherwise the call is rejected. Only with config `size_required` on (default off) is a `fix` or `general` job without it rejected |
+| `milestone`, `task` | optional, together: the milestone id and task key (`T1`, …) the job works on. Refused when the task is `blocked` (a dependency is not done) or `dropped`; the milestone's `branch` is the default `base`. A task with `depends_on` gets the accepted results of those tasks in its prompt (`## Prior results`, full reports in `prior/<key>/report.md`) |
+| `skills` | optional edits to the job's default skills from the skill catalog (the `core` skills of the kind plus the repository's project skills): `+name` adds, `-name` removes. Unknown or deprecated names, or more than the per-job budget, reject the call. Look them up with `skill_list`. A whole line `skills: none` in the brief disables catalog skills; do not combine it with edits. An empty `skills: []` keeps defaults. On a milestone task, leave `skills` out: the job gets the task's planned skills (giving them replaces the plan for this job) |
 
 job_start returns the id at once; the daemon starts the job within a minute, at most `max_running` at a time per agent (config.json, default two). Do not poll it in a loop: wait for the job-done line.
 
@@ -53,6 +54,14 @@ Inside a job:
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
 | `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
+| `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, covers?, skills?}]`), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel`; a task's `skills` are the `job_start` skills edits its jobs get |
+| `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; any edit of a done milestone while a task is not done or dropped reopens it) |
+| `milestone_get` | the tree: each task's derived status (blocked, running, review, done, failed, ready, dropped) and jobs, `ready` keys, progress |
+| `milestone_list` | by repo and order; `repo` + `tree: true` is the whole project in one call; pass the returned `cursor` as the next `updated_since` |
+
+## Milestones
+
+A piece of work with more than one task runs as a milestone by default; a single job needs none, and no brief or checklist is required. Create it with its tasks in one `milestone_create` call, then start one job per key in `ready` with `job_start(milestone, task)`; independent tasks run in parallel (`max_parallel` caps them). Choose skills once, for the whole milestone: look the catalog up with `skill_list` while writing `milestone_create` and give each task its `skills` (or `[]` for the defaults); then start its jobs without `skills`, and they get the task's plan. A task is done when you record `job_outcome(accepted)` for its job, which unblocks the tasks that depend on it. Task status is never set by hand.
 
 ## Change a job's course
 
@@ -125,8 +134,8 @@ For large work (a new project, more than 5 requirements, several jobs or more th
 2. `briefing_start(repo)` on the draft (it need not be approved): a read-only job whose input the daemon assembles; give no brief.
 3. `briefing_get(repo)`: put the rounds to the owner one at a time, each question with its proposed answer, so the owner can just agree; show the `decided` assumptions so the owner can overturn one. Round 1 holds what can stall the work from outside (payments, hosting, accounts, where data lives). Never ask the owner for a secret.
 4. Write the replies with `checklist_set`: new scope is a `G<nn>` row with the owner's words in `additions` in the same call; a choice goes into the Rationale of the row it settles; a cancellation is `dropped` with the owner's words in `rationale`. Each raises the version.
-5. Run `slicing_start(repo)` on the version the replies wrote, settle its unmapped quotes with the owner (`unmapped_decisions`), and show the owner only the rows `changed_since_approval` lists (all rows the first time). When `changed_since_approval.known` is false (an approval stored before its rows were recorded), its `rows` list is empty and says nothing: show the owner every current row. Then `checklist_set approve` with the owner's words.
-6. Start the feature jobs with `covers`, then judge the code with `judge_start`.
+5. Optionally run `slicing_start(repo)` on the version the replies wrote (advisory: approve does not need it; once it ran, settle its unmapped quotes with the owner in `unmapped_decisions`), and show the owner only the rows `changed_since_approval` lists (all rows the first time). When `changed_since_approval.known` is false (an approval stored before its rows were recorded), its `rows` list is empty and says nothing: show the owner every current row. Then `checklist_set approve` with the owner's words.
+6. Start the feature jobs with `covers`, then judge the code with `judge_start`: a codex model for claude coders, a claude model for codex coders. A requirement the owner waives (`checklist_set` `waivers`) stays waived across fix commits. A `gh pr merge` the merge gate cannot read only gets a warning: write it plainly with `-R OWNER/REPO --match-head-commit <sha>` so it is checked.
 
 ## Job context
 

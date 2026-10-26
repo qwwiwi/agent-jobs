@@ -690,6 +690,12 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it; start a new one with %s_start",
 			id, j.Kind, j.Kind)
 	}
+	if err := m.milestoneResumable(j); err != nil {
+		return nil, err
+	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -714,9 +720,13 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 
 // queueResume checks that the attempt of j (stopped, timed out or failed, after it ran) can be
 // resumed and queues the next attempt with the update; limits: see resumeLimits. The caller holds
-// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it.
+// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it, so the
+// sources refusal here guards every path that requeues a job that ran.
 func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	id := j.ID
+	if err := refuseSources(j.Sources); err != nil {
+		return fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Runner == store.RunnerCodex {
 		return fmt.Errorf("job %s: %w", id, errCodexResume)
 	}
@@ -795,6 +805,9 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 	if IsGateKind(j.Kind) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it (cancel it and start a new one)",
 			id, j.Kind)
+	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; cancel it and start a new job without them", id, err)
 	}
 	if j.Attempt > 0 {
 		err = m.Store.AmendContext(id, "\n\n"+strings.TrimSpace(context))
@@ -966,15 +979,25 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := m.refreshJobFiles(j, dir, gitDirs...); err != nil {
 		return launchPlan{}, err
 	}
+	// One read of the dependencies feeds the prior results of both prompts (the resumed session's update
+	// and the fallback prompt) and the prior/ folder, which is rewritten from it.
+	prior := m.priorSnapshot(j)
+	if err := m.writePriorReports(prior, dir); err != nil {
+		return launchPlan{}, err
+	}
 	update := m.resumeMessage(j)
-	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
+	resumed := update
+	if section := m.priorResults(j, prior); section != "" {
+		resumed += "\nThe prior results, read again for this attempt (prior/ was rewritten from the same read):\n\n" + section
+	}
+	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
 	}
 	var notes MemoryNotes
 	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
 		notes = m.LookupMemoryNotes(j)
 	}
-	brief, err := m.BuildPrompt(j, rules, cards, notes)
+	brief, err := m.buildPrompt(j, rules, cards, notes, prior, m.sourcesOnDisk(j))
 	if err != nil {
 		return launchPlan{}, err
 	}

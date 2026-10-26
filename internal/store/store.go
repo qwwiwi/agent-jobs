@@ -167,6 +167,11 @@ type Job struct {
 	// Gate is the input the daemon assembled for a gate job (Wave F: kind slicing, F3, or judge, F5);
 	// nil for every other kind. The job's prompt is built from it, never from an orchestrator brief.
 	Gate *GateInput
+	// MilestoneID and TaskKey attach the job to a task of a milestone (0 and "" for none).
+	MilestoneID int64
+	TaskKey     string
+	// Sources are the https git URLs cloned read-only into <jobdir>/sources before the job starts (G02).
+	Sources []string
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -414,6 +419,24 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: merge gate repos: %w", err)
 	}
+	if _, err := db.Exec(milestonesSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: milestones: %w", err)
+	}
+	if err := migrateMilestoneTriggers(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: milestone triggers: %w", err)
+	}
+	for _, alter := range milestoneMigrations {
+		if err := migrate(db, alter); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate db: milestones: %w", err)
+		}
+	}
+	if err := migrateSources(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: sources: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -560,6 +583,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN gate_input TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN size TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_sandbox TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN milestone_id INTEGER`,
+	`ALTER TABLE jobs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -692,7 +717,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -756,7 +781,8 @@ func insertArgs(j *Job) []any {
 		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
-		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size}
+		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -777,7 +803,8 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate string
+	var skills, delivered, covers, coverContract, gate, sources string
+	var milestone sql.NullInt64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
@@ -786,7 +813,8 @@ func scanJob(r scanner) (*Job, error) {
 		&skills, &delivered, &j.SkillsNote,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
-		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size)
+		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
+		&milestone, &j.TaskKey, &sources)
 	if err != nil {
 		return nil, err
 	}
@@ -803,6 +831,7 @@ func scanJob(r scanner) (*Job, error) {
 		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)
+	j.MilestoneID, j.Sources = milestone.Int64, SplitNames(sources)
 	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
@@ -944,9 +973,12 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 	}
 	// redaction_pending: from now on the attempt may write report.md; it is cleared only once the
 	// report of the ended attempt has been redacted (ClearRedactionPending).
-	return affected(s.db.Exec(`UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-		attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`, token, now.Unix(), id))
+	return affected(s.db.Exec(claimSQL, token, now.Unix(), id))
 }
+
+// claimSQL moves a queued job to running (Claim, ClaimOnMilestone): launch token, started_at, id.
+const claimSQL = `UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
+	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
 // report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.

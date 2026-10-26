@@ -106,7 +106,7 @@ func TestJobCoversRequirements(t *testing.T) {
 	var res JobResultOutput
 	call(t, cs, "job_result", map[string]any{"id": "261024-120000-c0fe"}, &res)
 	r := res.Requirements
-	if r == nil || !r.Block || len(r.Lines) != 2 || !slices.Equal(r.Claimed, []string{"R01"}) ||
+	if r == nil || !r.Block || len(r.Lines) != 2 || len(r.Claimed) != 0 || !r.Lines[0].Verified ||
 		!slices.Equal(r.Trailer, []string{"R01", "R03i"}) || r.TrailerNote != "" || !slices.Equal(res.Covers, []string{"R01", "R03i"}) {
 		t.Fatalf("job_result requirements: %+v %+v", r, res.Covers)
 	}

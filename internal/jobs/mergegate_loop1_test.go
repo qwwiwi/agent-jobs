@@ -23,12 +23,19 @@ func mergeGateRepo(t *testing.T) (*Manager, string) {
 
 func gateAnswer(t *testing.T, m *Manager, cwd, cmd, env string) string {
 	t.Helper()
-	r, err := m.MergeGate(cwd, cmd, env)
+	a, err := m.MergeGateCheck(cwd, cmd, env)
 	if err != nil {
 		t.Fatalf("%s: %v", cmd, err)
 	}
-	return r
+	if a.Refusal != "" {
+		return a.Refusal
+	}
+	return a.Warning
 }
+
+// unsureWarn starts the merge gate's answer for a merge it cannot read in a gated repository: a warning,
+// not a refusal (owner decision 2026-10-25).
+const unsureWarn = MergeGateWarnPrefix + "cannot tell"
 
 // A gated repository whose work tree is gone never makes a merge in an unrelated repository unreadable
 // once its names are stored (here by the daemon's backfill; they still gate it by name,
@@ -73,13 +80,13 @@ func TestMergeGateCdLikeTheShell(t *testing.T) {
 	}{
 		{"cd in a subshell", parent, "(cd " + elsewhere + "); cd " + name + " && gh pr merge 5", MergeGatePrefix},
 		{"cd in a branch not taken", parent, "false && cd " + elsewhere + "; cd " + name + " && gh pr merge 5", MergeGatePrefix},
-		{"HOME set, bare cd", elsewhere, "HOME=" + repo + "; cd; gh pr merge 5", "cannot tell"},
-		{"HOME prefix on cd", elsewhere, "HOME=" + repo + " cd && gh pr merge 5", "cannot tell"},
-		{"CDPATH exported", elsewhere, "export CDPATH=" + parent + "; cd " + name + " && gh pr merge 5", "cannot tell"},
+		{"HOME set, bare cd", elsewhere, "HOME=" + repo + "; cd; gh pr merge 5", unsureWarn},
+		{"HOME prefix on cd", elsewhere, "HOME=" + repo + " cd && gh pr merge 5", unsureWarn},
+		{"CDPATH exported", elsewhere, "export CDPATH=" + parent + "; cd " + name + " && gh pr merge 5", unsureWarn},
 		{"plain cd to an unrelated directory", parent, "cd " + elsewhere + " && gh pr merge 5", ""},
 		{"cd into .git", parent, "cd " + name + "/.git && gh pr merge 5", "without --match-head-commit"},
 		{"cd to a directory the command creates", elsewhere, "git clone -q " + repo + " " + elsewhere + "/new && cd " +
-			elsewhere + "/new && gh pr merge 5", "cannot tell"},
+			elsewhere + "/new && gh pr merge 5", unsureWarn},
 		{"cd to a symlink the command creates", elsewhere, "ln -s " + repo + " " + elsewhere + "/l && cd " + elsewhere +
 			"/l && gh pr merge 5", "does not exist now"},
 	} {
@@ -98,16 +105,16 @@ func TestMergeGateSelectorsAndLimits(t *testing.T) {
 		name, cwd, cmd string
 		want           string
 	}{
-		{"-R glob", elsewhere, "gh pr merge 5 -R acme/dem*", "cannot tell"},
-		{"-R brace", elsewhere, "gh pr merge 5 -R acme/{demo,x}", "cannot tell"},
-		{"GH_REPO glob", elsewhere, "GH_REPO=acme/dem* gh pr merge 5", "cannot tell"},
-		{"cd glob", filepath.Dir(repo), "cd " + filepath.Base(repo)[:1] + "* && gh pr merge 5", "cannot tell"},
-		{"OWNER/REPO#N", elsewhere, "gh pr merge acme/demo#5", "cannot tell"},
-		{"over-long, continued", elsewhere, "# " + strings.Repeat("x", 64<<10) + "\ngh pr mer\\\nge 5", "cannot tell"},
+		{"-R glob", elsewhere, "gh pr merge 5 -R acme/dem*", unsureWarn},
+		{"-R brace", elsewhere, "gh pr merge 5 -R acme/{demo,x}", unsureWarn},
+		{"GH_REPO glob", elsewhere, "GH_REPO=acme/dem* gh pr merge 5", unsureWarn},
+		{"cd glob", filepath.Dir(repo), "cd " + filepath.Base(repo)[:1] + "* && gh pr merge 5", unsureWarn},
+		{"OWNER/REPO#N", elsewhere, "gh pr merge acme/demo#5", unsureWarn},
+		{"over-long, continued", elsewhere, "# " + strings.Repeat("x", 64<<10) + "\ngh pr mer\\\nge 5", unsureWarn},
 		{"gh pr view in a substitution", repo, "X=$(gh pr view 5 --json mergeStateStatus -q .mergeStateStatus)", ""},
 		{"gh pr view in a quoted substitution", repo, `echo "$(gh pr view 5 --json mergeable)"`, ""},
 		{"gh pr view in bash -c", repo, "bash -c 'gh pr view 5 --json mergeable'", ""},
-		{"gh pr merge in a substitution", elsewhere, "X=$(gh pr merge 5)", "cannot tell"},
+		{"gh pr merge in a substitution", elsewhere, "X=$(gh pr merge 5)", unsureWarn},
 	} {
 		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)

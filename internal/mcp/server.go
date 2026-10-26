@@ -100,6 +100,10 @@ var toolDefs = []toolDef{
 	{"judge_start", addJudgeStart},
 	{"judge_get", addJudgeGet},
 	{"release_check", addReleaseCheck},
+	{"milestone_create", addMilestoneCreate},
+	{"milestone_set", addMilestoneSet},
+	{"milestone_get", addMilestoneGet},
+	{"milestone_list", addMilestoneList},
 }
 
 func definitions() []toolDef { return toolDefs }
@@ -127,6 +131,7 @@ Route: minutes of work, do it yourself; the session needs the result now, a suba
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.
 system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
 To change a job's course: job_amend adds context to a queued job; job_stop + job_resume stops a running one and continues it in the same session with your update; job_cancel gives it up.
+milestone_create / milestone_set / milestone_get / milestone_list: a multi-task piece of work runs as a milestone (tasks with depends_on, one job per task via job_start milestone+task); a single job needs none. Task status is derived from its jobs; a dependency is done once its job's outcome is accepted.
 intention_add, intention_list and intention_set keep the agent's own goals (open, done, dropped; never deleted).
 schedule_add / schedule_list / schedule_set / schedule_remove: a cron in local time plus a prompt; due prompts arrive as "[jobs:schedule] ..." (do each one), or start a job when the schedule has a kind. Remove a schedule only on the owner's instruction.
 check_add / check_list / check_set / check_remove: dead-man's switch checks (a cron in local time plus a grace); whatever stays silent while healthy calls check_mark (jobs can); a missed expected time arrives once as "[jobs:check-missed] ...". Remove a check only on the owner's instruction.

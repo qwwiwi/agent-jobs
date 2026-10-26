@@ -82,6 +82,9 @@ type JobView struct {
 	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
 	// config.json did not load, or the daemon runs another version (restart the session).
 	Warnings []string `json:"warnings,omitempty"`
+	// Notes (judge_start only): information that needs no action, such as the judge sharing a coder's
+	// model family (owner decision 2026-10-26: the family does not fail release_check).
+	Notes []string `json:"notes,omitempty"`
 	// CodexJobsToday (job_start of a codex job only): codex jobs of this agent in the last 24 hours
 	// against the daily cap, "n/limit".
 	CodexJobsToday string `json:"codex_jobs_today,omitempty"`
@@ -107,6 +110,13 @@ type JobView struct {
 	Covers []string `json:"covers,omitempty"`
 	// Size is the size given at job_start (small, large; omitted when none was given; Wave F, F9 (a)).
 	Size string `json:"size,omitempty"`
+	// Milestone and Task are the milestone task the job works on (omitted for none).
+	Milestone int64  `json:"milestone,omitempty"`
+	Task      string `json:"task,omitempty"`
+	// Waiting is why a queued job of a task does not start yet ("waiting for T1 (failed)"; omitted otherwise).
+	Waiting string `json:"waiting,omitempty"`
+	// Sources are the git URLs cloned read-only into the job folder before it starts (G02).
+	Sources []string `json:"sources,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -129,7 +139,8 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
-		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j),
+		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Milestone: j.MilestoneID, Task: j.TaskKey,
+		Waiting: m.MilestoneWaiting(context.Background(), j), Sources: j.Sources,
 	}
 }
 
@@ -188,9 +199,12 @@ type JobStartInput struct {
 	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
 	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
-	Covers          []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence · ran: <cmd → result>) plus a REDPROOF line per new test naming the ID (REDPROOF R01 · <test> failed before the change); without the block, or with no line for any covered ID, it is off contract; a done line without ran: or a red proof naming its ID counts as claimed. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
-	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); stored on the job. Fix and general jobs declare it; review, research and the gate kinds are exempt. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job is refused when config size_required is on, otherwise logged and allowed"`
-	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. See skill_list"`
+	Covers          []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence); without the block, or with no line for any covered ID, it is off contract; ran: and REDPROOF fields are shown when given, never required. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
+	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); optional, stored on the job. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job gets large when it has covers, else small (refused instead when config size_required is on, default off); review, research and the gate kinds are exempt"`
+	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
+	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
+	Sources         []string `json:"sources,omitempty" jsonschema:"currently DISABLED (G02 deferred, owner decision 2026-10-26: the text-parsing guard could still be bypassed; it returns with OS-level isolation): a non-empty list is refused, an empty or absent one changes nothing. When enabled: https git URLs (no ssh, file or local paths, no credentials) the daemon shallow-clones read-only into the job folder as sources/<name> before the job starts (no submodules, hooks or LFS; size cap config sources_max_mb, default 500 MB). A failed clone is reported in the job's brief and the job still starts. The job reads the local copy; it runs that code only in docker run --rm with a copy under sandbox/ mounted (the guard refuses running it on the host). Omitted on a milestone task: the task's planned sources; an empty list: none"`
+	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -210,6 +224,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
+			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -279,7 +294,7 @@ type JobResultOutput struct {
 	JobDirBytes   int64 `json:"job_dir_bytes"`
 	JobDirPartial bool  `json:"job_dir_partial,omitempty"`
 	// Covers and Requirements (jobs started with covers only, Wave F, F4): the report's
-	// "### Requirements" block read against the covers; claimed lists the done lines without ran: or REDPROOF.
+	// "### Requirements" block read against the covers (claimed stays empty since 2026-10-25).
 	Covers       []string          `json:"covers,omitempty"`
 	Requirements *RequirementsView `json:"requirements,omitempty"`
 }

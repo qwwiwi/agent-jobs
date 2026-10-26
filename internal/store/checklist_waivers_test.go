@@ -34,23 +34,28 @@ func TestWaiversBoundToHashVersionAndSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	got, err := s.Waivers("/r", "h1", 2)
+	got, err := s.Waivers("/r", "demo", "h1", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 2 || got[0].Requirement != "R01" || got[1].Quote != "new quote" || !got[1].CreatedAt.Equal(at) || got[1].ChecklistVersion != 2 {
 		t.Fatalf("waivers %+v", got)
 	}
-	if got, _ := s.Waivers("/other", "h1", 2); len(got) != 0 {
+	if got, _ := s.Waivers("/other", "demo", "h1", 2); len(got) != 0 {
 		t.Fatalf("other repo %+v", got)
 	}
-	if got, _ := s.Waivers("/r", "h1", 5); len(got) != 1 || got[0].Quote != "other version" {
+	if got, _ := s.Waivers("/r", "demo", "h1", 5); len(got) != 1 || got[0].Quote != "other version" {
 		t.Fatalf("other version %+v", got)
+	}
+	// A waiver without a sha is complete (it binds to the hash, version and requirement).
+	if err := s.PutWaiver(Waiver{Repo: "/r", ChecklistSHA256: "h9", ChecklistVersion: 1, Requirement: "R01", Quote: "q"}); err != nil {
+		t.Fatalf("waiver without a sha: %v", err)
 	}
 	for _, bad := range []Waiver{
 		{Repo: "/r", ChecklistSHA256: "h1", ChecklistVersion: 2, SHA: "s1", Requirement: "R01"},
 		{Repo: "", ChecklistSHA256: "h", ChecklistVersion: 2, SHA: "s", Requirement: "R01", Quote: "q"},
 		{Repo: "/r", ChecklistSHA256: "h", SHA: "s", Requirement: "R01", Quote: "q"},
+		{Repo: "/r", ChecklistSHA256: "h", ChecklistVersion: 2, Quote: "q"},
 	} {
 		if err := s.PutWaiver(bad); err == nil {
 			t.Fatalf("incomplete waiver stored: %+v", bad)
@@ -126,5 +131,52 @@ func TestChecklistBinding(t *testing.T) {
 	}
 	if b, err := s.Binding("/r", "demo"); err != nil || b == nil || b.BriefSHA256 != "p2" || !b.Approved {
 		t.Fatalf("approved: %+v %v", b, err)
+	}
+}
+
+// A waiver is bound to the checklist id too: two checklists with identical content and version under
+// two ids keep their own waivers, and one of id A never shows for id B.
+func TestWaiversBoundToChecklistID(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	at := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
+	a := Waiver{Repo: "/r", ChecklistID: "a", ChecklistSHA256: "h", ChecklistVersion: 1, SHA: "s", Requirement: "R01", Quote: "waive A", CreatedAt: at}
+	if err := s.PutWaiver(a); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Waivers("/r", "b", "h", 1); err != nil || len(got) != 0 {
+		t.Fatalf("waiver of A seen for B: %+v %v", got, err)
+	}
+	b := a
+	b.ChecklistID, b.Quote = "b", "waive B"
+	if err := s.PutWaiver(b); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Waivers("/r", "a", "h", 1); err != nil || len(got) != 1 || got[0].Quote != "waive A" {
+		t.Fatalf("waiver of A replaced by B: %+v %v", got, err)
+	}
+}
+
+// Waivers are listed oldest first (by created time, then insertion), so the last one for a requirement
+// is the newest, whatever its sha.
+func TestWaiversNewestLast(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	at := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
+	for i, sha := range []string{"ff", "00", "aa"} {
+		if err := s.PutWaiver(Waiver{Repo: "/r", ChecklistID: "a", ChecklistSHA256: "h", ChecklistVersion: 1, SHA: sha,
+			Requirement: "R01", Quote: "q" + sha, CreatedAt: at.Add(time.Duration(i) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Waivers("/r", "a", "h", 1)
+	if err != nil || len(got) != 3 || got[0].SHA != "ff" || got[2].SHA != "aa" {
+		t.Fatalf("waivers not oldest first: %+v %v", got, err)
 	}
 }

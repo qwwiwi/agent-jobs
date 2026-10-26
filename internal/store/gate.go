@@ -132,7 +132,8 @@ type JudgeVerdict struct {
 	EnforcedBlind bool `json:"enforced_blind"`
 	// CoderFamilies are the model families of the feature jobs (fix, general) whose covers name this
 	// checklist id, CoderJobs those jobs; FamilyDiffers is true only when there is at least one and none
-	// shares the judge's family; SameFamily when one does (stored, flagged: it cannot pass release_check).
+	// shares the judge's family; SameFamily when one does (information only: release_check does not read
+	// it, owner decision 2026-10-26).
 	// Both are a snapshot of the cover jobs when the verdict was stored: a later coder job does not
 	// change them, so release_check (F7) recomputes them.
 	CoderFamilies []string `json:"coder_families"`

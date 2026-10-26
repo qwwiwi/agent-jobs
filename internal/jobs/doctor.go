@@ -85,6 +85,9 @@ type ProcsReport struct {
 	DeadRows  []DeadRow `json:"dead_rows"`
 	Killed    int       `json:"killed"`
 	Note      string    `json:"note,omitempty"`
+	// PendingContainers are the jobs whose sandbox containers are not removed yet (containers.pending: a
+	// docker call failed or settle left it to the tick); every tick retries them.
+	PendingContainers []string `json:"pending_containers"`
 }
 
 // procInfo is what the scan reads about one process.
@@ -270,6 +273,14 @@ func (m *Manager) DoctorProcs(kill bool) (ProcsReport, error) { return m.doctorP
 // doctorProcs is DoctorProcs; with only set, it reports (and kills) the ghosts of that job only.
 func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 	rep := ProcsReport{Kill: kill, Ghosts: []Ghost{}, DeadRows: []DeadRow{}}
+	pending, err := m.PendingContainerCleanups()
+	if err != nil {
+		return rep, fmt.Errorf("pending container cleanups: %w", err)
+	}
+	if only != "" {
+		pending = slices.DeleteFunc(pending, func(id string) bool { return id != only })
+	}
+	rep.PendingContainers = pending
 	running, err := m.Store.ListByStatus(store.StatusRunning)
 	if err != nil {
 		return rep, err

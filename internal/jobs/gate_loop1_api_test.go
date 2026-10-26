@@ -103,9 +103,10 @@ func TestGateEnforcedBlindAndLockDir(t *testing.T) {
 	}
 }
 
-// judge_start warns when the judge runs on the family of a coder of the checklist, and not when no
-// coder shares it or there is none.
-func TestJudgeFamilyWarning(t *testing.T) {
+// judge_start notes when the judge runs on the family of a succeeded coder of the checklist, and not
+// when no coder shares it, there is none or the only one was cancelled. The note is information, no
+// longer a warning that the verdict will not pass (owner decision 2026-10-26, msg 68041).
+func TestJudgeFamilyNote(t *testing.T) {
 	m := newManager(t)
 	repo, sha := gateRepo(t)
 	approveBrief(t, m, repo)
@@ -117,18 +118,23 @@ func TestJudgeFamilyWarning(t *testing.T) {
 		}
 		return j
 	}
-	if w, err := m.JudgeFamilyWarning(judge("sonnet")); err != nil || w != "" {
+	if w, err := m.JudgeFamilyNote(judge("sonnet")); err != nil || w != "" {
 		t.Fatalf("no coders: %q %v", w, err)
 	}
-	coder := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
-	if err := m.Cancel(coder.ID); err != nil {
+	cancelled := enqueue(t, m, "build it", func(r *StartRequest) { r.Kind, r.RepoPath, r.Covers = "fix", repo, []string{"R01"} })
+	if err := m.Cancel(cancelled.ID); err != nil {
 		t.Fatal(err)
 	}
-	w, err := m.JudgeFamilyWarning(judge("sonnet"))
-	if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, coder.ID) {
+	if w, err := m.JudgeFamilyNote(judge("sonnet")); err != nil || w != "" {
+		t.Fatalf("a cancelled coder only: %q %v", w, err)
+	}
+	insertCoder(t, m, repo, "claude-ok", store.StatusSucceeded, SizeLarge, store.RunnerClaude, "sonnet", "R01")
+	w, err := m.JudgeFamilyNote(judge("sonnet"))
+	if err != nil || !strings.Contains(w, "same_family") || !strings.Contains(w, "claude-ok") || strings.Contains(w, cancelled.ID) ||
+		!strings.Contains(w, "information only") || strings.Contains(w, "cross-family") {
 		t.Fatalf("claude judge of claude coders: %q %v", w, err)
 	}
-	if w, err := m.JudgeFamilyWarning(judge("gpt-5.6-sol")); err != nil || w != "" {
+	if w, err := m.JudgeFamilyNote(judge("gpt-5.6-sol")); err != nil || w != "" {
 		t.Fatalf("codex judge of claude coders: %q %v", w, err)
 	}
 }
@@ -140,5 +146,35 @@ func TestWrapperChecklistLockDirOption(t *testing.T) {
 	}
 	if err := (WrapperOptions{ChecklistLockDir: "/abs/locks"}).validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A codex gate job launched under the read-only codex sandbox (the launch record) stores its result with
+// enforced_blind true (owner decision 2026-10-25); one under worktree-full-access stays not blind.
+func TestGateCodexReadOnlySandboxIsBlind(t *testing.T) {
+	m := newManager(t)
+	repo := briefRepo(t)
+	for _, tc := range []struct {
+		sandbox string
+		blind   bool
+	}{{CodexSandboxReadOnly, true}, {CodexSandboxFullAccess, false}} {
+		j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: repo, Model: "gpt-5.6-sol"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok := "tok-" + j.ID
+		if err := m.Store.Claim(j.ID, tok, m.Now()); err != nil {
+			t.Fatal(err)
+		}
+		cx := get(t, m, j.ID)
+		if err := m.Store.SetLaunchAuthorization(cx.ID, tok, cx.Attempt, store.LaunchAuthorization{CodexSandbox: tc.sandbox}); err != nil {
+			t.Fatal(err)
+		}
+		if msg := gateStep(m.Store, cx.ID, tok, slicingReport(t, cx.Gate), m.ChecklistLockDir(), time.Now()); msg != "" {
+			t.Fatal(msg)
+		}
+		if r, _ := m.Store.SlicingByJob(cx.ID, cx.Attempt); r == nil || r.EnforcedBlind != tc.blind {
+			t.Fatalf("codex result under %s: %+v", tc.sandbox, r)
+		}
 	}
 }

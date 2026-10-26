@@ -73,6 +73,16 @@ type Manager struct {
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
 
+	// prefetching is set while the daemon's background clone run (prefetchInBackground) is on; prefetchWG
+	// waits for it.
+	prefetching atomic.Bool
+	prefetchWG  sync.WaitGroup
+	// sourcesRetryAt holds, per job id, when clones that could not record their outcome are tried again
+	// (time.Time, sourcesRetryBackoff after the failure).
+	sourcesRetryAt sync.Map
+	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
+	beforeClaim func(*store.Job)
+
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
 	codexProbeKey string             // the codex binary identity it ran on (codexBinKey)
@@ -180,6 +190,18 @@ type StartRequest struct {
 	SizeRule bool
 	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
 	Gate *store.GateInput
+	// Milestone and Task attach the job to a task of a milestone (both or neither): the task must not
+	// be blocked or dropped, and the milestone's branch is the default base. Without Skills (nil) the
+	// job gets the task's planned skills (G01).
+	Milestone int64
+	Task      string
+	// Sources are https git URLs cloned read-only into the job folder before it starts (G02); nil = not
+	// given (a task job then takes its task's planned sources), empty = none.
+	Sources []string
+	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
+	plannedSkills bool
+	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
+	plannedSources bool
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -335,6 +357,23 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := checkGateRequest(r); err != nil {
 		return nil, err
 	}
+	if err := m.milestoneStart(&r); err != nil {
+		return nil, err
+	}
+	if err := refuseSources(r.Sources); err != nil {
+		if r.plannedSources {
+			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
+				"it without them, or clear them with milestone_set sources: [])", err, r.Task, r.Milestone)
+		}
+		return nil, err
+	}
+	sources, err := ValidateSources(r.Sources)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) > 0 && r.Gate != nil {
+		return nil, errors.New("a gate job gets nothing but its input: no sources")
+	}
 	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -346,6 +385,15 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	runner, err := ResolveRunner(r.Runner, model)
 	if err != nil {
 		return nil, err
+	}
+	if len(sources) > 0 && runner == store.RunnerCodex {
+		// The guard keeps cloned code off the host; codex runs its own sandbox, without the guard.
+		msg := "sources need the guard, which does not run inside codex: start a claude job for them"
+		if r.plannedSources {
+			msg += fmt.Sprintf(" (the sources planned for task %s of milestone %d: give job_start sources: [] to "+
+				"run it on codex without them)", r.Task, r.Milestone)
+		}
+		return nil, errors.New(msg)
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
@@ -420,6 +468,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 	} else if r.Gate == nil {
 		selected, err = m.selectSkills(r.Kind, repo, r.Skills)
+		if err != nil && r.plannedSkills {
+			return nil, fmt.Errorf("%w (the skills planned for task %s of milestone %d: give job_start skills of its own, "+
+				"or change the plan with milestone_set)", err, r.Task, r.Milestone)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -432,6 +484,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		MilestoneID: r.Milestone, TaskKey: r.Task, Sources: sources,
 	}
 	return j, nil
 }
@@ -442,7 +495,17 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 // notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
 	m.RefreshDaemonConfig()
+	// Sources are cloned outside the lifecycle lock (prefetchSources): in the background in the daemon,
+	// inline in a manual tick (none while a daemon runs: it clones them).
+	if m.daemonLockHeld {
+		m.prefetchInBackground()
+	} else if d, derr := m.ReadDaemonInfo(); derr != nil || !alive(d.PID) {
+		m.prefetchSources()
+	}
 	err := m.tickLocked()
+	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
+	// docker call may take up to containerCmdTimeout.
+	m.retryContainerCleanups()
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {
@@ -537,14 +600,46 @@ func (m *Manager) launchQueued() error {
 	}
 	limit := m.Config().MaxRunningJobs()
 	for _, j := range queued {
+		if err := refuseSources(j.Sources); err != nil {
+			// G02 is deferred: a stored job with sources never starts and nothing clones them.
+			m.cancelQueued(j, "cancelled before start: "+err.Error())
+			continue
+		}
 		if running >= limit {
 			return nil
 		}
+		if j.MilestoneID != 0 {
+			// A job on a task is checked again: its milestone may have changed since job_start. It waits for
+			// its dependencies and a slot of the milestone (max_parallel); one that can no longer run (the
+			// milestone closed, the task dropped) is cancelled with the reason.
+			wait, cancel, err := m.milestoneLaunch(context.Background(), j)
+			if err != nil {
+				m.Log.Printf("job %s: milestone check: %v", j.ID, err)
+				continue
+			}
+			if cancel != "" {
+				m.cancelQueued(j, "cancelled before start: "+cancel)
+				continue
+			}
+			if wait != "" {
+				continue
+			}
+		}
+		if needsClone(j) && !m.sourcesCloned(j) {
+			continue // its sources are cloned outside the lifecycle lock (prefetchSources); it starts once they are
+		}
+		if m.beforeClaim != nil {
+			m.beforeClaim(j)
+		}
 		token := newToken()
 		// The row is ours (running + token) before anything is created or spawned.
-		if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		if err := m.claim(j, token); err != nil {
 			if errors.Is(err, store.ErrImmutable) {
 				continue // cancelled or taken meanwhile
+			}
+			if errors.Is(err, errMilestoneChanged) {
+				m.Log.Printf("job %s: its milestone changed before the claim; checked again next tick", j.ID)
+				continue
 			}
 			return err
 		}
@@ -568,6 +663,45 @@ func (m *Manager) launchQueued() error {
 		}
 	}
 	return nil
+}
+
+// errMilestoneChanged: the launch check, taken again inside the claim, no longer lets the job start.
+var errMilestoneChanged = errors.New("the milestone changed since the launch check")
+
+// claim moves queued job j to running under token. A job on a task is claimed with its launch check taken
+// again inside the claim's write transaction (launchVerdict): a milestone edit, a job or an outcome
+// committed after launchQueued's check (a dependency added, the task dropped, the milestone closed)
+// cannot let it start. It stays queued (errMilestoneChanged); the next tick waits or cancels.
+func (m *Manager) claim(j *store.Job, token string) error {
+	if j.MilestoneID == 0 {
+		return m.Store.Claim(j.ID, token, m.Now())
+	}
+	return m.Store.ClaimOnMilestone(j.ID, token, m.Now(), j.MilestoneID,
+		func(ms *store.Milestone, tasks []store.MilestoneTask, jobs []*store.Job) error {
+			if wait, cancel := launchVerdict(j, ms, tasks, jobs); wait != "" || cancel != "" {
+				return errMilestoneChanged
+			}
+			return nil
+		})
+}
+
+// cancelQueued ends a queued job that may not start (launchQueued holds the lifecycle lock) as
+// cancelled with reason, as Cancel would.
+func (m *Manager) cancelQueued(j *store.Job, reason string) {
+	unlockAdmit, err := lockAdmitIfExists(m.JobDir(j.ID))
+	if err != nil {
+		m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		return
+	}
+	defer unlockAdmit()
+	if err := m.Store.Finish(j.ID, "", store.StatusCancelled, 0, 0, 0, RedactPrintable(reason, 300), m.Now()); err != nil {
+		if !errors.Is(err, store.ErrImmutable) {
+			m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		}
+		return
+	}
+	m.Log.Printf("job %s %s", j.ID, RedactText(reason))
+	m.settled(j.ID)
 }
 
 // ClaudeArgs is the reference command line (prompt.md arrives on stdin) with a pre-assigned session

@@ -94,15 +94,25 @@ func TestChecklistToolsFlow(t *testing.T) {
 		"waivers": []map[string]any{{"requirement": "D01", "sha": head, "quote": "ok"}}}); !strings.Contains(msg, "not a live requirement") {
 		t.Fatalf("waiver on D row: %q", msg)
 	}
-	if msg := callErr(t, cs, "checklist_set", map[string]any{"repo": repo,
-		"waivers": []map[string]any{{"requirement": "R01", "sha": strings.Repeat("0", 40), "quote": "ok"}}}); !strings.Contains(msg, "not a commit") {
-		t.Fatalf("waiver on unknown sha: %q", msg)
-	}
+	// The sha is accepted and ignored (a waiver binds to the hash and the requirement): no commit check,
+	// a warning says so; a waiver without a sha is stored too.
 	call(t, cs, "checklist_set", map[string]any{"repo": repo,
 		"waivers": []map[string]any{{"requirement": "R01", "sha": head, "quote": "ship without it " + secret}}}, &v)
 	if !v.Approved || v.WaiversAdded != 1 || len(v.Waivers) != 1 || v.Waivers[0].ChecklistSHA256 != approvedHash || v.Waivers[0].ChecklistVersion != 2 ||
-		v.Waivers[0].SHA != head || strings.Contains(v.Waivers[0].Quote, secret) {
+		v.Waivers[0].SHA != head || strings.Contains(v.Waivers[0].Quote, secret) || len(v.Warnings) != 1 ||
+		!strings.Contains(v.Warnings[0], "waiver sha ignored") {
 		t.Fatalf("waiver: %+v", v)
+	}
+	var nosha, unknown ChecklistView
+	call(t, cs, "checklist_set", map[string]any{"repo": repo,
+		"waivers": []map[string]any{{"requirement": "R01", "quote": "ok"}}}, &nosha)
+	if !nosha.Approved || nosha.WaiversAdded != 1 || len(nosha.Waivers) != 2 || len(nosha.Warnings) != 0 {
+		t.Fatalf("waiver without a sha: %+v", nosha)
+	}
+	call(t, cs, "checklist_set", map[string]any{"repo": repo,
+		"waivers": []map[string]any{{"requirement": "R01", "sha": strings.Repeat("0", 40), "quote": "ok"}}}, &unknown)
+	if unknown.WaiversAdded != 1 || len(unknown.Warnings) != 1 {
+		t.Fatalf("waiver on an unknown sha: %+v", unknown)
 	}
 
 	// A manual edit of a Rationale voids the approval; checklist_get says so.
