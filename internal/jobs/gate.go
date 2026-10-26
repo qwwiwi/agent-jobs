@@ -712,6 +712,87 @@ type JudgeRun struct {
 	Result string `json:"result"`
 }
 
+// JudgeRuns is the judge's ran list. An entry is the documented object {cmd, result} (unknown fields
+// refused) or a plain string, read as the command with no result.
+type JudgeRuns []JudgeRun
+
+// UnmarshalJSON decodes the list entry by entry; null leaves it nil, so the validation reports the list
+// missing.
+func (l *JudgeRuns) UnmarshalJSON(data []byte) error {
+	return gateEntries(data, "ran", l, func(raw json.RawMessage) (JudgeRun, error) {
+		var r JudgeRun
+		s, isString, err := stringOrObject(raw, &r)
+		if isString {
+			r.Cmd = s
+		}
+		return r, err
+	})
+}
+
+// JudgeNotRun is the judge's could_not_run list, stored as strings. An entry is a plain string or an
+// object {cmd, why} (both required, unknown fields refused), stored as "cmd: why".
+type JudgeNotRun []string
+
+// UnmarshalJSON decodes the list entry by entry; null leaves it nil, so the validation reports the list
+// missing.
+func (l *JudgeNotRun) UnmarshalJSON(data []byte) error {
+	return gateEntries(data, "could_not_run", l, func(raw json.RawMessage) (string, error) {
+		var o struct {
+			Cmd string `json:"cmd"`
+			Why string `json:"why"`
+		}
+		s, isString, err := stringOrObject(raw, &o)
+		switch {
+		case err != nil:
+			return "", err
+		case isString:
+			return s, nil
+		case checklist.NormalizeField(o.Cmd) == "":
+			return "", errors.New("cmd is empty")
+		case checklist.NormalizeField(o.Why) == "":
+			return "", errors.New("why is empty")
+		}
+		return o.Cmd + ": " + o.Why, nil
+	})
+}
+
+// gateEntries decodes the JSON list data into *l, one entry at a time; an entry's error names the list
+// and the entry's position. null leaves *l as it is.
+func gateEntries[T any, L ~[]T](data []byte, what string, l *L, entry func(json.RawMessage) (T, error)) error {
+	if string(bytes.TrimSpace(data)) == "null" {
+		return nil
+	}
+	var raws []json.RawMessage
+	if err := json.Unmarshal(data, &raws); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	out := make(L, 0, len(raws))
+	for i, raw := range raws {
+		v, err := entry(raw)
+		if err != nil {
+			return fmt.Errorf("%s %d: %w", what, i+1, err)
+		}
+		out = append(out, v)
+	}
+	*l = out
+	return nil
+}
+
+// stringOrObject decodes data as a JSON string (isString) or into the object obj with unknown fields
+// refused, as decodeStrict does for the whole block.
+func stringOrObject(data []byte, obj any) (s string, isString bool, err error) {
+	switch t := bytes.TrimSpace(data); {
+	case len(t) > 0 && t[0] == '"':
+		err = json.Unmarshal(t, &s)
+		return s, true, err
+	case len(t) > 0 && t[0] == '{':
+		dec := json.NewDecoder(bytes.NewReader(t))
+		dec.DisallowUnknownFields()
+		return "", false, dec.Decode(obj)
+	}
+	return "", false, fmt.Errorf("a string or an object, not %s", data)
+}
+
 // JudgeRequirement is the judge's verdict on one live requirement.
 type JudgeRequirement struct {
 	ID       string   `json:"id"`
@@ -726,8 +807,8 @@ type JudgeOutput struct {
 	Schema        string             `json:"schema"`
 	Checklist     GateChecklistRef   `json:"checklist"`
 	SHA           string             `json:"sha"`
-	Ran           []JudgeRun         `json:"ran"`
-	CouldNotRun   []string           `json:"could_not_run"`
+	Ran           JudgeRuns          `json:"ran"`
+	CouldNotRun   JudgeNotRun        `json:"could_not_run"`
 	Requirements  []JudgeRequirement `json:"requirements"`
 	UnmappedBrief []string           `json:"unmapped_brief"`
 	ExtraScope    []string           `json:"extra_scope"`
