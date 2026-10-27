@@ -38,6 +38,11 @@ import (
 //   - suspects: a process whose session leader is gone and whose command line looks like a preview
 //     server, a browser or a wait loop. It cannot be tied to a job (it may be the agent's own or
 //     another agent's), so it is reported, never killed.
+//   - temp dir binaries (#105): a process that runs an executable from the temp dir of a job that is
+//     finished (or whose wrapper is dead), <jobs>/<id>/tmp/…, such as the binary a job's `go test`
+//     built there and started as a daemon or a systemd unit. It needs neither the marker nor the
+//     job's session (a test drops the one, a unit leaves the other), so it is reported as a suspect
+//     with the job's id, never killed.
 //   - dead rows: running rows whose wrapper pid is dead, or that never got a wrapper.
 
 // Ghost kinds.
@@ -322,6 +327,7 @@ func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 		}
 	}
 	skip := selfAndAncestors()
+	jobsRoots := pathVariants(filepath.Join(m.StateDir, "jobs"))
 	ents, err := os.ReadDir(procRoot)
 	if err != nil {
 		return rep, err
@@ -380,12 +386,24 @@ func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 				}
 			}
 		}
-		switch {
-		case p.marker != "":
-			j := lookup(p.marker)
-			if j == nil || liveJob(j) || !ranDuring(j, started, boot) {
-				continue
+		var tmpJob *store.Job // the finished job whose temp dir holds this process's executable
+		if id := tmpBinaryJob(jobsRoots, pid, p.cmdline); id != "" {
+			if j := lookup(id); j != nil && !liveJob(j) {
+				tmpJob = j
 			}
+		}
+		// markerJob: the finished job whose marker this process carries and whose run window holds it.
+		// A marker that names no job of this agent, a live job or another time classifies nothing by
+		// itself (the process is not killed for it), but the temp-dir rule below still applies.
+		var markerJob *store.Job
+		if p.marker != "" {
+			if j := lookup(p.marker); j != nil && !liveJob(j) && ranDuring(j, started, boot) {
+				markerJob = j
+			}
+		}
+		switch {
+		case markerJob != nil:
+			j := markerJob
 			g.Kind, g.JobID = GhostJob, j.ID
 			if j.Status == store.StatusRunning {
 				g.Reason = fmt.Sprintf("carries the marker of job %s, whose wrapper is dead", j.ID)
@@ -403,11 +421,20 @@ func (m *Manager) doctorProcs(kill bool, only string) (ProcsReport, error) {
 				g.Kind = GhostLeader
 				g.Reason += "; a marked session leader (daemonized) is among its ancestors: reported, never killed"
 			}
-		case sessJob != nil:
+		case p.marker == "" && sessJob != nil:
 			j := sessJob
 			g.Kind, g.JobID = GhostJob, j.ID
 			g.Reason = fmt.Sprintf("in the session of job %s (%s), its wrapper is gone", j.ID, j.Status)
-		case leaderGone:
+		case tmpJob != nil:
+			j := tmpJob
+			g.Kind, g.JobID = GhostSuspect, j.ID
+			unit := ""
+			if u := procServiceUnit(pid); u != "" {
+				unit = ", systemd unit " + u
+			}
+			g.Reason = fmt.Sprintf("runs a binary from the temp dir of job %s, which is %s (a test daemon or unit that outlived the job%s): reported, never killed",
+				j.ID, j.Status, unit)
+		case p.marker == "" && leaderGone:
 			kind := SuspectKind(p.cmdline)
 			if kind == "" {
 				continue

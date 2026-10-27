@@ -253,6 +253,8 @@ Ideas recorded for later; none is approved or scheduled unless it is marked appr
   - Why: the numbers then reflect the work, not how fast the owner replied. Lives in: job_stats.
 - I8. Allow `Monitor` in jobs once its command goes through the same guard checks as a Bash command (and a WebSocket monitor is refused or checked). Today it is refused: it runs its own command outside the Bash guard (CONFORMANCE U1).
   - Why: job history shows jobs reaching for `Monitor` (11 calls) and `ScheduleWakeup` (12) to wait for builds; a checked `Monitor` would give them a native wait. `ScheduleWakeup` stays refused (the daemon owns a job's lifetime). Lives in: `internal/guard/toolallow.go`, `internal/jobs/prepare.go`. Source: Codex review of the U1 fix, 2026-10-18.
+- I9. Remove a finished job's temp dir at its cleanup instead of at prune (#105 follow-up). The removal was built and dropped: a `/proc` scan cannot prove the dir unused (a process can enter it between the scan and the delete, a non-dumpable process or root is not readable, a bind mount at the dir would take outside files with it). A safe version needs OS-level isolation of the job (its own mount namespace or user), so the dir is unreachable once the job's processes are gone.
+  - Why: a judge's temp dir holds about 1 GB for up to 48 hours. Until then `system_doctor` shows the size (`disk.job_tmp_bytes`) and prune removes it. Lives in: the job sandbox and the cleanup.
 
 Approved for later waves (owner 2026-10-25, [DECISIONS.md](DECISIONS.md); not scheduled):
 

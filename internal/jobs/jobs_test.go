@@ -336,6 +336,11 @@ func TestMain(m *testing.M) {
 	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
 	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
 	ignoreOuterJob()
+	// The child of TestStartedDaemonNeverOutlivesItsTest runs the binary its parent built.
+	if bin := os.Getenv(ownedHelperEnv); bin != "" {
+		selfBin = bin
+		os.Exit(m.Run())
+	}
 	dir, err := os.MkdirTemp("", "agent-jobs-test-")
 	if err != nil {
 		log.Fatal(err)
@@ -724,17 +729,14 @@ func TestDaemonRestartDoesNotKillOrLoseJob(t *testing.T) {
 	j := enqueue(t, m, "FAKE_SLEEP=3", nil)
 	d := exec.Command(selfBin, "daemon", "--agent", "test") // the first tick runs at start
 	d.Stderr = io.Discard
-	if err := d.Start(); err != nil {
-		t.Fatal(err)
-	}
+	stopDaemon := startOwned(t, d) // ended on every path out of the test (#105)
 	// The job is marked running when claimed, before the wrapper starts: wait for its pid as well.
 	waitFor(t, "job running", 10*time.Second, func() bool {
 		g := get(t, m, j.ID)
 		return g.Status == store.StatusRunning && g.PID > 0
 	})
 	// Hard-kill the daemon mid-job.
-	_ = d.Process.Kill()
-	_ = d.Wait()
+	_ = stopDaemon()
 	j = get(t, m, j.ID)
 	if !alive(j.PID) {
 		t.Fatal("killing the daemon killed the job")
