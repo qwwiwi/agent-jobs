@@ -911,8 +911,7 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 }
 
 // JobTmpDir is the job's own temp dir inside its folder (<jobDir>/tmp): what the job's tools leave in
-// the temp dir (go build work dirs of a killed `go test`) is removed at the job's cleanup once nothing
-// uses it (removeJobTmp, #105), or else pruned with the folder.
+// the temp dir (go build work dirs of a killed `go test`) is pruned with the folder.
 const JobTmpDir = "tmp"
 
 // tempEnvKeys are the variables tools read for the temp dir (TempEnv sets them all).
