@@ -104,7 +104,9 @@ func (m *Manager) MergeGates() ([]MergeGateView, error) {
 // MarkShippedGates records every repository whose latest approval shipped (the daemon's tick runs it):
 // the approval is valid now, and release_check passed at it, with a pass that still counts, on a sha on
 // origin's default branch (shippedOn). A retired or already shipped approval, one without a pass and a
-// work tree that is gone or has no fetched origin are skipped; store errors are returned.
+// work tree that is gone or has no fetched origin are skipped; store errors are returned. A git call that
+// timed out (errGitTimeout) leaves its repository not shipped with a logged warning, retried at the next
+// tick, and the others are still checked (#100).
 func (m *Manager) MarkShippedGates() error {
 	mains, err := m.Store.ApprovalRepos()
 	if err != nil {
@@ -113,7 +115,9 @@ func (m *Manager) MarkShippedGates() error {
 	g := &mergeGate{m: m, repos: map[string]*gatedRepo{}}
 	var errs []error
 	for _, main := range mains {
-		if err := m.markShipped(g, main); err != nil {
+		if err := m.markShipped(g, main); errors.Is(err, errGitTimeout) {
+			m.Log.Printf("merge gate: warning: %s: %v; not shipped, checked again at the next tick", Printable(main, 200), err)
+		} else if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", Printable(main, 200), err))
 		}
 	}
@@ -157,6 +161,9 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 		return nil
 	}
 	ref, err := originDefaultRef(main)
+	if errors.Is(err, errGitTimeout) {
+		return err
+	}
 	if err != nil {
 		return nil // nothing fetched from origin: nothing is known to be on its default branch
 	}
@@ -166,7 +173,12 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 		if err != nil {
 			return err
 		}
-		if stale != "" || !shippedOn(main, p.SHA, ref) {
+		if stale != "" {
+			continue
+		}
+		if on, err := shippedOn(main, p.SHA, ref); err != nil {
+			return err
+		} else if !on {
 			continue
 		}
 		if err := m.Store.MarkGateShipped(main, last.Seq, p.SHA, m.Now()); err != nil {
@@ -181,16 +193,24 @@ func (m *Manager) markShipped(g *mergeGate, main string) error {
 
 // originDefaultRef is the remote-tracking ref of origin's default branch in work tree dir:
 // refs/remotes/origin/HEAD (what origin names its default branch), else origin/main, else origin/master;
-// an error when none is there (nothing fetched).
+// an error when none is there (nothing fetched), errGitTimeout when git timed out.
 func originDefaultRef(dir string) (string, error) {
-	if ref, err := gitHistory(dir, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil && strings.HasPrefix(ref, "refs/remotes/origin/") {
+	ref, err := gitHistory(dir, "symbolic-ref", "-q", "refs/remotes/origin/HEAD")
+	if errors.Is(err, errGitTimeout) {
+		return "", err
+	}
+	if err == nil && strings.HasPrefix(ref, "refs/remotes/origin/") {
 		if _, err := gitHistory(dir, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
 			return ref, nil
+		} else if errors.Is(err, errGitTimeout) {
+			return "", err
 		}
 	}
 	for _, ref := range []string{"refs/remotes/origin/main", "refs/remotes/origin/master"} {
 		if _, err := gitHistory(dir, "rev-parse", "-q", "--verify", ref+"^{commit}"); err == nil {
 			return ref, nil
+		} else if errors.Is(err, errGitTimeout) {
+			return "", err
 		}
 	}
 	return "", errors.New("no refs/remotes/origin/HEAD, origin/main or origin/master")
@@ -199,34 +219,43 @@ func originDefaultRef(dir string) (string, error) {
 // shippedOn reports whether sha is on ref in work tree dir: an ancestor of it (a merge commit, a fast
 // forward), or a commit on ref that sha does not reach has sha's exact tree (a squash or rebase merge of
 // a branch that was up to date with its base). Anything unreadable (a sha not in the object store) is
-// not shipped. History is read as committed (gitHistory): neither a replace ref nor a grafts file can
-// fake the ancestry or the tree.
-func shippedOn(dir, sha, ref string) bool {
+// not shipped; a git call that timed out is errGitTimeout (not shipped either). History is read as
+// committed (gitHistory): neither a replace ref nor a grafts file can fake the ancestry or the tree.
+func shippedOn(dir, sha, ref string) (bool, error) {
 	if !commitSHARe.MatchString(sha) {
-		return false
+		return false, nil
 	}
 	_, err := gitHistory(dir, "merge-base", "--is-ancestor", sha, ref)
 	if err == nil {
-		return true
+		return true, nil
+	}
+	if errors.Is(err, errGitTimeout) {
+		return false, err
 	}
 	var ee *exec.ExitError
 	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
-		return false
+		return false, nil
 	}
 	tree, err := gitHistory(dir, "rev-parse", "-q", "--verify", sha+"^{tree}")
+	if errors.Is(err, errGitTimeout) {
+		return false, err
+	}
 	if err != nil || tree == "" {
-		return false
+		return false, nil
 	}
 	out, err := gitHistory(dir, "log", "--format=%T", ref, "^"+sha)
+	if errors.Is(err, errGitTimeout) {
+		return false, err
+	}
 	if err != nil {
-		return false
+		return false, nil
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if line == tree {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // gitHistory is git for the shipped check's history reads in work tree dir, which see the commits as
