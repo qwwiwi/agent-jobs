@@ -40,8 +40,15 @@ import (
 // substitution word (the sha, the PR number) is refused: write them literally. A command that runs
 // `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
 // brief files only.
+// A merge through the API (#107) gets the same decision as gh pr merge: `gh api` PUT to
+// repos/OWNER/REPO/pulls/N/merge (the repository from the endpoint, or with {owner}/{repo} from GH_REPO
+// or the directory; the pin is the sha field) and `gh api graphql` mergePullRequest (the repository
+// from GH_REPO or the directory, the pin expectedHeadOid; one that resolves to no gated repository warns
+// while some repository is gated, since its node id names none); enablePullRequestAutoMerge is refused
+// like --auto. A release_check pass whose verdicts list suspect tests (#106) lets the merge run with a
+// needs-live-check warning.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
-// `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
+// `./scripts/ship.sh`), `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
 // honest mistakes, it is not a boundary.
 
@@ -96,8 +103,8 @@ func ParsePreToolUseInput(r io.Reader) (PreToolUseInput, error) {
 	return in, nil
 }
 
-// MergeGateNeeded reports whether the command runs, or may run, `gh pr merge`: only then does the hook
-// open the store.
+// MergeGateNeeded reports whether the command runs, or may run, `gh pr merge` or a merge through the API:
+// only then does the hook open the store.
 func MergeGateNeeded(command string) bool {
 	calls, unsure := guard.GhPrMerges(command, "")
 	return len(calls) > 0 || unsure != ""
@@ -135,7 +142,8 @@ type mergeGate struct {
 }
 
 // MergeGateAnswer is the hook's answer: Refusal blocks the command ("" = it runs); Warning is one line
-// for stderr when the command runs although the reader could not tell what it merges.
+// for stderr when the command runs although the reader could not tell what it merges, or when the
+// release_check pass it merges on lists tests that need a live check (#106).
 type MergeGateAnswer struct {
 	Refusal string
 	Warning string
@@ -187,14 +195,22 @@ func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer,
 				// number, a flag): the merge runs in this gated repository, so it is refused, not waved through.
 				// Also with a literal sha that has a pass: the call does not tell which word is dynamic, and an
 				// unquoted one may split into flags (`--body $B` with B="x --auto").
-				return MergeGateAnswer{Refusal: dynamicWordRefusal(t)}, nil
+				return MergeGateAnswer{Refusal: dynamicWordRefusal(t, call)}, nil
 			}
-			if r, err := g.check(t, call); r != "" || err != nil {
+			r, w, err := g.check(t, call)
+			if r != "" || err != nil {
 				return MergeGateAnswer{Refusal: r}, err
+			}
+			if a.Warning == "" {
+				a.Warning = w
 			}
 		}
 		if call.Unsure != "" && why == "" {
 			why = call.Unsure
+		}
+		if call.API == guard.APIMergeGraphQL && len(targets) == 0 && why == "" {
+			why = "gh api graphql mergePullRequest names its pull request by node id, and neither GH_REPO nor the directory " +
+				"is a gated repository"
 		}
 		if why != "" {
 			if err := warn(why); err != nil {
@@ -212,11 +228,11 @@ func dynamicWord(w string) bool {
 
 // dynamicWordRefusal refuses a merge in gated repository r whose sha, PR number or another word is a
 // variable or substitution: the hook cannot tell which sha, PR or flags it merges with.
-func dynamicWordRefusal(r *gatedRepo) string {
-	return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s (a repo with an approved checklist) has a variable or "+
+func dynamicWordRefusal(r *gatedRepo, call guard.GhMerge) string {
+	return MergeGatePrefix + fmt.Sprintf("%s in %s (a repo with an approved checklist) has a variable or "+
 		"substitution in its words, so the hook cannot tell which sha, PR or flags it merges with, also when the "+
-		"sha has a release_check pass; write every word of gh pr merge literally (no variables or $(...)).",
-		Printable(r.main, 200))
+		"sha has a release_check pass; write every word of %s literally (no variables or $(...)).",
+		call.Form(), Printable(r.main, 200), call.Form())
 }
 
 // warnUnsure is the warning for a merge the hook cannot read while some stored repository has an
@@ -460,38 +476,47 @@ func RetireRefusal(command string) string {
 		"in a terminal outside the agent session."
 }
 
-// check is the refusal for a merge in gated repository r ("" = allowed).
-func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
+// check is the refusal for a merge in gated repository r ("" = allowed); warning is the needs-live-check
+// line when it is allowed on a pass whose verdicts list suspect tests (#106).
+func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (refusal, warning string, err error) {
+	form := call.Form()
 	if r.void != "" {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: its checklist approval is void (%s); approve the checklist "+
-			"again (checklist_set) and run release_check on the sha first.", Printable(r.main, 200), RedactPrintable(r.void, 200)), nil
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: its checklist approval is void (%s); approve the checklist "+
+			"again (checklist_set) and run release_check on the sha first.", form, Printable(r.main, 200), RedactPrintable(r.void, 200)), "", nil
 	}
 	where := fmt.Sprintf("%s (checklist %s v%d is approved)", Printable(r.main, 200), Printable(r.id, 80), r.version)
 	switch {
 	case call.DisableAuto && !call.Auto:
-		return "", nil // gh only turns auto-merge off
+		return "", "", nil // gh only turns auto-merge off
+	case call.Auto && call.API == guard.APIMergeGraphQL:
+		return MergeGatePrefix + "gh api graphql enablePullRequestAutoMerge in " + where + ": auto-merge merges a later head; " +
+			"merge without auto-merge, with expectedHeadOid of a commit release_check passed on.", "", nil
 	case call.Auto:
 		return MergeGatePrefix + "gh pr merge --auto in " + where + ": auto-merge merges a later head; merge without --auto, " +
-			"with --match-head-commit <sha> of a commit release_check passed on.", nil
+			"with --match-head-commit <sha> of a commit release_check passed on.", "", nil
 	case !call.HasMatchHead:
-		return MergeGatePrefix + "gh pr merge in " + where + " without --match-head-commit <full sha>; add the 40-hex sha " +
-			"release_check passed on.", nil
+		return MergeGatePrefix + form + " in " + where + " without " + call.PinForm() + "; add the 40-hex sha " +
+			"release_check passed on.", "", nil
 	}
 	sha := strings.ToLower(call.MatchHead)
 	if !fullSHA1Re.MatchString(sha) {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: --match-head-commit %q is not a full 40-hex sha.", where,
-			Printable(call.MatchHead, 80)), nil
+		pin := map[string]string{guard.APIMergeREST: "sha", guard.APIMergeGraphQL: "expectedHeadOid"}[call.API]
+		if pin == "" {
+			pin = "--match-head-commit"
+		}
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: %s %q is not a full 40-hex sha.", form, where, pin,
+			Printable(call.MatchHead, 80)), "", nil
 	}
 	p, err := g.m.Store.ReleasePassed(r.main, sha, r.id, r.version, r.hash)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if p == nil {
 		// A pass on another sha (the checklist's release) lifts the gate once it is on origin's default
 		// branch: say so, a later fix PR is the usual case here.
 		shipped := ""
 		if s, err := g.shippedPass(r); err != nil {
-			return "", err
+			return "", "", err
 		} else if s != "" {
 			shipped = fmt.Sprintf(" release_check passed on %s at this checklist: once that sha is on origin's default "+
 				"branch (a merge commit or a fast forward; a squash merge counts only for a branch that was up to date with "+
@@ -499,20 +524,26 @@ func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
 				"checklist shipped and merges are no longer gated; otherwise release_check must pass on a sha on that "+
 				"branch, or the owner lifts the gate with agent-jobs gate retire (owner only).", s, Printable(r.main, 200))
 		}
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: release_check has not passed on %s at this checklist; "+
-			"run release_check(repo, sha) first.%s", where, sha, shipped), nil
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: release_check has not passed on %s at this checklist; "+
+			"run release_check(repo, sha) first.%s", form, where, sha, shipped), "", nil
 	}
 	// Evidence stored after the pass that release_check would fail on: a newer verdict for the sha, or a
 	// red manifest-check run. The pass then no longer counts until release_check runs again.
 	stale, err := g.m.passStale(r, p)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if stale != "" {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: the release_check pass on %s is stale (%s); run "+
-			"release_check(repo, sha) again.", where, sha, RedactPrintable(stale, 200)), nil
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: the release_check pass on %s is stale (%s); run "+
+			"release_check(repo, sha) again.", form, where, sha, RedactPrintable(stale, 200)), "", nil
 	}
-	return "", nil
+	live, err := g.m.passLiveChecks(r, p)
+	if err != nil || len(live) == 0 {
+		return "", "", err
+	}
+	return "", MergeGateWarnPrefix + RedactPrintable(fmt.Sprintf("%s in %s: release_check passed on %s; live check needed: %d test(s) "+
+		"the judge could not prove offline (%s); check them on a live run.", form, Printable(r.main, 200), sha, len(live),
+		quoteList(live[:min(len(live), 3)])), 900), nil
 }
 
 // repo reads the checklist state of a main work tree (cached), without the checklist lock like the

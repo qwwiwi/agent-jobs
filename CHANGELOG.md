@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `release_check`: suspect tests no longer fail the check (#106, owner decision 2026-10-27). The `suspect_tests` condition is gone; the suspect tests of every verdict counted for the sha are listed in the new field `needs_live_check`, and the owner line adds «; live check needed: K test(s)». The check passes when every other condition holds (verdicts may now differ on suspect tests); a requirement not accepted, a void approval, an unmapped brief quote, a missing or ambiguous verdict, a red manifest check and a judge not blind by enforcement still block. The merge hook lets a merge on such a pass through with a needs-live-check warning.
+- Merge hook: merges through the API get the same decision as `gh pr merge` (#107): `gh api` `PUT` (`-X` / `--method`, any flag order) to `repos/OWNER/REPO/pulls/N/merge`, pinned by its `sha` field, and `gh api graphql` `mergePullRequest` / `enqueuePullRequest`, pinned by the `expectedHeadOid` among that field's arguments; `enablePullRequestAutoMerge` is refused like `--auto`; a `repositories/ID/…/merge` endpoint only warns.
+
 ## [0.6.0] - 2026-10-26
 
 **Upgrade:** a `release_check` pass stored before v0.6.0 has no `approval_seq` and never ships an approval, so a gated repository stays gated after the upgrade until `release_check` runs again on the released sha (#99). Restart the session (or `/mcp`) so that it reports MCP server 0.6.0.

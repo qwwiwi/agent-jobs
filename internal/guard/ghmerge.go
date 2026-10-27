@@ -42,6 +42,38 @@ type GhMerge struct {
 	// move it, a PR argument tied to no one repository, a directory change before it the reader cannot
 	// follow.
 	Unsure string
+	// API is how the call merges (#107): "" for gh pr merge, APIMergeREST for a gh api PUT to
+	// …/pulls/N/merge (MatchHead is its sha field), APIMergeGraphQL for a gh api graphql mergePullRequest or
+	// enqueuePullRequest (MatchHead is its expectedHeadOid; Auto is enablePullRequestAutoMerge).
+	API string
+}
+
+// GhMerge.API values.
+const (
+	APIMergeREST    = "rest"
+	APIMergeGraphQL = "graphql"
+)
+
+// Form names the call's form in the hook's lines.
+func (c GhMerge) Form() string {
+	switch c.API {
+	case APIMergeREST:
+		return "gh api PUT …/pulls/N/merge"
+	case APIMergeGraphQL:
+		return "gh api graphql mergePullRequest/enqueuePullRequest"
+	}
+	return "gh pr merge"
+}
+
+// PinForm is how the call pins the head sha it merges, in the hook's lines.
+func (c GhMerge) PinForm() string {
+	switch c.API {
+	case APIMergeREST:
+		return "-f sha=<full sha>"
+	case APIMergeGraphQL:
+		return "expectedHeadOid"
+	}
+	return "--match-head-commit <full sha>"
 }
 
 // ghMergeValueLong / ghMergeValueShort are the `gh pr merge` options that take a value (gh 2.x).
@@ -51,7 +83,9 @@ var (
 	ghMergeValueShort = "AbFtR"
 )
 
-// GhPrMerges reads cmd, run in directory cwd, for `gh pr merge` calls. unsure is why the command may run
+// GhPrMerges reads cmd, run in directory cwd, for `gh pr merge` calls, and for the merges gh makes
+// through the API (#107, ghAPIMergeCall): a PUT to repos/OWNER/REPO/pulls/N/merge and a GraphQL
+// mergePullRequest or enablePullRequestAutoMerge. unsure is why the command may run
 // a merge that is not in calls ("" = it cannot): a form the guard's reader cannot verify (a program from
 // a variable, a gh subcommand from a variable, gh flags it cannot read before the subcommand, a shell
 // reading stdin, …) in a command whose text names gh or merge as a word (mergeText: quotes split no
@@ -188,7 +222,9 @@ func readMerges(cmd, cwd string, scripts []*script, relax bool) (calls []GhMerge
 				case name == "gh":
 					call, ok := ghMergeCall(sc, c, v, relax)
 					if !ok {
-						continue
+						if call, ok = ghAPIMergeCall(sc, c, v); !ok {
+							continue
+						}
 					}
 					switch {
 					case call.Unsure != "":
@@ -637,7 +673,7 @@ func ghMergeCall(sc *script, c *simpleCmd, v cmdView, relax bool) (GhMerge, bool
 	pos, unknown := ghPositional(argv)
 	if unknown != "" {
 		// A flag before the subcommand that may take a value: which words are `pr merge` is unknown.
-		if !slices.Contains(argv, "merge") || ghOtherGroup(argv, dyn) {
+		if !slices.ContainsFunc(argv, func(w string) bool { return w == "merge" || apiMergeText(w) }) || ghOtherGroup(argv, dyn) {
 			return call, false
 		}
 		call.Unsure = "gh flag " + unknown + " before the subcommand"

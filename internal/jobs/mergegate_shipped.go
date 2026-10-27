@@ -311,3 +311,20 @@ func (m *Manager) passStale(r *gatedRepo, p *store.ReleasePass) (string, error) 
 	}
 	return "", nil
 }
+
+// passLiveChecks are the suspect tests of the verdicts pass p counted (those for its sha at gated
+// repository r's checklist id, version and hash; liveChecks): the merge runs with a needs-live-check
+// warning when there are any (#106).
+func (m *Manager) passLiveChecks(r *gatedRepo, p *store.ReleasePass) ([]string, error) {
+	vs, err := m.Store.VerdictsAt(r.main, r.id, r.version, p.SHA)
+	if err != nil {
+		return nil, err
+	}
+	var counted []*store.JudgeVerdict
+	for _, v := range vs {
+		if v.ChecklistSHA256 == r.hash {
+			counted = append(counted, v)
+		}
+	}
+	return liveChecks(counted), nil
+}
