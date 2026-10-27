@@ -3,6 +3,7 @@ package jobs
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ func TestGitTimesOut(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("FAKE_GIT_STATE", state)
 	fakeGitOnPath(t, `echo "$GIT_TERMINAL_PROMPT" > "$FAKE_GIT_STATE/prompt"
-sleep 1000 &
+sleep 60 &
 echo $! > "$FAKE_GIT_STATE/child"
 wait
 `)
@@ -77,15 +78,33 @@ wait
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		if processGone(t, pid) {
 			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("git's child %d still runs: the process group was not killed", pid)
 		}
 	}
+}
+
+// processGone reports whether process pid has ended: it is gone, or a zombie that waits for its parent
+// (a killed child of the fake git is reparented, and a container may have no reaper for it).
+func processGone(t *testing.T, pid int) bool {
+	t.Helper()
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+		return true
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The state follows the command name, which is in parentheses and may hold any character.
+	i := bytes.LastIndexByte(b, ')')
+	if i < 0 || i+2 >= len(b) {
+		t.Fatalf("/proc/%d/stat: %q", pid, b)
+	}
+	return b[i+2] == 'Z' || b[i+2] == 'X'
 }
 
 // A git call of the shipped check that hangs in one repository leaves it not shipped with a logged
@@ -212,5 +231,24 @@ exec '`+real+`' "$@"
 		return materializeTree(repo, sha, t.TempDir(), nil)
 	}); !errors.Is(err, errGitTimeout) {
 		t.Fatalf("materializeTree: %v", err)
+	}
+}
+
+// processGone counts a zombie as ended, where kill(pid, 0) still succeeds (#100).
+func TestProcessGoneZombie(t *testing.T) {
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	// Not reaped until the end: a zombie meanwhile.
+	defer func() { _ = cmd.Wait() }()
+	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d not seen as ended", pid)
+		}
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("kill(pid, 0) on the zombie: %v, want success (the check processGone replaces)", err)
 	}
 }
