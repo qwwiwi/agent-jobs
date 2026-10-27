@@ -542,3 +542,34 @@ func TestDoctorProcsReportsTmpBinarySurvivor(t *testing.T) {
 		t.Fatalf("doctor procs CLI: %v\n%s", err, out)
 	}
 }
+
+// #105: a marker that names no job of this agent, or a finished job whose run window does not hold the
+// process, does not hide a binary run from a finished job's temp dir: the process is still reported
+// as that job's suspect, and --kill never ends it.
+func TestDoctorProcsTmpBinaryDespiteStrayMarker(t *testing.T) {
+	m := newManager(t)
+	finished := time.Now()
+	dead := insertJob(t, m, "doctor-tmpmark-"+strconv.Itoa(os.Getpid()), store.StatusSucceeded, &finished, nil)
+	bin := plantTmpBinary(t, m.JobDir(dead.ID))
+	long := time.Now().Add(-3 * time.Hour)
+	stale := insertJob(t, m, "doctor-tmpstale-"+strconv.Itoa(os.Getpid()), store.StatusSucceeded, &long, nil)
+	unknown := spawnOwn(t, []string{JobEnvVar + "=no-such-job-" + strconv.Itoa(os.Getpid())}, bin, "300")
+	outOfWindow := spawnOwn(t, []string{JobEnvVar + "=" + stale.ID}, bin, "300")
+
+	rep, err := m.DoctorProcs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Supported {
+		t.Skip("no /proc")
+	}
+	for name, c := range map[string]*exec.Cmd{"unknown marker": unknown, "out-of-window marker": outOfWindow} {
+		g := findGhost(rep, c.Process.Pid)
+		if g == nil || g.Kind != GhostSuspect || g.JobID != dead.ID || g.Killed || !strings.Contains(g.Reason, "temp dir of job "+dead.ID) {
+			t.Fatalf("%s: tmp survivor not reported as the finished job's suspect: %+v (all: %+v)", name, g, rep.Ghosts)
+		}
+		if !pidAlive(c.Process.Pid) {
+			t.Fatalf("%s: doctor --kill ended a suspect", name)
+		}
+	}
+}

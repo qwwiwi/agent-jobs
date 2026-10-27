@@ -1,9 +1,9 @@
 package jobs
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -11,6 +11,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -96,90 +100,409 @@ func procServiceUnit(pid int) string {
 	return ""
 }
 
-// tmpHolders returns the live processes that use dir, the temp dir of job jobID: their executable,
-// working or root directory, an open file or a mapping lies under it, or their environment carries
-// the job's marker or points a temp variable (tempEnvKeys) into it. A process whose /proc entries
-// this user cannot read (another user's, or a non-dumpable one) is judged by what is readable. Only
-// a failure to list /proc is an error.
-func tmpHolders(dir, jobID string) ([]int, error) {
-	roots := pathVariants(dir)
-	ents, err := os.ReadDir(procRoot)
-	if err != nil {
-		return nil, err
-	}
-	var out []int
-	for _, e := range ents {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 1 {
-			continue
-		}
-		if p, err := procStatFull(pid); err != nil || p.state == "Z" {
-			continue
-		}
-		if procUsesDir(pid, jobID, roots) {
-			out = append(out, pid)
-		}
-	}
-	return out, nil
+// tmpStagePrefix starts the name a temp dir is renamed to just before it is removed
+// (<job>/.tmp-removing-<unix>): from then on no process finds it by the job's path. One that an
+// interrupted removal left, or that could not be renamed back, is removed by a later tick.
+const tmpStagePrefix = ".tmp-removing-"
+
+// pfKthread is the kernel-thread bit of the flags in /proc/<pid>/stat.
+const pfKthread = 0x00200000
+
+// maxTmpEntries bounds the entries a temp dir check walks; a bigger tree is kept for prune.
+const maxTmpEntries = 1 << 20
+
+// procReader is how the temp dir check reads /proc; a test swaps tmpProc to make a process unreadable.
+type procReader struct {
+	readlink func(string) (string, error)
+	readFile func(string) ([]byte, error)
+	readDir  func(string) ([]os.DirEntry, error)
+	// stat follows a /proc link to the file it names: its device and inode, whatever its path.
+	stat func(string) (os.FileInfo, error)
 }
 
-// procUsesDir is tmpHolders' test of one process.
-func procUsesDir(pid int, jobID string, roots []string) bool {
-	for _, l := range []string{"exe", "cwd", "root"} {
-		if inDir(procLink(pid, l), roots) {
+var tmpProc = procReader{readlink: os.Readlink, readFile: os.ReadFile, readDir: os.ReadDir, stat: os.Stat}
+
+// tmpRemovalHook is called at each stage of a removal: "scanned" (/proc checked, nothing renamed yet)
+// and "renamed" (the dir is under its staging name, not checked again yet), with the dir's current
+// path; a test makes a process take the dir there.
+var tmpRemovalHook = func(stage, dir string) {}
+
+// devIno identifies a file by device and inode.
+type devIno struct{ dev, ino uint64 }
+
+// tmpTree is what a process must not use for a temp dir to be removed: its paths (the job's tmp and,
+// once renamed, the staging name, each also with symlinks resolved, as /proc names it), the job's
+// marker, and the device and inode of every entry of the tree (a process in another mount namespace,
+// a sandbox, names it by another path; a working dir that was renamed is still the same inode).
+// private: the tree's top is this user's and closed to group and others (0700), and so is every
+// entry this user's. before: processes that started before it (the job's creation, less attrSlack)
+// predate the job (zero: none is taken as such). selfFd: the descriptor the removal holds on the
+// tree, not a use.
+type tmpTree struct {
+	roots   []string
+	jobID   string
+	inodes  map[devIno]bool
+	private bool
+	uid     int
+	before  time.Time
+	selfFd  int
+}
+
+// newTmpTree walks the directory fd for tmpTree.
+func newTmpTree(fd int, roots []string, jobID string, before time.Time) (*tmpTree, error) {
+	t := &tmpTree{roots: roots, jobID: jobID, inodes: map[devIno]bool{}, uid: os.Geteuid(), before: before, selfFd: fd}
+	if err := t.walk(fd, ".", 0); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// walk adds directory name (under dirfd) and everything in it to t. Each directory is opened relative
+// to its parent with O_NOFOLLOW, so nothing outside the tree is visited; one that cannot be listed is
+// an error (the tree is not fully known).
+func (t *tmpTree) walk(dirfd int, name string, depth int) error {
+	if depth > maxChmodDepth {
+		return fmt.Errorf("deeper than %d levels", maxChmodDepth)
+	}
+	fd, err := openDirNoFollow(dirfd, name)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if depth == 0 {
+		t.private = int64(st.Uid) == int64(t.uid) && st.Mode&0o077 == 0
+	}
+	t.add(&st)
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", name, err)
+	}
+	for _, n := range names {
+		if len(t.inodes) >= maxTmpEntries {
+			return fmt.Errorf("more than %d entries", maxTmpEntries)
+		}
+		if err := unix.Fstatat(fd, n, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return fmt.Errorf("stat %s: %w", n, err)
+		}
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			if err := t.walk(fd, n, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		t.add(&st)
+	}
+	return nil
+}
+
+func (t *tmpTree) add(st *unix.Stat_t) {
+	t.inodes[devIno{uint64(st.Dev), uint64(st.Ino)}] = true
+	if int64(st.Uid) != int64(t.uid) {
+		t.private = false
+	}
+}
+
+// usesLink reports whether the /proc link p names a file in t, by its path or (followed) by device
+// and inode. A link to no path (pipe:[…], socket:[…], anon_inode:…) uses nothing.
+func (t *tmpTree) usesLink(p string) (bool, error) {
+	target, err := tmpProc.readlink(p)
+	if err != nil {
+		return false, err
+	}
+	if inDir(target, t.roots) {
+		return true, nil
+	}
+	if !filepath.IsAbs(target) {
+		return false, nil
+	}
+	fi, err := tmpProc.stat(p)
+	if err != nil {
+		return false, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("%s: no device and inode", p)
+	}
+	return t.inodes[devIno{uint64(st.Dev), uint64(st.Ino)}], nil
+}
+
+// usesMaps reports whether a mapping in /proc/<pid>/maps content b is of a file in t, by its path
+// or by device and inode.
+func (t *tmpTree) usesMaps(b []byte) bool {
+	for _, line := range strings.Split(string(b), "\n") {
+		// address perms offset dev inode path: the path starts at the sixth field.
+		f := strings.SplitN(line, " ", 6)
+		if len(f) < 5 {
+			continue
+		}
+		if len(f) == 6 && inDir(strings.TrimSpace(f[5]), t.roots) {
 			return true
 		}
-	}
-	base := filepath.Join(procRoot, strconv.Itoa(pid))
-	if fds, err := os.ReadDir(filepath.Join(base, "fd")); err == nil {
-		for _, fd := range fds {
-			if inDir(procLink(pid, filepath.Join("fd", fd.Name())), roots) {
-				return true
-			}
+		ino, err := strconv.ParseUint(f[4], 10, 64)
+		major, minor, ok := strings.Cut(f[3], ":")
+		if err != nil || ino == 0 || !ok {
+			continue
 		}
-	}
-	if f, err := os.Open(filepath.Join(base, "maps")); err == nil {
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
-		for sc.Scan() {
-			// address perms offset dev inode path: the path starts at the sixth field.
-			if fields := strings.SplitN(sc.Text(), " ", 6); len(fields) == 6 && inDir(strings.TrimSpace(fields[5]), roots) {
-				f.Close()
-				return true
-			}
-		}
-		f.Close()
-	}
-	if b, err := os.ReadFile(filepath.Join(base, "environ")); err == nil {
-		for _, kv := range strings.Split(string(b), "\x00") {
-			k, v, _ := strings.Cut(kv, "=")
-			if (k == JobEnvVar && v == jobID) || (v != "" && slices.Contains(tempEnvKeys, k) && inDir(v, roots)) {
-				return true
-			}
+		ma, err1 := strconv.ParseUint(major, 16, 32)
+		mi, err2 := strconv.ParseUint(minor, 16, 32)
+		if err1 == nil && err2 == nil && t.inodes[devIno{unix.Mkdev(uint32(ma), uint32(mi)), ino}] {
+			return true
 		}
 	}
 	return false
 }
 
-// removeJobTmp removes the temp dir of finished job j (tmpCleanupDue). It is kept (an error, so it is
-// retried) while the job's process group or acceptance group is alive, its sandbox
-// containers are not removed yet (they use it as their home), /proc cannot be listed, or any process
-// still uses it (tmpHolders). Without /proc (not Linux) nothing proves it unused: it is kept for prune,
-// without an error. A non-directory in its place (a link the job planted) is left alone.
+// usesEnv reports whether the environment b (/proc/<pid>/environ) carries the job's marker or points
+// a temp variable (tempEnvKeys) into t.
+func (t *tmpTree) usesEnv(b []byte) bool {
+	for _, kv := range strings.Split(string(b), "\x00") {
+		k, v, _ := strings.Cut(kv, "=")
+		if (k == JobEnvVar && v == t.jobID) || (v != "" && slices.Contains(tempEnvKeys, k) && inDir(v, t.roots)) {
+			return true
+		}
+	}
+	return false
+}
+
+// tmpUse is what the temp dir check found of one process.
+type tmpUse int
+
+const (
+	useNone   tmpUse = iota
+	useHolds         // it uses the tree
+	useUnsure        // part of its /proc entry could not be read and the rule does not rule it out
+)
+
+// tmpUsers returns the live processes that use tree t (holders) and those that may (unsure). A
+// process uses it when its executable, working or root directory, an open file or a mapping is in
+// it (by path or by device and inode), or its environment carries the job's marker or points a temp
+// variable into it. It fails closed: a process of which any of this could not be read (another
+// user's, a non-dumpable one) is unsure, except
+//   - one of another uid (from status) while the tree is private: a 0700 dir whose entries are all
+//     this user's is one that process never could enter. A process that a 0700 dir does not stop
+//     (root, or one with CAP_DAC_OVERRIDE) and that this user cannot read is therefore taken as not
+//     using it: a job runs as this user and cannot start one;
+//   - one that started before the job was created (t.before): it did not inherit the dir from the
+//     job, and nothing of the job started it. This is what lets the dir go at all: this user's
+//     `systemd --user` and its `(sd-pam)` are non-dumpable, so never readable, and always there.
+//
+// Only a failure to list /proc (or to read the boot time) is an error.
+func tmpUsers(t *tmpTree) (holders, unsure []int, err error) {
+	ents, err := tmpProc.readDir(procRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	boot, err := bootTime()
+	if err != nil {
+		return nil, nil, fmt.Errorf("boot time: %w", err)
+	}
+	self := os.Getpid()
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		switch procTmpUse(pid, pid == self, boot, t) {
+		case useHolds:
+			holders = append(holders, pid)
+		case useUnsure:
+			unsure = append(unsure, pid)
+		}
+	}
+	return holders, unsure, nil
+}
+
+// procTmpUse is tmpUsers' test of one process (self: this process, whose descriptor t.selfFd on the
+// tree is not a use).
+func procTmpUse(pid int, self bool, boot time.Time, t *tmpTree) tmpUse {
+	base := filepath.Join(procRoot, strconv.Itoa(pid))
+	state, start := procTmpState(base)
+	switch state {
+	case procGone:
+		return useNone
+	case procUnknown:
+		return useUnsure
+	}
+	doubt := false
+	for _, l := range []string{"exe", "cwd", "root"} {
+		holds, err := t.usesLink(filepath.Join(base, l))
+		if holds {
+			return useHolds
+		}
+		doubt = doubt || err != nil
+	}
+	if fds, err := tmpProc.readDir(filepath.Join(base, "fd")); err != nil {
+		doubt = true
+	} else {
+		for _, fd := range fds {
+			if self && fd.Name() == strconv.Itoa(t.selfFd) {
+				continue
+			}
+			holds, err := t.usesLink(filepath.Join(base, "fd", fd.Name()))
+			if holds {
+				return useHolds
+			}
+			doubt = doubt || (err != nil && !errors.Is(err, fs.ErrNotExist)) // closed since the listing
+		}
+	}
+	if b, err := tmpProc.readFile(filepath.Join(base, "maps")); err != nil {
+		doubt = true
+	} else if t.usesMaps(b) {
+		return useHolds
+	}
+	if b, err := tmpProc.readFile(filepath.Join(base, "environ")); err != nil {
+		doubt = true
+	} else if t.usesEnv(b) {
+		return useHolds
+	}
+	if !doubt {
+		return useNone
+	}
+	switch now, _ := procTmpState(base); {
+	case now == procGone:
+		return useNone // it ended while it was read
+	case t.private && procOtherUID(base, t.uid):
+		return useNone
+	case !t.before.IsZero() && boot.Add(time.Duration(start)*time.Second/userHZ).Before(t.before):
+		return useNone
+	}
+	return useUnsure
+}
+
+// procState is what /proc/<pid>/stat says of a process for the temp dir check.
+type procState int
+
+const (
+	procLive    procState = iota
+	procGone              // ended, a zombie or a kernel thread: uses nothing
+	procUnknown           // stat unreadable or unparsable
+)
+
+// procTmpState reads the state of the process at base and its start (clock ticks since boot).
+func procTmpState(base string) (procState, uint64) {
+	b, err := tmpProc.readFile(filepath.Join(base, "stat"))
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+		return procGone, 0
+	}
+	if err != nil {
+		return procUnknown, 0
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return procUnknown, 0
+	}
+	f := strings.Fields(s[i+1:]) // state ppid pgrp session tty tpgid flags … starttime (index 19)
+	if len(f) < 20 {
+		return procUnknown, 0
+	}
+	flags, err := strconv.ParseUint(f[6], 10, 64)
+	start, err2 := strconv.ParseUint(f[19], 10, 64)
+	switch {
+	case err != nil || err2 != nil:
+		return procUnknown, 0
+	case f[0] == "Z" || flags&pfKthread != 0:
+		return procGone, 0
+	}
+	return procLive, start
+}
+
+// procOtherUID reports whether /proc/<pid>/status names uids (real, effective, saved, file system)
+// none of which is uid; false when unreadable (the uid is unknown).
+func procOtherUID(base string, uid int) bool {
+	b, err := tmpProc.readFile(filepath.Join(base, "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		rest, ok := strings.CutPrefix(line, "Uid:")
+		if !ok {
+			continue
+		}
+		ids := strings.Fields(rest)
+		if len(ids) == 0 {
+			return false
+		}
+		for _, s := range ids {
+			if n, err := strconv.Atoi(s); err != nil || n == uid {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// checkTmpUnused returns an error naming the processes that use or may use the directory fd (tmpUsers;
+// shown is its path in the message), nil when none does.
+func checkTmpUnused(fd int, roots []string, jobID string, before time.Time, shown string) error {
+	t, err := newTmpTree(fd, roots, jobID, before)
+	if err != nil {
+		return fmt.Errorf("keeping %s: cannot walk it: %w", shown, err)
+	}
+	holders, unsure, err := tmpUsers(t)
+	if err != nil {
+		return fmt.Errorf("keeping %s: cannot check its users: %w", shown, err)
+	}
+	var why []string
+	if len(holders) > 0 {
+		why = append(why, "still used by pids "+pidList(holders)+" (see doctor procs)")
+	}
+	if len(unsure) > 0 {
+		why = append(why, "cannot tell whether pids "+pidList(unsure)+" use it (their /proc entries are unreadable)")
+	}
+	if len(why) > 0 {
+		return fmt.Errorf("keeping %s: %s", shown, strings.Join(why, "; "))
+	}
+	return nil
+}
+
+func pidList(pids []int) string {
+	s := make([]string, 0, len(pids))
+	for _, p := range pids {
+		s = append(s, strconv.Itoa(p))
+	}
+	return Printable(strings.Join(s, ", "), 200)
+}
+
+// removeJobTmp removes the temp dir of finished job j (tmpCleanupDue), and a staging dir an earlier
+// try left. It is kept (an error, so it is retried) while the job's process group or acceptance group
+// is alive, its sandbox containers are not removed yet (they use it as their home), /proc cannot be
+// listed, or any process uses it or may use it (tmpUsers). Without /proc (not Linux) nothing proves
+// it unused: it is kept for prune, without an error. A non-directory in its place (a link the job
+// planted) is left alone.
+//
+// Every step goes through descriptors: the jobs root and the job dir are opened without following a
+// symlink (a symlinked job dir is refused); the temp dir is checked, renamed relative to the job dir
+// to its staging name, checked again under both names and only then removed relative to the job dir.
+// A process found the second time gets it back under its own name.
 func (m *Manager) removeJobTmp(j *store.Job) error {
+	if tmpRemovalGOOS != "linux" || !procExists(os.Getpid()) {
+		return nil
+	}
 	jobDir := m.JobDir(j.ID)
 	dir := filepath.Join(jobDir, JobTmpDir)
-	fi, err := os.Lstat(dir)
-	if errors.Is(err, os.ErrNotExist) {
+	jobFd, err := openJobDirPinned(m.StateDir, j.ID)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("job temp dir: %w", err)
+		return fmt.Errorf("keeping %s: job dir: %w", dir, err)
 	}
-	if !fi.IsDir() {
-		return nil
+	defer unix.Close(jobFd)
+	names, err := tmpEntries(jobFd)
+	if err != nil {
+		return fmt.Errorf("keeping %s: list the job dir: %w", dir, err)
 	}
-	if tmpRemovalGOOS != "linux" || !procExists(os.Getpid()) {
+	if len(names) == 0 {
 		return nil
 	}
 	if m.spawnedGroupAlive(j) {
@@ -188,26 +511,183 @@ func (m *Manager) removeJobTmp(j *store.Job) error {
 	if m.acceptanceGroupAlive(j) {
 		return fmt.Errorf("keeping %s: acceptance process group %d of the job is still alive", dir, j.AcceptancePGID)
 	}
-	if _, err := os.Lstat(filepath.Join(jobDir, containersPendingFile)); !errors.Is(err, os.ErrNotExist) {
+	var st unix.Stat_t
+	if err := unix.Fstatat(jobFd, containersPendingFile, &st, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
 		return fmt.Errorf("keeping %s: the job's sandbox containers are not removed yet", dir)
 	}
-	holders, err := tmpHolders(dir, j.ID)
-	if err != nil {
-		return fmt.Errorf("keeping %s: cannot check its users: %w", dir, err)
-	}
-	if len(holders) > 0 {
-		pids := make([]string, 0, len(holders))
-		for _, p := range holders {
-			pids = append(pids, strconv.Itoa(p))
+	var errs []error
+	removed := false
+	for _, n := range names {
+		ok, err := removeTmpEntry(jobFd, jobDir, n, j.ID, j.CreatedAt.Add(-attrSlack))
+		if err != nil {
+			errs = append(errs, err)
 		}
-		return fmt.Errorf("keeping %s: still used by pids %s (see doctor procs)", dir, Printable(strings.Join(pids, ", "), 200))
+		removed = removed || ok
 	}
-	if err := removeTree(dir); err != nil {
-		return fmt.Errorf("remove %s: %w", dir, err)
+	if removed {
+		m.Log.Printf("job %s: temp dir removed", j.ID)
+		m.recordDirSize(j.ID)
 	}
-	m.Log.Printf("job %s: temp dir removed", j.ID)
-	m.recordDirSize(j.ID)
+	return errors.Join(errs...)
+}
+
+// openJobDirPinned opens <state>/jobs/<id> as a directory without following a symlink at the jobs
+// root or at the job dir: a symlinked job dir (or jobs root) is refused.
+func openJobDirPinned(stateDir, id string) (int, error) {
+	if id == "" || id == "." || id == ".." || strings.ContainsRune(id, filepath.Separator) {
+		return -1, fmt.Errorf("job id %q is not a single path element", id)
+	}
+	sfd, err := unix.Open(stateDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, &os.PathError{Op: "open", Path: stateDir, Err: err}
+	}
+	defer unix.Close(sfd)
+	rootFd, err := openDirNoFollow(sfd, "jobs")
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(rootFd)
+	return openDirNoFollow(rootFd, id)
+}
+
+// tmpEntries lists the temp dir and staging dirs (real directories only) in the job dir jobFd.
+func tmpEntries(jobFd int) ([]string, error) {
+	fd, err := openDirNoFollow(jobFd, ".")
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), "job dir")
+	defer f.Close()
+	all, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range all {
+		var st unix.Stat_t
+		if (n == JobTmpDir || strings.HasPrefix(n, tmpStagePrefix)) &&
+			unix.Fstatat(jobFd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+			out = append(out, n)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// removeTmpEntry removes the directory name (the temp dir or a staging dir) of the job dir jobFd
+// (path jobDir) once no process uses it: checked, renamed (the temp dir), checked again, removed.
+// Processes started before (the job's creation) predate it (tmpUsers).
+func removeTmpEntry(jobFd int, jobDir, name, jobID string, before time.Time) (bool, error) {
+	shown := filepath.Join(jobDir, name)
+	fd, err := openDirNoFollow(jobFd, name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("keeping %s: %w", shown, err)
+	}
+	defer unix.Close(fd)
+	jobPath := jobDir
+	if a, err := filepath.Abs(jobDir); err == nil {
+		jobPath = a
+	}
+	roots := func(names ...string) []string {
+		var out []string
+		for _, v := range pathVariants(jobPath) {
+			for _, n := range names {
+				out = append(out, filepath.Join(v, n))
+			}
+		}
+		return out
+	}
+	if err := checkTmpUnused(fd, roots(JobTmpDir, name), jobID, before, shown); err != nil {
+		return false, err
+	}
+	tmpRemovalHook("scanned", shown)
+	staged := name
+	if name == JobTmpDir {
+		staged = tmpStagePrefix + strconv.FormatInt(time.Now().Unix(), 10)
+		if err := renameNoReplace(jobFd, name, jobFd, staged); err != nil {
+			return false, fmt.Errorf("keeping %s: rename to %s: %w", shown, staged, err)
+		}
+		if !sameDirAt(jobFd, staged, fd) { // swapped since it was opened: not the dir checked
+			_ = renameNoReplace(jobFd, staged, jobFd, name)
+			return false, fmt.Errorf("keeping %s: it changed while it was checked", shown)
+		}
+		tmpRemovalHook("renamed", filepath.Join(jobDir, staged))
+		if err := checkTmpUnused(fd, roots(JobTmpDir, staged), jobID, before, shown); err != nil {
+			if rerr := renameNoReplace(jobFd, staged, jobFd, name); rerr != nil {
+				err = fmt.Errorf("%w; left as %s, removed by a later tick once unused (%v)", err, staged, rerr)
+			}
+			return false, err
+		}
+	}
+	// The contents go through the descriptor of the dir that was checked; its name only for the last
+	// rmdir, which fails on anything put there in its place but an empty dir.
+	if err := removeContents(fd, 0); err != nil {
+		return false, fmt.Errorf("remove %s: %w", filepath.Join(jobDir, staged), err)
+	}
+	if !sameDirAt(jobFd, staged, fd) {
+		return false, fmt.Errorf("keeping %s: it changed while it was removed", shown)
+	}
+	if err := unix.Unlinkat(jobFd, staged, unix.AT_REMOVEDIR); err != nil {
+		return false, fmt.Errorf("remove %s: %w", filepath.Join(jobDir, staged), err)
+	}
+	return true, nil
+}
+
+// sameDirAt reports whether name under dirfd (not followed) is the directory open as fd.
+func sameDirAt(dirfd int, name string, fd int) bool {
+	var a, b unix.Stat_t
+	return unix.Fstatat(dirfd, name, &a, unix.AT_SYMLINK_NOFOLLOW) == nil && unix.Fstat(fd, &b) == nil &&
+		a.Mode&unix.S_IFMT == unix.S_IFDIR && a.Dev == b.Dev && a.Ino == b.Ino
+}
+
+// removeContents removes everything in the directory dirfd. Each directory is opened relative to its
+// parent without following a symlink (a symlink inside is removed as a link) and made 0700 first, so
+// a read-only one (a go module cache) goes too.
+func removeContents(dirfd, depth int) error {
+	if depth > maxChmodDepth {
+		return fmt.Errorf("deeper than %d levels", maxChmodDepth)
+	}
+	_ = unix.Fchmod(dirfd, 0o700)
+	fd, err := openDirNoFollow(dirfd, ".")
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), "dir")
+	names, err := f.Readdirnames(-1)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		err := unix.Unlinkat(dirfd, n, 0)
+		if err != nil && !errors.Is(err, unix.ENOENT) {
+			var st unix.Stat_t
+			if unix.Fstatat(dirfd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+				err = removeDirAt(dirfd, n, depth+1)
+			}
+		}
+		if err != nil && !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("%s: %w", n, err)
+		}
+	}
 	return nil
+}
+
+// removeDirAt removes the directory name under dirfd (not followed) with everything in it.
+func removeDirAt(dirfd int, name string, depth int) error {
+	fd, err := openDirNoFollow(dirfd, name)
+	if err != nil {
+		return err
+	}
+	err = removeContents(fd, depth)
+	unix.Close(fd)
+	if err != nil {
+		return err
+	}
+	return unix.Unlinkat(dirfd, name, unix.AT_REMOVEDIR)
 }
 
 // tmpCleanupDue removes the temp dir of every cleaned job that still has one (#105), each tick. It is a
@@ -219,14 +699,21 @@ func (m *Manager) tmpCleanupDue() error {
 	if tmpRemovalGOOS != "linux" {
 		return nil
 	}
-	dirs, err := filepath.Glob(filepath.Join(m.StateDir, "jobs", "*", JobTmpDir))
-	if err != nil {
-		return err
+	var dirs []string
+	for _, pat := range []string{JobTmpDir, tmpStagePrefix + "*"} {
+		d, err := filepath.Glob(filepath.Join(m.StateDir, "jobs", "*", pat))
+		if err != nil {
+			return err
+		}
+		dirs = append(dirs, d...)
 	}
 	now := m.Now()
 	seen := map[string]bool{}
 	for _, d := range dirs {
 		id := filepath.Base(filepath.Dir(d))
+		if seen[id] {
+			continue
+		}
 		seen[id] = true
 		j, err := m.Store.Get(id)
 		if err != nil || j.CleanedAt == nil || !finished(j.Status) || j.ScopePending {
