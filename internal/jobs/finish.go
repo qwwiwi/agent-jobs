@@ -732,15 +732,8 @@ func writeTar(dst, root string, files []string) error {
 	return os.Rename(tmp, dst)
 }
 
-// gitRaw returns raw stdout (patches must not be trimmed).
+// gitRaw returns raw stdout (patches must not be trimmed), bounded by gitLongTimeout: Cleanup runs it
+// under the lifecycle lock (#100).
 func gitRaw(dir string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return out, nil
+	return gitBytes(gitLongTimeout, dir, daemonGitEnv(), args...)
 }

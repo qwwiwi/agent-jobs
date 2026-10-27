@@ -279,9 +279,7 @@ func RenderCards(cards []Card) string {
 
 // repoRemotes returns the identities (RemoteIdentity) of every remote of repo (none is not an error).
 func repoRemotes(repo string) ([]string, error) {
-	cmd := exec.Command("git", "-C", repo, "config", "--get-regexp", `^remote\..*\.url$`)
-	cmd.Env = daemonGitEnv()
-	out, err := cmd.Output()
+	out, _, err := runGitFor(gitTimeout, "", daemonGitEnv(), "-C", repo, "config", "--get-regexp", `^remote\..*\.url$`)
 	var ee *exec.ExitError
 	if errors.As(err, &ee) && ee.ExitCode() == 1 && len(bytes.TrimSpace(out)) == 0 {
 		return nil, nil // no remote configured
@@ -453,9 +451,7 @@ func (m *Manager) NewCard(repoPath, name string) (string, error) {
 // is not a valid remote (a control character such as CR/LF that would inject a front matter line) is
 // an error: the card is not written.
 func originRemote(repo string) (string, error) {
-	cmd := exec.Command("git", "-C", repo, "config", "--get", "remote.origin.url")
-	cmd.Env = daemonGitEnv()
-	out, err := cmd.Output()
+	out, _, err := runGitFor(gitTimeout, "", daemonGitEnv(), "-C", repo, "config", "--get", "remote.origin.url")
 	var ee *exec.ExitError
 	if errors.As(err, &ee) && ee.ExitCode() == 1 {
 		return "", nil

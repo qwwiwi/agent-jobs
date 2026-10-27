@@ -308,28 +308,28 @@ func gitEnv(dir string, env []string, args ...string) (string, error) {
 	return gitEnvTimeout(gitTimeout, dir, env, args...)
 }
 
-// gitEnvTimeout is gitEnv bounded by timeout: past it git's whole process group is killed and the error
-// wraps errGitTimeout. GIT_TERMINAL_PROMPT=0 is set whatever env holds: git never waits on a prompt.
+// gitEnvTimeout is gitEnv bounded by timeout, with stdout trimmed.
 func gitEnvTimeout(timeout time.Duration, dir string, env []string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = append(slices.Clip(env), "GIT_TERMINAL_PROMPT=0")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = time.Second
-	out, err := cmd.Output()
-	if err != nil && ctx.Err() != nil {
-		return "", fmt.Errorf("git %s: %w after %s", strings.Join(args, " "), errGitTimeout, timeout)
+	out, err := gitBytes(timeout, dir, env, args...)
+	return strings.TrimSpace(string(out)), err
+}
+
+// gitBytes runs git -C dir args bounded by timeout (runGit) and returns stdout as it is. Past the
+// timeout git's whole process group is killed and the error wraps errGitTimeout; GIT_TERMINAL_PROMPT=0
+// is set whatever env holds: git never waits on a prompt.
+func gitBytes(timeout time.Duration, dir string, env []string, args ...string) ([]byte, error) {
+	out, stderr, err := runGitFor(timeout, "", env, append([]string{"-C", dir}, args...)...)
+	if errors.Is(err, errGitTimeout) {
+		return nil, fmt.Errorf("git %s: %w after %s", strings.Join(args, " "), errGitTimeout, timeout)
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
 	}
 	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(ee.Stderr)))
-		}
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out, nil
 }
 
 // Enqueue validates the request and inserts a queued job. It returns immediately. A codex job past the

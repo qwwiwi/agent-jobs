@@ -3,6 +3,7 @@ package jobs
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -501,26 +502,43 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("git", "-C", repo, noReplace, "cat-file", "--batch")
-	cmd.Env = daemonGitEnv()
-	in, err := cmd.StdinPipe()
+	// Own pipes rather than StdinPipe/StdoutPipe: the reaper's Wait (startGit) never closes them under a
+	// read.
+	inR, in, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	outPipe, err := cmd.StdoutPipe()
+	outPipe, outW, err := os.Pipe()
 	if err != nil {
+		_, _ = inR.Close(), in.Close()
 		return err
 	}
-	if err := cmd.Start(); err != nil {
+	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
+		"-C", repo, noReplace, "cat-file", "--batch")
+	_, _ = inR.Close(), outW.Close()
+	if err != nil {
+		_, _ = in.Close(), outPipe.Close()
 		return fmt.Errorf("git cat-file: %w", err)
 	}
+	// Bounded like the other daemon git calls (#100): at gitLongTimeout git's group is killed and both
+	// pipes are closed, so that a read or write blocked on a git that stopped answering ends.
+	ctx, cancel := context.WithTimeout(context.Background(), gitLongTimeout)
+	defer cancel()
+	stop := context.AfterFunc(ctx, func() {
+		p.kill()
+		_, _ = in.Close(), outPipe.Close()
+	})
 	defer func() {
+		stop()
 		if err != nil {
 			// git may be blocked writing the rest of a blob nobody reads: end it before waiting.
-			_ = cmd.Process.Kill()
+			p.kill()
 		}
 		_ = in.Close()
-		_ = cmd.Wait()
+		if errors.Is(p.wait(ctx), errGitTimeout) {
+			err = fmt.Errorf("git cat-file: %w after %s", errGitTimeout, gitLongTimeout)
+		}
+		_ = outPipe.Close()
 	}()
 	out := bufio.NewReader(outPipe)
 	var total int64

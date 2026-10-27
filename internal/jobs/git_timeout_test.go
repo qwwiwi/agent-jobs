@@ -141,3 +141,76 @@ exec '`+real+`' "$@"
 		t.Fatalf("not shipped at the next tick: %+v %v", g, err)
 	}
 }
+
+// shortGitLongTimeout sets gitLongTimeout to d for the test.
+func shortGitLongTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := gitLongTimeout
+	gitLongTimeout = d
+	t.Cleanup(func() { gitLongTimeout = orig })
+}
+
+// returnsWithin runs f and fails the test when it does not return within limit.
+func returnsWithin[T any](t *testing.T, limit time.Duration, what string, f func() T) T {
+	t.Helper()
+	done := make(chan T, 1)
+	go func() { done <- f() }()
+	select {
+	case v := <-done:
+		return v
+	case <-time.After(limit):
+		t.Fatalf("%s did not return within %s", what, limit)
+	}
+	panic("unreachable")
+}
+
+// gitRaw, the raw-output call of Cleanup (config, ls-files, format-patch, diff), is bounded like the
+// other daemon git calls (#100): a hung git fails with errGitTimeout and no output.
+func TestGitRawTimesOut(t *testing.T) {
+	fakeGitOnPath(t, "echo partial\nexec sleep 60\n")
+	shortGitLongTimeout(t, 300*time.Millisecond)
+	type result struct {
+		out []byte
+		err error
+	}
+	r := returnsWithin(t, 10*time.Second, "gitRaw", func() result {
+		out, err := gitRaw(t.TempDir(), "format-patch", "--stdout")
+		return result{out, err}
+	})
+	if !errors.Is(r.err, errGitTimeout) || len(r.out) != 0 || !strings.Contains(r.err.Error(), "git format-patch") {
+		t.Fatalf("want a timeout error and no output, got %q %v", r.out, r.err)
+	}
+}
+
+// gitRaw keeps git's stdout byte for byte: leading and trailing blanks, NULs, final newlines.
+func TestGitRawKeepsBytes(t *testing.T) {
+	fakeGitOnPath(t, `printf '  a\000b \n\n'`+"\n")
+	out, err := gitRaw(t.TempDir(), "ls-files", "-z")
+	if err != nil || string(out) != "  a\x00b \n\n" {
+		t.Fatalf("got %q %v", out, err)
+	}
+}
+
+// The other daemon git calls outside the helper are bounded too: the remotes read of the project cards
+// and the streaming git cat-file of the judge tree (#100).
+func TestDaemonGitCallsTimeOut(t *testing.T) {
+	repo, sha := gateRepo(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// config and cat-file never answer; every other git call is the real one.
+	fakeGitOnPath(t, `for a in "$@"; do case "$a" in config|cat-file) exec sleep 60;; esac; done
+exec '`+real+`' "$@"
+`)
+	shortGitTimeout(t, 300*time.Millisecond)
+	shortGitLongTimeout(t, 300*time.Millisecond)
+	if err := returnsWithin(t, 10*time.Second, "repoRemotes", func() error { _, err := repoRemotes(repo); return err }); !errors.Is(err, errGitTimeout) {
+		t.Fatalf("repoRemotes: %v", err)
+	}
+	if err := returnsWithin(t, 10*time.Second, "materializeTree", func() error {
+		return materializeTree(repo, sha, t.TempDir(), nil)
+	}); !errors.Is(err, errGitTimeout) {
+		t.Fatalf("materializeTree: %v", err)
+	}
+}

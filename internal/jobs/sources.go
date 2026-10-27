@@ -508,9 +508,7 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
 	if res.Bytes = treeBytes(target); res.Bytes > maxBytes {
 		return fail(capMsg)
 	}
-	head := exec.Command("git", "-c", "core.hooksPath="+tmpl, "rev-parse", "HEAD")
-	head.Dir, head.Env = target, sourceEnv(tmp, protocols)
-	if out, err := head.Output(); err == nil {
+	if out, _, err := runGitFor(gitTimeout, target, sourceEnv(tmp, protocols), "-c", "core.hooksPath="+tmpl, "rev-parse", "HEAD"); err == nil {
 		res.Commit = strings.TrimSpace(string(out))
 	}
 	if err := makeReadOnly(target); err != nil {
