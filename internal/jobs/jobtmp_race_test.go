@@ -10,7 +10,36 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+// scanOnlyTestProcs limits the temp dir check's /proc listing to this test process and its children
+// (every holder a test starts): a process of this user that another session starts meanwhile (an ssh
+// login, non-dumpable) would make a removal the test expects wait.
+func scanOnlyTestProcs(t *testing.T) {
+	t.Helper()
+	old := tmpProc
+	t.Cleanup(func() { tmpProc = old })
+	self := os.Getpid()
+	tmpProc.readDir = func(p string) ([]os.DirEntry, error) {
+		ents, err := old.readDir(p)
+		if err != nil || p != procRoot {
+			return ents, err
+		}
+		var out []os.DirEntry
+		for _, e := range ents {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil {
+				continue
+			}
+			if st, err := procStatFull(pid); pid == self || err == nil && st.ppid == self {
+				out = append(out, e)
+			}
+		}
+		return out, nil
+	}
+}
 
 // noStaging fails when a staging dir is left in the job dir.
 func noStaging(t *testing.T, jobDir string) {
@@ -30,6 +59,7 @@ func TestJobTmpHolderBetweenScanAndDelete(t *testing.T) {
 	for _, stage := range []string{"scanned", "renamed"} {
 		t.Run(stage, func(t *testing.T) {
 			m := newManager(t)
+			scanOnlyTestProcs(t)
 			id, tmp := finishedWithTmp(t, m)
 			var held *os.File
 			old := tmpRemovalHook
@@ -68,6 +98,7 @@ func TestJobTmpHolderBetweenScanAndDelete(t *testing.T) {
 	}
 	t.Run("leftover staging dir", func(t *testing.T) {
 		m := newManager(t)
+		scanOnlyTestProcs(t)
 		id, tmp := finishedWithTmp(t, m)
 		if err := os.RemoveAll(tmp); err != nil {
 			t.Fatal(err)
@@ -110,6 +141,7 @@ func TestJobTmpUnreadableProcessDefers(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newManager(t)
+			scanOnlyTestProcs(t)
 			var proc *exec.Cmd
 			start := func() {
 				proc = exec.Command("sleep", "300")
@@ -195,5 +227,40 @@ func TestJobTmpSymlinkedJobDirRefused(t *testing.T) {
 				t.Fatalf("removal followed a symlinked %s: %v", which, err)
 			}
 		})
+	}
+}
+
+// #105: the removal does not enter a directory on another file system than the temp dir's top (a
+// mount point, a FUSE mount the job left there): it fails and leaves what is behind it.
+func TestJobTmpRemovalStopsAtMountPoint(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the temp dir is removed only where /proc proves it unused")
+	}
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "mnt", "remote-file"), []byte("x"), 0o600)
+	writeFile(t, filepath.Join(dir, "local"), []byte("x"), 0o600)
+	fd, err := openDirNoFollow(unix.AT_FDCWD, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	top, err := fsOf(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := top
+	other.dev++ // as seen from the tree, "mnt" lies on another file system
+	err = removeContents(fd, other, 0)
+	if err == nil || !strings.Contains(err.Error(), "mount point") {
+		t.Fatalf("crossed into another file system: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "mnt", "remote-file")); err != nil {
+		t.Fatalf("removed behind a mount point: %v", err)
+	}
+	if err := removeContents(fd, top, 0); err != nil {
+		t.Fatalf("same file system: %v", err)
+	}
+	if left, _ := os.ReadDir(dir); len(left) != 0 {
+		t.Fatalf("left: %v", left)
 	}
 }

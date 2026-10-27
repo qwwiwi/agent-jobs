@@ -8,3 +8,6 @@ import "errors"
 func renameNoReplace(int, string, int, string) error {
 	return errors.New("rename without replace: Linux only")
 }
+
+// mountID: no mount ids outside Linux (the device alone tells the file systems apart).
+func mountID(int) uint64 { return 0 }

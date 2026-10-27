@@ -39,6 +39,7 @@ func TestFinishedJobTmpRemovedAtCleanup(t *testing.T) {
 		t.Skip("the temp dir is removed only where /proc proves it unused")
 	}
 	m := newManager(t)
+	scanOnlyTestProcs(t)
 	id, tmp := finishedWithTmp(t, m)
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
@@ -68,6 +69,7 @@ func TestJobTmpKeptWhileProcessHoldsIt(t *testing.T) {
 	for _, how := range []string{"cwd", "binary"} {
 		t.Run(how, func(t *testing.T) {
 			m := newManager(t)
+			scanOnlyTestProcs(t)
 			var logBuf bytes.Buffer
 			m.Log = log.New(&logBuf, "", 0)
 			id, tmp := finishedWithTmp(t, m)

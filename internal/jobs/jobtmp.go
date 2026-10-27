@@ -146,6 +146,7 @@ type tmpTree struct {
 	uid     int
 	before  time.Time
 	selfFd  int
+	fs      fsID // the file system of the tree's top: the walk does not cross into another
 }
 
 // newTmpTree walks the directory fd for tmpTree.
@@ -174,8 +175,16 @@ func (t *tmpTree) walk(dirfd int, name string, depth int) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return err
 	}
-	if depth == 0 {
+	id, err := fsOf(fd)
+	if err != nil {
+		return err
+	}
+	switch {
+	case depth == 0:
 		t.private = int64(st.Uid) == int64(t.uid) && st.Mode&0o077 == 0
+		t.fs = id
+	case id != t.fs:
+		return fmt.Errorf("%s is a mount point (another file system in the tree)", name)
 	}
 	t.add(&st)
 	names, err := f.Readdirnames(-1)
@@ -339,6 +348,23 @@ func procTmpUse(pid int, self bool, boot time.Time, t *tmpTree) tmpUse {
 		}
 		doubt = doubt || err != nil
 	}
+	// A thread can have a working or root dir of its own (unshare(CLONE_FS)).
+	if tasks, err := tmpProc.readDir(filepath.Join(base, "task")); err != nil {
+		doubt = true
+	} else {
+		for _, task := range tasks {
+			if task.Name() == strconv.Itoa(pid) {
+				continue
+			}
+			for _, l := range []string{"cwd", "root"} {
+				holds, err := t.usesLink(filepath.Join(base, "task", task.Name(), l))
+				if holds {
+					return useHolds
+				}
+				doubt = doubt || (err != nil && !errors.Is(err, fs.ErrNotExist)) // the thread ended
+			}
+		}
+	}
 	if fds, err := tmpProc.readDir(filepath.Join(base, "fd")); err != nil {
 		doubt = true
 	} else {
@@ -409,8 +435,15 @@ func procTmpState(base string) (procState, uint64) {
 	switch {
 	case err != nil || err2 != nil:
 		return procUnknown, 0
-	case f[0] == "Z" || flags&pfKthread != 0:
+	case flags&pfKthread != 0:
 		return procGone, 0
+	case f[0] == "Z":
+		// A leader that exited while other threads run: its fds, working dir and mappings are theirs
+		// now and not listed under it.
+		if tasks, err := tmpProc.readDir(filepath.Join(base, "task")); err == nil && len(tasks) <= 1 {
+			return procGone, 0
+		}
+		return procUnknown, 0
 	}
 	return procLive, start
 }
@@ -624,7 +657,11 @@ func removeTmpEntry(jobFd int, jobDir, name, jobID string, before time.Time) (bo
 	}
 	// The contents go through the descriptor of the dir that was checked; its name only for the last
 	// rmdir, which fails on anything put there in its place but an empty dir.
-	if err := removeContents(fd, 0); err != nil {
+	top, err := fsOf(fd)
+	if err != nil {
+		return false, fmt.Errorf("keeping %s: %w", shown, err)
+	}
+	if err := removeContents(fd, top, 0); err != nil {
 		return false, fmt.Errorf("remove %s: %w", filepath.Join(jobDir, staged), err)
 	}
 	if !sameDirAt(jobFd, staged, fd) {
@@ -636,6 +673,19 @@ func removeTmpEntry(jobFd int, jobDir, name, jobID string, before time.Time) (bo
 	return true, nil
 }
 
+// fsID identifies the file system (device) and, where the kernel reports it, the mount of a file:
+// a bind mount of a dir of the same device is another mount.
+type fsID struct{ dev, mnt uint64 }
+
+// fsOf returns the fsID of the open file fd.
+func fsOf(fd int) (fsID, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fsID{}, err
+	}
+	return fsID{dev: uint64(st.Dev), mnt: mountID(fd)}, nil
+}
+
 // sameDirAt reports whether name under dirfd (not followed) is the directory open as fd.
 func sameDirAt(dirfd int, name string, fd int) bool {
 	var a, b unix.Stat_t
@@ -645,8 +695,9 @@ func sameDirAt(dirfd int, name string, fd int) bool {
 
 // removeContents removes everything in the directory dirfd. Each directory is opened relative to its
 // parent without following a symlink (a symlink inside is removed as a link) and made 0700 first, so
-// a read-only one (a go module cache) goes too.
-func removeContents(dirfd, depth int) error {
+// a read-only one (a go module cache) goes too; one on another file system than top (a mount point,
+// a FUSE mount the job left) is not entered and fails the removal.
+func removeContents(dirfd int, top fsID, depth int) error {
 	if depth > maxChmodDepth {
 		return fmt.Errorf("deeper than %d levels", maxChmodDepth)
 	}
@@ -666,7 +717,7 @@ func removeContents(dirfd, depth int) error {
 		if err != nil && !errors.Is(err, unix.ENOENT) {
 			var st unix.Stat_t
 			if unix.Fstatat(dirfd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
-				err = removeDirAt(dirfd, n, depth+1)
+				err = removeDirAt(dirfd, n, top, depth+1)
 			}
 		}
 		if err != nil && !errors.Is(err, unix.ENOENT) {
@@ -677,12 +728,16 @@ func removeContents(dirfd, depth int) error {
 }
 
 // removeDirAt removes the directory name under dirfd (not followed) with everything in it.
-func removeDirAt(dirfd int, name string, depth int) error {
+func removeDirAt(dirfd int, name string, top fsID, depth int) error {
 	fd, err := openDirNoFollow(dirfd, name)
 	if err != nil {
 		return err
 	}
-	err = removeContents(fd, depth)
+	if id, err := fsOf(fd); err != nil || id != top {
+		unix.Close(fd)
+		return fmt.Errorf("%s is a mount point (another file system in the tree): not entered", name)
+	}
+	err = removeContents(fd, top, depth)
 	unix.Close(fd)
 	if err != nil {
 		return err
