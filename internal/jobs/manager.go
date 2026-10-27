@@ -282,15 +282,46 @@ func (m *Manager) spawnEnv(unit string) []string {
 	return env
 }
 
+// gitTimeout bounds one of the daemon's git calls (git, gitEnv, gitHistory): a git that hangs (a lock,
+// a stalled network file system, a prompt) fails with errGitTimeout and its process group is killed
+// instead of stalling the tick (#100). gitLongTimeout is for the calls whose work grows with the work
+// tree (gitLong: worktree add and remove, status, diff, apply). Variables only so that tests shorten them.
+var (
+	gitTimeout     = 30 * time.Second
+	gitLongTimeout = 10 * time.Minute
+)
+
+// errGitTimeout is a git call that ran past its timeout.
+var errGitTimeout = errors.New("git timed out")
+
 func git(dir string, args ...string) (string, error) {
 	return gitEnv(dir, daemonGitEnv(), args...)
 }
 
+// gitLong is git with gitLongTimeout.
+func gitLong(dir string, args ...string) (string, error) {
+	return gitEnvTimeout(gitLongTimeout, dir, daemonGitEnv(), args...)
+}
+
 // gitEnv is git with environment env.
 func gitEnv(dir string, env []string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = env
+	return gitEnvTimeout(gitTimeout, dir, env, args...)
+}
+
+// gitEnvTimeout is gitEnv bounded by timeout: past it git's whole process group is killed and the error
+// wraps errGitTimeout. GIT_TERMINAL_PROMPT=0 is set whatever env holds: git never waits on a prompt.
+func gitEnvTimeout(timeout time.Duration, dir string, env []string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(slices.Clip(env), "GIT_TERMINAL_PROMPT=0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
+	if err != nil && ctx.Err() != nil {
+		return "", fmt.Errorf("git %s: %w after %s", strings.Join(args, " "), errGitTimeout, timeout)
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

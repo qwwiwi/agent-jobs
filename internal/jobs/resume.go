@@ -300,7 +300,7 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 		}
 		return nil
 	}
-	st, err := git(work, append([]string{"status", "--porcelain", "--ignored", "--untracked-files=all", "--"},
+	st, err := gitLong(work, append([]string{"status", "--porcelain", "--ignored", "--untracked-files=all", "--"},
 		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
@@ -314,7 +314,7 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 			changed = append(changed, l)
 		}
 	}
-	diff, err := git(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
+	diff, err := gitLong(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
 		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
@@ -1080,7 +1080,7 @@ func (m *Manager) restoreWorktree(j *store.Job, work string) error {
 	if err != nil {
 		return fmt.Errorf("no saved ref of the job (start a new job instead): %w", err)
 	}
-	if _, err := git(j.RepoPath, "worktree", "add", "--detach", work, head); err != nil {
+	if _, err := gitLong(j.RepoPath, "worktree", "add", "--detach", work, head); err != nil {
 		return err
 	}
 	if err := m.markWorktree(j, work); err != nil {
@@ -1097,7 +1097,7 @@ func (m *Manager) restoreWorktree(j *store.Job, work string) error {
 		if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
 			continue
 		}
-		if _, err := git(work, append(p.args, path)...); err != nil {
+		if _, err := gitLong(work, append(p.args, path)...); err != nil {
 			return err
 		}
 	}

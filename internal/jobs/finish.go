@@ -178,7 +178,7 @@ func (m *Manager) noteReviewChanges(j *store.Job) {
 	}
 	if err == nil {
 		var st string
-		if st, err = git(work, "status", "--porcelain", "--untracked-files=all"); err == nil && st != "" {
+		if st, err = gitLong(work, "status", "--porcelain", "--untracked-files=all"); err == nil && st != "" {
 			what = append(what, fmt.Sprintf("%d changed or untracked paths", len(strings.Split(st, "\n"))))
 		}
 	}
@@ -576,7 +576,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 		}
 	}
 	// --no-ext-diff --no-textconv: the job may have set diff.external / a textconv in the repo config.
-	stat, err := git(work, "diff", "--no-ext-diff", "--no-textconv", "--stat", j.BaseCommit)
+	stat, err := gitLong(work, "diff", "--no-ext-diff", "--no-textconv", "--stat", j.BaseCommit)
 	if err != nil {
 		return err
 	}
@@ -612,7 +612,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if _, err := git(j.RepoPath, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
 		return err
 	}
-	if _, err := git(j.RepoPath, "worktree", "remove", "--force", work); err != nil {
+	if _, err := gitLong(j.RepoPath, "worktree", "remove", "--force", work); err != nil {
 		return err
 	}
 	m.Log.Printf("job %s: worktree removed, patches saved, ref refs/agent-jobs/jobs/%s -> %s", j.ID, j.ID, head)

@@ -539,7 +539,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if _, err := os.Stat(work); err == nil {
 		return fmt.Errorf("work dir %s already exists", work)
 	}
-	if _, err := git(j.RepoPath, "worktree", "add", "--detach", work, j.BaseCommit); err != nil {
+	if _, err := gitLong(j.RepoPath, "worktree", "add", "--detach", work, j.BaseCommit); err != nil {
 		return err
 	}
 	if err := m.markWorktree(j, work); err != nil {
