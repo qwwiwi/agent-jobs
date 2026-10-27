@@ -440,3 +440,38 @@ func (m *Manager) ManifestCheckWarnings(j *store.Job) []string {
 	}
 	return out
 }
+
+// JudgeReadiness is the checklist tools' early look at what a judge of the repository needs for its
+// manifest-check step (issue #83): config acceptance_allowed, and ManifestScript as a regular file at
+// the work tree's HEAD. Advisory only: judge_start checks the exact sha it is given, and decides.
+type JudgeReadiness struct {
+	AcceptanceAllowed bool `json:"acceptance_allowed"`
+	// Revision is the commit ManifestScript was looked up at, the work tree's HEAD ("" when unresolved).
+	Revision       string `json:"revision"`
+	ManifestScript bool   `json:"manifest_script"`
+	// Notes say what is missing and what to do; empty when both are in place.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// JudgeReadiness looks at config acceptance_allowed and at ManifestScript at HEAD of the work tree top.
+func (m *Manager) JudgeReadiness(top string) JudgeReadiness {
+	r := JudgeReadiness{AcceptanceAllowed: m.Config().AcceptanceAllowed}
+	if !r.AcceptanceAllowed {
+		r.Notes = append(r.Notes, "acceptance_allowed is off in config.json: a judge's manifest-check step cannot run, so a "+
+			"judge_start job would fail before the judge starts")
+	}
+	out, err := gitRaw(top, noReplace, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	if err != nil {
+		r.Notes = append(r.Notes, fmt.Sprintf("HEAD of the work tree is not a commit, so %s was not looked up", ManifestScript))
+		return r
+	}
+	r.Revision = strings.TrimSpace(string(out))
+	if _, err := manifestScriptAt(top, r.Revision); err != nil {
+		r.Notes = append(r.Notes, fmt.Sprintf("%s is not a regular file at HEAD %s: a judge of that sha would fail before it "+
+			"starts; commit one before judge_start (examples/manifest-check in agent-jobs is a reference)",
+			ManifestScript, shortSHA(r.Revision)))
+	} else {
+		r.ManifestScript = true
+	}
+	return r
+}

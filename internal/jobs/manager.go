@@ -1838,6 +1838,9 @@ func (m *Manager) sweepEscaped(id string) string {
 			continue
 		}
 		why := "leads its own session, never killed"
+		if g.Kind == GhostSuspect {
+			why = "runs a binary from the job's temp dir, never killed"
+		}
 		if g.KillError != "" {
 			why = g.KillError
 		}
