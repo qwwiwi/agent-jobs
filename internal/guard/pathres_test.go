@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -299,8 +300,29 @@ func TestProtectedFixLoop1Messages(t *testing.T) {
 	}
 }
 
-// The protected-path check stays linear: a 16 KB inline script with `..` checks well under a second,
-// also when every token is different.
+// processCPU is the CPU time (user and system) this test process has used so far.
+func processCPU(t *testing.T) time.Duration {
+	t.Helper()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatal(err)
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+// timedCheck runs Check and returns its result with the CPU time and the wall-clock time it took. The
+// bound is on CPU time: a busy host (check.sh runs the packages in parallel) stretches the wall-clock
+// time of the same work several times over, not its CPU time (issue #102). The guard tests do not run
+// in parallel, so the process CPU time is this check's, with its garbage collection.
+func timedCheck(t *testing.T, cmd string, cfg Config) (string, time.Duration, time.Duration) {
+	t.Helper()
+	cpu, start := processCPU(t), time.Now()
+	r := Check(cmd, cfg)
+	return r, processCPU(t) - cpu, time.Since(start)
+}
+
+// The protected-path check stays linear: a 16 KB inline script with `..` checks in well under a second
+// of CPU time, also when every token is different.
 func TestProtectedLargeInlineScriptFast(t *testing.T) {
 	_, _, _, cfg := protectedSetup(t)
 	var uniq strings.Builder
@@ -313,10 +335,9 @@ func TestProtectedLargeInlineScriptFast(t *testing.T) {
 		"echo x > \"" + strings.Repeat("a/../", 4000/5) + "b c\"",
 		"python3 -c \"" + strings.Repeat("'a/../b' ", 4000/9) + "\"",
 	} {
-		start := time.Now()
-		r := Check(cmd, cfg)
-		if d := time.Since(start); d > time.Second || r != "" {
-			t.Errorf("%.30q…: %v %s", cmd, d, r)
+		r, cpu, wall := timedCheck(t, cmd, cfg)
+		if cpu > time.Second || r != "" {
+			t.Errorf("%.30q…: cpu %v (wall %v) %s", cmd, cpu, wall, r)
 		}
 	}
 	for _, code := range []string{
@@ -324,12 +345,10 @@ func TestProtectedLargeInlineScriptFast(t *testing.T) {
 		strings.Repeat("'./a/../b' ", 16*1024/11),
 		uniq.String(),
 	} {
-		start := time.Now()
-		r := Check("python3 -c \""+code+"\"", cfg)
-		d := time.Since(start)
-		t.Logf("%d bytes: %v", len(code), d)
-		if d > time.Second {
-			t.Errorf("%.30q…: %v", code, d)
+		r, cpu, wall := timedCheck(t, "python3 -c \""+code+"\"", cfg)
+		t.Logf("%d bytes: cpu %v, wall %v", len(code), cpu, wall)
+		if cpu > time.Second {
+			t.Errorf("%.30q…: cpu %v (wall %v)", code, cpu, wall)
 		}
 		if r != "" {
 			t.Errorf("%.30q… refused: %s", code, r)
