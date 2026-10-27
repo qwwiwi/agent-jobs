@@ -60,7 +60,7 @@ func TestMergeGateAPIMerges(t *testing.T) {
 		{"REST, another sha", t.TempDir(), rest + other, "release_check has not passed on " + other},
 		{"REST, a short sha", t.TempDir(), rest + sha[:12], "is not a full 40-hex sha"},
 		{"REST, body from --input", t.TempDir(), "gh api -X PUT repos/acme/demo/pulls/5/merge --input b.json -f sha=" + sha,
-			"without -f sha=<full sha>"},
+			"the hook cannot read this merge request"},
 		{"REST, a variable sha", t.TempDir(), `gh api -X PUT repos/acme/demo/pulls/5/merge -f sha="$SHA"`, "literally"},
 		{"REST in another repository", t.TempDir(), "gh api -X PUT repos/other/repo/pulls/5/merge", ""},
 		{"REST read of the merge endpoint", t.TempDir(), "gh api repos/acme/demo/pulls/5/merge", ""},

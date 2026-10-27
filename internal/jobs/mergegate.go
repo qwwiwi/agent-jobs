@@ -45,7 +45,11 @@ import (
 // or the directory; the pin is the sha field) and `gh api graphql` mergePullRequest (the repository
 // from GH_REPO or the directory, the pin expectedHeadOid; one that resolves to no gated repository warns
 // while some repository is gated, since its node id names none); enablePullRequestAutoMerge is refused
-// like --auto. A release_check pass whose verdicts list suspect tests (#106) lets the merge run with a
+// like --auto. An API merge the hook cannot fully read (guard.GhMerge.Opaque: an endpoint from a variable,
+// a body from --input, a -F field from a file, a query from a variable, a field given twice, a $variable
+// pin at a GraphQL endpoint other than `graphql`) is refused in a gated repository, its context (the
+// endpoint's OWNER/REPO, else GH_REPO and the directory) resolved first; elsewhere it warns as other
+// unreadable merges. A release_check pass whose verdicts list suspect tests (#106) lets the merge run with a
 // needs-live-check warning.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
 // `./scripts/ship.sh`), `git push` to the base branch and the web UI pass by it, and so
@@ -177,6 +181,29 @@ func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer,
 		}
 	}
 	for _, call := range calls {
+		if call.Opaque != "" {
+			// An API merge the reader cannot fully read (#107): the gated context first, refused in it.
+			targets, why, err := g.targets(cwd, call, envRepo)
+			if err != nil {
+				return MergeGateAnswer{}, err
+			}
+			if len(targets) > 0 {
+				return MergeGateAnswer{Refusal: opaqueRefusal(targets[0], call)}, nil
+			}
+			if why == "" {
+				why = call.Unsure
+			}
+			if call.API == guard.APIMergeGraphQL && why == "" {
+				why = "gh api graphql mergePullRequest names its pull request by node id, and neither GH_REPO nor the directory " +
+					"is a gated repository"
+			}
+			if why != "" {
+				if err := warn(why); err != nil {
+					return MergeGateAnswer{}, err
+				}
+			}
+			continue
+		}
 		if call.Unsure != "" && (call.Unsure != guard.DynamicWordUnsure || dynamicWord(call.Repo)) {
 			if err := warn(call.Unsure); err != nil {
 				return MergeGateAnswer{}, err
@@ -233,6 +260,16 @@ func dynamicWordRefusal(r *gatedRepo, call guard.GhMerge) string {
 		"substitution in its words, so the hook cannot tell which sha, PR or flags it merges with, also when the "+
 		"sha has a release_check pass; write every word of %s literally (no variables or $(...)).",
 		call.Form(), Printable(r.main, 200), call.Form())
+}
+
+// opaqueRefusal refuses an API merge in gated repository r whose request the hook cannot fully read
+// (guard.GhMerge.Opaque): it cannot tell which pull request, sha or body GitHub gets.
+func opaqueRefusal(r *gatedRepo, call guard.GhMerge) string {
+	return MergeGatePrefix + fmt.Sprintf("%s in %s (a repo with an approved checklist): the hook cannot read this merge "+
+		"request (%s), so it cannot tell which pull request or sha GitHub merges. Merge with gh pr merge <N> "+
+		"--match-head-commit <sha> (the full sha release_check passed on), or a literal gh api -X PUT "+
+		"repos/OWNER/REPO/pulls/N/merge -f sha=<full sha> (no variables, files, --input or repeated fields).",
+		call.Form(), Printable(r.main, 200), Printable(call.Opaque, 200))
 }
 
 // warnUnsure is the warning for a merge the hook cannot read while some stored repository has an

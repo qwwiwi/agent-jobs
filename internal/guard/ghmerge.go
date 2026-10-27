@@ -46,6 +46,11 @@ type GhMerge struct {
 	// …/pulls/N/merge (MatchHead is its sha field), APIMergeGraphQL for a gh api graphql mergePullRequest or
 	// enqueuePullRequest (MatchHead is its expectedHeadOid; Auto is enablePullRequestAutoMerge).
 	API string
+	// Opaque says why the hook cannot fully read an API merge's request ("" = it can): an endpoint from a
+	// variable or substitution, a body from --input, a -F field from a file, a query from a variable, a
+	// field given more than once, a $variable pin at a GraphQL endpoint other than `graphql`. The hook
+	// refuses such a merge in a gated repository and warns elsewhere (#107).
+	Opaque string
 }
 
 // GhMerge.API values.

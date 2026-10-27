@@ -10,7 +10,8 @@ import (
 // The merges gh makes through the API (#107), read for the merge hook like `gh pr merge` (ghMergeCall):
 // `gh api` with the method PUT and the REST merge endpoint repos/OWNER/REPO/pulls/N/merge, and `gh api
 // graphql` whose query runs mergePullRequest or enqueuePullRequest (or enablePullRequestAutoMerge,
-// which the hook refuses like --auto). It is a text-level reading of the call's words, as the rest of the reader.
+// which the hook refuses like --auto). It is a text-level reading of the call's words, as the rest of the
+// reader; a merge request it cannot fully read is marked GhMerge.Opaque (apiMergeRequest).
 
 // ghAPIValueLong / ghAPIValueShort are the `gh api` options that take a value (gh 2.x).
 var (
@@ -45,32 +46,38 @@ func apiMergeText(w string) bool {
 	return reAPIMergePath.MatchString(w) || reGraphQLMerge.MatchString(w)
 }
 
+// apiField is one -f / -F field of a gh api call.
+type apiField struct {
+	key, val string
+	at       int  // its word
+	typed    bool // -F / --field: gh reads a value @file from the file (@- from stdin) and converts others
+}
+
 // ghAPIMergeCall reads a gh command as a merge through the API (ok false for any other gh call). The pin
-// is the REST call's sha field (none when the body comes from --input: gh then sends the fields as query
-// parameters, and the body's sha is not read) or the GraphQL expectedHeadOid of the one merge mutation
-// of the query, among that field's arguments (a literal, or the field its $variable names; graphQLPin).
-// The repository is the REST endpoint's OWNER/REPO; with the {owner}/{repo}
-// placeholders, and for GraphQL (a pull request node id names no repository the reader can read), it is
-// the one of GH_REPO or the directory, as for gh pr merge without -R.
+// is the REST call's sha field or the GraphQL expectedHeadOid of the one merge mutation of the query,
+// among that field's arguments (a literal, or the field its $variable names; graphQLPin). The
+// repository is the REST endpoint's OWNER/REPO; with the {owner}/{repo} placeholders, and for GraphQL (a
+// pull request node id names no repository the reader can read), it is the one of GH_REPO or the
+// directory, as for gh pr merge without -R. A merge whose request the reader cannot fully read has
+// GhMerge.Opaque (apiMergeRequest).
 func ghAPIMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 	argv, dyn, glob := c.words[v.start:], c.dyn[v.start:], c.glob[v.start:]
-	var call GhMerge
 	if len(argv) == 0 || dyn[0] || !isProg(argv[0], "gh") {
-		return call, false
+		return GhMerge{}, false
 	}
 	pos, _ := ghPositional(argv)
 	if len(pos) == 0 || dyn[pos[0]] || argv[pos[0]] != "api" {
-		return call, false
+		return GhMerge{}, false
 	}
 	endpoint, method, methodAt, input := -1, "", -1, false
-	fieldVal, fieldAt := map[string]string{}, map[string]int{} // the last value of each field and its word
+	var fields []apiField
 	set := func(name, value string, at int) {
 		switch name {
 		case "-X", "--method":
 			method, methodAt = value, at
 		case "-f", "--raw-field", "-F", "--field":
 			if k, val, ok := strings.Cut(value, "="); ok {
-				fieldVal[k], fieldAt[k] = val, at
+				fields = append(fields, apiField{key: k, val: val, at: at, typed: name == "-F" || name == "--field"})
 			}
 		case "--input":
 			input = true
@@ -112,61 +119,11 @@ func ghAPIMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 		}
 	}
 	if endpoint < 0 {
-		return call, false
-	}
-	methodPut := strings.EqualFold(method, "PUT") || methodAt >= 0 && dyn[methodAt]
-	ep := argv[endpoint]
-	switch m := reAPIMergePath.FindStringSubmatch(ep); {
-	case reGraphQLPath.MatchString(ep) && !dyn[endpoint]:
-		call.API = APIMergeGraphQL
-		q, hasQ := fieldVal["query"]
-		if input || hasQ && strings.HasPrefix(q, "@") {
-			call.Unsure = "gh api graphql with a query the reader cannot see (a file or stdin), which may run mergePullRequest"
-			return call, true
-		}
-		code, strs := graphQLCode(q)
-		ops := reGraphQLMerge.FindAllStringSubmatchIndex(code, -1)
-		switch {
-		case len(ops) == 0 && hasQ && dyn[fieldAt["query"]]:
-			call.Unsure = "gh api graphql with a query from a variable or substitution, which may run mergePullRequest"
-			return call, true
-		case len(ops) == 0:
-			return GhMerge{}, false
-		}
-		for _, op := range ops {
-			if code[op[2]:op[3]] == "enablePullRequestAutoMerge" {
-				call.Auto = true
-			}
-		}
-		// Only one merge mutation is read for its pin: with aliases (`a: mergePullRequest(…) b:
-		// mergePullRequest(…)`) one pin would let the other merge any head.
-		if len(ops) == 1 && !call.Auto {
-			call.MatchHead, call.HasMatchHead = graphQLPin(code[ops[0][1]:], strs, fieldVal)
-		}
-	case m == nil && dyn[endpoint] && methodPut:
-		call.API = APIMergeREST
-		call.Unsure = "gh api PUT to an endpoint from a variable or substitution, which may be a pull request's merge"
-		return call, true
-	case m == nil || !methodPut:
-		// Not the merge endpoint, or a GET (the default) or POST, which merge nothing.
 		return GhMerge{}, false
-	default:
-		call.API = APIMergeREST
-		owner, repo := m[1] == "{owner}", m[2] == "{repo}"
-		switch {
-		case m[3] != "":
-			call.Unsure = "a repository id in the endpoint of gh api (repositories/" + m[3] + "), which the reader cannot tie " +
-				"to a repository"
-		case owner && repo:
-			// gh fills them from GH_REPO or the directory: the call names no repository itself.
-		case owner || repo:
-			call.Unsure = "a {owner} or {repo} placeholder next to a literal part in the endpoint of gh api"
-		default:
-			call.Repo = m[1] + "/" + m[2]
-		}
-		if _, ok := fieldAt["sha"]; ok && !input {
-			call.MatchHead, call.HasMatchHead = fieldVal["sha"], true
-		}
+	}
+	call, ok := apiMergeRequest(argv, dyn, endpoint, method, methodAt, input, fields)
+	if !ok {
+		return GhMerge{}, false
 	}
 	switch {
 	case call.Unsure != "":
@@ -184,12 +141,142 @@ func ghAPIMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 			call.Unsure = "a wrapper option before gh (" + w + "), which may change its directory"
 		}
 	}
+	// Also for an unreadable request: the hook resolves its gated context from GH_REPO and the directory.
 	call.GHRepos = envAssigned(c.words, c.dyn, 0, v.start, func(why string) {
 		if call.Unsure == "" {
 			call.Unsure = why
 		}
 	})
 	return call, true
+}
+
+// apiMergeRequest reads the request of a gh api call (endpoint: the index of its endpoint in argv) as a
+// merge (ok false when it merges nothing). Opaque is set when the reader cannot fully read what gh sends
+// (the hook refuses such a merge in a gated repository, #107):
+//   - an endpoint from a variable or substitution (beyond the PR number of a literal OWNER/REPO merge
+//     endpoint) with the method PUT or one from a variable, or with POST (also gh's implicit one, with
+//     fields or --input) and --input, a merge_method field, a query from a variable or a file, or a field
+//     naming a merge mutation;
+//   - a body from --input (gh then sends the fields as query parameters), a -F field from a file or stdin
+//     (@…), a GraphQL query from a variable or substitution;
+//   - a field given more than once, also as key and key[…]: gh sends every -f field before the -F ones,
+//     whatever their order, so the last one written is not always the one sent;
+//   - a $variable expectedHeadOid at a GraphQL endpoint other than the exact `graphql`: only there does gh
+//     group the fields into the variables object; at /graphql or a URL it sends them as written (a
+//     variables[oid] field may then carry another sha).
+func apiMergeRequest(argv []string, dyn []bool, endpoint int, method string, methodAt int, input bool,
+	fields []apiField) (call GhMerge, ok bool) {
+	fieldVal, fieldAt, fieldTyped := map[string]string{}, map[string]int{}, map[string]bool{}
+	seen, dup, file := map[string]bool{}, "", ""
+	for _, f := range fields {
+		base, _, _ := strings.Cut(f.key, "[")
+		if seen[base] && dup == "" {
+			dup = base
+		}
+		seen[base] = true
+		if f.typed && strings.HasPrefix(f.val, "@") && file == "" {
+			file = f.key
+		}
+		fieldVal[f.key], fieldAt[f.key], fieldTyped[f.key] = f.val, f.at, f.typed
+	}
+	methodPut := strings.EqualFold(method, "PUT") || methodAt >= 0 && dyn[methodAt]
+	// gh posts when it has fields or --input and no method is given.
+	methodPost := strings.EqualFold(method, "POST") || method == "" && (len(fields) > 0 || input)
+	q, hasQ := fieldVal["query"]
+	qDyn, qFile := hasQ && dyn[fieldAt["query"]], hasQ && fieldTyped["query"] && strings.HasPrefix(q, "@")
+	ep := argv[endpoint]
+	m := reAPIMergePath.FindStringSubmatch(ep)
+	switch {
+	case dyn[endpoint] && (m == nil || dynamicText(m[1]+m[2]+m[3])):
+		// gh may send it anywhere, graphql included.
+		code, _ := graphQLCode(q)
+		names := slices.ContainsFunc(fields, func(f apiField) bool { return reGraphQLMerge.MatchString(f.val) })
+		if !methodPut && !(methodPost && (input || seen["merge_method"] || names || qDyn || qFile ||
+			reGraphQLMerge.MatchString(code))) {
+			return GhMerge{}, false
+		}
+		call.API = APIMergeGraphQL
+		if methodPut {
+			call.API = APIMergeREST
+		}
+		call.Unsure = "gh api to an endpoint from a variable or substitution, which may be a pull request's merge"
+		call.Opaque = "the endpoint is a variable or substitution"
+		return call, true
+	case reGraphQLPath.MatchString(ep):
+		call.API = APIMergeGraphQL
+		if input || qFile {
+			call.Unsure = "gh api graphql with a query the reader cannot see (a file or stdin), which may run mergePullRequest"
+			call.Opaque = "the query comes from a file or stdin (-F query=@…)"
+			if input {
+				call.Opaque = "the body comes from --input"
+			}
+			return call, true
+		}
+		code, strs := graphQLCode(q)
+		ops := reGraphQLMerge.FindAllStringSubmatchIndex(code, -1)
+		switch {
+		case len(ops) == 0 && qDyn:
+			call.Unsure = "gh api graphql with a query from a variable or substitution, which may run mergePullRequest"
+			call.Opaque = "the query is a variable or substitution"
+			return call, true
+		case len(ops) == 0:
+			return GhMerge{}, false
+		}
+		for _, op := range ops {
+			if code[op[2]:op[3]] == "enablePullRequestAutoMerge" {
+				call.Auto = true
+			}
+		}
+		// Only one merge mutation is read for its pin: with aliases (`a: mergePullRequest(…) b:
+		// mergePullRequest(…)`) one pin would let the other merge any head.
+		if len(ops) == 1 && !call.Auto {
+			pin, variable, ok := graphQLPin(code[ops[0][1]:], strs, fieldVal)
+			switch {
+			case variable != "" && ep != "graphql":
+				call.Opaque = "expectedHeadOid is the $variable " + variable + " at the endpoint " + ep +
+					" (gh groups the fields into variables only for the endpoint graphql)"
+			case variable == "query" || variable == "operationName":
+				// gh sends these fields at the top level, never as variables: no pin.
+			default:
+				call.MatchHead, call.HasMatchHead = pin, ok
+			}
+		}
+	case m == nil || !methodPut:
+		// Not the merge endpoint, or a GET (the default) or POST, which merge nothing.
+		return GhMerge{}, false
+	default:
+		call.API = APIMergeREST
+		owner, repo := m[1] == "{owner}", m[2] == "{repo}"
+		switch {
+		case m[3] != "":
+			call.Unsure = "a repository id in the endpoint of gh api (repositories/" + m[3] + "), which the reader cannot tie " +
+				"to a repository"
+		case owner && repo:
+			// gh fills them from GH_REPO or the directory: the call names no repository itself.
+		case owner || repo:
+			call.Unsure = "a {owner} or {repo} placeholder next to a literal part in the endpoint of gh api"
+		default:
+			call.Repo = m[1] + "/" + m[2]
+		}
+		if input {
+			call.Opaque = "the body comes from --input (gh then sends the fields as query parameters)"
+		} else if _, ok := fieldAt["sha"]; ok {
+			call.MatchHead, call.HasMatchHead = fieldVal["sha"], true
+		}
+	}
+	switch {
+	case call.Opaque != "":
+	case dup != "":
+		call.Opaque = "the field " + dup + " is given more than once (gh sends -f fields before -F ones, whatever their order)"
+	case file != "":
+		call.Opaque = "the field " + file + " comes from a file or stdin (-F " + file + "=@…)"
+	}
+	return call, true
+}
+
+// dynamicText reports text holding a shell expansion ($VAR, $(…), `…`).
+func dynamicText(s string) bool {
+	return strings.ContainsAny(s, "$`")
 }
 
 // apiGlob reports a word of a gh api call with an unquoted glob or brace the shell may expand (glob[i]),
@@ -251,12 +338,12 @@ func graphQLCode(q string) (code string, strs []string) {
 
 // graphQLPin is the expectedHeadOid among the arguments of the merge field whose code (graphQLCode)
 // starts right after its name: the one expectedHeadOid between the parentheses that follow it, a string
-// literal (from strs) or a $variable (the value of the gh api field of that name). ok is false without
-// exactly one there.
-func graphQLPin(after string, strs []string, fields map[string]string) (pin string, ok bool) {
+// literal (from strs) or a $variable (variable is its name, pin the value of the gh api field of that
+// name). ok is false without exactly one there.
+func graphQLPin(after string, strs []string, fields map[string]string) (pin, variable string, ok bool) {
 	rest := strings.TrimLeft(after, " \t\r\n,")
 	if !strings.HasPrefix(rest, "(") {
-		return "", false
+		return "", "", false
 	}
 	depth, end := 0, -1
 	for i := 0; i < len(rest) && end < 0; i++ {
@@ -270,19 +357,19 @@ func graphQLPin(after string, strs []string, fields map[string]string) (pin stri
 		}
 	}
 	if end < 0 {
-		return "", false
+		return "", "", false
 	}
 	m := reExpectedHeadOid.FindAllStringSubmatch(rest[1:end], -1)
 	if len(m) != 1 {
-		return "", false
+		return "", "", false
 	}
 	if m[0][2] != "" {
 		v, ok := fields[m[0][2]]
-		return v, ok
+		return v, m[0][2], ok
 	}
 	n, err := strconv.Atoi(m[0][1])
 	if err != nil || n >= len(strs) {
-		return "", false
+		return "", "", false
 	}
-	return strs[n], true
+	return strs[n], "", true
 }
