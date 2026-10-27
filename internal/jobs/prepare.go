@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -597,10 +596,9 @@ func (m *Manager) writeGitFiles(dir string) error {
 		if kv[1] == "" {
 			continue
 		}
-		cmd := exec.Command("git", "config", "--file", cfg, kv[0], kv[1])
-		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("write gitconfig %s: %w: %s", kv[0], err, strings.TrimSpace(string(out)))
+		env := append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
+		if out, stderr, err := runGitFor(gitTimeout, "", env, "config", "--file", cfg, kv[0], kv[1]); err != nil {
+			return fmt.Errorf("write gitconfig %s: %w: %s", kv[0], err, strings.TrimSpace(string(out)+string(stderr)))
 		}
 	}
 	if err := os.Chmod(cfg, 0o400); err != nil {

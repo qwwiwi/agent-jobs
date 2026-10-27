@@ -465,19 +465,16 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", cloneArgs(tmpl, remote, target, pin)...)
-	cmd.Dir, cmd.Env = tmp, sourceEnv(tmp, protocols)
 	var stderr bytes.Buffer
-	cmd.Stderr = &limitedWriter{w: &stderr, n: 4 << 10}
-	// git runs helpers (remote-https, index-pack): the whole group is killed on the cap or the timeout.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Start(); err != nil {
+	// git runs helpers (remote-https, index-pack): the whole group is killed on the cap or the timeout,
+	// and the clone ends by then plus gitKillGrace even when git is not reaped (gitProc.wait).
+	p, err := startGit(tmp, sourceEnv(tmp, protocols), func(c *exec.Cmd) { c.Stderr = &limitedWriter{w: &stderr, n: 4 << 10} },
+		cloneArgs(tmpl, remote, target, pin)...)
+	if err != nil {
 		return fail("git did not start: " + err.Error())
 	}
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() { done <- p.wait(ctx) }()
 	over := false
 	tick := time.NewTicker(sourcePollInterval)
 	defer tick.Stop()
@@ -508,9 +505,7 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
 	if res.Bytes = treeBytes(target); res.Bytes > maxBytes {
 		return fail(capMsg)
 	}
-	head := exec.Command("git", "-c", "core.hooksPath="+tmpl, "rev-parse", "HEAD")
-	head.Dir, head.Env = target, sourceEnv(tmp, protocols)
-	if out, err := head.Output(); err == nil {
+	if out, _, err := runGitFor(gitTimeout, target, sourceEnv(tmp, protocols), "-c", "core.hooksPath="+tmpl, "rev-parse", "HEAD"); err == nil {
 		res.Commit = strings.TrimSpace(string(out))
 	}
 	if err := makeReadOnly(target); err != nil {
