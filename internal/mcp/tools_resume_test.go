@@ -26,7 +26,8 @@ func TestJobStopResumeAmendTools(t *testing.T) {
 	}
 	var stopped JobView
 	call(t, cs, "job_stop", map[string]any{"id": started.ID, "reason": "wait for the API"}, &stopped)
-	if stopped.Status != store.StatusStopped || !strings.Contains(stopped.Error, "wait for the API") {
+	if stopped.Status != store.StatusStopped || !strings.Contains(stopped.Error, "wait for the API") ||
+		!strings.Contains(stopped.ResumeBudget, "$0.00 of the $50 budget ceiling, $50.00 left for job_resume") {
 		t.Fatalf("job_stop: %+v", stopped)
 	}
 	if msg := callErr(t, cs, "job_amend", map[string]any{"id": started.ID, "context": "x"}); !strings.Contains(msg, "only a queued job") {

@@ -66,7 +66,10 @@ func addJobStop(s *sdk.Server, d Deps) {
 		Description: "Stop a queued or running job so it can be resumed with new context: a running job's process group " +
 			"gets SIGTERM, then SIGKILL after 10 s (as job_cancel), but the job ends 'stopped', keeping its work dir, " +
 			"uncommitted changes and claude session, with its turns and cost so far. It gets no job-done line and no " +
-			"cleanup; continue it with job_resume or give it up with job_cancel.",
+			"cleanup; continue it with job_resume or give it up with job_cancel. resume_budget states the cost the job's " +
+			"attempts count against the $50 ceiling (an attempt stopped before claude reported its cost counts at its whole " +
+			"budget) and what is left; with nothing left it starts «resume impossible»: commit the work in progress and " +
+			"start a new job instead.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStopInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := getJob(d.Manager, in.ID)
 		if err != nil {
@@ -76,7 +79,13 @@ func addJobStop(s *sdk.Server, d Deps) {
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_stop: %w", err)
 		}
-		return nil, view(d.Manager, cur), nil
+		v := view(d.Manager, cur)
+		if note, err := d.Manager.ResumeBudget(cur); err != nil {
+			v.ResumeBudget = "unknown: " + err.Error()
+		} else {
+			v.ResumeBudget = note
+		}
+		return nil, v, nil
 	})
 }
 

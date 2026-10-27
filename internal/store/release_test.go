@@ -113,3 +113,39 @@ func TestReleasePassApprovalSeq(t *testing.T) {
 		t.Fatalf("passes: %+v %v", ps, err)
 	}
 }
+
+// Two release_check passes of the same repo, sha and checklist race to store (#103): the one checked at
+// the higher approval seq is kept, whichever order they land in; an equal seq replaces (the later run).
+func TestReleasePassKeepsHigherApprovalSeq(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	pass := func(sha, job string, seq int64) ReleasePass {
+		return ReleasePass{Repo: "/r", SHA: sha, ChecklistID: "demo", Version: 2, ChecklistSHA256: "h", VerdictJob: job,
+			CreatedAt: time.Unix(100+seq, 0), ApprovalSeq: seq}
+	}
+	for _, c := range []struct {
+		name     string
+		sha      string
+		puts     []ReleasePass
+		wantJob  string
+		wantSeq  int64
+		wantTime int64
+	}{
+		{"newer then older", "a", []ReleasePass{pass("a", "new", 5), pass("a", "old", 3)}, "new", 5, 105},
+		{"older then newer", "b", []ReleasePass{pass("b", "old", 3), pass("b", "new", 5)}, "new", 5, 105},
+		{"equal", "c", []ReleasePass{pass("c", "first", 4), pass("c", "second", 4)}, "second", 4, 104},
+	} {
+		for _, p := range c.puts {
+			if err := s.PutReleasePass(p); err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+		}
+		got, err := s.ReleasePassed("/r", c.sha, "demo", 2, "h")
+		if err != nil || got == nil || got.VerdictJob != c.wantJob || got.ApprovalSeq != c.wantSeq || got.CreatedAt.Unix() != c.wantTime {
+			t.Errorf("%s: %+v %v", c.name, got, err)
+		}
+	}
+}

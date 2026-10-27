@@ -20,7 +20,7 @@ func TestGhPrMerges(t *testing.T) {
 	}{
 		{"not gh", "ls -la && git merge main", nil, ""},
 		{"gh pr view", "gh pr view 5", nil, ""},
-		{"gh api merge passes", "gh api -X PUT repos/o/r/pulls/5/merge", nil, ""},
+		{"gh api read of the merge endpoint passes", "gh api repos/o/r/pulls/5/merge", nil, ""},
 		{"gh repo with a flag", "gh repo view --json name merge", nil, ""},
 		{"plain", "gh pr merge 5 --squash", &GhMerge{}, ""},
 		{"with sha", "gh pr merge 5 --squash --match-head-commit " + sha, &GhMerge{MatchHead: sha, HasMatchHead: true}, ""},

@@ -296,13 +296,15 @@ func addReleaseCheck(s *sdk.Server, d Deps) {
 			"owner approval exists and the checklist hash is unchanged), manifest_check (the judge's manifest-check record for sha " +
 			"exits 0), verdict (a judge verdict for sha at the approved checklist id and version; every verdict for them must agree), " +
 			"requirements (each live requirement met, placeholder on a placeholder-ok row, or judged and carrying an owner waiver " +
-			"bound to this checklist id, hash and version and the requirement, not to a commit), unmapped_brief and suspect_tests " +
-			"(empty), enforced_blind (true). The judge may run on any model, the coders' too: judge_family, coder_families (of " +
+			"bound to this checklist id, hash and version and the requirement, not to a commit), unmapped_brief (empty), " +
+			"enforced_blind (true). suspect_tests block nothing: the judge's suspect tests (of every verdict counted for sha) are " +
+			"listed in needs_live_check, a warning for the owner to check on a live run, and the check passes with them. The judge may run on any model, the coders' too: judge_family, coder_families (of " +
 			"the succeeded feature jobs, recomputed now; a feature job is a fix or general job of the repo whose covers name the " +
 			"checklist id and whose size is not small), same_family and family_note are information, not a condition. " +
 			"feature_jobs and covered_by list the feature jobs and their covers, informational only. " +
 			"owner_line is " +
-			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason».",
+			"the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: R03i — reason», followed by " +
+			"«; live check needed: K test(s)» when needs_live_check is not empty.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ReleaseCheckInput) (*sdk.CallToolResult, jobs.ReleaseCheckResult, error) {
 		out, err := ReleaseCheck(d.Manager, in.Repo, in.SHA)
 		if err != nil {
