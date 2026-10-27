@@ -36,44 +36,75 @@ func shortGitTimeout(t *testing.T, d time.Duration) {
 // bound (#100): its whole process group is killed, also a child that holds its stdout, and it runs with
 // GIT_TERMINAL_PROMPT=0 whatever environment the caller passed.
 func TestGitTimesOut(t *testing.T) {
+	gitTimesOut(t, "")
+}
+
+// A fake git that is slower to reach its first line than the 300ms bound (a loaded macOS host) is
+// killed before it records anything: that proves nothing about the environment, and TestGitTimesOut
+// runs it again with a longer bound instead of failing on the missing files.
+func TestGitTimesOutSlowStart(t *testing.T) {
+	gitTimesOut(t, "sleep 0.5\n")
+}
+
+// gitTimesOut is TestGitTimesOut with a fake git that runs prelude first. The fake writes to a state
+// directory named in the script, so that whether it ran does not depend on the environment under test,
+// and records GIT_TERMINAL_PROMPT and FAKE_GIT_ENV, the caller's variable. A call whose fake was killed
+// before it got to its child proves nothing and is repeated with a four times longer bound.
+func gitTimesOut(t *testing.T, prelude string) {
 	state := t.TempDir()
-	t.Setenv("FAKE_GIT_STATE", state)
-	fakeGitOnPath(t, `echo "$GIT_TERMINAL_PROMPT" > "$FAKE_GIT_STATE/prompt"
+	if strings.ContainsRune(state, '\'') {
+		t.Fatalf("state directory %q has a quote", state)
+	}
+	fakeGitOnPath(t, prelude+`echo "$GIT_TERMINAL_PROMPT" > '`+state+`/prompt'
+echo "$FAKE_GIT_ENV" > '`+state+`/env'
 sleep 60 &
-echo $! > "$FAKE_GIT_STATE/child"
+echo $! > '`+state+`/child'
 wait
 `)
-	shortGitTimeout(t, 300*time.Millisecond)
 	type result struct {
 		out string
 		err error
 	}
-	done := make(chan result, 1)
-	start := time.Now()
-	go func() {
-		out, err := gitEnv(t.TempDir(), []string{"PATH=" + os.Getenv("PATH"), "FAKE_GIT_STATE=" + state}, "status")
-		done <- result{out, err}
-	}()
-	var r result
-	select {
-	case r = <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("git did not return within 10s of a 300ms timeout")
-	}
-	if !errors.Is(r.err, errGitTimeout) || !strings.Contains(r.err.Error(), "git status") {
-		t.Fatalf("want a timeout error naming the command, got %q %v", r.out, r.err)
-	}
-	if took := time.Since(start); took > 5*time.Second {
-		t.Fatalf("returned after %s", took)
+	var child []byte
+	for timeout := 300 * time.Millisecond; ; timeout *= 4 {
+		shortGitTimeout(t, timeout)
+		done := make(chan result, 1)
+		start := time.Now()
+		go func() {
+			out, err := gitEnv(t.TempDir(), []string{"PATH=" + os.Getenv("PATH"), "FAKE_GIT_ENV=passed"}, "status")
+			done <- result{out, err}
+		}()
+		var r result
+		select {
+		case r = <-done:
+		case <-time.After(timeout + 10*time.Second):
+			t.Fatalf("git did not return within 10s of a %s timeout", timeout)
+		}
+		if !errors.Is(r.err, errGitTimeout) || !strings.Contains(r.err.Error(), "git status") {
+			t.Fatalf("want a timeout error naming the command, got %q %v", r.out, r.err)
+		}
+		if took := time.Since(start); took > timeout+5*time.Second {
+			t.Fatalf("returned after %s", took)
+		}
+		var err error
+		if child, err = os.ReadFile(filepath.Join(state, "child")); err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if timeout >= 4*time.Second {
+			t.Fatalf("the fake git did not get to its child within a %s timeout", timeout)
+		}
+		t.Logf("the fake git was not up within %s: again with a longer timeout", timeout)
 	}
 	if b, err := os.ReadFile(filepath.Join(state, "prompt")); err != nil || strings.TrimSpace(string(b)) != "0" {
 		t.Fatalf("GIT_TERMINAL_PROMPT: %q %v", b, err)
 	}
-	b, err := os.ReadFile(filepath.Join(state, "child"))
-	if err != nil {
-		t.Fatal(err)
+	if b, err := os.ReadFile(filepath.Join(state, "env")); err != nil || strings.TrimSpace(string(b)) != "passed" {
+		t.Fatalf("the caller's environment did not reach git: FAKE_GIT_ENV %q %v", b, err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(child)))
 	if err != nil {
 		t.Fatal(err)
 	}
