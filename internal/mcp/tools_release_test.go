@@ -308,12 +308,7 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.unmapped = []string{"a logout button"}
 			f.judge(t, j)
 		}},
-		{"suspect tests", jobs.ReleaseSuspectTests, "suspect_tests — 1 entr(ies)", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			j := okJudge()
-			j.suspect = []string{"TestLogin passes without a login"}
-			f.judge(t, j)
-		}},
+		// Suspect tests no longer fail the check (#106, owner decision 2026-10-27): TestReleaseCheckSuspectTestsWarnOnly.
 		// The family cases ("a coder of the judge's family, started after the verdict", "only a failed
 		// coder") pass now (owner decision 2026-10-26, msg 68041: family is informational); they moved to
 		// TestReleaseCheckFamilyInformational with that expectation.
@@ -373,17 +368,10 @@ func TestReleaseCheckFailsEachCondition(t *testing.T) {
 			j.reattempt = true
 			f.judge(t, j)
 		}},
-		{"an earlier verdict disagrees on unmapped_brief", jobs.ReleaseVerdict, "disagree on unmapped_brief or suspect_tests", func(t *testing.T, f *releaseFix) {
+		{"an earlier verdict disagrees on unmapped_brief", jobs.ReleaseVerdict, "disagree on unmapped_brief", func(t *testing.T, f *releaseFix) {
 			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
 			j := okJudge()
 			j.unmapped = []string{"a logout button"}
-			f.judge(t, j)
-			f.judge(t, okJudge())
-		}},
-		{"an earlier verdict disagrees on suspect_tests", jobs.ReleaseVerdict, "disagree on unmapped_brief or suspect_tests", func(t *testing.T, f *releaseFix) {
-			f.coder(t, store.RunnerCodex, "gpt-5.6-sol", "R01", "R02")
-			j := okJudge()
-			j.suspect = []string{"TestLogin passes without a login"}
 			f.judge(t, j)
 			f.judge(t, okJudge())
 		}},
