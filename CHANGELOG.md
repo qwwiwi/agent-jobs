@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 - `job_stop` returns `resume_budget` (#85): the cost the job's attempts count against the $50 budget ceiling (an attempt stopped before claude reported its cost counts at its whole budget, as before), what is left for `job_resume` and its default `max_budget_usd`; when a ceiling has nothing left it starts `resume impossible` and says to commit the work in progress and start a new job instead. The accounting is unchanged.
+- `checklist_get` and `checklist_set` return `judge_readiness` (#83), advisory: whether config `acceptance_allowed` is on and whether `scripts/manifest-check.sh` is a regular file at the work tree's HEAD (`revision`), with `notes` on what is missing, so a judge's missing manifest-check prerequisites show at checklist read and approval, not only at `judge_start`. `judge_start`'s check of the exact sha stays authoritative.
 
 ## [0.6.0] - 2026-10-26
 

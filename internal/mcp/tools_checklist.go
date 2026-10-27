@@ -48,6 +48,10 @@ type ChecklistView struct {
 	// re-reads and re-approves only these rows (F8). Null otherwise (the hash is the approved one, or the
 	// latest approval is of another id or there is none).
 	ChangedSinceApproval *ApprovalChanges `json:"changed_since_approval"`
+	// JudgeReadiness (advisory, issue #83): whether config acceptance_allowed is on and whether
+	// scripts/manifest-check.sh is at the work tree's HEAD (revision), both of which a judge needs;
+	// judge_start's check of the exact sha it is given decides.
+	JudgeReadiness jobs.JudgeReadiness `json:"judge_readiness"`
 	// Set by checklist_init / checklist_set only.
 	Written        bool     `json:"written,omitempty"`
 	BriefWritten   bool     `json:"brief_written,omitempty"`
@@ -139,6 +143,7 @@ func checklistView(m *jobs.Manager, top, main string, c *checklist.Checklist, br
 		v.ApprovedAt, v.ApprovedVersion, v.ApprovedSHA256 = last.ApprovedAt.UTC().Format(time.RFC3339), last.Version, last.ChecklistSHA256
 	}
 	v.ChangedSinceApproval = approvalChanges(last, c, brief, hash)
+	v.JudgeReadiness = m.JudgeReadiness(top)
 	sl, err := m.SlicingOf(main, c.ID, c.Version, hash)
 	if err != nil {
 		return ChecklistView{}, err
@@ -284,7 +289,9 @@ func addChecklistGet(s *sdk.Server, d Deps) {
 			"changed_since_approval: the rows added, changed (which fields) or removed since the repository's latest approval and " +
 			"whether BRIEF.md changed (null when the hash is the approved one, or that approval is of another id or absent): the owner " +
 			"re-approves only those rows; with known false (an approval stored before its rows were recorded) rows is empty and " +
-			"the owner re-reads every current row.",
+			"the owner re-reads every current row. judge_readiness (advisory) {acceptance_allowed, revision, manifest_script, " +
+			"notes}: whether config acceptance_allowed is on and scripts/manifest-check.sh is a regular file at the work tree's " +
+			"HEAD (revision), both of which a judge needs; judge_start checks the exact sha it is given.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistRepoInput) (*sdk.CallToolResult, ChecklistView, error) {
 		top, main, err := jobs.ChecklistRepo(in.Repo)
 		if err != nil {
@@ -335,7 +342,8 @@ func addChecklistSet(s *sdk.Server, d Deps) {
 			"owner's words in additions (dated) in the same call; a choice goes into the Rationale of the row it concerns; a " +
 			"cancellation sets the row to dropped with the owner's words in rationale; each raises the version, and " +
 			"changed_since_approval lists the rows the owner re-approves (with known false, every current row). Waivers need the " +
-			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Writes files only: never commits or pushes.",
+			"checklist approved after the call. Warns on fewer than 10 rows from a long brief. Returns judge_readiness as " +
+			"checklist_get does (advisory). Writes files only: never commits or pushes.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in ChecklistSetInput) (_ *sdk.CallToolResult, out ChecklistView, err error) {
 		m := d.Manager
 		top, main, err := jobs.ChecklistRepo(in.Repo)
