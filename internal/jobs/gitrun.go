@@ -174,8 +174,12 @@ func (p *gitProc) reap() {
 	err := p.cmd.Wait()
 	<-p.copied
 	p.closeOutputs()
-	if err == nil && p.cut.Load() {
-		err = errGitOutputCut
+	// A cut output is no result, also beside an exit status whose output a caller would read.
+	if p.cut.Load() {
+		var ee *exec.ExitError
+		if err == nil || errors.As(err, &ee) {
+			err = errGitOutputCut
+		}
 	}
 	if err == nil {
 		err = p.copyErr

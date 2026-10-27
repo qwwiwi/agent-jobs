@@ -6,7 +6,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -202,6 +204,46 @@ func TestGitAbandonedCallReleasesOutputs(t *testing.T) {
 	for deadline := time.Now().Add(5 * time.Second); gitCopyGoroutines() > base; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d output copies of the abandoned git still run", gitCopyGoroutines()-base)
+		}
+	}
+}
+
+// A git that exits with a status while a process of its group still holds its stdout past gitWaitDelay
+// hands out no output (#100): the group is killed before git is reaped, and the call is errGitOutputCut,
+// not an exit status whose partial output a caller would read as whole.
+func TestGitCutOutputBeatsExitStatus(t *testing.T) {
+	state := t.TempDir()
+	fakeGitOnPath(t, `echo partial
+sleep 60 &
+echo $! > "$FAKE_GIT_STATE/child"
+exit 1
+`)
+	origDelay := gitWaitDelay
+	gitWaitDelay = 300 * time.Millisecond
+	t.Cleanup(func() { gitWaitDelay = origDelay })
+	type result struct {
+		out []byte
+		err error
+	}
+	r := returnsWithin(t, 10*time.Second, "git", func() result {
+		out, _, err := runGitFor(30*time.Second, t.TempDir(), []string{"PATH=" + os.Getenv("PATH"), "FAKE_GIT_STATE=" + state}, "status")
+		return result{out, err}
+	})
+	b, err := os.ReadFile(filepath.Join(state, "child"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	if !errors.Is(r.err, errGitOutputCut) || len(r.out) != 0 {
+		t.Fatalf("want errGitOutputCut and no output, got %q %v", r.out, r.err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("git's child %d still runs: its group was not killed after git's exit", pid)
 		}
 	}
 }

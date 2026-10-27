@@ -266,7 +266,12 @@ sleep 60 &
 echo $! > "$FAKE_GIT_STATE/child"
 exit 0
 `)
-	shortGitTimeout(t, 300*time.Millisecond)
+	// A deadline wide enough for the fake git to write the child's pid on a busy host, and a wait delay
+	// past it, so that the kill comes from the deadline.
+	shortGitTimeout(t, time.Second)
+	origDelay := gitWaitDelay
+	gitWaitDelay = 30 * time.Second
+	t.Cleanup(func() { gitWaitDelay = origDelay })
 	type result struct {
 		out string
 		err error
