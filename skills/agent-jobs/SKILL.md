@@ -22,7 +22,7 @@ The main session only talks, decides and checks. Anything longer than a few step
 The job guard (`internal/guard`) refuses these, so a job that needs them audits code only or stops:
 
 - `ssh`, and other tools that start processes outside the job's cgroup scope: `systemd-run`, `systemctl --user`, `crontab`/`at`, `tmux`/`screen`, `pm2`, `docker`/`podman`, `machinectl`/`loginctl`, `unshare`/`nsenter`, the session bus. `scp`, `sftp` and `rsync` are not on that list; remote work is still outside a job's scope by its hard rules.
-- Anything that goes outside: `git push`/`tag` and other publishing git subcommands, any `gh` call except read-only ones, messages, notifications, schedules, wakeups.
+- Anything that goes outside: `git push`/`tag` and other publishing git subcommands, any `gh` call except read-only ones, messages, schedules, wakeups, direct external notifications; `notify_owner` remains available through the orchestrator.
 - Reading the agent-jobs state outside its own folder (other jobs' folders, `jobs.db`, config, cards).
 - Nested agents (`claude`, `codex`, …) and nested jobs.
 
