@@ -24,6 +24,19 @@ func TestMergeGateAPIOpaqueRefused(t *testing.T) {
 		// Finding 1: duplicate field keys.
 		{"REST -F sha then -f sha", outside, "gh api -X PUT repos/acme/demo/pulls/5/merge -F sha=" + other + " -f sha=" + pass, "", opaqueRefused},
 		{"GraphQL pin variable twice", repo, "gh api graphql -F oid=" + other + " -f oid=" + pass + " -f query=" + varMutation, "", opaqueRefused},
+		// Fix loop 2: a duplicate query hides a merge behind a read query, in either order and from a file.
+		{"GraphQL -F mutation then -f read query", repo, `gh api graphql -F 'query=mutation { mergePullRequest(input:{pullRequestId:"PR_kw"}) ` +
+			`{ clientMutationId } }' -f 'query=query { viewer { login } }'`, "", opaqueRefused},
+		{"GraphQL -f read query then -F mutation", repo, `gh api graphql -f 'query=query { viewer { login } }' -F 'query=mutation { ` +
+			`mergePullRequest(input:{pullRequestId:"PR_kw"}) { clientMutationId } }'`, "", opaqueRefused},
+		{"GraphQL -F @file query then -f read query", repo, "gh api graphql -F query=@merge.graphql -f 'query=query { viewer { login } }'",
+			"", opaqueRefused},
+		{"GraphQL -f read query then -F @file query", repo, "gh api graphql -f 'query=query { viewer { login } }' -F query=@merge.graphql",
+			"", opaqueRefused},
+		{"variable endpoint, -F @file query then -f read query", repo,
+			`gh api "$EP" -F query=@merge.graphql -f 'query=query { viewer { login } }'`, "", opaqueRefused},
+		{"GraphQL read query without duplicates", repo, "gh api graphql -f 'query=query { viewer { login } }'", "", ""},
+		{"REST POST with an array field", repo, "gh api repos/acme/demo/issues/5/labels -f 'labels[]=a' -f 'labels[]=b'", "", ""},
 		// Finding 2: a $variable pin at /graphql or a full URL.
 		{"GraphQL variable pin at /graphql", repo, "gh api /graphql -f oid=" + pass + " -f 'variables[oid]=" + other + "' -f query=" + varMutation,
 			"", opaqueRefused},

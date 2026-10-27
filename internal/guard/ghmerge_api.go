@@ -155,12 +155,14 @@ func ghAPIMergeCall(sc *script, c *simpleCmd, v cmdView) (GhMerge, bool) {
 // (the hook refuses such a merge in a gated repository, #107):
 //   - an endpoint from a variable or substitution (beyond the PR number of a literal OWNER/REPO merge
 //     endpoint) with the method PUT or one from a variable, or with POST (also gh's implicit one, with
-//     fields or --input) and --input, a merge_method field, a query from a variable or a file, or a field
-//     naming a merge mutation;
+//     fields or --input) and --input, a field given more than once, a merge_method field, a query from a
+//     variable or a file, or a field naming a merge mutation;
 //   - a body from --input (gh then sends the fields as query parameters), a -F field from a file or stdin
 //     (@…), a GraphQL query from a variable or substitution;
 //   - a field given more than once, also as key and key[…]: gh sends every -f field before the -F ones,
-//     whatever their order, so the last one written is not always the one sent;
+//     whatever their order, so the last one written is not always the one sent. At a GraphQL endpoint this
+//     is decided before the query is read (a read query may hide a mutation given with it); at a literal
+//     REST endpoint the fields never decide whether it merges (the endpoint and -X do);
 //   - a $variable expectedHeadOid at a GraphQL endpoint other than the exact `graphql`: only there does gh
 //     group the fields into the variables object; at /graphql or a URL it sends them as written (a
 //     variables[oid] field may then carry another sha).
@@ -191,7 +193,7 @@ func apiMergeRequest(argv []string, dyn []bool, endpoint int, method string, met
 		// gh may send it anywhere, graphql included.
 		code, _ := graphQLCode(q)
 		names := slices.ContainsFunc(fields, func(f apiField) bool { return reGraphQLMerge.MatchString(f.val) })
-		if !methodPut && !(methodPost && (input || seen["merge_method"] || names || qDyn || qFile ||
+		if !methodPut && !(methodPost && (input || dup != "" || seen["merge_method"] || names || qDyn || qFile ||
 			reGraphQLMerge.MatchString(code))) {
 			return GhMerge{}, false
 		}
@@ -210,6 +212,13 @@ func apiMergeRequest(argv []string, dyn []bool, endpoint int, method string, met
 			if input {
 				call.Opaque = "the body comes from --input"
 			}
+			return call, true
+		}
+		if dup != "" {
+			// Before the query is read: the one read (the last written) need not be the one gh sends, so a
+			// read query may hide a merge mutation (`-F query=<mutation> -f query=<read>`).
+			call.Unsure = "gh api graphql with the field " + dup + " given more than once, which may run mergePullRequest"
+			call.Opaque = dupOpaque(dup)
 			return call, true
 		}
 		code, strs := graphQLCode(q)
@@ -267,11 +276,16 @@ func apiMergeRequest(argv []string, dyn []bool, endpoint int, method string, met
 	switch {
 	case call.Opaque != "":
 	case dup != "":
-		call.Opaque = "the field " + dup + " is given more than once (gh sends -f fields before -F ones, whatever their order)"
+		call.Opaque = dupOpaque(dup)
 	case file != "":
 		call.Opaque = "the field " + file + " comes from a file or stdin (-F " + file + "=@…)"
 	}
 	return call, true
+}
+
+// dupOpaque is GhMerge.Opaque for a gh api field given more than once.
+func dupOpaque(field string) string {
+	return "the field " + field + " is given more than once (gh sends -f fields before -F ones, whatever their order)"
 }
 
 // dynamicText reports text holding a shell expansion ($VAR, $(…), `…`).
