@@ -3,6 +3,7 @@ package jobs
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -480,5 +481,64 @@ func TestDoctorProcsDeadRunningRowReusedSid(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if !pidAlive(pid) {
 		t.Fatal("unrelated process was killed")
+	}
+}
+
+// plantTmpBinary copies the sleep fixture into the job's temp dir the way TestMain builds the binary
+// under test there (<jobdir>/tmp/agent-jobs-test-*/agent-jobs) and returns its path.
+func plantTmpBinary(t *testing.T, jobDir string) string {
+	t.Helper()
+	b, err := os.ReadFile(testSleep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(jobDir, JobTmpDir, "agent-jobs-test-1", "agent-jobs")
+	writeFile(t, bin, b, 0o755)
+	return bin
+}
+
+// #105: a markerless daemon that runs a binary from a finished job's temp dir, in a session of its own
+// (a test daemon or a systemd unit a job's tests started), is reported with the job's id even once
+// the binary is deleted; it is never killed, and a running job's is not reported.
+func TestDoctorProcsReportsTmpBinarySurvivor(t *testing.T) {
+	m := newManager(t)
+	finished := time.Now()
+	dead := insertJob(t, m, "doctor-tmpbin-"+strconv.Itoa(os.Getpid()), store.StatusSucceeded, &finished, nil)
+	bin := plantTmpBinary(t, m.JobDir(dead.ID))
+	survivor := spawnOwn(t, nil, bin, "300")
+
+	wrapper := spawnOwn(t, nil, "sleep", "300")
+	live := insertJob(t, m, "doctor-tmplive-"+strconv.Itoa(os.Getpid()), store.StatusRunning, nil, func(j *store.Job) {
+		j.PID, j.PGID = wrapper.Process.Pid, wrapper.Process.Pid
+	})
+	liveProc := spawnOwn(t, nil, plantTmpBinary(t, m.JobDir(live.ID)), "300")
+
+	for _, deleted := range []bool{false, true} {
+		if deleted {
+			if err := os.Remove(bin); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rep, err := m.DoctorProcs(true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rep.Supported {
+			t.Skip("no /proc")
+		}
+		g := findGhost(rep, survivor.Process.Pid)
+		if g == nil || g.Kind != GhostSuspect || g.JobID != dead.ID || g.Killed || !strings.Contains(g.Reason, "temp dir of job "+dead.ID) {
+			t.Fatalf("binary deleted %v: tmp survivor not reported as the finished job's: %+v (all: %+v)", deleted, g, rep.Ghosts)
+		}
+		if findGhost(rep, liveProc.Process.Pid) != nil {
+			t.Fatalf("a running job's process reported: %+v", rep.Ghosts)
+		}
+		if !pidAlive(survivor.Process.Pid) {
+			t.Fatal("doctor --kill ended a suspect")
+		}
+	}
+	out, err := execSelf("doctor", "procs", "--agent", "test")
+	if err != nil || !strings.Contains(out, strconv.Itoa(survivor.Process.Pid)) || !strings.Contains(out, dead.ID) {
+		t.Fatalf("doctor procs CLI: %v\n%s", err, out)
 	}
 }

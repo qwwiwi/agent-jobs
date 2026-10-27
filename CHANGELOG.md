@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- Test daemons outlived their jobs and judge job folders kept ~1 GB in `tmp` (#105). The suite's tests register the end (SIGKILL, then wait) of a daemon they start right after the start (`startOwned`; on Linux the daemon also gets SIGKILL when the test process dies), and the systemd unit a scope test starts carries a description naming the test and `RuntimeMaxSec=10min`. `doctor procs` reports a process that runs a binary from a finished job's temp dir as a suspect with the job id (never killed). Once the worktree cleanup has run, the tick removes the job's temp dir as well, once no process uses it (Linux `/proc` check: executable, working dir, open files, mappings, the job marker or a temp variable; the job's groups and sandbox containers gone); otherwise it is kept, the pids logged and the removal retried on later ticks, without holding up the cleanup mark. The report, logs and stream stay until prune.
+
 ## [0.6.0] - 2026-10-26
 
 **Upgrade:** a `release_check` pass stored before v0.6.0 has no `approval_seq` and never ships an approval, so a gated repository stays gated after the upgrade until `release_check` runs again on the released sha (#99). Restart the session (or `/mcp`) so that it reports MCP server 0.6.0.

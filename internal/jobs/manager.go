@@ -72,6 +72,7 @@ type Manager struct {
 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
+	tmpFails     map[string]cleanupFail // job ID -> its consecutive kept temp dirs (tmpCleanupDue, same lock)
 
 	// prefetching is set while the daemon's background clone run (prefetchInBackground) is on; prefetchWG
 	// waits for it.
@@ -562,6 +563,9 @@ func (m *Manager) tickLocked() error {
 	}
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
+	}
+	if err := m.tmpCleanupDue(); err != nil {
+		errs = append(errs, fmt.Errorf("temp dir cleanup: %w", err))
 	}
 	return errors.Join(errs...)
 }
@@ -1807,6 +1811,9 @@ func (m *Manager) sweepEscaped(id string) string {
 			continue
 		}
 		why := "leads its own session, never killed"
+		if g.Kind == GhostSuspect {
+			why = "runs a binary from the job's temp dir, never killed"
+		}
 		if g.KillError != "" {
 			why = g.KillError
 		}
