@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 - A release pass checked at an older approval could overwrite one checked at a newer approval of the same repository, sha and checklist (#103): two `release_check` runs racing stored with `INSERT OR REPLACE`, keyed without `approval_seq`, so the last to store won. The store keeps the pass with the higher `approval_seq` (an equal seq replaces, the later run wins); the schema is unchanged.
+- Flaky `TestStopRunningThenResumeSameSession` (#101): the test stopped the job once the stream showed its first message, but the wrapper writes the stream before it persists the observed progress, which is all `job_stop` reads; the stop could land with 0 turns recorded. The test helper now also waits for the launch's persisted turn.
+- Flaky `TestProtectedLargeInlineScriptFast` (#102): its 1 s bound was wall-clock, which a busy host (`scripts/check.sh`) exceeds with the same work. The bound is now on the CPU time of each check (about 0.2-0.35 s, idle or loaded), so a slowdown of about 10x still fails it.
 
 ## [0.6.0] - 2026-10-26
 
