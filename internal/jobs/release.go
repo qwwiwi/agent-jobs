@@ -22,15 +22,17 @@ const (
 	ReleaseVerdict       = "verdict"
 	ReleaseRequirements  = "requirements"
 	ReleaseUnmapped      = "unmapped_brief"
-	ReleaseSuspectTests  = "suspect_tests"
 	ReleaseBlind         = "enforced_blind"
 )
 
 // ReleaseConditions lists the conditions in report order. There is no family condition (owner decision
 // 2026-10-26, msg 68041): the judge's independence is that it is a separate blind job of any model; the
 // judge's and the coders' families are reported as information (JudgeFamily, CoderFamilies, SameFamily).
+// suspect_tests is no condition either (#106, owner decision 2026-10-27): a test whose behaviour depends
+// on a live model's choice can never be proven offline, so the judge's suspect tests are a non-blocking
+// warning (ReleaseCheckResult.NeedsLiveCheck).
 var ReleaseConditions = []string{ReleaseApproval, ReleaseManifestCheck, ReleaseVerdict, ReleaseRequirements, ReleaseUnmapped,
-	ReleaseSuspectTests, ReleaseBlind}
+	ReleaseBlind}
 
 // ReleaseCondition is one condition of release_check and whether it holds.
 type ReleaseCondition struct {
@@ -97,7 +99,11 @@ type ReleaseCheckResult struct {
 	// ManifestCheck is the record of the latest verdict's attempt (without a verdict: the latest for the sha).
 	ManifestCheck *store.ManifestCheck `json:"manifest_check"`
 	Mismatches    []string             `json:"mismatches"`
-	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …».
+	// NeedsLiveCheck are the suspect tests of the counted verdicts for the sha (all of them, each once):
+	// a warning, not a mismatch (#106); the check passes with them when every condition holds.
+	NeedsLiveCheck []string `json:"needs_live_check"`
+	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …»,
+	// followed by «; live check needed: K test(s)» when NeedsLiveCheck is not empty.
 	OwnerLine string `json:"owner_line"`
 	// approvalSeq is the seq of the approval the check read (once) and checked: its pass ships only that
 	// approval (#99), also when the checklist is re-approved before the pass is stored.
@@ -145,7 +151,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return nil, fmt.Errorf("release_check: %w", err)
 	}
 	out := &ReleaseCheckResult{Repo: main, SHA: sha, Requirements: []ReleaseRequirement{}, FeatureJobs: []ReleaseFeatureJob{},
-		CoderFamilies: []string{}, Mismatches: []string{}}
+		CoderFamilies: []string{}, Mismatches: []string{}, NeedsLiveCheck: []string{}}
 	conds := map[string]ReleaseCondition{}
 	set := func(name string, ok bool, format string, a ...any) {
 		conds[name] = ReleaseCondition{Name: name, OK: ok, Detail: RedactPrintable(fmt.Sprintf(format, a...), 600)}
@@ -167,6 +173,9 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		out.OwnerLine = fmt.Sprintf("Acceptance: %d of %d", out.Accepted, out.Live)
 		if !out.Pass {
 			out.OwnerLine += ", mismatch: " + strings.Join(out.Mismatches, "; ")
+		}
+		if len(out.NeedsLiveCheck) > 0 {
+			out.OwnerLine += fmt.Sprintf("; live check needed: %d test(s)", len(out.NeedsLiveCheck))
 		}
 	}()
 
@@ -232,6 +241,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		} else {
 			set(ReleaseVerdict, true, "job %s (%d verdict(s) for this sha, all agree)", latest.JobID, len(verdicts))
 		}
+		out.NeedsLiveCheck = liveChecks(verdicts)
 	}
 
 	// The manifest-check record (F5) of every counted verdict's attempt, so a red run is not passed over
@@ -342,19 +352,13 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	if lo == nil {
+	switch {
+	case lo == nil:
 		set(ReleaseUnmapped, false, "no readable verdict")
-		set(ReleaseSuspectTests, false, "no readable verdict")
-	} else {
-		listCond := func(name string, l []string) {
-			if len(l) == 0 {
-				set(name, true, "empty")
-			} else {
-				set(name, false, "%d entr(ies): %s", len(l), quoteList(l[:min(len(l), 3)]))
-			}
-		}
-		listCond(ReleaseUnmapped, lo.UnmappedBrief)
-		listCond(ReleaseSuspectTests, lo.SuspectTests)
+	case len(lo.UnmappedBrief) == 0:
+		set(ReleaseUnmapped, true, "empty")
+	default:
+		set(ReleaseUnmapped, false, "%d entr(ies): %s", len(lo.UnmappedBrief), quoteList(lo.UnmappedBrief[:min(len(lo.UnmappedBrief), 3)]))
 	}
 
 	if latest == nil {
@@ -475,9 +479,28 @@ func verdictOutput(v *store.JudgeVerdict) (*JudgeOutput, error) {
 	return &o, nil
 }
 
+// liveChecks are the suspect tests of the verdicts vs, each once, in the order first listed (redacted,
+// one line each): the tests the owner checks on a live run (#106). An unreadable verdict adds none (the
+// verdict condition fails on it).
+func liveChecks(vs []*store.JudgeVerdict) []string {
+	out := []string{}
+	for _, v := range vs {
+		o, err := verdictOutput(v)
+		if err != nil {
+			continue
+		}
+		for _, s := range o.SuspectTests {
+			if s = RedactPrintable(s, maxReleaseReason); s != "" && !slices.Contains(out, s) {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
 // verdictsDisagree is why the verdicts for one sha and checklist version do not agree with the latest
-// one's block lo ("" = they agree): a requirement judged differently, or unmapped_brief / suspect_tests
-// empty in one and not in the other.
+// one's block lo ("" = they agree): a requirement judged differently, or unmapped_brief empty in one and
+// not in the other. suspect_tests may differ (#106): they block nothing, and liveChecks lists them all.
 func verdictsDisagree(vs []*store.JudgeVerdict, lo *JudgeOutput) string {
 	want := map[string]string{}
 	for _, r := range lo.Requirements {
@@ -508,8 +531,8 @@ func verdictsDisagree(vs []*store.JudgeVerdict, lo *JudgeOutput) string {
 				return fmt.Sprintf("jobs %s and %s disagree on %s (%q, %q)", v.JobID, latest.JobID, id, got[id], want[id])
 			}
 		}
-		if (len(o.UnmappedBrief) == 0) != (len(lo.UnmappedBrief) == 0) || (len(o.SuspectTests) == 0) != (len(lo.SuspectTests) == 0) {
-			return fmt.Sprintf("jobs %s and %s disagree on unmapped_brief or suspect_tests", v.JobID, latest.JobID)
+		if (len(o.UnmappedBrief) == 0) != (len(lo.UnmappedBrief) == 0) {
+			return fmt.Sprintf("jobs %s and %s disagree on unmapped_brief", v.JobID, latest.JobID)
 		}
 	}
 	return ""
