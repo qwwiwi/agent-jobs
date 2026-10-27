@@ -48,6 +48,11 @@ func startAndStop(t *testing.T, m *Manager, mod func(*StartRequest)) *store.Job 
 		_, err := os.Stat(filepath.Join(work, "wip.txt"))
 		return err == nil && strings.Contains(readFile(t, filepath.Join(m.JobDir(j.ID), "stream.jsonl")), "WIP_PROGRESS_NOTE")
 	})
+	// The wrapper writes the stream before it persists the observed progress, and job_stop reads only
+	// that persisted snapshot: wait for this launch's turn to be recorded (issue #101).
+	waitFor(t, "persisted progress", 15*time.Second, func() bool {
+		return m.endedResult(get(t, m, j.ID)).Turns >= 1
+	})
 	st, err := m.Stop(j.ID, "plan changed")
 	if err != nil {
 		t.Fatal(err)
