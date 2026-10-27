@@ -17,6 +17,28 @@ A job is a separate one-shot `claude -p` process with its own git worktree, a tu
 
 The main session only talks, decides and checks. Anything longer than a few steps goes into a job. When unsure between a subagent and a job: if you would otherwise sit and wait more than a few minutes, it is a job.
 
+## What a job cannot do, and where it goes instead
+
+The job guard (`internal/guard`) refuses these, so a job that needs them audits code only or stops:
+
+- `ssh`, and other tools that start processes outside the job's cgroup scope: `systemd-run`, `systemctl --user`, `crontab`/`at`, `tmux`/`screen`, `pm2`, `docker`/`podman`, `machinectl`/`loginctl`, `unshare`/`nsenter`, the session bus. `scp`, `sftp` and `rsync` are not on that list; remote work is still outside a job's scope by its hard rules.
+- Anything that goes outside: `git push`/`tag` and other publishing git subcommands, any `gh` call except read-only ones, messages, notifications, schedules, wakeups.
+- Reading the agent-jobs state outside its own folder (other jobs' folders, `jobs.db`, config, cards).
+- Nested agents (`claude`, `codex`, …) and nested jobs.
+
+Route instead:
+
+- A one-line check (one command, a few lines of output): do it yourself in this session.
+- Anything more (remote hosts, live servers, several commands): a subagent in this session does it and returns a summary of 20 lines or less. Never paste bulky raw output into this session.
+
+Hand-off when a job needs that data:
+
+1. The subagent (or this session) writes the bundle into a file in the repository, secrets redacted.
+2. It commits the file on a local branch that is never pushed.
+3. Start the job with `base=<that branch>`; the brief names the file.
+
+Decide this BEFORE `job_start`: if the brief needs live remote data, collect it first. Do not start a job blind and cancel it when it hits the guard.
+
 ## Start a job: `job_start`
 
 | field | rules |

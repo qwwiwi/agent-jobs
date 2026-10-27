@@ -257,6 +257,7 @@ Full rule list: [docs/ARCHITECTURE.md](ARCHITECTURE.md#rules-enforcement).
 
   Read a report's «Not done / uncertain» first, and check the diff before anything leaves the machine.
 - **Subagents in jobs:** at most three per job, inside the job's own limits; no nested jobs (see Safety).
+- **What a job cannot do.** The guard refuses `ssh` and other tools that start processes outside the job's scope, anything that goes outside (push, non-read-only `gh`, messages), and reads of other jobs' state. Work like that goes to a subagent in the orchestrator's session, which returns a summary of 20 lines or less; a one-line check the orchestrator runs itself. When a job needs the data, the subagent writes it to a file (secrets redacted), commits it on a local branch that is never pushed, and the job starts with `base=<that branch>` and a brief naming the file. Decide this before `job_start`, not after the job hits the guard. Two reasons: the orchestrator's context stays small (no raw server dumps in it), and a job never gets a remote shell, where it would act as root on production. Details: [What a job cannot do](../skills/agent-jobs/SKILL.md#what-a-job-cannot-do-and-where-it-goes-instead).
 - **Job profile.** The owner-rules file (≤ 8 KB) is generated from the agent's own rules: mark what must hold in every job, then run `agent-jobs profile`:
 
   ```markdown
