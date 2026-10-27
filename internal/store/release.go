@@ -72,14 +72,19 @@ func scanReleasePass(row interface{ Scan(...any) error }) (ReleasePass, error) {
 	return p, nil
 }
 
-// PutReleasePass stores a pass (a second pass at the same key replaces the first).
+// PutReleasePass stores a pass. A second pass at the same key replaces the first unless the first was
+// checked at a higher approval seq (#103): of two release_check runs that race, the one at the newer
+// approval is kept whichever stores last; an equal seq replaces (the later run wins).
 func (s *Store) PutReleasePass(p ReleasePass) error {
 	if p.Repo == "" || p.SHA == "" || p.ChecklistID == "" || p.Version < 1 || p.ChecklistSHA256 == "" {
 		return errors.New("release pass needs repo, sha, checklist id, version and hash")
 	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO release_passes (repo, sha, checklist_id, version, checklist_sha256, verdict_job,
-		created_at, approval_seq) VALUES (?,?,?,?,?,?,?,?)`, p.Repo, p.SHA, p.ChecklistID, p.Version, p.ChecklistSHA256, p.VerdictJob,
-		p.CreatedAt.Unix(), p.ApprovalSeq)
+	_, err := s.db.Exec(`INSERT INTO release_passes (repo, sha, checklist_id, version, checklist_sha256, verdict_job,
+		created_at, approval_seq) VALUES (?,?,?,?,?,?,?,?)
+		ON CONFLICT (repo, sha, checklist_id, version, checklist_sha256) DO UPDATE SET verdict_job=excluded.verdict_job,
+		created_at=excluded.created_at, approval_seq=excluded.approval_seq
+		WHERE excluded.approval_seq >= release_passes.approval_seq`, p.Repo, p.SHA, p.ChecklistID, p.Version, p.ChecklistSHA256,
+		p.VerdictJob, p.CreatedAt.Unix(), p.ApprovalSeq)
 	if err != nil {
 		return fmt.Errorf("put release pass: %w", err)
 	}
