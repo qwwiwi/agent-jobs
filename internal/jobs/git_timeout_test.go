@@ -3,7 +3,6 @@ package jobs
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -86,25 +85,6 @@ wait
 			t.Fatalf("git's child %d still runs: the process group was not killed", pid)
 		}
 	}
-}
-
-// processGone reports whether process pid has ended: it is gone, or a zombie that waits for its parent
-// (a killed child of the fake git is reparented, and a container may have no reaper for it).
-func processGone(t *testing.T, pid int) bool {
-	t.Helper()
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-		return true
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The state follows the command name, which is in parentheses and may hold any character.
-	i := bytes.LastIndexByte(b, ')')
-	if i < 0 || i+2 >= len(b) {
-		t.Fatalf("/proc/%d/stat: %q", pid, b)
-	}
-	return b[i+2] == 'Z' || b[i+2] == 'X'
 }
 
 // A git call of the shipped check that hangs in one repository leaves it not shipped with a logged
@@ -250,5 +230,66 @@ func TestProcessGoneZombie(t *testing.T) {
 	}
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("kill(pid, 0) on the zombie: %v, want success (the check processGone replaces)", err)
+	}
+}
+
+// A timeout of the judge tree's git cat-file is errGitTimeout whatever ends first after the deadline
+// (#100): the closed pipes, or git's exit status the reaper hands over before the deferred wait sees
+// the deadline. Repeated, since the order is a race.
+func TestMaterializeTreeTimeoutAlwaysNamed(t *testing.T) {
+	repo, sha := gateRepo(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeGitOnPath(t, `for a in "$@"; do [ "$a" = cat-file ] && exec sleep 60; done
+exec '`+real+`' "$@"
+`)
+	shortGitLongTimeout(t, 50*time.Millisecond)
+	for i := 0; i < 40; i++ {
+		err := returnsWithin(t, 10*time.Second, "materializeTree", func() error {
+			return materializeTree(repo, sha, t.TempDir(), nil)
+		})
+		if !errors.Is(err, errGitTimeout) {
+			t.Fatalf("run %d: want errGitTimeout, got %v", i, err)
+		}
+	}
+}
+
+// A git that exits while a process of its group still holds its stdout does not leave that process
+// running past the deadline (#100): the group is killed while git, not reaped yet, still reserves the
+// group's ID, and the call is errGitTimeout without output.
+func TestGitTimeoutKillsChildAfterGitExit(t *testing.T) {
+	state := t.TempDir()
+	fakeGitOnPath(t, `echo partial
+sleep 60 &
+echo $! > "$FAKE_GIT_STATE/child"
+exit 0
+`)
+	shortGitTimeout(t, 300*time.Millisecond)
+	type result struct {
+		out string
+		err error
+	}
+	r := returnsWithin(t, 10*time.Second, "git", func() result {
+		out, err := gitEnv(t.TempDir(), []string{"PATH=" + os.Getenv("PATH"), "FAKE_GIT_STATE=" + state}, "status")
+		return result{out, err}
+	})
+	b, err := os.ReadFile(filepath.Join(state, "child"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	if !errors.Is(r.err, errGitTimeout) || r.out != "" {
+		t.Fatalf("want a timeout error and no output, got %q %v", r.out, r.err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("git's child %d still runs after the deadline: git's group was not killed", pid)
+		}
 	}
 }

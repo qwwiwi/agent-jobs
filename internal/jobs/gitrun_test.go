@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -140,5 +141,67 @@ func TestGitGroupKillOnlyBeforeReap(t *testing.T) {
 	p.kill()
 	if k := kills(); len(k) != 1 || k[0] != p.cmd.Process.Pid {
 		t.Fatalf("want one kill of group %d, got %v", p.cmd.Process.Pid, k)
+	}
+}
+
+// gitCopyGoroutines counts the goroutines that copy a git's output: the runner's own and exec's.
+func gitCopyGoroutines() int {
+	buf := make([]byte, 1<<20)
+	n := 0
+	for _, g := range strings.Split(string(buf[:runtime.Stack(buf, true)]), "\n\n") {
+		if strings.Contains(g, "io.Copy") && (strings.Contains(g, "startGit") || strings.Contains(g, "os/exec.")) {
+			n++
+		}
+	}
+	return n
+}
+
+// An abandoned call (git never reaped: its SIGKILL pending in uninterruptible I/O) keeps nothing but the
+// reaping (#100): the runner closes the output pipes it copies, so the copies of stdout and stderr end
+// with their descriptors and buffers although git still holds the write ends.
+func TestGitAbandonedCallReleasesOutputs(t *testing.T) {
+	fakeGitOnPath(t, "echo partial\necho err >&2\nexec sleep 60\n")
+	shortGitTimeout(t, 200*time.Millisecond)
+	origGrace, origWait, origSignal := gitKillGrace, gitWaitExit, signalGroup
+	gitKillGrace = 200 * time.Millisecond
+	release := make(chan struct{})
+	gitWaitExit = func(pid int) error {
+		<-release
+		return origWait(pid)
+	}
+	// The kill does not take: git stays alive and holds its pipes, as a process in D state does.
+	var mu sync.Mutex
+	var pgids []int
+	signalGroup = func(pgid int, _ syscall.Signal) error {
+		mu.Lock()
+		pgids = append(pgids, pgid)
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() {
+		mu.Lock()
+		for _, g := range pgids {
+			_ = origSignal(g, syscall.SIGKILL)
+		}
+		mu.Unlock()
+		close(release)
+		gitKillGrace, gitWaitExit, signalGroup = origGrace, origWait, origSignal
+	})
+	base := gitCopyGoroutines()
+	type result struct {
+		out string
+		err error
+	}
+	r := returnsWithin(t, 10*time.Second, "git", func() result {
+		out, err := gitEnv(t.TempDir(), []string{"PATH=" + os.Getenv("PATH")}, "status")
+		return result{out, err}
+	})
+	if !errors.Is(r.err, errGitTimeout) || r.out != "" {
+		t.Fatalf("want a timeout error and no output, got %q %v", r.out, r.err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); gitCopyGoroutines() > base; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d output copies of the abandoned git still run", gitCopyGoroutines()-base)
+		}
 	}
 }

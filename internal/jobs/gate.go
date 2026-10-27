@@ -524,18 +524,26 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
 	// pipes are closed, so that a read or write blocked on a git that stopped answering ends.
 	ctx, cancel := context.WithTimeout(context.Background(), gitLongTimeout)
 	defer cancel()
+	deadlineDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		p.kill()
 		_, _ = in.Close(), outPipe.Close()
+		close(deadlineDone)
 	})
 	defer func() {
-		stop()
+		// The deadline ended the call when stop finds it run: whatever failure that left (a closed pipe,
+		// or git's exit status, which the reaper may hand to wait before wait sees ctx end) is the timeout.
+		timedOut := !stop()
+		if timedOut {
+			<-deadlineDone
+		}
 		if err != nil {
 			// git may be blocked writing the rest of a blob nobody reads: end it before waiting.
 			p.kill()
 		}
 		_ = in.Close()
-		if errors.Is(p.wait(ctx), errGitTimeout) {
+		werr := p.wait(ctx)
+		if errors.Is(werr, errGitTimeout) || timedOut && (err != nil || werr != nil) {
 			err = fmt.Errorf("git cat-file: %w after %s", errGitTimeout, gitLongTimeout)
 		}
 		_ = outPipe.Close()
