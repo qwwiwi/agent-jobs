@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+- `job_stop` returns `resume_budget` (#85): the cost the job's attempts count against the $50 budget ceiling (an attempt stopped before claude reported its cost counts at its whole budget, as before), what is left for `job_resume` and its default `max_budget_usd`; when a ceiling has nothing left it starts `resume impossible` and says to commit the work in progress and start a new job instead. The accounting is unchanged.
+
 ## [0.6.0] - 2026-10-26
 
 **Upgrade:** a `release_check` pass stored before v0.6.0 has no `approval_seq` and never ships an approval, so a gated repository stays gated after the upgrade until `release_check` runs again on the released sha (#99). Restart the session (or `/mcp`) so that it reports MCP server 0.6.0.

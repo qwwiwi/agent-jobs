@@ -656,6 +656,48 @@ func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.Resume
 	return out, nil
 }
 
+// ResumeBudget tells what a job_resume of the stopped job j can still get (issue #85): the cost its
+// attempts count against the budget ceiling, what is left, and, when a ceiling has nothing left, that a
+// resume is impossible and what to do instead. The accounting is resumeLimits'.
+func (m *Manager) ResumeBudget(j *store.Job) (string, error) {
+	earlier, err := m.Store.Attempts(j.ID)
+	if err != nil {
+		return "", err
+	}
+	return resumeBudgetNote(j, earlier), nil
+}
+
+// resumeBudgetNote is ResumeBudget for the job row j and its archived attempts.
+func resumeBudgetNote(j *store.Job, earlier []store.Attempt) string {
+	usedTurns, usedCost, usedMin := attemptsUsage(j, earlier)
+	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
+	counted := fmt.Sprintf("this job's attempts count $%.2f of the $%.0f budget ceiling", usedCost, CeilingMaxBudgetUSD)
+	if j.CostUnknown {
+		counted += fmt.Sprintf(" (this attempt ended before its cost was reported, so it counts at its whole $%.2f budget)", j.MaxBudgetUSD)
+	}
+	var none []string
+	if leftBudget < 0.01 {
+		none = append(none, "no budget")
+	}
+	if leftTurns < 1 {
+		none = append(none, fmt.Sprintf("no turns (%d of %d used)", usedTurns, CeilingMaxTurns))
+	}
+	if leftMin < 1 {
+		none = append(none, fmt.Sprintf("no time (%d of %d minutes used)", usedMin, CeilingTimeoutMinutes))
+	}
+	if len(none) > 0 {
+		return fmt.Sprintf("resume impossible: %s; the across-attempt ceilings leave %s, so job_resume will be refused. "+
+			"To continue, commit the work in progress in the job's work dir (a WIP commit) and start a new job from that commit.",
+			counted, strings.Join(none, ", "))
+	}
+	next := cents(j.MaxBudgetUSD - chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD))
+	def := fmt.Sprintf("job_resume's default max_budget_usd is $%.2f", math.Min(next, leftBudget))
+	if next < 0.01 {
+		def = "job_resume needs max_budget_usd"
+	}
+	return fmt.Sprintf("%s, $%.2f left for job_resume (%s, at most $%.2f).", counted, leftBudget, def, leftBudget)
+}
+
 // updateBlock is the orchestrator update as it is appended to a brief or sent to a session.
 func updateBlock(context string) string {
 	return "## Orchestrator update\n\n" + strings.TrimSpace(context) + "\n"
