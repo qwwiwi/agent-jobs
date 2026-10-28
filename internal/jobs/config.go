@@ -185,6 +185,10 @@ type Config struct {
 	// limits (turns, budget, minutes), each capped by what the across-attempt ceilings leave.
 	// 0 = DefaultAutoContinueFraction (0.5); at most 1.
 	AutoContinueFraction float64 `json:"auto_continue_fraction"`
+	// Prepare are per-repository commands the wrapper runs in a new job's worktree, with network, before
+	// its runner starts (repoprepare.go), e.g. a package install the sandboxed runner cannot do. The first
+	// entry whose repo_glob matches the job's repository applies; none = no prepare step.
+	Prepare []PrepareStep `json:"prepare"`
 }
 
 // Report contract modes (config report_contract).
@@ -506,6 +510,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := validatePrepare(c.Prepare); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.validateEffortByKind(); err != nil {

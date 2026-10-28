@@ -36,7 +36,11 @@ type StreamResult struct {
 	ReportContractNote string
 	// GateFailure is why a gate job's result was rejected and not stored ("" = stored, or not a gate job).
 	GateFailure string
-	ReportText  string `json:"-"` // last report from trusted assistant stdout
+	// Prepare is the job's prepare step (nil = none ran in this launch); PrepareFailure why it failed the
+	// job before its runner started ("" = passed or none).
+	Prepare        *PrepareResult `json:",omitempty"`
+	PrepareFailure string         `json:",omitempty"`
+	ReportText     string         `json:"-"` // last report from trusted assistant stdout
 	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
 	// second one is a line another process wrote into the pipe), for codex its terminal turn events
 	// (turn.completed, turn.failed: codex exec runs one turn).
@@ -552,7 +556,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		return 2
 	}
 	defer st.Close()
-	record := func(res StreamResult) error { return storeResult(st, id, token, res) }
+	var prepared *PrepareResult // the prepare step's result goes into every record of this launch
+	record := func(res StreamResult) error {
+		res.Prepare = prepared
+		return storeResult(st, id, token, res)
+	}
 	observe := func(res StreamResult) {
 		if err := record(res); err != nil {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
@@ -568,6 +576,20 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		if fail != "" {
 			fmt.Fprintln(stderrLog, "run-wrapper:", fail)
 			return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, GateFailure: fail}, record, stderrLog)
+		}
+	}
+	if opts.Prepare {
+		// The prepare step (issue #120): before the runner starts, never after; a failure ends the job here.
+		r, rc := runPrepareStep(jobDir, st, id, stderrLog)
+		prepared = r
+		if rc != 0 {
+			return rc
+		}
+		if r != nil {
+			if fail := prepareFailure(*r); fail != "" {
+				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail}, record, stderrLog)
+			}
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
@@ -670,6 +692,9 @@ type WrapperOptions struct {
 	// ManifestCheck runs the judge's manifest-check step before the runner (the daemon passes
 	// --manifest-check for a judge job's launch only): decided at launch, never from a row read here.
 	ManifestCheck bool
+	// Prepare runs the repository's prepare step (config prepare) before the runner (the daemon passes
+	// --prepare for the first launch of a job whose repository has one).
+	Prepare bool
 }
 
 func (o WrapperOptions) prompt() string {

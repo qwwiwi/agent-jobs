@@ -685,6 +685,10 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
+		if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil {
+			// First attempt only: a resumed attempt keeps the worktree its first attempt prepared.
+			plan.wrapper = append(plan.wrapper, "--prepare")
+		}
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
@@ -1690,6 +1694,9 @@ func (m *Manager) killRunning(j *store.Job) string {
 func Verdict(code int, res StreamResult, dir string) (string, string) {
 	if res.SweepFailure != "" {
 		return store.StatusFailed, res.SweepFailure
+	}
+	if res.PrepareFailure != "" {
+		return store.StatusFailed, res.PrepareFailure
 	}
 	// A natural failed exit retains its diagnostic reason; idle closure uses its trusted provenance.
 	if code != 0 && res.IdleReason == "" {

@@ -96,6 +96,9 @@ func doneLine(j *store.Job, dirNote int64, cost string) string {
 	if strings.Contains(j.Error, ReviewChangedWarning) {
 		line += " · " + ReviewChangedWarning
 	}
+	if n := prepareNote(j); n != "" {
+		line += " · " + n
+	}
 	if n := acceptanceNote(j); n != "" {
 		line += " · " + n
 	}
