@@ -87,7 +87,8 @@ type Config struct {
 	// CodexReadDirs are absolute directories a codex job is told it may read besides its job directory
 	// (a package manager's offline store, a browser cache), named in its prompt as read-only. The native
 	// codex sandbox does not confine reads (ticket 684), so nothing on the codex command line changes:
-	// they are never writable roots. Refused: "/", a path that is, holds or lies in the agent's state dir
+	// they are not added as writable roots (under worktree-full-access no sandbox keeps a job from writing
+	// there; only the prompt does). Refused: "/", a path that is, holds or lies in the agent's state dir
 	// or a secret dir (validateCodexReadDirs), or one in /tmp (a writable root of codex's workspace-write
 	// sandbox).
 	CodexReadDirs []string `json:"codex_read_dirs"`
