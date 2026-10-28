@@ -63,9 +63,11 @@ type Config struct {
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
 	// GitName / GitEmail is the job's git identity: written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL of
-	// the job). The guard rejects any other identity; via `git -c` none at all. Empty = the job's
-	// repository's local user.name / user.email (`git config --local`; none for a job without a
-	// repository, or for a value naming one of OwnerNames), else no identity.
+	// the job, and GIT_AUTHOR_* / GIT_COMMITTER_* in its git environment, which outrank the repository's
+	// config). The guard rejects any other identity; via `git -c` none at all. Empty = the job's
+	// repository's local user.name / user.email, both or neither (`git config --local`; none for a job
+	// without a repository, or when either names one of OwnerNames), else no identity. A codex job whose
+	// effective identity names one of OwnerNames is refused at launch (checkCodexIdentity).
 	GitName  string `json:"git_name"`
 	GitEmail string `json:"git_email"`
 	// ClaudeBin overrides the claude binary (env AGENT_JOBS_CLAUDE_BIN wins).

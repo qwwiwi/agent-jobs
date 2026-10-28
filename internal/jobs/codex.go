@@ -260,6 +260,27 @@ func pathWithin(path, dir string) bool {
 	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
 }
 
+// checkCodexIdentity refuses a codex job whose commits would carry the owner's identity: codex runs
+// without the guard hook, so its effective author and committer (`git var` in the worktree with the
+// job's git environment: the job identity, else the repository's own config, else git's guess) must
+// not name one of owners. No identity at all passes: such a commit fails, it carries nobody's.
+func checkCodexIdentity(jobDir string, env, owners []string) error {
+	env, err := GitEnv(jobDir, env)
+	if err != nil {
+		return err
+	}
+	for _, v := range []string{"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} {
+		cmd := exec.Command("git", "var", v)
+		cmd.Dir, cmd.Env = filepath.Join(jobDir, "work"), env
+		out, err := cmd.Output()
+		if err == nil && namesOwner(owners, string(out)) {
+			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s names one of owner_names, "+
+				"from the repository's local config); set git_name and git_email in config.json", v)
+		}
+	}
+	return nil
+}
+
 // codexReadDirsSection is the prompt section of a codex job that names config codex_read_dirs as
 // readable ("" for a claude or gate job, or none configured): the exception to the preamble's rule to
 // work only inside the job directory, read-only.

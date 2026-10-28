@@ -524,19 +524,47 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
 }
 
-// fallbackIdentity is the repository's local value of key (user.name or user.email) for a job's
-// gitconfig, "" when it has none or the value names one of config owner_names (the guard refuses those
-// in a job's commit).
-func (m *Manager) fallbackIdentity(repo, key string) string {
-	v := repoLocalIdentity(repo, key)
-	low := strings.ToLower(v)
-	for _, name := range m.Config().OwnerNames {
-		if n := strings.ToLower(strings.TrimSpace(name)); n != "" && strings.Contains(low, n) {
-			m.Log.Printf("repository %s: local %s names the owner; not used as the job's identity", repo, key)
-			return ""
+// jobIdentity is a job's git identity: config git_name / git_email, a field the config leaves empty
+// taken from the repository's local identity (repoIdentity; repo "" = none), "" = none.
+func (m *Manager) jobIdentity(repo string) (name, email string) {
+	name, email = m.Config().GitName, m.Config().GitEmail
+	if (name == "" || email == "") && repo != "" {
+		rn, re := m.repoIdentity(repo)
+		if name == "" {
+			name = rn
+		}
+		if email == "" {
+			email = re
 		}
 	}
-	return v
+	return name, email
+}
+
+// repoIdentity is the repository's local user.name and user.email together, or neither: none when
+// either is missing or either names one of config owner_names (the guard refuses those in a job's
+// commit).
+func (m *Manager) repoIdentity(repo string) (name, email string) {
+	name, email = repoLocalIdentity(repo, "user.name"), repoLocalIdentity(repo, "user.email")
+	if name == "" || email == "" {
+		return "", ""
+	}
+	if namesOwner(m.Config().OwnerNames, name, email) {
+		m.Log.Printf("repository %s: local user.name/user.email names the owner; not used as the job's identity", repo)
+		return "", ""
+	}
+	return name, email
+}
+
+// namesOwner reports whether any of values contains one of owners (case-insensitive), the guard's rule
+// for a commit.
+func namesOwner(owners []string, values ...string) bool {
+	low := strings.ToLower(strings.Join(values, "\n"))
+	for _, name := range owners {
+		if n := strings.ToLower(strings.TrimSpace(name)); n != "" && strings.Contains(low, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // repoLocalIdentity reads key from the repository's own config (`git config --local`), never the
@@ -573,17 +601,16 @@ func (m *Manager) markWorktree(j *store.Job, work string) error {
 
 // writeGitFiles writes <jobdir>/gitconfig (the job identity, nothing else) and the empty
 // <jobdir>/no-hooks dir; the wrapper points GIT_CONFIG_GLOBAL and core.hooksPath at them (GitEnv).
-// The identity is config git_name / git_email; a field the config leaves empty is taken from the
-// repository's local config (repo; "" = none), so a job's commits do not go without one (#120).
+// The identity is jobIdentity: config git_name / git_email, a field the config leaves empty taken from
+// the repository's local identity (repo; "" = none), so a job's commits do not go without one (#120).
+// GitEnv also sets it as GIT_AUTHOR_* / GIT_COMMITTER_*, which outrank the repository's own config.
 func (m *Manager) writeGitFiles(dir, repo string) error {
 	cfg := filepath.Join(dir, gitConfigFile)
 	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
 		return fmt.Errorf("write gitconfig: %w", err)
 	}
-	for _, kv := range [][2]string{{"user.name", m.Config().GitName}, {"user.email", m.Config().GitEmail}} {
-		if kv[1] == "" && repo != "" {
-			kv[1] = m.fallbackIdentity(repo, kv[0])
-		}
+	name, email := m.jobIdentity(repo)
+	for _, kv := range [][2]string{{"user.name", name}, {"user.email", email}} {
 		if kv[1] == "" {
 			continue
 		}

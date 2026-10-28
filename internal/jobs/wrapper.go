@@ -973,8 +973,10 @@ const (
 // environment: no system config, <jobdir>/gitconfig as the only global config, cat as pager, true as
 // editor, no terminal prompt, and the gitOverrides (core.hooksPath=<jobdir>/no-hooks, no fsmonitor,
 // ssh command or credential helper; cat/true as pager/editor) at command-line level (via
-// GIT_CONFIG_COUNT), which wins over any repository config. So git run by the job does not execute
-// hooks, a pager, an editor or a credential prompt the guard does not see.
+// GIT_CONFIG_COUNT), which wins over any repository config, and the job identity of the gitconfig as
+// GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL, which win over the repository's own identity. So
+// git run by the job does not execute hooks, a pager, an editor or a credential prompt the guard does
+// not see, and its commits carry the job identity.
 func GitEnv(jobDir string, env []string) ([]string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
@@ -999,12 +1001,49 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
 		"GIT_TERMINAL_PROMPT=0",
 	)
+	// The job identity outranks the repository's config (its local user.name/user.email, author.*,
+	// committer.*), which would otherwise win over GIT_CONFIG_GLOBAL.
+	name, email, err := gitFileIdentity(cfg, out)
+	if err != nil {
+		return nil, err
+	}
+	if name != "" {
+		out = append(out, "GIT_AUTHOR_NAME="+name, "GIT_COMMITTER_NAME="+name)
+	}
+	if email != "" {
+		out = append(out, "GIT_AUTHOR_EMAIL="+email, "GIT_COMMITTER_EMAIL="+email)
+	}
 	overrides := gitOverrides(hooks)
 	out = append(out, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))
 	for i, kv := range overrides {
 		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
 	}
 	return out, nil
+}
+
+// gitFileIdentity reads user.name and user.email from the job's gitconfig ("" = unset); env is the
+// scrubbed git environment being built.
+func gitFileIdentity(cfg string, env []string) (name, email string, err error) {
+	cmd := exec.Command("git", "config", "--file", cfg, "-z", "--get-regexp", `^user\.(name|email)$`)
+	cmd.Env = env
+	out, err := cmd.Output()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return "", "", nil // neither is set
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("read the job identity from %s: %w", cfg, err)
+	}
+	for _, rec := range strings.Split(string(out), "\x00") {
+		key, value, _ := strings.Cut(rec, "\n")
+		switch strings.ToLower(key) {
+		case "user.name":
+			name = value
+		case "user.email":
+			email = value
+		}
+	}
+	return name, email, nil
 }
 
 // gitOverrides are set at command-line level (GIT_CONFIG_COUNT), which beats repository config: a
