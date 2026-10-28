@@ -265,6 +265,9 @@ func pathWithin(path, dir string) bool {
 // job's git environment: the job identity, else the repository's own config, else git's guess) must
 // not name one of owners. No identity at all passes: such a commit fails, it carries nobody's.
 func checkCodexIdentity(jobDir string, env, owners []string) error {
+	if !slices.ContainsFunc(owners, func(n string) bool { return strings.TrimSpace(n) != "" }) {
+		return nil
+	}
 	env, err := GitEnv(jobDir, env)
 	if err != nil {
 		return err
@@ -274,8 +277,8 @@ func checkCodexIdentity(jobDir string, env, owners []string) error {
 		cmd.Dir, cmd.Env = filepath.Join(jobDir, "work"), env
 		out, err := cmd.Output()
 		if err == nil && namesOwner(owners, string(out)) {
-			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s names one of owner_names, "+
-				"from the repository's local config); set git_name and git_email in config.json", v)
+			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s names one of owner_names: "+
+				"the repository's own identity or git's guess is in force); set git_name and git_email in config.json", v)
 		}
 	}
 	return nil
