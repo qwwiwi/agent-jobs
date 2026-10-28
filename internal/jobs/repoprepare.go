@@ -158,6 +158,10 @@ func prepareNote(j *store.Job) string {
 // agentjobs_testhooks build (repoprepare_testhooks.go), never in a release build.
 var prepareRecordFault string
 
+// prepareTimeoutOverride replaces the prepare step's time limit (0 = the step's own): a test hook set
+// only in the agentjobs_testhooks build (repoprepare_testhooks.go), never in a release build.
+var prepareTimeoutOverride time.Duration
+
 // injectedPrepareRecordFault is the injected record error of the prepare snapshot r (nil = none).
 func injectedPrepareRecordFault(r PrepareResult) error {
 	phase := "passed"
@@ -253,7 +257,11 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id 
 			return fail(r, "record the step's start: %v", err)
 		}
 	}
-	fmt.Fprintf(log, "run-wrapper: prepare: %s (in %s, timeout %s)\n", RedactPrintable(step.Command, 300), dir, step.Timeout())
+	timeout := step.Timeout()
+	if prepareTimeoutOverride > 0 {
+		timeout = prepareTimeoutOverride
+	}
+	fmt.Fprintf(log, "run-wrapper: prepare: %s (in %s, timeout %s)\n", RedactPrintable(step.Command, 300), dir, timeout)
 	start := time.Now()
 	out := &tailBuffer{max: AcceptanceLogBytes}
 	recordGroup := func(pgid int) {
@@ -261,7 +269,7 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id 
 			fmt.Fprintln(log, "run-wrapper: prepare: record process group:", err)
 		}
 	}
-	exit := runShellGroup(ctx, dir, env, step.Command, step.Timeout(), out, log, recordGroup)
+	exit := runShellGroup(ctx, dir, env, step.Command, timeout, out, log, recordGroup)
 	dur := time.Since(start)
 	body, dropped := keptTail(out)
 	if dropped > 0 {

@@ -2,9 +2,13 @@ package jobs
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -419,4 +423,125 @@ func TestPrepareRerunSkipsAttemptsWithoutRecord(t *testing.T) {
 	if n := strings.Count(readFile(t, filepath.Join(m.JobDir(j.ID), "prep-runs.txt")), "run"); n != 2 {
 		t.Fatalf("prepare ran %d times, want 2 (attempts 1 and 3)", n)
 	}
+}
+
+// A prepare step that runs past its time limit is ended with its process group and fails the job
+// before the runner starts ("prepare failed (timeout after Ns)").
+func TestPrepareTimeoutFailsJob(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "echo PREP_STARTED; sleep 30"}}, "")
+	t.Setenv("AGENT_JOBS_TEST_PREPARE_TIMEOUT_MS", "300")
+	start := time.Now()
+	j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
+	if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, "prepare failed (timeout after ") {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	if took := time.Since(start); took > 12*time.Second {
+		t.Fatalf("the timed-out step took %s", took)
+	}
+	dir := m.JobDir(j.ID)
+	if _, err := os.Stat(filepath.Join(dir, "stream.jsonl")); err == nil {
+		t.Fatal("the runner started after a timed-out prepare step")
+	}
+	if log := readFile(t, filepath.Join(dir, PrepareLog)); !strings.Contains(log, "PREP_STARTED") {
+		t.Fatalf("prepare.log: %q", log)
+	}
+	if p := m.PrepareResultOf(j); p == nil || !p.Ran || !p.TimedOut {
+		t.Fatalf("prepare result: %+v", p)
+	}
+}
+
+// A stop during the prepare step ends its command; the runner never starts, the step counts as not
+// passed, and the resume runs it again.
+func TestPrepareStoppedThenRerun(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo),
+		Command: "echo run >> ../prep-runs.txt; test -d ../attempts || sleep 30"}}, "")
+	j := enqueue(t, m, "do it", inRepo(repo))
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "prepare start", 10*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "prep-runs.txt"))
+		return err == nil
+	})
+	if _, err := m.Stop(j.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "stopped", 15*time.Second, func() bool {
+		_ = m.Tick()
+		return get(t, m, j.ID).Status == store.StatusStopped
+	})
+	j = get(t, m, j.ID)
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "stream.jsonl")); err == nil {
+		t.Fatal("the runner started after a stopped prepare step")
+	}
+	if p := m.PrepareResultOf(j); p == nil || prepareFailure(*p) == "" {
+		t.Fatalf("prepare result of the stopped attempt: %+v", p)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	j = runToEnd(t, m, j.ID)
+	if j.Status != store.StatusSucceeded || j.Attempt != 2 {
+		t.Fatalf("attempt 2: %s %q (attempt %d)", j.Status, j.Error, j.Attempt)
+	}
+	if n := strings.Count(readFile(t, filepath.Join(m.JobDir(j.ID), "prep-runs.txt")), "run"); n != 2 {
+		t.Fatalf("prepare ran %d times, want 2", n)
+	}
+}
+
+// What the prepare command leaves running outside its process group (a job-control background job,
+// as a package manager's daemon) is ended by the session sweep before the runner starts; a leftover
+// the sweep cannot end (made unkillable through the test-only hook) fails the job before the runner.
+func TestPrepareLeftoverProcesses(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("session sweep reads /proc (Linux)")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash missing")
+	}
+	cmd := `bash -c 'set -m; sleep 30 > /dev/null 2>&1 & echo $! > ../leftover.pid'`
+	t.Run("ended", func(t *testing.T) {
+		m := newManager(t)
+		repo := newRepo(t)
+		withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: cmd}}, "")
+		j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
+		if j.Status != store.StatusSucceeded {
+			t.Fatalf("got %s %q", j.Status, j.Error)
+		}
+		var pid int
+		if _, err := fmt.Sscan(readFile(t, filepath.Join(m.JobDir(j.ID), "leftover.pid")), &pid); err != nil || pid <= 1 {
+			t.Fatalf("leftover pid: %d %v", pid, err)
+		}
+		t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+		waitFor(t, "leftover ended", 5*time.Second, func() bool { return !procAlive(pid) })
+		if log := readFile(t, filepath.Join(m.JobDir(j.ID), "stderr.log")); !strings.Contains(log, "prepare: ended 1 leftover process") {
+			t.Fatalf("the prepare sweep did not end the leftover:\n%s", log)
+		}
+	})
+	t.Run("survives", func(t *testing.T) {
+		t.Setenv("AGENT_JOBS_TEST_UNKILLABLE", "1")
+		t.Setenv("AGENT_JOBS_TEST_SWEEP_GRACE_MS", "20")
+		m := newManager(t)
+		repo := newRepo(t)
+		withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: cmd}}, "")
+		id := enqueue(t, m, "do it", inRepo(repo)).ID
+		t.Cleanup(func() {
+			var pid int
+			if _, err := fmt.Sscan(readFile(t, filepath.Join(m.JobDir(id), "leftover.pid")), &pid); err == nil && pid > 1 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		})
+		j := runToEnd(t, m, id)
+		if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, "prepare failed: ") {
+			t.Fatalf("got %s %q", j.Status, j.Error)
+		}
+		if _, err := os.Stat(filepath.Join(m.JobDir(id), "stream.jsonl")); err == nil {
+			t.Fatal("the runner started after a prepare step whose leftovers survived")
+		}
+	})
 }
