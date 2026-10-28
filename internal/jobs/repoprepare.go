@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,9 +21,10 @@ import (
 // --frozen-lockfile`, so a job whose runner has no network (the codex sandbox) still finds its
 // dependencies. The daemon decides at the first launch of a job with a repository whose path matches
 // an entry (the first matching entry wins) and passes --prepare to the wrapper; a resumed attempt keeps
-// the prepared worktree and runs no prepare step, unless the prepare step of the newest earlier attempt
-// with a wrapper record did not pass (it failed, was stopped or its wrapper died in it: its runner
-// never started, so the worktree is still the base commit's). The wrapper runs the command the way it runs
+// the prepared worktree and runs no prepare step only when the newest earlier attempt that started a
+// wrapper shows it (prepareAgain): its prepare step passed or its runner ran. A step that did not pass
+// (it failed, was stopped or its wrapper died in it: its runner never started, so the worktree is still
+// the base commit's) or no evidence at all (no record) runs it again. The wrapper runs the command the way it runs
 // acceptance_cmd: inside the job's own containment (its scope or session), in a process group of its
 // own (recorded in the job row like the acceptance command's, so cancel, stop and the timeout end it
 // even without a scope), without the guard and without a sandbox, with network; unlike acceptance_cmd it keeps the
@@ -154,7 +156,8 @@ func prepareNote(j *store.Job) string {
 }
 
 // prepareRecordFault names the prepare snapshot whose record fails ("unfinished": the one before the
-// command runs, "passed": the one before the runner starts; "" = none): a test hook set only in the
+// command runs, "passed": the one before the runner starts, "all": every record of the prepare step,
+// its failure record too, so the wrapper ends without one; "" = none): a test hook set only in the
 // agentjobs_testhooks build (repoprepare_testhooks.go), never in a release build.
 var prepareRecordFault string
 
@@ -164,6 +167,9 @@ var prepareTimeoutOverride time.Duration
 
 // injectedPrepareRecordFault is the injected record error of the prepare snapshot r (nil = none).
 func injectedPrepareRecordFault(r PrepareResult) error {
+	if prepareRecordFault == "all" {
+		return errors.New("injected record fault (all)")
+	}
 	phase := "passed"
 	if r.Failure == prepareUnfinished {
 		phase = "unfinished"
@@ -174,6 +180,14 @@ func injectedPrepareRecordFault(r PrepareResult) error {
 		return fmt.Errorf("injected record fault (%s)", phase)
 	}
 	return nil
+}
+
+// withPrepareRecordFault is record, or with the injected fault "all" a record that always fails.
+func withPrepareRecordFault(record func(StreamResult) error) func(StreamResult) error {
+	if prepareRecordFault != "all" {
+		return record
+	}
+	return func(StreamResult) error { return errors.New("injected record fault (all)") }
 }
 
 // prepareFailure is the failure reason of a prepare result ("" = passed).
@@ -344,20 +358,41 @@ func (m *Manager) PrepareResultOf(j *store.Job) *PrepareResult {
 	return nil
 }
 
-// prepareAgain reports whether a resumed attempt of j runs the prepare step again: the newest earlier
-// attempt with a wrapper record ran one that did not pass (failed, stopped, or its wrapper died in
-// it). Its runner never started then, so the worktree holds nothing of the job's own. An attempt
-// without a record (refused at launch, or never archived) started no wrapper and is skipped.
-func (m *Manager) prepareAgain(j *store.Job) bool {
+// prepareAgain reports whether a resumed attempt of j runs the prepare step (again). Only evidence
+// keeps it from running: the newest earlier attempt that started a wrapper decides. Its record with a
+// prepare step that passed, or without one (its runner ran on a worktree an earlier attempt prepared),
+// skips the step; a step that did not pass (failed, stopped, or its wrapper died in it: its runner
+// never started, so the worktree holds nothing of the job's own), no record at all (the wrapper
+// recorded nothing), an unreadable record or a missing attempt row is unknown, and the step runs. An
+// attempt refused at launch (launchRefusedPrefix) started no wrapper and is skipped; with no attempt
+// left the step runs too. A store read error fails the launch (an older attempt must not decide).
+func (m *Manager) prepareAgain(j *store.Job) (bool, error) {
+	attempts, err := m.Store.Attempts(j.ID)
+	if err != nil {
+		return false, fmt.Errorf("prepare step: read the earlier attempts: %w", err)
+	}
+	refused := map[int]bool{}
+	for _, a := range attempts {
+		refused[a.N] = strings.HasPrefix(a.Error, launchRefusedPrefix)
+	}
 	for n := j.Attempt - 1; n >= 1; n-- {
-		raw, err := m.Store.AttemptWrapperResult(j.ID, n)
-		if err != nil || raw == "" {
+		if refused[n] {
 			continue
 		}
-		r := prepareOfRecord(raw)
-		return r != nil && prepareFailure(*r) != ""
+		raw, err := m.Store.AttemptWrapperResult(j.ID, n)
+		if errors.Is(err, store.ErrNotFound) || err == nil && raw == "" {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("prepare step: read the record of attempt %d: %w", n, err)
+		}
+		var res StreamResult
+		if json.Unmarshal([]byte(raw), &res) != nil {
+			return true, nil
+		}
+		return res.Prepare != nil && prepareFailure(*res.Prepare) != "", nil
 	}
-	return false
+	return true, nil
 }
 
 func prepareOfRecord(raw string) *PrepareResult {

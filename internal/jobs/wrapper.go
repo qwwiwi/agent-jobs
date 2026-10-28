@@ -609,7 +609,8 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			if fail != "" {
 				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
 				prepared = r
-				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail}, record, stderrLog)
+				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail},
+					withPrepareRecordFault(record), stderrLog)
 			}
 		}
 	}

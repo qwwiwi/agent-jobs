@@ -526,6 +526,10 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
+// launchRefusedPrefix starts the error of an attempt refused at launch: no wrapper was started for it
+// (prepareAgain skips such an attempt).
+const launchRefusedPrefix = "refused to start: "
+
 func (m *Manager) launchQueued() error {
 	running, err := m.Store.CountRunning()
 	if err != nil {
@@ -559,7 +563,7 @@ func (m *Manager) launchQueued() error {
 		} else if err != nil {
 			m.Log.Printf("job %s refused to start: %s", j.ID, RedactText(err.Error()))
 			m.removeSkills(j)
-			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: "+err.Error(), m.Now()); ferr != nil {
+			if ferr := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, launchRefusedPrefix+err.Error(), m.Now()); ferr != nil {
 				m.Log.Printf("job %s: mark failed: %v", j.ID, ferr)
 			} else {
 				running-- // the failed launch no longer occupies a slot
@@ -689,9 +693,18 @@ func (m *Manager) launch(j *store.Job, token string) error {
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
 	}
-	if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil && (j.Attempt == 1 || m.prepareAgain(j)) {
-		// A resumed attempt keeps the worktree an earlier attempt prepared, unless that prepare did not pass.
-		plan.wrapper = append(plan.wrapper, "--prepare")
+	if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil {
+		// A resumed attempt keeps the worktree an earlier attempt is known to have prepared; else (that
+		// prepare did not pass, or nothing shows it ran) the step runs before the runner.
+		again := j.Attempt == 1
+		if !again {
+			if again, err = m.prepareAgain(j); err != nil {
+				return err
+			}
+		}
+		if again {
+			plan.wrapper = append(plan.wrapper, "--prepare")
+		}
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,

@@ -545,3 +545,79 @@ func TestPrepareLeftoverProcesses(t *testing.T) {
 		}
 	})
 }
+
+// A wrapper that left no record at all (its "unfinished" snapshot and its failure record both failed to
+// persist) is no evidence that the worktree was prepared, and an attempt refused at launch after it
+// (no wrapper) changes nothing: the next resume runs the prepare step before its runner starts.
+func TestPrepareRerunAfterAttemptWithoutRecord(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "echo run >> ../prep-runs.txt"}}, "")
+	t.Setenv("AGENT_JOBS_TEST_PREPARE_RECORD_FAULT", "all")
+	j := enqueue(t, m, "do it", inRepo(repo))
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "attempt 1 to end", 30*time.Second, func() bool {
+		if err := m.Tick(); err != nil {
+			t.Fatal(err)
+		}
+		return get(t, m, j.ID).Status != store.StatusRunning
+	})
+	if j = get(t, m, j.ID); j.Status != store.StatusFailed {
+		t.Fatalf("attempt 1: %s %q", j.Status, j.Error)
+	}
+	if raw, ok, err := m.Store.WrapperResult(j.ID, j.LaunchToken); err != nil || ok && raw != "" {
+		t.Fatalf("attempt 1 left a wrapper record: %q %v %v", raw, ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "prep-runs.txt")); err == nil {
+		t.Fatal("attempt 1 ran the prepare command without its start record")
+	}
+	t.Setenv("AGENT_JOBS_TEST_PREPARE_RECORD_FAULT", "")
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Attempt 2 is refused at launch, as launchQueued does it: claimed, failed, no wrapper.
+	token := newToken()
+	if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, launchRefusedPrefix+"test", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	j = runToEnd(t, m, j.ID)
+	if j.Attempt != 3 || j.Status != store.StatusSucceeded {
+		t.Fatalf("attempt 3: %s %q (attempt %d)", j.Status, j.Error, j.Attempt)
+	}
+	if n := strings.Count(readFile(t, filepath.Join(m.JobDir(j.ID), "prep-runs.txt")), "run"); n != 1 {
+		t.Fatalf("prepare ran %d times, want 1 (attempt 3)", n)
+	}
+}
+
+// A store that cannot be read is no "the older attempts decide": prepareAgain fails, so the launch is
+// refused instead of starting a runner on a worktree nobody knows was prepared.
+func TestPrepareAgainStoreReadError(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "true"}}, "")
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_EXIT3", inRepo(repo)).ID)
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	j.Attempt++ // as Claim counts it for the launch
+	if again, err := m.prepareAgain(j); err != nil || again {
+		t.Fatalf("after a passed prepare: again = %v, err = %v", again, err)
+	}
+	if err := m.Store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := m.prepareAgain(j); err == nil {
+		t.Fatalf("store unreadable: again = %v without an error", again)
+	}
+}
