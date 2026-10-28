@@ -307,3 +307,22 @@ func TestCodexReadDirsCaseFolded(t *testing.T) {
 		t.Errorf("case-sensitive: %v", err)
 	}
 }
+
+// On a case-insensitive file system a ~/.CLAUDE-lab link is a ~/.claude* entry like ~/.claude-lab, so
+// its target is refused too (#122).
+func TestCodexReadDirsUpperCaseClaudeLinkTarget(t *testing.T) {
+	withCodexTmp(t)
+	home := withCodexHome(t)
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	target := filepath.Join(filepath.Dir(home), "agent-config")
+	mkdirs(t, filepath.Join(target, "secrets"))
+	symlink(t, target, filepath.Join(home, ".CLAUDE-lab"))
+	old := codexReadDirsFoldCase
+	t.Cleanup(func() { codexReadDirsFoldCase = old })
+	codexReadDirsFoldCase = true
+	for _, d := range []string{target, filepath.Join(target, "secrets")} {
+		if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+d+`"]}`)); err == nil || !strings.Contains(err.Error(), "holds credentials") {
+			t.Errorf("%s: err = %v, want a secret-dir refusal", d, err)
+		}
+	}
+}

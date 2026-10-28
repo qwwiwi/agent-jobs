@@ -173,7 +173,8 @@ func secretDirs(stateDir string) (homes, secrets []string, err error) {
 		}
 		if entries, err := os.ReadDir(h); err == nil {
 			for _, e := range entries {
-				if strings.HasPrefix(e.Name(), homeSecretPrefix) {
+				// Folded where the file system ignores case: ~/.CLAUDE-lab is a ~/.claude* entry there (#122).
+				if strings.HasPrefix(foldReadDirPath(e.Name()), homeSecretPrefix) {
 					secrets = append(secrets, filepath.Join(h, e.Name()))
 				}
 			}
