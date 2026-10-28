@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/casefold"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -273,12 +274,13 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 }
 
 // codexReadDirsFoldCase compares codex_read_dirs paths case-folded: macOS file systems ignore case by
-// default, so ~/.SSH is ~/.ssh there. A test hook besides the platform default, never user config.
+// default, so ~/.SSH (or ~/.ſsh, U+017F folding to s) is ~/.ssh there. A test hook besides the platform
+// default, never user config.
 var codexReadDirsFoldCase = runtime.GOOS == "darwin"
 
 func foldReadDirPath(p string) string {
 	if codexReadDirsFoldCase {
-		return strings.ToLower(p)
+		return casefold.Fold(p)
 	}
 	return p
 }

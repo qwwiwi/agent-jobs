@@ -287,6 +287,7 @@ func TestCodexReadDirsCaseFolded(t *testing.T) {
 	for _, d := range []string{
 		filepath.Join(home, ".SSH"),
 		filepath.Join(home, ".Claude-Lab"),
+		filepath.Join(home, ".ſsh"), // U+017F (long s) folds to s: ~/.ssh
 		filepath.Join(filepath.Dir(home), "HOME"),
 		filepath.Join(filepath.Dir(filepath.Dir(state)), "AJ", "other-agent"), // the agent-jobs home
 	} {
