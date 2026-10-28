@@ -353,3 +353,35 @@ func TestPrepareRecordsGroupAndProgress(t *testing.T) {
 		t.Fatalf("prepare result: %+v", p)
 	}
 }
+
+// The prepare state is recorded before its command runs and before the runner starts, or the job
+// stops there (fail closed): a failed "unfinished" record runs no command, a failed "passed" record
+// starts no runner, so a durable "unfinished" never stands for a runner that ran.
+func TestPrepareRecordFailureFailsClosed(t *testing.T) {
+	for _, c := range []struct{ fault, errPrefix string }{
+		{"unfinished", "prepare did not run: record the step's start: "},
+		{"passed", "prepare failed: its passed result could not be recorded: "},
+	} {
+		t.Run(c.fault, func(t *testing.T) {
+			m := newManager(t)
+			repo := newRepo(t)
+			withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "touch ../prep-ran"}}, "")
+			t.Setenv("AGENT_JOBS_TEST_PREPARE_RECORD_FAULT", c.fault)
+			j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
+			if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, c.errPrefix) || !strings.Contains(j.Error, "injected record fault") {
+				t.Fatalf("got %s %q, want failed with %q", j.Status, j.Error, c.errPrefix)
+			}
+			dir := m.JobDir(j.ID)
+			if _, err := os.Stat(filepath.Join(dir, "stream.jsonl")); err == nil {
+				t.Fatal("the runner started although the prepare state was not recorded")
+			}
+			_, err := os.Stat(filepath.Join(dir, "prep-ran"))
+			if ran := err == nil; ran != (c.fault == "passed") {
+				t.Fatalf("prepare command ran = %v with the %s record failing", ran, c.fault)
+			}
+			if p := m.PrepareResultOf(j); p == nil || prepareFailure(*p) == "" && c.fault == "unfinished" {
+				t.Fatalf("prepare result: %+v", p)
+			}
+		})
+	}
+}

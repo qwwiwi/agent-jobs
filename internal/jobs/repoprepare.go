@@ -153,6 +153,25 @@ func prepareNote(j *store.Job) string {
 	return RedactPrintable(strings.TrimSpace(note), 80)
 }
 
+// prepareRecordFault names the prepare snapshot whose record fails ("unfinished": the one before the
+// command runs, "passed": the one before the runner starts; "" = none): a test hook set only in the
+// agentjobs_testhooks build (repoprepare_testhooks.go), never in a release build.
+var prepareRecordFault string
+
+// injectedPrepareRecordFault is the injected record error of the prepare snapshot r (nil = none).
+func injectedPrepareRecordFault(r PrepareResult) error {
+	phase := "passed"
+	if r.Failure == prepareUnfinished {
+		phase = "unfinished"
+	} else if prepareFailure(r) != "" {
+		return nil
+	}
+	if prepareRecordFault == phase {
+		return fmt.Errorf("injected record fault (%s)", phase)
+	}
+	return nil
+}
+
 // prepareFailure is the failure reason of a prepare result ("" = passed).
 func prepareFailure(r PrepareResult) string {
 	switch {
@@ -170,9 +189,10 @@ func prepareFailure(r PrepareResult) string {
 // returns the result to record (nil = no step applies any more: config.json changed since the launch)
 // and a non-zero rc when a stop signal ended the run (the wrapper exits with it and does not start the
 // runner). A failed step is a result with prepareFailure set; the caller ends the job with it.
-// onStart gets the result before the command runs (Failure prepareUnfinished), for the record.
+// onStart records the result before the command runs (Failure prepareUnfinished); when it fails, the
+// command does not run (fail closed: the step did not run).
 func runPrepareStep(jobDir, token string, st *store.Store, id string, log io.Writer,
-	onStart func(PrepareResult)) (*PrepareResult, int) {
+	onStart func(PrepareResult) error) (*PrepareResult, int) {
 	ctx, release := catchStopSignals()
 	res, signalled := prepareStep(ctx, jobDir, token, st, id, log, onStart)
 	if release() || signalled {
@@ -186,7 +206,7 @@ func runPrepareStep(jobDir, token string, st *store.Store, id string, log io.Wri
 }
 
 func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id string, log io.Writer,
-	onStart func(PrepareResult)) (*PrepareResult, bool) {
+	onStart func(PrepareResult) error) (*PrepareResult, bool) {
 	fail := func(r *PrepareResult, format string, a ...any) (*PrepareResult, bool) {
 		r.Failure = prepareReasonPrefix + "did not run: " + RedactPrintable(fmt.Sprintf(format, a...), 300)
 		return r, false
@@ -229,7 +249,9 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id 
 	if onStart != nil {
 		started := *r
 		started.Failure = prepareUnfinished
-		onStart(started)
+		if err := onStart(started); err != nil {
+			return fail(r, "record the step's start: %v", err)
+		}
 	}
 	fmt.Fprintf(log, "run-wrapper: prepare: %s (in %s, timeout %s)\n", RedactPrintable(step.Command, 300), dir, step.Timeout())
 	start := time.Now()

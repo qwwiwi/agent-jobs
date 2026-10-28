@@ -582,26 +582,35 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		// The prepare step (issue #120): before the runner starts, never after; a failure ends the job here.
 		// The step is recorded as unfinished before its command runs, and as it ended before the runner
 		// starts: a wrapper killed in between leaves an unfinished prepare, which a resume runs again.
-		snapshot := func(r *PrepareResult) {
+		// Either record failing stops the job there (fail closed): no command runs without its
+		// "unfinished" record, no runner starts while the record still says "unfinished".
+		snapshot := func(r *PrepareResult) error {
 			prepared = r
-			if err := record(StreamResult{Runner: opts.Runner}); err != nil {
-				fmt.Fprintln(stderrLog, "run-wrapper: record prepare step:", err)
+			if err := injectedPrepareRecordFault(*r); err != nil {
+				return err
 			}
+			return record(StreamResult{Runner: opts.Runner})
 		}
-		r, rc := runPrepareStep(jobDir, token, st, id, stderrLog, func(r PrepareResult) { snapshot(&r) })
+		r, rc := runPrepareStep(jobDir, token, st, id, stderrLog, func(r PrepareResult) error { return snapshot(&r) })
 		if rc != 0 {
 			if r != nil {
-				snapshot(r) // best effort: the daemon is ending the job
+				_ = snapshot(r) // best effort: the daemon is ending the job
 			}
 			return rc
 		}
 		if r != nil {
-			if fail := prepareFailure(*r); fail != "" {
+			fail := prepareFailure(*r)
+			if fail == "" {
+				if err := snapshot(r); err != nil {
+					fail = prepareReasonPrefix + "failed: its passed result could not be recorded: " +
+						RedactPrintable(err.Error(), 300) + "; the runner is not started"
+				}
+			}
+			if fail != "" {
 				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
 				prepared = r
 				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail}, record, stderrLog)
 			}
-			snapshot(r)
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
