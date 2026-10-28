@@ -297,6 +297,10 @@ func TestScopeStoppedOnCancelAndTimeout(t *testing.T) {
 	}
 }
 
+// testUnitMaxRuntime caps a systemd unit a test starts (RuntimeMaxSec): far above the test's own
+// waits, so only a unit whose test died without its cleanup ever reaches it.
+const testUnitMaxRuntime = "10min"
+
 // Point 5, daemon restarts: the real daemon runs as a systemd user service with the KillMode of the
 // shipped unit template; restarting it leaves the job's scope (outside the service's cgroup) running,
 // and the job is collected normally afterwards.
@@ -314,7 +318,11 @@ func TestDaemonUnitRestartLeavesJobScope(t *testing.T) {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
 	svc := "agent-jobs-testd-" + hex.EncodeToString(b) + ".service"
-	args := []string{"--user", "--quiet", "--collect", "--unit=" + svc, "--property=KillMode=" + string(km[1])}
+	// The unit runs outside the job's scope, so no containment of a job running this suite ends it:
+	// a recognisable name and description, stopped in t.Cleanup, and a runtime cap that has systemd
+	// stop it even when the test process dies before its cleanup runs (#105).
+	args := []string{"--user", "--quiet", "--collect", "--unit=" + svc, "--property=KillMode=" + string(km[1]),
+		"--description=agent-jobs test daemon (" + t.Name() + ")", "--property=RuntimeMaxSec=" + testUnitMaxRuntime}
 	for _, k := range []string{"AGENT_JOBS_HOME", "AGENT_JOBS_CLAUDE_BIN", "AGENT_JOBS_TMUX_BIN", "AGENT_JOBS_CGROUP_SCOPE", "PATH"} {
 		args = append(args, "--setenv="+k+"="+os.Getenv(k))
 	}

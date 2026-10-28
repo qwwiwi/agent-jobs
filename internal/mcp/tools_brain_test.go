@@ -17,6 +17,7 @@ import (
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
+	"github.com/qwwiwi/agent-jobs/internal/testutil"
 )
 
 var brainTools = []string{"memory_search", "memory_write", "memory_already_exists", "task_create", "task_list",
@@ -273,7 +274,7 @@ func TestStdioJobRoleWithoutBrain(t *testing.T) {
 // call still works): memory_search and memory_write go through the daemon's proxy, which gives the
 // note the job's provenance.
 func TestStdioJobRoleThroughDaemonProxy(t *testing.T) {
-	home := t.TempDir()
+	home := testutil.ShortTempDir(t) // brain.sock lives in the state dir below it
 	t.Setenv("AGENT_JOBS_HOME", home)
 	if err := os.MkdirAll(home+"/test", 0o700); err != nil {
 		t.Fatal(err)

@@ -223,7 +223,9 @@ func TestCheckFixLoop2(t *testing.T) {
 		{"commit -F /dev/stdin", "git commit -F /dev/stdin", true},
 		{"identity in heredoc substitution", "cat <<EOF\n$(git -c user.name=Foreign commit -m x)\nEOF", true},
 		{"quoted heredoc body is data", "cat <<'EOF'\n$(git push)\nEOF", false},
-		{"git in substitution", `echo "$(git rev-parse HEAD)"`, true},
+		// 2026-10-25 (noise.go): a read-only git call in a command substitution is checked as a plain call.
+		{"read-only git in substitution", `echo "$(git rev-parse HEAD)"`, false},
+		{"push in substitution", `echo "$(git push)"`, true},
 		{"gh in backticks", "echo `gh pr create`", true},
 		{"git in process substitution", "diff <(git show HEAD:a) a", true},
 		{"eval with git", `eval "git status"`, true},
@@ -403,7 +405,8 @@ func TestCheckFailClosedAllowlist(t *testing.T) {
 		{"touch git", "touch git", false},
 		{"apt-get install git", "apt-get install git", false},
 		{"go get git", "go get github.com/x/git", false},
-		{"go install gh", "go install github.com/cli/cli/v2/cmd/gh@latest", false},
+		{"go install gh", "go install github.com/cli/cli/v2/cmd/gh@latest", true}, // a gh in GOBIN shadows the real one (#96)
+		{"go install tool", "go install golang.org/x/tools/cmd/goimports@latest", false},
 		{"pip install git", "pip install gitpython git", false},
 		{"npm install gh", "npm install gh", false},
 		{"python script file", "python3 tool.py git", false},

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
@@ -25,21 +26,41 @@ import (
 // approved is not gated; one whose approval is void now (the checklist or brief edited by hand or gone, a
 // newer slicing check, an unreadable file) stays gated and is refused until it is approved again (fail
 // closed: a void approval never lifts the gate) until the owner retires it (`agent-jobs gate retire`).
+// One whose valid latest approval shipped (#99: release_check passed at it on a sha now on origin's
+// default branch, recorded by the daemon's tick, mergegate_shipped.go) is not gated until a new approval.
 // Another clone of a gated repository (a shared OWNER/REPO remote) is gated with it: the names of a gated
 // repository's remotes are stored (store.GateRepo, by checklist_set at the approval, by release_check on a
 // pass and by the daemon's backfill at its start), so a gated work tree that is gone or moved is still
 // matched by name and never makes other merges unreadable (one without stored names and with unreadable
-// remotes makes a merge by name or in another work tree unsure). A gh pr merge written in the Bash
-// command whose target the reader cannot tell is refused while some repository is gated; a command that
-// runs `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
+// remotes makes a merge by name or in another work tree unsure, never one into an identified gated
+// repository: that one is still checked). A gh pr merge written in the Bash command whose form or target
+// the reader cannot tell passes with a one-line warning while some repository is gated (owner decision
+// 2026-10-25: only a parsed gh pr merge in a gated repository without a release pass is blocked); a
+// merge whose target resolves to a gated repository and whose only unreadable part is a variable or
+// substitution word (the sha, the PR number) is refused: write them literally. A command that runs
+// `agent-jobs gate retire` is always refused (RetireRefusal). It reads the store, git remotes and the
 // brief files only.
+// A merge through the API (#107) gets the same decision as gh pr merge: `gh api` PUT to
+// repos/OWNER/REPO/pulls/N/merge (the repository from the endpoint, or with {owner}/{repo} from GH_REPO
+// or the directory; the pin is the sha field) and `gh api graphql` mergePullRequest (the repository
+// from GH_REPO or the directory, the pin expectedHeadOid; one that resolves to no gated repository warns
+// while some repository is gated, since its node id names none); enablePullRequestAutoMerge is refused
+// like --auto. An API merge the hook cannot fully read (guard.GhMerge.Opaque: an endpoint from a variable,
+// a body from --input, a -F field from a file, a query from a variable, a field given twice, a $variable
+// pin at a GraphQL endpoint other than `graphql`) is refused in a gated repository, its context (the
+// endpoint's OWNER/REPO, else GH_REPO and the directory) resolved first; elsewhere it warns as other
+// unreadable merges. A release_check pass whose verdicts list suspect tests (#106) lets the merge run with a
+// needs-live-check warning.
 // It sees only the command text: a script or program that runs gh pr merge itself (`make merge`,
-// `./scripts/ship.sh`), `gh api` merges, `git push` to the base branch and the web UI pass by it, and so
+// `./scripts/ship.sh`), `git push` to the base branch and the web UI pass by it, and so
 // does the auto-merge or merge queue gh may enable on a protected branch (PLAN Wave F, Risks): it catches
 // honest mistakes, it is not a boundary.
 
-// MergeGatePrefix starts the hook's refusal line.
-const MergeGatePrefix = "agent-jobs merge-gate: blocked: "
+// MergeGatePrefix starts the hook's refusal line; MergeGateWarnPrefix its warning line (the command runs).
+const (
+	MergeGatePrefix     = "agent-jobs merge-gate: blocked: "
+	MergeGateWarnPrefix = "agent-jobs merge-gate: warning: "
+)
 
 // fullSHA1Re is the full commit id --match-head-commit must carry (GitHub's ids are sha1).
 var fullSHA1Re = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -86,8 +107,8 @@ func ParsePreToolUseInput(r io.Reader) (PreToolUseInput, error) {
 	return in, nil
 }
 
-// MergeGateNeeded reports whether the command runs, or may run, `gh pr merge`: only then does the hook
-// open the store.
+// MergeGateNeeded reports whether the command runs, or may run, `gh pr merge` or a merge through the API:
+// only then does the hook open the store.
 func MergeGateNeeded(command string) bool {
 	calls, unsure := guard.GhPrMerges(command, "")
 	return len(calls) > 0 || unsure != ""
@@ -109,6 +130,12 @@ type gatedRepo struct {
 	id      string
 	version int
 	hash    string
+	// seq is the approval's when it is valid now; retired says the owner retired it; shipped is the sha
+	// its release shipped on (#99, mergegate_shipped.go): neither is gated.
+	seq       int64
+	retired   bool
+	shipped   string
+	shippedAt time.Time
 }
 
 // mergeGate is one hook call: the repositories it has read, by main work tree.
@@ -118,49 +145,137 @@ type mergeGate struct {
 	all   []*gatedRepo // the gated stored repositories (nil = not read yet)
 }
 
-// MergeGate is the hook's answer for a Bash command run at cwd: a refusal line ("" = allowed). envRepo is
-// GH_REPO of the session's environment. An error (unreadable store or brief files) is returned as is;
-// the caller refuses on it.
+// MergeGateAnswer is the hook's answer: Refusal blocks the command ("" = it runs); Warning is one line
+// for stderr when the command runs although the reader could not tell what it merges, or when the
+// release_check pass it merges on lists tests that need a live check (#106).
+type MergeGateAnswer struct {
+	Refusal string
+	Warning string
+}
+
+// MergeGate is the hook's refusal line for a Bash command run at cwd ("" = allowed); see MergeGateCheck.
 func (m *Manager) MergeGate(cwd, command, envRepo string) (string, error) {
+	a, err := m.MergeGateCheck(cwd, command, envRepo)
+	return a.Refusal, err
+}
+
+// MergeGateCheck is the hook's answer for a Bash command run at cwd. envRepo is GH_REPO of the session's
+// environment. An error (unreadable store or brief files) is returned as is; the caller refuses on it.
+func (m *Manager) MergeGateCheck(cwd, command, envRepo string) (MergeGateAnswer, error) {
+	var a MergeGateAnswer
 	calls, unsure := guard.GhPrMerges(command, cwd)
 	if len(calls) == 0 && unsure == "" {
-		return "", nil
+		return a, nil
 	}
 	g := &mergeGate{m: m, repos: map[string]*gatedRepo{}}
+	warn := func(why string) error {
+		w, err := g.warnUnsure(why)
+		if a.Warning == "" {
+			a.Warning = w
+		}
+		return err
+	}
 	if unsure != "" {
-		if r, err := g.refuseUnsure(unsure); r != "" || err != nil {
-			return r, err
+		if err := warn(unsure); err != nil {
+			return MergeGateAnswer{}, err
 		}
 	}
 	for _, call := range calls {
-		if call.Unsure != "" {
-			if r, err := g.refuseUnsure(call.Unsure); r != "" || err != nil {
-				return r, err
+		if call.Opaque != "" {
+			// An API merge the reader cannot fully read (#107): the gated context first, refused in it.
+			targets, why, err := g.targets(cwd, call, envRepo)
+			if err != nil {
+				return MergeGateAnswer{}, err
+			}
+			if len(targets) > 0 {
+				return MergeGateAnswer{Refusal: opaqueRefusal(targets[0], call)}, nil
+			}
+			if why == "" {
+				why = call.Unsure
+			}
+			if call.API == guard.APIMergeGraphQL && why == "" {
+				why = "gh api graphql mergePullRequest names its pull request by node id, and neither GH_REPO nor the directory " +
+					"is a gated repository"
+			}
+			if why != "" {
+				if err := warn(why); err != nil {
+					return MergeGateAnswer{}, err
+				}
 			}
 			continue
 		}
+		if call.Unsure != "" && (call.Unsure != guard.DynamicWordUnsure || dynamicWord(call.Repo)) {
+			if err := warn(call.Unsure); err != nil {
+				return MergeGateAnswer{}, err
+			}
+			continue
+		}
+		// Every identified target is checked, also when another candidate is unreadable (why): an
+		// unreadable other repository never lifts the gate of a known one.
 		targets, why, err := g.targets(cwd, call, envRepo)
 		if err != nil {
-			return "", err
-		}
-		if why != "" {
-			if r, err := g.refuseUnsure(why); r != "" || err != nil {
-				return r, err
-			}
-			continue
+			return MergeGateAnswer{}, err
 		}
 		for _, t := range targets {
-			if r, err := g.check(t, call); r != "" || err != nil {
-				return r, err
+			if call.Unsure != "" {
+				// Only a variable or substitution among the words the target does not depend on (the sha, the PR
+				// number, a flag): the merge runs in this gated repository, so it is refused, not waved through.
+				// Also with a literal sha that has a pass: the call does not tell which word is dynamic, and an
+				// unquoted one may split into flags (`--body $B` with B="x --auto").
+				return MergeGateAnswer{Refusal: dynamicWordRefusal(t, call)}, nil
+			}
+			r, w, err := g.check(t, call)
+			if r != "" || err != nil {
+				return MergeGateAnswer{Refusal: r}, err
+			}
+			if a.Warning == "" {
+				a.Warning = w
+			}
+		}
+		if call.Unsure != "" && why == "" {
+			why = call.Unsure
+		}
+		if call.API == guard.APIMergeGraphQL && len(targets) == 0 && why == "" {
+			why = "gh api graphql mergePullRequest names its pull request by node id, and neither GH_REPO nor the directory " +
+				"is a gated repository"
+		}
+		if why != "" {
+			if err := warn(why); err != nil {
+				return MergeGateAnswer{}, err
 			}
 		}
 	}
-	return "", nil
+	return a, nil
 }
 
-// refuseUnsure refuses a merge the hook cannot read while some stored repository has an approved
-// checklist ("" when none has: nothing is gated).
-func (g *mergeGate) refuseUnsure(why string) (string, error) {
+// dynamicWord reports a word the shell expands ($VAR, ${VAR}, $(…), `…`).
+func dynamicWord(w string) bool {
+	return strings.ContainsAny(w, "$`")
+}
+
+// dynamicWordRefusal refuses a merge in gated repository r whose sha, PR number or another word is a
+// variable or substitution: the hook cannot tell which sha, PR or flags it merges with.
+func dynamicWordRefusal(r *gatedRepo, call guard.GhMerge) string {
+	return MergeGatePrefix + fmt.Sprintf("%s in %s (a repo with an approved checklist) has a variable or "+
+		"substitution in its words, so the hook cannot tell which sha, PR or flags it merges with, also when the "+
+		"sha has a release_check pass; write every word of %s literally (no variables or $(...)).",
+		call.Form(), Printable(r.main, 200), call.Form())
+}
+
+// opaqueRefusal refuses an API merge in gated repository r whose request the hook cannot fully read
+// (guard.GhMerge.Opaque): it cannot tell which pull request, sha or body GitHub gets.
+func opaqueRefusal(r *gatedRepo, call guard.GhMerge) string {
+	return MergeGatePrefix + fmt.Sprintf("%s in %s (a repo with an approved checklist): the hook cannot read this merge "+
+		"request (%s), so it cannot tell which pull request or sha GitHub merges. Merge with gh pr merge <N> "+
+		"--match-head-commit <sha> (the full sha release_check passed on), or a literal gh api -X PUT "+
+		"repos/OWNER/REPO/pulls/N/merge -f sha=<full sha> (no variables, files, --input or repeated fields).",
+		call.Form(), Printable(r.main, 200), Printable(call.Opaque, 200))
+}
+
+// warnUnsure is the warning for a merge the hook cannot read while some stored repository has an
+// approved checklist ("" when none has: nothing is gated). It no longer refuses (owner decision
+// 2026-10-25): an unreadable form blocked harmless commands and caught no defect.
+func (g *mergeGate) warnUnsure(why string) (string, error) {
 	all, err := g.approvedRepos()
 	if err != nil || len(all) == 0 {
 		return "", err
@@ -169,19 +284,25 @@ func (g *mergeGate) refuseUnsure(why string) (string, error) {
 	for _, r := range all {
 		names = append(names, Printable(r.main, 200))
 	}
-	return MergeGatePrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
-		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); write gh pr merge as a plain command with -R " +
-		"OWNER/REPO and --match-head-commit <full sha>.", nil
+	return MergeGateWarnPrefix + "cannot tell whether this command runs gh pr merge in a repo with an approved checklist (" +
+		Printable(why, 200) + "; gated: " + strings.Join(names, ", ") + "); not checked: run release_check before merging, and " +
+		"write gh pr merge as a plain command with -R OWNER/REPO and --match-head-commit <full sha> to be checked.", nil
 }
 
 // targets are the gated repositories a call may merge in. A repository the call names (PR URL, -R) is
 // the one gh uses; without one, every candidate counts (each GH_REPO value and every directory the call
 // may run in, guard.GhMerge.Dirs), since the reader cannot tell which one gh takes. why is set when a
-// candidate cannot be read.
+// candidate cannot be read; out still holds every gated repository identified (the caller checks them
+// before it warns about why).
 func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out []*gatedRepo, why string, err error) {
 	add := func(r *gatedRepo) {
 		if r.gated && !slices.Contains(out, r) {
 			out = append(out, r)
+		}
+	}
+	unsure := func(w string) {
+		if why == "" {
+			why = w
 		}
 	}
 	named := []string{call.Repo}
@@ -194,7 +315,8 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 		}
 		name := gitHubRepoName(n)
 		if name == "" {
-			return nil, fmt.Sprintf("repository %q is not OWNER/REPO", n), nil
+			unsure(fmt.Sprintf("repository %q is not OWNER/REPO", n))
+			continue
 		}
 		all, err := g.approvedRepos()
 		if err != nil {
@@ -209,15 +331,18 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 				add(r)
 			}
 		}
-		if why, err := g.unknownNames(); why != "" || err != nil {
-			return nil, why, err
+		w, err := g.unknownNames()
+		if err != nil {
+			return nil, "", err
 		}
+		unsure(w)
 	}
 	if call.Repo != "" {
-		return out, "", nil
+		return out, why, nil
 	}
 	if cwd == "" || !filepath.IsAbs(cwd) {
-		return nil, "the hook input has no absolute cwd", nil
+		unsure("the hook input has no absolute cwd")
+		return out, why, nil
 	}
 	skipped := 0
 	for _, d := range call.Dirs {
@@ -229,7 +354,8 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 				skipped++
 				continue
 			}
-			return nil, fmt.Sprintf("the directory %s does not exist now", d), nil
+			unsure(fmt.Sprintf("the directory %s does not exist now", d))
+			continue
 		}
 		// Inside a .git directory git has no work tree, gh still finds the repository's remotes.
 		if i := strings.Index(d+"/", "/.git/"); i > 0 {
@@ -248,17 +374,20 @@ func (g *mergeGate) targets(cwd string, call guard.GhMerge, envRepo string) (out
 			continue
 		}
 		// Another clone of a gated repository merges the same pull requests: match it by its remotes.
-		if why, err := g.byRemotes(r, add); why != "" || err != nil {
-			return nil, why, err
+		w, err := g.byRemotes(r, add)
+		if err != nil {
+			return nil, "", err
 		}
-		if why, err := g.unknownNames(); why != "" || err != nil {
-			return nil, why, err
+		unsure(w)
+		if w, err = g.unknownNames(); err != nil {
+			return nil, "", err
 		}
+		unsure(w)
 	}
 	if skipped > 0 && skipped == len(call.Dirs) {
-		return nil, "every directory the call may run in is missing now (the command may create it before the call)", nil
+		unsure("every directory the call may run in is missing now (the command may create it before the call)")
 	}
-	return out, "", nil
+	return out, why, nil
 }
 
 // byRemotes adds every gated repository that shares an OWNER/REPO name with work tree r (not gated
@@ -384,69 +513,81 @@ func RetireRefusal(command string) string {
 		"in a terminal outside the agent session."
 }
 
-// check is the refusal for a merge in gated repository r ("" = allowed).
-func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (string, error) {
+// check is the refusal for a merge in gated repository r ("" = allowed); warning is the needs-live-check
+// line when it is allowed on a pass whose verdicts list suspect tests (#106).
+func (g *mergeGate) check(r *gatedRepo, call guard.GhMerge) (refusal, warning string, err error) {
+	form := call.Form()
 	if r.void != "" {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: its checklist approval is void (%s); approve the checklist "+
-			"again (checklist_set) and run release_check on the sha first.", Printable(r.main, 200), RedactPrintable(r.void, 200)), nil
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: its checklist approval is void (%s); approve the checklist "+
+			"again (checklist_set) and run release_check on the sha first.", form, Printable(r.main, 200), RedactPrintable(r.void, 200)), "", nil
 	}
 	where := fmt.Sprintf("%s (checklist %s v%d is approved)", Printable(r.main, 200), Printable(r.id, 80), r.version)
 	switch {
 	case call.DisableAuto && !call.Auto:
-		return "", nil // gh only turns auto-merge off
+		return "", "", nil // gh only turns auto-merge off
+	case call.Auto && call.API == guard.APIMergeGraphQL:
+		return MergeGatePrefix + "gh api graphql enablePullRequestAutoMerge in " + where + ": auto-merge merges a later head; " +
+			"merge without auto-merge, with expectedHeadOid of a commit release_check passed on.", "", nil
 	case call.Auto:
 		return MergeGatePrefix + "gh pr merge --auto in " + where + ": auto-merge merges a later head; merge without --auto, " +
-			"with --match-head-commit <sha> of a commit release_check passed on.", nil
+			"with --match-head-commit <sha> of a commit release_check passed on.", "", nil
 	case !call.HasMatchHead:
-		return MergeGatePrefix + "gh pr merge in " + where + " without --match-head-commit <full sha>; add the 40-hex sha " +
-			"release_check passed on.", nil
+		return MergeGatePrefix + form + " in " + where + " without " + call.PinForm() + "; add the 40-hex sha " +
+			"release_check passed on.", "", nil
 	}
 	sha := strings.ToLower(call.MatchHead)
 	if !fullSHA1Re.MatchString(sha) {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: --match-head-commit %q is not a full 40-hex sha.", where,
-			Printable(call.MatchHead, 80)), nil
+		pin := map[string]string{guard.APIMergeREST: "sha", guard.APIMergeGraphQL: "expectedHeadOid"}[call.API]
+		if pin == "" {
+			pin = "--match-head-commit"
+		}
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: %s %q is not a full 40-hex sha.", form, where, pin,
+			Printable(call.MatchHead, 80)), "", nil
 	}
 	p, err := g.m.Store.ReleasePassed(r.main, sha, r.id, r.version, r.hash)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if p == nil {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: release_check has not passed on %s at this checklist; "+
-			"run release_check(repo, sha) first.", where, sha), nil
+		// A pass on another sha (the checklist's release) lifts the gate once it is on origin's default
+		// branch: say so, a later fix PR is the usual case here.
+		shipped := ""
+		if s, err := g.shippedPass(r); err != nil {
+			return "", "", err
+		} else if s != "" {
+			shipped = fmt.Sprintf(" release_check passed on %s at this checklist: once that sha is on origin's default "+
+				"branch (a merge commit or a fast forward; a squash merge counts only for a branch that was up to date with "+
+				"its base (the identical tree)) and fetched into %s (git fetch origin), the daemon's next tick marks the "+
+				"checklist shipped and merges are no longer gated; otherwise release_check must pass on a sha on that "+
+				"branch, or the owner lifts the gate with agent-jobs gate retire (owner only).", s, Printable(r.main, 200))
+		}
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: release_check has not passed on %s at this checklist; "+
+			"run release_check(repo, sha) first.%s", form, where, sha, shipped), "", nil
 	}
 	// Evidence stored after the pass that release_check would fail on: a newer verdict for the sha, or a
 	// red manifest-check run. The pass then no longer counts until release_check runs again.
-	stale := ""
-	if red, err := g.m.Store.RedManifestCheck(r.main, sha, r.id, r.version, r.hash); err != nil {
-		return "", err
-	} else if red != nil {
-		stale = fmt.Sprintf("manifest-check of job %s exited %d after it", red.JobID, red.ExitCode)
-	}
-	vs, err := g.m.Store.VerdictsAt(r.main, r.id, r.version, sha)
+	stale, err := g.m.passStale(r, p)
 	if err != nil {
-		return "", err
-	}
-	latest := ""
-	for _, v := range vs {
-		if v.ChecklistSHA256 == r.hash {
-			latest = v.JobID
-		}
-	}
-	if stale == "" && latest != p.VerdictJob {
-		stale = fmt.Sprintf("the latest verdict for the sha is of job %s, the pass read job %s", latest, p.VerdictJob)
+		return "", "", err
 	}
 	if stale != "" {
-		return MergeGatePrefix + fmt.Sprintf("gh pr merge in %s: the release_check pass on %s is stale (%s); run "+
-			"release_check(repo, sha) again.", where, sha, RedactPrintable(stale, 200)), nil
+		return MergeGatePrefix + fmt.Sprintf("%s in %s: the release_check pass on %s is stale (%s); run "+
+			"release_check(repo, sha) again.", form, where, sha, RedactPrintable(stale, 200)), "", nil
 	}
-	return "", nil
+	live, err := g.m.passLiveChecks(r, p)
+	if err != nil || len(live) == 0 {
+		return "", "", err
+	}
+	return "", MergeGateWarnPrefix + RedactPrintable(fmt.Sprintf("%s in %s: release_check passed on %s; live check needed: %d test(s) "+
+		"the judge could not prove offline (%s); check them on a live run.", form, Printable(r.main, 200), sha, len(live),
+		quoteList(live[:min(len(live), 3)])), 900), nil
 }
 
 // repo reads the checklist state of a main work tree (cached), without the checklist lock like the
 // brief reminder: a read that races a checklist_set can misjudge one call. A repository never approved,
-// or retired by the owner since its latest approval, is not gated; one approved once stays gated (void
-// when its checklist is not approved now, also when the file or the work tree is gone); a store error is
-// returned.
+// or retired by the owner since its latest approval, or whose valid latest approval shipped (#99), is
+// not gated; one approved once stays gated (void when its checklist is not approved now, also when the
+// file or the work tree is gone, and also when it shipped); a store error is returned.
 func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if r, ok := g.repos[main]; ok {
 		return r, nil
@@ -456,12 +597,13 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 		return nil, err
 	}
 	r := &gatedRepo{main: main}
+	var rec store.GateRepo
 	if last != nil {
-		rec, err := g.m.Store.GateRepoOf(main)
-		if err != nil {
+		if rec, err = g.m.Store.GateRepoOf(main); err != nil {
 			return nil, err
 		}
 		if last.Seq <= rec.RetiredSeq {
+			r.retired = true
 			g.repos[main] = r // retired: out of the gate until it is approved again
 			return r, nil
 		}
@@ -488,13 +630,29 @@ func (g *mergeGate) repo(main string) (*gatedRepo, error) {
 	if err != nil {
 		return voided(checklist.ChecklistRel + " does not parse: " + err.Error())
 	}
-	approved, hash, reason, _, err := g.m.ChecklistStatus(main, c, f.Brief)
+	approved, hash, reason, cur, err := g.m.ChecklistStatus(main, c, f.Brief)
 	if err != nil {
 		return nil, err
 	}
 	r.id, r.version, r.hash = c.ID, c.Version, hash
 	if !approved {
 		return voided(reason)
+	}
+	if cur != nil {
+		r.seq = cur.Seq
+	}
+	// Shipped (#99): the daemon saw a pass at this approval on origin's default branch; the pass must still
+	// count (stored, not stale), else the approval gates as before.
+	if cur != nil && rec.ShippedSeq == cur.Seq && rec.ShippedSHA != "" {
+		ok, err := g.m.passCounts(r, rec.ShippedSHA)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			r.shipped, r.shippedAt = rec.ShippedSHA, rec.ShippedAt
+			g.repos[main] = r
+			return r, nil
+		}
 	}
 	r.gated = true
 	g.repos[main] = r

@@ -105,6 +105,17 @@ const usage = `usage: agent-jobs <command> [flags]
                                            later checklist approval gates it again
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
+  milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
+                                           the milestones (milestone_list): by repo, order, creation
+  milestone  --agent A <id> [--json]       one milestone's tree (milestone_get): tasks with their
+                                           derived status and jobs, ready tasks, progress
+  milestone create --agent A --input F|- [--title T]
+                                           create a milestone with its tasks (milestone_create): F
+                                           holds its JSON input or only the tasks array ("-" = stdin);
+                                           prints the tree as JSON
+  milestone set --agent A <id> [--input F|-] [--title T] [--status S] [--close-note N]
+                                           edit a milestone (milestone_set): F as for create, the
+                                           flags over it; prints the tree as JSON
   schedules  --agent A [--json]            the agent's schedules (schedule_* MCP tools): cron in local
                                            time, delivery (session or job kind), next and last firing
   checks     --agent A [--json]            the agent's dead-man's switch checks (check_* MCP tools):
@@ -128,6 +139,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            on stdin): in a repo with an approved checklist, blocks
                                            gh pr merge (exit 2) unless --match-head-commit <sha> names
                                            a sha release_check passed on; no-op inside a job
+  hook skills-picker                       PreToolUse hook on milestone_create and job_start of the
+                                           orchestrator session (JSON on stdin): asks for skills once
+                                           per milestone (tasks without a skills list), not on
+                                           job_start of a task; never blocks, reads no state
   doctor procs --agent A [--kill] [--json] processes that outlived their job or session, running
                                            rows with a dead pid; report only unless --kill
   heartbeat run-now --agent A [--dry-run]  one heartbeat now (config heartbeat; the interval is
@@ -158,9 +173,7 @@ func main() {
 	}
 	cmd, args := os.Args[1], os.Args[2:]
 	if reason := refuseInsideJob(cmd, args); reason != "" {
-		// The brief reminder always exits 0, and the merge gate is a no-op in a job (a job never merges): inside
-		// a job both end here, silently, before any state is opened.
-		if cmd == "hook" && len(args) > 0 && (args[0] == "brief-reminder" || args[0] == "merge-gate") {
+		if silentInsideJob(cmd, args) {
 			os.Exit(0)
 		}
 		fmt.Fprintln(os.Stderr, "agent-jobs:", reason)
@@ -210,6 +223,10 @@ func main() {
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
+	case "milestones":
+		err = cmdMilestones(args)
+	case "milestone":
+		err = cmdMilestone(args)
 	case "schedules":
 		err = cmdSchedules(args)
 	case "checks":
@@ -342,6 +359,9 @@ func runGuard(args []string, stdin io.Reader) int {
 	readOnly := fs.String("read-only", "", "the worktree of a review job: no tool call writes inside it")
 	var readAllow multi
 	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
+	var sources multi
+	fs.Var(&sources, "sources", "the job's cloned sources dir: read-only, its code never runs on the host (repeatable)")
+	sandbox := fs.String("sandbox", "", "the job's sandbox dir: its copies run only in docker run --rm with one -v mount from it")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -363,6 +383,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
 		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
+		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob),
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -374,6 +395,15 @@ func runGuard(args []string, stdin io.Reader) int {
 		return 2 // exit 2 = block the tool call, stderr goes back to the model
 	}
 	return 0
+}
+
+// guardJobID is the job id the guard names sandbox containers by: the job marker the wrapper sets,
+// else the daemon's --subagent-job.
+func guardJobID(subagentJob string) string {
+	if id, ok := jobs.InsideJob(); ok && id != "" {
+		return id
+	}
+	return subagentJob
 }
 
 // parse parses flags allowing positional args before or after them.
@@ -486,10 +516,18 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	var sources multi
+	fs.Var(&sources, "source", "disabled until OS-level isolation lands (G02 deferred): any value is refused")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
+	if len(sources) > 0 {
+		return jobs.ErrSourcesDisabled // refused before the store is opened (Enqueue refuses it too)
+	}
 	r.Skills = skills.ParseEdits(*skillEdits)
+	if len(sources) > 0 {
+		r.Sources = sources
+	}
 	switch {
 	case *brief != "":
 		r.Brief = *brief
@@ -575,6 +613,9 @@ func cmdStatus(args []string) error {
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
 		}
+		if err := printMergeGates(m); err != nil {
+			return err
+		}
 		if err := printUndelivered(m); err != nil {
 			return err
 		}
@@ -602,6 +643,9 @@ func cmdStatus(args []string) error {
 		if j.SkillsNote != "" {
 			fmt.Printf("           %s\n", j.SkillsNote)
 		}
+	}
+	if len(j.Sources) > 0 {
+		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if p := m.PrepareResultOf(j); p != nil {
@@ -694,6 +738,19 @@ func printHTTPAPI(m *jobs.Manager) {
 	default:
 		fmt.Println(c.Detail)
 	}
+}
+
+// printMergeGates is the merge gate part of `status` without a job id: one line per repository with a
+// stored checklist approval (gated, void, retired, or shipped with its sha, #99).
+func printMergeGates(m *jobs.Manager) error {
+	views, err := m.MergeGates()
+	if err != nil {
+		return err
+	}
+	for _, v := range views {
+		fmt.Printf("merge gate: %s\n", jobs.MergeGateText(v))
+	}
+	return nil
 }
 
 // printUndelivered is the end of `status` without a job id: notify_owner notifications of the last
@@ -1965,6 +2022,9 @@ func cmdDoctor(args []string) error {
 	for _, r := range rep.DeadRows {
 		fmt.Printf("row   %s  pid %d  %s  (%s)\n", r.ID, r.PID, r.Reason, r.Title)
 	}
+	for _, id := range rep.PendingContainers {
+		fmt.Printf("containers %s  sandbox containers not removed yet (containers.pending; retried every tick)\n", id)
+	}
 	for _, g := range rep.Ghosts {
 		state := ""
 		switch {
@@ -1983,6 +2043,13 @@ func cmdDoctor(args []string) error {
 	return nil
 }
 
+// silentInsideJob reports whether a command refused inside a job ends there silently with exit 0: the
+// brief reminder and the skills picker always exit 0, and the merge gate is a no-op in a job (a job never
+// merges); they end before any state is opened.
+func silentInsideJob(cmd string, args []string) bool {
+	return cmd == "hook" && len(args) > 0 && (args[0] == "brief-reminder" || args[0] == "merge-gate" || args[0] == "skills-picker")
+}
+
 // runHook serves the hooks of the orchestrator session (Claude Code hook JSON on stdin):
 //
 //	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds, only
@@ -1995,6 +2062,8 @@ func cmdDoctor(args []string) error {
 //	hook merge-gate --agent A
 //	                      PreToolUse hook on Bash: blocks gh pr merge in a repo with an approved checklist
 //	                      unless release_check passed on its --match-head-commit sha (mergeGateHook)
+//	hook skills-picker    PreToolUse hook on milestone_create and job_start: adds context asking for the
+//	                      tasks' skills once per milestone (skillsPickerHook); always exits 0
 //
 // Both fail open: any error (bad or incomplete input, no store, a job session) exits 1 without
 // output, a non-blocking hook error (exit 2 would block); a failed bind keeps the old binding. The
@@ -2006,7 +2075,10 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		sub = args[0]
 	}
 	if sub == "merge-gate" {
-		return mergeGateHook(args[1:], stdin, stderr, openReadOnly)
+		return mergeGateHook(args[1:], stdin, stdout, stderr, openReadOnly)
+	}
+	if sub == "skills-picker" {
+		return skillsPickerHook(args[1:], stdin, stdout, stderr)
 	}
 	if sub == "brief-reminder" {
 		type answer struct {
@@ -2045,7 +2117,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		return 1
 	}
 	if sub != "stop" && sub != "bind" {
-		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder|merge-gate --agent A (Claude Code Stop / " +
+		return fail(errors.New("usage: agent-jobs hook stop|bind|brief-reminder|merge-gate|skills-picker --agent A (Claude Code Stop / " +
 			"SessionStart / UserPromptSubmit / PreToolUse hook, JSON on stdin)"))
 	}
 	fs := flag.NewFlagSet("hook "+sub, flag.ContinueOnError)
@@ -2113,8 +2185,9 @@ const mergeGateTimeout = 5 * time.Second
 // one line on stderr (Claude Code shows it to the model). A call that does not run `gh pr merge` (and
 // cannot) is allowed before the store is opened; for one that does or may, every error blocks (fail
 // closed): bad flags, an unreadable input, the store, a timeout. A job session (ErrInJobSession) is a
-// no-op, like the job-role refusal in main.
-func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
+// no-op, like the job-role refusal in main. A merge it cannot read runs (exit 0) with a warning as hook
+// JSON on stdout (mergeGateWarningJSON).
+func mergeGateHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener func(string) (*jobs.Manager, error)) int {
 	block := func(reason string) int {
 		fmt.Fprintln(stderr, reason)
 		return 2
@@ -2141,19 +2214,20 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 			"agent-jobs hook merge-gate --agent A")
 	}
 	type answer struct {
-		reason string
-		err    error
+		reason  string
+		warning string
+		err     error
 	}
 	done := make(chan answer, 1)
 	go func() {
 		m, err := opener(*agent)
 		if err != nil {
-			done <- answer{"", err}
+			done <- answer{"", "", err}
 			return
 		}
 		defer m.Close()
-		r, err := m.MergeGate(in.Cwd, in.Command, os.Getenv("GH_REPO"))
-		done <- answer{r, err}
+		r, err := m.MergeGateCheck(in.Cwd, in.Command, os.Getenv("GH_REPO"))
+		done <- answer{r.Refusal, r.Warning, err}
 	}()
 	var a answer
 	select {
@@ -2168,8 +2242,37 @@ func mergeGateHook(args []string, stdin io.Reader, stderr io.Writer, opener func
 		return block(jobs.MergeGatePrefix + "cannot check the merge (" + jobs.RedactPrintable(a.err.Error(), 300) + ")")
 	case a.reason != "":
 		return block(a.reason)
+	case a.warning != "":
+		// The command runs (exit 0). Claude Code drops the stderr of a hook that exits 0, so the warning is
+		// hook JSON on stdout (mergeGateWarningJSON).
+		if err := json.NewEncoder(stdout).Encode(mergeGateWarningJSON(a.warning)); err != nil {
+			fmt.Fprintln(stderr, a.warning) // the transcript still has it; the warning never blocks
+		}
 	}
 	return 0
+}
+
+// preToolUseOutput is the PreToolUse hook JSON the merge hook prints with a warning.
+type preToolUseOutput struct {
+	HookSpecificOutput preToolUseSpecific `json:"hookSpecificOutput"`
+	SystemMessage      string             `json:"systemMessage"`
+}
+
+type preToolUseSpecific struct {
+	HookEventName     string `json:"hookEventName"`
+	AdditionalContext string `json:"additionalContext"`
+}
+
+// mergeGateWarningJSON is the hook output for a merge the gate cannot read: hookSpecificOutput's
+// additionalContext is added to the model's context (the form examples/hooks/prefer-jobs-reminder.sh
+// uses, docs/WORKFLOW.md), systemMessage shows the same line to the user. It carries no
+// permissionDecision: "allow" would skip the session's permission prompts for the command, and its
+// permissionDecisionReason is shown to the user only, not to the model.
+func mergeGateWarningJSON(warning string) preToolUseOutput {
+	return preToolUseOutput{
+		HookSpecificOutput: preToolUseSpecific{HookEventName: "PreToolUse", AdditionalContext: warning},
+		SystemMessage:      warning,
+	}
 }
 
 // briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
@@ -2199,6 +2302,44 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 	}
 	defer m.Close()
 	return m.BriefReminder(in)
+}
+
+// skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
+// nothing when it has none. It reads only its input (no state; --agent is accepted and not needed) and
+// always exits 0: an error goes to stderr and the call goes on.
+func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	agentFlag(fs)
+	pos, err := parse(fs, args)
+	if err == nil && len(pos) > 0 {
+		err = errors.New("no positional arguments")
+	}
+	var msg string
+	if err == nil {
+		msg, err = jobs.SkillsPicker(stdin)
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", jobs.Printable(err.Error(), 300), "(no reminder)")
+		return 0
+	}
+	if msg == "" {
+		return 0
+	}
+	type specific struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	}
+	b, err := json.Marshal(struct {
+		HookSpecificOutput specific `json:"hookSpecificOutput"`
+	}{specific{"PreToolUse", msg}})
+	if err == nil {
+		_, err = fmt.Fprintln(stdout, string(b))
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+	}
+	return 0
 }
 
 // openReadOnly is open for the brief reminder: the existing state for reads only (jobs.OpenReadOnly),

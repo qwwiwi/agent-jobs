@@ -46,6 +46,10 @@ type pathScope struct {
 	writeUnknown bool                     // an earlier write target cannot be resolved
 	expired      bool                     // the budget ran out: every further check reports a hit
 	inodes       *inodeSet                // set by checkProtected: a hard link of a protected file is a hit too
+	// sources marks the read-only check of a job's sources (checkSourcesWrite, G02): its refusals name the
+	// sources, git and inline code are refused only when they point there, and a word expanded at run time
+	// is a hit only when it names a sources folder (the clone's 0444/0555 modes are the first layer).
+	sources bool
 }
 
 // newPathScope walks every command of the call (substitutions and `sh -c` code included) and

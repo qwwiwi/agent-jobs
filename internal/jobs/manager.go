@@ -73,6 +73,16 @@ type Manager struct {
 
 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
 
+	// prefetching is set while the daemon's background clone run (prefetchInBackground) is on; prefetchWG
+	// waits for it.
+	prefetching atomic.Bool
+	prefetchWG  sync.WaitGroup
+	// sourcesRetryAt holds, per job id, when clones that could not record their outcome are tried again
+	// (time.Time, sourcesRetryBackoff after the failure).
+	sourcesRetryAt sync.Map
+	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
+	beforeClaim func(*store.Job)
+
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
 	codexProbeKey string             // the codex binary identity it ran on (codexBinKey)
@@ -180,6 +190,18 @@ type StartRequest struct {
 	SizeRule bool
 	// Gate is the daemon's input of a gate job (StartGate only; Wave F, F3 / F5).
 	Gate *store.GateInput
+	// Milestone and Task attach the job to a task of a milestone (both or neither): the task must not
+	// be blocked or dropped, and the milestone's branch is the default base. Without Skills (nil) the
+	// job gets the task's planned skills (G01).
+	Milestone int64
+	Task      string
+	// Sources are https git URLs cloned read-only into the job folder before it starts (G02); nil = not
+	// given (a task job then takes its task's planned sources), empty = none.
+	Sources []string
+	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
+	plannedSkills bool
+	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
+	plannedSources bool
 }
 
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
@@ -260,18 +282,54 @@ func (m *Manager) spawnEnv(unit string) []string {
 	return env
 }
 
+// gitTimeout bounds one of the daemon's git calls (git, gitEnv, gitHistory): a git that hangs (a lock,
+// a stalled network file system, a prompt) fails with errGitTimeout and its process group is killed
+// instead of stalling the tick (#100). gitLongTimeout is for the calls whose work grows with the work
+// tree (gitLong: worktree add and remove, status, diff, apply). Variables only so that tests shorten them.
+var (
+	gitTimeout     = 30 * time.Second
+	gitLongTimeout = 10 * time.Minute
+)
+
+// errGitTimeout is a git call that ran past its timeout.
+var errGitTimeout = errors.New("git timed out")
+
 func git(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
-	out, err := cmd.Output()
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(ee.Stderr)))
-		}
-		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	return gitEnv(dir, daemonGitEnv(), args...)
+}
+
+// gitLong is git with gitLongTimeout.
+func gitLong(dir string, args ...string) (string, error) {
+	return gitEnvTimeout(gitLongTimeout, dir, daemonGitEnv(), args...)
+}
+
+// gitEnv is git with environment env.
+func gitEnv(dir string, env []string, args ...string) (string, error) {
+	return gitEnvTimeout(gitTimeout, dir, env, args...)
+}
+
+// gitEnvTimeout is gitEnv bounded by timeout, with stdout trimmed.
+func gitEnvTimeout(timeout time.Duration, dir string, env []string, args ...string) (string, error) {
+	out, err := gitBytes(timeout, dir, env, args...)
+	return strings.TrimSpace(string(out)), err
+}
+
+// gitBytes runs git -C dir args bounded by timeout (runGit) and returns stdout as it is. Past the
+// timeout git's whole process group is killed and the error wraps errGitTimeout; GIT_TERMINAL_PROMPT=0
+// is set whatever env holds: git never waits on a prompt.
+func gitBytes(timeout time.Duration, dir string, env []string, args ...string) ([]byte, error) {
+	out, stderr, err := runGitFor(timeout, "", env, append([]string{"-C", dir}, args...)...)
+	if errors.Is(err, errGitTimeout) {
+		return nil, fmt.Errorf("git %s: %w after %s", strings.Join(args, " "), errGitTimeout, timeout)
 	}
-	return strings.TrimSpace(string(out)), nil
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return out, nil
 }
 
 // Enqueue validates the request and inserts a queued job. It returns immediately. A codex job past the
@@ -335,6 +393,23 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := checkGateRequest(r); err != nil {
 		return nil, err
 	}
+	if err := m.milestoneStart(&r); err != nil {
+		return nil, err
+	}
+	if err := refuseSources(r.Sources); err != nil {
+		if r.plannedSources {
+			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
+				"it without them, or clear them with milestone_set sources: [])", err, r.Task, r.Milestone)
+		}
+		return nil, err
+	}
+	sources, err := ValidateSources(r.Sources)
+	if err != nil {
+		return nil, err
+	}
+	if len(sources) > 0 && r.Gate != nil {
+		return nil, errors.New("a gate job gets nothing but its input: no sources")
+	}
 	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -346,6 +421,15 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	runner, err := ResolveRunner(r.Runner, model)
 	if err != nil {
 		return nil, err
+	}
+	if len(sources) > 0 && runner == store.RunnerCodex {
+		// The guard keeps cloned code off the host; codex runs its own sandbox, without the guard.
+		msg := "sources need the guard, which does not run inside codex: start a claude job for them"
+		if r.plannedSources {
+			msg += fmt.Sprintf(" (the sources planned for task %s of milestone %d: give job_start sources: [] to "+
+				"run it on codex without them)", r.Task, r.Milestone)
+		}
+		return nil, errors.New(msg)
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
@@ -420,6 +504,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 	} else if r.Gate == nil {
 		selected, err = m.selectSkills(r.Kind, repo, r.Skills)
+		if err != nil && r.plannedSkills {
+			return nil, fmt.Errorf("%w (the skills planned for task %s of milestone %d: give job_start skills of its own, "+
+				"or change the plan with milestone_set)", err, r.Task, r.Milestone)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -432,6 +520,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		MilestoneID: r.Milestone, TaskKey: r.Task, Sources: sources,
 	}
 	return j, nil
 }
@@ -442,7 +531,22 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 // notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
 func (m *Manager) Tick() error {
 	m.RefreshDaemonConfig()
+	// Sources are cloned outside the lifecycle lock (prefetchSources): in the background in the daemon,
+	// inline in a manual tick (none while a daemon runs: it clones them).
+	if m.daemonLockHeld {
+		m.prefetchInBackground()
+	} else if d, derr := m.ReadDaemonInfo(); derr != nil || !alive(d.PID) {
+		m.prefetchSources()
+	}
 	err := m.tickLocked()
+	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
+	// docker call may take up to containerCmdTimeout.
+	m.retryContainerCleanups()
+	// A checklist whose release shipped stops gating merges (#99): recorded here for the merge hook,
+	// which opens the store read-only.
+	if serr := m.MarkShippedGates(); serr != nil {
+		err = errors.Join(err, fmt.Errorf("merge gate shipped: %w", serr))
+	}
 	// The checks' missed alerts are typed after the lifecycle lock is released: a stalled tmux
 	// holds only tmux.lock, never the lifecycle (cancel, a manual tick, the other daemon).
 	if derr := m.deliverCheckAlerts(); derr != nil {
@@ -541,14 +645,46 @@ func (m *Manager) launchQueued() error {
 	}
 	limit := m.Config().MaxRunningJobs()
 	for _, j := range queued {
+		if err := refuseSources(j.Sources); err != nil {
+			// G02 is deferred: a stored job with sources never starts and nothing clones them.
+			m.cancelQueued(j, "cancelled before start: "+err.Error())
+			continue
+		}
 		if running >= limit {
 			return nil
 		}
+		if j.MilestoneID != 0 {
+			// A job on a task is checked again: its milestone may have changed since job_start. It waits for
+			// its dependencies and a slot of the milestone (max_parallel); one that can no longer run (the
+			// milestone closed, the task dropped) is cancelled with the reason.
+			wait, cancel, err := m.milestoneLaunch(context.Background(), j)
+			if err != nil {
+				m.Log.Printf("job %s: milestone check: %v", j.ID, err)
+				continue
+			}
+			if cancel != "" {
+				m.cancelQueued(j, "cancelled before start: "+cancel)
+				continue
+			}
+			if wait != "" {
+				continue
+			}
+		}
+		if needsClone(j) && !m.sourcesCloned(j) {
+			continue // its sources are cloned outside the lifecycle lock (prefetchSources); it starts once they are
+		}
+		if m.beforeClaim != nil {
+			m.beforeClaim(j)
+		}
 		token := newToken()
 		// The row is ours (running + token) before anything is created or spawned.
-		if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		if err := m.claim(j, token); err != nil {
 			if errors.Is(err, store.ErrImmutable) {
 				continue // cancelled or taken meanwhile
+			}
+			if errors.Is(err, errMilestoneChanged) {
+				m.Log.Printf("job %s: its milestone changed before the claim; checked again next tick", j.ID)
+				continue
 			}
 			return err
 		}
@@ -572,6 +708,45 @@ func (m *Manager) launchQueued() error {
 		}
 	}
 	return nil
+}
+
+// errMilestoneChanged: the launch check, taken again inside the claim, no longer lets the job start.
+var errMilestoneChanged = errors.New("the milestone changed since the launch check")
+
+// claim moves queued job j to running under token. A job on a task is claimed with its launch check taken
+// again inside the claim's write transaction (launchVerdict): a milestone edit, a job or an outcome
+// committed after launchQueued's check (a dependency added, the task dropped, the milestone closed)
+// cannot let it start. It stays queued (errMilestoneChanged); the next tick waits or cancels.
+func (m *Manager) claim(j *store.Job, token string) error {
+	if j.MilestoneID == 0 {
+		return m.Store.Claim(j.ID, token, m.Now())
+	}
+	return m.Store.ClaimOnMilestone(j.ID, token, m.Now(), j.MilestoneID,
+		func(ms *store.Milestone, tasks []store.MilestoneTask, jobs []*store.Job) error {
+			if wait, cancel := launchVerdict(j, ms, tasks, jobs); wait != "" || cancel != "" {
+				return errMilestoneChanged
+			}
+			return nil
+		})
+}
+
+// cancelQueued ends a queued job that may not start (launchQueued holds the lifecycle lock) as
+// cancelled with reason, as Cancel would.
+func (m *Manager) cancelQueued(j *store.Job, reason string) {
+	unlockAdmit, err := lockAdmitIfExists(m.JobDir(j.ID))
+	if err != nil {
+		m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		return
+	}
+	defer unlockAdmit()
+	if err := m.Store.Finish(j.ID, "", store.StatusCancelled, 0, 0, 0, RedactPrintable(reason, 300), m.Now()); err != nil {
+		if !errors.Is(err, store.ErrImmutable) {
+			m.Log.Printf("job %s: cancel: %v", j.ID, err)
+		}
+		return
+	}
+	m.Log.Printf("job %s %s", j.ID, RedactText(reason))
+	m.settled(j.ID)
 }
 
 // ClaudeArgs is the reference command line (prompt.md arrives on stdin) with a pre-assigned session
@@ -634,6 +809,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 	}
 	var plan launchPlan
 	var codexSandbox string // a codex job's `codex exec --sandbox` value
+	var codexNetwork bool   // a codex write job's network (CodexNetworkOverride)
 	launchCfg := m.Config()
 	if j.Runner == store.RunnerCodex || j.AcceptanceCmd != "" || j.Kind == KindJudge {
 		launchCfg, err = m.authorizedLaunchConfig()
@@ -659,6 +835,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		if codexSandbox, err = m.codexLaunchSandbox(launchCfg, j.Kind); err != nil {
 			return err
 		}
+		codexNetwork = codexSandbox == CodexSandboxWrite && launchCfg.CodexWriteNetworkOn()
 	}
 	if j.Attempt > 1 {
 		p, err := m.prepareResume(j, token)
@@ -689,7 +866,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			if err := checkCodexIdentity(m.JobDir(j.ID), j.RepoPath, m.jobSpawnEnv(), launchCfg.OwnerNames); err != nil {
 				return err
 			}
-			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
+			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox, m.JobDir(j.ID), codexNetwork),
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
 	}
@@ -710,6 +887,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,
 		AcceptanceAllowed: (j.AcceptanceCmd != "" || j.Kind == KindJudge) && launchCfg.AcceptanceAllowed,
 		CodexSandbox:      codexSandbox,
+		CodexNetwork:      codexNetwork,
 	}); err != nil {
 		return fmt.Errorf("record launch authorization: %w", err)
 	}
@@ -1680,6 +1858,9 @@ func (m *Manager) sweepEscaped(id string) string {
 			continue
 		}
 		why := "leads its own session, never killed"
+		if g.Kind == GhostSuspect {
+			why = "runs a binary from the job's temp dir, never killed"
+		}
 		if g.KillError != "" {
 			why = g.KillError
 		}

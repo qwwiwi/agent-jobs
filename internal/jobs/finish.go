@@ -181,7 +181,7 @@ func (m *Manager) noteReviewChanges(j *store.Job) {
 	}
 	if err == nil {
 		var st string
-		if st, err = git(work, "status", "--porcelain", "--untracked-files=all"); err == nil && st != "" {
+		if st, err = gitLong(work, "status", "--porcelain", "--untracked-files=all"); err == nil && st != "" {
 			what = append(what, fmt.Sprintf("%d changed or untracked paths", len(strings.Split(st, "\n"))))
 		}
 	}
@@ -579,7 +579,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 		}
 	}
 	// --no-ext-diff --no-textconv: the job may have set diff.external / a textconv in the repo config.
-	stat, err := git(work, "diff", "--no-ext-diff", "--no-textconv", "--stat", j.BaseCommit)
+	stat, err := gitLong(work, "diff", "--no-ext-diff", "--no-textconv", "--stat", j.BaseCommit)
 	if err != nil {
 		return err
 	}
@@ -615,7 +615,7 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if _, err := git(j.RepoPath, "update-ref", "refs/agent-jobs/jobs/"+j.ID, head); err != nil {
 		return err
 	}
-	if _, err := git(j.RepoPath, "worktree", "remove", "--force", work); err != nil {
+	if _, err := gitLong(j.RepoPath, "worktree", "remove", "--force", work); err != nil {
 		return err
 	}
 	m.Log.Printf("job %s: worktree removed, patches saved, ref refs/agent-jobs/jobs/%s -> %s", j.ID, j.ID, head)
@@ -635,10 +635,19 @@ func driverKey(k string) bool {
 // followed (an included file reports the scope of the file that includes it). The daemon owner's
 // global/system config (e.g. filter.lfs) is not the job's and does not count.
 func repoDrivers(work string) ([]string, error) {
-	out, err := gitRaw(work, "config", "--list", "--show-scope", "--name-only", "--includes", "-z")
+	out, err := gitRaw(work, repoDriversArgs...)
 	if err != nil {
 		return nil, err
 	}
+	return driverKeys(out), nil
+}
+
+// repoDriversArgs lists the config keys with their scopes for driverKeys.
+var repoDriversArgs = []string{"config", "--list", "--show-scope", "--name-only", "--includes", "-z"}
+
+// driverKeys returns the driver keys (driverKey) of scope local or worktree in the output of
+// `git` repoDriversArgs.
+func driverKeys(out []byte) []string {
 	f := strings.Split(string(out), "\x00")
 	var keys []string
 	for i := 0; i+1 < len(f); i += 2 {
@@ -647,7 +656,7 @@ func repoDrivers(work string) ([]string, error) {
 			keys = append(keys, k)
 		}
 	}
-	return keys, nil
+	return keys
 }
 
 // keepWithDrivers is the cleanup of a job whose repository config names filter/diff drivers: any
@@ -726,15 +735,8 @@ func writeTar(dst, root string, files []string) error {
 	return os.Rename(tmp, dst)
 }
 
-// gitRaw returns raw stdout (patches must not be trimmed).
+// gitRaw returns raw stdout (patches must not be trimmed), bounded by gitLongTimeout: Cleanup runs it
+// under the lifecycle lock (#100).
 func gitRaw(dir string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = daemonGitEnv()
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return out, nil
+	return gitBytes(gitLongTimeout, dir, daemonGitEnv(), args...)
 }

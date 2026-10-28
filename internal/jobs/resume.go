@@ -300,7 +300,7 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 		}
 		return nil
 	}
-	st, err := git(work, append([]string{"status", "--porcelain", "--ignored", "--untracked-files=all", "--"},
+	st, err := gitLong(work, append([]string{"status", "--porcelain", "--ignored", "--untracked-files=all", "--"},
 		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
@@ -314,7 +314,7 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 			changed = append(changed, l)
 		}
 	}
-	diff, err := git(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
+	diff, err := gitLong(work, append([]string{"diff", "--name-only", "--no-ext-diff", "--no-textconv", j.BaseCommit, "--"},
 		projectClaudePathspecs...)...)
 	if err != nil {
 		return err
@@ -656,6 +656,48 @@ func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.Resume
 	return out, nil
 }
 
+// ResumeBudget tells what a job_resume of the stopped job j can still get (issue #85): the cost its
+// attempts count against the budget ceiling, what is left, and, when a ceiling has nothing left, that a
+// resume is impossible and what to do instead. The accounting is resumeLimits'.
+func (m *Manager) ResumeBudget(j *store.Job) (string, error) {
+	earlier, err := m.Store.Attempts(j.ID)
+	if err != nil {
+		return "", err
+	}
+	return resumeBudgetNote(j, earlier), nil
+}
+
+// resumeBudgetNote is ResumeBudget for the job row j and its archived attempts.
+func resumeBudgetNote(j *store.Job, earlier []store.Attempt) string {
+	usedTurns, usedCost, usedMin := attemptsUsage(j, earlier)
+	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
+	counted := fmt.Sprintf("this job's attempts count $%.2f of the $%.0f budget ceiling", usedCost, CeilingMaxBudgetUSD)
+	if j.CostUnknown {
+		counted += fmt.Sprintf(" (this attempt ended before its cost was reported, so it counts at its whole $%.2f budget)", j.MaxBudgetUSD)
+	}
+	var none []string
+	if leftBudget < 0.01 {
+		none = append(none, "no budget")
+	}
+	if leftTurns < 1 {
+		none = append(none, fmt.Sprintf("no turns (%d of %d used)", usedTurns, CeilingMaxTurns))
+	}
+	if leftMin < 1 {
+		none = append(none, fmt.Sprintf("no time (%d of %d minutes used)", usedMin, CeilingTimeoutMinutes))
+	}
+	if len(none) > 0 {
+		return fmt.Sprintf("resume impossible: %s; the across-attempt ceilings leave %s, so job_resume will be refused. "+
+			"To continue, commit the work in progress in the job's work dir (a WIP commit) and start a new job from that commit.",
+			counted, strings.Join(none, ", "))
+	}
+	next := cents(j.MaxBudgetUSD - chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD))
+	def := fmt.Sprintf("job_resume's default max_budget_usd is $%.2f", math.Min(next, leftBudget))
+	if next < 0.01 {
+		def = "job_resume needs max_budget_usd"
+	}
+	return fmt.Sprintf("%s, $%.2f left for job_resume (%s, at most $%.2f).", counted, leftBudget, def, leftBudget)
+}
+
 // updateBlock is the orchestrator update as it is appended to a brief or sent to a session.
 func updateBlock(context string) string {
 	return "## Orchestrator update\n\n" + strings.TrimSpace(context) + "\n"
@@ -690,6 +732,12 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it; start a new one with %s_start",
 			id, j.Kind, j.Kind)
 	}
+	if err := m.milestoneResumable(j); err != nil {
+		return nil, err
+	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -714,9 +762,13 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 
 // queueResume checks that the attempt of j (stopped, timed out or failed, after it ran) can be
 // resumed and queues the next attempt with the update; limits: see resumeLimits. The caller holds
-// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it.
+// the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it, so the
+// sources refusal here guards every path that requeues a job that ran.
 func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	id := j.ID
+	if err := refuseSources(j.Sources); err != nil {
+		return fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
+	}
 	if j.Runner == store.RunnerCodex {
 		return fmt.Errorf("job %s: %w", id, errCodexResume)
 	}
@@ -795,6 +847,9 @@ func (m *Manager) Amend(id, context string) (*store.Job, error) {
 	if IsGateKind(j.Kind) {
 		return nil, fmt.Errorf("job %s is a %s job: its input is the daemon's, an update cannot join it (cancel it and start a new one)",
 			id, j.Kind)
+	}
+	if err := refuseSources(j.Sources); err != nil {
+		return nil, fmt.Errorf("job %s carries sources: %w; cancel it and start a new job without them", id, err)
 	}
 	if j.Attempt > 0 {
 		err = m.Store.AmendContext(id, "\n\n"+strings.TrimSpace(context))
@@ -966,15 +1021,25 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if err := m.refreshJobFiles(j, dir, gitDirs...); err != nil {
 		return launchPlan{}, err
 	}
+	// One read of the dependencies feeds the prior results of both prompts (the resumed session's update
+	// and the fallback prompt) and the prior/ folder, which is rewritten from it.
+	prior := m.priorSnapshot(j)
+	if err := m.writePriorReports(prior, dir); err != nil {
+		return launchPlan{}, err
+	}
 	update := m.resumeMessage(j)
-	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(update)); err != nil {
+	resumed := update
+	if section := m.priorResults(j, prior); section != "" {
+		resumed += "\nThe prior results, read again for this attempt (prior/ was rewritten from the same read):\n\n" + section
+	}
+	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
 	}
 	var notes MemoryNotes
 	if !IsGateKind(j.Kind) { // a gate job's input is the daemon's: no memory notes
 		notes = m.LookupMemoryNotes(j)
 	}
-	brief, err := m.BuildPrompt(j, rules, cards, notes)
+	brief, err := m.buildPrompt(j, rules, cards, notes, prior, m.sourcesOnDisk(j))
 	if err != nil {
 		return launchPlan{}, err
 	}
@@ -1057,7 +1122,7 @@ func (m *Manager) restoreWorktree(j *store.Job, work string) error {
 	if err != nil {
 		return fmt.Errorf("no saved ref of the job (start a new job instead): %w", err)
 	}
-	if _, err := git(j.RepoPath, "worktree", "add", "--detach", work, head); err != nil {
+	if _, err := gitLong(j.RepoPath, "worktree", "add", "--detach", work, head); err != nil {
 		return err
 	}
 	if err := m.markWorktree(j, work); err != nil {
@@ -1074,7 +1139,7 @@ func (m *Manager) restoreWorktree(j *store.Job, work string) error {
 		if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
 			continue
 		}
-		if _, err := git(work, append(p.args, path)...); err != nil {
+		if _, err := gitLong(work, append(p.args, path)...); err != nil {
 			return err
 		}
 	}

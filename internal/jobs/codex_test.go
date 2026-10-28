@@ -39,6 +39,7 @@ echo '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53
 echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_CODEX_WRITE* ]]; then echo written > codex-wrote.txt; fi
+if [[ $prompt == *FAKE_CODEX_COMMITMSG* ]]; then printf 'Add codex-wrote.txt\n\nWritten by the fake codex.\n' > ../progress/COMMIT_MSG; fi
 echo '{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking"}}'
 if [[ $prompt == *FAKE_CODEX_NOCMD* ]]; then
   # What codex 0.162 prints under -s read-only when bwrap cannot start (issue #81): no command item at

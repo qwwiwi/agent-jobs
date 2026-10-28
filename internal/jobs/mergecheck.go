@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -72,25 +70,18 @@ func gitCtx(ctx context.Context, dir string, args ...string) (string, int, strin
 
 // gitEnvCtx is gitCtx with the given environment.
 func gitEnvCtx(ctx context.Context, env []string, dir string, args ...string) (string, int, string, error) {
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	stdout, stderr, err := runGit(ctx, "", env, append([]string{"-C", dir}, args...)...)
 	if ctx.Err() != nil {
 		return "", -1, "", fmt.Errorf("timed out after %s", MergeCheckTimeout)
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
-		return stdout.String(), ee.ExitCode(), strings.TrimSpace(stderr.String()), nil
+		return string(stdout), ee.ExitCode(), strings.TrimSpace(string(stderr)), nil
 	}
 	if err != nil {
 		return "", -1, "", err
 	}
-	return stdout.String(), 0, strings.TrimSpace(stderr.String()), nil
+	return string(stdout), 0, strings.TrimSpace(string(stderr)), nil
 }
 
 // isolatedMergeTree runs `git merge-tree --write-tree` of tip and head so that nothing the repository

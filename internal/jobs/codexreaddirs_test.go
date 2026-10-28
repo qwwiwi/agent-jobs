@@ -80,11 +80,18 @@ func TestCodexReadDirsValidation(t *testing.T) {
 }
 
 // codex_read_dirs changes the prompt only: the codex command line (sandbox, writable roots) is the same.
+// The one extra writable root is the job's progress dir (#92).
 func TestCodexReadDirsNotInArgv(t *testing.T) {
 	j := &store.Job{Model: "gpt-6.1-sol"}
-	args := strings.Join(CodexArgs(j, "high", CodexSandboxWrite), " ")
-	if strings.Contains(args, "writable_roots") || strings.Contains(args, "--add-dir") {
+	jobDir := t.TempDir()
+	argv := CodexArgs(j, "high", CodexSandboxWrite, jobDir, false)
+	if args := strings.Join(argv, " "); strings.Contains(args, "writable_roots") {
 		t.Fatalf("codex argv grants extra writable roots: %s", args)
+	}
+	for i, a := range argv {
+		if a == "--add-dir" && (i+1 >= len(argv) || argv[i+1] != codexProgressRoot(CodexSandboxWrite, jobDir)) {
+			t.Fatalf("codex argv adds a writable root other than the progress dir: %v", argv)
+		}
 	}
 }
 

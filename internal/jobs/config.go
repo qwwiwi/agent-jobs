@@ -94,6 +94,13 @@ type Config struct {
 	// or a secret dir (validateCodexReadDirs), or one in /tmp (a writable root of codex's workspace-write
 	// sandbox).
 	CodexReadDirs []string `json:"codex_read_dirs"`
+	// CodexWriteNetwork lets the commands of codex write jobs (fix/general, workspace-write sandbox) reach
+	// the network, so package installs work (`-c sandbox_workspace_write.network_access=true`, issue #92).
+	// Only an explicit true turns it on; nil (absent) and false keep them offline. With network the job can
+	// reach anything (and send out what it can read), so it is an owner opt-in. Read-only codex jobs never
+	// get network; worktree-full-access has no codex sandbox and so network whatever this says. Like
+	// codex_write_allowed: enabling needs a daemon restart, switching it off on disk applies at once.
+	CodexWriteNetwork *bool `json:"codex_write_network"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`
 	// CodexJobsPerDay caps the codex jobs of this agent created in the last 24 hours, whatever became of
@@ -146,6 +153,9 @@ type Config struct {
 	KeepRawReports bool `json:"keep_raw_reports"`
 	// MaxBriefBytes is the largest brief job_start accepts. 0 = DefaultMaxBriefBytes (32 KB).
 	MaxBriefBytes int `json:"max_brief_bytes"`
+	// SourcesMaxMB is the size cap of one source clone (G02): a clone past it is aborted and the job told.
+	// 0 = DefaultSourcesMaxMB (500).
+	SourcesMaxMB int `json:"sources_max_mb"`
 	// BriefWarnFiles: a brief naming more files than this gets a size_warning. 0 = DefaultBriefWarnFiles (40).
 	BriefWarnFiles int `json:"brief_warn_files"`
 	// BriefWarnHeadings: a brief with more "## " headings than this gets a size_warning (it likely asks
@@ -217,6 +227,10 @@ const DefaultAutoContinueFraction = 0.5
 
 // AutoContinueOn reports whether a stopped attempt is continued automatically (auto_continue, default on).
 func (c Config) AutoContinueOn() bool { return c.AutoContinue == nil || *c.AutoContinue }
+
+// CodexWriteNetworkOn reports whether codex write jobs get network (codex_write_network; only an explicit
+// true, absent = off).
+func (c Config) CodexWriteNetworkOn() bool { return c.CodexWriteNetwork != nil && *c.CodexWriteNetwork }
 
 // AutoContinueShare returns the automatic continuation's fraction of the original limits.
 func (c Config) AutoContinueShare() float64 {
@@ -524,6 +538,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if err := c.validateAcceptance(); err != nil {
 		return c, err
 	}
+	if c.SourcesMaxMB < 0 {
+		return c, errors.New("config.json: sources_max_mb must be 0 (default) or positive")
+	}
 	if c.MaxBriefBytes < 0 || c.BriefWarnFiles < 0 || c.BriefWarnHeadings < 0 {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
@@ -616,9 +633,9 @@ var defaultModels = map[string]map[string]string{
 	"fix":      {"light": "sonnet", "normal": "opus", "hard": "fable"},
 	"research": {"light": "sonnet", "normal": "sonnet", "hard": "opus"},
 	"general":  {"light": "sonnet", "normal": "opus", "hard": "fable"},
-	// The gate kinds (Wave F): a judge for claude coders runs on codex (an explicit gpt-* model). The
-	// default judge model is a claude one, so a default verdict on claude-coded work is same_family:
-	// judge_start warns (JudgeFamilyWarning).
+	// The gate kinds (Wave F): the judge may run on any model (owner decision 2026-10-26). A default
+	// (claude) verdict on claude-coded work is stored with same_family true, as information only:
+	// judge_start notes it (JudgeFamilyNote), release_check does not read it.
 	KindSlicing:  {"light": "sonnet", "normal": "opus", "hard": "fable"},
 	KindJudge:    {"light": "opus", "normal": "opus", "hard": "fable"},
 	KindBriefing: {"light": "sonnet", "normal": "opus", "hard": "fable"},

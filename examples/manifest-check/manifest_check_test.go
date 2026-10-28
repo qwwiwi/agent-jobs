@@ -21,7 +21,14 @@ func run(t *testing.T, dir, checklist string, args ...string) (string, int) {
 	}
 	cmd := exec.Command("/bin/sh", append([]string{script}, args...)...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "TMPDIR="+t.TempDir())
+	// The caller's MANIFEST_* settings (agent-jobs' wrapper exports them for the run that holds these
+	// tests) belong to that run, not to the fixture's.
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "MANIFEST_") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "TMPDIR="+t.TempDir())
 	if checklist != "" {
 		cmd.Env = append(cmd.Env, "MANIFEST_CHECKLIST="+checklist)
 	}
@@ -182,4 +189,15 @@ func TestManifestCheckReadsLiveIDsBeforeTheTests(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(repo, "brief", "CHECKLIST.md")); err != nil || strings.Contains(string(b), "R02") {
 		t.Fatalf("the fixture test did not rewrite the checklist: %v\n%s", err, b)
 	}
+}
+
+// agent-jobs' scripts/manifest-check.sh exports MANIFEST_CHECKLIST and MANIFEST_GO_TEST_ARGS for the
+// go test run that holds these tests: the fixture runs of the script under test must not inherit them
+// (the caller's checklist and test filter would replace the fixture's).
+func TestManifestCheckIgnoresCallerEnv(t *testing.T) {
+	t.Setenv("MANIFEST_CHECKLIST", abs(t, "testdata/CHECKLIST.md"))
+	t.Setenv("MANIFEST_GO_TEST_ARGS", "-run ^NoSuchTest$ ./...")
+	t.Run("runs go test", TestManifestCheckRunsGoTest)
+	t.Run("reads live IDs before the tests", TestManifestCheckReadsLiveIDsBeforeTheTests)
+	t.Run("bad input", TestManifestCheckBadInput)
 }

@@ -58,6 +58,9 @@ type SystemDoctorOutput struct {
 	CodexSandbox jobs.CodexSandboxStatus `json:"codex_sandbox"`
 	// MCPServer is this MCP server against the installed binary and the daemon (daemon.json).
 	MCPServer MCPServerStatus `json:"mcp_server"`
+	// MergeGate is the merge-gate state of every repository with a stored checklist approval: gated, void,
+	// retired or shipped (with the sha; not gated until a new approval, #99).
+	MergeGate []jobs.MergeGateView `json:"merge_gate"`
 }
 
 // MCPServerStatus is system_doctor's view of the orchestrator MCP server: a long-lived process that an
@@ -79,7 +82,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		Name: "system_doctor",
 		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue " +
 			"(configured_max_running is the value of config.json as this MCP server last loaded it, reloaded when the file changes; the daemon's active cap is max_running in /v1/health), " +
-			"processes that outlived their job or session and running rows with a dead pid (doctor procs, report only: " +
+			"processes that outlived their job or session and running rows with a dead pid, and jobs whose sandbox " +
+			"containers are not removed yet (pending_containers, each a problem) (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +
 			"owner rules readable, notify target exists), and the last daily run of prune and doctor procs (time and " +
 			"counts: jobs pruned, bytes freed, archived, ghosts found), and notify_owner notifications of the last 24 h that were " +
@@ -92,7 +96,9 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"version against the daemon's (daemon.json) and the installed binary, plus (Linux) this agent's orchestrator " +
 			"MCP processes running a deleted or replaced binary (each a problem: restart the session or /mcp reconnect), " +
 			"and codex_sandbox: config codex_sandbox, what a codex job runs in now (native, worktree-full-access, or refused) " +
-			"and the cached probe of codex's native sandbox (a sandbox that cannot start is a problem unless worktree-full-access is set). " +
+			"and the cached probe of codex's native sandbox (a sandbox that cannot start is a problem unless worktree-full-access is set), " +
+			"and merge_gate: each repository with a stored checklist approval as gated, void, retired or shipped (release_check passed " +
+			"on a sha now on origin's default branch: merges are not gated until a new approval). " +
 			"ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
@@ -103,6 +109,10 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.Procs, err = m.DoctorProcs(false); err != nil {
 			return nil, out, fmt.Errorf("doctor procs: %w", err)
+		}
+		for _, id := range out.Procs.PendingContainers {
+			out.Problems = append(out.Problems, "job "+id+": sandbox containers not removed yet (containers.pending; docker "+
+				"failed, retried every tick)")
 		}
 		if out.Undelivered, err = m.UndeliveredNotifications(); err != nil {
 			out.Problems = append(out.Problems, "owner notifications: "+err.Error())
@@ -136,6 +146,10 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.CodexSandbox = m.CodexSandboxStatus(); out.CodexSandbox.Problem != "" {
 			out.Problems = append(out.Problems, out.CodexSandbox.Problem)
+		}
+		if out.MergeGate, err = m.MergeGates(); err != nil {
+			out.MergeGate = []jobs.MergeGateView{}
+			out.Problems = append(out.Problems, "merge gate: "+err.Error())
 		}
 		out.MCPServer = mcpServerStatus(d)
 		out.Problems = append(out.Problems, out.MCPServer.Warnings...)

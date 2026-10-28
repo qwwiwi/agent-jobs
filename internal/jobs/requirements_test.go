@@ -28,18 +28,19 @@ func TestParseRequirements(t *testing.T) {
 		l.Evidence != "login page in web/login.go:12" {
 		t.Fatalf("R01 %+v", l)
 	}
-	// done without ran: (R02) is claimed; R09 is verified but not covered; R05 has no line inside the block.
-	if !slices.Equal(r.Claimed, []string{"R02"}) || !slices.Equal(r.Uncovered, []string{"R09"}) ||
+	// done without ran: (R02) counts too (owner decision 2026-10-25: ran: and REDPROOF are informational);
+	// R09 is done but not covered; R05 has no line inside the block.
+	if len(r.Claimed) != 0 || !r.Lines[1].Verified || !slices.Equal(r.Uncovered, []string{"R09"}) ||
 		!slices.Equal(r.MissingLines, []string{"R05"}) || len(r.Invalid) != 1 || !strings.Contains(r.Invalid[0], "R04") {
 		t.Fatalf("claimed %v uncovered %v missing %v invalid %v", r.Claimed, r.Uncovered, r.MissingLines, r.Invalid)
 	}
 	if len(r.RedProofs) != 1 || !strings.HasPrefix(r.RedProofs[0], "REDPROOF R01") {
 		t.Fatalf("redproofs %v", r.RedProofs)
 	}
-	// done with ran: but no REDPROOF naming it is claimed too.
+	// done with ran: but no REDPROOF naming it counts as well.
 	noProof := strings.Replace(reqReport, "REDPROOF R01 · TestLogin", "REDPROOF R77 · TestLogin", 1)
-	if r := ParseRequirements(noProof, []string{"R01"}); !slices.Contains(r.Claimed, "R01") {
-		t.Fatalf("done without REDPROOF not claimed: %v", r.Claimed)
+	if r := ParseRequirements(noProof, []string{"R01"}); len(r.Claimed) != 0 || !r.Lines[0].Verified {
+		t.Fatalf("done without REDPROOF claimed: %+v", r)
 	}
 	for _, report := range []string{
 		"## Summary\nok\n\n## Findings / Changes\n- x\n\n## Not done / uncertain\nnothing\n",
@@ -85,7 +86,8 @@ func TestEnqueueCovers(t *testing.T) {
 }
 
 // A job with covers whose report has no block is off contract (job row, done line, stats); one with
-// a block counts its claimed done lines in the stats; a job without covers is unchanged.
+// a block claims no done line (ran: and REDPROOF are informational since 2026-10-25); a job without
+// covers is unchanged.
 func TestCoversReportContract(t *testing.T) {
 	m := newManager(t)
 	repo := briefRepo(t)
@@ -103,11 +105,25 @@ func TestCoversReportContract(t *testing.T) {
 		t.Fatalf("no covers: %q", plain.Error)
 	}
 	rep, err := m.Stats(time.Time{}, "kind")
-	if err != nil || rep.Totals.ReportOffContract != 1 || rep.Totals.RequirementsClaimed != 1 || rep.Totals.ClaimedJobs != 1 {
+	if err != nil || rep.Totals.ReportOffContract != 1 || rep.Totals.RequirementsClaimed != 0 || rep.Totals.ClaimedJobs != 0 {
 		t.Fatalf("stats: %+v %v", rep.Totals, err)
 	}
 	st, err := m.Store.GetStats(ok.ID)
-	if err != nil || st.RequirementsClaimed != 1 {
+	if err != nil || st.RequirementsClaimed != 0 {
 		t.Fatalf("stats row: %+v %v", st, err)
+	}
+}
+
+// A «done» line counts without «ran:» and without REDPROOF (owner decision 2026-10-25): the strict parse
+// is informational, nothing is claimed; the other statuses never count.
+func TestRequirementsDoneWithoutRanOrRedProof(t *testing.T) {
+	report := "## Summary\nok\n\n## Findings / Changes\n- x\n\n### Requirements\n" +
+		"- R01 · done · web/login.go:12\n- R02 · done\n- R03 · partial · the form only\n\n## Not done / uncertain\nnothing\n"
+	r := ParseRequirements(report, []string{"R01", "R02", "R03"})
+	if !r.Block || len(r.Lines) != 3 || len(r.Claimed) != 0 || !r.Lines[0].Verified || !r.Lines[1].Verified || r.Lines[2].Verified {
+		t.Fatalf("requirements: %+v", r)
+	}
+	if n := reportContractNote(report, []string{"R01", "R02", "R03"}); n != "" {
+		t.Fatalf("contract note: %q", n)
 	}
 }

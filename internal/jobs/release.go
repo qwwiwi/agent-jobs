@@ -22,15 +22,17 @@ const (
 	ReleaseVerdict       = "verdict"
 	ReleaseRequirements  = "requirements"
 	ReleaseUnmapped      = "unmapped_brief"
-	ReleaseSuspectTests  = "suspect_tests"
-	ReleaseFamily        = "family"
 	ReleaseBlind         = "enforced_blind"
-	ReleaseTrace         = "trace"
 )
 
-// ReleaseConditions lists the conditions in report order.
+// ReleaseConditions lists the conditions in report order. There is no family condition (owner decision
+// 2026-10-26, msg 68041): the judge's independence is that it is a separate blind job of any model; the
+// judge's and the coders' families are reported as information (JudgeFamily, CoderFamilies, SameFamily).
+// suspect_tests is no condition either (#106, owner decision 2026-10-27): a test whose behaviour depends
+// on a live model's choice can never be proven offline, so the judge's suspect tests are a non-blocking
+// warning (ReleaseCheckResult.NeedsLiveCheck).
 var ReleaseConditions = []string{ReleaseApproval, ReleaseManifestCheck, ReleaseVerdict, ReleaseRequirements, ReleaseUnmapped,
-	ReleaseSuspectTests, ReleaseFamily, ReleaseBlind, ReleaseTrace}
+	ReleaseBlind}
 
 // ReleaseCondition is one condition of release_check and whether it holds.
 type ReleaseCondition struct {
@@ -45,20 +47,19 @@ type ReleaseRequirement struct {
 	// Verdict is the judge's ("" = none).
 	Verdict       string `json:"verdict"`
 	PlaceholderOK bool   `json:"placeholder_ok,omitempty"`
-	// Waived: an owner waiver bound to this checklist hash and version and this sha covers it.
+	// Waived: an owner waiver bound to this checklist hash and version covers it (any sha).
 	Waived      bool   `json:"waived,omitempty"`
 	WaiverQuote string `json:"waiver_quote,omitempty"`
 	// Accepted: met, placeholder on a placeholder-ok row, or waived.
 	Accepted bool `json:"accepted"`
-	// CoveredBy are the succeeded feature jobs whose covers name it.
+	// CoveredBy are the succeeded feature jobs whose covers name it (informational: no condition reads it).
 	CoveredBy []string `json:"covered_by"`
 }
 
 // ReleaseFeatureJob is a feature job of the checklist: a fix or general job of the repository started
-// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36): only a succeeded one
-// counts for the trace, whose source stays its covers. The family condition counts every fix or general
-// job with covers of the checklist, of any size and any status (a failed coder may have commits in the
-// sha).
+// with size large (F9 (a)) whose covers name the checklist id (DEVIATIONS #34, #36). The reported coder
+// families count only the succeeded ones (owner decision 2026-10-25); they are information, not a
+// condition (owner decision 2026-10-26).
 type ReleaseFeatureJob struct {
 	ID     string   `json:"id"`
 	Kind   string   `json:"kind"`
@@ -86,14 +87,27 @@ type ReleaseCheckResult struct {
 	// VerdictJob is the judge job whose verdict was read (the latest for the sha); Verdicts counts the
 	// verdicts for the sha at this checklist version and hash (all must agree, each from a judge job that
 	// ended succeeded at the verdict's attempt, each with that attempt's manifest-check at exit 0).
-	VerdictJob  string `json:"verdict_job,omitempty"`
-	Verdicts    int    `json:"verdicts"`
-	JudgeFamily string `json:"judge_family,omitempty"`
+	VerdictJob string `json:"verdict_job,omitempty"`
+	Verdicts   int    `json:"verdicts"`
+	// JudgeFamily, CoderFamilies (of the succeeded feature jobs, recomputed now) and SameFamily (the
+	// judge shares a coder's family) are information only: no condition reads them (owner decision
+	// 2026-10-26, msg 68041). FamilyNote says it in one line.
+	JudgeFamily   string   `json:"judge_family,omitempty"`
+	CoderFamilies []string `json:"coder_families"`
+	SameFamily    bool     `json:"same_family"`
+	FamilyNote    string   `json:"family_note,omitempty"`
 	// ManifestCheck is the record of the latest verdict's attempt (without a verdict: the latest for the sha).
 	ManifestCheck *store.ManifestCheck `json:"manifest_check"`
 	Mismatches    []string             `json:"mismatches"`
-	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …».
+	// NeedsLiveCheck are the suspect tests of the counted verdicts for the sha (all of them, each once):
+	// a warning, not a mismatch (#106); the check passes with them when every condition holds.
+	NeedsLiveCheck []string `json:"needs_live_check"`
+	// OwnerLine is the one line for the owner: «Acceptance: N of M» or «Acceptance: N of M, mismatch: …»,
+	// followed by «; live check needed: K test(s)» when NeedsLiveCheck is not empty.
 	OwnerLine string `json:"owner_line"`
+	// approvalSeq is the seq of the approval the check read (once) and checked: its pass ships only that
+	// approval (#99), also when the checklist is re-approved before the pass is stored.
+	approvalSeq int64
 }
 
 // maxReleaseReason bounds one mismatch reason.
@@ -119,7 +133,8 @@ func (m *Manager) ReleaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return nil, fmt.Errorf("release_check passed, but the remote names for the merge hook could not be stored: %w", err)
 	}
 	if err := m.Store.PutReleasePass(store.ReleasePass{Repo: out.Repo, SHA: out.SHA, ChecklistID: out.ChecklistID,
-		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now()}); err != nil {
+		Version: out.Version, ChecklistSHA256: out.ChecklistSHA256, VerdictJob: out.VerdictJob, CreatedAt: m.Now(),
+		ApprovalSeq: out.approvalSeq}); err != nil {
 		return nil, fmt.Errorf("release_check passed, but its record for the merge hook could not be stored: %w", err)
 	}
 	return out, nil
@@ -136,7 +151,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return nil, fmt.Errorf("release_check: %w", err)
 	}
 	out := &ReleaseCheckResult{Repo: main, SHA: sha, Requirements: []ReleaseRequirement{}, FeatureJobs: []ReleaseFeatureJob{},
-		Mismatches: []string{}}
+		CoderFamilies: []string{}, Mismatches: []string{}, NeedsLiveCheck: []string{}}
 	conds := map[string]ReleaseCondition{}
 	set := func(name string, ok bool, format string, a ...any) {
 		conds[name] = ReleaseCondition{Name: name, OK: ok, Detail: RedactPrintable(fmt.Sprintf(format, a...), 600)}
@@ -158,6 +173,9 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		out.OwnerLine = fmt.Sprintf("Acceptance: %d of %d", out.Accepted, out.Live)
 		if !out.Pass {
 			out.OwnerLine += ", mismatch: " + strings.Join(out.Mismatches, "; ")
+		}
+		if len(out.NeedsLiveCheck) > 0 {
+			out.OwnerLine += fmt.Sprintf("; live check needed: %d test(s)", len(out.NeedsLiveCheck))
 		}
 	}()
 
@@ -187,6 +205,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		return out, nil
 	}
 	set(ReleaseApproval, true, "checklist %s version %d approved, hash unchanged", c.ID, c.Version)
+	out.approvalSeq = last.Seq
 	live := c.LiveIDs()
 	if len(live) == 0 {
 		set(ReleaseRequirements, false, "the checklist has no live requirements")
@@ -222,6 +241,7 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		} else {
 			set(ReleaseVerdict, true, "job %s (%d verdict(s) for this sha, all agree)", latest.JobID, len(verdicts))
 		}
+		out.NeedsLiveCheck = liveChecks(verdicts)
 	}
 
 	// The manifest-check record (F5) of every counted verdict's attempt, so a red run is not passed over
@@ -270,17 +290,11 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	waivers, err := m.Store.Waivers(main, hash, c.Version)
+	waivers, err := m.Store.Waivers(main, c.ID, hash, c.Version)
 	if err != nil {
 		return nil, err
 	}
-	coders, err := m.Store.FeatureJobs(main, c.ID)
-	if err != nil {
-		return nil, err
-	}
-	// The family condition counts every job that coded against the checklist (any size): a same-family
-	// coder of size small still saw the code the judge reads.
-	anyCoders, err := m.Store.CoverJobs(main, c.ID)
+	coders, familyOf, err := familyCoders(m.Store, main, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +303,10 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		row, _ := c.Row(id)
 		r := ReleaseRequirement{ID: id, PlaceholderOK: row.PlaceholderOK, CoveredBy: []string{}}
 		for _, w := range waivers {
-			if w.SHA == sha && w.Requirement == id {
+			// Bound to the checklist id, hash and version (Waivers) and the requirement, not to a commit
+			// (owner decision 2026-10-25): a fix commit after the waiver does not void it. Waivers lists the
+			// oldest first, so the newest quote is the one kept.
+			if w.Requirement == id {
 				r.Waived, r.WaiverQuote = true, RedactPrintable(w.Quote, 300)
 			}
 		}
@@ -335,94 +352,61 @@ func (m *Manager) releaseCheck(repo, sha string) (*ReleaseCheckResult, error) {
 		}
 	}
 
-	if lo == nil {
+	switch {
+	case lo == nil:
 		set(ReleaseUnmapped, false, "no readable verdict")
-		set(ReleaseSuspectTests, false, "no readable verdict")
-	} else {
-		listCond := func(name string, l []string) {
-			if len(l) == 0 {
-				set(name, true, "empty")
-			} else {
-				set(name, false, "%d entr(ies): %s", len(l), quoteList(l[:min(len(l), 3)]))
-			}
-		}
-		listCond(ReleaseUnmapped, lo.UnmappedBrief)
-		listCond(ReleaseSuspectTests, lo.SuspectTests)
+	case len(lo.UnmappedBrief) == 0:
+		set(ReleaseUnmapped, true, "empty")
+	default:
+		set(ReleaseUnmapped, false, "%d entr(ies): %s", len(lo.UnmappedBrief), quoteList(lo.UnmappedBrief[:min(len(lo.UnmappedBrief), 3)]))
 	}
 
-	// The coders' families, recomputed now (the verdict's are a snapshot taken when it was stored).
 	if latest == nil {
-		set(ReleaseFamily, false, "no verdict")
 		set(ReleaseBlind, false, "no verdict")
+	} else if latest.EnforcedBlind {
+		set(ReleaseBlind, true, "the judge was held to its input by the guard")
 	} else {
+		set(ReleaseBlind, false, "the judge (runner %s) was not blind by enforcement", latest.JudgeRunner)
+	}
+
+	// The families, recomputed now (the verdict's are a snapshot taken when it was stored), as
+	// information only (owner decision 2026-10-26, msg 68041): a same-family verdict passes. Only the
+	// succeeded feature jobs count (familyCoders, owner decision 2026-10-25).
+	var same []string
+	for _, cj := range familyOf {
+		f := ModelFamily(cj.Runner, cj.Model)
+		if !slices.Contains(out.CoderFamilies, f) {
+			out.CoderFamilies = append(out.CoderFamilies, f)
+		}
+		if latest != nil && f == ModelFamily(latest.JudgeRunner, latest.JudgeModel) {
+			same = append(same, cj.ID)
+		}
+	}
+	if latest != nil {
 		out.JudgeFamily = ModelFamily(latest.JudgeRunner, latest.JudgeModel)
-		var same []string
-		for _, cj := range anyCoders {
-			if ModelFamily(cj.Runner, cj.Model) == out.JudgeFamily {
-				same = append(same, cj.ID)
-			}
-		}
+		out.SameFamily = len(same) > 0
 		switch {
-		case len(coders) == 0:
-			set(ReleaseFamily, false, "no feature job (a fix or general job of size large) covers checklist %s, so no coder family to differ from", c.ID)
-		case len(same) > 0:
-			set(ReleaseFamily, false, "the judge (%s, model %s) shares its family with coder job(s) %s", out.JudgeFamily,
-				latest.JudgeModel, strings.Join(same, ", "))
+		case len(familyOf) == 0:
+			out.FamilyNote = fmt.Sprintf("judge %s; no succeeded feature job covers checklist %s (information only)", out.JudgeFamily, c.ID)
+		case out.SameFamily:
+			out.FamilyNote = RedactPrintable(fmt.Sprintf("judge %s (model %s) shares its family with coder job(s) %s (information only)",
+				out.JudgeFamily, latest.JudgeModel, strings.Join(same, ", ")), 600)
 		default:
-			set(ReleaseFamily, true, "judge %s, coders differ", out.JudgeFamily)
-		}
-		if latest.EnforcedBlind {
-			set(ReleaseBlind, true, "the judge was held to its input by the guard")
-		} else {
-			set(ReleaseBlind, false, "the judge (runner %s) was not blind by enforcement", latest.JudgeRunner)
+			out.FamilyNote = fmt.Sprintf("judge %s, coders %s (information only)", out.JudgeFamily, strings.Join(out.CoderFamilies, ", "))
 		}
 	}
 
-	// The trace both ways, over the succeeded feature jobs only (a cancelled or failed job delivered
-	// nothing): every live requirement in some succeeded job's covers, and every succeeded job covering
-	// some row of the checklist (a row since deferred or dropped still counts, so a later re-scoping does
-	// not fail the trace for good; only covers naming no row of it at all leave a job idle).
-	var uncovered, idle []string
-	succeeded := 0
+	// The feature jobs and their covers, informational only: the trace condition was cut (owner decision
+	// 2026-10-25), CoveredBy and LiveCovers stay for the owner's view.
 	for _, cj := range coders {
 		fj := ReleaseFeatureJob{ID: cj.ID, Kind: cj.Kind, Status: cj.Status, Family: ModelFamily(cj.Runner, cj.Model),
 			Covers: nonNilSlice(cj.Covers), LiveCovers: []string{}}
-		known := false
 		for _, id := range cj.Covers {
 			if slices.Contains(live, id) {
 				fj.LiveCovers = append(fj.LiveCovers, id)
 			}
-			if _, ok := c.Row(id); ok {
-				known = true
-			}
-		}
-		if cj.Status == store.StatusSucceeded {
-			succeeded++
-			if !known {
-				idle = append(idle, cj.ID)
-			}
 		}
 		out.FeatureJobs = append(out.FeatureJobs, fj)
-	}
-	for _, r := range out.Requirements {
-		if len(r.CoveredBy) == 0 {
-			uncovered = append(uncovered, r.ID)
-		}
-	}
-	var trace []string
-	if succeeded == 0 {
-		trace = append(trace, "no succeeded feature job covers checklist "+c.ID+" (a feature job is a fix or general job of size large)")
-	}
-	if len(uncovered) > 0 {
-		trace = append(trace, "in no feature job's covers: "+strings.Join(uncovered, ", "))
-	}
-	if len(idle) > 0 {
-		trace = append(trace, "feature job(s) covering no row of the checklist: "+strings.Join(idle, ", "))
-	}
-	if len(trace) == 0 {
-		set(ReleaseTrace, true, "%d succeeded feature job(s), every live requirement covered", succeeded)
-	} else {
-		set(ReleaseTrace, false, "%s", strings.Join(trace, "; "))
 	}
 	return out, nil
 }
@@ -495,9 +479,28 @@ func verdictOutput(v *store.JudgeVerdict) (*JudgeOutput, error) {
 	return &o, nil
 }
 
+// liveChecks are the suspect tests of the verdicts vs, each once, in the order first listed (redacted,
+// one line each): the tests the owner checks on a live run (#106). An unreadable verdict adds none (the
+// verdict condition fails on it).
+func liveChecks(vs []*store.JudgeVerdict) []string {
+	out := []string{}
+	for _, v := range vs {
+		o, err := verdictOutput(v)
+		if err != nil {
+			continue
+		}
+		for _, s := range o.SuspectTests {
+			if s = RedactPrintable(s, maxReleaseReason); s != "" && !slices.Contains(out, s) {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
 // verdictsDisagree is why the verdicts for one sha and checklist version do not agree with the latest
-// one's block lo ("" = they agree): a requirement judged differently, or unmapped_brief / suspect_tests
-// empty in one and not in the other.
+// one's block lo ("" = they agree): a requirement judged differently, or unmapped_brief empty in one and
+// not in the other. suspect_tests may differ (#106): they block nothing, and liveChecks lists them all.
 func verdictsDisagree(vs []*store.JudgeVerdict, lo *JudgeOutput) string {
 	want := map[string]string{}
 	for _, r := range lo.Requirements {
@@ -528,8 +531,8 @@ func verdictsDisagree(vs []*store.JudgeVerdict, lo *JudgeOutput) string {
 				return fmt.Sprintf("jobs %s and %s disagree on %s (%q, %q)", v.JobID, latest.JobID, id, got[id], want[id])
 			}
 		}
-		if (len(o.UnmappedBrief) == 0) != (len(lo.UnmappedBrief) == 0) || (len(o.SuspectTests) == 0) != (len(lo.SuspectTests) == 0) {
-			return fmt.Sprintf("jobs %s and %s disagree on unmapped_brief or suspect_tests", v.JobID, latest.JobID)
+		if (len(o.UnmappedBrief) == 0) != (len(lo.UnmappedBrief) == 0) {
+			return fmt.Sprintf("jobs %s and %s disagree on unmapped_brief", v.JobID, latest.JobID)
 		}
 	}
 	return ""

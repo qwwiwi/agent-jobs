@@ -68,9 +68,10 @@ func TestGateToolsClosedToJobs(t *testing.T) {
 	}
 }
 
-// approve needs the slicing check of the version and hash it approves, with an owner decision for
-// every unmapped quote; decisions are taken only on the result's unmapped quotes and stored; a result
-// for an older version does not count; checklist_get and slicing_get show the result.
+// The slicing check is advisory for approve (owner decision 2026-10-25), but a result of the version and
+// hash it approves needs an owner decision for every unmapped quote; decisions are taken only on the
+// result's unmapped quotes and stored; a result for an older version does not count; checklist_get and
+// slicing_get show the result.
 func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 	m := newManager(t)
 	repo, _ := gitRepo(t)
@@ -83,10 +84,6 @@ func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 		t.Fatalf("slicing before any check: %+v", v.Slicing)
 	}
 	approve := map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}
-	// No slicing check at all.
-	if msg := callErr(t, cs, "checklist_set", approve); !strings.Contains(msg, "no slicing check of checklist") {
-		t.Fatalf("approve without slicing: %q", msg)
-	}
 	// A check with an unmapped quote and no decision.
 	storeSlicing(t, m, repo, "And dark mode.")
 	if msg := callErr(t, cs, "checklist_set", approve); !strings.Contains(msg, "without an owner decision") || !strings.Contains(msg, "And dark mode.") {
@@ -120,24 +117,46 @@ func TestApprovalNeedsCurrentSlicing(t *testing.T) {
 		sg.Decisions[0].Quote != "dark mode later, not now" || len(sg.Undecided) != 0 || sg.Version != 2 {
 		t.Fatalf("slicing_get: %+v", sg)
 	}
-	// A new version: the clean v2 check does not count for it (stale), even with no unmapped quote left.
+	// A new version: the v2 check does not count for it (stale) and is not needed: approve passes.
 	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
 		{"id": "R02", "verbatim": "dark mode", "contract": "deferred", "rationale": "owner: dark mode later, not now"}}}, &v)
 	if v.Version != 3 || v.Approved || v.Slicing == nil || v.Slicing.Current || v.Slicing.Version != 2 {
 		t.Fatalf("after a change: %+v %+v", v, v.Slicing)
 	}
-	if msg := callErr(t, cs, "checklist_set", approve); !strings.Contains(msg, "version 3") || !strings.Contains(msg, "older version") {
-		t.Fatalf("approve with a stale slicing check: %q", msg)
-	}
-	// A change and the approval in one call: the check of the old content does not count either.
-	storeSlicing(t, m, repo)
-	if msg := callErr(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes",
-		"rows": []map[string]any{{"id": "R03", "verbatim": "x", "contract": "live", "rationale": "brief"}}}); !strings.Contains(msg, "no slicing check") {
-		t.Fatalf("approve together with a change: %q", msg)
-	}
 	call(t, cs, "checklist_set", approve, &v)
 	if !v.Approved || v.Version != 3 {
-		t.Fatalf("approve v3 after its check: %+v", v)
+		t.Fatalf("approve v3 without its own check: %+v", v)
+	}
+	// A change and the approval in one call: no check of the new content is needed either.
+	var both ChecklistView
+	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes",
+		"rows": []map[string]any{{"id": "R03", "verbatim": "x", "contract": "live", "rationale": "brief"}}}, &both)
+	if !both.Approved || both.Version != 4 {
+		t.Fatalf("approve together with a change: %+v", both)
+	}
+	// Decisions without any result of the version are still refused: there is nothing to decide.
+	if msg := callErr(t, cs, "checklist_set", map[string]any{"repo": repo,
+		"unmapped_decisions": []map[string]any{{"unmapped": "And dark mode.", "quote": "later"}}}); !strings.Contains(msg, "no slicing check") {
+		t.Fatalf("decision without a result: %q", msg)
+	}
+}
+
+// approve without any slicing check is not refused (owner decision 2026-10-25: the check is advisory);
+// slicing_start stays available.
+func TestApproveWithoutSlicing(t *testing.T) {
+	m := newManager(t)
+	repo, _ := gitRepo(t)
+	cs := connect(t, mustServer(t, m))
+	var v ChecklistView
+	call(t, cs, "checklist_init", map[string]any{"repo": repo, "brief": "I want a login page."}, &v)
+	call(t, cs, "checklist_set", map[string]any{"repo": repo, "rows": []map[string]any{
+		{"id": "R01", "verbatim": "a login page", "contract": "live", "rationale": "brief"}}}, &v)
+	call(t, cs, "checklist_set", map[string]any{"repo": repo, "approve": true, "approve_quote": "yes"}, &v)
+	if !v.Approved || v.Slicing != nil {
+		t.Fatalf("approve without slicing: %+v", v)
+	}
+	if !slices.Contains(toolNames(t, cs), "slicing_start") {
+		t.Fatal("slicing_start gone")
 	}
 }
 

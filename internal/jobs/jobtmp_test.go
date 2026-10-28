@@ -270,3 +270,40 @@ func TestJobDirSizeBoundedAndCached(t *testing.T) {
 		t.Fatalf("disk status %+v tmp %d, want the recorded %d / %d", d.LargestJobDirs, d.JobTmpBytes, got.DirBytes, got.DirTmpBytes)
 	}
 }
+
+// #105: the job's cleanup leaves its temp dir alone (no early removal: proving it unused safely needs
+// OS-level isolation); the disk status still shows its size, and prune removes it with the folder.
+func TestFinishedJobTmpKeptUntilPrune(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_BIGTMP", nil).ID)
+	big := filepath.Join(m.JobDir(j.ID), JobTmpDir, "big.bin")
+	if _, err := os.Stat(big); err != nil {
+		t.Fatalf("the job left nothing in its temp dir: %v", err)
+	}
+	if got := get(t, m, j.ID); got.NotifiedAt == nil {
+		t.Fatal("job not notified")
+	}
+	real := m.Now
+	m.Now = func() time.Time { return real().Add(CleanupDelay + time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, m, j.ID); got.CleanedAt == nil {
+		t.Fatal("cleanup did not run")
+	}
+	if _, err := os.Stat(big); err != nil {
+		t.Fatalf("cleanup removed the job's temp dir: %v", err)
+	}
+	if d := m.Disk(); d.JobTmpBytes < 3<<20 {
+		t.Fatalf("disk status lost the kept temp dir: %d bytes", d.JobTmpBytes)
+	}
+
+	m.Now = func() time.Time { return real().Add(PruneAge + time.Hour) }
+	if _, err := m.Prune(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(m.JobDir(j.ID), JobTmpDir)); !os.IsNotExist(err) {
+		t.Fatalf("prune kept the job temp dir: %v", err)
+	}
+}

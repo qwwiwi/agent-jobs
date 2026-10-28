@@ -30,7 +30,7 @@ func TestMergeGateDailyCommands(t *testing.T) {
 		`bash -c 'gh pr "" merge --squash'`,
 		`bash -O extglob -c 'gh pr m@(erge) 5'`,
 	} {
-		if r := gateAnswer(t, m, t.TempDir(), cmd, ""); !strings.Contains(r, "cannot tell") {
+		if r := gateAnswer(t, m, t.TempDir(), cmd, ""); !strings.Contains(r, unsureWarn) {
 			t.Errorf("%q: %q", cmd, r)
 		}
 	}
@@ -58,9 +58,9 @@ func TestMergeGateCdChains(t *testing.T) {
 		{"absolute then relative into the gated repo", elsewhere, "cd " + parent + " && cd " + name + " && gh pr merge 78 --merge",
 			"without --match-head-commit"},
 		{"relative after a fork", elsewhere, "cd " + parent + "; cd " + name + " && gh pr merge 5", "without --match-head-commit"},
-		{"a directory the command creates", elsewhere, "mkdir y && cd y && gh pr merge 5", "cannot tell"},
+		{"a directory the command creates", elsewhere, "mkdir y && cd y && gh pr merge 5", unsureWarn},
 		{"a relative directory the command may create", elsewhere, "cd " + repo + "; mkdir -p sub; cd sub && gh pr merge 5",
-			"cannot tell"},
+			unsureWarn},
 	} {
 		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); tc.want == "" && r != "" || tc.want != "" && !strings.Contains(r, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, r, tc.want)
@@ -84,7 +84,7 @@ func TestMergeGateNoNamesUnreadable(t *testing.T) {
 		{"by URL", t.TempDir(), "gh pr merge https://github.com/acme/demo/pull/5"},
 		{"in another work tree", plain, "gh pr merge 5"},
 	} {
-		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); !strings.Contains(r, "cannot tell") {
+		if r := gateAnswer(t, m, tc.cwd, tc.cmd, ""); !strings.Contains(r, unsureWarn) {
 			t.Errorf("%s: %q", tc.name, r)
 		}
 	}

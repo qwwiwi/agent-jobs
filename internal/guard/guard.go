@@ -91,6 +91,15 @@ type Config struct {
 	// a command or redirection word it cannot expand ($VAR, a substitution). A path under a top-level
 	// name that does not exist (`/api/v1` in a pattern) cannot be read and is not refused.
 	ReadAllow []string
+	// Sources are the job's cloned repositories (<jobdir>/sources, G02): read-only for the job, and their
+	// code never runs on the host (sources.go). Empty = no sources.
+	Sources []string
+	// Sandbox is <jobdir>/sandbox (G02), where a job copies a clone to run it: its code never runs on the
+	// host either, and a copy below it is the only path a `docker run` may mount. "" = docker refused.
+	Sandbox string
+	// JobID is the job's id (G02): a sandbox container is named aj-<JobID>-<suffix>, so the daemon removes
+	// it when the job ends. "" = docker refused.
+	JobID string
 	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
 	// paths its own folders).
 	readAllowScope bool
@@ -474,6 +483,9 @@ func CheckFileWrite(tool, path string, cfg Config) string {
 		if readOnlyFile(p, cfg) {
 			return readOnlyBlocked(tool + " into `" + p + "`")
 		}
+		if sourcesFileWrite(p, cfg) {
+			return sourcesWriteBlocked(tool + " into `" + p + "`")
+		}
 	}
 	if len(cfg.Protected) > 0 {
 		links := &inodeSet{forms: protectedForms(cfg.Protected)}
@@ -701,6 +713,19 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						return protectedBlocked(p)
 					}
 				}
+				if g, ok := parseGit(argv); ok {
+					// git diff --output, archive -o, format-patch's directory (new files in it, nothing
+					// below): a protected path is no target.
+					outs, _ := gitWriteTargets(argv, g)
+					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
+						if p, ok := s.hit(t, false); ok {
+							return protectedBlocked(p)
+						}
+					}
+				}
 				var ca copyArgs
 				if destCopiers[name] {
 					ca = parseCopyArgs(name, argv[1:])
@@ -741,7 +766,7 @@ func (s *pathScope) checkScripts(scripts []*script) string {
 						}
 					}
 				}
-				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" {
+				if h, ok := s.contains(c.heredoc, true); ok && c.heredoc != "" && !dataHeredoc(sc, pl, c) {
 					return h.reason()
 				}
 				// Whatever its arguments, an interpreter may still run the pipe (`node -p`, `node -e 0
@@ -810,8 +835,13 @@ func Check(cmd string, cfg Config) string {
 		return rootBlocked(p)
 	}
 	scripts := parseAll(cmd)
+	// A job with sources (G02) may run one docker command, the sandbox form, as the whole call: its
+	// arguments after the image run inside the container, so the host checks below do not apply to them.
+	if r, handled := dockerSandbox(scripts, cfg); handled {
+		return r
+	}
 	for _, check := range []func([]*script, string, Config) string{
-		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
+		checkUnverifiable, checkNestedAgents, checkSelf, checkJobEnv, checkUserManager, checkPackageRunners, checkNothingOut, checkGitEnv, checkGitFiles, checkLinkScheduling, checkProtected, checkReadOnly, checkSourcesWrite, checkSourcesExec, checkStateRead, checkStatusAfterPipe, checkSelfMatchingWait,
 		checkOwnerInCommit, checkForeignIdentity,
 	} {
 		if r := check(scripts, cmd, cfg); r != "" {
@@ -1050,7 +1080,7 @@ var dataReaders = map[string]bool{
 var dataSubcommands = map[string]map[string]bool{
 	"brew":    {"install": true, "info": true, "search": true, "list": true},
 	"apt-get": {"install": true},
-	"go":      {"get": true, "install": true},
+	"go":      {"get": true}, // not install: a git, gh or agent-jobs binary in GOBIN shadows the real one (#96)
 	"pip":     {"install": true},
 	"pip3":    {"install": true},
 	"npm":     {"install": true},
@@ -1143,6 +1173,9 @@ var (
 // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
 func checkUnverifiable(scripts []*script, _ string, _ Config) string {
 	for _, sc := range scripts {
+		if sc.vague != "" {
+			return cannot(sc.vague)
+		}
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
 				if r := unverifiable(sc, c); r != "" {
@@ -1173,6 +1206,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 			return cannot("glob/brace in the command or its wrappers: " + w)
 		}
 	}
+	if r := goEnv(c, v); r != "" {
+		return cannot(r)
+	}
 	if v.start >= len(c.words) {
 		return ""
 	}
@@ -1186,7 +1222,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
-		case sc.depth > 0:
+		case sc.depth > 0 && !substGitRead(sc, argv):
 			return cannot(name + " inside a substitution, eval or sh -c")
 		case c.stdin:
 			return cannot("stdin redirect, here-doc or here-string into " + name)
@@ -1269,8 +1305,20 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	// Any other program (find -exec, flock, trap 'git push' EXIT, python -c, awk system(), vim -c '!…',
 	// an unknown runner): the guard cannot see what it runs, so a git/gh (or shell/eval) word among its
-	// arguments is rejected.
+	// arguments is rejected. A literal file or package operand of a program that never runs its
+	// operands is data (`go test ./cmd/agent-jobs/`, `sed -n 1p cmd/agent-jobs/x.go`; see operands).
+	var ops []bool
+	static := staticArgv(c, v)
+	if static && !(name == "go" && sc.goEnvSet) {
+		ops = operands(name, argv[1:])
+	}
+	if name == "sed" && sedExecMention(argv[1:], static) {
+		return cannot("sed running git/gh, a shell or an agent indirectly")
+	}
 	for k, a := range argv[1:] {
+		if k < len(ops) && ops[k] {
+			continue
+		}
 		if b := progName(a); execName(b) || reMention.MatchString(a) || reGitDashCmd.MatchString(a) ||
 			(dyn[k+1] && mentionsExec(a)) {
 			return cannot(name + " running git/gh, a shell or an agent indirectly")
@@ -1827,9 +1875,14 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 		}
 		name := progName(argv[0])
 		if outOfScopeTools[name] {
+			sandbox := ""
+			if name == "docker" && cfg.Sandbox != "" {
+				sandbox = " The one exception is the sources sandbox: a single `docker run --rm ... -v <sandbox>/<copy>:/src " +
+					"<image> <command>` as the whole Bash command (the Sources section of the brief)."
+			}
 			return "blocked by guard: `" + name + "` starts processes outside the job's cgroup scope (service manager, " +
 				"session bus, scheduler, terminal multiplexer, process manager, container, ssh or namespace); a job runs " +
-				"its processes itself, inside its scope."
+				"its processes itself, inside its scope." + sandbox
 		}
 		if name == "systemctl" {
 			for _, a := range argv[1:] {
@@ -2230,6 +2283,13 @@ func globBlocked(w string) string {
 		"that may write; the guard does not expand globs (one could resolve to .git). Write the paths out."
 }
 
+// codeGlobBlocked is the reason for a `*` pattern in inline code that can name git's config or hooks,
+// a protected path or the agent state (codeGlobReason).
+func codeGlobBlocked(p string) string {
+	return "blocked by guard: the pattern `" + p + "` in inline code can match git's config or hooks, a job's git " +
+		"dir, a protected path or agent-jobs state; the guard does not expand it. Write the paths out."
+}
+
 // dotGlobOn reports a command that makes globs match dot files (`.git`): bash `shopt -s dotglob`,
 // a GLOBIGNORE assignment (bash then matches dot files), zsh `setopt globdots` / `set -o globdots`
 // (zsh option names ignore case and underscores).
@@ -2260,7 +2320,7 @@ func dotGlobOn(c *simpleCmd, argv []string) bool {
 // cd/pushd/ln/cp/mv/tee/install/rsync. Globs are not evaluated: any glob/brace word in a redirection
 // target or in an argument of a non-reader is rejected (fail closed), as is turning on dotglob/globdots.
 // git itself is checked by the config allowlist instead.
-func checkGitFiles(scripts []*script, _ string, _ Config) string {
+func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 	blocked := func(p string) string {
 		return "blocked by guard: `" + p + "` is git's config, hooks or $GIT_DIR; a job does not write there " +
 			"(git would run programs from it)."
@@ -2284,6 +2344,22 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 					continue
 				}
 				name := progName(argv[0])
+				if g, ok := parseGit(argv); ok {
+					// git diff --output=<file>, archive -o, format-patch -o <dir>, bundle create <file> and
+					// marks files write there like a redirection; a target computed at run time is unverifiable.
+					outs, _ := gitWriteTargets(argv, g)
+					for _, t := range outs {
+						if gitUnverifiedTarget(t) {
+							return unresolvedBlocked(t)
+						}
+						if gitFile(t) || inGitDir(t) {
+							return blocked(t)
+						}
+						if hasGlob(reBraceVar.ReplaceAllString(t, "")) {
+							return globBlocked(t)
+						}
+					}
+				}
 				if isGitName(name) || gitFileReaders[name] {
 					continue
 				}
@@ -2291,12 +2367,22 @@ func checkGitFiles(scripts []*script, _ string, _ Config) string {
 				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 				})
-				for _, a := range argv[1:] {
+				off := len(c.words) - len(argv)
+				for k, a := range argv[1:] {
 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
-					if hasGlob(reBraceVar.ReplaceAllString(a, "")) && !findFilter {
+					if !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter {
+						continue
+					}
+					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word
+					// the shell does not glob: its `*` is code, as in a script file (noise.go), unless a glob
+					// character in it is unquoted, or the code may glob a path the job never writes.
+					if !inlineCode(name, argv, k+1) || c.glob[off+k+1] {
 						return globBlocked(a)
+					}
+					if r := codeGlobReason(a, cfg); r != "" {
+						return r
 					}
 				}
 			}

@@ -310,6 +310,10 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.schedules(w, r)
 	case p == "/v1/skills":
 		a.skills(w, r)
+	case p == "/v1/milestones":
+		a.milestones(w, r)
+	case strings.HasPrefix(p, "/v1/milestones/"):
+		a.milestone(w, r, strings.TrimPrefix(p, "/v1/milestones/"))
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
