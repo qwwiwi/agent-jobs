@@ -524,20 +524,21 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
 }
 
-// jobIdentity is a job's git identity: config git_name / git_email, a field the config leaves empty
-// taken from the repository's local identity (repoIdentity; repo "" = none), "" = none.
+// jobIdentity is a job's git identity, both fields or neither: config git_name / git_email when both
+// are set, the repository's local identity when neither is (repoIdentity; repo "" = none), else none.
+// A half configured identity (config validation refuses it) is never completed from the repository.
 func (m *Manager) jobIdentity(repo string) (name, email string) {
 	name, email = m.Config().GitName, m.Config().GitEmail
-	if (name == "" || email == "") && repo != "" {
-		rn, re := m.repoIdentity(repo)
-		if name == "" {
-			name = rn
-		}
-		if email == "" {
-			email = re
-		}
+	switch {
+	case name != "" && email != "":
+		return name, email
+	case name != "" || email != "":
+		m.Log.Printf("config git_name / git_email: only one is set; the job gets no identity")
+		return "", ""
+	case repo != "":
+		return m.repoIdentity(repo)
 	}
-	return name, email
+	return "", ""
 }
 
 // repoIdentity is the repository's local user.name and user.email together, or neither: none when
@@ -601,8 +602,8 @@ func (m *Manager) markWorktree(j *store.Job, work string) error {
 
 // writeGitFiles writes <jobdir>/gitconfig (the job identity, nothing else) and the empty
 // <jobdir>/no-hooks dir; the wrapper points GIT_CONFIG_GLOBAL and core.hooksPath at them (GitEnv).
-// The identity is jobIdentity: config git_name / git_email, a field the config leaves empty taken from
-// the repository's local identity (repo; "" = none), so a job's commits do not go without one (#120).
+// The identity is jobIdentity: config git_name / git_email, else the repository's local identity (repo;
+// "" = none), so a job's commits do not go without one (#120); both fields or neither.
 // GitEnv also sets it as GIT_AUTHOR_* / GIT_COMMITTER_*, which outrank the repository's own config.
 func (m *Manager) writeGitFiles(dir, repo string) error {
 	cfg := filepath.Join(dir, gitConfigFile)

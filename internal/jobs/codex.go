@@ -263,8 +263,10 @@ func pathWithin(path, dir string) bool {
 // checkCodexIdentity refuses a codex job whose commits would carry the owner's identity: codex runs
 // without the guard hook, so its effective author and committer (`git var` in the worktree with the
 // job's git environment: the job identity, else the repository's own config, else git's guess) must
-// not name one of owners. No identity at all passes: such a commit fails, it carries nobody's.
-func checkCodexIdentity(jobDir string, env, owners []string) error {
+// not name one of owners, nor carry the email of the repository's (repo; "" = none) local pair when
+// that pair names one (jobIdentity dropped it as the owner's; its email need not contain an owner
+// name). No identity at all passes: such a commit fails, it carries nobody's.
+func checkCodexIdentity(jobDir, repo string, env, owners []string) error {
 	if !slices.ContainsFunc(owners, func(n string) bool { return strings.TrimSpace(n) != "" }) {
 		return nil
 	}
@@ -272,16 +274,43 @@ func checkCodexIdentity(jobDir string, env, owners []string) error {
 	if err != nil {
 		return err
 	}
+	var ownerEmail string
+	if repo != "" {
+		name, email := repoLocalIdentity(repo, "user.name"), repoLocalIdentity(repo, "user.email")
+		if namesOwner(owners, name, email) {
+			ownerEmail = strings.TrimSpace(email)
+		}
+	}
 	for _, v := range []string{"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} {
 		cmd := exec.Command("git", "var", v)
 		cmd.Dir, cmd.Env = filepath.Join(jobDir, "work"), env
 		out, err := cmd.Output()
-		if err == nil && namesOwner(owners, string(out)) {
+		if err != nil {
+			continue
+		}
+		if namesOwner(owners, string(out)) {
 			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s names one of owner_names: "+
 				"the repository's own identity or git's guess is in force); set git_name and git_email in config.json", v)
 		}
+		if ownerEmail != "" && strings.EqualFold(identEmail(string(out)), ownerEmail) {
+			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s has the email of the "+
+				"repository's user.name/user.email, which names one of owner_names); set git_name and git_email in config.json", v)
+		}
 	}
 	return nil
+}
+
+// identEmail is the email of a `git var GIT_*_IDENT` line ("Name <email> 1700000000 +0000"; "" = none).
+func identEmail(ident string) string {
+	_, rest, ok := strings.Cut(ident, "<")
+	if !ok {
+		return ""
+	}
+	email, _, ok := strings.Cut(rest, ">")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(email)
 }
 
 // codexReadDirsSection is the prompt section of a codex job that names config codex_read_dirs as

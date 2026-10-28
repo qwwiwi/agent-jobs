@@ -62,12 +62,14 @@ type Config struct {
 	TmuxSocket string `json:"tmux_socket"`
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
-	// GitName / GitEmail is the job's git identity: written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL of
-	// the job, and GIT_AUTHOR_* / GIT_COMMITTER_* in its git environment, which outrank the repository's
-	// config). The guard rejects any other identity; via `git -c` none at all. Empty = the job's
-	// repository's local user.name / user.email, both or neither (`git config --local`; none for a job
-	// without a repository, or when either names one of OwnerNames), else no identity. A codex job whose
-	// effective identity names one of OwnerNames is refused at launch (checkCodexIdentity).
+	// GitName / GitEmail is the job's git identity, both or neither (one alone is a config error: the
+	// repository's config would fill in the other half): written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL
+	// of the job, and GIT_AUTHOR_* / GIT_COMMITTER_* in its git environment, which outrank the
+	// repository's config). The guard rejects any other identity; via `git -c` none at all. Both empty =
+	// the job's repository's local user.name / user.email, both or neither (`git config --local`; none
+	// for a job without a repository, or when either names one of OwnerNames), else no identity. A codex
+	// job whose effective identity names one of OwnerNames, or carries the email of a repository pair
+	// dropped for naming one, is refused at launch (checkCodexIdentity).
 	GitName  string `json:"git_name"`
 	GitEmail string `json:"git_email"`
 	// ClaudeBin overrides the claude binary (env AGENT_JOBS_CLAUDE_BIN wins).
@@ -449,6 +451,10 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		if v, ok := raw["auto_continue"]; ok && strings.TrimSpace(string(v)) == "null" {
 			return c, errors.New("config.json: auto_continue must be true or false, not null (omit the key for default true)")
 		}
+	}
+	if (c.GitName == "") != (c.GitEmail == "") {
+		return c, errors.New("config.json: git_name and git_email must be set together (both or neither): " +
+			"with one alone the repository's config fills in the other half")
 	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)

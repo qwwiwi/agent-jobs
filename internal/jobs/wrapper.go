@@ -983,7 +983,8 @@ const (
 // editor, no terminal prompt, and the gitOverrides (core.hooksPath=<jobdir>/no-hooks, no fsmonitor,
 // ssh command or credential helper; cat/true as pager/editor) at command-line level (via
 // GIT_CONFIG_COUNT), which wins over any repository config, and the job identity of the gitconfig as
-// GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL, which win over the repository's own identity. So
+// GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL, which win over the repository's own identity (all
+// four or none: a gitconfig with only one of user.name and user.email is an error). So
 // git run by the job does not execute hooks, a pager, an editor or a credential prompt the guard does
 // not see, and its commits carry the job identity.
 func GitEnv(jobDir string, env []string) ([]string, error) {
@@ -1011,16 +1012,18 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		"GIT_TERMINAL_PROMPT=0",
 	)
 	// The job identity outranks the repository's config (its local user.name/user.email, author.*,
-	// committer.*), which would otherwise win over GIT_CONFIG_GLOBAL.
+	// committer.*, an include or includeIf), which would otherwise win over GIT_CONFIG_GLOBAL. Both
+	// halves or neither: with one alone git would take the other from that config.
 	name, email, err := gitFileIdentity(cfg, out)
 	if err != nil {
 		return nil, err
 	}
-	if name != "" {
-		out = append(out, "GIT_AUTHOR_NAME="+name, "GIT_COMMITTER_NAME="+name)
+	if (name == "") != (email == "") {
+		return nil, fmt.Errorf("the job identity in %s is incomplete (user.name %q, user.email %q): both or neither", cfg, name, email)
 	}
-	if email != "" {
-		out = append(out, "GIT_AUTHOR_EMAIL="+email, "GIT_COMMITTER_EMAIL="+email)
+	if name != "" {
+		out = append(out, "GIT_AUTHOR_NAME="+name, "GIT_COMMITTER_NAME="+name,
+			"GIT_AUTHOR_EMAIL="+email, "GIT_COMMITTER_EMAIL="+email)
 	}
 	overrides := gitOverrides(hooks)
 	out = append(out, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(overrides)))

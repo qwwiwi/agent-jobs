@@ -32,15 +32,15 @@ func TestGitIdentityFallsBackToRepoLocal(t *testing.T) {
 	}
 }
 
-// The configured identity wins over the repository's, field by field.
+// The configured identity wins over the repository's.
 func TestGitIdentityConfigWins(t *testing.T) {
 	m := newManager(t)
-	m.Cfg.GitName = "Agent Bot"
+	m.Cfg.GitName, m.Cfg.GitEmail = "Agent Bot", "bot@example.org"
 	repo := newRepo(t)
 	j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
 	cfg := filepath.Join(m.JobDir(j.ID), gitConfigFile)
-	if n, e := gitConfigValue(t, cfg, "user.name"), gitConfigValue(t, cfg, "user.email"); n != "Agent Bot" || e != "t@example.com" {
-		t.Fatalf("job gitconfig identity %q <%q>, want Agent Bot <t@example.com>", n, e)
+	if n, e := gitConfigValue(t, cfg, "user.name"), gitConfigValue(t, cfg, "user.email"); n != "Agent Bot" || e != "bot@example.org" {
+		t.Fatalf("job gitconfig identity %q <%q>, want Agent Bot <bot@example.org>", n, e)
 	}
 }
 
@@ -161,5 +161,98 @@ func TestCodexRefusedWithOwnerIdentity(t *testing.T) {
 	}
 	if got, want := commitIdentity(t, m, j.ID), "Agent Bot <bot@example.org> / Agent Bot <bot@example.org>"; got != want {
 		t.Fatalf("codex job commit identity %q, want %q", got, want)
+	}
+}
+
+// git_name and git_email are set together or not at all: a half identity let the repository's config
+// fill in the other half (a codex job committed as "Job Bot <owner@…>" when the repository's pair named
+// the owner and was dropped). Such a config is refused when it loads.
+func TestGitIdentityHalfConfigRefused(t *testing.T) {
+	state := t.TempDir()
+	for _, body := range []string{
+		`{"git_name": "Job Bot", "codex_write_allowed": true, "owner_names": ["Owner Person"]}`,
+		`{"git_email": "bot@example.org"}`,
+		`{"git_name": "Job Bot", "git_email": ""}`,
+	} {
+		if _, err := parseConfig(state, []byte(body)); err == nil || !strings.Contains(err.Error(), "git_name and git_email") {
+			t.Errorf("%s: err = %v, want a refusal of the half identity", body, err)
+		}
+	}
+	for _, body := range []string{`{}`, `{"git_name": "Job Bot", "git_email": "bot@example.org"}`} {
+		if _, err := parseConfig(state, []byte(body)); err != nil {
+			t.Errorf("%s: %v", body, err)
+		}
+	}
+}
+
+// A half configured identity (only possible past config validation) is never completed from the
+// repository: the job gets no identity of its own, and a codex job, whose commits would then carry the
+// repository's owner pair, is refused; the name alone no longer hides the owner's email.
+func TestCodexRefusedWithHalfIdentity(t *testing.T) {
+	m := newCodexManager(t)
+	m.Cfg.OwnerNames = []string{"Owner Person"}
+	m.Cfg.GitName = "Job Bot"
+	repo := newRepo(t)
+	gitT(t, repo, "config", "user.name", "Owner Person")
+	gitT(t, repo, "config", "user.email", "boss@corp.example")
+	if n, e := m.jobIdentity(repo); n != "" || e != "" {
+		t.Fatalf("jobIdentity with a half config and the owner's repository pair: %q <%q>, want none", n, e)
+	}
+	j := enqueue(t, m, "review the thing", func(r *StartRequest) { codexReview(r); r.RepoPath = repo })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if j = get(t, m, j.ID); j.Status != store.StatusFailed || !strings.Contains(j.Error, "refused to start") {
+		t.Fatalf("codex job with a half identity over the owner's repository pair: %s %q", j.Status, j.Error)
+	}
+}
+
+// The configured email being the email of the repository's rejected (owner-naming) pair is the owner's
+// identity too, although it does not contain one of owner_names: a codex job is refused.
+func TestCodexRefusedWithRejectedPairEmail(t *testing.T) {
+	m := newCodexManager(t)
+	m.Cfg.OwnerNames = []string{"Owner Person"}
+	m.Cfg.GitName, m.Cfg.GitEmail = "Job Bot", "Boss@corp.example"
+	repo := newRepo(t)
+	gitT(t, repo, "config", "user.name", "Owner Person")
+	gitT(t, repo, "config", "user.email", "boss@corp.example")
+	j := enqueue(t, m, "review the thing", func(r *StartRequest) { codexReview(r); r.RepoPath = repo })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	if j = get(t, m, j.ID); j.Status != store.StatusFailed || !strings.Contains(j.Error, "refused to start") || !strings.Contains(j.Error, "email") {
+		t.Fatalf("codex job committing with the rejected pair's email: %s %q", j.Status, j.Error)
+	}
+}
+
+// Nothing in the repository's config changes the committed email: with the job's pair set, the
+// repository's author.email, committer.email and an includeIf-included user.email lose; a job gitconfig
+// with only half an identity (which would let them fill in the other half) is refused by GitEnv.
+func TestGitIdentityRepoConfigCannotChangeEmail(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.GitName, m.Cfg.GitEmail = "Agent Bot", "bot@example.org"
+	repo := newRepo(t)
+	inc := filepath.Join(t.TempDir(), "inc.gitconfig")
+	if err := os.WriteFile(inc, []byte("[user]\n\temail = included@corp.example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "config", "author.email", "author@corp.example")
+	gitT(t, repo, "config", "committer.email", "committer@corp.example")
+	gitT(t, repo, "config", "includeIf.gitdir:/.path", inc)
+	gitT(t, repo, "config", "include.path", inc)
+	j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
+	if got, want := commitIdentity(t, m, j.ID), "Agent Bot <bot@example.org> / Agent Bot <bot@example.org>"; got != want {
+		t.Fatalf("job commit identity %q, want %q", got, want)
+	}
+	// A half identity in the job's gitconfig: GitEnv refuses instead of leaving the email to the repository.
+	cfg := filepath.Join(m.JobDir(j.ID), gitConfigFile)
+	if err := os.Chmod(cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "config", "--file", cfg, "--unset", "user.email")
+	if env, err := GitEnv(m.JobDir(j.ID), os.Environ()); err == nil {
+		t.Fatalf("GitEnv with a half identity in the job's gitconfig: no error (env %d entries)", len(env))
+	} else if !strings.Contains(err.Error(), "user.email") {
+		t.Fatalf("GitEnv error %q does not name the missing half", err)
 	}
 }
