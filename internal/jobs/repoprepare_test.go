@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -282,5 +283,73 @@ func TestPrepareFailureText(t *testing.T) {
 		if got := prepareFailure(c.r); got != c.want {
 			t.Errorf("prepareFailure(%+v) = %q, want %q", c.r, got, c.want)
 		}
+	}
+}
+
+// A resume after a prepare step that did not pass runs it again (the runner never started, so the
+// worktree is still the base commit's); once it passed, a later resume does not.
+func TestPrepareRerunOnResumeAfterFailure(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	// Fails on attempt 1 (no attempts dir yet), passes once attempt 1 is archived.
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "echo run >> ../prep-runs.txt; test -d ../attempts"}}, "")
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_EXIT3", inRepo(repo)).ID)
+	if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, "prepare failed (exit 1") {
+		t.Fatalf("attempt 1: %s %q", j.Status, j.Error)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if p := m.PrepareResultOf(get(t, m, j.ID)); p == nil || p.Exit != 1 {
+		t.Fatalf("prepare result of the queued resume: %+v", p)
+	}
+	j = runToEnd(t, m, j.ID)
+	// The brief's FAKE_EXIT3 fails the runner of attempt 2: prepare passed, the runner ran.
+	if j.Attempt != 2 || !strings.Contains(j.Error, "exited with code 3") {
+		t.Fatalf("attempt 2: %s %q (attempt %d)", j.Status, j.Error, j.Attempt)
+	}
+	if p := m.PrepareResultOf(j); p == nil || p.Exit != 0 || prepareFailure(*p) != "" {
+		t.Fatalf("prepare result of attempt 2: %+v", p)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	j = runToEnd(t, m, j.ID)
+	if j.Attempt != 3 || j.Status != store.StatusSucceeded {
+		t.Fatalf("attempt 3: %s %q (attempt %d)", j.Status, j.Error, j.Attempt)
+	}
+	if n := strings.Count(readFile(t, filepath.Join(m.JobDir(j.ID), "prep-runs.txt")), "run"); n != 2 {
+		t.Fatalf("prepare ran %d times, want 2 (attempts 1 and 2)", n)
+	}
+}
+
+// While the command runs, its process group is in the job row (cancel, stop and the timeout end it
+// without a scope too) and the record shows an unfinished step; afterwards the group is cleared.
+func TestPrepareRecordsGroupAndProgress(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "touch ../prep-started; sleep 2"}}, "")
+	j := enqueue(t, m, "do it", inRepo(repo))
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "prepare start", 10*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "prep-started"))
+		return err == nil
+	})
+	running := get(t, m, j.ID)
+	if running.AcceptancePGID <= 0 {
+		t.Fatalf("prepare process group not recorded: %d", running.AcceptancePGID)
+	}
+	if p := m.PrepareResultOf(running); p == nil || p.Ran || p.Failure != prepareUnfinished {
+		t.Fatalf("in-progress prepare result: %+v", p)
+	}
+	j = runToEnd(t, m, j.ID)
+	if j.Status != store.StatusSucceeded || j.AcceptancePGID != 0 {
+		t.Fatalf("got %s %q, acceptance pgid %d", j.Status, j.Error, j.AcceptancePGID)
+	}
+	if p := m.PrepareResultOf(j); p == nil || !p.Ran || p.Exit != 0 || p.DurationSec < 1 {
+		t.Fatalf("prepare result: %+v", p)
 	}
 }

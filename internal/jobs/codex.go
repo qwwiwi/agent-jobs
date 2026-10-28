@@ -152,6 +152,16 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 		case pathWithin(d, "/tmp"):
 			return fmt.Errorf("codex_read_dirs entry %q is in /tmp, which a workspace-write codex job can write", d)
 		}
+		// The same with links resolved, where the paths exist.
+		if real, err := filepath.EvalSymlinks(d); err == nil {
+			realState, serr := filepath.EvalSymlinks(state)
+			if serr != nil {
+				realState = state
+			}
+			if pathWithin(realState, real) || pathWithin(real, realState) || pathWithin(real, "/tmp") || real == "/" {
+				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, /tmp or /", d, real)
+			}
+		}
 	}
 	return nil
 }

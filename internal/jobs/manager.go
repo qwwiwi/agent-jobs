@@ -685,10 +685,10 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox),
 				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
 		}
-		if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil {
-			// First attempt only: a resumed attempt keeps the worktree its first attempt prepared.
-			plan.wrapper = append(plan.wrapper, "--prepare")
-		}
+	}
+	if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil && (j.Attempt == 1 || m.prepareAgain(j)) {
+		// A resumed attempt keeps the worktree an earlier attempt prepared, unless that prepare did not pass.
+		plan.wrapper = append(plan.wrapper, "--prepare")
 	}
 	if err := m.Store.SetLaunchAuthorization(j.ID, token, j.Attempt, store.LaunchAuthorization{
 		CodexWriteAllowed: j.Runner == store.RunnerCodex && launchCfg.CodexWriteAllowed,

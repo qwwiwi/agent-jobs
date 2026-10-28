@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,5 +65,21 @@ func TestCodexReadDirsNotInArgv(t *testing.T) {
 	args := strings.Join(CodexArgs(j, "high", CodexSandboxWrite), " ")
 	if strings.Contains(args, "writable_roots") || strings.Contains(args, "--add-dir") {
 		t.Fatalf("codex argv grants extra writable roots: %s", args)
+	}
+}
+
+// An entry that reaches the state dir through a link is refused like the state dir itself.
+func TestCodexReadDirsLinkToStateRefused(t *testing.T) {
+	base := t.TempDir()
+	state := filepath.Join(base, "home", "agent")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "cache")
+	if err := os.Symlink(filepath.Join(base, "home"), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+link+`"]}`)); err == nil || !strings.Contains(err.Error(), "resolves to") {
+		t.Fatalf("link to the state dir's parent: err = %v", err)
 	}
 }

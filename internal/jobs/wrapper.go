@@ -580,16 +580,28 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	}
 	if opts.Prepare {
 		// The prepare step (issue #120): before the runner starts, never after; a failure ends the job here.
-		r, rc := runPrepareStep(jobDir, st, id, stderrLog)
-		prepared = r
+		// The step is recorded as unfinished before its command runs, and as it ended before the runner
+		// starts: a wrapper killed in between leaves an unfinished prepare, which a resume runs again.
+		snapshot := func(r *PrepareResult) {
+			prepared = r
+			if err := record(StreamResult{Runner: opts.Runner}); err != nil {
+				fmt.Fprintln(stderrLog, "run-wrapper: record prepare step:", err)
+			}
+		}
+		r, rc := runPrepareStep(jobDir, token, st, id, stderrLog, func(r PrepareResult) { snapshot(&r) })
 		if rc != 0 {
+			if r != nil {
+				snapshot(r) // best effort: the daemon is ending the job
+			}
 			return rc
 		}
 		if r != nil {
 			if fail := prepareFailure(*r); fail != "" {
 				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				prepared = r
 				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail}, record, stderrLog)
 			}
+			snapshot(r)
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)

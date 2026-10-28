@@ -20,9 +20,12 @@ import (
 // --frozen-lockfile`, so a job whose runner has no network (the codex sandbox) still finds its
 // dependencies. The daemon decides at the first launch of a job with a repository whose path matches
 // an entry (the first matching entry wins) and passes --prepare to the wrapper; a resumed attempt keeps
-// the prepared worktree and runs no prepare step. The wrapper runs the command the way it runs
+// the prepared worktree and runs no prepare step, unless the previous attempt's prepare step did not
+// pass (it failed, was stopped or its wrapper died in it: its runner never started, so the worktree is
+// still the base commit's). The wrapper runs the command the way it runs
 // acceptance_cmd: inside the job's own containment (its scope or session), in a process group of its
-// own, without the guard and without a sandbox, with network; unlike acceptance_cmd it keeps the
+// own (recorded in the job row like the acceptance command's, so cancel, stop and the timeout end it
+// even without a scope), without the guard and without a sandbox, with network; unlike acceptance_cmd it keeps the
 // environment the runner gets (the real HOME, so package managers find their stores, caches and
 // registry config), with the job's git environment, temp dir and marker. stdout and stderr go
 // (tail-capped) to <jobdir>/prepare.log. A non-zero exit, a timeout or a step that cannot run fails the
@@ -38,6 +41,8 @@ const (
 	CeilingPrepareTimeoutMinutes = 60
 	PrepareLog                   = "prepare.log"
 	prepareReasonPrefix          = "prepare "
+	// prepareUnfinished is the Failure of the snapshot recorded before the command runs.
+	prepareUnfinished = prepareReasonPrefix + "did not finish (the wrapper ended while it ran)"
 )
 
 // PrepareStep is one entry of config prepare.
@@ -124,7 +129,8 @@ func validatePrepare(steps []PrepareStep) error {
 type PrepareResult struct {
 	Command string `json:"command"`
 	Dir     string `json:"dir,omitempty"`
-	// Ran is false when the command could not be started (the reason is in Failure).
+	// Ran is false when the step did not get to run its command, or did not see it end (the reason is
+	// in Failure).
 	Ran bool `json:"ran"`
 	// Exit is the exit code (128+signal when killed by a signal); -1 with TimedOut.
 	Exit        int    `json:"exit"`
@@ -164,17 +170,23 @@ func prepareFailure(r PrepareResult) string {
 // returns the result to record (nil = no step applies any more: config.json changed since the launch)
 // and a non-zero rc when a stop signal ended the run (the wrapper exits with it and does not start the
 // runner). A failed step is a result with prepareFailure set; the caller ends the job with it.
-func runPrepareStep(jobDir string, st *store.Store, id string, log io.Writer) (*PrepareResult, int) {
+// onStart gets the result before the command runs (Failure prepareUnfinished), for the record.
+func runPrepareStep(jobDir, token string, st *store.Store, id string, log io.Writer,
+	onStart func(PrepareResult)) (*PrepareResult, int) {
 	ctx, release := catchStopSignals()
-	res, signalled := prepareStep(ctx, jobDir, st, id, log)
+	res, signalled := prepareStep(ctx, jobDir, token, st, id, log, onStart)
 	if release() || signalled {
 		fmt.Fprintln(log, "run-wrapper: stopped by a signal during the prepare step; the runner is not started")
+		if res != nil {
+			res.Ran, res.Failure = false, prepareReasonPrefix+"stopped by a signal"
+		}
 		return res, 128 + int(syscall.SIGTERM)
 	}
 	return res, 0
 }
 
-func prepareStep(ctx context.Context, jobDir string, st *store.Store, id string, log io.Writer) (*PrepareResult, bool) {
+func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id string, log io.Writer,
+	onStart func(PrepareResult)) (*PrepareResult, bool) {
 	fail := func(r *PrepareResult, format string, a ...any) (*PrepareResult, bool) {
 		r.Failure = prepareReasonPrefix + "did not run: " + RedactPrintable(fmt.Sprintf(format, a...), 300)
 		return r, false
@@ -214,10 +226,20 @@ func prepareStep(ctx context.Context, jobDir string, st *store.Store, id string,
 		return fail(r, "environment: %v", err)
 	}
 	env = TempEnv(env, tmp)
+	if onStart != nil {
+		started := *r
+		started.Failure = prepareUnfinished
+		onStart(started)
+	}
 	fmt.Fprintf(log, "run-wrapper: prepare: %s (in %s, timeout %s)\n", RedactPrintable(step.Command, 300), dir, step.Timeout())
 	start := time.Now()
 	out := &tailBuffer{max: AcceptanceLogBytes}
-	exit := runShellGroup(ctx, dir, env, step.Command, step.Timeout(), out, log, nil)
+	recordGroup := func(pgid int) {
+		if err := st.SetAcceptancePGID(id, token, pgid); err != nil {
+			fmt.Fprintln(log, "run-wrapper: prepare: record process group:", err)
+		}
+	}
+	exit := runShellGroup(ctx, dir, env, step.Command, step.Timeout(), out, log, recordGroup)
 	dur := time.Since(start)
 	body, dropped := keptTail(out)
 	if dropped > 0 {
@@ -230,14 +252,22 @@ func prepareStep(ctx context.Context, jobDir string, st *store.Store, id string,
 	if exit == acceptanceSignalled {
 		return r, true
 	}
-	// What the command left running (a package manager's daemon) does not outlive the step: the
-	// runner starts with nothing of it around.
-	if sw := sweepJob(jobDir, log, true); sw.Signalled > 0 || sw.Incomplete() {
-		fmt.Fprintf(log, "run-wrapper: prepare: ended %d leftover process(es); survivors %v, error: %v\n",
-			sw.Signalled, sw.Survivors, sw.Err)
-	}
 	r.Ran, r.Exit, r.TimedOut = true, exit, exit == store.AcceptanceTimedOut
 	r.DurationSec = int(dur.Round(time.Second).Seconds())
+	// What the command left running (a package manager's daemon) does not outlive the step: the
+	// runner has not started, so every other process of the session is the step's.
+	sw := sweepJob(jobDir, log, true)
+	if sw.Signalled > 0 {
+		fmt.Fprintf(log, "run-wrapper: prepare: ended %d leftover process(es)\n", sw.Signalled)
+	}
+	if sw.Incomplete() {
+		if err := writeSweepMarker(jobDir, sw); err != nil {
+			fmt.Fprintln(log, "run-wrapper: write sweep marker:", err)
+		}
+		r.Failure = prepareReasonPrefix + "failed: " + sweepResultFailure(sw)
+		return r, false
+	}
+	recordGroup(0)
 	return r, false
 }
 
@@ -266,20 +296,34 @@ func prepareDir(work, rel string) (string, error) {
 	return dir, nil
 }
 
-// PrepareResultOf is the prepare step of job j as its wrapper recorded it: the current launch's result,
-// else, for a resumed job, the first attempt's (the only one that runs the step). Nil = no step ran.
+// PrepareResultOf is the latest prepare step of job j as its wrappers recorded it: the current
+// launch's, else the newest archived attempt's that ran one. Nil = no step ran.
 func (m *Manager) PrepareResultOf(j *store.Job) *PrepareResult {
 	if raw, ok, err := m.Store.WrapperResult(j.ID, j.LaunchToken); err == nil && ok {
 		if r := prepareOfRecord(raw); r != nil {
 			return r
 		}
 	}
-	if j.Attempt > 1 {
-		if raw, err := m.Store.AttemptWrapperResult(j.ID, 1); err == nil {
-			return prepareOfRecord(raw)
+	for n := j.Attempt; n >= 1; n-- {
+		if raw, err := m.Store.AttemptWrapperResult(j.ID, n); err == nil {
+			if r := prepareOfRecord(raw); r != nil {
+				return r
+			}
 		}
 	}
 	return nil
+}
+
+// prepareAgain reports whether a resumed attempt of j runs the prepare step again: the previous
+// attempt ran one that did not pass (failed, stopped, or its wrapper died in it). Its runner never
+// started then, so the worktree holds nothing of the job's own.
+func (m *Manager) prepareAgain(j *store.Job) bool {
+	raw, err := m.Store.AttemptWrapperResult(j.ID, j.Attempt-1)
+	if err != nil {
+		return false
+	}
+	r := prepareOfRecord(raw)
+	return r != nil && prepareFailure(*r) != ""
 }
 
 func prepareOfRecord(raw string) *PrepareResult {
