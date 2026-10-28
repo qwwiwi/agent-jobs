@@ -388,6 +388,17 @@ func runContainedCmd(parent context.Context, jobDir, dir, home, cmdline string, 
 		fmt.Fprintln(log, "run-wrapper: acceptance environment:", err)
 		return 127
 	}
+	return runShellGroup(parent, dir, env, cmdline, timeout, out, log, onStart)
+}
+
+// runShellGroup runs cmdline with /bin/sh -c in dir with env, in a process group of its own (onStart,
+// when set, gets its id), stdout and stderr to out. On the timeout or when parent ends the group gets
+// SIGTERM, then SIGKILL after acceptanceKillGrace. It returns the exit code (128+signal when killed by
+// a signal, store.AcceptanceTimedOut on the timeout, acceptanceSignalled when parent ended, 127 when
+// it could not start). The acceptance command, the manifest-check step and the prepare step run through it.
+func runShellGroup(parent context.Context, dir string, env []string, cmdline string, timeout time.Duration, out io.Writer,
+	log io.Writer, onStart func(pgid int)) int {
+	var err error
 	if parent.Err() != nil {
 		return acceptanceSignalled
 	}
@@ -426,7 +437,7 @@ func runContainedCmd(parent context.Context, jobDir, dir, home, cmdline string, 
 		}
 		return ee.ExitCode()
 	}
-	fmt.Fprintln(log, "run-wrapper: acceptance: start:", err)
+	fmt.Fprintln(log, "run-wrapper: start command:", err)
 	return 127
 }
 

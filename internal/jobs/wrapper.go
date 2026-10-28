@@ -36,7 +36,11 @@ type StreamResult struct {
 	ReportContractNote string
 	// GateFailure is why a gate job's result was rejected and not stored ("" = stored, or not a gate job).
 	GateFailure string
-	ReportText  string `json:"-"` // last report from trusted assistant stdout
+	// Prepare is the job's prepare step (nil = none ran in this launch); PrepareFailure why it failed the
+	// job before its runner started ("" = passed or none).
+	Prepare        *PrepareResult `json:",omitempty"`
+	PrepareFailure string         `json:",omitempty"`
+	ReportText     string         `json:"-"` // last report from trusted assistant stdout
 	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
 	// second one is a line another process wrote into the pipe), for codex its terminal turn events
 	// (turn.completed, turn.failed: codex exec runs one turn).
@@ -613,7 +617,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		return 2
 	}
 	defer st.Close()
-	record := func(res StreamResult) error { return storeResult(st, id, token, res) }
+	var prepared *PrepareResult // the prepare step's result goes into every record of this launch
+	record := func(res StreamResult) error {
+		res.Prepare = prepared
+		return storeResult(st, id, token, res)
+	}
 	observe := func(res StreamResult) {
 		if err := record(res); err != nil {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
@@ -629,6 +637,42 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		if fail != "" {
 			fmt.Fprintln(stderrLog, "run-wrapper:", fail)
 			return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, GateFailure: fail}, record, stderrLog)
+		}
+	}
+	if opts.Prepare {
+		// The prepare step (issue #120): before the runner starts, never after; a failure ends the job here.
+		// The step is recorded as unfinished before its command runs, and as it ended before the runner
+		// starts: a wrapper killed in between leaves an unfinished prepare, which a resume runs again.
+		// Either record failing stops the job there (fail closed): no command runs without its
+		// "unfinished" record, no runner starts while the record still says "unfinished".
+		snapshot := func(r *PrepareResult) error {
+			prepared = r
+			if err := injectedPrepareRecordFault(*r); err != nil {
+				return err
+			}
+			return record(StreamResult{Runner: opts.Runner})
+		}
+		r, rc := runPrepareStep(jobDir, token, st, id, stderrLog, func(r PrepareResult) error { return snapshot(&r) })
+		if rc != 0 {
+			if r != nil {
+				_ = snapshot(r) // best effort: the daemon is ending the job
+			}
+			return rc
+		}
+		if r != nil {
+			fail := prepareFailure(*r)
+			if fail == "" {
+				if err := snapshot(r); err != nil {
+					fail = prepareReasonPrefix + "failed: its passed result could not be recorded: " +
+						RedactPrintable(err.Error(), 300) + "; the runner is not started"
+				}
+			}
+			if fail != "" {
+				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				prepared = r
+				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, PrepareFailure: fail},
+					withPrepareRecordFault(record), stderrLog)
+			}
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
@@ -742,6 +786,9 @@ type WrapperOptions struct {
 	// ManifestCheck runs the judge's manifest-check step before the runner (the daemon passes
 	// --manifest-check for a judge job's launch only): decided at launch, never from a row read here.
 	ManifestCheck bool
+	// Prepare runs the repository's prepare step (config prepare) before the runner (the daemon passes
+	// --prepare for the first launch of a job whose repository has one).
+	Prepare bool
 }
 
 func (o WrapperOptions) prompt() string {
@@ -1012,8 +1059,11 @@ const (
 // environment: no system config, <jobdir>/gitconfig as the only global config, cat as pager, true as
 // editor, no terminal prompt, and the gitOverrides (core.hooksPath=<jobdir>/no-hooks, no fsmonitor,
 // ssh command or credential helper; cat/true as pager/editor) at command-line level (via
-// GIT_CONFIG_COUNT), which wins over any repository config. So git run by the job does not execute
-// hooks, a pager, an editor or a credential prompt the guard does not see.
+// GIT_CONFIG_COUNT), which wins over any repository config, and the job identity of the gitconfig as
+// GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL, which win over the repository's own identity (all
+// four or none: a gitconfig with only one of user.name and user.email is an error). So
+// git run by the job does not execute hooks, a pager, an editor or a credential prompt the guard does
+// not see, and its commits carry the job identity.
 func GitEnv(jobDir string, env []string) ([]string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
@@ -1038,6 +1088,20 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		"GIT_EDITOR=true", "EDITOR=true", "VISUAL=true",
 		"GIT_TERMINAL_PROMPT=0",
 	)
+	// The job identity outranks the repository's config (its local user.name/user.email, author.*,
+	// committer.*, an include or includeIf), which would otherwise win over GIT_CONFIG_GLOBAL. Both
+	// halves or neither: with one alone git would take the other from that config.
+	name, email, err := gitFileIdentity(cfg, out)
+	if err != nil {
+		return nil, err
+	}
+	if (name == "") != (email == "") {
+		return nil, fmt.Errorf("the job identity in %s is incomplete (user.name %q, user.email %q): both or neither", cfg, name, email)
+	}
+	if name != "" {
+		out = append(out, "GIT_AUTHOR_NAME="+name, "GIT_COMMITTER_NAME="+name,
+			"GIT_AUTHOR_EMAIL="+email, "GIT_COMMITTER_EMAIL="+email)
+	}
 	overrides := gitOverrides(hooks)
 	if fi, err := os.Lstat(filepath.Join(abs, SourcesDir)); err == nil && fi.IsDir() {
 		overrides = append(overrides, jobGitOverrides...)
@@ -1047,6 +1111,32 @@ func GitEnv(jobDir string, env []string) ([]string, error) {
 		out = append(out, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
 	}
 	return out, nil
+}
+
+// gitFileIdentity reads user.name and user.email from the job's gitconfig ("" = unset); env is the
+// scrubbed git environment being built.
+func gitFileIdentity(cfg string, env []string) (name, email string, err error) {
+	out, _, err := runGitFor(gitTimeout, "", env, "config", "--file", cfg, "-z", "--get-regexp", `^user\.(name|email)$`)
+	if errors.Is(err, errGitTimeout) {
+		return "", "", fmt.Errorf("read the job identity from %s: %w after %s", cfg, err, gitTimeout)
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return "", "", nil // neither is set
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("read the job identity from %s: %w", cfg, err)
+	}
+	for _, rec := range strings.Split(string(out), "\x00") {
+		key, value, _ := strings.Cut(rec, "\n")
+		switch strings.ToLower(key) {
+		case "user.name":
+			name = value
+		case "user.email":
+			email = value
+		}
+	}
+	return name, email, nil
 }
 
 // gitOverrides are set at command-line level (GIT_CONFIG_COUNT), which beats repository config: a

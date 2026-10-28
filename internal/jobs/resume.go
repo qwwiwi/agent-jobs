@@ -952,7 +952,7 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 	if err := os.Remove(filepath.Join(dir, noHooksDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%s: %w", noHooksDir, err)
 	}
-	return m.writeGitFiles(dir)
+	return m.writeGitFiles(dir, j.RepoPath)
 }
 
 // prepareResume readies the job dir for attempt j.Attempt and returns its launch: the previous

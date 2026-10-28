@@ -388,7 +388,8 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 			"Commit locally; never push. The diff is measured from that base.", j.BaseCommit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
+	fmt.Fprintf(&b, "%s\n\n%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, codexReadDirsSection(j, m.Config().CodexReadDirs),
+		skillsLine(j), sub, ownerRules)
 	if IsGateKind(j.Kind) {
 		// A gate job's input is the daemon's (Wave F): never the brief column, cards or memory notes.
 		if j.Gate == nil {
@@ -499,7 +500,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err := m.writePriorReports(prior, dir); err != nil {
 		return err
 	}
-	if err := m.writeGitFiles(dir); err != nil {
+	if err := m.writeGitFiles(dir, j.RepoPath); err != nil {
 		return err
 	}
 	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only), none for a
@@ -563,6 +564,60 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
 }
 
+// jobIdentity is a job's git identity, both fields or neither: config git_name / git_email when both
+// are set, the repository's local identity when neither is (repoIdentity; repo "" = none), else none.
+// A half configured identity (config validation refuses it) is never completed from the repository.
+func (m *Manager) jobIdentity(repo string) (name, email string) {
+	name, email = m.Config().GitName, m.Config().GitEmail
+	switch {
+	case name != "" && email != "":
+		return name, email
+	case name != "" || email != "":
+		m.Log.Printf("config git_name / git_email: only one is set; the job gets no identity")
+		return "", ""
+	case repo != "":
+		return m.repoIdentity(repo)
+	}
+	return "", ""
+}
+
+// repoIdentity is the repository's local user.name and user.email together, or neither: none when
+// either is missing or either names one of config owner_names (the guard refuses those in a job's
+// commit).
+func (m *Manager) repoIdentity(repo string) (name, email string) {
+	name, email = repoLocalIdentity(repo, "user.name"), repoLocalIdentity(repo, "user.email")
+	if name == "" || email == "" {
+		return "", ""
+	}
+	if namesOwner(m.Config().OwnerNames, name, email) {
+		m.Log.Printf("repository %s: local user.name/user.email names the owner; not used as the job's identity", repo)
+		return "", ""
+	}
+	return name, email
+}
+
+// namesOwner reports whether any of values contains one of owners (case-insensitive), the guard's rule
+// for a commit.
+func namesOwner(owners []string, values ...string) bool {
+	low := strings.ToLower(strings.Join(values, "\n"))
+	for _, name := range owners {
+		if n := strings.ToLower(strings.TrimSpace(name)); n != "" && strings.Contains(low, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// repoLocalIdentity reads key from the repository's own config (`git config --local`), never the
+// user's global or the system config: the user's identity is the owner's, not the job's.
+func repoLocalIdentity(repo, key string) string {
+	v, err := git(repo, "config", "--local", "--get", key)
+	if err != nil || strings.ContainsAny(v, "\n\x00") {
+		return ""
+	}
+	return v
+}
+
 // worktreeOwnerFile lives in the worktree's admin dir (<repo>/.git/worktrees/<name>/): git leaves
 // it alone and deletes it together with the worktree, so it proves which job created the worktree.
 const worktreeOwnerFile = "agent-jobs-owner"
@@ -585,14 +640,18 @@ func (m *Manager) markWorktree(j *store.Job, work string) error {
 	return writeJSON(filepath.Join(m.JobDir(j.ID), "worktree.json"), WorktreeInfo{Path: work, GitDir: gitDir, Head: j.BaseCommit})
 }
 
-// writeGitFiles writes <jobdir>/gitconfig (the job identity from config, nothing else) and the empty
+// writeGitFiles writes <jobdir>/gitconfig (the job identity, nothing else) and the empty
 // <jobdir>/no-hooks dir; the wrapper points GIT_CONFIG_GLOBAL and core.hooksPath at them (GitEnv).
-func (m *Manager) writeGitFiles(dir string) error {
+// The identity is jobIdentity: config git_name / git_email, else the repository's local identity (repo;
+// "" = none), so a job's commits do not go without one (#120); both fields or neither.
+// GitEnv also sets it as GIT_AUTHOR_* / GIT_COMMITTER_*, which outrank the repository's own config.
+func (m *Manager) writeGitFiles(dir, repo string) error {
 	cfg := filepath.Join(dir, gitConfigFile)
 	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
 		return fmt.Errorf("write gitconfig: %w", err)
 	}
-	for _, kv := range [][2]string{{"user.name", m.Config().GitName}, {"user.email", m.Config().GitEmail}} {
+	name, email := m.jobIdentity(repo)
+	for _, kv := range [][2]string{{"user.name", name}, {"user.email", email}} {
 		if kv[1] == "" {
 			continue
 		}

@@ -28,7 +28,7 @@ const MaxReportBytes = 256 << 10
 // artifactFiles are the files job_result points at when they exist (what the job changed). They are
 // only listed (lstat, regular files only), never read; report.md is the one file read (ReadJobReport).
 var artifactFiles = []string{"report.md", "diffstat.txt", "commits.patch", "staged.patch", "uncommitted.patch",
-	"untracked.tar", "stream.jsonl", "stderr.log", jobs.AcceptanceLog}
+	"untracked.tar", "stream.jsonl", "stderr.log", jobs.PrepareLog, jobs.AcceptanceLog}
 
 // JobView is one job row as the tools return it.
 type JobView struct {
@@ -98,6 +98,10 @@ type JobView struct {
 	// daemon recorded it (read-only, workspace-write, danger-full-access under codex_sandbox
 	// worktree-full-access); empty before launch.
 	CodexSandbox string `json:"codex_sandbox,omitempty"`
+	// Prepare is the repository's prepare step (config prepare) as the job's wrapper ran it before the
+	// runner: command, dir, exit, timed_out, duration_sec, failure; output in <job_dir>/prepare.log.
+	// Omitted when no prepare step ran (none configured, or not started yet).
+	Prepare *jobs.PrepareResult `json:"prepare,omitempty"`
 	// AcceptanceCmd is the command the job must pass after claude exits 0 (empty = none).
 	AcceptanceCmd string `json:"acceptance_cmd,omitempty"`
 	// Skills are the catalog skills selected at job_start; SkillsDelivered those linked into the work
@@ -142,8 +146,8 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
-		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Milestone: j.MilestoneID, Task: j.TaskKey,
-		Waiting: m.MilestoneWaiting(context.Background(), j), Sources: j.Sources,
+		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
+		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.MilestoneWaiting(context.Background(), j), Sources: j.Sources,
 	}
 }
 
@@ -291,6 +295,9 @@ type JobResultOutput struct {
 	Attempts []AttemptView `json:"attempts,omitempty"`
 	// Acceptance is the acceptance command's outcome (jobs with acceptance_cmd only).
 	Acceptance *AcceptanceView `json:"acceptance,omitempty"`
+	// Prepare is the repository's prepare step as the wrapper ran it before the runner (omitted when
+	// none ran); its output is prepare.log among the artifacts.
+	Prepare *jobs.PrepareResult `json:"prepare,omitempty"`
 	// JobDirBytes is the size of the job folder last measured (when the job ended, after a prune; the
 	// worktree of a repo job left out); JobDirPartial: the measurement stopped at its bound, the size
 	// is a lower bound.
@@ -367,6 +374,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 		out.DoneLine = m.DoneLineFor(j)
 		out.JobDirBytes, out.JobDirPartial = j.DirBytes, j.DirPartial
 		out.Acceptance = acceptanceView(m, j)
+		out.Prepare = m.PrepareResultOf(j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {
 			if fi, err := os.Lstat(filepath.Join(dir, f)); err == nil && fi.Mode().IsRegular() {

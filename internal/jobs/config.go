@@ -62,8 +62,14 @@ type Config struct {
 	TmuxSocket string `json:"tmux_socket"`
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
-	// GitName / GitEmail is the job's git identity: written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL of
-	// the job). The guard rejects any other identity; via `git -c` none at all. Empty = no identity.
+	// GitName / GitEmail is the job's git identity, both or neither (one alone is a config error: the
+	// repository's config would fill in the other half): written to <jobdir>/gitconfig (GIT_CONFIG_GLOBAL
+	// of the job, and GIT_AUTHOR_* / GIT_COMMITTER_* in its git environment, which outrank the
+	// repository's config). The guard rejects any other identity; via `git -c` none at all. Both empty =
+	// the job's repository's local user.name / user.email, both or neither (`git config --local`; none
+	// for a job without a repository, or when either names one of OwnerNames), else no identity. A codex
+	// job whose effective identity names one of OwnerNames, or carries the email of a repository pair
+	// dropped for naming one, is refused at launch (checkCodexIdentity).
 	GitName  string `json:"git_name"`
 	GitEmail string `json:"git_email"`
 	// ClaudeBin overrides the claude binary (env AGENT_JOBS_CLAUDE_BIN wins).
@@ -80,6 +86,14 @@ type Config struct {
 	// CodexWriteAllowed too). Enabling worktree-full-access needs a daemon restart; turning it off on disk
 	// applies at the next launch.
 	CodexSandboxMode string `json:"codex_sandbox"`
+	// CodexReadDirs are absolute directories a codex job is told it may read besides its job directory
+	// (a package manager's offline store, a browser cache), named in its prompt as read-only. The native
+	// codex sandbox does not confine reads (ticket 684), so nothing on the codex command line changes:
+	// they are not added as writable roots (under worktree-full-access no sandbox keeps a job from writing
+	// there; only the prompt does). Refused: "/", a path that is, holds or lies in the agent's state dir
+	// or a secret dir (validateCodexReadDirs), or one in /tmp (a writable root of codex's workspace-write
+	// sandbox).
+	CodexReadDirs []string `json:"codex_read_dirs"`
 	// CodexWriteNetwork lets the commands of codex write jobs (fix/general, workspace-write sandbox) reach
 	// the network, so package installs work (`-c sandbox_workspace_write.network_access=true`, issue #92).
 	// Only an explicit true turns it on; nil (absent) and false keep them offline. With network the job can
@@ -195,6 +209,10 @@ type Config struct {
 	// limits (turns, budget, minutes), each capped by what the across-attempt ceilings leave.
 	// 0 = DefaultAutoContinueFraction (0.5); at most 1.
 	AutoContinueFraction float64 `json:"auto_continue_fraction"`
+	// Prepare are per-repository commands the wrapper runs in a new job's worktree, with network, before
+	// its runner starts (repoprepare.go), e.g. a package install the sandboxed runner cannot do. The first
+	// entry whose repo_glob matches the job's repository applies; none = no prepare step.
+	Prepare []PrepareStep `json:"prepare"`
 }
 
 // Report contract modes (config report_contract).
@@ -448,6 +466,10 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 			return c, errors.New("config.json: auto_continue must be true or false, not null (omit the key for default true)")
 		}
 	}
+	if (c.GitName == "") != (c.GitEmail == "") {
+		return c, errors.New("config.json: git_name and git_email must be set together (both or neither): " +
+			"with one alone the repository's config fills in the other half")
+	}
 	if c.TmuxSocket != "" && !reTmuxSocket.MatchString(c.TmuxSocket) {
 		return c, fmt.Errorf("config.json: tmux_socket %q must be a socket name (letters, digits, _ . -), not a path", c.TmuxSocket)
 	}
@@ -523,6 +545,12 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := validateCodexReadDirs(stateDir, c.CodexReadDirs); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := validatePrepare(c.Prepare); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.validateEffortByKind(); err != nil {

@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/qwwiwi/agent-jobs/internal/casefold"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -134,6 +136,303 @@ func (c Config) validateCodex() error {
 		}
 	}
 	return nil
+}
+
+// codexWritableTmp is the temp dir codex's workspace-write sandbox keeps writable; a test hook (the
+// tests' own temp dirs may lie in it), never user config.
+var codexWritableTmp = "/tmp"
+
+// codexReadDirsHome is the user's home dir the secret-dir rule of codex_read_dirs is checked against; a
+// test hook, never user config.
+var codexReadDirsHome = os.UserHomeDir
+
+// homeSecretDirs are the dirs below the user's home that hold credentials or keys; with every
+// ~/.claude* entry (homeSecretPrefix: ~/.claude, ~/.claude.json, ~/.claude-lab and its */secrets) and
+// the agent-jobs home they are never named to a codex job as readable. The list is a minimum, not every
+// place a tool may keep credentials: the owner names only package stores and caches.
+var homeSecretDirs = []string{".secrets", ".ssh", ".gnupg", ".aws", filepath.Join(".config", "gh"),
+	".codex", ".kube", ".docker", filepath.Join(".config", "gcloud")}
+
+const homeSecretPrefix = ".claude"
+
+// secretDirs are the user's home dirs (as configured and with links resolved) and the secret dirs a
+// codex_read_dirs entry must neither be, hold nor lie in: homeSecretDirs, the existing ~/.claude*
+// entries and the agent-jobs home (the state dir's parent), each also with its links resolved.
+func secretDirs(stateDir string) (homes, secrets []string, err error) {
+	home, err := codexReadDirsHome()
+	if err != nil || !filepath.IsAbs(home) {
+		return nil, nil, fmt.Errorf("home dir %q unknown (%v): codex_read_dirs cannot be checked against its secret dirs", home, err)
+	}
+	homes = []string{filepath.Clean(home)}
+	if real, err := filepath.EvalSymlinks(home); err == nil && real != homes[0] {
+		homes = append(homes, real)
+	}
+	for _, h := range homes {
+		for _, s := range homeSecretDirs {
+			secrets = append(secrets, filepath.Join(h, s))
+		}
+		if entries, err := os.ReadDir(h); err == nil {
+			for _, e := range entries {
+				// Folded where the file system ignores case: ~/.CLAUDE-lab is a ~/.claude* entry there (#122).
+				if strings.HasPrefix(foldReadDirPath(e.Name()), homeSecretPrefix) {
+					secrets = append(secrets, filepath.Join(h, e.Name()))
+				}
+			}
+		}
+	}
+	secrets = append(secrets, filepath.Dir(filepath.Clean(stateDir)))
+	for _, s := range slices.Clone(secrets) {
+		if real, err := filepath.EvalSymlinks(s); err == nil && real != s {
+			secrets = append(secrets, real)
+		}
+	}
+	return homes, secrets, nil
+}
+
+// secretOverlap is the home or secret dir path p is, holds or lies in ("" = none): a path holding a
+// home holds all its secret dirs, and any path below a home whose first element starts with
+// homeSecretPrefix is a ~/.claude* one, existing or not.
+func secretOverlap(p string, homes, secrets []string) string {
+	for _, h := range homes {
+		if pathWithin(h, p) {
+			return h
+		}
+		if rel, err := filepath.Rel(h, p); err == nil && pathWithin(p, h) {
+			if first, _, _ := strings.Cut(rel, string(filepath.Separator)); strings.HasPrefix(first, homeSecretPrefix) {
+				return filepath.Join(h, first)
+			}
+		}
+	}
+	for _, s := range secrets {
+		if pathWithin(p, s) || pathWithin(s, p) {
+			return s
+		}
+	}
+	return ""
+}
+
+// validateCodexReadDirs checks config codex_read_dirs: absolute clean paths, not "/", not the agent's
+// state dir, one holding it (the agent-jobs home, the user's home) or one inside it (other jobs' dirs),
+// not in /tmp, which codex's workspace-write sandbox keeps writable, and not a secret dir (secretDirs),
+// one holding it (the user's home, /home) or one inside it; each also with its links resolved
+// (resolvePath: an entry whose links cannot be resolved is refused), and case-folded where the file
+// system ignores case (codexReadDirsFoldCase).
+func validateCodexReadDirs(stateDir string, dirs []string) error {
+	if len(dirs) == 0 {
+		return nil
+	}
+	state := filepath.Clean(stateDir)
+	tmp := codexWritableTmp
+	realTmp, err := filepath.EvalSymlinks(tmp)
+	if err != nil {
+		realTmp = tmp
+	}
+	realState, err := resolvePath(state)
+	if err != nil {
+		realState = state
+	}
+	homes, secrets, err := secretDirs(state)
+	if err != nil {
+		return err
+	}
+	fold := foldReadDirPath
+	fState, fRealState, fTmp, fRealTmp := fold(state), fold(realState), fold(tmp), fold(realTmp)
+	for i := range homes {
+		homes[i] = fold(homes[i])
+	}
+	for i := range secrets {
+		secrets[i] = fold(secrets[i])
+	}
+	for _, d := range dirs {
+		fd := fold(d)
+		switch {
+		case !filepath.IsAbs(d) || filepath.Clean(d) != d || strings.ContainsRune(d, 0):
+			return fmt.Errorf("codex_read_dirs entry %q must be an absolute clean path", d)
+		case d == "/":
+			return errors.New(`codex_read_dirs entry "/" names the whole file system`)
+		case pathWithin(fState, fd) || pathWithin(fd, fState):
+			return fmt.Errorf("codex_read_dirs entry %q overlaps the agent-jobs state dir %s", d, state)
+		case pathWithin(fd, fTmp):
+			return fmt.Errorf("codex_read_dirs entry %q is in %s, which a workspace-write codex job can write", d, tmp)
+		}
+		if s := secretOverlap(fd, homes, secrets); s != "" {
+			return fmt.Errorf("codex_read_dirs entry %q overlaps %s, which holds credentials, keys or agent configuration", d, s)
+		}
+		// The same with links resolved: the longest existing part's, the missing rest appended.
+		real, err := resolvePath(d)
+		if err != nil {
+			return fmt.Errorf("codex_read_dirs entry %q cannot be resolved: %v", d, err)
+		}
+		fReal := fold(real)
+		if pathWithin(fRealState, fReal) || pathWithin(fReal, fRealState) || pathWithin(fReal, fTmp) || pathWithin(fReal, fRealTmp) || real == "/" {
+			return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, %s or /", d, real, tmp)
+		}
+		if s := secretOverlap(fReal, homes, secrets); s != "" {
+			return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps %s, which holds credentials, keys or agent configuration", d, real, s)
+		}
+	}
+	return nil
+}
+
+// codexReadDirsFoldCase compares codex_read_dirs paths case-folded: macOS file systems ignore case by
+// default, so ~/.SSH (or ~/.ſsh, U+017F folding to s) is ~/.ssh there. A test hook besides the platform
+// default, never user config.
+var codexReadDirsFoldCase = runtime.GOOS == "darwin"
+
+func foldReadDirPath(p string) string {
+	if codexReadDirsFoldCase {
+		return casefold.Fold(p)
+	}
+	return p
+}
+
+// maxResolveLinks bounds the dangling links resolvePath follows.
+const maxResolveLinks = 40
+
+// resolvePath is the clean absolute path p with its links resolved as far as it exists: the longest
+// existing ancestor resolved (filepath.EvalSymlinks) and the missing rest appended, so a link to the
+// home with a missing ~/.claude-new below it resolves into the home. A dangling link on the way is
+// followed to its target (one with ".." after a name is refused: the name may be a link, which makes
+// ".." not lexical). Any error but a missing element (a file on the way, a link loop, no permission)
+// is returned.
+func resolvePath(p string) (string, error) {
+	for range maxResolveLinks {
+		real, err := filepath.EvalSymlinks(p)
+		if err == nil {
+			return real, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		// The longest ancestor that resolves, and the elements below it.
+		dir, rest := filepath.Dir(p), []string{filepath.Base(p)}
+		realDir, err := filepath.EvalSymlinks(dir)
+		for errors.Is(err, fs.ErrNotExist) && dir != "/" {
+			dir, rest = filepath.Dir(dir), append([]string{filepath.Base(dir)}, rest...)
+			realDir, err = filepath.EvalSymlinks(dir)
+		}
+		if err != nil {
+			return "", err
+		}
+		first, tail := filepath.Join(realDir, rest[0]), filepath.Join(rest[1:]...)
+		fi, err := os.Lstat(first)
+		if errors.Is(err, fs.ErrNotExist) {
+			return filepath.Join(first, tail), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			return "", fmt.Errorf("%s exists but does not resolve", first)
+		}
+		target, err := os.Readlink(first)
+		if err != nil {
+			return "", err
+		}
+		if dotDotAfterName(target) {
+			return "", fmt.Errorf("dangling link %s -> %s: a target with .. after a name is not followed", first, target)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(realDir, target)
+		}
+		p = filepath.Join(target, tail)
+	}
+	return "", fmt.Errorf("%s: too many links", p)
+}
+
+// dotDotAfterName reports whether the link target has a ".." element after a name element (leading
+// ".." elements of a relative target climb from the link's resolved dir and are lexical).
+func dotDotAfterName(target string) bool {
+	named := false
+	for _, e := range strings.Split(target, "/") {
+		switch e {
+		case "", ".":
+		case "..":
+			if named {
+				return true
+			}
+		default:
+			named = true
+		}
+	}
+	return false
+}
+
+// pathWithin reports whether path is dir or lies below it (both clean and absolute).
+func pathWithin(path, dir string) bool {
+	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+}
+
+// checkCodexIdentity refuses a codex job whose commits would carry the owner's identity: codex runs
+// without the guard hook, so its effective author and committer (`git var` in the worktree with the
+// job's git environment: the job identity, else the repository's own config, else git's guess) must
+// not name one of owners, nor carry the email of the repository's (repo; "" = none) local pair when
+// that pair names one (jobIdentity dropped it as the owner's; its email need not contain an owner
+// name). No identity at all passes: such a commit fails, it carries nobody's.
+func checkCodexIdentity(jobDir, repo string, env, owners []string) error {
+	if !slices.ContainsFunc(owners, func(n string) bool { return strings.TrimSpace(n) != "" }) {
+		return nil
+	}
+	env, err := GitEnv(jobDir, env)
+	if err != nil {
+		return err
+	}
+	var ownerEmail string
+	if repo != "" {
+		name, email := repoLocalIdentity(repo, "user.name"), repoLocalIdentity(repo, "user.email")
+		if namesOwner(owners, name, email) {
+			ownerEmail = strings.TrimSpace(email)
+		}
+	}
+	for _, v := range []string{"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} {
+		out, _, err := runGitFor(gitTimeout, filepath.Join(jobDir, "work"), env, "var", v)
+		if errors.Is(err, errGitTimeout) {
+			return fmt.Errorf("check a codex job's commit identity: git var %s: %w after %s", v, err, gitTimeout)
+		}
+		if err != nil {
+			continue
+		}
+		if namesOwner(owners, string(out)) {
+			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s names one of owner_names: "+
+				"the repository's own identity or git's guess is in force); set git_name and git_email in config.json", v)
+		}
+		if ownerEmail != "" && strings.EqualFold(identEmail(string(out)), ownerEmail) {
+			return fmt.Errorf("a codex job's commits would carry the owner's identity (its %s has the email of the "+
+				"repository's user.name/user.email, which names one of owner_names); set git_name and git_email in config.json", v)
+		}
+	}
+	return nil
+}
+
+// identEmail is the email of a `git var GIT_*_IDENT` line ("Name <email> 1700000000 +0000"; "" = none).
+func identEmail(ident string) string {
+	_, rest, ok := strings.Cut(ident, "<")
+	if !ok {
+		return ""
+	}
+	email, _, ok := strings.Cut(rest, ">")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(email)
+}
+
+// codexReadDirsSection is the prompt section of a codex job that names config codex_read_dirs as
+// readable ("" for a claude or gate job, or none configured): the exception to the preamble's rule to
+// work only inside the job directory, read-only.
+func codexReadDirsSection(j *store.Job, dirs []string) string {
+	if j.Runner != store.RunnerCodex || IsGateKind(j.Kind) || len(dirs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Read-only directories\n\nBesides your job directory you may READ these directories (an exception to the rule " +
+		"«Work only inside your own job directory»). Use them read-only: never write, create, change or delete anything in them " +
+		"(for a package manager, point it at them as an offline store or cache, never as a target).\n\n")
+	for _, d := range dirs {
+		fmt.Fprintf(&b, "- `%s`\n", d)
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 func (c Config) codexBin() string {

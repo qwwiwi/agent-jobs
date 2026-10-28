@@ -153,7 +153,7 @@ const usage = `usage: agent-jobs <command> [flags]
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
   version                                  print the version (also --version)
-  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] -- <claude|codex> <args...>
+  run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
                                            job: only the tools allow-listed for jobs)
@@ -294,7 +294,7 @@ func mcpRole(args []string) string {
 
 func runWrapper(args []string) int {
 	const u = "usage: agent-jobs run-wrapper <jobdir> --token <launch-token> [--prompt F] " +
-		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] [--manifest-check] -- <claude|codex> <args...>"
+		"[--fallback-prompt F --fallback-session ID] [--runner claude|codex] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>"
 	if len(args) < 5 || args[1] != "--token" {
 		fmt.Fprintln(os.Stderr, u)
 		return 2
@@ -304,6 +304,11 @@ func runWrapper(args []string) int {
 	for len(rest) >= 2 && rest[0] != "--" {
 		if rest[0] == "--manifest-check" {
 			opts.ManifestCheck = true
+			rest = rest[1:]
+			continue
+		}
+		if rest[0] == "--prepare" {
+			opts.Prepare = true
 			rest = rest[1:]
 			continue
 		}
@@ -643,6 +648,9 @@ func cmdStatus(args []string) error {
 		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
+	if p := m.PrepareResultOf(j); p != nil {
+		fmt.Printf("prepare:   %s (%s)\n", p.Command, prepareWord(*p))
+	}
 	if j.AcceptanceCmd != "" {
 		fmt.Printf("accept:    %s (%s)\n", j.AcceptanceCmd, acceptanceWord(j))
 	}
@@ -853,6 +861,19 @@ func cmdList(args []string) error {
 			fmtTime(&j.CreatedAt), containShort(j), j.Title)
 	}
 	return w.Flush()
+}
+
+// prepareWord is how a job's prepare step ended: did not run, passed, timeout or exit N.
+func prepareWord(p jobs.PrepareResult) string {
+	switch {
+	case !p.Ran:
+		return "did not run"
+	case p.TimedOut:
+		return fmt.Sprintf("timeout after %ds", p.DurationSec)
+	case p.Exit == 0:
+		return fmt.Sprintf("passed in %ds", p.DurationSec)
+	}
+	return fmt.Sprintf("exit %d after %ds", p.Exit, p.DurationSec)
 }
 
 // acceptanceWord is how a job's acceptance command ended: not run, passed, timeout or exit N.
