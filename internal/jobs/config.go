@@ -80,6 +80,12 @@ type Config struct {
 	// CodexWriteAllowed too). Enabling worktree-full-access needs a daemon restart; turning it off on disk
 	// applies at the next launch.
 	CodexSandboxMode string `json:"codex_sandbox"`
+	// CodexReadDirs are absolute directories a codex job is told it may read besides its job directory
+	// (a package manager's offline store, a browser cache), named in its prompt as read-only. The native
+	// codex sandbox does not confine reads (ticket 684), so nothing on the codex command line changes:
+	// they are never writable roots. Refused: "/", a path that is, holds or lies in the agent's state dir,
+	// or one in /tmp (a writable root of codex's workspace-write sandbox).
+	CodexReadDirs []string `json:"codex_read_dirs"`
 	// CodexReasoningEffort is the default reasoning effort of codex jobs (low|medium|high); empty = high.
 	CodexReasoningEffort string `json:"codex_reasoning_effort"`
 	// CodexJobsPerDay caps the codex jobs of this agent created in the last 24 hours, whatever became of
@@ -510,6 +516,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, errors.New("config.json: max_brief_bytes, brief_warn_files and brief_warn_headings must be 0 (default) or positive")
 	}
 	if err := c.validateCodex(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := validateCodexReadDirs(stateDir, c.CodexReadDirs); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := validatePrepare(c.Prepare); err != nil {

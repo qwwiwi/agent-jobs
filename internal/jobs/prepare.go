@@ -365,7 +365,8 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 			"Commit locally; never push. The diff is measured from that base.", j.BaseCommit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n%s%s\n\n## Owner rules\n\n%s\n\n", pre, skillsLine(j), sub, ownerRules)
+	fmt.Fprintf(&b, "%s\n\n%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, codexReadDirsSection(j, m.Config().CodexReadDirs),
+		skillsLine(j), sub, ownerRules)
 	if IsGateKind(j.Kind) {
 		// A gate job's input is the daemon's (Wave F): never the brief column, cards or memory notes.
 		if j.Gate == nil {

@@ -136,6 +136,49 @@ func (c Config) validateCodex() error {
 	return nil
 }
 
+// validateCodexReadDirs checks config codex_read_dirs: absolute clean paths, not "/", not the agent's
+// state dir, one holding it (the agent-jobs home, the user's home) or one inside it (other jobs' dirs),
+// and not in /tmp, which codex's workspace-write sandbox keeps writable.
+func validateCodexReadDirs(stateDir string, dirs []string) error {
+	state := filepath.Clean(stateDir)
+	for _, d := range dirs {
+		switch {
+		case !filepath.IsAbs(d) || filepath.Clean(d) != d || strings.ContainsRune(d, 0):
+			return fmt.Errorf("codex_read_dirs entry %q must be an absolute clean path", d)
+		case d == "/":
+			return errors.New(`codex_read_dirs entry "/" names the whole file system`)
+		case pathWithin(state, d) || pathWithin(d, state):
+			return fmt.Errorf("codex_read_dirs entry %q overlaps the agent-jobs state dir %s", d, state)
+		case pathWithin(d, "/tmp"):
+			return fmt.Errorf("codex_read_dirs entry %q is in /tmp, which a workspace-write codex job can write", d)
+		}
+	}
+	return nil
+}
+
+// pathWithin reports whether path is dir or lies below it (both clean and absolute).
+func pathWithin(path, dir string) bool {
+	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+}
+
+// codexReadDirsSection is the prompt section of a codex job that names config codex_read_dirs as
+// readable ("" for a claude or gate job, or none configured): the exception to the preamble's rule to
+// work only inside the job directory, read-only.
+func codexReadDirsSection(j *store.Job, dirs []string) string {
+	if j.Runner != store.RunnerCodex || IsGateKind(j.Kind) || len(dirs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Read-only directories\n\nBesides your job directory you may READ these directories (an exception to the rule " +
+		"«Work only inside your own job directory»). Use them read-only: never write, create, change or delete anything in them " +
+		"(for a package manager, point it at them as an offline store or cache, never as a target).\n\n")
+	for _, d := range dirs {
+		fmt.Fprintf(&b, "- `%s`\n", d)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 func (c Config) codexBin() string {
 	if b := os.Getenv("AGENT_JOBS_CODEX_BIN"); b != "" {
 		return b

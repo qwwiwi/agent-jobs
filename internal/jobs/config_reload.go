@@ -41,7 +41,7 @@ var hotConfigKeys = map[string]bool{
 	"effort_by_kind": true, "codex_reasoning_effort": true,
 	"acceptance_timeout_minutes": true, "owner_waits_max_hours": true,
 	"idle_after_result_seconds": true, "job_dir_note_mb": true, "size_required": true,
-	"prepare": true,
+	"prepare": true, "codex_read_dirs": true,
 }
 
 func (w *ConfigReloader) changed(id FileIdentity, exists bool) bool {
