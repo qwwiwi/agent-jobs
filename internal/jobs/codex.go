@@ -140,15 +140,89 @@ func (c Config) validateCodex() error {
 // tests' own temp dirs may lie in it), never user config.
 var codexWritableTmp = "/tmp"
 
+// codexReadDirsHome is the user's home dir the secret-dir rule of codex_read_dirs is checked against; a
+// test hook, never user config.
+var codexReadDirsHome = os.UserHomeDir
+
+// homeSecretDirs are the dirs below the user's home that hold credentials or keys; with every
+// ~/.claude* entry (homeSecretPrefix: ~/.claude, ~/.claude.json, ~/.claude-lab and its */secrets) and
+// the agent-jobs home they are never named to a codex job as readable.
+var homeSecretDirs = []string{".secrets", ".ssh", ".gnupg", ".aws", filepath.Join(".config", "gh")}
+
+const homeSecretPrefix = ".claude"
+
+// secretDirs are the user's home dirs (as configured and with links resolved) and the secret dirs a
+// codex_read_dirs entry must neither be, hold nor lie in: homeSecretDirs, the existing ~/.claude*
+// entries and the agent-jobs home (the state dir's parent), each also with its links resolved.
+func secretDirs(stateDir string) (homes, secrets []string, err error) {
+	home, err := codexReadDirsHome()
+	if err != nil || !filepath.IsAbs(home) {
+		return nil, nil, fmt.Errorf("home dir %q unknown (%v): codex_read_dirs cannot be checked against its secret dirs", home, err)
+	}
+	homes = []string{filepath.Clean(home)}
+	if real, err := filepath.EvalSymlinks(home); err == nil && real != homes[0] {
+		homes = append(homes, real)
+	}
+	for _, h := range homes {
+		for _, s := range homeSecretDirs {
+			secrets = append(secrets, filepath.Join(h, s))
+		}
+		if entries, err := os.ReadDir(h); err == nil {
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), homeSecretPrefix) {
+					secrets = append(secrets, filepath.Join(h, e.Name()))
+				}
+			}
+		}
+	}
+	secrets = append(secrets, filepath.Dir(filepath.Clean(stateDir)))
+	for _, s := range slices.Clone(secrets) {
+		if real, err := filepath.EvalSymlinks(s); err == nil && real != s {
+			secrets = append(secrets, real)
+		}
+	}
+	return homes, secrets, nil
+}
+
+// secretOverlap is the home or secret dir path p is, holds or lies in ("" = none): a path holding a
+// home holds all its secret dirs, and any path below a home whose first element starts with
+// homeSecretPrefix is a ~/.claude* one, existing or not.
+func secretOverlap(p string, homes, secrets []string) string {
+	for _, h := range homes {
+		if pathWithin(h, p) {
+			return h
+		}
+		if rel, err := filepath.Rel(h, p); err == nil && pathWithin(p, h) {
+			if first, _, _ := strings.Cut(rel, string(filepath.Separator)); strings.HasPrefix(first, homeSecretPrefix) {
+				return filepath.Join(h, first)
+			}
+		}
+	}
+	for _, s := range secrets {
+		if pathWithin(p, s) || pathWithin(s, p) {
+			return s
+		}
+	}
+	return ""
+}
+
 // validateCodexReadDirs checks config codex_read_dirs: absolute clean paths, not "/", not the agent's
 // state dir, one holding it (the agent-jobs home, the user's home) or one inside it (other jobs' dirs),
-// and not in /tmp, which codex's workspace-write sandbox keeps writable.
+// not in /tmp, which codex's workspace-write sandbox keeps writable, and not a secret dir (secretDirs),
+// one holding it (the user's home, /home) or one inside it; each also with its links resolved.
 func validateCodexReadDirs(stateDir string, dirs []string) error {
+	if len(dirs) == 0 {
+		return nil
+	}
 	state := filepath.Clean(stateDir)
 	tmp := codexWritableTmp
 	realTmp, err := filepath.EvalSymlinks(tmp)
 	if err != nil {
 		realTmp = tmp
+	}
+	homes, secrets, err := secretDirs(state)
+	if err != nil {
+		return err
 	}
 	for _, d := range dirs {
 		switch {
@@ -161,6 +235,9 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 		case pathWithin(d, tmp):
 			return fmt.Errorf("codex_read_dirs entry %q is in %s, which a workspace-write codex job can write", d, tmp)
 		}
+		if s := secretOverlap(d, homes, secrets); s != "" {
+			return fmt.Errorf("codex_read_dirs entry %q overlaps %s, which holds credentials, keys or agent configuration", d, s)
+		}
 		// The same with links resolved, where the paths exist.
 		if real, err := filepath.EvalSymlinks(d); err == nil {
 			realState, serr := filepath.EvalSymlinks(state)
@@ -169,6 +246,9 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 			}
 			if pathWithin(realState, real) || pathWithin(real, realState) || pathWithin(real, tmp) || pathWithin(real, realTmp) || real == "/" {
 				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, %s or /", d, real, tmp)
+			}
+			if s := secretOverlap(real, homes, secrets); s != "" {
+				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps %s, which holds credentials, keys or agent configuration", d, real, s)
 			}
 		}
 	}

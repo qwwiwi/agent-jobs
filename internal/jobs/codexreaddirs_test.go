@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,5 +102,123 @@ func TestCodexReadDirsLinkToStateRefused(t *testing.T) {
 	}
 	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+link+`"]}`)); err == nil || !strings.Contains(err.Error(), "resolves to") {
 		t.Fatalf("link to the state dir's parent: err = %v", err)
+	}
+}
+
+// withCodexHome points the secret-dir rule at a fresh home dir (real path, alone in its parent) and
+// returns it.
+func withCodexHome(t *testing.T) string {
+	t.Helper()
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(parent, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := codexReadDirsHome
+	codexReadDirsHome = func() (string, error) { return home, nil }
+	t.Cleanup(func() { codexReadDirsHome = old })
+	return home
+}
+
+func mkdirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Secret dirs (credentials, keys, agent config), a dir holding one (the home itself, its parent) and a
+// dir inside one are refused, lexically and through links; package caches in the home are not.
+func TestCodexReadDirsSecretDirsRefused(t *testing.T) {
+	withCodexTmp(t)
+	home := withCodexHome(t)
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	base := t.TempDir()
+	mkdirs(t, state, filepath.Join(home, ".ssh"), filepath.Join(home, ".aws"), filepath.Join(home, ".config", "gh"),
+		filepath.Join(home, ".claude-lab", "thrall", "secrets"), filepath.Join(home, ".local", "share", "pnpm", "store"),
+		filepath.Join(home, ".cache", "ms-playwright"), filepath.Join(base, "real-gnupg", "keys"))
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// ~/.gnupg is a link elsewhere; links outside the home lead to a secret dir and to the home.
+	symlink(t, filepath.Join(base, "real-gnupg"), filepath.Join(home, ".gnupg"))
+	symlink(t, filepath.Join(home, ".ssh"), filepath.Join(base, "ssh-alias"))
+	symlink(t, home, filepath.Join(base, "home-alias"))
+	symlink(t, filepath.Join(home, ".aws"), filepath.Join(home, ".cache", "aws-alias"))
+	symlink(t, filepath.Join(home, ".claude-lab"), filepath.Join(base, "lab-alias"))
+	for _, d := range []string{
+		home,
+		filepath.Dir(home),
+		filepath.Join(home, ".ssh"),
+		filepath.Join(home, ".ssh", "keys"),
+		filepath.Join(home, ".secrets"), // missing: refused all the same
+		filepath.Join(home, ".gnupg"),
+		filepath.Join(home, ".aws"),
+		filepath.Join(home, ".config"), // holds ~/.config/gh
+		filepath.Join(home, ".config", "gh"),
+		filepath.Join(home, ".claude"),
+		filepath.Join(home, ".claude.json"),
+		filepath.Join(home, ".claude-lab"),
+		filepath.Join(home, ".claude-lab", "thrall", "secrets"),
+		filepath.Join(home, ".claude-other", "cache"),     // any ~/.claude*, existing or not
+		filepath.Join(filepath.Dir(state), "other-agent"), // the agent-jobs home: other agents' state
+		filepath.Join(base, "real-gnupg"),                 // the real path of the ~/.gnupg link
+		filepath.Join(base, "real-gnupg", "keys"),
+		filepath.Join(base, "ssh-alias"),
+		filepath.Join(base, "home-alias"),
+		filepath.Join(home, ".cache", "aws-alias"),
+		filepath.Join(base, "lab-alias"),
+	} {
+		_, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+d+`"]}`))
+		if err == nil || !strings.Contains(err.Error(), "codex_read_dirs") || !strings.Contains(err.Error(), "holds credentials, keys or agent configuration") {
+			t.Errorf("%s: err = %v, want a secret-dir refusal", d, err)
+		}
+	}
+	ok := []string{filepath.Join(home, ".local", "share", "pnpm", "store"), filepath.Join(home, ".cache", "ms-playwright"), "/opt/pnpm-store"}
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+strings.Join(ok, `", "`)+`"]}`)); err != nil {
+		t.Fatalf("package caches refused: %v", err)
+	}
+}
+
+// A home reached through a link is checked with the link resolved too: its real path's secret dirs
+// are refused.
+func TestCodexReadDirsLinkedHome(t *testing.T) {
+	withCodexTmp(t)
+	real := withCodexHome(t)
+	link := filepath.Join(t.TempDir(), "home-link")
+	symlink(t, real, link)
+	codexReadDirsHome = func() (string, error) { return link, nil }
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	for _, d := range []string{filepath.Join(real, ".ssh"), filepath.Join(link, ".ssh"), real, filepath.Join(real, ".claude")} {
+		if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+d+`"]}`)); err == nil || !strings.Contains(err.Error(), "holds credentials") {
+			t.Errorf("%s: err = %v, want a secret-dir refusal", d, err)
+		}
+	}
+}
+
+// Without a known home dir no entry can be checked: codex_read_dirs is refused, an empty one is not.
+func TestCodexReadDirsUnknownHome(t *testing.T) {
+	withCodexTmp(t)
+	old := codexReadDirsHome
+	codexReadDirsHome = func() (string, error) { return "", errors.New("$HOME is not defined") }
+	t.Cleanup(func() { codexReadDirsHome = old })
+	state := filepath.Join(t.TempDir(), "agent")
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["/opt/pnpm-store"]}`)); err == nil || !strings.Contains(err.Error(), "home dir") {
+		t.Fatalf("unknown home: err = %v", err)
+	}
+	if _, err := parseConfig(state, []byte(`{}`)); err != nil {
+		t.Fatalf("no codex_read_dirs, unknown home: %v", err)
 	}
 }
