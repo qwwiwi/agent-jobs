@@ -20,9 +20,9 @@ import (
 // --frozen-lockfile`, so a job whose runner has no network (the codex sandbox) still finds its
 // dependencies. The daemon decides at the first launch of a job with a repository whose path matches
 // an entry (the first matching entry wins) and passes --prepare to the wrapper; a resumed attempt keeps
-// the prepared worktree and runs no prepare step, unless the previous attempt's prepare step did not
-// pass (it failed, was stopped or its wrapper died in it: its runner never started, so the worktree is
-// still the base commit's). The wrapper runs the command the way it runs
+// the prepared worktree and runs no prepare step, unless the prepare step of the newest earlier attempt
+// with a wrapper record did not pass (it failed, was stopped or its wrapper died in it: its runner
+// never started, so the worktree is still the base commit's). The wrapper runs the command the way it runs
 // acceptance_cmd: inside the job's own containment (its scope or session), in a process group of its
 // own (recorded in the job row like the acceptance command's, so cancel, stop and the timeout end it
 // even without a scope), without the guard and without a sandbox, with network; unlike acceptance_cmd it keeps the
@@ -336,16 +336,20 @@ func (m *Manager) PrepareResultOf(j *store.Job) *PrepareResult {
 	return nil
 }
 
-// prepareAgain reports whether a resumed attempt of j runs the prepare step again: the previous
-// attempt ran one that did not pass (failed, stopped, or its wrapper died in it). Its runner never
-// started then, so the worktree holds nothing of the job's own.
+// prepareAgain reports whether a resumed attempt of j runs the prepare step again: the newest earlier
+// attempt with a wrapper record ran one that did not pass (failed, stopped, or its wrapper died in
+// it). Its runner never started then, so the worktree holds nothing of the job's own. An attempt
+// without a record (refused at launch, or never archived) started no wrapper and is skipped.
 func (m *Manager) prepareAgain(j *store.Job) bool {
-	raw, err := m.Store.AttemptWrapperResult(j.ID, j.Attempt-1)
-	if err != nil {
-		return false
+	for n := j.Attempt - 1; n >= 1; n-- {
+		raw, err := m.Store.AttemptWrapperResult(j.ID, n)
+		if err != nil || raw == "" {
+			continue
+		}
+		r := prepareOfRecord(raw)
+		return r != nil && prepareFailure(*r) != ""
 	}
-	r := prepareOfRecord(raw)
-	return r != nil && prepareFailure(*r) != ""
+	return false
 }
 
 func prepareOfRecord(raw string) *PrepareResult {

@@ -385,3 +385,38 @@ func TestPrepareRecordFailureFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// An attempt that left no wrapper record (refused to start) between a failed prepare step and the
+// next resume does not hide the failure: the newest attempt with a record decides, so the step runs
+// again.
+func TestPrepareRerunSkipsAttemptsWithoutRecord(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "echo run >> ../prep-runs.txt; test -d ../attempts"}}, "")
+	j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
+	if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, "prepare failed (exit 1") {
+		t.Fatalf("attempt 1: %s %q", j.Status, j.Error)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// Attempt 2 is refused at launch, as launchQueued does it: claimed, failed, no wrapper record.
+	token := newToken()
+	if err := m.Store.Claim(j.ID, token, m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(j.ID, token, store.StatusFailed, 0, 0, 0, "refused to start: test", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{MaxBudgetUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	j = runToEnd(t, m, j.ID)
+	if j.Attempt != 3 || j.Status != store.StatusSucceeded {
+		t.Fatalf("attempt 3: %s %q (attempt %d)", j.Status, j.Error, j.Attempt)
+	}
+	if n := strings.Count(readFile(t, filepath.Join(m.JobDir(j.ID), "prep-runs.txt")), "run"); n != 2 {
+		t.Fatalf("prepare ran %d times, want 2 (attempts 1 and 3)", n)
+	}
+}
