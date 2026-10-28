@@ -109,7 +109,7 @@ func TestJobGuardProtectsJobGitFiles(t *testing.T) {
 	m := newManager(t)
 	j := protectJob(t, m, "gitf")
 	dir := m.JobDir(j.ID)
-	if err := m.writeGitFiles(dir); err != nil {
+	if err := m.writeGitFiles(dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	cfg := jobHookConfig(t, m, j)

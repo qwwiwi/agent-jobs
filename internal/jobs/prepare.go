@@ -460,7 +460,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
 		return err
 	}
-	if err := m.writeGitFiles(dir); err != nil {
+	if err := m.writeGitFiles(dir, j.RepoPath); err != nil {
 		return err
 	}
 	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only), none for a
@@ -524,6 +524,31 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	return os.WriteFile(filepath.Join(dir, "base_commit"), []byte(j.BaseCommit+"\n"), 0o600)
 }
 
+// fallbackIdentity is the repository's local value of key (user.name or user.email) for a job's
+// gitconfig, "" when it has none or the value names one of config owner_names (the guard refuses those
+// in a job's commit).
+func (m *Manager) fallbackIdentity(repo, key string) string {
+	v := repoLocalIdentity(repo, key)
+	low := strings.ToLower(v)
+	for _, name := range m.Config().OwnerNames {
+		if n := strings.ToLower(strings.TrimSpace(name)); n != "" && strings.Contains(low, n) {
+			m.Log.Printf("repository %s: local %s names the owner; not used as the job's identity", repo, key)
+			return ""
+		}
+	}
+	return v
+}
+
+// repoLocalIdentity reads key from the repository's own config (`git config --local`), never the
+// user's global or the system config: the user's identity is the owner's, not the job's.
+func repoLocalIdentity(repo, key string) string {
+	v, err := git(repo, "config", "--local", "--get", key)
+	if err != nil || strings.ContainsAny(v, "\n\x00") {
+		return ""
+	}
+	return v
+}
+
 // worktreeOwnerFile lives in the worktree's admin dir (<repo>/.git/worktrees/<name>/): git leaves
 // it alone and deletes it together with the worktree, so it proves which job created the worktree.
 const worktreeOwnerFile = "agent-jobs-owner"
@@ -546,14 +571,19 @@ func (m *Manager) markWorktree(j *store.Job, work string) error {
 	return writeJSON(filepath.Join(m.JobDir(j.ID), "worktree.json"), WorktreeInfo{Path: work, GitDir: gitDir, Head: j.BaseCommit})
 }
 
-// writeGitFiles writes <jobdir>/gitconfig (the job identity from config, nothing else) and the empty
+// writeGitFiles writes <jobdir>/gitconfig (the job identity, nothing else) and the empty
 // <jobdir>/no-hooks dir; the wrapper points GIT_CONFIG_GLOBAL and core.hooksPath at them (GitEnv).
-func (m *Manager) writeGitFiles(dir string) error {
+// The identity is config git_name / git_email; a field the config leaves empty is taken from the
+// repository's local config (repo; "" = none), so a job's commits do not go without one (#120).
+func (m *Manager) writeGitFiles(dir, repo string) error {
 	cfg := filepath.Join(dir, gitConfigFile)
 	if err := os.WriteFile(cfg, nil, 0o600); err != nil {
 		return fmt.Errorf("write gitconfig: %w", err)
 	}
 	for _, kv := range [][2]string{{"user.name", m.Config().GitName}, {"user.email", m.Config().GitEmail}} {
+		if kv[1] == "" && repo != "" {
+			kv[1] = m.fallbackIdentity(repo, kv[0])
+		}
 		if kv[1] == "" {
 			continue
 		}

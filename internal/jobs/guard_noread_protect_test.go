@@ -21,7 +21,7 @@ func TestJobGuardRefusesChecklistLocksWithProtectedPaths(t *testing.T) {
 	m := newManager(t)
 	j := protectJob(t, m, "lockprot")
 	dir := m.JobDir(j.ID)
-	if err := m.writeGitFiles(dir); err != nil {
+	if err := m.writeGitFiles(dir, ""); err != nil {
 		t.Fatal(err)
 	}
 	locks := m.ChecklistLockDir()
