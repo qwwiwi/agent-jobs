@@ -38,20 +38,39 @@ func TestCodexReadDirsInPrompt(t *testing.T) {
 	}
 }
 
+// withCodexTmp points the codex temp-dir rule at a fresh dir of its own, so a test's temp dirs (in /tmp
+// on most hosts) do not trip it, and returns that dir.
+func withCodexTmp(t *testing.T) string {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "codex-tmp")
+	old := codexWritableTmp
+	codexWritableTmp = tmp
+	t.Cleanup(func() { codexWritableTmp = old })
+	return tmp
+}
+
+// Each refusal names its own reason, whatever TMPDIR the tests run with.
 func TestCodexReadDirsValidation(t *testing.T) {
+	tmp := withCodexTmp(t)
 	state := filepath.Join(t.TempDir(), "agent")
-	for _, bad := range []string{
-		`{"codex_read_dirs": ["relative/dir"]}`,
-		`{"codex_read_dirs": ["/"]}`,
-		`{"codex_read_dirs": ["/opt/x/../y"]}`,
-		`{"codex_read_dirs": ["` + filepath.Dir(state) + `"]}`,
-		`{"codex_read_dirs": ["` + state + `"]}`,
-		`{"codex_read_dirs": ["` + filepath.Join(state, "jobs") + `"]}`,
-		`{"codex_read_dirs": ["/tmp/cache"]}`,
+	for _, c := range []struct{ dir, want string }{
+		{"relative/dir", "absolute clean path"},
+		{"/", "whole file system"},
+		{"/opt/x/../y", "absolute clean path"},
+		{filepath.Dir(state), "overlaps the agent-jobs state dir"},
+		{state, "overlaps the agent-jobs state dir"},
+		{filepath.Join(state, "jobs"), "overlaps the agent-jobs state dir"},
+		{filepath.Join(tmp, "cache"), "which a workspace-write codex job can write"},
 	} {
-		if _, err := parseConfig(state, []byte(bad)); err == nil || !strings.Contains(err.Error(), "codex_read_dirs") {
-			t.Errorf("%s: err = %v, want a codex_read_dirs error", bad, err)
+		_, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+c.dir+`"]}`))
+		if err == nil || !strings.Contains(err.Error(), "codex_read_dirs") || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want a codex_read_dirs error with %q", c.dir, err, c.want)
 		}
+	}
+	// Outside tests the rule is /tmp.
+	codexWritableTmp = "/tmp"
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["/tmp/cache"]}`)); err == nil || !strings.Contains(err.Error(), "is in /tmp") {
+		t.Errorf("/tmp/cache: err = %v", err)
 	}
 	c, err := parseConfig(state, []byte(`{"codex_read_dirs": ["/home/u/.local/share/pnpm/store", "/home/u/.cache/ms-playwright"]}`))
 	if err != nil || len(c.CodexReadDirs) != 2 {
@@ -70,6 +89,7 @@ func TestCodexReadDirsNotInArgv(t *testing.T) {
 
 // An entry that reaches the state dir through a link is refused like the state dir itself.
 func TestCodexReadDirsLinkToStateRefused(t *testing.T) {
+	withCodexTmp(t)
 	base := t.TempDir()
 	state := filepath.Join(base, "home", "agent")
 	if err := os.MkdirAll(state, 0o700); err != nil {

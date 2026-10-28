@@ -136,11 +136,20 @@ func (c Config) validateCodex() error {
 	return nil
 }
 
+// codexWritableTmp is the temp dir codex's workspace-write sandbox keeps writable; a test hook (the
+// tests' own temp dirs may lie in it), never user config.
+var codexWritableTmp = "/tmp"
+
 // validateCodexReadDirs checks config codex_read_dirs: absolute clean paths, not "/", not the agent's
 // state dir, one holding it (the agent-jobs home, the user's home) or one inside it (other jobs' dirs),
 // and not in /tmp, which codex's workspace-write sandbox keeps writable.
 func validateCodexReadDirs(stateDir string, dirs []string) error {
 	state := filepath.Clean(stateDir)
+	tmp := codexWritableTmp
+	realTmp, err := filepath.EvalSymlinks(tmp)
+	if err != nil {
+		realTmp = tmp
+	}
 	for _, d := range dirs {
 		switch {
 		case !filepath.IsAbs(d) || filepath.Clean(d) != d || strings.ContainsRune(d, 0):
@@ -149,8 +158,8 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 			return errors.New(`codex_read_dirs entry "/" names the whole file system`)
 		case pathWithin(state, d) || pathWithin(d, state):
 			return fmt.Errorf("codex_read_dirs entry %q overlaps the agent-jobs state dir %s", d, state)
-		case pathWithin(d, "/tmp"):
-			return fmt.Errorf("codex_read_dirs entry %q is in /tmp, which a workspace-write codex job can write", d)
+		case pathWithin(d, tmp):
+			return fmt.Errorf("codex_read_dirs entry %q is in %s, which a workspace-write codex job can write", d, tmp)
 		}
 		// The same with links resolved, where the paths exist.
 		if real, err := filepath.EvalSymlinks(d); err == nil {
@@ -158,8 +167,8 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 			if serr != nil {
 				realState = state
 			}
-			if pathWithin(realState, real) || pathWithin(real, realState) || pathWithin(real, "/tmp") || real == "/" {
-				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, /tmp or /", d, real)
+			if pathWithin(realState, real) || pathWithin(real, realState) || pathWithin(real, tmp) || pathWithin(real, realTmp) || real == "/" {
+				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, %s or /", d, real, tmp)
 			}
 		}
 	}
