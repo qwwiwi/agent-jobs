@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -146,8 +147,10 @@ var codexReadDirsHome = os.UserHomeDir
 
 // homeSecretDirs are the dirs below the user's home that hold credentials or keys; with every
 // ~/.claude* entry (homeSecretPrefix: ~/.claude, ~/.claude.json, ~/.claude-lab and its */secrets) and
-// the agent-jobs home they are never named to a codex job as readable.
-var homeSecretDirs = []string{".secrets", ".ssh", ".gnupg", ".aws", filepath.Join(".config", "gh")}
+// the agent-jobs home they are never named to a codex job as readable. The list is a minimum, not every
+// place a tool may keep credentials: the owner names only package stores and caches.
+var homeSecretDirs = []string{".secrets", ".ssh", ".gnupg", ".aws", filepath.Join(".config", "gh"),
+	".codex", ".kube", ".docker", filepath.Join(".config", "gcloud")}
 
 const homeSecretPrefix = ".claude"
 
@@ -209,7 +212,9 @@ func secretOverlap(p string, homes, secrets []string) string {
 // validateCodexReadDirs checks config codex_read_dirs: absolute clean paths, not "/", not the agent's
 // state dir, one holding it (the agent-jobs home, the user's home) or one inside it (other jobs' dirs),
 // not in /tmp, which codex's workspace-write sandbox keeps writable, and not a secret dir (secretDirs),
-// one holding it (the user's home, /home) or one inside it; each also with its links resolved.
+// one holding it (the user's home, /home) or one inside it; each also with its links resolved
+// (resolvePath: an entry whose links cannot be resolved is refused), and case-folded where the file
+// system ignores case (codexReadDirsFoldCase).
 func validateCodexReadDirs(stateDir string, dirs []string) error {
 	if len(dirs) == 0 {
 		return nil
@@ -220,39 +225,134 @@ func validateCodexReadDirs(stateDir string, dirs []string) error {
 	if err != nil {
 		realTmp = tmp
 	}
+	realState, err := resolvePath(state)
+	if err != nil {
+		realState = state
+	}
 	homes, secrets, err := secretDirs(state)
 	if err != nil {
 		return err
 	}
+	fold := foldReadDirPath
+	fState, fRealState, fTmp, fRealTmp := fold(state), fold(realState), fold(tmp), fold(realTmp)
+	for i := range homes {
+		homes[i] = fold(homes[i])
+	}
+	for i := range secrets {
+		secrets[i] = fold(secrets[i])
+	}
 	for _, d := range dirs {
+		fd := fold(d)
 		switch {
 		case !filepath.IsAbs(d) || filepath.Clean(d) != d || strings.ContainsRune(d, 0):
 			return fmt.Errorf("codex_read_dirs entry %q must be an absolute clean path", d)
 		case d == "/":
 			return errors.New(`codex_read_dirs entry "/" names the whole file system`)
-		case pathWithin(state, d) || pathWithin(d, state):
+		case pathWithin(fState, fd) || pathWithin(fd, fState):
 			return fmt.Errorf("codex_read_dirs entry %q overlaps the agent-jobs state dir %s", d, state)
-		case pathWithin(d, tmp):
+		case pathWithin(fd, fTmp):
 			return fmt.Errorf("codex_read_dirs entry %q is in %s, which a workspace-write codex job can write", d, tmp)
 		}
-		if s := secretOverlap(d, homes, secrets); s != "" {
+		if s := secretOverlap(fd, homes, secrets); s != "" {
 			return fmt.Errorf("codex_read_dirs entry %q overlaps %s, which holds credentials, keys or agent configuration", d, s)
 		}
-		// The same with links resolved, where the paths exist.
-		if real, err := filepath.EvalSymlinks(d); err == nil {
-			realState, serr := filepath.EvalSymlinks(state)
-			if serr != nil {
-				realState = state
-			}
-			if pathWithin(realState, real) || pathWithin(real, realState) || pathWithin(real, tmp) || pathWithin(real, realTmp) || real == "/" {
-				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, %s or /", d, real, tmp)
-			}
-			if s := secretOverlap(real, homes, secrets); s != "" {
-				return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps %s, which holds credentials, keys or agent configuration", d, real, s)
-			}
+		// The same with links resolved: the longest existing part's, the missing rest appended.
+		real, err := resolvePath(d)
+		if err != nil {
+			return fmt.Errorf("codex_read_dirs entry %q cannot be resolved: %v", d, err)
+		}
+		fReal := fold(real)
+		if pathWithin(fRealState, fReal) || pathWithin(fReal, fRealState) || pathWithin(fReal, fTmp) || pathWithin(fReal, fRealTmp) || real == "/" {
+			return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps the agent-jobs state dir, %s or /", d, real, tmp)
+		}
+		if s := secretOverlap(fReal, homes, secrets); s != "" {
+			return fmt.Errorf("codex_read_dirs entry %q resolves to %s, which overlaps %s, which holds credentials, keys or agent configuration", d, real, s)
 		}
 	}
 	return nil
+}
+
+// codexReadDirsFoldCase compares codex_read_dirs paths case-folded: macOS file systems ignore case by
+// default, so ~/.SSH is ~/.ssh there. A test hook besides the platform default, never user config.
+var codexReadDirsFoldCase = runtime.GOOS == "darwin"
+
+func foldReadDirPath(p string) string {
+	if codexReadDirsFoldCase {
+		return strings.ToLower(p)
+	}
+	return p
+}
+
+// maxResolveLinks bounds the dangling links resolvePath follows.
+const maxResolveLinks = 40
+
+// resolvePath is the clean absolute path p with its links resolved as far as it exists: the longest
+// existing ancestor resolved (filepath.EvalSymlinks) and the missing rest appended, so a link to the
+// home with a missing ~/.claude-new below it resolves into the home. A dangling link on the way is
+// followed to its target (one with ".." after a name is refused: the name may be a link, which makes
+// ".." not lexical). Any error but a missing element (a file on the way, a link loop, no permission)
+// is returned.
+func resolvePath(p string) (string, error) {
+	for range maxResolveLinks {
+		real, err := filepath.EvalSymlinks(p)
+		if err == nil {
+			return real, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		// The longest ancestor that resolves, and the elements below it.
+		dir, rest := filepath.Dir(p), []string{filepath.Base(p)}
+		realDir, err := filepath.EvalSymlinks(dir)
+		for errors.Is(err, fs.ErrNotExist) && dir != "/" {
+			dir, rest = filepath.Dir(dir), append([]string{filepath.Base(dir)}, rest...)
+			realDir, err = filepath.EvalSymlinks(dir)
+		}
+		if err != nil {
+			return "", err
+		}
+		first, tail := filepath.Join(realDir, rest[0]), filepath.Join(rest[1:]...)
+		fi, err := os.Lstat(first)
+		if errors.Is(err, fs.ErrNotExist) {
+			return filepath.Join(first, tail), nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			return "", fmt.Errorf("%s exists but does not resolve", first)
+		}
+		target, err := os.Readlink(first)
+		if err != nil {
+			return "", err
+		}
+		if dotDotAfterName(target) {
+			return "", fmt.Errorf("dangling link %s -> %s: a target with .. after a name is not followed", first, target)
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(realDir, target)
+		}
+		p = filepath.Join(target, tail)
+	}
+	return "", fmt.Errorf("%s: too many links", p)
+}
+
+// dotDotAfterName reports whether the link target has a ".." element after a name element (leading
+// ".." elements of a relative target climb from the link's resolved dir and are lexical).
+func dotDotAfterName(target string) bool {
+	named := false
+	for _, e := range strings.Split(target, "/") {
+		switch e {
+		case "", ".":
+		case "..":
+			if named {
+				return true
+			}
+		default:
+			named = true
+		}
+	}
+	return false
 }
 
 // pathWithin reports whether path is dir or lies below it (both clean and absolute).

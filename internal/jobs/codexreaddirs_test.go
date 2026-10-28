@@ -222,3 +222,80 @@ func TestCodexReadDirsUnknownHome(t *testing.T) {
 		t.Fatalf("no codex_read_dirs, unknown home: %v", err)
 	}
 }
+
+// An entry whose tail does not exist yet is checked with its existing part's links resolved: a link to
+// the home with a missing ~/.claude* or secret dir below it, and a dangling link into one, are refused;
+// a path that cannot be resolved for another reason (a file on the way, a link loop) is refused too.
+func TestCodexReadDirsMissingTailThroughLink(t *testing.T) {
+	withCodexTmp(t)
+	home := withCodexHome(t)
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	base := t.TempDir()
+	mkdirs(t, state, filepath.Join(home, ".cache"))
+	symlink(t, home, filepath.Join(base, "home-link"))
+	symlink(t, filepath.Join(home, ".claude-new"), filepath.Join(base, "dangling"))
+	symlink(t, filepath.Join("..", filepath.Base(base), "home-link", ".ssh"), filepath.Join(base, "dotdot-link"))
+	// A dangling link whose target has ".." after a name: the name may be a link, so ".." is not lexical.
+	symlink(t, "home-link/x/../.ssh", filepath.Join(base, "inner-dotdot"))
+	symlink(t, filepath.Join(base, "loop-b"), filepath.Join(base, "loop-a"))
+	symlink(t, filepath.Join(base, "loop-a"), filepath.Join(base, "loop-b"))
+	if err := os.WriteFile(filepath.Join(base, "file"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for d, want := range map[string]string{
+		filepath.Join(base, "home-link", ".claude-new"):        "holds credentials",
+		filepath.Join(base, "home-link", ".ssh", "keys"):       "holds credentials",
+		filepath.Join(base, "home-link", ".config", "gh", "x"): "holds credentials",
+		filepath.Join(base, "dangling"):                        "holds credentials",
+		filepath.Join(base, "dangling", "sub"):                 "holds credentials",
+		filepath.Join(base, "dotdot-link", "missing"):          "holds credentials",
+		filepath.Join(base, "inner-dotdot"):                    "cannot be resolved",
+		filepath.Join(base, "file", "sub"):                     "cannot be resolved",
+		filepath.Join(base, "loop-a", "sub"):                   "cannot be resolved",
+	} {
+		if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+d+`"]}`)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", d, err, want)
+		}
+	}
+	ok := filepath.Join(base, "home-link", ".cache", "pnpm-new")
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+ok+`"]}`)); err != nil {
+		t.Fatalf("a missing cache dir below a linked home: %v", err)
+	}
+}
+
+// The denylist's minimum covers the codex, kubernetes, docker and gcloud credentials too.
+func TestCodexReadDirsMoreSecretDirs(t *testing.T) {
+	withCodexTmp(t)
+	home := withCodexHome(t)
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	for _, d := range []string{".codex", ".kube", ".docker", filepath.Join(".config", "gcloud"), filepath.Join(".codex", "sessions")} {
+		p := filepath.Join(home, d)
+		if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+p+`"]}`)); err == nil || !strings.Contains(err.Error(), "holds credentials") {
+			t.Errorf("%s: err = %v, want a secret-dir refusal", p, err)
+		}
+	}
+}
+
+// On a case-insensitive file system (macOS) ~/.SSH is ~/.ssh: the paths are compared case-folded there.
+func TestCodexReadDirsCaseFolded(t *testing.T) {
+	withCodexTmp(t)
+	home := withCodexHome(t)
+	state := filepath.Join(t.TempDir(), "aj", "agent")
+	old := codexReadDirsFoldCase
+	t.Cleanup(func() { codexReadDirsFoldCase = old })
+	codexReadDirsFoldCase = true
+	for _, d := range []string{
+		filepath.Join(home, ".SSH"),
+		filepath.Join(home, ".Claude-Lab"),
+		filepath.Join(filepath.Dir(home), "HOME"),
+		filepath.Join(filepath.Dir(filepath.Dir(state)), "AJ", "other-agent"), // the agent-jobs home
+	} {
+		if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+d+`"]}`)); err == nil {
+			t.Errorf("%s: accepted with case-folded comparison", d)
+		}
+	}
+	codexReadDirsFoldCase = false
+	if _, err := parseConfig(state, []byte(`{"codex_read_dirs": ["`+filepath.Join(home, ".SSH")+`"]}`)); err != nil {
+		t.Errorf("case-sensitive: %v", err)
+	}
+}
