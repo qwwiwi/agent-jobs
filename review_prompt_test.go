@@ -87,3 +87,24 @@ func TestReviewPromptBriefGapAndFixReview(t *testing.T) {
 		t.Error("brief gap and fix review must come before the Blocking subsection")
 	}
 }
+
+// Owner requirement 2026-11-03: a reviewer of a UI diff checks the executor's browser evidence; missing
+// evidence, a matrix not covered or BROWSER CHECK NOT RUN is at least a High finding, and Blocking.
+func TestReviewPromptUIEvidence(t *testing.T) {
+	b, err := Templates.ReadFile("prompts/kind-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		"UI diff:", "browser evidence", "covers the matrix", "360x740, 390x844, 768x1024, 1366x768, 1920x1080",
+		"full page length", "`BROWSER CHECK NOT RUN`", "at least a High finding", "a Blocking line",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("kind-review.md lacks %q", want)
+		}
+	}
+	if i := strings.Index(s, "### Blocking"); strings.Index(s, "UI diff:") > i {
+		t.Error("the UI evidence rule must come before the Blocking subsection it feeds")
+	}
+}

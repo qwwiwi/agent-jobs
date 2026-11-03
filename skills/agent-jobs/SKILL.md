@@ -124,6 +124,8 @@ You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.
 3. Only then does anything leave the machine: push, PR, deploy, a message to a person. That is this session's job, never the job's.
 4. A failed job without a report: look at `stderr.log`, then `stream.jsonl` in the job's directory.
 
+UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `node <job dir>/tools/ui-check.mjs <base-url> <path>...` yourself (exit 0 pass, 1 fail, 2 not run), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
+
 After a review, and when a job failed:
 
 - A fix job gets the review's Blocking findings as written and nothing more: copy them unchanged, without the Non-blocking items, your own rewording or extra ideas. Non-blocking items go to a separate ticket.

@@ -80,3 +80,32 @@ func TestResearchPromptCloneRule(t *testing.T) {
 		}
 	}
 }
+
+// Owner requirement 2026-11-03: a fix or general job whose diff touches UI checks it in a real headless
+// browser (the full device matrix, the full page length, the listed checks, screenshots, one pass/fail per
+// device x page) before it reports done, and says BROWSER CHECK NOT RUN when it cannot start one.
+func TestKindPromptsUIChangesRule(t *testing.T) {
+	for _, name := range []string{"prompts/kind-fix.md", "prompts/kind-general.md"} {
+		b, err := Templates.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(b)
+		for _, want := range []string{
+			"UI changes:", "css/scss", "html", "jsx/tsx", "vue/svelte", "templates", "static-site renderers", "design tokens",
+			"before you report done", "real headless browser", "`node <job dir>/tools/ui-check.mjs <base-url> <path>... --out <job dir>/ui-check`",
+			"the repo's own e2e tool",
+			"360x740, 390x844, 768x1024, 1366x768, 1920x1080", "light and dark scheme when the site has both",
+			"full page length", "not just the first screen",
+			"`documentElement.scrollWidth <= clientWidth`", "sticking out of the viewport outside a scroll container",
+			"no broken images", "CLS < 0.1", "split inside a word", "no 4xx/5xx responses",
+			"screenshots in the job dir", "every device x scheme x page with pass/fail",
+			"no sockets, no child processes", "Codex sandbox", "missing system libraries",
+			"«Not done / uncertain» MUST start with `BROWSER CHECK NOT RUN: <reason>`", "never claim the UI is verified",
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+}

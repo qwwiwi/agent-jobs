@@ -316,6 +316,21 @@ func (m *Manager) briefProtected(j *store.Job) []string {
 	return out
 }
 
+// UICheckToolRel is where prepare puts the shipped browser check (scripts/ui-check.mjs) in the job dir:
+// the fix and general checklists tell a job whose diff touches UI to run it, whatever its repository.
+const UICheckToolRel = "tools/ui-check.mjs"
+
+func writeUICheckTool(dir string) error {
+	b, err := agentjobs.Templates.ReadFile("scripts/ui-check.mjs")
+	if err != nil {
+		return fmt.Errorf("template scripts/ui-check.mjs: %w", err)
+	}
+	if _, err := ensureJobSubdir(dir, filepath.Dir(UICheckToolRel)); err != nil {
+		return fmt.Errorf("create job tools dir: %w", err)
+	}
+	return os.WriteFile(filepath.Join(dir, filepath.FromSlash(UICheckToolRel)), b, 0o600)
+}
+
 func template(name string) (string, error) {
 	b, err := agentjobs.Templates.ReadFile(name)
 	if err != nil {
@@ -498,6 +513,9 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 		return err
 	}
 	if err := m.writePriorReports(prior, dir); err != nil {
+		return err
+	}
+	if err := writeUICheckTool(dir); err != nil {
 		return err
 	}
 	if err := m.writeGitFiles(dir, j.RepoPath); err != nil {
