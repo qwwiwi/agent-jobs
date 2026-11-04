@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -59,5 +61,44 @@ func TestMidTaskEndResumable(t *testing.T) {
 	}
 	if got := runToEnd(t, m, j.ID); got.Status != store.StatusSucceeded || got.Attempt != 2 {
 		t.Fatalf("resumed: %s attempt %d %q", got.Status, got.Attempt, got.Error)
+	}
+}
+
+// A clean claude result with an empty final message and no report file ("exit 0 without a report",
+// which the report contract never sees) is a mid-task end too: it is continued once, and an attempt 2
+// that ends the same way is not continued again.
+func TestNoReportEndAutoContinuesOnce(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	j := enqueue(t, m, "FAKE_NOREPORT", nil)
+	tick(t, m)
+	waitExit(t, m, j.ID)
+	// The update quotes the progress file: attempt 2 runs in the same no-report mode.
+	if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), ProgressFile), []byte("- next: FAKE_NOREPORT again\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tick(t, m) // collects attempt 1, queues and launches attempt 2
+	got := get(t, m, j.ID)
+	if got.Status != store.StatusRunning || got.Attempt != 2 || got.RunMode != store.RunResume ||
+		!strings.Contains(got.PendingContext, autoContinueTag+"attempt 1 "+stopMidTask) {
+		t.Fatalf("after the empty end: %s attempt %d mode %s %q\n%s", got.Status, got.Attempt, got.RunMode, got.Error, got.PendingContext)
+	}
+	waitExit(t, m, j.ID)
+	tick(t, m)
+	got = get(t, m, j.ID)
+	if got.Status != store.StatusFailed || got.Attempt != 2 || !strings.Contains(got.Error, "without a report") ||
+		!strings.Contains(got.Error, "not auto-continued: it was auto-continued once already") {
+		t.Fatalf("attempt 2: %s attempt %d %q", got.Status, got.Attempt, got.Error)
+	}
+}
+
+// A runner failure that also left no report (a non-success result not flagged as an error, here a
+// spent budget) is not a mid-task end: it is not continued.
+func TestNoReportRunnerFailureNotContinued(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_NONSUCCESS_REPORT", nil).ID)
+	if j.Status != store.StatusFailed || j.Attempt != 1 || strings.Contains(j.Error, "auto-continue") {
+		t.Fatalf("runner failure: %s attempt %d %q", j.Status, j.Attempt, j.Error)
 	}
 }

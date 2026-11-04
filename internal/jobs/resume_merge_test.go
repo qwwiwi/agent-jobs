@@ -90,6 +90,8 @@ func TestResumeRunsInNewCgroupScope(t *testing.T) {
 func TestStoppedResumedJobStatsNotDoubleCounted(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, true)
+	// Attempt 2 ends without a report: the test resumes it itself.
+	noAutoContinue(m)
 	st := startAndStop(t, m, nil) // attempt 1: 1 turn, cost unknown, no tools
 	s1, err := m.Store.GetStats(st.ID)
 	if err != nil {

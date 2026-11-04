@@ -262,6 +262,8 @@ func TestResumeIntactTranscriptResumes(t *testing.T) {
 func TestActivityCountsEarlierAttempts(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, true)
+	// Attempt 1 ends without a report: the test resumes it itself.
+	noAutoContinue(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_NOREPORT", nil).ID) // 2 turns, $0.01, no report: failed
 	if j.Status != store.StatusFailed || j.CostUSD != 0.01 || j.CostUnknown {
 		t.Fatalf("precondition: %+v", j)

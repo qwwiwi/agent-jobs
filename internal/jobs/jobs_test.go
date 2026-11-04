@@ -665,6 +665,7 @@ func TestGuardKnowsJobGitDirs(t *testing.T) {
 
 func TestExitZeroWithoutReportFails(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m) // a clean end without a report is otherwise continued once (#126)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_NOREPORT", nil).ID)
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "without a report") {
 		t.Fatalf("got %s %q", j.Status, j.Error)

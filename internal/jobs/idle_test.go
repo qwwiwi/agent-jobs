@@ -213,6 +213,7 @@ func TestIdleAfterResultKeepsOwnReport(t *testing.T) {
 // A normal exit with an empty result text: subagent output and a quoted heading are not the report.
 func TestReportFallbackIgnoresSubagentAndQuotes(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m) // a clean end without a report is otherwise continued once (#126)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_SUBAGENT_REPORT", nil).ID)
 	if j.Status != store.StatusFailed || j.Error != "exit 0 without a report" {
 		t.Fatalf("job: %s %q", j.Status, j.Error)

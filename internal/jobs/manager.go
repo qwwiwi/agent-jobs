@@ -1712,7 +1712,7 @@ func (m *Manager) collect() error {
 
 // collectExited finishes an attempt whose wrapper recorded trusted completion. An attempt stopped at its turn
 // limit gets a stop report when it wrote none and is then continued once (autoContinue); so is an attempt
-// that ended its turn without a report (NoteNoSummary, #126).
+// that ended its turn without a report (midTaskEnd, #126).
 func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	dir := m.JobDir(j.ID)
 	res := m.endedResult(j)
@@ -1730,13 +1730,25 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	switch {
 	case turnLimit:
 		why = stopTurnLimit
-	case status == store.StatusFailed && OffContractNote(msg) == NoteNoSummary:
+	case midTaskEnd(j, status, msg, res):
 		why = stopMidTask
 	}
 	// Continued only when finish recorded the verdict as it was (not a failed scope stop or skill-link check).
 	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); why != "" && ok && st == status && got == msg {
 		m.autoContinue(j.ID, why)
 	}
+}
+
+// midTaskEnd reports whether a claude attempt failed only because it ended its turn without a report: a
+// final message without a Summary section (NoteNoSummary) or a clean result with an empty final message
+// and no report file (reasonNoReport). Runner failures (an error or non-success result, a non-zero
+// exit) are not.
+func midTaskEnd(j *store.Job, status, msg string, res StreamResult) bool {
+	if status != store.StatusFailed || j.Runner == store.RunnerCodex {
+		return false
+	}
+	return OffContractNote(msg) == NoteNoSummary ||
+		(msg == reasonNoReport && res.Found && !res.IsError && res.Subtype == "success")
 }
 
 // killedResult reads the latest trusted progress snapshot. A result already observed by the wrapper
@@ -1947,13 +1959,16 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	if !reported {
-		return store.StatusFailed, "exit 0 without a report"
+		return store.StatusFailed, reasonNoReport
 	}
 	if res.Runner != store.RunnerCodex && res.Subtype != "success" {
 		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	return store.StatusSucceeded, ""
 }
+
+// reasonNoReport is Verdict's reason for a clean exit that left no report.
+const reasonNoReport = "exit 0 without a report"
 
 func hasReport(dir string) bool {
 	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
