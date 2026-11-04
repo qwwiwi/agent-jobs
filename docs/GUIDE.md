@@ -198,6 +198,23 @@ A job's final message is its report, saved as `report.md`. Exactly four sections
 
 **Brief size.** `job_start` refuses a brief above `max_brief_bytes` (default 32 KB) and returns a `size_warning` when the brief names more than `brief_warn_files` files (default 40) or has more than `brief_warn_headings` `## ` headings (default 8): it may be more than one job.
 
+## Checking UI work
+
+Owner requirement (2026-11-03): frontend work is checked for real, in a browser. A static blog once went live after checks of only its first screen at two widths; tables further down broke words letter by letter on 360-393 px phones.
+
+- **Jobs.** When a fix or general job's diff touches UI (css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers, design tokens), its checklist makes it load every changed page in a real headless browser before it reports done, over the full page length, at 360x740, 390x844, 768x1024, 1366x768 and 1920x1080, light and dark when the site has both, with screenshots in the job dir and one pass/fail line per device x scheme x page in Evidence. A job that cannot start a browser (no sockets or child processes, as in the Codex sandbox, missing system libraries) starts «Not done / uncertain» with `BROWSER CHECK NOT RUN: <reason>`.
+- **Reviews.** A reviewer of a UI diff checks that this evidence exists and covers the matrix; missing evidence is at least a High finding and Blocking.
+- **Orchestrator.** It never accepts or deploys a UI job without the evidence, runs the check itself (or starts a job that can) before merge or deploy, and again on the live URL after a frontend deploy (prompts/orchestrator.md, the skill).
+- **The tool.** [scripts/ui-check.mjs](../scripts/ui-check.mjs), copied into every job dir as `tools/ui-check.mjs`:
+
+  ```sh
+  python3 -m http.server 8000 -d public &   # or the site's own dev server
+  node <job dir>/tools/ui-check.mjs http://127.0.0.1:8000 / /blog/post --out <job dir>/ui-check
+  ```
+
+  For each device x scheme x page it scrolls the window and every vertical scroll container whose content exceeds its box by more than a viewport (an app shell's `overflow-y: auto` area; `body` too when `html` has a non-visible overflow so `body` scrolls on its own), largest first, to the end (lazy content loads; a scroll that stops early, a scroller cut off or left out by the shared budget of 400 steps fails), observes layout shifts for at least `--dwell` ms (default 3000), and fails on: a 4xx/5xx or failed response, horizontal page scroll (`documentElement.scrollWidth > clientWidth`), a visible element sticking out of the viewport outside a scroll container (one in its containing-block chain whose own box stays inside the viewport), a broken image, CLS ≥ 0.1, a word split inside a word (the client rects of a word, between line-break opportunities, fall on more than one line; a word is skipped only when `hyphens: auto` provably hyphenated it: its breaks move with hyphenation off, no `word-break: break-all`, no fragment under 2 letters, 3 under `overflow-wrap: anywhere`; scripts written without spaces are skipped). The 3-letter minimum under `overflow-wrap: anywhere` is deliberate policy: a 2-letter fragment fails even where the dictionary hyphenated correctly, because short word fragments are not allowed on phones. `--schemes auto` (default) adds the dark run when the page declares a dark scheme or its colours change under `prefers-color-scheme: dark`; `--schemes light,dark` forces both (a site whose dark mode is only a toggle button needs its own run). It prints one `PASS` / `FAIL` line per run, writes full-page screenshots and `results.json` to `--out`, and exits 0 (all pass), 1 (a failure) or 2 (could not run: the last line starts `BROWSER CHECK NOT RUN:`).
+- **Playwright** is not a dependency of agent-jobs: the script resolves it from the caller's environment (node_modules above the current directory, `NODE_PATH`, `npm root -g`) and uses Chromium (`npx playwright install chromium`). `scripts/check.sh` runs only static tests of it (`scripts/ui-check.test.mjs` under `node --test`: the pure helpers and the in-page probe against a fake DOM), no browser.
+
 ## Cleanup and patches
 
 30 minutes after the job-done line is delivered, the daemon removes the job's worktree, the heaviest part. It first checks that the worktree really belongs to this job, then saves everything the job changed, without touching the index or files:
