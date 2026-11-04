@@ -206,8 +206,9 @@ type Config struct {
 	// price here or in the built-in table keeps an unknown cost.
 	ModelPrices map[string]ModelPrice `json:"model_prices"`
 	// ReportContract is what happens to a claude job that ends succeeded with a report missing the
-	// "## Summary" or "## Not done / uncertain" section: "warn" (default; it stays succeeded with a
-	// note in its error, on the job-done line and in the stats) or "fail" (it fails with that note).
+	// "## Not done / uncertain" section: "warn" (default; it stays succeeded with a note in its error,
+	// on the job-done line and in the stats) or "fail" (it fails with that note). A report missing the
+	// "## Summary" section fails a non-gate job in both modes (#126).
 	ReportContract string `json:"report_contract"`
 	// AutoContinue continues a claude attempt stopped at its turn limit or its timeout once, in the same
 	// session, with a fresh allowance (AutoContinueFraction). Nil (absent) = on; false turns it off.

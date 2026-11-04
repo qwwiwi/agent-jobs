@@ -1711,7 +1711,8 @@ func (m *Manager) collect() error {
 }
 
 // collectExited finishes an attempt whose wrapper recorded trusted completion. An attempt stopped at its turn
-// limit gets a stop report when it wrote none and is then continued once (autoContinue).
+// limit gets a stop report when it wrote none and is then continued once (autoContinue); so is an attempt
+// that ended its turn without a report (NoteNoSummary, #126).
 func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	dir := m.JobDir(j.ID)
 	res := m.endedResult(j)
@@ -1725,9 +1726,16 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	if turnLimit {
 		m.writeStopReport(j, dir, stopTurnLimit, res.Turns)
 	}
+	why := ""
+	switch {
+	case turnLimit:
+		why = stopTurnLimit
+	case status == store.StatusFailed && OffContractNote(msg) == NoteNoSummary:
+		why = stopMidTask
+	}
 	// Continued only when finish recorded the verdict as it was (not a failed scope stop or skill-link check).
-	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); turnLimit && ok && st == status && got == msg {
-		m.autoContinue(j.ID, stopTurnLimit)
+	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); why != "" && ok && st == status && got == msg {
+		m.autoContinue(j.ID, why)
 	}
 }
 
