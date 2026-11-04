@@ -1,7 +1,9 @@
 package jobs
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/checklist"
 	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 // denyRules is «Ничего наружу»: deny rules hold even under bypassPermissions.
@@ -325,10 +328,77 @@ func writeUICheckTool(dir string) error {
 	if err != nil {
 		return fmt.Errorf("template scripts/ui-check.mjs: %w", err)
 	}
-	if _, err := ensureJobSubdir(dir, filepath.Dir(UICheckToolRel)); err != nil {
+	tools, err := ensureJobSubdir(dir, filepath.Dir(UICheckToolRel))
+	if err != nil {
 		return fmt.Errorf("create job tools dir: %w", err)
 	}
-	return os.WriteFile(filepath.Join(dir, filepath.FromSlash(UICheckToolRel)), b, 0o600)
+	return writeJobFileOnce(tools, filepath.Base(UICheckToolRel), b)
+}
+
+// writeJobFileOnce creates name in dir with content b, never through a symlink and never over an
+// existing file: the job dir is writable by the job, so a planted symlink or hard link at name could
+// otherwise redirect or truncate a file outside it. dir is opened with O_NOFOLLOW|O_DIRECTORY and name
+// is created relative to it with O_CREAT|O_EXCL|O_NOFOLLOW. An existing regular file with one link and
+// exactly content b is kept (a resumed job runs prepare again); a symlink, a hard link, another file
+// type or differing content is an error.
+func writeJobFileOnce(dir, name string, b []byte) error {
+	dfd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: dir, Err: err}
+	}
+	defer unix.Close(dfd)
+	p := filepath.Join(dir, name)
+	fd, err := unix.Openat(dfd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if errors.Is(err, unix.EEXIST) {
+		return checkJobFileSame(dfd, name, p, b)
+	}
+	if err != nil {
+		return &os.PathError{Op: "create", Path: p, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), p)
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write %s: %w", p, err)
+	}
+	return f.Close()
+}
+
+// checkJobFileSame accepts the existing name under dfd only when it is a regular file with one link
+// whose content equals b.
+func checkJobFileSame(dfd int, name, p string, b []byte) error {
+	var st unix.Stat_t
+	if err := unix.Fstatat(dfd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return &os.PathError{Op: "lstat", Path: p, Err: err}
+	}
+	switch {
+	case st.Mode&unix.S_IFMT == unix.S_IFLNK:
+		return fmt.Errorf("%s exists and is a symlink: refusing to write through it", p)
+	case st.Mode&unix.S_IFMT != unix.S_IFREG:
+		return fmt.Errorf("%s exists and is not a regular file (mode %o)", p, st.Mode&unix.S_IFMT)
+	case uint64(st.Nlink) != 1:
+		return fmt.Errorf("%s exists and is a hard link (%d links): refusing to keep or overwrite it", p, st.Nlink)
+	}
+	rfd, err := unix.Openat(dfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: p, Err: err}
+	}
+	f := os.NewFile(uintptr(rfd), p)
+	defer f.Close()
+	var st2 unix.Stat_t
+	if err := unix.Fstat(rfd, &st2); err != nil {
+		return &os.PathError{Op: "fstat", Path: p, Err: err}
+	}
+	if st2.Ino != st.Ino || st2.Dev != st.Dev || st2.Mode&unix.S_IFMT != unix.S_IFREG || uint64(st2.Nlink) != 1 {
+		return fmt.Errorf("%s changed while it was checked", p)
+	}
+	got, err := io.ReadAll(io.LimitReader(f, int64(len(b))+1))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", p, err)
+	}
+	if !bytes.Equal(got, b) {
+		return fmt.Errorf("%s exists with different content: refusing to overwrite it", p)
+	}
+	return nil
 }
 
 func template(name string) (string, error) {
