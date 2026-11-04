@@ -8,7 +8,8 @@
 // Checks per device x scheme x page: no 4xx/5xx or failed response, no horizontal page scroll
 // (documentElement.scrollWidth <= clientWidth), no visible element sticking out of the viewport outside a
 // scroll container, no broken images, CLS < 0.1, no word split inside a word (a word whose rendered
-// rects fall on more than one line, e.g. a table cell narrower than its longest word). A full-page
+// rects fall on more than one line, e.g. a table cell narrower than its longest word; only proven
+// hyphenation is exempt), the page and its main inner scroller scrolled to their end. A full-page
 // screenshot of each run and results.json go to --out (default ./ui-check). Layout shifts are observed
 // from navigation until the page is scrolled through and at least --dwell ms (default 3000) have passed.
 //
@@ -20,8 +21,9 @@
 // browser); on 2 the last line starts with "BROWSER CHECK NOT RUN:".
 //
 // The functions exported below are pure (no Node or Playwright state) so scripts/ui-check.test.mjs can
-// test them; wordSegments, countLines, sticksOut and pageProbe also run inside the page, serialized by
-// probeExpression, so they must not refer to anything outside their own bodies.
+// test them; wordSegments, countLines, lineFragments, hyphenationExempt, sticksOut and pageProbe also run
+// inside the page, serialized by probeExpression (scrollThrough by scrollExpression), so they must not refer
+// to anything outside their own bodies.
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
@@ -142,6 +144,53 @@ export function countLines(rects) {
 }
 
 /**
+ * Groups a word's characters by the line they render on. charRects holds, per code point of the word, its
+ * client rects and its length in UTF-16 units; a code point is placed by its last non-empty rect (a line
+ * end can add an empty or a hyphen rect before it). Returns the fragments in order, with their start
+ * (UTF-16 offset in the word) and length in code points. Runs inside the page: self-contained.
+ * @param {{rects: {top: number, bottom: number, left: number, right: number}[], units: number}[]} charRects
+ * @returns {{start: number, length: number}[]}
+ */
+export function lineFragments(charRects) {
+  const frags = [];
+  let cur = null;
+  let offset = 0;
+  for (const c of charRects) {
+    const r = c.rects.filter((x) => x.right - x.left > 0.5 && x.bottom - x.top > 0).pop();
+    if (!r) {
+      if (cur) cur.length++;
+    } else if (cur && Math.min(cur.bottom, r.bottom) - Math.max(cur.top, r.top) > 0.5 * Math.min(cur.bottom - cur.top, r.bottom - r.top)) {
+      cur.length++;
+    } else {
+      cur = { start: offset, length: 1, top: r.top, bottom: r.bottom };
+      frags.push(cur);
+    }
+    offset += c.units;
+  }
+  return frags.map((f) => ({ start: f.start, length: f.length }));
+}
+
+/**
+ * Whether a word rendered on several lines is hyphenated on purpose, so not a defect. Only hyphens: auto
+ * hyphenates here (a soft hyphen in the source already splits the word in wordSegments), and hyphens: auto
+ * alone proves nothing: without a dictionary for the language, or under word-break: break-all, the word
+ * still wraps letter by letter with no hyphen drawn. So the word is exempt only when its breaks move once
+ * hyphenation is switched off (hyphenChanged: they are hyphenation points, where a hyphen is rendered),
+ * word-break is not break-all, and every fragment has at least 2 letters (3 when overflow-wrap: anywhere /
+ * break-word could have forced a break). Runs inside the page: self-contained.
+ * @param {{hyphens: string, wordBreak: string, overflowWrap: string}} s computed style of the text's parent
+ * @param {{start: number, length: number}[]} fragments lineFragments of the word
+ * @param {boolean} hyphenChanged whether the breaks differ under hyphens: manual
+ * @returns {boolean}
+ */
+export function hyphenationExempt(s, fragments, hyphenChanged) {
+  if (s.hyphens !== 'auto' || s.wordBreak === 'break-all' || !hyphenChanged) return false;
+  const forced = s.overflowWrap === 'anywhere' || s.overflowWrap === 'break-word' || s.wordBreak === 'break-word';
+  const min = forced ? 3 : 2;
+  return fragments.length > 1 && fragments.every((f) => f.length >= min);
+}
+
+/**
  * Whether an element's box is visible in the viewport horizontally and sticks out of it by more than
  * 1px on either side. A box entirely off-screen (an off-canvas menu) does not count. Runs inside the page.
  * @param {{left: number, right: number, width: number, height: number}} r getBoundingClientRect()
@@ -181,9 +230,9 @@ export function clsFromShifts(entries) {
 
 /**
  * The in-page probe, run after the page was scrolled to its end and back to the top. h carries
- * wordSegments, countLines and sticksOut (serialized in by probeExpression); limit caps the examples
- * kept per check (the counts are complete).
- * @param {{wordSegments: Function, countLines: Function, sticksOut: Function}} h
+ * wordSegments, countLines, lineFragments, hyphenationExempt and sticksOut (serialized in by
+ * probeExpression); limit caps the examples kept per check (the counts are complete).
+ * @param {{wordSegments: Function, countLines: Function, lineFragments: Function, hyphenationExempt: Function, sticksOut: Function}} h
  * @param {number} limit
  */
 export function pageProbe(h, limit) {
@@ -213,11 +262,28 @@ export function pageProbe(h, limit) {
   };
   const describe = (el) => (el.parentElement && el.parentElement !== body ? name(el.parentElement) + ' > ' : '') + name(el);
   // An ancestor below body that does not let content overflow (auto, scroll, hidden, clip) is a scroll or
-  // clip container: what sticks out of it is scrolled or cut there, not on the page. body and html are not
+  // clip container: what sticks out of it is scrolled or cut there, not on the page. It clips el only when
+  // it is in el's containing-block chain (a fixed box escapes every ancestor but a transformed one, an
+  // absolute box every unpositioned one) and its own box stays inside the viewport. body and html are not
   // counted: content cut by an overflow-x: hidden body is still a defect.
+  const establishes = (mode, s) => {
+    const transformed = (s.transform && s.transform !== 'none') || (s.perspective && s.perspective !== 'none') ||
+      (s.filter && s.filter !== 'none') || /paint|layout|strict|content/.test(s.contain || '') ||
+      /transform|perspective|filter/.test(s.willChange || '');
+    if (mode === 'fixed') return Boolean(transformed);
+    if (mode === 'absolute') return s.position !== 'static' || Boolean(transformed);
+    return true;
+  };
   const contained = (el) => {
+    let mode = style(el).position;
     for (let p = el.parentElement; p && p !== body && p !== de; p = p.parentElement) {
-      if (style(p).overflowX !== 'visible') return true;
+      const s = style(p);
+      if (!establishes(mode, s)) continue;
+      if (s.overflowX !== 'visible' && s.display !== 'inline' && s.display !== 'contents') {
+        const r = p.getBoundingClientRect();
+        if (r.left >= -1 && r.right <= vw + 1) return true;
+      }
+      mode = s.position;
     }
     return false;
   };
@@ -245,6 +311,39 @@ export function pageProbe(h, limit) {
   const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'TEXTAREA', 'OPTION']);
   const walker = document.createTreeWalker(body, 4 /* NodeFilter.SHOW_TEXT */);
   const range = document.createRange();
+  // The word's line fragments, measured code point by code point.
+  const fragmentsOf = (n, seg) => {
+    const chars = [];
+    for (let i = seg.start; i < seg.end;) {
+      const units = n.data.codePointAt(i) > 0xffff ? 2 : 1;
+      range.setStart(n, i);
+      range.setEnd(n, i + units);
+      chars.push({ rects: Array.from(range.getClientRects()), units });
+      i += units;
+    }
+    return h.lineFragments(chars);
+  };
+  // A multiline word under hyphens: auto is exempt only when switching hyphenation off for its parent
+  // moves its breaks (they are hyphenation points, drawn with a hyphen); the parent's inline hyphens is
+  // restored right after.
+  const hyphenatedOnPurpose = (n, seg) => {
+    const p = n.parentElement;
+    const s = style(p);
+    if (s.hyphens !== 'auto' || s.wordBreak === 'break-all') return false;
+    const frags = fragmentsOf(n, seg);
+    const breaks = (f) => f.map((x) => x.start).join(',');
+    const value = p.style.getPropertyValue('hyphens');
+    const priority = p.style.getPropertyPriority('hyphens');
+    let changed;
+    try {
+      p.style.setProperty('hyphens', 'manual', 'important');
+      changed = breaks(fragmentsOf(n, seg)) !== breaks(frags);
+    } finally {
+      if (value) p.style.setProperty('hyphens', value, priority);
+      else p.style.removeProperty('hyphens');
+    }
+    return h.hyphenationExempt({ hyphens: s.hyphens, wordBreak: s.wordBreak, overflowWrap: s.overflowWrap }, frags, changed);
+  };
   const seen = new Set();
   let words = 0;
   for (let n = walker.nextNode(); n && words < 200000; n = walker.nextNode()) {
@@ -252,15 +351,12 @@ export function pageProbe(h, limit) {
     if (!p || skip.has(String(p.tagName).toUpperCase())) continue;
     const text = n.data;
     if (!text || text.trim().length < 2) continue;
-    let hyphenated = null;
     for (const seg of h.wordSegments(text)) {
       words++;
       range.setStart(n, seg.start);
       range.setEnd(n, seg.end);
       if (h.countLines(Array.from(range.getClientRects())) < 2) continue;
-      // hyphens: auto breaks words on purpose, with a visible hyphen.
-      if (hyphenated === null) hyphenated = style(p).hyphens === 'auto';
-      if (hyphenated) break;
+      if (hyphenatedOnPurpose(n, seg)) continue;
       out.splitWordCount++;
       const where = describe(p);
       const key = seg.word + '\u0000' + where;
@@ -279,7 +375,85 @@ export function pageProbe(h, limit) {
  * @returns {string}
  */
 export function probeExpression(limit) {
-  return `(${pageProbe})({ wordSegments: ${wordSegments}, countLines: ${countLines}, sticksOut: ${sticksOut} }, ${Number(limit)})`;
+  return `(${pageProbe})({ wordSegments: ${wordSegments}, countLines: ${countLines}, lineFragments: ${lineFragments}, ` +
+    `hyphenationExempt: ${hyphenationExempt}, sticksOut: ${sticksOut} }, ${Number(limit)})`;
+}
+
+export const SCROLL_STEPS = 400;
+
+/**
+ * In-page: scrolls the window to its end, then the main inner scroller (the largest element with
+ * overflow-y auto or scroll whose content is taller than its box: an app shell with a 100vh main area
+ * scrolls there, not in the window), in steps of 80% of the visible height, so lazy content loads, until
+ * the height stops growing; then both back to the top. A traversal that stops moving before the end, or
+ * uses up maxSteps (an endless page), is a problem: content below it was never loaded or checked.
+ * Self-contained: serialized by scrollExpression.
+ * @param {number} maxSteps
+ * @param {number} pauseMs wait after each step
+ * @param {number} settleMs wait at the end for more content
+ * @returns {Promise<string[]>} the problems, empty when every traversal reached the end
+ */
+export async function scrollThrough(maxSteps, pauseMs, settleMs) {
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  const de = document.documentElement;
+  const traverse = async (t) => {
+    let lastHeight = -1;
+    for (let steps = 0; ;) {
+      const h = t.height();
+      if (t.top() + t.client() >= h - 2) {
+        if (h === lastHeight) return '';
+        lastHeight = h;
+        await pause(settleMs);
+        continue;
+      }
+      if (steps >= maxSteps) return `${t.name}: stopped after ${maxSteps} steps at ${Math.round(t.top())} of ${h}`;
+      const before = t.top();
+      t.by(Math.max(200, Math.floor(t.client() * 0.8)));
+      steps++;
+      await pause(pauseMs);
+      if (!(t.top() > before)) return `${t.name}: cannot scroll past ${Math.round(before)} of ${t.height()}`;
+    }
+  };
+  const problems = [];
+  const win = {
+    name: 'window', top: () => window.scrollY, client: () => window.innerHeight, height: () => de.scrollHeight,
+    by: (d) => window.scrollBy({ top: d, behavior: 'instant' }), reset: () => window.scrollTo({ top: 0, behavior: 'instant' }),
+  };
+  const winProblem = await traverse(win);
+  if (winProblem) problems.push(winProblem);
+  let scroller = null;
+  let area = 0;
+  for (const el of document.body ? Array.from(document.body.querySelectorAll('*')) : []) {
+    if (!(el.scrollHeight > el.clientHeight + 1)) continue;
+    const oy = getComputedStyle(el).overflowY;
+    if (oy !== 'auto' && oy !== 'scroll') continue;
+    const a = el.clientWidth * el.clientHeight;
+    if (a > area) {
+      scroller = el;
+      area = a;
+    }
+  }
+  if (scroller) {
+    const el = scroller;
+    const label = String(el.tagName).toLowerCase() + (el.id ? '#' + el.id : '');
+    const inner = {
+      name: label, top: () => el.scrollTop, client: () => el.clientHeight, height: () => el.scrollHeight,
+      by: (d) => el.scrollBy({ top: d, behavior: 'instant' }), reset: () => el.scrollTo({ top: 0, behavior: 'instant' }),
+    };
+    const innerProblem = await traverse(inner);
+    if (innerProblem) problems.push(innerProblem);
+    inner.reset();
+  }
+  win.reset();
+  return problems;
+}
+
+/**
+ * The page.evaluate expression that runs scrollThrough.
+ * @returns {string}
+ */
+export function scrollExpression(maxSteps = SCROLL_STEPS, pauseMs = 100, settleMs = 400) {
+  return `(${scrollThrough})(${Number(maxSteps)}, ${Number(pauseMs)}, ${Number(settleMs)})`;
 }
 
 /** In-page: whether the page's own CSS or meta declares a dark scheme. */
@@ -323,6 +497,7 @@ export function failuresOf(run) {
   const f = [];
   if (run.error) f.push(`error: ${run.error}`);
   if (run.badResponses.length) f.push(`http: ${run.badResponses.length} bad (first: ${run.badResponses[0]})`);
+  if (run.scrollProblems && run.scrollProblems.length) f.push(`scroll: not traversed to the end (${run.scrollProblems.join('; ')})`);
   const p = run.probe;
   if (p) {
     if (p.scrollWidth > p.clientWidth) f.push(`hscroll: scrollWidth ${p.scrollWidth} > clientWidth ${p.clientWidth}`);
@@ -393,26 +568,6 @@ async function settle(page, timeout) {
   }
 }
 
-// Scrolls to the end in steps of 80% of the viewport, so lazy content loads, until the height stops growing
-// (at most 400 steps for endless pages), then back to the top.
-async function scrollFull(page) {
-  await page.evaluate(async () => {
-    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-    const step = Math.max(200, Math.floor(window.innerHeight * 0.8));
-    let lastHeight = -1;
-    for (let i = 0; i < 400; i++) {
-      window.scrollBy(0, step);
-      await pause(100);
-      const h = document.documentElement.scrollHeight;
-      if (window.scrollY + window.innerHeight >= h - 2) {
-        if (h === lastHeight) break;
-        lastHeight = h;
-        await pause(400);
-      }
-    }
-  });
-}
-
 async function openPage(browser, device, scheme) {
   const context = await browser.newContext({
     viewport: { width: device.width, height: device.height }, deviceScaleFactor: device.deviceScaleFactor,
@@ -432,7 +587,10 @@ async function openPage(browser, device, scheme) {
 }
 
 async function runOne(browser, device, scheme, pagePath, url, shot, opts) {
-  const run = { device: device.name, scheme, path: pagePath, url, screenshot: shot, badResponses: [], probe: null, cls: undefined, error: '' };
+  const run = {
+    device: device.name, scheme, path: pagePath, url, screenshot: shot, badResponses: [], scrollProblems: [], probe: null,
+    cls: undefined, error: '',
+  };
   const { context, page } = await openPage(browser, device, scheme);
   page.on('response', (r) => {
     if (r.status() >= 400) run.badResponses.push(`${r.status()} ${r.url()}`);
@@ -445,9 +603,8 @@ async function runOne(browser, device, scheme, pagePath, url, shot, opts) {
     const resp = await page.goto(url, { waitUntil: 'load', timeout: opts.timeout });
     if (!resp && !url.startsWith('file:')) throw new Error('no response');
     await settle(page, opts.timeout);
-    await scrollFull(page);
+    run.scrollProblems = await page.evaluate(scrollExpression());
     await settle(page, opts.timeout);
-    await page.evaluate(() => window.scrollTo(0, 0));
     // Late shifts (a banner or an ad injected after load) count too: observe at least opts.dwell ms.
     const elapsed = await page.evaluate(() => performance.now());
     await sleep(Math.max(300, opts.dwell - elapsed));

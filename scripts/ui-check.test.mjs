@@ -6,8 +6,8 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 
 import {
-  CLS_LIMIT, DEVICES, UsageError, clsFromShifts, countLines, failuresOf, parseArgs, probeExpression, slug, sticksOut,
-  wordSegments,
+  CLS_LIMIT, DEVICES, UsageError, clsFromShifts, countLines, failuresOf, hyphenationExempt, lineFragments, parseArgs,
+  probeExpression, scrollExpression, slug, sticksOut, wordSegments,
 } from './ui-check.mjs';
 
 test('device matrix is the required minimum', () => {
@@ -86,46 +86,48 @@ test('failuresOf and slug', () => {
   assert.equal(slug('/blog/post-1?x=2'), 'blog-post-1-x-2');
 });
 
-// A fake DOM: a table cell whose word "Configuration" renders one letter per line (the incident), a cell
-// with a word on one line, a hyphens:auto paragraph, a script, a box sticking out of the page, one inside a
-// scroll container, a broken image and a hidden one.
-function fakeDOM() {
+const rect = (left, right, top = 0, h = 20) => ({ left, right, top, bottom: top + h, width: right - left, height: h });
+
+// An inline style object with the CSSStyleDeclaration methods the probe uses.
+function inlineStyle(init = {}) {
+  const props = { ...init };
+  const prio = {};
+  return {
+    props,
+    getPropertyValue: (k) => props[k] || '',
+    getPropertyPriority: (k) => prio[k] || '',
+    setProperty(k, v, p = '') { props[k] = v; prio[k] = p; },
+    removeProperty(k) { delete props[k]; delete prio[k]; },
+  };
+}
+
+// A fake page: elements (each {tagName, parent, style, box}) and text nodes whose rects(start, end, el) say
+// how a [start, end) range renders; getComputedStyle reads the element's current inline style, so a
+// rendering can depend on it (hyphens switched off by the probe).
+function fakePage(build) {
   const vw = 360;
-  const rect = (left, right, top = 0, h = 20) => ({ left, right, top, bottom: top + h, width: right - left, height: h });
   const el = (tagName, parent, opts = {}) => ({
-    tagName, id: opts.id || '', className: opts.className || '', parentElement: parent, style: opts.style || {},
+    tagName, id: opts.id || '', className: opts.className || '', parentElement: parent, style: inlineStyle(opts.style),
     box: opts.box || rect(0, 100),
     getBoundingClientRect() { return this.box; },
     contains(o) { for (let p = o; p; p = p.parentElement) if (p === this) return true; return false; },
   });
   const html = el('HTML', null);
   const body = el('BODY', html);
-  const table = el('TABLE', body);
-  const td1 = el('TD', table, { className: 'price wide' });
-  const td2 = el('TD', table);
-  const para = el('P', body, { style: { hyphens: 'auto' } });
-  const script = el('SCRIPT', body);
-  const wide = el('DIV', body, { id: 'banner', box: rect(0, 500) });
-  const wideChild = el('SPAN', wide, { box: rect(0, 480) });
-  const scroller = el('DIV', body, { style: { overflowX: 'auto' } });
-  const inScroller = el('PRE', scroller, { box: rect(0, 900) });
-  const elements = [table, td1, td2, para, script, wide, wideChild, scroller, inScroller];
-  // Each text node says how a [start, end) range of it renders.
-  const perLetter = (s, e) => Array.from({ length: e - s }, (_, i) => rect(0, 8, i * 20));
-  const oneLine = (s, e) => [rect(s * 8, e * 8)];
-  const texts = [
-    { data: 'Configuration', parentElement: td1, rects: perLetter },
-    { data: 'Short words', parentElement: td2, rects: oneLine },
-    { data: 'Internationalization', parentElement: para, rects: perLetter },
-    { data: 'var longidentifier', parentElement: script, rects: perLetter },
-  ];
-  const img = (src, complete, naturalWidth, rendered = true) => ({
-    currentSrc: src, complete, naturalWidth, getAttribute: () => src, getClientRects: () => (rendered ? [rect(0, 10)] : []),
-  });
+  const elements = [];
+  const texts = [];
+  const images = [];
+  const add = (tagName, parent, opts) => {
+    const e = el(tagName, parent || body, opts);
+    elements.push(e);
+    return e;
+  };
+  const text = (data, parentElement, rects) => texts.push({ data, parentElement, rects: (s, e) => rects(s, e, parentElement) });
+  build({ add, text, images, body });
   const document = {
     documentElement: { clientWidth: vw, scrollWidth: 500, scrollHeight: 3000 },
     body: { ...body, querySelectorAll: () => elements },
-    images: [img('/ok.png', true, 10), img('/missing.png', true, 0), img('/lazy-hidden.png', false, 0, false)],
+    images,
     createTreeWalker: () => {
       let i = 0;
       return { nextNode: () => texts[i++] || null };
@@ -142,14 +144,66 @@ function fakeDOM() {
     },
   };
   for (const e of elements) if (e.parentElement === body) e.parentElement = document.body;
-  const getComputedStyle = (e) => ({ overflowX: 'visible', visibility: 'visible', opacity: '1', hyphens: 'manual', ...e.style });
+  const getComputedStyle = (e) => ({
+    overflowX: 'visible', visibility: 'visible', opacity: '1', hyphens: 'manual', wordBreak: 'normal', overflowWrap: 'normal',
+    position: 'static', display: 'block', transform: 'none', filter: 'none', perspective: 'none', contain: 'none',
+    willChange: 'auto', ...e.style.props,
+  });
   return { document, getComputedStyle };
 }
 
-test('pageProbe finds split words, stick-outs and broken images in a fake DOM', () => {
-  const ctx = vm.createContext(fakeDOM());
+// Renderings of a text range: one letter per line (the incident), all on one line, or broken before the
+// given offsets (breaksFor(el) picks them from the element's current style).
+const perLetter = (s, e) => Array.from({ length: e - s }, (_, i) => rect(0, 8, (s + i) * 20));
+const oneLine = (s, e) => [rect(s * 8, e * 8)];
+const brokenAt = (breaksFor) => (s, e, el) => {
+  const breaks = breaksFor(el);
+  const line = (k) => breaks.filter((b) => b <= k).length;
+  const lineStart = (k) => [0, ...breaks].filter((b) => b <= k).pop();
+  const out = [];
+  for (let k = s; k < e; k++) {
+    const x = (k - lineStart(k)) * 8;
+    out.push(rect(x, x + 8, line(k) * 20));
+  }
+  return out;
+};
+// Broken at auto when the element's hyphens is auto, at manual otherwise.
+const byHyphens = (auto, manual) => brokenAt((el) => (el.style.getPropertyValue('hyphens') === 'manual' ? manual : auto));
+
+function runProbe(page) {
+  const ctx = vm.createContext(page);
   // Serialized like page.evaluate's result (this also drops the vm realm's prototypes).
-  const out = JSON.parse(JSON.stringify(vm.runInContext(probeExpression(5), ctx)));
+  return JSON.parse(JSON.stringify(vm.runInContext(probeExpression(5), ctx)));
+}
+
+// The base fixture: a table cell whose word "Configuration" renders one letter per line (the incident), a
+// cell with a word on one line, a paragraph hyphenated by hyphens: auto (its breaks vanish under hyphens:
+// manual), a script, a box sticking out of the page, one inside a scroll container, a broken image and a
+// hidden one.
+function fakeDOM() {
+  return fakePage(({ add, text, images }) => {
+    const table = add('TABLE');
+    const td1 = add('TD', table, { className: 'price wide' });
+    const td2 = add('TD', table);
+    const para = add('P', null, { style: { hyphens: 'auto' } });
+    const script = add('SCRIPT');
+    const wide = add('DIV', null, { id: 'banner', box: rect(0, 500) });
+    add('SPAN', wide, { box: rect(0, 480) });
+    const scroller = add('DIV', null, { style: { overflowX: 'auto' } });
+    add('PRE', scroller, { box: rect(0, 900) });
+    text('Configuration', td1, perLetter);
+    text('Short words', td2, oneLine);
+    text('Internationalization', para, byHyphens([10], []));
+    text('var longidentifier', script, perLetter);
+    const img = (src, complete, naturalWidth, rendered = true) => ({
+      currentSrc: src, complete, naturalWidth, getAttribute: () => src, getClientRects: () => (rendered ? [rect(0, 10)] : []),
+    });
+    images.push(img('/ok.png', true, 10), img('/missing.png', true, 0), img('/lazy-hidden.png', false, 0, false));
+  });
+}
+
+test('pageProbe finds split words, stick-outs and broken images in a fake DOM', () => {
+  const out = runProbe(fakeDOM());
   assert.equal(out.scrollWidth, 500);
   assert.equal(out.clientWidth, 360);
   assert.equal(out.splitWordCount, 1, JSON.stringify(out.splitWords));
@@ -159,6 +213,157 @@ test('pageProbe finds split words, stick-outs and broken images in a fake DOM', 
   assert.deepEqual(out.brokenImages, ['/missing.png']);
   const failures = failuresOf({ error: '', badResponses: [], cls: 0, probe: out });
   assert.equal(failures.length, 4); // hscroll, overflow, images, split-words
+});
+
+test('lineFragments groups code points by line', () => {
+  const at = (top, units = 1) => ({ rects: [rect(0, 8, top)], units });
+  assert.deepEqual(lineFragments([at(0), at(0), at(20), at(20), at(20)]), [{ start: 0, length: 2 }, { start: 2, length: 3 }]);
+  // A line-end hyphen rect before the char's own rect: the char belongs to the next line.
+  assert.deepEqual(lineFragments([at(0), { rects: [rect(8, 13, 0), rect(0, 8, 20)], units: 1 }, at(20)]),
+    [{ start: 0, length: 1 }, { start: 1, length: 2 }]);
+  assert.deepEqual(lineFragments([at(0, 2), at(20)]), [{ start: 0, length: 1 }, { start: 2, length: 1 }]); // UTF-16 offsets
+  assert.deepEqual(lineFragments([]), []);
+});
+
+test('hyphenationExempt needs proven hyphenation', () => {
+  const s = (extra = {}) => ({ hyphens: 'auto', wordBreak: 'normal', overflowWrap: 'normal', ...extra });
+  const frags = (...lens) => lens.map((length) => ({ start: 0, length }));
+  assert.equal(hyphenationExempt(s(), frags(10, 10), true), true);
+  assert.equal(hyphenationExempt(s(), frags(18, 2), true), true);
+  assert.equal(hyphenationExempt(s({ hyphens: 'manual' }), frags(10, 10), true), false);
+  assert.equal(hyphenationExempt(s(), frags(10, 10), false), false); // no dictionary: breaks do not move
+  assert.equal(hyphenationExempt(s({ wordBreak: 'break-all' }), frags(5, 5, 3), true), false);
+  assert.equal(hyphenationExempt(s(), frags(12, 1), true), false); // a 1-letter fragment
+  assert.equal(hyphenationExempt(s({ overflowWrap: 'anywhere' }), frags(9, 9, 2), true), false);
+  assert.equal(hyphenationExempt(s({ overflowWrap: 'anywhere' }), frags(10, 10), true), true);
+});
+
+// Review finding: hyphens: auto alone exempted every multiline word, so letter-by-letter wrapping under
+// break-all, or with no dictionary, escaped the check.
+test('pageProbe reports words hyphens: auto did not hyphenate', () => {
+  let td;
+  const out = runProbe(fakePage(({ add, text }) => {
+    const table = add('TABLE');
+    // A narrow cell with hyphens: auto and break-all: broken mid-word with no hyphen, same breaks either way.
+    td = add('TD', table, { id: 'narrow', style: { hyphens: 'auto', wordBreak: 'break-all' } });
+    text('Configuration', td, byHyphens([5, 10], [5, 10]));
+    // No dictionary: overflow-wrap breaks the word the same way with or without hyphenation.
+    const nodict = add('P', null, { id: 'nodict', style: { hyphens: 'auto', overflowWrap: 'anywhere' } });
+    text('Internationalization', nodict, byHyphens([11], [11]));
+    // Hyphenated, but overflow-wrap left a 2-letter tail.
+    const tail = add('P', null, { id: 'tail', style: { hyphens: 'auto', overflowWrap: 'anywhere' } });
+    text('Internationalization', tail, byHyphens([9, 18], [11]));
+    // Hyphenated cleanly: exempt.
+    const ok = add('P', null, { id: 'ok', style: { hyphens: 'auto' } });
+    text('Internationalization', ok, byHyphens([5, 13], []));
+  }));
+  assert.deepEqual(out.splitWords.map((w) => w.el), ['table > td#narrow', 'p#nodict', 'p#tail'], JSON.stringify(out.splitWords));
+  assert.equal(out.splitWordCount, 3);
+  assert.equal(td.style.getPropertyValue('hyphens'), 'auto'); // inline style left as it was
+});
+
+// Review finding: any ancestor with non-visible overflow hid a stick-out, even one that is not in the
+// element's containing-block chain or that itself crosses the viewport.
+test('pageProbe: only a clipping ancestor in the containing-block chain hides a stick-out', () => {
+  const out = runProbe(fakePage(({ add }) => {
+    const inside = rect(0, 300);
+    // A fixed child of an overflow:auto panel that stays inside the viewport: not clipped by it.
+    const panel = add('DIV', null, { id: 'panel', box: inside, style: { overflowX: 'auto' } });
+    add('DIV', panel, { id: 'fixed', box: rect(0, 500), style: { position: 'fixed' } });
+    // The same under a transformed panel: the panel is its containing block and clips it.
+    const tpanel = add('DIV', null, { id: 'tpanel', box: inside, style: { overflowX: 'auto', transform: 'matrix(1, 0, 0, 1, 0, 0)' } });
+    add('DIV', tpanel, { id: 'fixedin', box: rect(0, 500), style: { position: 'fixed' } });
+    // An absolute child of an unpositioned overflow:hidden box: escapes it.
+    const clip = add('DIV', null, { id: 'clip', box: inside, style: { overflowX: 'hidden' } });
+    add('DIV', clip, { id: 'abs', box: rect(0, 520), style: { position: 'absolute' } });
+    // An absolute child of a positioned overflow:hidden box: clipped.
+    const pclip = add('DIV', null, { id: 'pclip', box: inside, style: { overflowX: 'hidden', position: 'relative' } });
+    add('DIV', pclip, { id: 'absin', box: rect(0, 520), style: { position: 'absolute' } });
+    // An in-flow child of a scroller that itself reaches past the viewport (hidden, so not reported itself).
+    const big = add('DIV', null, { id: 'big', box: rect(0, 900), style: { overflowX: 'auto', visibility: 'hidden' } });
+    add('DIV', big, { id: 'inbig', box: rect(0, 800), style: { visibility: 'visible' } });
+    // An in-flow child of a scroller inside the viewport: scrolled there, not a defect.
+    const sc = add('DIV', null, { id: 'sc', box: inside, style: { overflowX: 'auto' } });
+    add('PRE', sc, { id: 'pre', box: rect(0, 900) });
+  }));
+  assert.deepEqual(out.stickOut.map((s) => s.el), ['div#panel > div#fixed', 'div#clip > div#abs', 'div#big > div#inbig'],
+    JSON.stringify(out.stickOut));
+  assert.equal(out.stickOutCount, 3);
+});
+
+// A fake scrollable page for scrollThrough: the window and one inner scroller, each with a content height
+// that can grow when its end is reached (lazy content).
+function fakeScrollPage({ winHeight = 740, winContent = 740, inner = null }) {
+  const win = { scrollY: 0, innerHeight: winHeight };
+  const de = { scrollHeight: winContent };
+  const clampWin = () => { win.scrollY = Math.max(0, Math.min(win.scrollY, de.scrollHeight - win.innerHeight)); };
+  win.scrollBy = ({ top }) => { win.scrollY += top; clampWin(); };
+  win.scrollTo = ({ top }) => { win.scrollY = top; clampWin(); };
+  const elements = [];
+  let scroller = null;
+  if (inner) {
+    scroller = {
+      tagName: 'MAIN', id: 'app', className: '', scrollTop: 0, clientHeight: inner.clientHeight, clientWidth: 360,
+      scrollHeight: inner.content, overflowY: 'auto', loads: 0, steps: 0,
+    };
+    const clamp = () => {
+      scroller.scrollTop = Math.max(0, Math.min(scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight));
+      if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2 && inner.grow(scroller)) scroller.loads++;
+    };
+    scroller.scrollBy = ({ top }) => { scroller.steps++; scroller.scrollTop += top; clamp(); };
+    scroller.scrollTo = ({ top }) => { scroller.scrollTop = top; clamp(); };
+    // A small overflow-y:auto box that is not the main scroller.
+    elements.push({ tagName: 'DIV', id: '', className: '', scrollHeight: 400, clientHeight: 100, clientWidth: 100, overflowY: 'auto' }, scroller);
+  }
+  const ctx = vm.createContext({
+    window: win, setTimeout,
+    document: { documentElement: de, body: { querySelectorAll: () => elements } },
+    getComputedStyle: (e) => ({ overflowY: e.overflowY }),
+  });
+  return { ctx, win, scroller };
+}
+
+const scrollIn = (ctx, steps) => vm.runInContext(scrollExpression(steps, 0, 0), ctx);
+
+// Review finding: only the window was scrolled, so an app shell with a 100vh overflow-y:auto main area
+// was never traversed and its lazy content never loaded.
+test('scrollThrough traverses the main inner scroller and loads its lazy content', async () => {
+  let lazy = 2;
+  const { ctx, win, scroller } = fakeScrollPage({
+    inner: { clientHeight: 700, content: 2000, grow: (s) => lazy-- > 0 && (s.scrollHeight += 1500) },
+  });
+  const problems = await scrollIn(ctx, 400);
+  assert.deepEqual(Array.from(problems), []);
+  assert.equal(scroller.loads, 2); // both lazy chunks below loaded
+  assert.equal(scroller.scrollHeight, 5000);
+  assert.equal(scroller.scrollTop, 0); // back at the top for the probe and the screenshot
+  assert.equal(win.scrollY, 0);
+});
+
+test('scrollThrough traverses a long window page', async () => {
+  const { ctx, win } = fakeScrollPage({ winContent: 5000 });
+  assert.deepEqual(Array.from(await scrollIn(ctx, 400)), []);
+  assert.equal(win.scrollY, 0);
+});
+
+// Review finding: hitting the step cap (an endless feed) passed silently.
+test('scrollThrough reports cap exhaustion and a scroller that cannot reach its end', async () => {
+  const endless = fakeScrollPage({ inner: { clientHeight: 700, content: 2000, grow: (s) => (s.scrollHeight += 1000) } });
+  const capped = Array.from(await scrollIn(endless.ctx, 5));
+  assert.equal(capped.length, 1, JSON.stringify(capped));
+  assert.match(capped[0], /^main#app: stopped after 5 steps/);
+  assert.equal(endless.scroller.steps, 5);
+
+  // A window whose content is taller than the viewport but does not move (overflow: hidden on html).
+  const stuck = fakeScrollPage({ winContent: 3000 });
+  stuck.win.scrollBy = () => {};
+  const p = Array.from(await scrollIn(stuck.ctx, 400));
+  assert.equal(p.length, 1, JSON.stringify(p));
+  assert.match(p[0], /^window: cannot scroll past 0 of 3000/);
+
+  const f = failuresOf({ error: '', badResponses: [], scrollProblems: capped, cls: 0, probe: null });
+  assert.equal(f.length, 1);
+  assert.match(f[0], /^scroll: not traversed to the end \(main#app: stopped after 5 steps/);
 });
 
 test('probeExpression is a self-contained expression', () => {
