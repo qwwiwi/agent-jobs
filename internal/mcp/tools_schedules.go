@@ -18,7 +18,7 @@ type ScheduleAddInput struct {
 	// The job fields below are validated like job_start and stored on the schedule at creation.
 	Model           string   `json:"model,omitempty" jsonschema:"job schedules: explicit model (a gpt-* model runs on codex exec)"`
 	Complexity      string   `json:"complexity,omitempty" jsonschema:"job schedules: light | normal | hard; the model is resolved now and stored"`
-	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"job schedules: turn limit; default 80, ceiling 200"`
+	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"job schedules: turn limit; default 200 for fix and general, 80 for other kinds; ceiling 200"`
 	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"job schedules: wall-clock limit in minutes; default 45, ceiling 180"`
 	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"job schedules: spend cap in USD; default 10, ceiling 50"`
 	Repo            string   `json:"repo,omitempty" jsonschema:"job schedules: absolute path of a git repository"`

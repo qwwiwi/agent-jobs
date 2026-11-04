@@ -22,7 +22,7 @@ func TestSkillContent(t *testing.T) {
 		"do it yourself", "a subagent", "a job", "survive a restart", "overnight",
 		"at most three per job", "No nested jobs",
 		"«Not done / uncertain» first", "Check the diff", "leave the machine",
-		"80 / $10 / 45 min", "200 / $50 / 180",
+		"80 / $10 / 45 min", "200 turns for fix and general jobs", "200 / $50 / 180",
 		"agent-jobs profile", "agent-jobs card new",
 		"job_stop", "job_resume", "job_amend", "same claude session", "Orchestrator update",
 		"skill_list", "`skills`",

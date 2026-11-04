@@ -29,7 +29,14 @@ const (
 	CeilingMaxBudgetUSD   = 50.0
 	CeilingTimeoutMinutes = 180
 	MaxOwnerRulesBytes    = 8 * 1024
+	// DefaultCoderMaxTurns is the turn default of a coder job (CoderKinds), the ceiling (owner decision
+	// 2026-10-31, #123): a turn limit does not guard spend (budget, timeout and the limit tiers do), and
+	// cutting a coder job off at 80 turns lost work it had done before it ran its tests or wrote its report.
+	DefaultCoderMaxTurns = CeilingMaxTurns
 )
+
+// CoderKinds are the kinds whose default turn limit is DefaultCoderMaxTurns.
+var CoderKinds = []string{"fix", "general"}
 
 // Running jobs per agent (config max_running): the default and the hard ceiling. A value outside
 // 1..CeilingMaxRunningPerAgent is a config error, never clamped.
@@ -199,8 +206,9 @@ type Config struct {
 	// price here or in the built-in table keeps an unknown cost.
 	ModelPrices map[string]ModelPrice `json:"model_prices"`
 	// ReportContract is what happens to a claude job that ends succeeded with a report missing the
-	// "## Summary" or "## Not done / uncertain" section: "warn" (default; it stays succeeded with a
-	// note in its error, on the job-done line and in the stats) or "fail" (it fails with that note).
+	// "## Not done / uncertain" section: "warn" (default; it stays succeeded with a note in its error,
+	// on the job-done line and in the stats) or "fail" (it fails with that note). A report missing the
+	// "## Summary" section fails a non-gate job in both modes (#126).
 	ReportContract string `json:"report_contract"`
 	// AutoContinue continues a claude attempt stopped at its turn limit or its timeout once, in the same
 	// session, with a fresh allowance (AutoContinueFraction). Nil (absent) = on; false turns it off.

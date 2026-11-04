@@ -55,7 +55,7 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 		!strings.Contains(launches[1], "--resume\n"+sid+"\n") {
 		t.Fatalf("attempt 2 did not resume session %q (row %q):\n%v", sid, got.SessionID, launches)
 	}
-	if got.MaxTurns != 40 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 23 {
+	if got.MaxTurns != DefaultCoderMaxTurns/2 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 23 {
 		t.Fatalf("continuation limits: %d turns $%g %d min", got.MaxTurns, got.MaxBudgetUSD, got.TimeoutMinutes)
 	}
 	for _, s := range []string{autoContinueTag + "attempt 1 stopped at its turn limit after 7 turns (cost $0.40)",
@@ -160,7 +160,7 @@ func TestAutoContinueAfterTimeout(t *testing.T) {
 	m.Now = func() time.Time { return later }
 	tick(t, m)
 	got := get(t, m, j.ID)
-	if got.Attempt != 2 || got.MaxTurns != 40 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 5 {
+	if got.Attempt != 2 || got.MaxTurns != DefaultCoderMaxTurns/2 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 5 {
 		t.Fatalf("after the timeout: %s attempt %d limits %d/$%g/%d %q", got.Status, got.Attempt, got.MaxTurns,
 			got.MaxBudgetUSD, got.TimeoutMinutes, got.Error)
 	}
@@ -242,13 +242,15 @@ func TestAutoContinueLimits(t *testing.T) {
 	}
 }
 
-// Report contract (issue #46): a final message without the Summary section keeps the job succeeded
-// with a note in its row, on the job-done line and in the stats; report_contract fail fails it; a
-// report that follows the contract gets no note.
+// Report contract (issue #46): a final message without the Summary section is no report: the job
+// fails with the note in its row, on the job-done line and in the stats, under report_contract warn too
+// (#126); a report that follows the contract gets no note. Under warn, a report that only lacks the Not
+// done section keeps the job succeeded with the note; report_contract fail fails it.
 func TestReportContractNote(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_MIDTASK", nil).ID)
-	if j.Status != store.StatusSucceeded || j.Error != NoteNoSummary {
+	if j.Status != store.StatusFailed || j.Error != NoteNoSummary {
 		t.Fatalf("mid-task report: %s %q", j.Status, j.Error)
 	}
 	if line := DoneLine(j, 0); !strings.HasSuffix(line, " · "+NoteNoSummary) {
@@ -262,9 +264,19 @@ func TestReportContractNote(t *testing.T) {
 	if err != nil || rep.Totals.ReportOffContract != 1 || len(rep.Groups) != 1 || rep.Groups[0].ReportOffContract != 1 {
 		t.Fatalf("stats: %+v %v", rep.Totals, err)
 	}
+	claude := &store.Job{Kind: "general", Runner: store.RunnerClaude}
+	if st, msg := m.applyReportContract(claude, store.StatusSucceeded, "", NoteNoNotDone); st != store.StatusSucceeded || msg != NoteNoNotDone {
+		t.Fatalf("warn, no Not done: %s %q", st, msg)
+	}
+	if st, msg := m.applyReportContract(claude, store.StatusSucceeded, "idle", NoteNoSummary); st != store.StatusFailed || msg != "idle; "+NoteNoSummary {
+		t.Fatalf("warn, no Summary: %s %q", st, msg)
+	}
 	m.Cfg.ReportContract = ReportContractFail
 	if f := runToEnd(t, m, enqueue(t, m, "FAKE_MIDTASK", nil).ID); f.Status != store.StatusFailed || f.Error != NoteNoSummary {
 		t.Fatalf("report_contract fail: %s %q", f.Status, f.Error)
+	}
+	if st, msg := m.applyReportContract(claude, store.StatusSucceeded, "", NoteNoNotDone); st != store.StatusFailed || msg != NoteNoNotDone {
+		t.Fatalf("fail, no Not done: %s %q", st, msg)
 	}
 }
 

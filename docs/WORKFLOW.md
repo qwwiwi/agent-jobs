@@ -26,7 +26,7 @@ A job is started with `job_start` (MCP) or `agent-jobs start` (CLI). Give it:
 - `model` **or** `complexity` (`light` / `normal` / `hard`). One of them is required; with neither the job is rejected. There is no default and no classifier: you decide;
 - `repo` (absolute path) and `base` (the ref to start from, default `HEAD`). The job works in its own worktree detached at that commit. Omit `repo` for an empty work dir;
 - `brief`: written for a stranger. A job has none of your conversation; state the goal, the boundaries, what counts as done and what not to touch;
-- limits only when the defaults (80 turns / $10 / 45 min) do not fit; above the ceilings (200 / $50 / 180 min) the call is rejected, not clamped.
+- limits only when the defaults (80 turns, 200 for fix and general / $10 / 45 min) do not fit; above the ceilings (200 / $50 / 180 min) the call is rejected, not clamped.
 
 **Cost note.** Even an empty subagent loads a full context: a subagent that only answered «ok» took about 100K tokens (measured once on one host, 2026-10-17). Its result then lands in the parent and is re-read on every following call. A job runs outside the session; the parent gets one line.
 

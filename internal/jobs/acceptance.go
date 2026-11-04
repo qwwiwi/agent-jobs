@@ -189,8 +189,10 @@ func (m *Manager) completedReportContract(j *store.Job, status, msg string, res 
 }
 
 // reportContract checks the report of a succeeded claude job against the report contract: one
-// without a "## Summary" or "## Not done / uncertain" section keeps its status with the note added to
-// its message (report_contract warn, the default) or fails with it (fail).
+// without a "## Not done / uncertain" section (or a covered job's Requirements block) keeps its status
+// with the note added to its message (report_contract warn, the default) or fails with it (fail). One
+// without a "## Summary" section is no report: it fails in both modes (gate jobs aside, whose stored
+// result is what they deliver).
 func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string, string) {
 	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
 		return status, msg
@@ -209,6 +211,13 @@ func (m *Manager) applyReportContract(j *store.Job, status, msg, note string) (s
 	switch {
 	case note == "":
 		return status, msg
+	case note == NoteNoSummary && !IsGateKind(j.Kind):
+		// No report at all: the job ended its turn mid-task (#126), whatever report_contract says. It
+		// fails, so job_resume accepts it, and collectExited continues it once.
+		if msg != "" {
+			return store.StatusFailed, msg + "; " + note
+		}
+		return store.StatusFailed, note
 	case m.Config().ReportContract == ReportContractFail:
 		return store.StatusFailed, note
 	case msg != "":

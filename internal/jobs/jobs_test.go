@@ -113,6 +113,10 @@ if [[ $prompt == *FAKE_FORGE* ]]; then
   # The job appends a result line of its own to the stream (it lies in the job dir).
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
 fi
+if [[ $prompt == *FAKE_EARLY_USAGE* && ! -d ../attempts ]]; then
+  # Usage before a FAKE_SLEEP_ONCE stop (#127): the stopped attempt has tokens to price.
+  echo '{"type":"assistant","message":{"id":"eu1","content":[{"type":"text","text":"early"}],"usage":{"input_tokens":1000,"output_tokens":2000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+fi
 if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
   # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a
@@ -298,6 +302,12 @@ if [[ $prompt == *FAKE_REQUIREMENTS_REPORT* ]]; then
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":0.25,"result":"## Summary\nok\n\n## Findings / Changes\n- x\n\n### Requirements\n- R01 · done · a.go:1 · ran: go test → ok · REDPROOF R01: TestA failed before\n- R02 · done · b.go:2\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
   exit 0
 fi
+if [[ $prompt == *FAKE_WAIT_SUBAGENTS_ONCE* && ! -d ../attempts ]]; then
+  # Ends its turn waiting for background subagents (#126): they die with the session, no report.
+  echo '{"type":"assistant","message":{"id":"ws1","content":[{"type":"text","text":"Waiting for the subagent notifications."}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Waiting for the subagent notifications."}'
+  exit 0
+fi
 if [[ $prompt == *FAKE_MIDTASK* ]]; then
   # Ends its turn mid-task: the final message is no report.
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Now let me check the remaining callers in store.go."}'
@@ -473,8 +483,8 @@ func runToEnd(t *testing.T, m *Manager, id string) *store.Job {
 
 func TestLimitsDefaultsAndCeilingsRejected(t *testing.T) {
 	m := newManager(t)
-	j := enqueue(t, m, "x", nil)
-	if j.MaxTurns != 80 || j.MaxBudgetUSD != 10 || j.TimeoutMinutes != 45 {
+	j := enqueue(t, m, "x", nil) // kind general: the coder turn default (#123)
+	if j.MaxTurns != DefaultCoderMaxTurns || j.MaxBudgetUSD != 10 || j.TimeoutMinutes != 45 {
 		t.Fatalf("defaults: %d/%v/%d", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 	}
 	enqueue(t, m, "x", func(r *StartRequest) { r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes = 200, 50, 180 })
@@ -655,6 +665,7 @@ func TestGuardKnowsJobGitDirs(t *testing.T) {
 
 func TestExitZeroWithoutReportFails(t *testing.T) {
 	m := newManager(t)
+	noAutoContinue(m) // a clean end without a report is otherwise continued once (#126)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_NOREPORT", nil).ID)
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "without a report") {
 		t.Fatalf("got %s %q", j.Status, j.Error)

@@ -204,6 +204,16 @@ type StartRequest struct {
 	plannedSources bool
 }
 
+// DefaultTurns is the turn limit a job of this kind starts with: the explicit one when given, else
+// DefaultCoderMaxTurns for a coder kind (#123); 0 for any other kind, which ValidateLimits makes
+// DefaultMaxTurns.
+func DefaultTurns(kind string, turns int) int {
+	if turns == 0 && slices.Contains(CoderKinds, kind) {
+		return DefaultCoderMaxTurns
+	}
+	return turns
+}
+
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
 func ValidateLimits(turns int, budget float64, timeout int) (int, float64, int, error) {
 	if turns == 0 {
@@ -410,7 +420,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if len(sources) > 0 && r.Gate != nil {
 		return nil, errors.New("a gate job gets nothing but its input: no sources")
 	}
-	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
+	turns, budget, timeout, err := ValidateLimits(DefaultTurns(r.Kind, r.MaxTurns), r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -1701,7 +1711,8 @@ func (m *Manager) collect() error {
 }
 
 // collectExited finishes an attempt whose wrapper recorded trusted completion. An attempt stopped at its turn
-// limit gets a stop report when it wrote none and is then continued once (autoContinue).
+// limit gets a stop report when it wrote none and is then continued once (autoContinue); so is an attempt
+// that ended its turn without a report (midTaskEnd, #126).
 func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	dir := m.JobDir(j.ID)
 	res := m.endedResult(j)
@@ -1715,10 +1726,30 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 	if turnLimit {
 		m.writeStopReport(j, dir, stopTurnLimit, res.Turns)
 	}
-	// Continued only when finish recorded the verdict as it was (not a failed scope stop or skill-link check).
-	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); turnLimit && ok && st == status && got == msg {
-		m.autoContinue(j.ID, stopTurnLimit)
+	why := ""
+	switch {
+	case turnLimit:
+		why = stopTurnLimit
+	case midTaskEnd(j, status, msg, res):
+		why = stopMidTask
 	}
+	// Continued only when finish recorded the verdict as it was (not a failed scope stop or skill-link check).
+	if st, got, ok := m.finish(j, status, res, false, dur, msg, now); why != "" && ok && st == status && got == msg {
+		m.autoContinue(j.ID, why)
+	}
+}
+
+// midTaskEnd reports whether a claude attempt failed only because it ended its turn without a report: a
+// final message without a Summary section (NoteNoSummary) or a clean result with an empty final message
+// and no report file (reasonNoReport). Runner failures (an error or non-success result, a non-zero
+// exit) are not, nor are gate jobs: their stored result is what they deliver, and their input is the
+// daemon's (job_resume refuses them too).
+func midTaskEnd(j *store.Job, status, msg string, res StreamResult) bool {
+	if status != store.StatusFailed || j.Runner == store.RunnerCodex || IsGateKind(j.Kind) {
+		return false
+	}
+	return OffContractNote(msg) == NoteNoSummary ||
+		(msg == reasonNoReport && res.Found && !res.IsError && res.Subtype == "success")
 }
 
 // killedResult reads the latest trusted progress snapshot. A result already observed by the wrapper
@@ -1822,6 +1853,14 @@ func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) 
 	if killed || j.Runner == store.RunnerCodex || (!res.Found && j.LaunchToken != "") {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
+		} else if j.Runner != store.RunnerCodex {
+			// A claude attempt has a budget the limits would otherwise count whole (#127): its trusted
+			// token usage so far, at list prices, is recorded as an estimate instead.
+			if est, ok := m.estimateTokenCost(j.Model, res.Tokens, res.TokensInvalid); ok {
+				if err := m.Store.SetCostEstimate(j.ID, est); err != nil {
+					m.Log.Printf("job %s: record cost estimate: %v", j.ID, err)
+				}
+			}
 		}
 	}
 	digest := ""
@@ -1921,13 +1960,16 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	if !reported {
-		return store.StatusFailed, "exit 0 without a report"
+		return store.StatusFailed, reasonNoReport
 	}
 	if res.Runner != store.RunnerCodex && res.Subtype != "success" {
 		return store.StatusFailed, res.program() + " result is an error: " + res.Subtype
 	}
 	return store.StatusSucceeded, ""
 }
+
+// reasonNoReport is Verdict's reason for a clean exit that left no report.
+const reasonNoReport = "exit 0 without a report"
 
 func hasReport(dir string) bool {
 	b, err := os.ReadFile(filepath.Join(dir, "report.md"))
