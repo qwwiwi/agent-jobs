@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,5 +101,39 @@ func TestNoReportRunnerFailureNotContinued(t *testing.T) {
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_NONSUCCESS_REPORT", nil).ID)
 	if j.Status != store.StatusFailed || j.Attempt != 1 || strings.Contains(j.Error, "auto-continue") {
 		t.Fatalf("runner failure: %s attempt %d %q", j.Status, j.Attempt, j.Error)
+	}
+}
+
+// A gate job's stored result is what it delivers: one whose report has a valid block but no Summary
+// section is not continued as a mid-task end, under report_contract warn (it succeeds with the note)
+// and fail (it fails with it).
+func TestGateNoSummaryNotContinued(t *testing.T) {
+	for _, contract := range []string{ReportContractWarn, ReportContractFail} {
+		t.Run(contract, func(t *testing.T) {
+			m := newManager(t)
+			sessionsHome(t, true)
+			m.Cfg.ReportContract = contract
+			j, err := m.StartGate(GateRequest{Kind: KindSlicing, Repo: briefRepo(t), Model: "sonnet"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := json.Marshal(slicingBlock(j.Gate))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(t.TempDir(), "report.md")
+			if err := os.WriteFile(p, []byte("```json\n"+string(b)+"\n```\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("FAKE_GATE_REPORT", p)
+			got := runToEnd(t, m, j.ID)
+			want := store.StatusSucceeded
+			if contract == ReportContractFail {
+				want = store.StatusFailed
+			}
+			if got.Status != want || got.Attempt != 1 || got.Error != NoteNoSummary {
+				t.Fatalf("gate without Summary: %s attempt %d %q", got.Status, got.Attempt, got.Error)
+			}
+		})
 	}
 }

@@ -1742,9 +1742,10 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 // midTaskEnd reports whether a claude attempt failed only because it ended its turn without a report: a
 // final message without a Summary section (NoteNoSummary) or a clean result with an empty final message
 // and no report file (reasonNoReport). Runner failures (an error or non-success result, a non-zero
-// exit) are not.
+// exit) are not, nor are gate jobs: their stored result is what they deliver, and their input is the
+// daemon's (job_resume refuses them too).
 func midTaskEnd(j *store.Job, status, msg string, res StreamResult) bool {
-	if status != store.StatusFailed || j.Runner == store.RunnerCodex {
+	if status != store.StatusFailed || j.Runner == store.RunnerCodex || IsGateKind(j.Kind) {
 		return false
 	}
 	return OffContractNote(msg) == NoteNoSummary ||
