@@ -50,6 +50,9 @@ type JobView struct {
 	CostUSD         float64 `json:"cost_usd"`
 	// CostUnknown: the cost was never reported (a codex job, a killed attempt); cost_usd is not a cost then.
 	CostUnknown bool `json:"cost_unknown"`
+	// CostEstimateUSD is the current attempt's estimated cost when it was not reported (a stopped or
+	// killed claude attempt): its token usage at list prices, what job_resume's limits count (#127).
+	CostEstimateUSD *float64 `json:"cost_estimate_usd,omitempty"`
 	// Limits is "n/a (codex)" for a codex job: max_turns and max_budget_usd (0) do not apply, the
 	// timeout is the only limit.
 	Limits      string `json:"limits,omitempty"`
@@ -138,7 +141,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
 		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
-		Limits: limitsNote(j), DurationSec: j.DurationSec,
+		CostEstimateUSD: j.CostEstimateUSD, Limits: limitsNote(j), DurationSec: j.DurationSec,
 		RepoPath: j.RepoPath, BaseCommit: j.BaseCommit, CreatedAt: fmtTS(&j.CreatedAt),
 		StartedAt: fmtTS(j.StartedAt), FinishedAt: fmtTS(j.FinishedAt), NotifiedAt: fmtTS(j.NotifiedAt),
 		CleanedAt: fmtTS(j.CleanedAt), OwnerWaits: j.OwnerWaits, ResumedFrom: j.ResumedFrom,

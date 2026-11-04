@@ -183,7 +183,10 @@ func autoContinueLimits(j *store.Job, earlier []store.Attempt, share float64) (L
 func autoContinueMessage(j *store.Job, dir, why string) string {
 	var b strings.Builder
 	cost := CostText(j.CostUSD, j.CostUnknown)
-	if j.CostUnknown {
+	switch {
+	case j.CostUnknown && j.CostEstimateUSD != nil:
+		cost += ", counted at " + estimateText(*j.CostEstimateUSD, j.MaxBudgetUSD)
+	case j.CostUnknown:
 		cost += fmt.Sprintf(", counted at its $%g budget", j.MaxBudgetUSD)
 	}
 	fmt.Fprintf(&b, "%sattempt %d %s after %d turns (cost %s).\n\n", autoContinueTag, j.Attempt, why, j.Turns, cost)

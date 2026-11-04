@@ -574,13 +574,23 @@ type Limits struct {
 	TimeoutMinutes int
 }
 
-// chargedCost is what an attempt counts against the budget: its cost, or its whole budget when the
-// cost is unknown (it ended without a result event).
-func chargedCost(cost float64, unknown bool, budget float64) float64 {
-	if unknown {
-		return math.Max(cost, budget)
+// chargedCost is what an attempt counts against the budget: its cost; when the cost is unknown (it
+// ended without a result event) its estimate from token usage, at most its budget (#127), or without
+// an estimate its whole budget.
+func chargedCost(cost float64, unknown bool, estimate *float64, budget float64) float64 {
+	switch {
+	case !unknown:
+		return cost
+	case estimate != nil:
+		return math.Max(cost, math.Min(*estimate, budget))
 	}
-	return cost
+	return math.Max(cost, budget)
+}
+
+// estimateText is what an attempt with an unknown cost and a cost estimate counts at (chargedCost).
+func estimateText(estimate, budget float64) string {
+	return fmt.Sprintf("its estimate %s (list price of its token usage, at most its $%.2f budget)",
+		EstimatedCostText(math.Min(estimate, budget)), budget)
 }
 
 // cents rounds a dollar amount down to whole cents.
@@ -589,10 +599,10 @@ func cents(v float64) float64 { return math.Floor(v*100+1e-6) / 100 }
 // attemptsUsage sums what all attempts of a job used so far (the archived ones and the row j): turns,
 // counted cost (chargedCost) and minutes (each attempt rounded up).
 func attemptsUsage(j *store.Job, earlier []store.Attempt) (turns int, cost float64, minutes int) {
-	turns, cost, minutes = j.Turns, chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD), (j.DurationSec+59)/60
+	turns, cost, minutes = j.Turns, chargedCost(j.CostUSD, j.CostUnknown, j.CostEstimateUSD, j.MaxBudgetUSD), (j.DurationSec+59)/60
 	for _, a := range earlier {
 		turns += a.Turns
-		cost += chargedCost(a.CostUSD, a.CostUnknown, a.MaxBudgetUSD)
+		cost += chargedCost(a.CostUSD, a.CostUnknown, a.CostEstimateUSD, a.MaxBudgetUSD)
 		minutes += (a.DurationSec + 59) / 60
 	}
 	return turns, cost, minutes
@@ -605,7 +615,7 @@ func attemptsUsage(j *store.Job, earlier []store.Attempt) (turns int, cost float
 // error that names the field to pass.
 func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.ResumeLimits, error) {
 	var errs []string
-	prevCost := chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD)
+	prevCost := chargedCost(j.CostUSD, j.CostUnknown, j.CostEstimateUSD, j.MaxBudgetUSD)
 	usedTurns, usedCost, usedMin := attemptsUsage(j, earlier)
 	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
 	out := store.ResumeLimits{
@@ -614,7 +624,11 @@ func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.Resume
 		TimeoutMinutes: min(j.TimeoutMinutes-(j.DurationSec+59)/60, leftMin),
 	}
 	unknown := ""
-	if j.CostUnknown {
+	switch {
+	case j.CostUnknown && j.CostEstimateUSD != nil:
+		unknown = " (its cost is unknown: it ended without a result event, so it counts at " +
+			estimateText(*j.CostEstimateUSD, j.MaxBudgetUSD) + ")"
+	case j.CostUnknown:
 		unknown = " (its cost is unknown: it ended without a result event, so it counts at its whole budget)"
 	}
 	switch {
@@ -672,7 +686,11 @@ func resumeBudgetNote(j *store.Job, earlier []store.Attempt) string {
 	usedTurns, usedCost, usedMin := attemptsUsage(j, earlier)
 	leftTurns, leftBudget, leftMin := CeilingMaxTurns-usedTurns, cents(CeilingMaxBudgetUSD-usedCost), CeilingTimeoutMinutes-usedMin
 	counted := fmt.Sprintf("this job's attempts count $%.2f of the $%.0f budget ceiling", usedCost, CeilingMaxBudgetUSD)
-	if j.CostUnknown {
+	switch {
+	case j.CostUnknown && j.CostEstimateUSD != nil:
+		counted += " (this attempt ended before its cost was reported, so it counts at " +
+			estimateText(*j.CostEstimateUSD, j.MaxBudgetUSD) + ")"
+	case j.CostUnknown:
 		counted += fmt.Sprintf(" (this attempt ended before its cost was reported, so it counts at its whole $%.2f budget)", j.MaxBudgetUSD)
 	}
 	var none []string
@@ -690,7 +708,7 @@ func resumeBudgetNote(j *store.Job, earlier []store.Attempt) string {
 			"To continue, commit the work in progress in the job's work dir (a WIP commit) and start a new job from that commit.",
 			counted, strings.Join(none, ", "))
 	}
-	next := cents(j.MaxBudgetUSD - chargedCost(j.CostUSD, j.CostUnknown, j.MaxBudgetUSD))
+	next := cents(j.MaxBudgetUSD - chargedCost(j.CostUSD, j.CostUnknown, j.CostEstimateUSD, j.MaxBudgetUSD))
 	def := fmt.Sprintf("job_resume's default max_budget_usd is $%.2f", math.Min(next, leftBudget))
 	if next < 0.01 {
 		def = "job_resume needs max_budget_usd"

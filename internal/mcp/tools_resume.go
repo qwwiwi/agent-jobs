@@ -22,10 +22,13 @@ type AttemptView struct {
 	TimeoutMinutes int     `json:"timeout_minutes"`
 	Turns          int     `json:"turns"`
 	CostUSD        float64 `json:"cost_usd"`
-	// CostUnknown: the attempt ended without a result event; it counts at its whole budget.
-	CostUnknown bool   `json:"cost_unknown,omitempty"`
-	DurationSec int    `json:"duration_sec"`
-	Error       string `json:"error,omitempty"`
+	// CostUnknown: the attempt ended without a result event; it counts at its whole budget, or at
+	// cost_estimate_usd (at most its budget) when it has one.
+	CostUnknown bool `json:"cost_unknown,omitempty"`
+	// CostEstimateUSD is such an attempt's estimated cost: its token usage at list prices (#127).
+	CostEstimateUSD *float64 `json:"cost_estimate_usd,omitempty"`
+	DurationSec     int      `json:"duration_sec"`
+	Error           string   `json:"error,omitempty"`
 	// Context is the orchestrator update the attempt was resumed with (empty for the first).
 	Context   string `json:"context,omitempty"`
 	StartedAt string `json:"started_at,omitempty"`
@@ -44,12 +47,14 @@ func attemptViews(m *jobs.Manager, j *store.Job) ([]AttemptView, error) {
 	for _, a := range atts {
 		out = append(out, AttemptView{N: a.N, Mode: a.Mode, Status: a.Status, SessionID: a.SessionID,
 			MaxTurns: a.MaxTurns, MaxBudgetUSD: a.MaxBudgetUSD, TimeoutMinutes: a.TimeoutMinutes, Turns: a.Turns,
-			CostUSD: a.CostUSD, CostUnknown: a.CostUnknown, DurationSec: a.DurationSec, Error: a.Error, Context: a.Context,
+			CostUSD: a.CostUSD, CostUnknown: a.CostUnknown, CostEstimateUSD: a.CostEstimateUSD, DurationSec: a.DurationSec,
+			Error: a.Error, Context: a.Context,
 			StartedAt: fmtTS(a.StartedAt), Report: filepath.Join(dir, jobs.AttemptReportName(a.N))})
 	}
 	out = append(out, AttemptView{N: j.Attempt, Mode: j.RunMode, Status: j.Status, SessionID: j.SessionID,
 		MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns,
-		CostUSD: j.CostUSD, CostUnknown: j.CostUnknown, DurationSec: j.DurationSec, Error: j.Error, Context: j.PendingContext,
+		CostUSD: j.CostUSD, CostUnknown: j.CostUnknown, CostEstimateUSD: j.CostEstimateUSD, DurationSec: j.DurationSec,
+		Error: j.Error, Context: j.PendingContext,
 		StartedAt: fmtTS(j.StartedAt), Report: filepath.Join(dir, "report.md")})
 	return out, nil
 }

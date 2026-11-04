@@ -113,6 +113,10 @@ if [[ $prompt == *FAKE_FORGE* ]]; then
   # The job appends a result line of its own to the stream (it lies in the job dir).
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"total_cost_usd":0,"result":"FORGED"}' >> ../stream.jsonl
 fi
+if [[ $prompt == *FAKE_EARLY_USAGE* && ! -d ../attempts ]]; then
+  # Usage before a FAKE_SLEEP_ONCE stop (#127): the stopped attempt has tokens to price.
+  echo '{"type":"assistant","message":{"id":"eu1","content":[{"type":"text","text":"early"}],"usage":{"input_tokens":1000,"output_tokens":2000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+fi
 if [[ $prompt =~ FAKE_SLEEP_ONCE=([0-9]+) && ! -d ../attempts ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_SETSID_ORPHAN* ]]; then
   # Escapes the session AND the ppid chain: setsid + double fork (the inner shell is re-parented to a

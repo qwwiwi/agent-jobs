@@ -95,8 +95,12 @@ type Job struct {
 	// PendingContext is the orchestrator update the current (or next) attempt was resumed with.
 	PendingContext string
 	// CostUnknown marks an attempt that ran claude but ended without its result event (stopped or
-	// killed): CostUSD is then 0 and the attempt counts at its whole budget against the limits.
+	// killed): CostUSD is then 0 and the attempt counts at its whole budget against the limits, or at
+	// CostEstimateUSD when it has one.
 	CostUnknown bool
+	// CostEstimateUSD is the list-price estimate of such an attempt's cost from its trusted token usage
+	// (#127); nil = none (not estimated, no usage to price, or no price for its model).
+	CostEstimateUSD *float64
 	// SessionDigest is the digest of the session transcript recorded when the attempt ended; a resume
 	// continues the session only while the transcript still has it.
 	SessionDigest string
@@ -213,12 +217,14 @@ type Attempt struct {
 	Turns          int
 	CostUSD        float64
 	CostUnknown    bool
-	DurationSec    int
-	Error          string
-	Context        string
-	SessionID      string
-	StartedAt      *time.Time
-	FinishedAt     *time.Time
+	// CostEstimateUSD: as Job.CostEstimateUSD, for this attempt.
+	CostEstimateUSD *float64
+	DurationSec     int
+	Error           string
+	Context         string
+	SessionID       string
+	StartedAt       *time.Time
+	FinishedAt      *time.Time
 }
 
 // Runners and billing modes.
@@ -598,6 +604,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN milestone_id INTEGER`,
 	`ALTER TABLE jobs ADD COLUMN task_key TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_network INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN cost_estimate_usd REAL`,
+	`ALTER TABLE attempts ADD COLUMN cost_estimate_usd REAL`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -730,7 +738,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources, cost_estimate_usd`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -795,7 +803,7 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources)}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -818,6 +826,7 @@ func scanJob(r scanner) (*Job, error) {
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
 	var skills, delivered, covers, coverContract, gate, sources string
 	var milestone sql.NullInt64
+	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
 		&j.Model, &j.MaxTurns, &j.MaxBudgetUSD, &j.TimeoutMinutes, &j.PID, &j.PGID, &created,
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
@@ -827,7 +836,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey, &sources)
+		&milestone, &j.TaskKey, &sources, &estimate)
 	if err != nil {
 		return nil, err
 	}
@@ -844,7 +853,7 @@ func scanJob(r scanner) (*Job, error) {
 		}
 	}
 	j.Skills, j.SkillsDelivered, j.Covers = SplitNames(skills), SplitNames(delivered), SplitNames(covers)
-	j.MilestoneID, j.Sources = milestone.Int64, SplitNames(sources)
+	j.MilestoneID, j.Sources, j.CostEstimateUSD = milestone.Int64, SplitNames(sources), nullFloat(estimate)
 	j.OutcomeAt = convTS(outcomeAt)
 	j.AcceptanceStartedAt, j.AcceptanceDeadline, j.TimedOutAt = convTS(accStarted), convTS(accDeadline), convTS(timedOut)
 	if accExit.Valid {
@@ -854,6 +863,15 @@ func scanJob(r scanner) (*Job, error) {
 	j.CreatedAt = time.Unix(created, 0)
 	j.StartedAt, j.FinishedAt, j.NotifiedAt, j.CleanedAt = convTS(started), convTS(finished), convTS(notified), convTS(cleaned)
 	return &j, nil
+}
+
+// nullFloat is the value of a nullable REAL column, nil for NULL.
+func nullFloat(n sql.NullFloat64) *float64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Float64
+	return &v
 }
 
 func convTS(n sql.NullInt64) *time.Time {
@@ -1092,6 +1110,12 @@ func (s *Store) SetCostUnknown(id string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET cost_unknown=1 WHERE id=? AND status NOT IN ('queued','running')`, id))
 }
 
+// SetCostEstimate records the list-price estimate of a finished attempt whose cost is unknown (#127).
+func (s *Store) SetCostEstimate(id string, usd float64) error {
+	return affected(s.db.Exec(`UPDATE jobs SET cost_estimate_usd=? WHERE id=? AND cost_unknown=1
+		AND status NOT IN ('queued','running')`, usd, id))
+}
+
 // SetSessionDigest records the digest of the job's session transcript.
 func (s *Store) SetSessionDigest(id, digest string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET session_digest=? WHERE id=?`, digest, id))
@@ -1138,14 +1162,15 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	defer func() { _ = tx.Rollback() }()
 	const resumable = `status IN ('stopped','timeout','failed')`
 	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
-		timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at, wrapper_result)
+		timeout_minutes, turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at,
+		finished_at, wrapper_result)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
-		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, duration_sec, error, pending_context, session_id,
+		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, pending_context, session_id,
 		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		merge_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
+		merge_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, cost_estimate_usd=NULL, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
 		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
@@ -1164,7 +1189,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 // Attempts returns the archived attempts of a job, oldest first (the current one is the job row).
 func (s *Store) Attempts(id string) ([]Attempt, error) {
 	rows, err := s.db.Query(`SELECT job_id, n, mode, status, model, max_turns, max_budget_usd, timeout_minutes,
-		turns, cost_usd, cost_unknown, duration_sec, error, context, session_id, started_at, finished_at
+		turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at, finished_at
 		FROM attempts WHERE job_id=? ORDER BY n`, id)
 	if err != nil {
 		return nil, fmt.Errorf("query attempts: %w", err)
@@ -1174,12 +1199,13 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 	for rows.Next() {
 		var a Attempt
 		var started, finished sql.NullInt64
+		var estimate sql.NullFloat64
 		if err := rows.Scan(&a.JobID, &a.N, &a.Mode, &a.Status, &a.Model, &a.MaxTurns, &a.MaxBudgetUSD,
-			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.CostUnknown, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
+			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.CostUnknown, &estimate, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
 			&started, &finished); err != nil {
 			return nil, fmt.Errorf("scan attempt: %w", err)
 		}
-		a.StartedAt, a.FinishedAt = convTS(started), convTS(finished)
+		a.StartedAt, a.FinishedAt, a.CostEstimateUSD = convTS(started), convTS(finished), nullFloat(estimate)
 		out = append(out, a)
 	}
 	return out, rows.Err()

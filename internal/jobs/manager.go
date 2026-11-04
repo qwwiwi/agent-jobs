@@ -1840,6 +1840,14 @@ func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) 
 	if killed || j.Runner == store.RunnerCodex || (!res.Found && j.LaunchToken != "") {
 		if err := m.Store.SetCostUnknown(j.ID); err != nil {
 			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
+		} else if j.Runner != store.RunnerCodex {
+			// A claude attempt has a budget the limits would otherwise count whole (#127): its trusted
+			// token usage so far, at list prices, is recorded as an estimate instead.
+			if est, ok := m.estimateTokenCost(j.Model, res.Tokens, res.TokensInvalid); ok {
+				if err := m.Store.SetCostEstimate(j.ID, est); err != nil {
+					m.Log.Printf("job %s: record cost estimate: %v", j.ID, err)
+				}
+			}
 		}
 	}
 	digest := ""

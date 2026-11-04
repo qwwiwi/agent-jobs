@@ -496,14 +496,11 @@ func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store
 	var est float64
 	price := func(model string, ss *StreamStats) {
 		unknown++
-		// No stream, or no usage in it (killed before its first message, a codex turn that never
-		// completed), or usage that cannot be real: nothing to price, the cost stays unknown rather
-		// than a "$0.00 est." or a figure from bad counts.
-		if ss == nil || ss.TokensInvalid || ss.Tokens == (TokenUsage{}) {
+		if ss == nil {
 			return
 		}
-		if p, ok := m.Config().PriceFor(model); ok {
-			est += p.Cost(ss.Tokens)
+		if c, ok := m.estimateTokenCost(model, ss.Tokens, ss.TokensInvalid); ok {
+			est += c
 			priced++
 		}
 	}
@@ -524,6 +521,21 @@ func (m *Manager) estimateCost(st *store.JobStats, j *store.Job, earlier []store
 	default:
 		st.CostSource = store.CostSourceUnknown
 	}
+}
+
+// estimateTokenCost prices an attempt's trusted token usage at list prices (Config.PriceFor). No usage
+// (killed before its first message, a codex turn that never completed), usage that cannot be real, or
+// a model with no price: nothing to price (false), the cost stays unknown rather than a "$0.00 est." or
+// a figure from bad counts.
+func (m *Manager) estimateTokenCost(model string, tokens TokenUsage, invalid bool) (float64, bool) {
+	if invalid || tokens == (TokenUsage{}) {
+		return 0, false
+	}
+	p, ok := m.Config().PriceFor(model)
+	if !ok {
+		return 0, false
+	}
+	return p.Cost(tokens), true
 }
 
 func finished(status string) bool {
