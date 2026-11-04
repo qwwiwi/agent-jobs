@@ -38,7 +38,8 @@ func uiCheckTemplate(t *testing.T) []byte {
 	return b
 }
 
-// A resumed job runs prepare again: the tool already in place with the shipped content is kept.
+// The writer runs on a job's first attempt only (a resume goes through prepareResume), but it is
+// idempotent for repeated calls: the tool already in place with the shipped content is kept.
 func TestWriteUICheckToolIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 3; i++ {

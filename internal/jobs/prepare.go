@@ -339,8 +339,9 @@ func writeUICheckTool(dir string) error {
 // existing file: the job dir is writable by the job, so a planted symlink or hard link at name could
 // otherwise redirect or truncate a file outside it. dir is opened with O_NOFOLLOW|O_DIRECTORY and name
 // is created relative to it with O_CREAT|O_EXCL|O_NOFOLLOW. An existing regular file with one link and
-// exactly content b is kept (a resumed job runs prepare again); a symlink, a hard link, another file
-// type or differing content is an error.
+// exactly content b is kept, so repeated calls are idempotent (the writer runs on a job's first attempt
+// only: a resumed attempt goes through prepareResume, which does not call it); a symlink, a hard link,
+// another file type or differing content is an error.
 func writeJobFileOnce(dir, name string, b []byte) error {
 	dfd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {

@@ -291,36 +291,42 @@ test('pageProbe: only a clipping ancestor in the containing-block chain hides a 
   assert.equal(out.stickOutCount, 3);
 });
 
-// A fake scrollable page for scrollThrough: the window and one inner scroller, each with a content height
-// that can grow when its end is reached (lazy content).
-function fakeScrollPage({ winHeight = 740, winContent = 740, inner = null }) {
+// A fake scroll container for scrollThrough: content can grow when its end is reached (lazy content).
+function fakeScroller({ tagName = 'MAIN', id = '', clientHeight, clientWidth = 360, content, grow = () => false, overflowY = 'auto' }) {
+  const s = { tagName, id, className: '', scrollTop: 0, clientHeight, clientWidth, scrollHeight: content, overflowY, loads: 0, steps: 0 };
+  const clamp = () => {
+    s.scrollTop = Math.max(0, Math.min(s.scrollTop, s.scrollHeight - s.clientHeight));
+    if (s.scrollTop + s.clientHeight >= s.scrollHeight - 2 && grow(s)) s.loads++;
+  };
+  s.scrollBy = ({ top }) => { s.steps++; s.order = s.order || ++fakeScroller.seq; s.scrollTop += top; clamp(); };
+  s.scrollTo = ({ top }) => { s.scrollTop = top; clamp(); };
+  return s;
+}
+fakeScroller.seq = 0;
+
+// A fake scrollable page for scrollThrough: the window, an optional main inner scroller (inner), further
+// scrollers (more) and an optional body that is itself a scroller (body), with the root's overflow-y.
+function fakeScrollPage({ winHeight = 740, winContent = 740, inner = null, more = [], body = null, rootOverflowY = 'visible' }) {
   const win = { scrollY: 0, innerHeight: winHeight };
-  const de = { scrollHeight: winContent };
+  const de = { scrollHeight: winContent, overflowY: rootOverflowY };
   const clampWin = () => { win.scrollY = Math.max(0, Math.min(win.scrollY, de.scrollHeight - win.innerHeight)); };
   win.scrollBy = ({ top }) => { win.scrollY += top; clampWin(); };
   win.scrollTo = ({ top }) => { win.scrollY = top; clampWin(); };
-  const elements = [];
-  let scroller = null;
-  if (inner) {
-    scroller = {
-      tagName: 'MAIN', id: 'app', className: '', scrollTop: 0, clientHeight: inner.clientHeight, clientWidth: 360,
-      scrollHeight: inner.content, overflowY: 'auto', loads: 0, steps: 0,
-    };
-    const clamp = () => {
-      scroller.scrollTop = Math.max(0, Math.min(scroller.scrollTop, scroller.scrollHeight - scroller.clientHeight));
-      if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2 && inner.grow(scroller)) scroller.loads++;
-    };
-    scroller.scrollBy = ({ top }) => { scroller.steps++; scroller.scrollTop += top; clamp(); };
-    scroller.scrollTo = ({ top }) => { scroller.scrollTop = top; clamp(); };
-    // A small overflow-y:auto box that is not the main scroller.
-    elements.push({ tagName: 'DIV', id: '', className: '', scrollHeight: 400, clientHeight: 100, clientWidth: 100, overflowY: 'auto' }, scroller);
-  }
+  // A small overflow-y:auto box (scrolls less than a viewport) that is not traversed.
+  const small = fakeScroller({ tagName: 'DIV', clientHeight: 100, clientWidth: 100, content: 400 });
+  const elements = [small];
+  const scroller = inner ? fakeScroller({ id: 'app', ...inner }) : null;
+  if (scroller) elements.push(scroller);
+  const others = more.map((m) => fakeScroller(m));
+  elements.push(...others);
+  const bodyEl = body ? fakeScroller({ tagName: 'BODY', ...body }) : {};
+  bodyEl.querySelectorAll = () => elements;
   const ctx = vm.createContext({
     window: win, setTimeout,
-    document: { documentElement: de, body: { querySelectorAll: () => elements } },
-    getComputedStyle: (e) => ({ overflowY: e.overflowY }),
+    document: { documentElement: de, body: bodyEl },
+    getComputedStyle: (e) => ({ overflowY: e.overflowY || 'visible' }),
   });
-  return { ctx, win, scroller };
+  return { ctx, win, scroller, others, small, body: body ? bodyEl : null };
 }
 
 const scrollIn = (ctx, steps) => vm.runInContext(scrollExpression(steps, 0, 0), ctx);
@@ -364,6 +370,57 @@ test('scrollThrough reports cap exhaustion and a scroller that cannot reach its 
   const f = failuresOf({ error: '', badResponses: [], scrollProblems: capped, cls: 0, probe: null });
   assert.equal(f.length, 1);
   assert.match(f[0], /^scroll: not traversed to the end \(main#app: stopped after 5 steps/);
+});
+
+// Review finding: html{overflow:hidden} with body{height:100vh;overflow:auto} scrolls in body, which was
+// never a candidate, so the lazy content at its bottom was never loaded or checked.
+test('scrollThrough traverses body when it scrolls independently and loads its lazy content', async () => {
+  let lazy = 1;
+  const { ctx, win, body } = fakeScrollPage({
+    rootOverflowY: 'hidden',
+    body: { clientHeight: 740, content: 3000, grow: (s) => lazy-- > 0 && (s.scrollHeight += 2000) },
+  });
+  assert.deepEqual(Array.from(await scrollIn(ctx, 400)), []);
+  assert.equal(body.loads, 1);
+  assert.equal(body.scrollHeight, 5000);
+  assert.equal(body.scrollTop, 0);
+  assert.equal(win.scrollY, 0);
+
+  // With a visible root, body's overflow applies to the viewport: body is the window, not traversed again.
+  const propagated = fakeScrollPage({ body: { clientHeight: 740, content: 3000 } });
+  assert.deepEqual(Array.from(await scrollIn(propagated.ctx, 400)), []);
+  assert.equal(propagated.body.steps, 0);
+});
+
+// Review finding: only the single largest scroller was traversed; a second independent one was skipped.
+test('scrollThrough traverses every independent scroller, largest first, within one step budget', async () => {
+  let lazyA = 1;
+  let lazyB = 1;
+  const { ctx, others, small } = fakeScrollPage({
+    more: [
+      { tagName: 'ASIDE', id: 'side', clientWidth: 100, clientHeight: 700, content: 2000, grow: (s) => lazyB-- > 0 && (s.scrollHeight += 1000) },
+      { tagName: 'SECTION', id: 'feed', clientWidth: 260, clientHeight: 700, content: 2000, grow: (s) => lazyA-- > 0 && (s.scrollHeight += 1000) },
+    ],
+  });
+  assert.deepEqual(Array.from(await scrollIn(ctx, 400)), []);
+  const [side, feed] = others;
+  assert.equal(feed.loads, 1);
+  assert.equal(side.loads, 1);
+  assert.ok(feed.order < side.order, 'the larger scroller goes first');
+  assert.equal(feed.scrollTop + side.scrollTop, 0);
+  assert.equal(small.steps, 0); // scrolls less than a viewport: not traversed
+
+  // The budget is shared: the first endless scroller uses it up, the second is reported, not skipped.
+  const endless = fakeScrollPage({
+    more: [
+      { tagName: 'ASIDE', id: 'side', clientWidth: 100, clientHeight: 700, content: 2000 },
+      { tagName: 'SECTION', id: 'feed', clientWidth: 260, clientHeight: 700, content: 2000, grow: (s) => (s.scrollHeight += 1000) },
+    ],
+  });
+  const p = Array.from(await scrollIn(endless.ctx, 5));
+  assert.equal(p.length, 2, JSON.stringify(p));
+  assert.match(p[0], /^section#feed: stopped after 5 steps/);
+  assert.match(p[1], /^aside#side: not traversed/);
 });
 
 test('probeExpression is a self-contained expression', () => {

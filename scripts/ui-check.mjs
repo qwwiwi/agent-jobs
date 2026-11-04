@@ -9,8 +9,8 @@
 // (documentElement.scrollWidth <= clientWidth), no visible element sticking out of the viewport outside a
 // scroll container, no broken images, CLS < 0.1, no word split inside a word (a word whose rendered
 // rects fall on more than one line, e.g. a table cell narrower than its longest word; only proven
-// hyphenation is exempt), the page and its main inner scroller scrolled to their end. A full-page
-// screenshot of each run and results.json go to --out (default ./ui-check). Layout shifts are observed
+// hyphenation is exempt), the page and every scroller taller than a viewport (body too) scrolled to their
+// end. A full-page screenshot of each run and results.json go to --out (default ./ui-check). Layout shifts are observed
 // from navigation until the page is scrolled through and at least --dwell ms (default 3000) have passed.
 //
 // Playwright is not a dependency of this repository: it is resolved from the caller's environment, in this
@@ -186,6 +186,8 @@ export function lineFragments(charRects) {
 export function hyphenationExempt(s, fragments, hyphenChanged) {
   if (s.hyphens !== 'auto' || s.wordBreak === 'break-all' || !hyphenChanged) return false;
   const forced = s.overflowWrap === 'anywhere' || s.overflowWrap === 'break-word' || s.wordBreak === 'break-word';
+  // Intentional policy: under a forced break a 2-letter fragment fails even when the dictionary put the
+  // hyphen there, because the owner forbids short word fragments on phones.
   const min = forced ? 3 : 2;
   return fragments.length > 1 && fragments.every((f) => f.length >= min);
 }
@@ -382,13 +384,17 @@ export function probeExpression(limit) {
 export const SCROLL_STEPS = 400;
 
 /**
- * In-page: scrolls the window to its end, then the main inner scroller (the largest element with
- * overflow-y auto or scroll whose content is taller than its box: an app shell with a 100vh main area
- * scrolls there, not in the window), in steps of 80% of the visible height, so lazy content loads, until
- * the height stops growing; then both back to the top. A traversal that stops moving before the end, or
- * uses up maxSteps (an endless page), is a problem: content below it was never loaded or checked.
+ * In-page: scrolls the window to its end, then every vertical scroll container (overflow-y auto or
+ * scroll) whose content is taller than its box by more than a viewport, largest first: an app shell with
+ * a 100vh main area scrolls there, not in the window. body counts when it scrolls on its own, i.e. html's
+ * overflow is not visible (otherwise body's overflow is the viewport's); html's overflow is always the
+ * viewport's, so the window traversal covers html. Steps are 80% of the visible height, so lazy content
+ * loads, until the height stops growing; scrollers that appear meanwhile are picked up too. Then all of
+ * them back to the top. maxSteps bounds the steps of all traversals together. A traversal that stops
+ * moving before the end, one cut off by the step budget (an endless page), or a scroller left untraversed
+ * once the budget is used up is a problem: content below it was never loaded or checked.
  * Self-contained: serialized by scrollExpression.
- * @param {number} maxSteps
+ * @param {number} maxSteps step budget for the window and all scrollers together
  * @param {number} pauseMs wait after each step
  * @param {number} settleMs wait at the end for more content
  * @returns {Promise<string[]>} the problems, empty when every traversal reached the end
@@ -396,9 +402,10 @@ export const SCROLL_STEPS = 400;
 export async function scrollThrough(maxSteps, pauseMs, settleMs) {
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));
   const de = document.documentElement;
+  let steps = 0;
   const traverse = async (t) => {
     let lastHeight = -1;
-    for (let steps = 0; ;) {
+    for (;;) {
       const h = t.height();
       if (t.top() + t.client() >= h - 2) {
         if (h === lastHeight) return '';
@@ -406,7 +413,9 @@ export async function scrollThrough(maxSteps, pauseMs, settleMs) {
         await pause(settleMs);
         continue;
       }
-      if (steps >= maxSteps) return `${t.name}: stopped after ${maxSteps} steps at ${Math.round(t.top())} of ${h}`;
+      if (steps >= maxSteps) {
+        return `${t.name}: stopped after ${maxSteps} steps (the budget for all scrollers) at ${Math.round(t.top())} of ${h}`;
+      }
       const before = t.top();
       t.by(Math.max(200, Math.floor(t.client() * 0.8)));
       steps++;
@@ -421,29 +430,50 @@ export async function scrollThrough(maxSteps, pauseMs, settleMs) {
   };
   const winProblem = await traverse(win);
   if (winProblem) problems.push(winProblem);
-  let scroller = null;
-  let area = 0;
-  for (const el of document.body ? Array.from(document.body.querySelectorAll('*')) : []) {
-    if (!(el.scrollHeight > el.clientHeight + 1)) continue;
-    const oy = getComputedStyle(el).overflowY;
-    if (oy !== 'auto' && oy !== 'scroll') continue;
-    const a = el.clientWidth * el.clientHeight;
-    if (a > area) {
-      scroller = el;
-      area = a;
+  const label = (el) => {
+    const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/)[0] : '';
+    return String(el.tagName).toLowerCase() + (el.id ? '#' + el.id : cls ? '.' + cls : '');
+  };
+  // body scrolls on its own only when html's overflow is not visible; otherwise body's goes to the viewport.
+  const bodyOwn = () => {
+    const r = getComputedStyle(de);
+    return [r.overflowX, r.overflowY].some((o) => o && o !== 'visible');
+  };
+  const candidates = () => {
+    const b = document.body;
+    if (!b) return [];
+    const els = Array.from(b.querySelectorAll('*'));
+    if (bodyOwn()) els.unshift(b);
+    return els.filter((el) => {
+      if (!(el.clientHeight > 0 && el.clientWidth > 0)) return false; // not rendered
+      if (!(el.scrollHeight - el.clientHeight > window.innerHeight)) return false;
+      const oy = getComputedStyle(el).overflowY;
+      return oy === 'auto' || oy === 'scroll';
+    }).sort((x, y) => y.clientWidth * y.clientHeight - x.clientWidth * x.clientHeight);
+  };
+  const seen = new Set();
+  const traversed = [];
+  for (;;) {
+    // Rescan after each round: a traversal can load content that holds further scrollers.
+    const next = candidates().filter((el) => !seen.has(el));
+    if (!next.length) break;
+    for (const el of next) {
+      seen.add(el);
+      const t = {
+        name: label(el), top: () => el.scrollTop, client: () => el.clientHeight, height: () => el.scrollHeight,
+        by: (d) => el.scrollBy({ top: d, behavior: 'instant' }), reset: () => el.scrollTo({ top: 0, behavior: 'instant' }),
+      };
+      if (steps >= maxSteps) {
+        problems.push(`${t.name}: not traversed, the budget of ${maxSteps} steps is used up`);
+        continue;
+      }
+      traversed.push(t);
+      const p = await traverse(t);
+      if (p) problems.push(p);
     }
+    if (steps >= maxSteps) break; // budget used up: what this round found is reported, no further rounds
   }
-  if (scroller) {
-    const el = scroller;
-    const label = String(el.tagName).toLowerCase() + (el.id ? '#' + el.id : '');
-    const inner = {
-      name: label, top: () => el.scrollTop, client: () => el.clientHeight, height: () => el.scrollHeight,
-      by: (d) => el.scrollBy({ top: d, behavior: 'instant' }), reset: () => el.scrollTo({ top: 0, behavior: 'instant' }),
-    };
-    const innerProblem = await traverse(inner);
-    if (innerProblem) problems.push(innerProblem);
-    inner.reset();
-  }
+  for (const t of traversed.reverse()) t.reset();
   win.reset();
   return problems;
 }
