@@ -38,7 +38,7 @@ Default limits and ceilings. A request above a ceiling is rejected, not silently
 
 | parameter | default | ceiling |
 |---|---|---|
-| max_turns | 80 | 200 |
+| max_turns | 200 for fix and general, 80 for other kinds | 200 |
 | max_budget_usd | 10 | 50 |
 | timeout_minutes | 45 | 180 |
 | concurrent per agent | 2 | |

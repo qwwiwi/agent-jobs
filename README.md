@@ -73,7 +73,7 @@ Every job needs `--model` or `--complexity`. Full setup (all config keys, the sh
 
 ## Why agent-jobs
 
-**Delegate big tasks, not just small errands.** Anything longer than a few steps becomes a job: coding, fix loops, reviews, research, overnight work. A job gets its own git worktree, its own limits (default 80 turns, $10, 45 minutes for the first attempt), a guard on every tool call when it runs on Claude, and it must end with a report in a fixed format. Nobody has to watch it.
+**Delegate big tasks, not just small errands.** Anything longer than a few steps becomes a job: coding, fix loops, reviews, research, overnight work. A job gets its own git worktree, its own limits (default 200 turns for fix and general jobs, 80 for the other kinds, $10, 45 minutes for the first attempt), a guard on every tool call when it runs on Claude, and it must end with a report in a fixed format. Nobody has to watch it.
 
 **Each job runs on its own.** A job is a separate process with a full context of its own. It commits locally; in a Claude job the guard blocks pushes, releases, PR and issue writes and messages to other sessions (the direct spellings: the guard is [not a sandbox](docs/GUIDE.md#safety)). It survives a restart of the session or the daemon. A Claude job stopped at its turn limit or timeout is continued once automatically, with half of its first limits again, and a stopped Claude job can be resumed in the same session with new instructions. A Codex job has no guard (the codex sandbox contains it, read-only unless `codex_write_allowed`) and is neither continued nor resumed.
 

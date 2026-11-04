@@ -55,7 +55,7 @@ func TestAutoContinueAfterTurnLimit(t *testing.T) {
 		!strings.Contains(launches[1], "--resume\n"+sid+"\n") {
 		t.Fatalf("attempt 2 did not resume session %q (row %q):\n%v", sid, got.SessionID, launches)
 	}
-	if got.MaxTurns != 40 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 23 {
+	if got.MaxTurns != DefaultCoderMaxTurns/2 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 23 {
 		t.Fatalf("continuation limits: %d turns $%g %d min", got.MaxTurns, got.MaxBudgetUSD, got.TimeoutMinutes)
 	}
 	for _, s := range []string{autoContinueTag + "attempt 1 stopped at its turn limit after 7 turns (cost $0.40)",
@@ -160,7 +160,7 @@ func TestAutoContinueAfterTimeout(t *testing.T) {
 	m.Now = func() time.Time { return later }
 	tick(t, m)
 	got := get(t, m, j.ID)
-	if got.Attempt != 2 || got.MaxTurns != 40 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 5 {
+	if got.Attempt != 2 || got.MaxTurns != DefaultCoderMaxTurns/2 || got.MaxBudgetUSD != 5 || got.TimeoutMinutes != 5 {
 		t.Fatalf("after the timeout: %s attempt %d limits %d/$%g/%d %q", got.Status, got.Attempt, got.MaxTurns,
 			got.MaxBudgetUSD, got.TimeoutMinutes, got.Error)
 	}

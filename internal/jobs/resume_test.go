@@ -99,7 +99,7 @@ func TestStopRunningThenResumeSameSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != store.StatusQueued || r.MaxTurns != DefaultMaxTurns-1 || r.TimeoutMinutes != DefaultTimeoutMinutes-(st.DurationSec+59)/60 ||
+	if r.Status != store.StatusQueued || r.MaxTurns != DefaultCoderMaxTurns-1 || r.TimeoutMinutes != DefaultTimeoutMinutes-(st.DurationSec+59)/60 ||
 		r.MaxBudgetUSD != 4 || r.PendingContext != "NEW_FACT_42: use the other API" {
 		t.Fatalf("resumed row: %+v", r)
 	}

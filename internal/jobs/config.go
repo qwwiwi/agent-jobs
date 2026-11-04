@@ -29,7 +29,14 @@ const (
 	CeilingMaxBudgetUSD   = 50.0
 	CeilingTimeoutMinutes = 180
 	MaxOwnerRulesBytes    = 8 * 1024
+	// DefaultCoderMaxTurns is the turn default of a coder job (CoderKinds), the ceiling (owner decision
+	// 2026-10-31, #123): a turn limit does not guard spend (budget, timeout and the limit tiers do), and
+	// cutting a coder job off at 80 turns lost work it had done before it ran its tests or wrote its report.
+	DefaultCoderMaxTurns = CeilingMaxTurns
 )
+
+// CoderKinds are the kinds whose default turn limit is DefaultCoderMaxTurns.
+var CoderKinds = []string{"fix", "general"}
 
 // Running jobs per agent (config max_running): the default and the hard ceiling. A value outside
 // 1..CeilingMaxRunningPerAgent is a config error, never clamped.

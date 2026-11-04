@@ -473,8 +473,8 @@ func runToEnd(t *testing.T, m *Manager, id string) *store.Job {
 
 func TestLimitsDefaultsAndCeilingsRejected(t *testing.T) {
 	m := newManager(t)
-	j := enqueue(t, m, "x", nil)
-	if j.MaxTurns != 80 || j.MaxBudgetUSD != 10 || j.TimeoutMinutes != 45 {
+	j := enqueue(t, m, "x", nil) // kind general: the coder turn default (#123)
+	if j.MaxTurns != DefaultCoderMaxTurns || j.MaxBudgetUSD != 10 || j.TimeoutMinutes != 45 {
 		t.Fatalf("defaults: %d/%v/%d", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 	}
 	enqueue(t, m, "x", func(r *StartRequest) { r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes = 200, 50, 180 })

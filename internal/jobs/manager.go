@@ -204,6 +204,16 @@ type StartRequest struct {
 	plannedSources bool
 }
 
+// DefaultTurns is the turn limit a job of this kind starts with: the explicit one when given, else
+// DefaultCoderMaxTurns for a coder kind (#123); 0 for any other kind, which ValidateLimits makes
+// DefaultMaxTurns.
+func DefaultTurns(kind string, turns int) int {
+	if turns == 0 && slices.Contains(CoderKinds, kind) {
+		return DefaultCoderMaxTurns
+	}
+	return turns
+}
+
 // ValidateLimits applies defaults and rejects anything above a ceiling (never clamps).
 func ValidateLimits(turns int, budget float64, timeout int) (int, float64, int, error) {
 	if turns == 0 {
@@ -410,7 +420,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if len(sources) > 0 && r.Gate != nil {
 		return nil, errors.New("a gate job gets nothing but its input: no sources")
 	}
-	turns, budget, timeout, err := ValidateLimits(r.MaxTurns, r.MaxBudgetUSD, r.TimeoutMinutes)
+	turns, budget, timeout, err := ValidateLimits(DefaultTurns(r.Kind, r.MaxTurns), r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
 	}

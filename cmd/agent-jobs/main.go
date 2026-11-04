@@ -504,7 +504,8 @@ func cmdStart(args []string) error {
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
 	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
 	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
-	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
+	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d for fix and general, %d for other kinds; ceiling %d",
+		jobs.DefaultCoderMaxTurns, jobs.DefaultMaxTurns, jobs.CeilingMaxTurns))
 	fs.Float64Var(&r.MaxBudgetUSD, "max-budget-usd", 0, fmt.Sprintf("default %g, ceiling %g", jobs.DefaultMaxBudgetUSD, jobs.CeilingMaxBudgetUSD))
 	fs.IntVar(&r.TimeoutMinutes, "timeout-minutes", 0, fmt.Sprintf("default %d, ceiling %d", jobs.DefaultTimeoutMinutes, jobs.CeilingTimeoutMinutes))
 	fs.StringVar(&r.Runner, "runner", "", "claude|codex (default: codex for a gpt-* model, else claude)")

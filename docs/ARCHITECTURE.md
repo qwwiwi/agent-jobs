@@ -98,7 +98,7 @@ Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed
 
 ## Flows
 
-**Start.** `agent-jobs start` validates kind, limits (defaults 80 turns / $10 / 45 min; above 200 / $50 / 180 → error, never clamped), resolves repo + base to a commit SHA, picks the model (explicit `--model`, validated as a model name so it can never become a flag; else the kind × complexity table; neither given = rejected, complexity is never defaulted), inserts a `queued` row and prints the id. Nothing runs yet.
+**Start.** `agent-jobs start` validates kind, limits (defaults 80 turns, 200 for fix and general jobs / $10 / 45 min; above 200 / $50 / 180 → error, never clamped), resolves repo + base to a commit SHA, picks the model (explicit `--model`, validated as a model name so it can never become a flag; else the kind × complexity table; neither given = rejected, complexity is never defaulted), inserts a `queued` row and prints the id. Nothing runs yet.
 
 **Tick** (every minute, also `agent-jobs tick`) runs under an exclusive `flock` on `<state>/tick.lock` (also taken by `cancel`), so two daemons or a manual tick never interleave. In this order:
 1. *Collect* each `running` job. A claimed job without a recorded pid (daemon died between spawn and pid write) is adopted from `wrapper.json` if its token matches; with no `wrapper.json` after 1 minute it is `failed` under `admit.lock` ("the wrapper never registered", work dir kept). Then: `exit_code` present → stream.jsonl is read *after* it (so the result is complete) → verdict; else past `started_at + timeout` → SIGTERM to the process group, 10 s, SIGKILL → `timeout`; else wrapper PID dead → re-check exit_code, then `failed` ("wrapper died without writing exit_code").

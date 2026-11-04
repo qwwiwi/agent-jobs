@@ -117,7 +117,7 @@ Use amend while a job waits, stop and resume when a running job needs new facts 
 
 | | default | ceiling |
 |---|---|---|
-| Turns (`--max-turns`) | 80 | 200 |
+| Turns (`--max-turns`) | 200 for fix and general, 80 for other kinds | 200 |
 | Budget (`--max-budget-usd`) | $10 | $50 |
 | Time (`--timeout-minutes`) | 45 min | 180 min |
 | Running per agent (`max_running`) | 2 | 8 |

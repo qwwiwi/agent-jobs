@@ -36,7 +36,7 @@ claude -p --output-format stream-json --verbose --model M \
 
 | параметр | по умолчанию | потолок |
 |---|---|---|
-| max_turns | 80 | 200 |
+| max_turns | 200 для fix и general, 80 для остальных | 200 |
 | max_budget_usd | 10 | 50 |
 | timeout_minutes | 45 | 180 |
 | одновременно на агента | 2 | |

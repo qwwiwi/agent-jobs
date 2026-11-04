@@ -197,7 +197,7 @@ type JobStartInput struct {
 	Brief           string   `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
 	Model           string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec; give this or complexity"`
 	Complexity      string   `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
-	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 80, ceiling 200"`
+	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 200 for fix and general, 80 for other kinds; ceiling 200"`
 	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
 	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
 	Repo            string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
