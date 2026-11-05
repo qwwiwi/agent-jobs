@@ -238,7 +238,7 @@ func TestResultTeeWaitDelay(t *testing.T) {
 			defer log.Close()
 			script := `printf '%s\n' '{"type":"result","subtype":"success","num_turns":2,"total_cost_usd":0.5}'; sleep 1 & exit ` + fmt.Sprint(code)
 			started := time.Now()
-			got, closed, res := runClaude(dir, "prompt.md", []string{"/bin/sh", "-c", script}, store.RunnerClaude, 0, log)
+			got, closed, res := runClaude(dir, "prompt.md", []string{"/bin/sh", "-c", script}, store.RunnerClaude, 0, log, nil)
 			if got != code || closed || !res.Found || res.Turns != 2 || res.CostUSD != 0.5 {
 				t.Fatalf("exit=%d closed=%v result=%+v", got, closed, res)
 			}

@@ -580,6 +580,7 @@ type JobView struct {
 	Model           string  `json:"model"`
 	Complexity      string  `json:"complexity,omitempty"`
 	Runner          string  `json:"runner"`
+	Provider        string  `json:"provider"`
 	ReasoningEffort string  `json:"reasoning_effort,omitempty"`
 	Billing         string  `json:"billing"`
 	MaxTurns        int     `json:"max_turns"`
@@ -630,7 +631,7 @@ func ViewOf(j *store.Job) JobView {
 	v := JobView{
 		ID: capField(j.ID), Title: capField(jobs.JobTitle(j)), Kind: capField(j.Kind), Status: capField(j.Status),
 		Model: capField(j.Model), Complexity: capField(j.Complexity), Runner: capField(j.Runner),
-		ReasoningEffort: capField(j.ReasoningEffort), Billing: capField(j.Billing), MaxTurns: j.MaxTurns,
+		Provider: jobs.JobProvider(j), ReasoningEffort: capField(j.ReasoningEffort), Billing: capField(j.Billing), MaxTurns: j.MaxTurns,
 		MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD,
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, Repo: repoName(j.RepoPath),
 		BaseCommit: capField(j.BaseCommit), CreatedAt: ts(&j.CreatedAt), StartedAt: ts(j.StartedAt),

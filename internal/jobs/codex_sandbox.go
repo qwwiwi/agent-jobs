@@ -62,7 +62,22 @@ type CodexSandboxStatus struct {
 	Probe     *CodexSandboxProbe `json:"probe,omitempty"`
 	// Problem is set when codex jobs are refused (auto) or would fail (native) on this host.
 	Problem string `json:"problem,omitempty"`
+	// KeyProtection is how codex jobs stand to the OpenRouter key sandbox (keysandbox.go) of the
+	// config.json the wrapper reads ("" without providers.openrouter): protected (codex runs inside it,
+	// codex_sandbox worktree-full-access), unprotected (the native sandbox under codex_policy
+	// allow_unprotected: codex and its commands can read key_file) or refused (codex_policy refuse).
+	KeyProtection string `json:"openrouter_key_protection,omitempty"`
+	// Warning is set when codex jobs run with the OpenRouter key readable to them (unprotected): not a
+	// problem (they work as configured), said loudly.
+	Warning string `json:"warning,omitempty"`
 }
+
+// Values of CodexSandboxStatus.KeyProtection.
+const (
+	CodexKeyProtected   = "protected"
+	CodexKeyUnprotected = "unprotected"
+	CodexKeyRefused     = "refused"
+)
 
 // codexSandboxMode is the configured codex_sandbox (auto when unset).
 func (c Config) codexSandboxMode() string {
@@ -238,6 +253,37 @@ func (m *Manager) codexLaunchSandbox(cfg Config, kind string) (string, error) {
 // off; an unreadable config.json refuses codex jobs). It probes when the mode uses the native sandbox and
 // no usable probe of the current binary is cached.
 func (m *Manager) CodexSandboxStatus() CodexSandboxStatus {
+	s := m.codexSandboxStatus()
+	if disk, err := LoadConfig(m.StateDir); err == nil {
+		s.setKeyProtection(disk.Providers.OpenRouter)
+	}
+	return s
+}
+
+// setKeyProtection fills KeyProtection and its Warning or Problem for providers.openrouter o (nil = none)
+// and the codex sandbox in effect (a refused codex sandbox is left as it is).
+func (s *CodexSandboxStatus) setKeyProtection(o *OpenRouterConfig) {
+	if o == nil || s.Effective == "refused" {
+		return
+	}
+	switch {
+	case s.Effective == CodexSandboxModeWorktreeFullAccess:
+		s.KeyProtection = CodexKeyProtected
+	case o.codexPolicy() == CodexPolicyRefuse:
+		s.KeyProtection = CodexKeyRefused
+		s.Problem = "codex sandbox: codex jobs on the native sandbox are refused: providers.openrouter.codex_policy is " +
+			"refuse (bwrap cannot start inside the Landlock key sandbox); set codex_sandbox worktree-full-access or " +
+			"codex_policy allow_unprotected"
+	default:
+		s.KeyProtection = CodexKeyUnprotected
+		s.Warning = "WARNING: codex jobs can read the OpenRouter key: providers.openrouter is set and codex's native " +
+			"sandbox (bwrap) cannot start inside the Landlock key sandbox, so codex jobs run their codex process outside " +
+			"it (providers.openrouter.codex_policy allow_unprotected, the default) and codex and every command it runs " +
+			"can read providers.openrouter.key_file; codex_policy refuse refuses them instead"
+	}
+}
+
+func (m *Manager) codexSandboxStatus() CodexSandboxStatus {
 	cfg, err := m.authorizedLaunchConfig()
 	if err != nil {
 		s := CodexSandboxStatus{Mode: m.Config().codexSandboxMode(), Effective: "refused"}

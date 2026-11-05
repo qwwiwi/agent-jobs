@@ -101,7 +101,7 @@ func startGit(dir string, env []string, setup func(*exec.Cmd), args ...string) (
 		p.outs, dsts, ends = append(p.outs, r), append(dsts, *w), append(ends, pw)
 		*w = pw
 	}
-	err := cmd.Start()
+	err := startJobCmd(cmd) // in a wrapper, in its key sandbox: the repository's config is the job's
 	closeEnds()
 	if err != nil {
 		p.closeOutputs()

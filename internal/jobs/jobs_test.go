@@ -343,6 +343,9 @@ func TestMain(m *testing.M) {
 	// Run inside a job (a job working on this repository), the binary under test would refuse its
 	// control commands; the tests set the marker themselves where they need it.
 	_ = os.Unsetenv(JobEnvVar)
+	// The tests' OpenRouter key files live in their temp dirs, a placement the key sandbox refuses
+	// (keysandbox_testhooks.go); Landlock itself still applies to the jobs' processes.
+	_ = os.Setenv("AGENT_JOBS_TEST_KEY_PLACEMENT_ANY", "1")
 	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
 	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
 	ignoreOuterJob()

@@ -39,6 +39,9 @@ type JobView struct {
 	Model      string `json:"model"`
 	Complexity string `json:"complexity,omitempty"`
 	Runner     string `json:"runner"`
+	// Provider is who serves the model: anthropic (the subscription), openai (codex) or openrouter
+	// (billing api: real money, issue #136).
+	Provider string `json:"provider"`
 	// ReasoningEffort is the job's reasoning effort (codex model_reasoning_effort or claude --effort);
 	// empty for a claude job from before it was recorded.
 	ReasoningEffort string  `json:"reasoning_effort,omitempty"`
@@ -94,6 +97,9 @@ type JobView struct {
 	// CodexJobsToday (job_start of a codex job only): codex jobs of this agent in the last 24 hours
 	// against the daily cap, "n/limit".
 	CodexJobsToday string `json:"codex_jobs_today,omitempty"`
+	// OpenRouterSpentToday (job_start of an openrouter job only): what this agent's openrouter jobs of the
+	// last 24 hours spent or may still spend (this one included, at its budget) against the daily cap.
+	OpenRouterSpentToday string `json:"openrouter_spent_today,omitempty"`
 	// Containment: "scope <unit>" (", stop pending" while a failed stop is retried) or "session only"
 	// (the weaker fallback); empty before launch.
 	Containment string `json:"containment,omitempty"`
@@ -139,7 +145,7 @@ func fmtTS(t *time.Time) string {
 func view(m *jobs.Manager, j *store.Job) JobView {
 	return JobView{
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
-		Runner: j.Runner, Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
+		Runner: j.Runner, Provider: jobs.JobProvider(j), Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
 		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
 		CostEstimateUSD: j.CostEstimateUSD, Limits: limitsNote(j), DurationSec: j.DurationSec,
 		RepoPath: j.RepoPath, BaseCommit: j.BaseCommit, CreatedAt: fmtTS(&j.CreatedAt),
@@ -198,7 +204,7 @@ type JobStartInput struct {
 	Title           string   `json:"title" jsonschema:"short title; shown in the job-done line"`
 	Kind            string   `json:"kind" jsonschema:"review | fix | research | general (sets the checklist and whether web tools are open: only research)"`
 	Brief           string   `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
-	Model           string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec; give this or complexity"`
+	Model           string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec, or openrouter:<slug> (a slug of config providers.openrouter.models, e.g. openrouter:z-ai/glm-5.3), which runs claude -p on that OpenRouter model: billing api (real money), budget enforced per job and by the provider's daily_cap_usd, not for review jobs or denied repos, no resume; give this or complexity"`
 	Complexity      string   `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
 	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 200 for fix and general, 80 for other kinds; ceiling 200"`
 	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
@@ -249,6 +255,11 @@ func addJobStart(s *sdk.Server, d Deps) {
 			v.Warnings = append(v.Warnings, d.Manager.Config().CodexBriefWarnings(j)...)
 			if v.CodexJobsToday, err = d.Manager.CodexJobsToday(); err != nil {
 				v.CodexJobsToday = "unknown: " + err.Error()
+			}
+		}
+		if jobs.IsOpenRouterJob(j) {
+			if v.OpenRouterSpentToday, err = d.Manager.OpenRouterSpentToday(); err != nil {
+				v.OpenRouterSpentToday = "unknown: " + err.Error()
 			}
 		}
 		return nil, v, nil

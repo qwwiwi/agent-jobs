@@ -15,6 +15,8 @@ type JobStats struct {
 	ID    string `json:"id"`
 	Kind  string `json:"kind"`
 	Model string `json:"model"`
+	// Provider is who served the model: anthropic, openai (codex) or openrouter ("" for rows from before).
+	Provider string `json:"provider,omitempty"`
 	// Effort is the reasoning effort the job ran at ("" when it was not recorded).
 	Effort  string  `json:"effort,omitempty"`
 	Status  string  `json:"status"`
@@ -104,7 +106,8 @@ CREATE INDEX IF NOT EXISTS job_stats_finished ON job_stats(finished_at);
 const statsCols = `id, kind, model, status, turns, cost_usd, duration_sec, created_at, started_at, finished_at,
 	repo, tool_calls, skills, guard_refusals, guard_rules, subagents, has_report, result_subtype, source, recorded_at,
 	cost_unknown, skills_delivered, effort, report_off_contract, dir_bytes, outcome, outcome_note, cost_estimated_usd,
-	cost_source, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requirements_claimed`
+	cost_source, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requirements_claimed,
+	provider`
 
 func countsJSON(m map[string]int) (string, error) {
 	if m == nil {
@@ -127,13 +130,13 @@ func (s *Store) PutStats(st *JobStats) error {
 	}
 	_, err := s.db.Exec(`INSERT OR REPLACE INTO job_stats (`+statsCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
 		COALESCE((SELECT outcome FROM jobs WHERE id=?), ?), COALESCE((SELECT outcome_note FROM jobs WHERE id=?), ?),
-		?,?,?,?,?,?,?)`,
+		?,?,?,?,?,?,?,?)`,
 		st.ID, st.Kind, st.Model, st.Status, st.Turns, st.CostUSD, st.DurationSec, st.CreatedAt.Unix(),
 		ts(st.StartedAt), ts(st.FinishedAt), st.Repo, cols[0], cols[1], st.GuardRefusals, cols[2],
 		st.Subagents, st.HasReport, st.ResultSubtype, st.Source, st.RecordedAt.Unix(), st.CostUnknown,
 		JoinNames(st.SkillsDelivered), st.Effort, st.ReportOffContract, st.DirBytes,
 		st.ID, st.Outcome, st.ID, st.OutcomeNote, st.CostEstimatedUSD, st.CostSource, st.InputTokens,
-		st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens, st.RequirementsClaimed)
+		st.OutputTokens, st.CacheReadTokens, st.CacheWriteTokens, st.RequirementsClaimed, st.Provider)
 	if err != nil {
 		return fmt.Errorf("put stats: %w", err)
 	}
@@ -149,7 +152,7 @@ func scanStats(r scanner) (*JobStats, error) {
 		&started, &finished, &st.Repo, &tools, &skills, &st.GuardRefusals, &rules, &st.Subagents, &st.HasReport,
 		&st.ResultSubtype, &st.Source, &recorded, &st.CostUnknown, &delivered, &st.Effort, &st.ReportOffContract,
 		&st.DirBytes, &st.Outcome, &st.OutcomeNote, &st.CostEstimatedUSD, &st.CostSource, &st.InputTokens, &st.OutputTokens,
-		&st.CacheReadTokens, &st.CacheWriteTokens, &st.RequirementsClaimed); err != nil {
+		&st.CacheReadTokens, &st.CacheWriteTokens, &st.RequirementsClaimed, &st.Provider); err != nil {
 		return nil, err
 	}
 	st.SkillsDelivered = SplitNames(delivered)

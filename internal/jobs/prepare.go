@@ -217,6 +217,10 @@ func (m *Manager) guardCommand(jobID, readOnly string, extraProtected, extraNoRe
 		}
 		// The checklist locks are shared by every agent: a job neither reads nor writes there.
 		parts = append(parts, "--no-read", shellQuote(m.ChecklistLockDir()))
+		if o := m.Config().Providers.OpenRouter; o != nil {
+			// The OpenRouter key file (issue #136): only the wrapper reads it, before claude starts.
+			parts = append(parts, "--no-read", shellQuote(o.KeyFile))
+		}
 		for _, p := range extraNoRead {
 			parts = append(parts, "--no-read", shellQuote(p))
 		}

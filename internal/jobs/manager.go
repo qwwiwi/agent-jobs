@@ -359,6 +359,24 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			cleanup()
 		}
 	}()
+	if IsOpenRouterJob(j) {
+		capUSD := m.Config().Providers.OpenRouter.DailyCap()
+		since := j.CreatedAt.Add(-OpenRouterCapWindow)
+		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			spent, _ := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, since)
+			return nil, fmt.Errorf("openrouter daily cap reached: the openrouter jobs of agent %s in the last 24 hours spent or "+
+				"may still spend $%.2f (queued, running and stopped jobs count at their whole budget), this job's budget "+
+				"$%.2f would pass the cap $%.2f (providers.openrouter.daily_cap_usd); give a smaller max_budget_usd or wait",
+				m.Agent, spent, j.MaxBudgetUSD, capUSD)
+		}
+		inserted = true
+		m.logSize(j)
+		return j, nil
+	}
 	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
 		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
 		if err != nil {
@@ -440,6 +458,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	provider, billing := "", store.BillingSubscription
+	orSlug, openRouter := OpenRouterSlug(model)
+	if openRouter {
+		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
+			return nil, err
+		}
+		provider, billing = store.ProviderOpenRouter, store.BillingAPI
+	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
 		return nil, err
@@ -486,6 +512,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	if openRouter && repo != "" {
+		// Checked against both the path given and the main worktree it belongs to.
+		for _, p := range []string{top, repo} {
+			if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, p); err != nil {
+				return nil, err
+			}
+		}
+	}
 	covers, err := ValidateCovers(r.Covers)
 	if err != nil {
 		return nil, err
@@ -526,7 +560,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		ID: newID(now), Agent: m.Agent, Title: strings.TrimSpace(r.Title), Kind: r.Kind, Brief: r.Brief,
 		RepoPath: repo, BaseCommit: base, Status: store.StatusQueued, Model: model,
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
-		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
+		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
@@ -782,8 +816,12 @@ func claudeSettingSources(kind string) string {
 }
 
 func claudeBaseArgs(j *store.Job, jobDir string) []string {
+	model := j.Model
+	if slug, ok := OpenRouterSlug(model); ok {
+		model = slug // the wrapper points claude at OpenRouter (openRouterEnv)
+	}
 	args := []string{
-		"-p", "--output-format", "stream-json", "--verbose", "--model", j.Model,
+		"-p", "--output-format", "stream-json", "--verbose", "--model", model,
 		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
 		"--permission-mode", "bypassPermissions",
 		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", claudeSettingSources(j.Kind),
@@ -1808,7 +1846,8 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 			status, msg = store.StatusFailed, RedactPrintable(err.Error(), 300)
 		}
 	}
-	if err := m.Store.Finish(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+	unknown, estimate := m.attemptCost(j, res, killed)
+	if err := m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
@@ -1816,7 +1855,7 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
 	m.noteReviewChanges(j)
-	m.recordAttemptEnd(j, res, killed)
+	m.recordAttemptEnd(j)
 	m.Log.Printf("job %s %s (%s)", j.ID, status, RedactText(msg)) // msg can carry the job's own text
 	m.settled(j.ID)
 	return status, msg, true
@@ -1844,24 +1883,34 @@ func (m *Manager) noteSweep(id, note string) {
 	}
 }
 
-// recordAttemptEnd records, for a finished attempt, whether its cost is unknown (killed, or claude ran
-// but no result event came) and the digest of its session transcript (checked before the session is
-// resumed). Call it after the sweep: nothing of the job may change the transcript after the digest.
-func (m *Manager) recordAttemptEnd(j *store.Job, res StreamResult, killed bool) {
+// attemptCost is whether a finished attempt's cost is unknown (killed, or claude ran but no result event
+// came; for an openrouter job, also a request without its final usage) and, for a claude attempt, the
+// list-price estimate of its trusted token usage (#127; nil = none). The caller writes both with the
+// attempt's terminal status in one update (Store.FinishAttempt).
+func (m *Manager) attemptCost(j *store.Job, res StreamResult, killed bool) (bool, *float64) {
 	// Codex reports no price: a codex attempt's cost is always unknown.
-	if killed || j.Runner == store.RunnerCodex || (!res.Found && j.LaunchToken != "") {
-		if err := m.Store.SetCostUnknown(j.ID); err != nil {
-			m.Log.Printf("job %s: mark cost unknown: %v", j.ID, err)
-		} else if j.Runner != store.RunnerCodex {
-			// A claude attempt has a budget the limits would otherwise count whole (#127): its trusted
-			// token usage so far, at list prices, is recorded as an estimate instead.
-			if est, ok := m.estimateTokenCost(j.Model, res.Tokens, res.TokensInvalid); ok {
-				if err := m.Store.SetCostEstimate(j.ID, est); err != nil {
-					m.Log.Printf("job %s: record cost estimate: %v", j.ID, err)
-				}
-			}
-		}
+	unknown := killed || j.Runner == store.RunnerCodex || (!res.Found && j.LaunchToken != "")
+	if IsOpenRouterJob(j) {
+		// The wrapper's proxy saw every request of a completed attempt (also one that failed before claude
+		// started: $0); a killed one may have had requests in flight, and a request that ended without its
+		// final usage counts at its reservation, not at a known figure.
+		unknown = killed || !res.Completed || res.ProviderCostUncertain
 	}
+	if !unknown || j.Runner == store.RunnerCodex {
+		return unknown, nil
+	}
+	// A claude attempt has a budget the limits would otherwise count whole (#127): its trusted token
+	// usage so far, at list prices, is recorded as an estimate instead.
+	if est, ok := m.estimateTokenCost(j.Model, res.Tokens, res.TokensInvalid); ok {
+		return true, &est
+	}
+	return true, nil
+}
+
+// recordAttemptEnd records, for a finished attempt, the digest of its session transcript (checked
+// before the session is resumed). Call it after the sweep: nothing of the job may change the transcript
+// after the digest.
+func (m *Manager) recordAttemptEnd(j *store.Job) {
 	digest := ""
 	if p := m.transcriptPath(j); p != "" {
 		d, err := sessionDigest(p, j.SessionID)
@@ -1932,6 +1981,9 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 	}
 	if res.PrepareFailure != "" {
 		return store.StatusFailed, res.PrepareFailure
+	}
+	if res.ProviderFailure != "" {
+		return store.StatusFailed, res.ProviderFailure
 	}
 	// A natural failed exit retains its diagnostic reason; idle closure uses its trusted provenance.
 	if code != 0 && res.IdleReason == "" {
@@ -2033,13 +2085,8 @@ func (m *Manager) Cancel(id string) error {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
-	if err := m.Store.Finish(id, "", store.StatusCancelled, res.Turns, res.CostUSD, dur, msg, now); err != nil {
+	if err := m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now); err != nil {
 		return err
-	}
-	if killed {
-		if err := m.Store.SetCostUnknown(id); err != nil {
-			m.Log.Printf("job %s: mark cost unknown: %v", id, err)
-		}
 	}
 	m.noteSweep(id, m.sweepEscaped(id))
 	m.settled(id)

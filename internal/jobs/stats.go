@@ -380,7 +380,7 @@ func (m *Manager) RecordStats(j *store.Job) (*store.JobStats, error) {
 		return nil, fmt.Errorf("job %s is %s, not finished", j.ID, j.Status)
 	}
 	st := &store.JobStats{
-		ID: j.ID, Kind: j.Kind, Model: j.Model, Effort: j.ReasoningEffort, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
+		ID: j.ID, Kind: j.Kind, Model: j.Model, Provider: JobProvider(j), Effort: j.ReasoningEffort, Status: j.Status, Turns: j.Turns, CostUSD: j.CostUSD,
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt,
 		ToolCalls:  map[string]int{}, Skills: map[string]int{}, GuardRules: map[string]int{}, HasReport: m.hasReport(j),
@@ -592,7 +592,7 @@ func (m *Manager) BackfillStats(all bool) (BackfillReport, error) {
 }
 
 // Stats grouping keys.
-var StatsGroupBy = []string{"kind", "model", "skill", "effort", "repo"}
+var StatsGroupBy = []string{"kind", "model", "skill", "effort", "repo", "provider"}
 
 // Outcomes job_outcome records: what the orchestrator did with a job's result.
 const (
@@ -784,6 +784,11 @@ func Summarize(rows []*store.JobStats, by string) (StatsReport, error) {
 			keys = []string{r.Kind}
 		case "model":
 			keys = []string{r.Model}
+		case "provider":
+			keys = []string{r.Provider}
+			if r.Provider == "" {
+				keys = []string{"(none)"} // a row from before the provider was recorded
+			}
 		case "effort":
 			keys = []string{r.Effort}
 			if r.Effort == "" {

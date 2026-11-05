@@ -204,3 +204,48 @@ func TestSystemDoctorCodexSandbox(t *testing.T) {
 		}
 	}
 }
+
+// D2 (#136 fix loop 2): with providers.openrouter on disk, system_doctor says how codex jobs stand to
+// the key sandbox: unprotected (the default codex_policy allow_unprotected) is a loud warning, not a
+// problem; refuse is a problem; worktree-full-access is protected.
+func TestSystemDoctorCodexOpenRouterKeyProtection(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_JOBS_CODEX_BIN", bin)
+	or := func(extra string) string {
+		return `"providers":{"openrouter":{"key_file":"/var/lib/agent-jobs-keys/a/openrouter.env","models":["z-ai/glm-5.3"],` +
+			`"daily_cap_usd":5` + extra + `}}`
+	}
+	for _, c := range []struct {
+		name, disk, protection string
+		full, warning, problem bool
+	}{
+		{"no openrouter", `{}`, "", false, false, false},
+		{"default", `{` + or("") + `}`, jobs.CodexKeyUnprotected, false, true, false},
+		{"allow_unprotected", `{` + or(`,"codex_policy":"allow_unprotected"`) + `}`, jobs.CodexKeyUnprotected, false, true, false},
+		{"refuse", `{` + or(`,"codex_policy":"refuse"`) + `}`, jobs.CodexKeyRefused, false, false, true},
+		{"full access", `{"codex_sandbox":"worktree-full-access","codex_write_allowed":true,` + or(`,"codex_policy":"refuse"`) + `}`,
+			jobs.CodexKeyProtected, true, false, false},
+	} {
+		m := newManager(t)
+		m.SelfBin = selfBin
+		if c.full {
+			m.Cfg.CodexSandboxMode, m.Cfg.CodexWriteAllowed = jobs.CodexSandboxModeWorktreeFullAccess, true
+		}
+		if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(c.disk), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var doc SystemDoctorOutput
+		call(t, connect(t, mustServer(t, m)), "system_doctor", map[string]any{}, &doc)
+		s := doc.CodexSandbox
+		warned := slices.ContainsFunc(doc.Warnings, func(w string) bool {
+			return strings.HasPrefix(w, "WARNING: codex jobs can read the OpenRouter key")
+		})
+		problem := slices.ContainsFunc(doc.Problems, func(p string) bool { return strings.Contains(p, "codex_policy is refuse") })
+		if s.KeyProtection != c.protection || warned != c.warning || (s.Warning != "") != c.warning || problem != c.problem {
+			t.Fatalf("%s: codex_sandbox %+v warnings %v problems %v", c.name, s, doc.Warnings, doc.Problems)
+		}
+	}
+}
