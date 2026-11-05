@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,54 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
+
+func TestHookBriefReminderPendingOutcomeError(t *testing.T) {
+	orch := bindableAgent(t, "test")
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var out, errs bytes.Buffer
+	if code := runHook([]string{"bind", "--agent", "test"}, strings.NewReader(bindEvent("s1", orch)), &out, &errs, open); code != 0 || errs.Len() != 0 {
+		t.Fatalf("bind: exit %d, stderr %q", code, errs.String())
+	}
+	input := fmt.Sprintf(`{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":%q,"prompt":"hello"}`, draftRepo(t))
+	run := func() int {
+		t.Helper()
+		out.Reset()
+		errs.Reset()
+		return runHook([]string{"brief-reminder", "--agent", "test"}, strings.NewReader(input), &out, &errs, open)
+	}
+	if code := run(); code != 0 || errs.Len() != 0 || !strings.HasPrefix(out.String(), jobs.BriefReminderPrefix+"Checklist: ") {
+		t.Fatalf("checklist reminder: exit %d, stdout %q, stderr %q", code, out.String(), errs.String())
+	}
+	want := out.String()
+	finished := time.Now().Add(-time.Hour)
+	if err := m.Store.Insert(&store.Job{ID: "bad-gate", Agent: "test", Title: "finished job", Kind: "fix", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", CreatedAt: finished, FinishedAt: &finished}); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := jobs.StateDir("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE jobs SET gate_input = '{' WHERE id = 'bad-gate'`); err != nil {
+		t.Fatal(err)
+	}
+	if code := run(); code != 0 || out.String() != want {
+		t.Errorf("pending-outcome error: exit %d, stdout %q, want %q", code, out.String(), want)
+	}
+	if !strings.Contains(errs.String(), "agent-jobs hook brief-reminder: job bad-gate: gate_input: unexpected end of JSON input") ||
+		!strings.HasSuffix(errs.String(), "(no pending-outcome reminder)\n") {
+		t.Errorf("pending-outcome diagnostic: %q", errs.String())
+	}
+}
 
 func TestHookPendingOutcome(t *testing.T) {
 	orch := bindableAgent(t, "test")

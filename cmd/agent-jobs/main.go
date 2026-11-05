@@ -2089,7 +2089,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		}
 		done := make(chan answer, 1)
 		go func() {
-			line, err := briefReminder(args[1:], stdin, openReadOnly)
+			line, err := briefReminder(args[1:], stdin, stderr, openReadOnly)
 			done <- answer{line, err}
 		}()
 		var a answer
@@ -2288,7 +2288,7 @@ const briefReminderTimeout = 2 * time.Second
 
 // briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, error) {
+func briefReminder(args []string, stdin io.Reader, stderr io.Writer, opener func(string) (*jobs.Manager, error)) (string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
@@ -2314,7 +2314,8 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 	}
 	pending, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		return "", err
+		fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(no pending-outcome reminder)")
+		return line, nil
 	}
 	if line == "" {
 		return pending, nil
