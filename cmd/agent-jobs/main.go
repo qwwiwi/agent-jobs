@@ -518,12 +518,9 @@ func cmdStart(args []string) error {
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
 	var sources multi
-	fs.Var(&sources, "source", "disabled until OS-level isolation lands (G02 deferred): any value is refused")
+	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
 	if _, err := parse(fs, args); err != nil {
 		return err
-	}
-	if len(sources) > 0 {
-		return jobs.ErrSourcesDisabled // refused before the store is opened (Enqueue refuses it too)
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
 	if len(sources) > 0 {
@@ -647,6 +644,9 @@ func cmdStatus(args []string) error {
 	}
 	if len(j.Sources) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
+	}
+	if len(j.SourceFiles) > 0 {
+		fmt.Printf("sources:   %s\n", strings.Join(j.SourceFiles, ", "))
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if p := m.PrepareResultOf(j); p != nil {

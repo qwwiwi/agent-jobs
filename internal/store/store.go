@@ -176,6 +176,9 @@ type Job struct {
 	TaskKey     string
 	// Sources are the https git URLs cloned read-only into <jobdir>/sources before the job starts (G02).
 	Sources []string
+	// SourceFiles are absolute paths or job:<id> origins copied into <jobdir>/sources at enqueue.
+	// Kept separate from the disabled repository clones in Sources.
+	SourceFiles []string
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -738,7 +741,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources, cost_estimate_usd`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources, cost_estimate_usd, source_files`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -803,7 +806,7 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, sourceFilesJSON(j.SourceFiles)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -824,7 +827,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -836,9 +839,12 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey, &sources, &estimate)
+		&milestone, &j.TaskKey, &sources, &estimate, &sourceFiles)
 	if err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal([]byte(sourceFiles), &j.SourceFiles); err != nil {
+		return nil, fmt.Errorf("job %s: source_files: %w", j.ID, err)
 	}
 	if coverContract != "" {
 		j.CoverContract = &CoverContract{}

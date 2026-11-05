@@ -249,6 +249,9 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
 	protected = append(protected, m.ChecklistLockDir())
+	if len(j.SourceFiles) > 0 {
+		protected = append(protected, filepath.Join(m.JobDir(j.ID), SourcesDir))
+	}
 	readOnly := ""
 	if readOnlyKind(j.Kind) {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
@@ -513,7 +516,7 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSources(m.JobDir(j.ID), sources),
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSourceFiles(j.SourceFiles)+renderSources(m.JobDir(j.ID), sources),
 		m.priorResults(j, prior), cover, check, contract)
 	return b.String(), nil
 }

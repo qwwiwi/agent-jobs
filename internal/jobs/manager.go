@@ -195,8 +195,8 @@ type StartRequest struct {
 	// job gets the task's planned skills (G01).
 	Milestone int64
 	Task      string
-	// Sources are https git URLs cloned read-only into the job folder before it starts (G02); nil = not
-	// given (a task job then takes its task's planned sources), empty = none.
+	// Sources are absolute file paths or job:<id> report references copied before enqueue.
+	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
@@ -349,6 +349,16 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	cleanup, err := m.copySourceFiles(j)
+	if err != nil {
+		return nil, err
+	}
+	inserted := false
+	defer func() {
+		if !inserted {
+			cleanup()
+		}
+	}()
 	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
 		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
 		if err != nil {
@@ -359,12 +369,14 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			return nil, fmt.Errorf("codex daily cap reached: %d codex jobs of agent %s in the last 24 hours, limit %d "+
 				"(config codex_jobs_per_day, per agent; 0 turns it off); start a claude job or wait", n, m.Agent, limit)
 		}
+		inserted = true
 		m.logSize(j)
 		return j, nil
 	}
 	if err := m.Store.Insert(j); err != nil {
 		return nil, err
 	}
+	inserted = true
 	m.logSize(j)
 	return j, nil
 }
@@ -406,18 +418,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
-	if err := refuseSources(r.Sources); err != nil {
+	if err := checkFileSourceOrigins(r.Sources); err != nil {
 		if r.plannedSources {
 			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
 				"it without them, or clear them with milestone_set sources: [])", err, r.Task, r.Milestone)
 		}
 		return nil, err
 	}
-	sources, err := ValidateSources(r.Sources)
-	if err != nil {
-		return nil, err
-	}
-	if len(sources) > 0 && r.Gate != nil {
+	if len(r.Sources) > 0 && r.Gate != nil {
 		return nil, errors.New("a gate job gets nothing but its input: no sources")
 	}
 	turns, budget, timeout, err := ValidateLimits(DefaultTurns(r.Kind, r.MaxTurns), r.MaxBudgetUSD, r.TimeoutMinutes)
@@ -431,15 +439,6 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	runner, err := ResolveRunner(r.Runner, model)
 	if err != nil {
 		return nil, err
-	}
-	if len(sources) > 0 && runner == store.RunnerCodex {
-		// The guard keeps cloned code off the host; codex runs its own sandbox, without the guard.
-		msg := "sources need the guard, which does not run inside codex: start a claude job for them"
-		if r.plannedSources {
-			msg += fmt.Sprintf(" (the sources planned for task %s of milestone %d: give job_start sources: [] to "+
-				"run it on codex without them)", r.Task, r.Milestone)
-		}
-		return nil, errors.New(msg)
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
@@ -530,7 +529,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: store.BillingSubscription, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task, Sources: sources,
+		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
 	}
 	return j, nil
 }

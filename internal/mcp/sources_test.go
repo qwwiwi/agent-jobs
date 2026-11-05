@@ -52,13 +52,13 @@ func TestSourcesOverMCP(t *testing.T) {
 	})
 }
 
-// G02 is deferred (owner decision 2026-10-26): job_start, milestone_create and milestone_set refuse a
-// non-empty sources list before anything is stored, and their schemas say so.
+// G02 repository clones remain deferred: job_start describes local copies instead, while
+// milestone_create and milestone_set keep refusing planned repository sources.
 func TestSourcesDisabledOverMCP(t *testing.T) {
 	m := newManager(t)
 	cs := connect(t, mustServer(t, m))
 	const off = "sources is disabled until OS-level isolation lands"
-	t.Run("[G02 off] the job_start and milestone schemas say sources is disabled", func(t *testing.T) {
+	t.Run("[G02 off] schemas describe file copies and keep repository clones disabled", func(t *testing.T) {
 		res, err := cs.ListTools(context.Background(), nil)
 		if err != nil {
 			t.Fatal(err)
@@ -70,7 +70,11 @@ func TestSourcesDisabledOverMCP(t *testing.T) {
 			}
 			seen++
 			b, _ := json.Marshal(tl.InputSchema)
-			if !strings.Contains(string(b), "currently DISABLED (G02 deferred, owner decision 2026-10-26") {
+			if tl.Name == "job_start" {
+				if !strings.Contains(string(b), "absolute file paths") || !strings.Contains(string(b), "report.md") || !strings.Contains(string(b), "cloning remains disabled") {
+					t.Errorf("job_start schema must describe file copies and keep repository cloning disabled")
+				}
+			} else if !strings.Contains(string(b), "currently DISABLED (G02 deferred, owner decision 2026-10-26") {
 				t.Errorf("%s schema does not say sources is disabled", tl.Name)
 			}
 		}
