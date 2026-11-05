@@ -59,6 +59,7 @@ var redactRules = []redactRule{
 	{"private-key", pemInlineRe, 0},
 	{"private-key", pemEscapedRe, 0},
 	{"anthropic", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}`), 0},
+	{"openrouter", regexp.MustCompile(`\bsk-or-v[0-9]+-[A-Za-z0-9_-]{20,}`), 0},
 	{"openai", regexp.MustCompile(`\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`), 0},
 	{"github", regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`), 0},
 	{"github", regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`), 0},

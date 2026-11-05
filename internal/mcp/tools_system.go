@@ -23,8 +23,11 @@ type SystemDoctorInput struct{}
 
 // SystemDoctorOutput is system_doctor's output.
 type SystemDoctorOutput struct {
-	OK       bool             `json:"ok"`
-	Problems []string         `json:"problems"`
+	OK       bool     `json:"ok"`
+	Problems []string `json:"problems"`
+	// Warnings are risks the configuration accepts (not problems: ok stays true), e.g. codex jobs that
+	// can read the OpenRouter key (codex_sandbox.warning).
+	Warnings []string         `json:"warnings,omitempty"`
 	Disk     jobs.DiskStatus  `json:"disk"`
 	Queue    jobs.QueueStatus `json:"queue"`
 	Procs    jobs.ProcsReport `json:"processes"`
@@ -97,6 +100,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"MCP processes running a deleted or replaced binary (each a problem: restart the session or /mcp reconnect), " +
 			"and codex_sandbox: config codex_sandbox, what a codex job runs in now (native, worktree-full-access, or refused) " +
 			"and the cached probe of codex's native sandbox (a sandbox that cannot start is a problem unless worktree-full-access is set), " +
+			"and, with providers.openrouter set, codex_sandbox.openrouter_key_protection: protected, unprotected (codex jobs can read " +
+			"the OpenRouter key: listed in warnings, ok unaffected) or refused (a problem; codex_policy refuse), " +
 			"and merge_gate: each repository with a stored checklist approval as gated, void, retired or shipped (release_check passed " +
 			"on a sha now on origin's default branch: merges are not gated until a new approval). " +
 			"ok=false lists the problems.",
@@ -146,6 +151,9 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 		}
 		if out.CodexSandbox = m.CodexSandboxStatus(); out.CodexSandbox.Problem != "" {
 			out.Problems = append(out.Problems, out.CodexSandbox.Problem)
+		}
+		if w := out.CodexSandbox.Warning; w != "" {
+			out.Warnings = append(out.Warnings, w)
 		}
 		if out.MergeGate, err = m.MergeGates(); err != nil {
 			out.MergeGate = []jobs.MergeGateView{}

@@ -421,7 +421,7 @@ func runShellGroup(parent context.Context, dir string, env []string, cmdline str
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	// After the grace Go kills the leader and stops waiting for pipes a straggler still holds.
 	cmd.WaitDelay = acceptanceKillGrace
-	if err = cmd.Start(); err == nil {
+	if err = startJobCmd(cmd); err == nil { // in the key sandbox (keysandbox.go)
 		if onStart != nil {
 			onStart(cmd.Process.Pid) // Setpgid: the leader's pid is the group id
 		}

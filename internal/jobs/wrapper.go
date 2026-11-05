@@ -36,6 +36,12 @@ type StreamResult struct {
 	ReportContractNote string
 	// GateFailure is why a gate job's result was rejected and not stored ("" = stored, or not a gate job).
 	GateFailure string
+	// ProviderFailure is why an OpenRouter job failed in the wrapper: it could not start (config, key
+	// file, routing) or its budget was spent and further requests were refused ("" = none).
+	ProviderFailure string `json:",omitempty"`
+	// ProviderCostUncertain: an OpenRouter job's CostUSD is not a settled figure (a request ended without
+	// its final usage and counts at its reservation, or one was in flight); the attempt's cost is unknown.
+	ProviderCostUncertain bool `json:",omitempty"`
 	// Prepare is the job's prepare step (nil = none ran in this launch); PrepareFailure why it failed the
 	// job before its runner started ("" = passed or none).
 	Prepare        *PrepareResult `json:",omitempty"`
@@ -617,15 +623,31 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		return 2
 	}
 	defer st.Close()
-	var prepared *PrepareResult // the prepare step's result goes into every record of this launch
+	var prepared *PrepareResult   // the prepare step's result goes into every record of this launch
+	var openRouter *openRouterJob // an OpenRouter job's proxy: its cost goes into every record
 	record := func(res StreamResult) error {
 		res.Prepare = prepared
+		if openRouter != nil {
+			openRouter.apply(&res)
+		}
 		return storeResult(st, id, token, res)
 	}
 	observe := func(res StreamResult) {
 		if err := record(res); err != nil {
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
+	}
+	// Before anything of the job runs (B6, #136): with providers.openrouter configured, every process the
+	// wrapper starts for the job is kept from reading the key file, an openrouter job or not.
+	if fail := wrapperSandbox(jobDir); fail != "" {
+		fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+		return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
+	}
+	if fail, warn := codexKeySandbox(opts.Runner, argv); fail != "" {
+		fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+		return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
+	} else if warn != "" {
+		fmt.Fprintln(stderrLog, "run-wrapper:", warn)
 	}
 	if opts.ManifestCheck {
 		// The judge's manifest-check (Wave F, F5): before the runner starts, never after; a failure ends the
@@ -675,9 +697,32 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			}
 		}
 	}
-	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, observe)
+	var runEnv func([]string) []string
+	if opts.Runner != store.RunnerCodex {
+		// An OpenRouter job (issue #136) is decided by the job's row, never by an argument or a job file.
+		j, err := st.Get(id)
+		if err != nil {
+			fmt.Fprintln(stderrLog, "run-wrapper: job row:", err)
+			return 2
+		}
+		if IsOpenRouterJob(j) {
+			orj, fail := wrapperOpenRouter(jobDir, j, stderrLog)
+			if fail != "" {
+				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
+			}
+			openRouter, runEnv = orj, orj.env
+			defer orj.proxy.close()
+		}
+	}
+	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, runEnv, observe)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
-		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record)
+		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record, runEnv)
+	}
+	if openRouter != nil {
+		// claude has exited: nothing of the job may reach OpenRouter any more.
+		openRouter.proxy.close()
+		fmt.Fprintln(stderrLog, "run-wrapper:", openRouter.proxy.summary())
 	}
 	// A sandbox container is not in the job's process group: it goes with the job (G02).
 	if j, err := st.Get(id); err == nil && len(j.Sources) > 0 {
@@ -759,6 +804,57 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	return 0
 }
 
+// wrapperSandbox sets this wrapper's key sandbox from the agent's config.json (<state>/jobs/<id> =
+// jobDir): the failure reason, redacted, when the job must not start (the config unreadable, so whether
+// a key must be protected is unknown; a key placement the sandbox cannot protect; no Landlock).
+func wrapperSandbox(jobDir string) string {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return "job not started: " + RedactPrintable(err.Error(), 400)
+	}
+	state := filepath.Dir(filepath.Dir(abs))
+	c, err := LoadConfig(state)
+	if err != nil {
+		// A config the daemon would refuse (it keeps its last good one) still names the key file it has.
+		var raw struct {
+			Providers struct {
+				OpenRouter *OpenRouterConfig `json:"openrouter"`
+			} `json:"providers"`
+		}
+		b, rerr := os.ReadFile(filepath.Join(state, "config.json"))
+		if rerr != nil || json.Unmarshal(b, &raw) != nil {
+			return "job not started: the agent config could not be read, so the openrouter key protection is unknown: " +
+				RedactPrintable(err.Error(), 400)
+		}
+		c = Config{}
+		c.Providers.OpenRouter = raw.Providers.OpenRouter
+	}
+	s, err := wrapperKeySandbox(c, state)
+	if err != nil {
+		return "job not started: openrouter key protection: " + RedactPrintable(err.Error(), 600)
+	}
+	setJobSandbox(s)
+	return ""
+}
+
+// wrapperOpenRouter prepares an OpenRouter job's launch from the agent's config.json (<state>/jobs/<id>
+// = jobDir) and the job's row: the failure reason, redacted, when it cannot start.
+func wrapperOpenRouter(jobDir string, j *store.Job, log io.Writer) (*openRouterJob, string) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return nil, "openrouter: " + err.Error()
+	}
+	c, err := LoadConfig(filepath.Dir(filepath.Dir(abs)))
+	if err == nil {
+		var orj *openRouterJob
+		if orj, err = setupOpenRouter(c, j.Model, j.Kind, j.RepoPath, abs, j.ID, j.MaxBudgetUSD, log); err == nil {
+			fmt.Fprintln(log, "run-wrapper:", RedactPrintable(orj.note, 2000))
+			return orj, ""
+		}
+	}
+	return nil, "openrouter job not started: " + RedactPrintable(err.Error(), 400)
+}
+
 // finishBeforeRunner records the completion of a job that ends before its runner starts (exit 1, the
 // reason in res) and writes exit_code.
 func finishBeforeRunner(jobDir string, res StreamResult, record func(StreamResult) error, log io.Writer) int {
@@ -831,7 +927,7 @@ const FallbackMarker = "fallback_session"
 
 // runFallback reruns claude in a fresh session after a failed resume (see RunWrapper).
 func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Duration, stderrLog *os.File, code int,
-	res StreamResult, record func(StreamResult) error) (int, bool, StreamResult) {
+	res StreamResult, record func(StreamResult) error, runEnv func([]string) []string) (int, bool, StreamResult) {
 	fresh := make([]string, 0, len(argv))
 	replaced := false
 	for i := 0; i < len(argv); i++ {
@@ -866,7 +962,7 @@ func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Du
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
-	code, closed, res := runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog, observe)
+	code, closed, res := runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog, runEnv, observe)
 	res.FallbackSession = opts.FallbackSession
 	return code, closed, res
 }
@@ -889,8 +985,10 @@ func idleGrace(jobDir string, log io.Writer) time.Duration {
 var teeWaitDelay = 10 * time.Second
 
 // runClaude runs the job's runner (claude, or codex when runner is codex) and returns its exit code,
-// whether the idle-after-result rule ended it, and the result parsed from its stdout.
-func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File, observe ...func(StreamResult)) (int, bool, StreamResult) {
+// whether the idle-after-result rule ended it, and the result parsed from its stdout. runEnv (nil =
+// none) finishes the runner's environment last (an OpenRouter job's, openRouterEnv).
+func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File,
+	runEnv func([]string) []string, observe ...func(StreamResult)) (int, bool, StreamResult) {
 	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
@@ -922,6 +1020,9 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 	env = TempEnv(env, tmp)
 	if runner != store.RunnerCodex {
 		env = ForkSubagentEnv(env)
+	}
+	if runEnv != nil {
+		env = runEnv(env)
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = filepath.Join(jobDir, "work")

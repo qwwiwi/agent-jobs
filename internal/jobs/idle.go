@@ -178,7 +178,7 @@ func mcpRoleJob(args []string) bool {
 // runIdleWatched starts cmd, watches it under the rule and waits for it. It reports whether the rule
 // ended claude, and cmd.Wait's error.
 func runIdleWatched(cmd *exec.Cmd, tee *resultTee, grace time.Duration, log io.Writer) (bool, error) {
-	if err := cmd.Start(); err != nil {
+	if err := startRunnerCmd(cmd); err != nil { // in the key sandbox unless codex_policy lets it out (keysandbox.go)
 		return false, err
 	}
 	done := make(chan struct{})

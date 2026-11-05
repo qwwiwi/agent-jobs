@@ -74,7 +74,7 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
-  stats      --agent A [--since D] [--by kind|model|skill|effort|repo] [--json] [--backfill [--all]]
+  stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
                                            delivered); --backfill first writes missing rows from
@@ -152,6 +152,12 @@ const usage = `usage: agent-jobs <command> [flags]
                                            its reason labelled untrusted model text
   http-api token --agent A --rotate        write a new bearer token for the read-only HTTP API
                                            (<state>/http-api.token, mode 600) and print it once
+  openrouter endpoints <slug> [--agent A] [--json] [--file F]
+                                           the data-center endpoints of an OpenRouter model (public
+                                           list, no key sent): price in/out/cache per 1M, quantization,
+                                           context, uptime, sorted by the routing policy (the agent's
+                                           providers.openrouter, else the defaults); * = the endpoint
+                                           the policy picks. --file reads a saved endpoints JSON
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -243,6 +249,8 @@ func main() {
 		err = cmdHTTPAPI(args)
 	case "heartbeat":
 		err = cmdHeartbeat(args)
+	case "openrouter":
+		err = cmdOpenRouter(args, os.Stdout)
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -1807,7 +1815,7 @@ func cmdStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
-	by := fs.String("by", "kind", "group by kind|model|skill|effort|repo (skill,repo: the skills rating by repository)")
+	by := fs.String("by", "kind", "group by kind|model|skill|effort|repo|provider (skill,repo: the skills rating by repository)")
 	byRepo := fs.Bool("by-repo", false, "with --by skill: the skills rating with a per-repository breakdown")
 	repo := fs.String("repo", "", "with --by-repo: only jobs of this repository (folder name)")
 	limit := fs.Int("limit", httpapi.DefaultSkillsLimit, "with --by-repo: at most this many skills")

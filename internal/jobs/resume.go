@@ -521,14 +521,16 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 	}
-	if err := m.Store.Finish(id, "", store.StatusStopped, res.Turns, res.CostUSD, dur, RedactPrintable(msg, 800), now); err != nil {
+	unknown, estimate := m.attemptCost(j, res, killed)
+	if err := m.Store.FinishAttempt(id, "", store.StatusStopped, res.Turns, res.CostUSD, unknown, estimate, dur,
+		RedactPrintable(msg, 800), now); err != nil {
 		return nil, err
 	}
 	// Only now (the row is no longer running) does a process left in the job's session count as a
 	// ghost; it is swept before the transcript digest is taken.
 	note := m.sweepEscaped(id)
 	m.noteSweep(id, note)
-	m.recordAttemptEnd(j, res, killed)
+	m.recordAttemptEnd(j)
 	m.settled(id)
 	if note != "" {
 		msg += "; " + note
@@ -766,6 +768,11 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	if err := refuseSources(j.Sources); err != nil {
 		return nil, fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
 	}
+	// Before the attempt-0 branch: requeued there with new limits, a job stopped while queued would
+	// skip the refusal in queueResume and the daily cap (which only job_start checks).
+	if err := refuseOpenRouterResume(j); err != nil {
+		return nil, err
+	}
 	if j.Attempt == 0 {
 		// Stopped before it ever ran: no session yet, so the update joins the brief.
 		lim := store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}
@@ -788,12 +795,26 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	return m.Store.Get(id)
 }
 
+// refuseOpenRouterResume refuses every requeue of an openrouter job (Resume, also of a job stopped
+// while queued, and the automatic continuation): each attempt spends real money against the daily cap,
+// which job_start checks once per job at its budget then.
+func refuseOpenRouterResume(j *store.Job) error {
+	if !IsOpenRouterJob(j) {
+		return nil
+	}
+	return fmt.Errorf("job %s runs on an openrouter model (billing api): it is not resumed or continued; "+
+		"start a new job with what it left (its report, its commits)", j.ID)
+}
+
 // queueResume checks that the attempt of j (stopped, timed out or failed, after it ran) can be
 // resumed and queues the next attempt with the update; limits: see resumeLimits. The caller holds
 // the lifecycle lock. Resume and the automatic continuation (autoContinue) both go through it, so the
 // sources refusal here guards every path that requeues a job that ran.
 func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	id := j.ID
+	if err := refuseOpenRouterResume(j); err != nil {
+		return err
+	}
 	if err := refuseSources(j.Sources); err != nil {
 		return fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
 	}

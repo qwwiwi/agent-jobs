@@ -221,6 +221,9 @@ type Config struct {
 	// its runner starts (repoprepare.go), e.g. a package install the sandboxed runner cannot do. The first
 	// entry whose repo_glob matches the job's repository applies; none = no prepare step.
 	Prepare []PrepareStep `json:"prepare"`
+	// Providers are the model providers besides the subscription (issue #136): providers.openrouter runs
+	// claude jobs on OpenRouter models ("openrouter:<slug>"), billed "api". Absent = none.
+	Providers ProvidersConfig `json:"providers"`
 }
 
 // Report contract modes (config report_contract).
@@ -445,6 +448,7 @@ func LoadConfig(stateDir string) (Config, error) {
 
 func parseConfig(stateDir string, b []byte) (Config, error) {
 	var c Config
+	var rawOpenRouter json.RawMessage
 	if b != nil {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return c, fmt.Errorf("parse config.json: %w", err)
@@ -473,6 +477,15 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		if v, ok := raw["auto_continue"]; ok && strings.TrimSpace(string(v)) == "null" {
 			return c, errors.New("config.json: auto_continue must be true or false, not null (omit the key for default true)")
 		}
+		if v, ok := raw["providers"]; ok {
+			var providers map[string]json.RawMessage
+			if json.Unmarshal(v, &providers) == nil {
+				rawOpenRouter = providers["openrouter"]
+			}
+		}
+	}
+	if err := c.validateProviders(rawOpenRouter); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if (c.GitName == "") != (c.GitEmail == "") {
 		return c, errors.New("config.json: git_name and git_email must be set together (both or neither): " +
@@ -699,6 +712,13 @@ func resolveModel(overrides map[string]map[string]string, kind, model, complexit
 		if model == "" {
 			return m, nil
 		}
+	}
+	if slug, ok := OpenRouterSlug(model); ok {
+		// Checked against providers.openrouter by newJob (allow-list, kind, repository).
+		if !reOpenRouterSlug.MatchString(slug) {
+			return "", fmt.Errorf("model %q: %q is not an OpenRouter model slug (author/model)", model, slug)
+		}
+		return model, nil
 	}
 	if err := ValidateModel(model); err != nil {
 		return "", err

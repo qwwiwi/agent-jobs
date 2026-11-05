@@ -83,8 +83,12 @@ type Job struct {
 	ResumedFrom string
 	// ScheduleID is the schedule that created the job (S2-M4), empty otherwise.
 	ScheduleID string
-	// Billing is how the run is paid: "subscription" (default) or "api" (S3-M6 fallback).
+	// Billing is how the run is paid: "subscription" (default) or "api" (real money: an OpenRouter job,
+	// or the S3-M6 fallback).
 	Billing string
+	// Provider is the model provider a claude job is pointed at: "" = Anthropic (the subscription), or
+	// ProviderOpenRouter (claude -p against OpenRouter's Anthropic-compatible endpoint, issue #136).
+	Provider string
 	// SessionID is the claude session id assigned before launch (--session-id), so the job can be
 	// resumed in the same session (--resume). Empty for rows from before session resume.
 	SessionID string
@@ -237,6 +241,9 @@ const (
 	RunnerClaude        = "claude"
 	RunnerCodex         = "codex"
 	BillingSubscription = "subscription"
+	BillingAPI          = "api"
+	// ProviderOpenRouter is the Provider of a claude job that runs on an OpenRouter model.
+	ProviderOpenRouter = "openrouter"
 )
 
 // Store wraps the SQLite handle.
@@ -611,6 +618,8 @@ var migrations = []string{
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_network INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN cost_estimate_usd REAL`,
 	`ALTER TABLE attempts ADD COLUMN cost_estimate_usd REAL`,
+	`ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE job_stats ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN skills_manifest TEXT NOT NULL DEFAULT ''`,
 }
 
@@ -744,7 +753,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	skills, skills_delivered, skills_note, skills_manifest,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
-	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources, cost_estimate_usd, source_files`
+	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
+	cost_estimate_usd, provider, source_files`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -774,6 +784,36 @@ func (s *Store) InsertCapped(j *Job, since time.Time, limit int) (bool, error) {
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// InsertBudgetCapped inserts j only when the money the provider's jobs of agent created at or after
+// since have spent or may still spend, plus j's own budget, stays within capUSD; it reports whether the
+// row was inserted. The check and the insert are one statement, so two concurrent starts cannot both
+// pass the cap.
+func (s *Store) InsertBudgetCapped(j *Job, since time.Time, capUSD float64) (bool, error) {
+	args := append(insertArgs(j), j.Agent, j.Provider, since.Unix(), j.MaxBudgetUSD, capUSD)
+	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (`+providerSpendSQL+`) + ? <= ?`, args...)
+	if err != nil {
+		return false, fmt.Errorf("insert job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// providerSpendSQL sums, over the jobs of an agent and provider created at or after a time (three
+// parameters), what they spent or may still spend: the recorded cost of a finished attempt whose cost
+// is known, else the whole budget (queued, running, stopped, or ended without a known cost).
+const providerSpendSQL = `SELECT COALESCE(SUM(CASE WHEN status IN ('queued','running','stopped') OR cost_unknown = 1
+	THEN max_budget_usd ELSE cost_usd END), 0) FROM jobs WHERE agent = ? AND provider = ? AND created_at >= ?`
+
+// ProviderSpendSince returns what the provider's jobs of agent created at or after since have spent or
+// may still spend (see InsertBudgetCapped).
+func (s *Store) ProviderSpendSince(agent, provider string, since time.Time) (float64, error) {
+	var v float64
+	if err := s.db.QueryRow(providerSpendSQL, agent, provider, since.Unix()).Scan(&v); err != nil {
+		return 0, fmt.Errorf("provider spend: %w", err)
+	}
+	return v, nil
 }
 
 // CountCodexSince returns how many codex jobs of agent were created at or after since, whatever became
@@ -809,7 +849,7 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, sourceFilesJSON(j.SourceFiles)}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -842,7 +882,7 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey, &sources, &estimate, &sourceFiles)
+		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -1349,14 +1389,28 @@ func (s *Store) ScopePending() ([]*Job, error) {
 // (explicit cancel or stop) any queued, running or stopped job can. Other terminal rows never change
 // status again (only Requeue starts a new attempt).
 func (s *Store) Finish(id, token, status string, turns int, cost float64, durationSec int, errMsg string, now time.Time) error {
+	return s.FinishAttempt(id, token, status, turns, cost, false, nil, durationSec, errMsg, now)
+}
+
+// FinishAttempt is Finish for the end of an attempt: costUnknown (with its estimate, nil = none) is set
+// in the same update as the terminal status and the cost, so no reader (the provider daily cap) ever
+// sees the ended attempt at a known cost it does not have. A false costUnknown leaves the flags as they are.
+func (s *Store) FinishAttempt(id, token, status string, turns int, cost float64, costUnknown bool, estimate *float64,
+	durationSec int, errMsg string, now time.Time) error {
 	if status == StatusQueued || status == StatusRunning {
 		return fmt.Errorf("finish: %q is not a terminal status", status)
 	}
 	// redaction_pending is set in the same update: the report of the ended attempt counts as
 	// unredacted until it was redacted (ClearRedactionPending), whatever set or cleared it before.
-	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=?, redaction_pending=1
+	q := `UPDATE jobs SET status=?, turns=?, cost_usd=?, duration_sec=?, error=?, finished_at=?, redaction_pending=1,
+		cost_unknown = CASE WHEN ? THEN 1 ELSE cost_unknown END,
+		cost_estimate_usd = CASE WHEN ? THEN ? ELSE cost_estimate_usd END
 		WHERE id=? AND `
-	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), id}
+	var est any
+	if estimate != nil {
+		est = *estimate
+	}
+	args := []any{status, turns, cost, durationSec, errMsg, now.Unix(), costUnknown, costUnknown && estimate != nil, est, id}
 	if token == "" {
 		q += `status IN ('queued','running','stopped')`
 	} else {
