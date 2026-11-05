@@ -28,8 +28,11 @@ func TestJobStartCodexBriefWarnings(t *testing.T) {
 		want               int
 	}{
 		{"English", "gpt-6.1-sol", "GIT CLONE repo; GIT COMMIT; GIT PUSH; SCREENSHOT via browser; PSQL pg_virtualenv DOCKER; CURL https://example.invalid; RUN CODEX", 7},
-		{"Russian", "gpt-6.1-sol", "Склонируй репозиторий; закоммить; запушь; сделай скриншот в браузере; запусти постгрес; выполни HTTP-запрос; запусти codex", 7},
+		{"Russian", "gpt-6.1-sol", "Склонируй репозиторий; закоммить; запушь; сделай скриншот в браузере; запусти постгрес; выполни curl; запусти codex", 7},
 		{"ordinary Codex work", "gpt-6.1-sol", "Fix parsing and write unit tests", 0},
+		{"negated English", "gpt-6.1-sol", "Do not clone; do not commit; never push; no browser; without Docker; do not curl; never run codex", 0},
+		{"negated Russian", "gpt-6.1-sol", "Не клонируй; не коммить; не пушь; без браузера; нельзя запускать Docker; никогда не запускай curl; не запускай codex", 0},
+		{"runner and HTTP description", "gpt-6.1-sol", "Document the codex exec runner and fix the HTTP handler", 0},
 		{"Claude", "sonnet", "git clone; git commit; screenshot; psql; curl; run codex", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

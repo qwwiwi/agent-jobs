@@ -108,7 +108,7 @@ func TestCodexPromptBriefConflicts(t *testing.T) {
 		{"запусти PostgreSQL", "", "fix", false, 1},
 		{"подними постгрес", "", "fix", false, 1},
 		{"curl", "", "fix", false, 1},
-		{"HTTP request", "", "fix", false, 1},
+		{"HTTP request", "", "fix", false, 0},
 		{"https://example.invalid", "", "fix", false, 1},
 		{"run `codex`", "", "fix", false, 1},
 		{"starting CODEX", "", "fix", false, 1},
@@ -148,4 +148,138 @@ func TestCodexPromptBriefConflicts(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestCodexBriefNegatedRequests(t *testing.T) {
+	for _, request := range []string{"clone", "git commit", "git push", "a browser", "Docker", "curl", "run codex"} {
+		for _, negation := range []string{"not", "don't", "do not", "never", "no", "without", "не", "нельзя", "без", "никогда"} {
+			t.Run(negation+" "+request, func(t *testing.T) {
+				j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: negation + " " + request}
+				if got := (Config{}).CodexBriefWarnings(j); len(got) != 0 {
+					t.Fatalf("negated request got warnings: %v", got)
+				}
+			})
+		}
+	}
+	for _, brief := range []string{
+		"Do not commit", "не коммить", "не пушь", "без браузера", "Нельзя клонировать",
+		"никогда не запускай codex", "Don't start `codex`", "do not take a screenshot",
+		"never use Docker", "do not fetch https://example.invalid", "no https://example.invalid",
+	} {
+		t.Run(brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != 0 {
+				t.Fatalf("negated request got warnings: %v", got)
+			}
+		})
+	}
+}
+
+func TestCodexBriefNegationScope(t *testing.T) {
+	for _, brief := range []string{
+		"Do not commit; git push", "Do not commit. Take a screenshot", "No browser\ngit commit",
+		"No commit; commit", "No commit,commit", "No unrelated changes are needed here; clone repository",
+	} {
+		t.Run(brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != 1 {
+				t.Fatalf("got %v, want one positive-request warning", got)
+			}
+		})
+	}
+}
+
+func TestCodexBriefHTTPRequests(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		{"Fix the HTTP handler and HTTPS support", 0},
+		{"HTTP request parsing", 0},
+		{"https://", 0},
+		{"https:///path", 0},
+		{"wget", 1},
+		{"fetch the fixture", 1},
+		{"Fetch https://example.invalid/data", 1},
+		{"https://example.invalid/data", 1},
+		{"wget http://localhost:3000/data", 0},
+		{"do not wget https://example.invalid", 0},
+		{"without fetch", 0},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", Brief: tc.brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexBriefNestedCodexRequests(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		{"Document the codex exec runner", 0},
+		{"The codex review command uses the sandbox", 0},
+		{"Explain codex --help output", 0},
+		{"Обнови описание codex exec", 0},
+		{"Run codex exec", 1},
+		{"Invoke `codex` review", 1},
+		{"Вызови codex review", 1},
+		{"codex exec", 1},
+		{"Commands:\n  $ codex review", 1},
+		{"```sh\ncodex exec\n```", 1},
+		{"Do not run codex exec", 0},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", Brief: tc.brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexPromptNegatedBrief(t *testing.T) {
+	m := &Manager{StateDir: t.TempDir()}
+	j := &store.Job{ID: "j1", Kind: "fix", Runner: store.RunnerCodex, RepoPath: "repository",
+		Brief: "Do not clone; do not commit; never push; no browser; without Docker; do not curl; never run codex"}
+	p, err := m.BuildPrompt(j, "rules", nil, MemoryNotes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(p, "The brief asks ") {
+		t.Fatal("prompt contradicts the negated brief")
+	}
+}
+
+func TestCodexPromptReportCommitMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name, runner, mode string
+		wrapperCommits     bool
+	}{
+		{"native Codex", store.RunnerCodex, "native", true},
+		{"full access Codex", store.RunnerCodex, "worktree-full-access", false},
+		{"Claude", store.RunnerClaude, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Manager{StateDir: t.TempDir(), Cfg: Config{CodexSandboxMode: tc.mode}}
+			j := &store.Job{ID: "j1", Kind: "fix", Runner: tc.runner, RepoPath: "repository", Brief: "Fix parsing"}
+			p, err := m.BuildPrompt(j, "rules", nil, MemoryNotes{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "with file:line and commit hashes"
+			if tc.wrapperCommits {
+				want = "with file:line and commit message (the wrapper commits after the run)"
+				if strings.Contains(p, "commit hashes") {
+					t.Error("wrapper-commit report still asks for commit hashes")
+				}
+			}
+			if !strings.Contains(p, want) {
+				t.Errorf("report contract lacks %q", want)
+			}
+		})
+	}
 }

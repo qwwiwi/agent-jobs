@@ -467,6 +467,9 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if err != nil {
 		return "", err
 	}
+	if j.Runner == store.RunnerCodex && cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite {
+		contract = strings.Replace(contract, "commit hashes", "commit message (the wrapper commits after the run)", 1)
+	}
 	cover := ""
 	if j.CoverContract != nil {
 		rules, err := template("prompts/requirements.md")

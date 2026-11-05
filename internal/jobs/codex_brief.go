@@ -35,10 +35,7 @@ func (c Config) CodexBriefWarnings(j *store.Job) []string {
 	s := c.codexPromptSettings(j.Kind)
 	var warnings []string
 	for _, rule := range codexBriefRules {
-		if rule.blocked(s, j) && rule.pattern.MatchString(j.Brief) {
-			if rule.externalHTTP && !briefExternalHTTP(j.Brief) {
-				continue
-			}
+		if rule.blocked(s, j) && briefRequests(j.Brief, rule.pattern, rule.externalHTTP) {
 			warnings = append(warnings, "The brief asks "+rule.asks+"; you cannot "+rule.reason+" – "+rule.instead+".")
 		}
 	}
@@ -47,7 +44,32 @@ func (c Config) CodexBriefWarnings(j *store.Job) []string {
 
 func briefPattern(pattern string) *regexp.Regexp {
 	// A period can end a sentence, but browser.go is a filename rather than a browser request.
-	return regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:` + pattern + `)($|[^\pL\pN_.]|\.(?:$|[^\pL\pN_]))`)
+	return regexp.MustCompile(`(?i)(^|[^\pL\pN_])(` + pattern + `)($|[^\pL\pN_.]|\.(?:$|[^\pL\pN_]))`)
+}
+
+// Negation applies within four preceding words and stops at a clause or line boundary.
+var briefNegation = regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:not|don['’]t|never|no|without|не|нельзя|без|никогда)(?:[^\pL\pN_.;,:!?\r\n]+[\pL\pN_]+){0,3}[^\pL\pN_.;,:!?\r\n]*$`)
+
+func briefRequests(brief string, pattern *regexp.Regexp, externalHTTP bool) bool {
+	for offset := 0; offset < len(brief); {
+		match := pattern.FindStringSubmatchIndex(brief[offset:])
+		if match == nil {
+			return false
+		}
+		start, end := offset+match[4], offset+match[5]
+		if !briefNegation.MatchString(brief[:start]) {
+			target := brief
+			if briefHTTPURLs.MatchString(brief[start:end]) {
+				target = brief[start:end]
+			}
+			if !externalHTTP || briefExternalHTTP(target) {
+				return true
+			}
+		}
+		// Keep the trailing delimiter available for a subsequent positive match.
+		offset = end
+	}
+	return false
 }
 
 var codexBriefRules = []struct {
@@ -67,9 +89,9 @@ var codexBriefRules = []struct {
 		"for a browser or screenshot", "run a socket-dependent browser with network off", "describe the screenshot to take and report the browser check as not run", false},
 	{briefPattern(`psql|pg_virtualenv|postgres\pL*|docker|постгрес\pL*|докер\pL*`), codexOffline,
 		"for PostgreSQL or Docker", "run socket-bound services/tests with network off", "write the tests but do not run socket-bound ones; report the command for the orchestrator", false},
-	{briefPattern(`curl|https?|https?://|http-запрос\pL*|сетев\pL*\s+запрос\pL*`), codexOffline,
+	{briefPattern(`curl|wget|fetch|https?://[^\s<>"` + "`" + `]+`), codexOffline,
 		"for external HTTP/curl", "reach external hosts with network off", "use local fixtures or describe the request for the orchestrator", true},
-	{briefPattern("(?:run|running|start|starting|launch|launching|invoke|execute|запус\\pL*|запущ\\pL*|вызов\\pL*|вызва\\pL*)\\s+[`\"']?(?:codex|кодекс)|codex\\s+(?:exec|review|--?\\pL+)"), codexAlways,
+	{briefPattern("(?:run|running|start|starting|launch|launching|invoke|execute|запус\\pL*|запущ\\pL*|вызов\\pL*|вызва\\pL*)\\s+[`\"']?(?:codex|кодекс)|(?m:^[\\t ]*(?:[$>][\\t ]*)?codex[\\t ]+(?:exec|review|--?\\pL+))"), codexAlways,
 		"to start codex", "start a nested agent in a background job", "edit or review the files directly in this job", false},
 }
 
@@ -83,8 +105,8 @@ func briefExternalHTTP(brief string) bool {
 	urls := briefHTTPURLs.FindAllString(brief, -1)
 	for _, raw := range urls {
 		u, err := url.Parse(raw)
-		if err != nil {
-			return true
+		if err != nil || u.Hostname() == "" {
+			continue
 		}
 		host := strings.ToLower(u.Hostname())
 		ip := net.ParseIP(host)
@@ -92,7 +114,7 @@ func briefExternalHTTP(brief string) bool {
 			return true
 		}
 	}
-	return len(urls) == 0 // curl/HTTP with no literal URL still deserves an advisory warning.
+	return len(urls) == 0 // Fetch commands with no literal URL still deserve an advisory warning.
 }
 
 func (c Config) codexSandboxSection(j *store.Job) string {
