@@ -440,12 +440,16 @@ func (m *Manager) BuildPrompt(j *store.Job, ownerRules string, cards []Card, not
 // buildPrompt is BuildPrompt with the job's prior results taken from prior, the snapshot its prior/
 // folder is written from, and its sources section from sources (the clones of this or an earlier attempt).
 func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, notes MemoryNotes, prior priorSnapshot,
-	sources []sourceResult) (string, error) {
+	sources []sourceResult, promptConfig ...Config) (string, error) {
+	cfg := m.Config()
+	if len(promptConfig) > 0 {
+		cfg = promptConfig[0] // The launcher's authorized snapshot, including on-disk revocations.
+	}
 	pre, err := template("prompts/preamble.md")
 	if err != nil {
 		return "", err
 	}
-	if pre, err = codexPreamble(pre, j, m.JobDir(j.ID)); err != nil {
+	if pre, err = codexPreamble(pre, j, m.JobDir(j.ID), cfg); err != nil {
 		return "", err
 	}
 	sub, err := template("prompts/subagents.md")
@@ -456,9 +460,15 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if err != nil {
 		return "", err
 	}
+	if j.Runner == store.RunnerCodex && cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite {
+		check = strings.Replace(check, "and create a local commit.", "and leave files for the wrapper to commit.", 1)
+	}
 	contract, err := template("prompts/report-contract.md")
 	if err != nil {
 		return "", err
+	}
+	if j.Runner == store.RunnerCodex && cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite {
+		contract = strings.Replace(contract, "commit hashes", "commit message (the wrapper commits after the run)", 1)
 	}
 	cover := ""
 	if j.CoverContract != nil {
@@ -470,11 +480,20 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	}
 	work := "Your working directory is an empty directory."
 	if j.RepoPath != "" {
+		commit := "Commit locally; never push."
+		if j.Runner == store.RunnerCodex {
+			switch {
+			case CodexSandbox(j.Kind) == CodexSandboxReadOnly:
+				commit = "Read-only task; no commits."
+			case cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite:
+				commit = "Write files only; the wrapper commits. Never push."
+			}
+		}
 		work = fmt.Sprintf("Your working directory is a git worktree of the repository at base commit %s (detached HEAD). "+
-			"Commit locally; never push. The diff is measured from that base.", j.BaseCommit)
+			"%s The diff is measured from that base.", j.BaseCommit, commit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, codexReadDirsSection(j, m.Config().CodexReadDirs),
+	fmt.Fprintf(&b, "%s\n\n%s%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, cfg.codexSandboxSection(j), codexReadDirsSection(j, cfg.CodexReadDirs),
 		skillsLine(j), sub, ownerRules)
 	if IsGateKind(j.Kind) {
 		// A gate job's input is the daemon's (Wave F): never the brief column, cards or memory notes.
@@ -537,7 +556,7 @@ func (m *Manager) JobMCPConfig(kind string) map[string]any {
 }
 
 // prepare creates the job directory: prompt.md, settings.json, mcp.json, work/, base_commit.
-func (m *Manager) prepare(j *store.Job, token, dir string) error {
+func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Config) error {
 	rules, err := m.readOwnerRules()
 	if err != nil {
 		return err
@@ -573,7 +592,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string) error {
 	}
 	// One read of the dependencies feeds both the prompt's prior results and the prior/ folder.
 	prior := m.priorSnapshot(j)
-	prompt, err := m.buildPrompt(j, rules, cards, notes, prior, sources)
+	prompt, err := m.buildPrompt(j, rules, cards, notes, prior, sources, promptConfig...)
 	if err != nil {
 		return err
 	}

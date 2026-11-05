@@ -582,7 +582,7 @@ const preambleProgressRule = "- Keep `PROGRESS.md` in the job directory up to da
 // codexPreamble returns the preamble of j with the progress bullet a codex job can follow (issue #92): a
 // write kind keeps its progress file at CodexProgressPath, the one path outside work/ its sandbox lets
 // it write; a read-only kind keeps none. A claude job's preamble is returned as it is.
-func codexPreamble(pre string, j *store.Job, jobDir string) (string, error) {
+func codexPreamble(pre string, j *store.Job, jobDir string, cfg Config) (string, error) {
 	if j.Runner != store.RunnerCodex {
 		return pre, nil
 	}
@@ -596,18 +596,36 @@ func codexPreamble(pre string, j *store.Job, jobDir string) (string, error) {
 	}
 	rule := "- Your sandbox is read-only: keep no progress file (`" + ProgressFile + "` cannot be written); " +
 		"the report's Progress section is your record."
+	sandbox := cfg.codexPromptSettings(j.Kind).sandbox
+	if sandbox == CodexSandboxFullAccess {
+		rule = "- This is a read-only task: keep no progress file; the report's Progress section is your record."
+	}
 	if codexProgressWritable(j) {
 		path := CodexProgressPath(jobDir)
 		dir := filepath.Dir(path)
+		where := "Its folder is the one path outside `work/` your sandbox lets you write; the rest of the job directory is read-only."
+		if sandbox == CodexSandboxFullAccess {
+			where = "Keep progress in this folder even though Codex does not confine writes in this mode."
+		}
 		rule = fmt.Sprintf("- Keep `%s` at `%s` up to date after each meaningful step: what is done, what is next, "+
-			"what not to redo. Its folder is the one path outside `work/` your sandbox lets you write; the rest of the job "+
-			"directory is read-only. Write it with a shell heredoc (`cat > %s <<'EOF'`).\n"+
-			"- You cannot commit: the repository's git directory is read-only in your sandbox (`git add` and `git commit` "+
-			"fail). Leave your changes in `work/` and write the commit message to `%s`; when you have finished, the "+
-			"wrapper stages everything in `work/` that is not ignored (`git add -A`) and makes one commit with that message.",
-			ProgressFile, path, path, filepath.Join(dir, CodexCommitMessageFile))
+			"what not to redo. %s Write it with a shell heredoc (`cat > %s <<'EOF'`).",
+			ProgressFile, path, where, path)
+		if sandbox == CodexSandboxWrite {
+			rule += fmt.Sprintf("\n- You cannot commit: the repository's git directory is read-only in your sandbox (`git add` and `git commit` "+
+				"fail). Leave your changes in `work/` and write the commit message to `%s`; when you have finished, the "+
+				"wrapper stages repository changes in `work/` that are not ignored (`git add -A`) and makes one commit with that message.",
+				filepath.Join(dir, CodexCommitMessageFile))
+		}
 	}
-	return pre[:start] + rule + pre[end:], nil
+	pre = pre[:start] + rule + pre[end:]
+	pre = strings.Replace(pre, "(`claude -p`)", "(`codex exec`)", 1)
+	pre = strings.Replace(pre, "If something is impossible, stop and say so in the report instead of improvising around the rules.",
+		"If a step is unavailable, complete feasible work and list the unavailable step and reason in the report; do not bypass the sandbox.", 1)
+	if sandbox != CodexSandboxFullAccess || CodexSandbox(j.Kind) == CodexSandboxReadOnly {
+		pre = strings.Replace(pre, "Commit locally if the brief asks for changes; the orchestrator reviews and ships.",
+			"Do not commit yourself; follow Your sandbox below. The orchestrator reviews and ships.", 1)
+	}
+	return pre, nil
 }
 
 // CodexNetworkOverride is the `-c` override that lets commands under codex's workspace-write sandbox

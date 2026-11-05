@@ -83,7 +83,7 @@ type JobView struct {
 	// MergeNote is that check, made when the job-done line was sent.
 	MergeNote string `json:"merge_note,omitempty"`
 	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
-	// config.json did not load, or the daemon runs another version (restart the session).
+	// config.json did not load, the daemon runs another version, or the Codex brief conflicts with its sandbox.
 	Warnings []string `json:"warnings,omitempty"`
 	// Notes (judge_start only): information that needs no action, such as the judge sharing a coder's
 	// model family (owner decision 2026-10-26: the family does not fail release_check).
@@ -246,6 +246,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			v.Warnings = d.Watch.Warnings("job_start")
 		}
 		if j.Runner == store.RunnerCodex {
+			v.Warnings = append(v.Warnings, d.Manager.Config().CodexBriefWarnings(j)...)
 			if v.CodexJobsToday, err = d.Manager.CodexJobsToday(); err != nil {
 				v.CodexJobsToday = "unknown: " + err.Error()
 			}

@@ -860,7 +860,7 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunNew); err != nil {
 			return fmt.Errorf("record session: %w", err)
 		}
-		if err := m.prepare(j, token, m.JobDir(j.ID)); err != nil {
+		if err := m.prepare(j, token, m.JobDir(j.ID), launchCfg); err != nil {
 			return err
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
