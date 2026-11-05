@@ -304,3 +304,76 @@ func TestOpenRouterProxyIncompleteKeepsReservation(t *testing.T) {
 		}
 	})
 }
+
+// #148 fix loop: a stream that ends with message_stop but without its final message_delta usage is not
+// settled at its opening usage. message_start's figures (input tokens, output 0, an opening cost:0) are
+// partial: the request is charged at its reservation, the cost is uncertain, and the budget refuses
+// further requests. Socket-free: the upstream is a RoundTripper.
+func TestOpenRouterProxyStreamWithoutFinalUsageKeepsReservation(t *testing.T) {
+	for name, opening := range map[string]string{
+		"opening cost 0":  `{"input_tokens":10,"output_tokens":0,"cost":0}`,
+		"no opening cost": `{"input_tokens":10,"output_tokens":0}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":" + opening + "}}\n\n" +
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+				"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+			hits := 0
+			// Output $40000/M: max_tokens 10 reserves $0.40; the budget $0.50 admits two ($0, $0.40 < $0.50).
+			p := &orProxy{token: "tok", slug: orGLM, upstream: "https://upstream.invalid/api", provider: json.RawMessage(`{}`),
+				budget: 0.5, price: ModelPrice{Output: 40000}}
+			p.client = &http.Client{Transport: orProxyRoutingTransport(func(r *http.Request) (*http.Response, error) {
+				hits++
+				_, _ = io.Copy(io.Discard, r.Body)
+				h := make(http.Header)
+				h.Set("Content-Type", "text/event-stream")
+				return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(stream))}, nil
+			})}
+			send := func() int {
+				r := httptest.NewRequest(http.MethodPost, "/v1/messages",
+					strings.NewReader(`{"model":"x","max_tokens":10,"stream":true,"messages":[]}`))
+				r.Header.Set("Authorization", "Bearer tok")
+				w := httptest.NewRecorder()
+				p.ServeHTTP(w, r)
+				return w.Code
+			}
+			if code := send(); code != http.StatusOK {
+				t.Fatalf("first request: %d", code)
+			}
+			if c := p.Cost(); c < 0.4-1e-9 || !p.CostUncertain() {
+				t.Fatalf("cost %v uncertain %t, want the $0.40 reservation, uncertain", c, p.CostUncertain())
+			}
+			if code := send(); code != http.StatusOK {
+				t.Fatalf("second request: %d", code)
+			}
+			if code := send(); code != http.StatusBadRequest {
+				t.Fatalf("third request: %d, want refused (400) once $0.80 is charged of $0.50", code)
+			}
+			if hits != 2 || p.BudgetFailure() == "" {
+				t.Fatalf("upstream hits %d (want 2), budget failure %q", hits, p.BudgetFailure())
+			}
+			if c := p.Cost(); c < 0.8-1e-9 || p.uncertain != 2 {
+				t.Fatalf("cost %v uncertain %d, want $0.80 charged at the reservations, 2 uncertain", c, p.uncertain)
+			}
+		})
+	}
+}
+
+// #148 fix loop: the opening cost:0 is not the response's cost; a final message_delta with only its
+// output_tokens is final and priced by its tokens.
+func TestOpenRouterUsageReaderOpeningCostIsNotFinal(t *testing.T) {
+	u := &usageReader{stream: true}
+	u.write([]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cost\":0}}}\n\n"))
+	if u.final() {
+		t.Fatal("opening usage alone counted as final")
+	}
+	u.write([]byte("data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\ndata: {\"type\":\"message_stop\"}\n"))
+	if !u.final() {
+		t.Fatal("message_delta usage then message_stop not final")
+	}
+	if r := u.result(); r.HasCost || r.Tokens != (TokenUsage{Input: 10, Output: 7}) {
+		t.Fatalf("usage %+v, want tokens 10/7 and no cost (the opening cost:0 is not the response's)", r)
+	}
+}
