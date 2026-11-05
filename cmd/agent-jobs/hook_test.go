@@ -246,8 +246,10 @@ func TestHookBindProvenance(t *testing.T) {
 	run := func(opener func(string) (*jobs.Manager, error), stdin string) (int, string) {
 		var out, errb bytes.Buffer
 		code := runHook([]string{"bind", "--agent", "test"}, strings.NewReader(stdin), &out, &errb, opener)
-		if out.Len() != 0 {
-			t.Fatalf("bind printed %q", out.String())
+		for line := range strings.Lines(out.String()) {
+			if !strings.HasPrefix(line, "[jobs:pending-outcome] ") {
+				t.Fatalf("bind printed %q", out.String())
+			}
 		}
 		return code, errb.String()
 	}
