@@ -970,6 +970,13 @@ func (s *Store) PendingNotify() ([]*Job, error) {
 	return s.query(`WHERE status NOT IN ('queued','running','stopped') AND notified_at IS NULL ORDER BY finished_at`)
 }
 
+// PendingOutcomes returns this agent's succeeded, failed and timed-out jobs finished at or after
+// since without a recorded outcome, newest first, whether their job-done line was delivered or not.
+func (s *Store) PendingOutcomes(agent string, since time.Time) ([]*Job, error) {
+	return s.query(`WHERE agent = ? AND status IN ('succeeded','failed','timeout')
+		AND outcome = '' AND finished_at >= ? ORDER BY finished_at DESC, rowid DESC`, agent, since.Unix())
+}
+
 // ListActiveOnRepo returns the queued and running jobs on repository repo other than id, oldest first.
 func (s *Store) ListActiveOnRepo(repo, id string) ([]*Job, error) {
 	return s.query(`WHERE repo_path = ? AND id != ? AND status IN ('queued','running') ORDER BY created_at, rowid`, repo, id)
