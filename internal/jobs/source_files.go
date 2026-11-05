@@ -66,11 +66,14 @@ func sourceFileNames(origins []string) []string {
 // openAbsoluteSource walks every component through directory descriptors. Neither a leaf symlink
 // nor a symlinked parent can redirect a snapshot, even if the origin is changed during the walk.
 func openAbsoluteSource(path string) (*os.File, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("non-canonical absolute source path %q", path)
+	}
 	dfd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
-	parts := strings.Split(strings.TrimPrefix(filepath.Clean(path), string(filepath.Separator)), string(filepath.Separator))
+	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
 	for _, part := range parts[:len(parts)-1] {
 		next, err := openDirNoFollow(dfd, part)
 		_ = unix.Close(dfd)
@@ -120,8 +123,12 @@ func (m *Manager) readSourceFile(origin string) ([]byte, error) {
 	if fi.Size() > MaxSourceFileBytes {
 		return nil, fmt.Errorf("sources %q: exceeds %d bytes per file", origin, MaxSourceFileBytes)
 	}
+	return readSourceBytes(origin, f)
+}
+
+func readSourceBytes(origin string, r io.Reader) ([]byte, error) {
 	// Bound the actual read too: the source may grow after Stat.
-	b, err := io.ReadAll(io.LimitReader(f, MaxSourceFileBytes+1))
+	b, err := io.ReadAll(io.LimitReader(r, MaxSourceFileBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("sources %q: read: %w", origin, err)
 	}

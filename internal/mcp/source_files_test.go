@@ -50,3 +50,37 @@ func TestJobStartFileSources(t *testing.T) {
 		t.Fatalf("missing source must reject job_start: %s", msg)
 	}
 }
+
+func TestJobStartRejectsNonCanonicalSources(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin := filepath.Join(dir, "report.md")
+	if err := os.WriteFile(origin, []byte("review evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dir, filepath.Join(dir, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, path string
+	}{
+		{"missing parent with dotdot", dir + "/missing/../report.md"},
+		{"symlink parent with dotdot", dir + "/linked/../report.md"},
+		{"trailing slash on regular file", origin + "/"},
+		{"dot component", dir + "/./report.md"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {
+				// Preserve the supplied spelling: filepath.Join would clean it.
+				a["sources"] = []any{tc.path}
+			}))
+			if !strings.Contains(msg, "non-canonical") {
+				t.Fatalf("want non-canonical source path validation error, got %q", msg)
+			}
+		})
+	}
+}

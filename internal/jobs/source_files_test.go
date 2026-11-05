@@ -221,3 +221,57 @@ func TestSourceFilesCodex(t *testing.T) {
 		t.Fatalf("runner = %s", j.Runner)
 	}
 }
+
+func TestSourceFileReadUsesOpenedOrigin(t *testing.T) {
+	origin := sourceFixture(t, t.TempDir(), "report.md", "opened content")
+	f, err := openAbsoluteSource(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	replacement := sourceFixture(t, filepath.Dir(origin), "replacement.md", "replacement content")
+	if err := os.Rename(replacement, origin); err != nil {
+		t.Fatal(err)
+	}
+	b, err := readSourceBytes(origin, f)
+	if err != nil || string(b) != "opened content" {
+		t.Fatalf("snapshot must read the opened file: %q, %v", b, err)
+	}
+	b, err = os.ReadFile(origin)
+	if err != nil || string(b) != "replacement content" {
+		t.Fatalf("origin must point to the replacement: %q, %v", b, err)
+	}
+}
+
+func TestSourceFileReadRejectsGrowthAfterStat(t *testing.T) {
+	origin := sourceFixture(t, t.TempDir(), "report.md", "small")
+	f, err := openAbsoluteSource(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > MaxSourceFileBytes {
+		t.Fatal("source must pass the initial stat checks")
+	}
+	w, err := os.OpenFile(origin, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := w.WriteString(strings.Repeat("x", int(MaxSourceFileBytes)))
+	closeErr := w.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("grow source: write %v, close %v", writeErr, closeErr)
+	}
+	b, err := readSourceBytes(origin, f)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 2097152 bytes") || b != nil {
+		t.Fatalf("source grown after stat must fail the read limit: %d bytes, %v", len(b), err)
+	}
+	pos, err := f.Seek(0, 1)
+	if err != nil || pos != MaxSourceFileBytes+1 {
+		t.Fatalf("read must stop at cap plus one: position %d, %v", pos, err)
+	}
+}
