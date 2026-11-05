@@ -2085,18 +2085,22 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if sub == "brief-reminder" {
 		type answer struct {
 			line string
+			warn string
 			err  error
 		}
 		done := make(chan answer, 1)
 		go func() {
-			line, err := briefReminder(args[1:], stdin, stderr, openReadOnly)
-			done <- answer{line, err}
+			line, warn, err := briefReminder(args[1:], stdin, openReadOnly)
+			done <- answer{line, warn, err}
 		}()
 		var a answer
 		select {
 		case a = <-done:
 		case <-time.After(briefReminderTimeout):
 			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+		}
+		if a.warn != "" {
+			fmt.Fprintln(stderr, a.warn)
 		}
 		switch {
 		case errors.Is(a.err, jobs.ErrInJobSession):
@@ -2288,42 +2292,41 @@ const briefReminderTimeout = 2 * time.Second
 
 // briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, stderr io.Writer, opener func(string) (*jobs.Manager, error)) (string, error) {
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if len(pos) > 0 {
-		return "", errors.New("no positional arguments")
+		return "", "", errors.New("no positional arguments")
 	}
 	in, err := jobs.ParseUserPromptInput(stdin)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	m, err := opener(*agent)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer m.Close()
 	line, err := m.BriefReminder(in)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	pending, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(no pending-outcome reminder)")
-		return line, nil
+		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
 	}
 	if line == "" {
-		return pending, nil
+		return pending, "", nil
 	}
 	if pending != "" {
 		line += "\n" + pending
 	}
-	return line, nil
+	return line, "", nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,

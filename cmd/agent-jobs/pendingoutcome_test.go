@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,17 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
+type hookDiagnosticWriter struct {
+	bytes.Buffer
+	goroutine string
+}
+
+func (w *hookDiagnosticWriter) Write(p []byte) (int, error) {
+	var stack [64]byte
+	w.goroutine = string(bytes.Fields(stack[:runtime.Stack(stack[:], false)])[1])
+	return w.Buffer.Write(p)
+}
+
 func TestHookBriefReminderPendingOutcomeError(t *testing.T) {
 	orch := bindableAgent(t, "test")
 	m, err := jobs.Open("test")
@@ -20,7 +32,8 @@ func TestHookBriefReminderPendingOutcomeError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	var out, errs bytes.Buffer
+	var out bytes.Buffer
+	var errs hookDiagnosticWriter
 	if code := runHook([]string{"bind", "--agent", "test"}, strings.NewReader(bindEvent("s1", orch)), &out, &errs, open); code != 0 || errs.Len() != 0 {
 		t.Fatalf("bind: exit %d, stderr %q", code, errs.String())
 	}
@@ -55,10 +68,21 @@ func TestHookBriefReminderPendingOutcomeError(t *testing.T) {
 	if code := run(); code != 0 || out.String() != want {
 		t.Errorf("pending-outcome error: exit %d, stdout %q, want %q", code, out.String(), want)
 	}
-	if !strings.Contains(errs.String(), "agent-jobs hook brief-reminder: job bad-gate: gate_input: unexpected end of JSON input") ||
+	if !strings.HasPrefix(errs.String(), "agent-jobs hook brief-reminder: ") ||
+		!strings.Contains(errs.String(), "job bad-gate: gate_input: unexpected end of JSON input") ||
 		!strings.HasSuffix(errs.String(), "(no pending-outcome reminder)\n") {
 		t.Errorf("pending-outcome diagnostic: %q", errs.String())
 	}
+	t.Run("stderr_on_hook_goroutine", func(t *testing.T) {
+		var stack [64]byte
+		caller := string(bytes.Fields(stack[:runtime.Stack(stack[:], false)])[1])
+		if code := run(); code != 0 {
+			t.Fatalf("brief-reminder: exit %d", code)
+		}
+		if errs.goroutine != caller {
+			t.Errorf("stderr written by goroutine %s, want hook caller %s", errs.goroutine, caller)
+		}
+	})
 }
 
 func TestHookPendingOutcome(t *testing.T) {
