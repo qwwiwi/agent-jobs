@@ -47,8 +47,10 @@ func briefPattern(pattern string) *regexp.Regexp {
 	return regexp.MustCompile(`(?i)(^|[^\pL\pN_])(` + pattern + `)($|[^\pL\pN_.]|\.(?:$|[^\pL\pN_]))`)
 }
 
-// Negation applies within four preceding words and stops at a clause or line boundary.
-var briefNegation = regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:not|don['’]t|never|no|without|не|нельзя|без|никогда)(?:[^\pL\pN_.;,:!?\r\n]+[\pL\pN_]+){0,3}[^\pL\pN_.;,:!?\r\n]*$`)
+// Negation applies only before the matched verb, within four preceding words,
+// and stops at a clause or line boundary. This is a lexical heuristic:
+// "Don't forget to commit" gives no warning by design; generic sandbox guidance still applies.
+var briefNegation = regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:not|cannot|\pL*n['’]t|never|no|without|не|нельзя|запрещ\pL*|без|никогда)(?:[^\pL\pN_.;,:!?\r\n]+[\pL\pN_]+){0,3}[^\pL\pN_.;,:!?\r\n]*$`)
 
 func briefRequests(brief string, pattern *regexp.Regexp, externalHTTP bool) bool {
 	for offset := 0; offset < len(brief); {
@@ -89,7 +91,7 @@ var codexBriefRules = []struct {
 		"for a browser or screenshot", "run a socket-dependent browser with network off", "describe the screenshot to take and report the browser check as not run", false},
 	{briefPattern(`psql|pg_virtualenv|postgres\pL*|docker|постгрес\pL*|докер\pL*`), codexOffline,
 		"for PostgreSQL or Docker", "run socket-bound services/tests with network off", "write the tests but do not run socket-bound ones; report the command for the orchestrator", false},
-	{briefPattern(`curl|wget|fetch|https?://[^\s<>"` + "`" + `]+`), codexOffline,
+	{briefPattern(`https?://[^\s<>"` + "`" + `]+`), codexOffline,
 		"for external HTTP/curl", "reach external hosts with network off", "use local fixtures or describe the request for the orchestrator", true},
 	{briefPattern("(?:run|running|start|starting|launch|launching|invoke|execute|запус\\pL*|запущ\\pL*|вызов\\pL*|вызва\\pL*)\\s+[`\"']?(?:codex|кодекс)|(?m:^[\\t ]*(?:[$>][\\t ]*)?codex[\\t ]+(?:exec|review|--?\\pL+))"), codexAlways,
 		"to start codex", "start a nested agent in a background job", "edit or review the files directly in this job", false},
@@ -114,7 +116,7 @@ func briefExternalHTTP(brief string) bool {
 			return true
 		}
 	}
-	return len(urls) == 0 // Fetch commands with no literal URL still deserve an advisory warning.
+	return false
 }
 
 func (c Config) codexSandboxSection(j *store.Job) string {

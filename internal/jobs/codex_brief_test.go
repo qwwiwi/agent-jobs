@@ -107,7 +107,7 @@ func TestCodexPromptBriefConflicts(t *testing.T) {
 		{"Docker", "", "fix", false, 1},
 		{"запусти PostgreSQL", "", "fix", false, 1},
 		{"подними постгрес", "", "fix", false, 1},
-		{"curl", "", "fix", false, 1},
+		{"curl", "", "fix", false, 0},
 		{"HTTP request", "", "fix", false, 0},
 		{"https://example.invalid", "", "fix", false, 1},
 		{"run `codex`", "", "fix", false, 1},
@@ -119,7 +119,7 @@ func TestCodexPromptBriefConflicts(t *testing.T) {
 		{"git clone; screenshot; psql; curl", "worktree-full-access", "fix", false, 0},
 		{"git commit", "worktree-full-access", "fix", false, 0},
 		{"git commit", "worktree-full-access", "review", false, 1},
-		{"git clone; screenshot; psql; curl", "native", "review", true, 4},
+		{"git clone; screenshot; psql; curl https://example.invalid", "native", "review", true, 4},
 		{"curl http://localhost:3000", "", "fix", false, 0},
 		{"curl http://127.0.0.1:3000", "", "fix", false, 0},
 		{"curl http://[::1]:3000", "", "fix", false, 0},
@@ -151,8 +151,8 @@ func TestCodexPromptBriefConflicts(t *testing.T) {
 }
 
 func TestCodexBriefNegatedRequests(t *testing.T) {
-	for _, request := range []string{"clone", "git commit", "git push", "a browser", "Docker", "curl", "run codex"} {
-		for _, negation := range []string{"not", "don't", "do not", "never", "no", "without", "не", "нельзя", "без", "никогда"} {
+	for _, request := range []string{"clone", "git commit", "git push", "a browser", "Docker", "curl https://example.invalid", "run codex"} {
+		for _, negation := range []string{"not", "don't", "do not", "cannot", "can't", "mustn't", "shouldn't", "won't", "isn't", "don’t", "can’t", "mustn’t", "shouldn’t", "won’t", "isn’t", "never", "no", "without", "не", "нельзя", "запрещено", "запрещается", "без", "никогда"} {
 			t.Run(negation+" "+request, func(t *testing.T) {
 				j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: negation + " " + request}
 				if got := (Config{}).CodexBriefWarnings(j); len(got) != 0 {
@@ -198,8 +198,15 @@ func TestCodexBriefHTTPRequests(t *testing.T) {
 		{"HTTP request parsing", 0},
 		{"https://", 0},
 		{"https:///path", 0},
-		{"wget", 1},
-		{"fetch the fixture", 1},
+		{"wget", 0},
+		{"fetch the fixture", 0},
+		{"fix the fetch function", 0},
+		{"curl the fixture", 0},
+		{"fetch('https://example.invalid/data')", 1},
+		{"curl https://example.invalid/data", 1},
+		{"wget https://example.invalid/data", 1},
+		{"curl https:///path", 0},
+		{"fetch('https:///path')", 0},
 		{"Fetch https://example.invalid/data", 1},
 		{"https://example.invalid/data", 1},
 		{"wget http://localhost:3000/data", 0},
@@ -210,6 +217,28 @@ func TestCodexBriefHTTPRequests(t *testing.T) {
 			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", Brief: tc.brief}
 			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
 				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexBriefNegationKnownLimits(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		{"Don't forget to commit", 0},
+		{"commit is not allowed", 1},
+		{"Do not make any new local git commit", 1},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: tc.brief}
+			cfg := Config{}
+			if got := cfg.CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+			if !strings.Contains(cfg.codexSandboxSection(j), "Git metadata is read-only; the wrapper commits") {
+				t.Fatal("generic sandbox guidance missing")
 			}
 		})
 	}
