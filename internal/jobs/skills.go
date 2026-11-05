@@ -232,10 +232,12 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 	j.SkillsNote = ""
 	if len(j.Skills) == 0 {
 		j.SkillsDelivered = nil
+		j.SkillsManifest = ""
 		return nil
 	}
 	if j.Runner == store.RunnerCodex {
 		j.SkillsDelivered, j.SkillsNote = nil, SkillsCodexNote
+		j.SkillsManifest = ""
 		m.Log.Printf("job %s: %s (%s)", j.ID, SkillsCodexNote, strings.Join(j.Skills, ", "))
 		return m.Store.SetSkillsDelivered(j.ID, token, nil, j.SkillsNote)
 	}
@@ -269,6 +271,11 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 		return fmt.Errorf("skills: %w", err)
 	}
 	j.SkillsDelivered = d.Linked
+	manifest, err := skillDeliveryManifest(work, d.Linked)
+	if err != nil {
+		_ = m.removeSkills(j)
+		return fmt.Errorf("record skill delivery manifest: %w", err)
+	}
 	if len(d.RepoOwned) > 0 {
 		j.SkillsNote = "the repository's own .claude/skills kept (repository wins): " + strings.Join(d.RepoOwned, ", ")
 		m.Log.Printf("job %s: %s", j.ID, j.SkillsNote)
@@ -283,10 +290,11 @@ func (m *Manager) deliverSkills(j *store.Job, token, work string) error {
 			return fmt.Errorf("skills: info/exclude: %w", err)
 		}
 	}
-	if err := m.Store.SetSkillsDelivered(j.ID, token, j.SkillsDelivered, j.SkillsNote); err != nil {
+	if err := m.Store.SetSkillsDelivery(j.ID, token, j.SkillsDelivered, j.SkillsNote, manifest); err != nil {
 		_ = m.removeSkills(j)
 		return fmt.Errorf("record skills: %w", err)
 	}
+	j.SkillsManifest = manifest
 	if len(d.Linked) > 0 {
 		m.Log.Printf("job %s: skills linked: %s", j.ID, strings.Join(d.Linked, ", "))
 	}

@@ -145,6 +145,8 @@ type Job struct {
 	// when the attempt ends; the record stays). A selected skill the repository already has is not
 	// linked (the repository wins); a codex job gets none.
 	SkillsDelivered []string
+	// SkillsManifest records the delivered links' targets and content digests for resume checks.
+	SkillsManifest string
 	// SkillsNote says why a selected skill was not delivered (repository wins, codex runner), "" otherwise.
 	SkillsNote string
 	// Outcome is what the orchestrator did with the result (job_outcome): accepted, extended, reworked,
@@ -609,6 +611,7 @@ var migrations = []string{
 	`ALTER TABLE launch_authorizations ADD COLUMN codex_network INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN cost_estimate_usd REAL`,
 	`ALTER TABLE attempts ADD COLUMN cost_estimate_usd REAL`,
+	`ALTER TABLE jobs ADD COLUMN skills_manifest TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -738,7 +741,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	finished_at, notified_at, cleaned_at, turns, cost_usd, duration_sec, error, launch_token,
 	complexity, runner, owner_waits, resumed_from, schedule_id, billing, session_id, attempt, run_mode,
 	pending_context, cost_unknown, session_digest, scope_unit, scope_pending, reasoning_effort,
-	skills, skills_delivered, skills_note,
+	skills, skills_delivered, skills_note, skills_manifest,
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources, cost_estimate_usd, source_files`
@@ -802,7 +805,7 @@ func insertArgs(j *Job) []any {
 		j.Turns, j.CostUSD, j.DurationSec, j.Error, j.LaunchToken,
 		j.Complexity, j.Runner, j.OwnerWaits, j.ResumedFrom, j.ScheduleID, j.Billing, j.SessionID, j.Attempt,
 		j.RunMode, j.PendingContext, j.CostUnknown, j.SessionDigest, j.ScopeUnit, j.ScopePending, j.ReasoningEffort,
-		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote,
+		JoinNames(j.Skills), JoinNames(j.SkillsDelivered), j.SkillsNote, j.SkillsManifest,
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
@@ -835,7 +838,7 @@ func scanJob(r scanner) (*Job, error) {
 		&started, &finished, &notified, &cleaned, &j.Turns, &j.CostUSD, &j.DurationSec, &j.Error, &j.LaunchToken,
 		&j.Complexity, &j.Runner, &j.OwnerWaits, &j.ResumedFrom, &j.ScheduleID, &j.Billing, &j.SessionID, &j.Attempt,
 		&j.RunMode, &j.PendingContext, &j.CostUnknown, &j.SessionDigest, &j.ScopeUnit, &j.ScopePending, &j.ReasoningEffort,
-		&skills, &delivered, &j.SkillsNote,
+		&skills, &delivered, &j.SkillsNote, &j.SkillsManifest,
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
@@ -1310,8 +1313,13 @@ func (s *Store) SetScope(id, token, unit string) error {
 // SetSkillsDelivered records the skills linked into the work dir of the running attempt (token) and
 // why a selected one was not (note).
 func (s *Store) SetSkillsDelivered(id, token string, delivered []string, note string) error {
-	return affected(s.db.Exec(`UPDATE jobs SET skills_delivered=?, skills_note=? WHERE id=? AND status='running' AND launch_token=?`,
-		JoinNames(delivered), note, id, token))
+	return s.SetSkillsDelivery(id, token, delivered, note, "")
+}
+
+// SetSkillsDelivery atomically records the daemon's delivery manifest with the delivered names.
+func (s *Store) SetSkillsDelivery(id, token string, delivered []string, note, manifest string) error {
+	return affected(s.db.Exec(`UPDATE jobs SET skills_delivered=?, skills_note=?, skills_manifest=? WHERE id=? AND status='running' AND launch_token=?`,
+		JoinNames(delivered), note, manifest, id, token))
 }
 
 // JoinNames stores a list of skill names (names never contain a comma) as one column.
