@@ -3,6 +3,7 @@ package jobs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -172,5 +173,126 @@ func TestResumeDeliveredSkillsRejectReplacements(t *testing.T) {
 				t.Fatal("changed or unrecorded delivery accepted")
 			}
 		})
+	}
+}
+
+func TestResumeLegacySkillsAfterCleanupRefused(t *testing.T) {
+	for _, missingWork := range []bool{false, true} {
+		for _, mode := range []string{"resume", "auto-continue"} {
+			name := mode + "/work-present"
+			if missingWork {
+				name = mode + "/work-missing"
+			}
+			t.Run(name, func(t *testing.T) {
+				m, j, work := deliveredResumeSkills(t, false)
+				// Model a pre-manifest delivery, edited through its link before normal cleanup.
+				if err := m.Store.SetSkillsDelivered(j.ID, "skills-test", j.SkillsDelivered, j.SkillsNote); err != nil {
+					t.Fatal(err)
+				}
+				j = get(t, m, j.ID)
+				if err := os.WriteFile(filepath.Join(work, ".claude", "skills", "golang", "SKILL.md"), []byte("changed instructions\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.removeSkills(j); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Lstat(filepath.Join(work, ".claude", "skills", "golang")); !os.IsNotExist(err) {
+					t.Fatalf("cleanup left the delivered link: %v", err)
+				}
+				if missingWork {
+					if err := os.Rename(work, work+"-previous"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("original task\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Store.Finish(j.ID, "skills-test", store.StatusFailed, 7, 0.4, 1, "turn limit", m.Now()); err != nil {
+					t.Fatal(err)
+				}
+				const reason = "no verifiable baseline"
+				if mode == "resume" {
+					if _, err := m.Resume(j.ID, "continue", Limits{}); err == nil || !strings.Contains(err.Error(), reason) {
+						t.Fatalf("legacy delivery resume must refuse with %q: %v", reason, err)
+					}
+				} else {
+					unlock, err := m.lock()
+					if err != nil {
+						t.Fatal(err)
+					}
+					m.autoContinue(j.ID, stopTurnLimit)
+					unlock()
+					if got := get(t, m, j.ID); !strings.Contains(got.Error, "not auto-continued: ") || !strings.Contains(got.Error, reason) {
+						t.Fatalf("legacy delivery auto-continuation must refuse with %q: status=%s error=%q", reason, got.Status, got.Error)
+					}
+				}
+				if got := get(t, m, j.ID); got.Status != store.StatusFailed || got.Attempt != 1 || got.SkillsManifest != "" {
+					t.Fatalf("refused legacy delivery changed: status=%s attempt=%d manifest=%q", got.Status, got.Attempt, got.SkillsManifest)
+				}
+			})
+		}
+	}
+}
+
+func TestResumeDeliveredSkillsSymlinkedWorkRefused(t *testing.T) {
+	for _, mode := range []string{"admission", "launch"} {
+		for _, name := range []string{"CLAUDE.md", ".claude/settings.local.json"} {
+			t.Run(mode+"/"+name, func(t *testing.T) {
+				m, _ := skillsManager(t)
+				j := enqueue(t, m, "resume guard", func(r *StartRequest) { r.Kind = "fix" })
+				if err := m.Store.Claim(j.ID, "skills-test", m.Now()); err != nil {
+					t.Fatal(err)
+				}
+				j = get(t, m, j.ID)
+				work := filepath.Join(m.JobDir(j.ID), "work")
+				if err := os.MkdirAll(work, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.deliverSkills(j, "skills-test", work); err != nil {
+					t.Fatal(err)
+				}
+				if len(j.SkillsDelivered) == 0 || j.SkillsManifest == "" || j.RepoPath != "" {
+					t.Fatal("fixture must have recorded deliveries and no repository")
+				}
+				if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("original task\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Store.Finish(j.ID, "skills-test", store.StatusFailed, 7, 0.4, 1, "turn limit", m.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "launch" {
+					if _, err := m.Resume(j.ID, "continue", Limits{}); err != nil {
+						t.Fatalf("unchanged work refused at admission: %v", err)
+					}
+					if err := m.Store.Claim(j.ID, "resume-test", m.Now()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Replace the root after admission too, to exercise launch-time revalidation.
+				moved := work + "-previous"
+				if err := os.Rename(work, moved); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(moved, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("planted instructions\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(moved, work); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				if mode == "admission" {
+					_, err = m.Resume(j.ID, "continue", Limits{})
+				} else {
+					_, err = m.prepareResume(get(t, m, j.ID), "resume-test")
+				}
+				if err == nil || !strings.Contains(err.Error(), "work is not a real directory") {
+					t.Fatalf("symlinked work must be refused at %s: %v", mode, err)
+				}
+			})
+		}
 	}
 }

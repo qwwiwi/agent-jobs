@@ -94,9 +94,12 @@ func skillDeliveryManifest(work string, names []string) (string, error) {
 
 // checkedSkillLinks exempts only unchanged daemon deliveries recorded in the protected jobs DB.
 // Even after cleanup removes a link, its target must still match: edits through a link must not
-// disappear from the resume check when cleanup unlinks it. Legacy rows get no new exemption.
+// disappear from the resume check when cleanup unlinks it. Legacy deliveries cannot be verified.
 func checkedSkillLinks(j *store.Job, work string) ([]string, error) {
 	if j.SkillsManifest == "" {
+		if len(j.SkillsDelivered) > 0 {
+			return nil, fmt.Errorf("delivered skills have no manifest: no verifiable baseline")
+		}
 		return nil, nil
 	}
 	var entries []deliveredSkill
