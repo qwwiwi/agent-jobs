@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -139,6 +140,17 @@ type orJournal struct {
 	base ORCostLine
 	log  io.Writer
 	once sync.Once
+	// caughtElsewhere: another handler of the wrapper owns SIGTERM (the acceptance step), so onKill's
+	// handler writes the line without ending the wrapper.
+	caughtElsewhere atomic.Bool
+}
+
+// stopsCaughtElsewhere marks (on) or clears the span in which another handler owns SIGTERM. A nil
+// journal (not an OpenRouter job) does nothing.
+func (jr *orJournal) stopsCaughtElsewhere(on bool) {
+	if jr != nil {
+		jr.caughtElsewhere.Store(on)
+	}
 }
 
 // newORJournal is the journal of j's attempt in the agent's state dir (<state>/jobs/<id> = jobDir).
@@ -161,6 +173,9 @@ func newORJournal(jobDir string, j *store.Job, log io.Writer) *orJournal {
 // started, nothing was sent), status and errText, and OpenRouter's record (billed; nil = not looked
 // up). A failure is logged, never the job's.
 func (jr *orJournal) end(orj *openRouterJob, status, errText string, billed *ORBilled) {
+	if jr == nil {
+		return // not an OpenRouter job
+	}
 	jr.once.Do(func() {
 		l := jr.base
 		l.TSEnd = time.Now().UTC().Format(time.RFC3339)
@@ -202,14 +217,22 @@ func (jr *orJournal) onKill(orj *openRouterJob) func() {
 	signal.Notify(ch, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
-		select {
-		case <-ch:
-			jr.end(orj, ORStatusKilled, "the wrapper got SIGTERM: the daemon ended the attempt (cancel, stop or timeout)",
-				&ORBilled{Generations: len(orj.proxy.generationIDs()),
-					Reason: "not looked up: the attempt was killed; run `agent-jobs openrouter costs --reconcile`"})
-			signal.Reset(syscall.SIGTERM)
-			_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
-		case <-done:
+		for {
+			select {
+			case <-ch:
+				jr.end(orj, ORStatusKilled, "the wrapper got SIGTERM: the daemon ended the attempt (cancel, stop or timeout)",
+					&ORBilled{Generations: len(orj.proxy.generationIDs()),
+						Reason: "not looked up: the attempt was killed; run `agent-jobs openrouter costs --reconcile`"})
+				if jr.caughtElsewhere.Load() {
+					continue // the acceptance step ends the wrapper; a later SIGTERM still does
+				}
+				// Die of the signal, as the wrapper did without this handler.
+				signal.Reset(syscall.SIGTERM)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+				return
+			case <-done:
+				return
+			}
 		}
 	}()
 	var stop sync.Once

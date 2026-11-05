@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -233,6 +234,27 @@ func TestORCostJournalCancelled(t *testing.T) {
 	if got := get(t, m, j.ID); got.Status != store.StatusCancelled {
 		t.Errorf("job status %s", got.Status)
 	}
+}
+
+// While the acceptance step owns SIGTERM, the journal's handler writes the line as killed and leaves the
+// wrapper's exit to the step (no signal.Reset, no re-raise: this test process survives the signal).
+func TestORCostJournalKillDuringAcceptance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), OpenRouterCostsFile)
+	jr := &orJournal{path: path, log: &bytes.Buffer{}, base: ORCostLine{Type: ORCostRun, JobID: "j", Attempt: 1}}
+	jr.stopsCaughtElsewhere(true)
+	stop := jr.onKill(&openRouterJob{proxy: &orProxy{key: orFakeKey, token: "agent-jobs-proxy-0123456789abcdef"}})
+	defer stop()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the killed line", 5*time.Second, func() bool {
+		b, _ := os.ReadFile(path)
+		return bytes.Contains(b, []byte(`"status":"killed"`))
+	})
+	// A nil journal (not an OpenRouter job) ignores both calls.
+	var none *orJournal
+	none.stopsCaughtElsewhere(true)
+	none.end(nil, store.StatusFailed, "x", nil)
 }
 
 // A write failure is logged and never fails the job.

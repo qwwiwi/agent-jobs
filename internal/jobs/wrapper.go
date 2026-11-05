@@ -781,7 +781,15 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		terminalOK = codexStreamFailure(res) == ""
 	}
 	if code == 0 && terminalOK && !sw.Incomplete() && hasReport(jobDir) {
-		if rc := runAcceptanceStep(jobDir, token, stderrLog, &res); rc != 0 {
+		// The acceptance step catches the stop signals itself: meanwhile the journal's SIGTERM handler only
+		// writes the line and leaves the wrapper's exit to the step.
+		costJournal.stopsCaughtElsewhere(true)
+		rc := runAcceptanceStep(jobDir, token, stderrLog, &res)
+		costJournal.stopsCaughtElsewhere(false)
+		if rc != 0 {
+			if rc > 128 {
+				costJournal.end(openRouter, ORStatusKilled, "the acceptance step was ended by a stop signal", nil)
+			}
 			return rc
 		}
 		// A gate job's result (Wave F) is validated and stored here, by the wrapper, never by the orchestrator,
