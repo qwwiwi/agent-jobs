@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- `job_start sources` (#125) accepts up to 10 absolute file paths or `job:<id>` reports of the same agent, at most 2 MiB per regular file. It snapshots them read-only into `sources/` before enqueue and lists their origins in the prompt; CLI `start --source` is repeatable, symlinks are refused, and repository cloning stays disabled.
+
 ### Docs
 - What a job cannot do (ssh and other out-of-scope tools, anything outside, other jobs' state) and where that work goes instead: a subagent in the orchestrator's session with a short summary, bulky data handed to the job as a file on a local `base` branch, decided before `job_start` (skills/agent-jobs/SKILL.md, docs/GUIDE.md).
 

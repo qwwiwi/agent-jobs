@@ -3,15 +3,26 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 )
 
-// sourcesMigrations add the sources columns (G02): the git URLs a job gets cloned read-only into its
-// folder, and those planned for a milestone task. Applied at the end of Open, after the milestone
+// sourcesMigrations add the legacy clone columns (G02), the milestone plans, and local file origins
+// (#125). Applied at the end of Open, after the milestone
 // tables exist. Never edit or reorder a row.
 var sourcesMigrations = []string{
 	`ALTER TABLE jobs ADD COLUMN sources TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE milestone_tasks ADD COLUMN sources TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN source_files TEXT NOT NULL DEFAULT '[]'`,
+}
+
+// sourceFilesJSON preserves commas and whitespace in source paths.
+func sourceFilesJSON(files []string) string {
+	if len(files) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(files)
+	return string(b)
 }
 
 // migrateSources applies sourcesMigrations (tolerant, like migrations).
