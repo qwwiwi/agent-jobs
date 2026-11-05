@@ -273,10 +273,12 @@ func (m *Manager) checkProjectClaude(j *store.Job, work string) error {
 	if _, err := os.Lstat(work); errors.Is(err, os.ErrNotExist) {
 		return nil // restored from the saved ref before the launch, then checked again
 	}
-	// Skill links an earlier removal left behind are the daemon's, not the project's: the next
-	// attempt adopts them (deliverSkills), and they do not count as a change, whether git sees them
-	// ignored (their exclude line kept) or untracked (the line gone).
-	left := m.leftSkillLinks(j, work)
+	// Only the daemon's recorded, unchanged links are exempt, whether ignored or untracked.
+	// Their contents are checked even when cleanup already removed the links.
+	left, err := checkedSkillLinks(j, work)
+	if err != nil {
+		return refuse(err.Error())
+	}
 	if j.RepoPath == "" {
 		found := ""
 		err := filepath.WalkDir(work, func(path string, d fs.DirEntry, err error) error {
