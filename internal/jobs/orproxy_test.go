@@ -3,8 +3,10 @@ package jobs
 import (
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -376,4 +378,90 @@ func TestOpenRouterUsageReaderOpeningCostIsNotFinal(t *testing.T) {
 	if r := u.result(); r.HasCost || r.Tokens != (TokenUsage{Input: 10, Output: 7}) {
 		t.Fatalf("usage %+v, want tokens 10/7 and no cost (the opening cost:0 is not the response's)", r)
 	}
+}
+
+// orProxyOneShot sends one /v1/messages request (max_tokens maxTokens) through a fresh socket-free proxy
+// whose upstream answers 200 with body under contentType; Output costs $40000/M, so max_tokens 10
+// reserves $0.40 and each output token costs $0.04.
+func orProxyOneShot(t *testing.T, maxTokens int, contentType, body string) *orProxy {
+	t.Helper()
+	p := &orProxy{token: "tok", slug: orGLM, upstream: "https://upstream.invalid/api", provider: json.RawMessage(`{}`),
+		budget: 100, price: ModelPrice{Output: 40000}}
+	p.client = &http.Client{Transport: orProxyRoutingTransport(func(r *http.Request) (*http.Response, error) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		h := make(http.Header)
+		h.Set("Content-Type", contentType)
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	stream := strings.HasPrefix(contentType, "text/event-stream")
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(
+		`{"model":"x","max_tokens":`+strconv.Itoa(maxTokens)+`,"stream":`+strconv.FormatBool(stream)+`,"messages":[]}`))
+	r.Header.Set("Authorization", "Bearer tok")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("request: %d", w.Code)
+	}
+	return p
+}
+
+func sseEvents(events ...string) string {
+	var b strings.Builder
+	for _, e := range events {
+		b.WriteString("data: " + e + "\n\n")
+	}
+	return b.String()
+}
+
+const sseOpening = `{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}`
+
+// #148 fix loop 2: completeness follows the latest message_delta. A usage-bearing delta followed by one
+// without usage (only its stop_reason) does not settle at the early count: the reservation is kept.
+func TestOpenRouterProxyLatestDeltaWithoutUsageIsNotFinal(t *testing.T) {
+	p := orProxyOneShot(t, 10, "text/event-stream", sseEvents(sseOpening,
+		`{"type":"message_delta","delta":{},"usage":{"output_tokens":1}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		`{"type":"message_stop"}`))
+	if c := p.Cost(); c < 0.4-1e-9 || !p.CostUncertain() {
+		t.Fatalf("cost %v uncertain %t, want the $0.40 reservation, uncertain", c, p.CostUncertain())
+	}
+}
+
+// #148 fix loop 2: an earlier delta's cost:0 does not survive a later delta with tokens but no cost; the
+// response is priced by its tokens (50 output tokens: $2.00 of a $4.00 reservation).
+func TestOpenRouterProxyLatestDeltaWithoutCostDropsEarlierCost(t *testing.T) {
+	p := orProxyOneShot(t, 100, "text/event-stream", sseEvents(sseOpening,
+		`{"type":"message_delta","delta":{},"usage":{"output_tokens":1,"cost":0}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}`,
+		`{"type":"message_stop"}`))
+	if c := p.Cost(); math.Abs(c-2) > 1e-9 || p.CostUncertain() {
+		t.Fatalf("cost %v uncertain %t, want $2.00 by tokens, known", c, p.CostUncertain())
+	}
+}
+
+// Control: cumulative deltas ending with a usage-bearing delta (output_tokens and cost) settle at that cost.
+func TestOpenRouterProxyCumulativeDeltasSettleAtLastCost(t *testing.T) {
+	p := orProxyOneShot(t, 100, "text/event-stream", sseEvents(sseOpening,
+		`{"type":"message_delta","delta":{},"usage":{"output_tokens":3,"cost":0.05}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cost":0.1}}`,
+		`{"type":"message_stop"}`))
+	if c := p.Cost(); math.Abs(c-0.1) > 1e-9 || p.CostUncertain() {
+		t.Fatalf("cost %v uncertain %t, want the reported $0.10, known", c, p.CostUncertain())
+	}
+}
+
+// #148 fix loop 2: a JSON body is final only when its usage carries output_tokens or cost.
+func TestOpenRouterProxyJSONBodyNeedsFinalUsage(t *testing.T) {
+	t.Run("input only", func(t *testing.T) {
+		p := orProxyOneShot(t, 10, "application/json", `{"type":"message","usage":{"input_tokens":10}}`)
+		if c := p.Cost(); c < 0.4-1e-9 || !p.CostUncertain() {
+			t.Fatalf("cost %v uncertain %t, want the $0.40 reservation, uncertain", c, p.CostUncertain())
+		}
+	})
+	t.Run("output tokens", func(t *testing.T) {
+		p := orProxyOneShot(t, 10, "application/json", `{"type":"message","usage":{"input_tokens":10,"output_tokens":2}}`)
+		if c := p.Cost(); math.Abs(c-0.08) > 1e-9 || p.CostUncertain() {
+			t.Fatalf("cost %v uncertain %t, want $0.08 by tokens, known", c, p.CostUncertain())
+		}
+	})
 }
