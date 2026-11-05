@@ -33,7 +33,7 @@ func TestSkillColumnsMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j.Skills != nil || j.SkillsDelivered != nil || j.SkillsNote != "" {
+	if j.Skills != nil || j.SkillsDelivered != nil || j.SkillsNote != "" || j.SkillsManifest != "" {
 		t.Fatalf("old row skills %v %v %q", j.Skills, j.SkillsDelivered, j.SkillsNote)
 	}
 	if sc, err := st.GetSchedule(1); err != nil || sc.Skills != nil {
@@ -51,12 +51,19 @@ func TestSkillColumnsMigration(t *testing.T) {
 	if err := st.SetSkillsDelivered("new-1", "other", []string{"a"}, ""); err == nil {
 		t.Fatal("recorded with a foreign token")
 	}
-	if err := st.SetSkillsDelivered("new-1", "tok", []string{"a"}, "note"); err != nil {
+	const manifest = `[{"Name":"a","Target":"/catalog/a","Digest":"test-digest"}]`
+	if err := st.SetSkillsDelivery("new-1", "other", []string{"a"}, "note", manifest); err == nil {
+		t.Fatal("recorded manifest with a foreign token")
+	}
+	if err := st.SetSkillsDelivery("new-1", "tok", []string{"a"}, "note", manifest); err != nil {
 		t.Fatal(err)
 	}
 	g, _ := st.Get("new-1")
 	if !slices.Equal(g.Skills, []string{"a", "b"}) || !slices.Equal(g.SkillsDelivered, []string{"a"}) || g.SkillsNote != "note" {
 		t.Fatalf("round trip %v %v %q", g.Skills, g.SkillsDelivered, g.SkillsNote)
+	}
+	if g.SkillsManifest != manifest {
+		t.Fatalf("manifest round trip: %q", g.SkillsManifest)
 	}
 	if err := st.PutStats(&JobStats{ID: "new-1", Kind: "fix", Model: "m", Status: StatusSucceeded, CreatedAt: now,
 		RecordedAt: now, SkillsDelivered: []string{"a"}}); err != nil {
