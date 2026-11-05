@@ -131,10 +131,10 @@ const usage = `usage: agent-jobs <command> [flags]
                                            reply to the owner is pending (owner_replied clears it);
                                            holds only the session bound by hook bind
   hook bind  --agent A                     SessionStart hook of the orchestrator session (JSON on
-                                           stdin): binds it as the session the Stop hook holds
+                                           stdin): binds it and reminds of finished jobs needing outcomes
   hook brief-reminder --agent A            UserPromptSubmit hook of the orchestrator session (JSON
-                                           on stdin): one line with the size rule and whether the
-                                           session's repo has an approved checklist; never blocks
+                                           on stdin): pending checklist and job-outcome reminders;
+                                           never blocks
   hook merge-gate --agent A                PreToolUse hook on Bash of the orchestrator session (JSON
                                            on stdin): in a repo with an approved checklist, blocks
                                            gh pr merge (exit 2) unless --match-head-commit <sha> names
@@ -2054,12 +2054,13 @@ func silentInsideJob(cmd string, args []string) bool {
 // runHook serves the hooks of the orchestrator session (Claude Code hook JSON on stdin):
 //
 //	hook bind --agent A   SessionStart hook: binds this session as the one the Stop hook holds, only
-//	                      from the notify tmux pane ($TMUX_PANE) with its cwd inside orchestrator_dir
+//	                      from the notify tmux pane ($TMUX_PANE) with its cwd inside orchestrator_dir;
+//	                      reminds it of finished jobs without outcomes
 //	hook stop --agent A   Stop hook: prints the block decision while an owner reply is pending, for
 //	                      the bound session only
 //	hook brief-reminder --agent A
-//	                      UserPromptSubmit hook: prints one reminder line (the size rule, whether the
-//	                      repo at the session's cwd has an approved checklist), for the bound session only
+//	                      UserPromptSubmit hook: pending checklist and job-outcome reminders,
+//	                      for the bound session only
 //	hook merge-gate --agent A
 //	                      PreToolUse hook on Bash: blocks gh pr merge in a repo with an approved checklist
 //	                      unless release_check passed on its --match-head-commit sha (mergeGateHook)
@@ -2141,9 +2142,14 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 			return fail(err)
 		}
 		defer m.Close()
-		// Nothing on stdout: a SessionStart hook's stdout becomes session context.
 		if err := m.BindHookSession(in, os.Getenv("TMUX_PANE")); err != nil {
 			return fail(err)
+		}
+		// SessionStart stdout becomes context, including after a restart or compaction.
+		if line, err := m.PendingOutcomeReminder(in.SessionID); err != nil {
+			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no pending-outcome reminder)")
+		} else if line != "" {
+			fmt.Fprintln(stdout, line)
 		}
 		return 0
 	}
@@ -2280,7 +2286,7 @@ func mergeGateWarningJSON(warning string) preToolUseOutput {
 // prompt goes on without a reminder.
 const briefReminderTimeout = 2 * time.Second
 
-// briefReminder is `hook brief-reminder`: the reminder line (UserPromptSubmit stdout becomes context),
+// briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
 func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
@@ -2302,7 +2308,21 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 		return "", err
 	}
 	defer m.Close()
-	return m.BriefReminder(in)
+	line, err := m.BriefReminder(in)
+	if err != nil {
+		return "", err
+	}
+	pending, err := m.PendingOutcomeReminder(in.SessionID)
+	if err != nil {
+		return "", err
+	}
+	if line == "" {
+		return pending, nil
+	}
+	if pending != "" {
+		line += "\n" + pending
+	}
+	return line, nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
