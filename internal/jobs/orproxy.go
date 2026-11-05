@@ -381,12 +381,16 @@ func scrubKey(msg, key string) string {
 	return strings.ReplaceAll(msg, key, "[redacted]")
 }
 
-// rewrite sets the body's model to the job's slug and, for /v1/messages, its provider object and (when
-// absent) its session_id (OpenRouter's sticky routing key: the provider keeps the prompt cache warm).
+// rewrite removes client routing and billing overrides on every forwarded path, then sets the body's
+// model to the job's slug and, for /v1/messages, its provider object and sticky routing session_id.
 func (p *orProxy) rewrite(b []byte, messages bool) ([]byte, int64, error) {
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(b, &body); err != nil || body == nil {
 		return nil, 0, errors.New("request body is not a JSON object")
+	}
+	// Only the job controls OpenRouter routing and billing; preserve Anthropic request fields.
+	for _, key := range []string{"models", "route", "plugins", "transforms", "preset", "provider", "usage", "session_id"} {
+		delete(body, key)
 	}
 	var maxTokens int64
 	if json.Unmarshal(body["max_tokens"], &maxTokens) != nil || maxTokens <= 0 {
@@ -402,7 +406,7 @@ func (p *orProxy) rewrite(b []byte, messages bool) ([]byte, int64, error) {
 	}
 	if messages {
 		body["provider"] = p.provider
-		if _, ok := body["session_id"]; !ok && p.sessionID != "" {
+		if p.sessionID != "" {
 			body["session_id"], _ = json.Marshal(p.sessionID)
 		}
 	}

@@ -18,6 +18,67 @@ type proxyFixture struct {
 	hits atomic.Int64
 }
 
+type orProxyRoutingTransport func(*http.Request) (*http.Response, error)
+
+func (f orProxyRoutingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestOpenRouterProxyDropsClientRouting(t *testing.T) {
+	const body = `{"model":"client/model","models":["x/expensive"],"route":"fallback","provider":{"order":["client-provider"]},"plugins":[{"id":"web"}],"transforms":["middle-out"],"preset":"client-preset","usage":{"include":true},"session_id":"client-session","max_tokens":10,"messages":[{"role":"user","content":"hello"}],"stream":true}`
+	for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
+		for _, sessionID := range []string{"job-session", ""} {
+			t.Run(path+"/session="+sessionID, func(t *testing.T) {
+				p := &orProxy{token: "tok", slug: orGLM, upstream: "https://upstream.invalid/api",
+					provider: json.RawMessage(`{"order":["job-provider"]}`), sessionID: sessionID, budget: 5}
+				hits := 0
+				p.client = &http.Client{Transport: orProxyRoutingTransport(func(r *http.Request) (*http.Response, error) {
+					hits++
+					if r.URL.Path != "/api"+path {
+						t.Errorf("upstream path = %q", r.URL.Path)
+					}
+					var got map[string]json.RawMessage
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Fatal(err)
+					}
+					for _, key := range []string{"models", "route", "plugins", "transforms", "preset", "usage"} {
+						if _, ok := got[key]; ok {
+							t.Errorf("client %s reached upstream", key)
+						}
+					}
+					want := map[string]string{"model": `"` + orGLM + `"`, "max_tokens": "10",
+						"messages": `[{"role":"user","content":"hello"}]`, "stream": "true"}
+					if path == "/v1/messages" {
+						want["provider"] = string(p.provider)
+						if sessionID != "" {
+							want["session_id"] = `"` + sessionID + `"`
+						}
+					}
+					for _, key := range []string{"provider", "session_id"} {
+						if _, ok := want[key]; !ok && got[key] != nil {
+							t.Errorf("client %s reached upstream", key)
+						}
+					}
+					for key, value := range want {
+						if string(got[key]) != value {
+							t.Errorf("%s = %s, want %s", key, got[key], value)
+						}
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+						Body: io.NopCloser(strings.NewReader(`{"usage":{"cost":0.01}}`))}, nil
+				})}
+				r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+				r.Header.Set("Authorization", "Bearer tok")
+				w := httptest.NewRecorder()
+				p.ServeHTTP(w, r)
+				if w.Code != http.StatusOK || hits != 1 {
+					t.Fatalf("status %d, upstream hits %d; want 200, 1", w.Code, hits)
+				}
+			})
+		}
+	}
+}
+
 func newProxyFixture(t *testing.T, budget float64, price ModelPrice, upstream http.HandlerFunc) *proxyFixture {
 	t.Helper()
 	f := &proxyFixture{}
