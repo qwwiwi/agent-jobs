@@ -21,6 +21,11 @@ import (
 func TestOpenRouterCostsCommand(t *testing.T) {
 	key := "sk-or-" + "v1-" + strings.Repeat("fedcba9876543210", 4)
 	var genAuth []string
+	orCostsRetry = 10 * time.Millisecond
+	t.Cleanup(func() { orCostsRetry = 2 * time.Second })
+	// Like OpenRouter: an id that is not a generation id is a 400; a generation's record is a 404 at
+	// first, then read.
+	lateAsked := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/key":
@@ -31,11 +36,21 @@ func TestOpenRouterCostsCommand(t *testing.T) {
 			_, _ = io.WriteString(w, `{"data":{"usage":3.25,"limit":20,"limit_remaining":16.75}}`)
 		case "/api/v1/generation":
 			genAuth = append(genAuth, r.Header.Get("Authorization"))
-			if r.URL.Query().Get("id") != "gen-late" {
+			id := r.URL.Query().Get("id")
+			if !strings.HasPrefix(id, "gen-") {
+				http.Error(w, `{"error":{"code":400,"message":"Invalid generation id"}}`, http.StatusBadRequest)
+				return
+			}
+			if id != "gen-late" {
 				http.NotFound(w, r)
 				return
 			}
-			_, _ = io.WriteString(w, `{"data":{"total_cost":0.5,"provider_name":"Novita","model":"z-ai/glm-5.3","native_tokens_prompt":10,"native_tokens_completion":5}}`)
+			if lateAsked++; lateAsked == 1 {
+				http.Error(w, `{"error":{"code":404,"message":"Generation not found"}}`, http.StatusNotFound)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":{"total_cost":0.5,"provider_name":"Novita","model":"z-ai/glm-5.3-20260816",`+
+				`"native_tokens_prompt":10,"native_tokens_completion":5,"native_tokens_cached":3}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -97,10 +112,13 @@ func TestOpenRouterCostsCommand(t *testing.T) {
 		!strings.Contains(text, "last 30 days: 2 run(s)  proxy $0.5000  openrouter $0.6000") {
 		t.Fatalf("reconcile output:\n%s", text)
 	}
-	if len(genAuth) != 1 || genAuth[0] != "Bearer "+key {
-		t.Fatalf("generation lookups %d", len(genAuth))
+	if len(genAuth) != 2 || genAuth[0] != "Bearer "+key || genAuth[1] != "Bearer "+key {
+		t.Fatalf("generation lookups %d, want 2 (404, then the record)", len(genAuth))
 	}
 	after, _ := os.ReadFile(journal)
+	if !strings.Contains(string(after), `"native_tokens_cached":3`) {
+		t.Errorf("the reconcile line lacks native_tokens_cached:\n%s", after)
+	}
 	if !strings.HasPrefix(string(after), body) || strings.Count(string(after), `"type":"reconcile"`) != 1 {
 		t.Fatalf("the journal was not appended to:\n%s", after)
 	}

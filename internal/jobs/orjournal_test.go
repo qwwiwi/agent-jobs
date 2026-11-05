@@ -57,7 +57,10 @@ func assertNoSecretInLine(t *testing.T, raw, prompt string) {
 	}
 }
 
+// The generation id is the response's X-Generation-Id header (the body's id is a message id, which the
+// generation endpoint refuses with 400); its record is 404 at first, then read.
 func TestORCostJournalSuccess(t *testing.T) {
+	t.Setenv("AGENT_JOBS_TEST_GENERATION_WAIT", "4s") // retry after 1s
 	f := newFakeOpenRouter(t, "0.0123")
 	f.billed = "0.0125" // within 10% of the proxy's figure: no mismatch
 	m, _ := orManager(t, f.srv.URL+"/api", writeKeyFile(t, t.TempDir()))
@@ -90,15 +93,17 @@ func TestORCostJournalSuccess(t *testing.T) {
 	}
 	o := l.OpenRouter
 	if o == nil || o.CostUSD == nil || *o.CostUSD != 0.0125 || o.Found != 1 || o.Generations != 1 || o.Reason != "" ||
-		len(o.Providers) != 1 || o.Providers[0] != "Baidu" || len(o.Models) != 1 || o.Models[0] != orGLM ||
-		o.NativeTokensPrompt != 990 || o.NativeTokensCompletion != 48 {
+		len(o.Providers) != 1 || o.Providers[0] != "Baidu" || len(o.Models) != 1 || o.Models[0] != orGLMVersion ||
+		o.NativeTokensPrompt != 990 || o.NativeTokensCompletion != 48 || o.NativeTokensCached != 512 {
 		t.Errorf("openrouter record: %s", raw[0])
 	}
 	f.mu.Lock()
-	genAuth := append([]string{}, f.genAuth...)
+	genAuth, genAsked := append([]string{}, f.genAuth...), append([]string{}, f.genAsked...)
 	f.mu.Unlock()
-	if len(genAuth) != 1 || genAuth[0] != "Bearer "+orFakeKey {
-		t.Errorf("generation lookups %d (with the key: %v)", len(genAuth), len(genAuth) == 1 && genAuth[0] == "Bearer "+orFakeKey)
+	// One 404 (not yet), then the record.
+	if len(genAuth) != 2 || genAuth[0] != "Bearer "+orFakeKey || genAuth[1] != "Bearer "+orFakeKey ||
+		genAsked[0] != "gen-1" || genAsked[1] != "gen-1" {
+		t.Errorf("generation lookups %v (with the key: %v)", genAsked, len(genAuth) == 2 && genAuth[0] == "Bearer "+orFakeKey)
 	}
 	assertNoSecretInLine(t, raw[0], "journal this run")
 	// The key is still in no artifact of the job, no log and no row.
@@ -361,5 +366,48 @@ func TestORCostsMissingJournal(t *testing.T) {
 	runs, malformed, err := ReadORCosts(filepath.Join(t.TempDir(), "none.jsonl"))
 	if err != nil || malformed != 0 || len(runs) != 0 {
 		t.Fatalf("runs %d malformed %d err %v", len(runs), malformed, err)
+	}
+}
+
+// A generation not found yet (404) is asked again with a growing delay until it is read within the
+// window; an id OpenRouter refuses (400: e.g. a message id) is a permanent error with its reason, asked
+// once. Native cached tokens are summed with the others.
+func TestLookupGenerationsNotYetAndInvalid(t *testing.T) {
+	f := newFakeOpenRouter(t, "0.01")
+	f.gens, f.genNotYet = 2, 3
+	start := time.Now()
+	b := LookupGenerations(context.Background(), http.DefaultClient, f.srv.URL+"/api", orFakeKey, []string{"gen-1", "gen-2"}, 20*time.Millisecond)
+	if b.CostUSD == nil || !near(*b.CostUSD, 0.02) || b.Found != 2 || b.Generations != 2 || b.Reason != "" ||
+		b.NativeTokensPrompt != 1980 || b.NativeTokensCompletion != 96 || b.NativeTokensCached != 1024 {
+		t.Fatalf("lookup: %+v", b)
+	}
+	// 3 x 404, then 200 per id: delays 20ms, 40ms, 60ms (doubling, capped at 3x the first).
+	if el := time.Since(start); el < 120*time.Millisecond {
+		t.Errorf("no backoff: the lookups took %v", el)
+	}
+	f.mu.Lock()
+	asked := len(f.genAsked)
+	f.mu.Unlock()
+	if asked != 8 {
+		t.Errorf("generation requests %d, want 8", asked)
+	}
+
+	f2 := newFakeOpenRouter(t, "0.01")
+	f2.gens, f2.genNotYet = 1, 0
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start = time.Now()
+	b = LookupGenerations(ctx, http.DefaultClient, f2.srv.URL+"/api", orFakeKey, []string{"msg_fdw7PJ7PWY6MaqVYHTkK", "gen-1"}, 10*time.Millisecond)
+	if b.CostUSD != nil || b.Found != 1 || !strings.Contains(b.Reason, "HTTP 400") ||
+		!strings.Contains(b.Reason, "Invalid generation id") || !strings.Contains(b.Reason, "not a generation id") {
+		t.Fatalf("lookup with a message id: %+v", b)
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Errorf("a 400 was retried: %v", el)
+	}
+	f2.mu.Lock()
+	defer f2.mu.Unlock()
+	if f2.genSeen["msg_fdw7PJ7PWY6MaqVYHTkK"] != 1 {
+		t.Errorf("the message id was asked %d times, want 1", f2.genSeen["msg_fdw7PJ7PWY6MaqVYHTkK"])
 	}
 }

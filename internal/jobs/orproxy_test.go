@@ -304,3 +304,71 @@ func TestOpenRouterProxyIncompleteKeepsReservation(t *testing.T) {
 		}
 	})
 }
+
+// The proxy keeps a response's generation id from its X-Generation-Id header (else request-id when it is
+// a gen- id), streamed or not; the body's id is a message id and never a generation id. Provider comes
+// from the body (a JSON body's top level, a stream's message_start).
+func TestOpenRouterProxyGenerationIDFromHeader(t *testing.T) {
+	const body = `{"model":"x","max_tokens":10,"messages":[]}`
+	jsonBody := `{"id":"msg_fdw7PJ7PWY6MaqVYHTkK","type":"message","role":"assistant","model":"z-ai/glm-5.3","provider":"Baidu",` +
+		`"content":[],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cost":0.01}}`
+	sse := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"provider\":\"Novita\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5,\"cost\":0.01}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	for _, c := range []struct {
+		name, genHeader, requestID string
+		stream                     bool
+		wantGen, wantProvider      string
+	}{
+		{"json, X-Generation-Id", "gen-1793920043-Vi07TN7aIT7NesZYYZHD", "gen-1793920043-Vi07TN7aIT7NesZYYZHD", false, "gen-1793920043-Vi07TN7aIT7NesZYYZHD", "Baidu"},
+		{"stream, X-Generation-Id", "gen-2", "", true, "gen-2", "Novita"},
+		{"json, request-id fallback", "", "gen-3", false, "gen-3", "Baidu"},
+		{"stream, request-id fallback", "", "gen-4", true, "gen-4", "Novita"},
+		{"request-id not a generation", "", "req_5", false, "", "Baidu"},
+		{"no header", "", "", true, "", "Novita"},
+		{"header not a token", "gen 6", "", false, "", "Baidu"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newProxyFixture(t, 5, ModelPrice{Input: 1, Output: 1}, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if c.genHeader != "" {
+					w.Header().Set("X-Generation-Id", c.genHeader)
+				}
+				if c.requestID != "" {
+					w.Header().Set("Request-Id", c.requestID)
+				}
+				if c.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, sse)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, jsonBody)
+			})
+			if code, b := f.do(t, http.MethodPost, "/v1/messages", body); code != http.StatusOK {
+				t.Fatalf("status %d: %s", code, b)
+			}
+			f.p.inflight.Wait() // the request is settled
+			ids := f.p.generationIDs()
+			if c.wantGen == "" && len(ids) != 0 || c.wantGen != "" && (len(ids) != 1 || ids[0] != c.wantGen) {
+				t.Errorf("generation ids %v, want %q", ids, c.wantGen)
+			}
+			var l ORCostLine
+			f.p.fill(&l)
+			if l := l; len(l.Providers) != 1 || l.Providers[0] != c.wantProvider {
+				t.Errorf("providers %v, want %q", l.Providers, c.wantProvider)
+			}
+		})
+	}
+	// A non-200 response's header id is not kept.
+	f := newProxyFixture(t, 5, ModelPrice{Input: 1, Output: 1}, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("X-Generation-Id", "gen-err")
+		http.Error(w, `{"error":{"message":"upstream"}}`, http.StatusBadGateway)
+	})
+	f.do(t, http.MethodPost, "/v1/messages", body)
+	f.p.inflight.Wait()
+	if ids := f.p.generationIDs(); len(ids) != 0 {
+		t.Errorf("a 502's id kept: %v", ids)
+	}
+}

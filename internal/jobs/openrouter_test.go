@@ -400,16 +400,25 @@ type fakeOpenRouter struct {
 	mu   sync.Mutex
 	auth []string
 	body []map[string]json.RawMessage
-	// Each /v1/messages response gets generation id gen-<n>; /v1/generation serves its record (billed,
-	// a total_cost) with genStatus 0, else answers genStatus; genAuth records that endpoint's auth.
+	// Like OpenRouter (live, 2026-11-05): each /v1/messages response carries its generation id gen-<n> in
+	// the X-Generation-Id and request-id headers, its message_start the message id msg_<n>.
+	// /v1/generation answers 400 to an id that is not a generation id and 404 to a generation's first
+	// genNotYet lookups (its record lags the response); then its record (billed, a total_cost) with
+	// genStatus 0, else genStatus. genAuth records that endpoint's auth, genAsked the ids it was asked.
 	gens      int
 	billed    string
 	genStatus int
+	genNotYet int
+	genSeen   map[string]int
 	genAuth   []string
+	genAsked  []string
 }
 
+// orGLMVersion is the versioned model name OpenRouter's generation record reports for orGLM.
+const orGLMVersion = orGLM + "-20260816"
+
 func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
-	f := &fakeOpenRouter{cost: cost, billed: cost}
+	f := &fakeOpenRouter{cost: cost, billed: cost, genNotYet: 1, genSeen: map[string]int{}}
 	if cost == "cut" {
 		f.billed = "0.002" // OpenRouter bills what the cut stream produced
 	}
@@ -417,21 +426,27 @@ func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/generation":
-			f.mu.Lock()
-			f.genAuth = append(f.genAuth, r.Header.Get("Authorization"))
-			status, billed, n := f.genStatus, f.billed, f.gens
-			f.mu.Unlock()
 			id := r.URL.Query().Get("id")
+			f.mu.Lock()
+			f.genAuth, f.genAsked = append(f.genAuth, r.Header.Get("Authorization")), append(f.genAsked, id)
+			f.genSeen[id]++
+			status, billed, n, early := f.genStatus, f.billed, f.gens, f.genSeen[id] <= f.genNotYet
+			f.mu.Unlock()
+			if !strings.HasPrefix(id, "gen-") {
+				http.Error(w, `{"error":{"code":400,"message":"Invalid generation id"}}`, http.StatusBadRequest)
+				return
+			}
 			var k int
-			if _, err := fmt.Sscanf(id, "gen-%d", &k); err != nil || k < 1 || k > n {
+			if _, err := fmt.Sscanf(id, "gen-%d", &k); err != nil || k < 1 || k > n || early {
 				status = http.StatusNotFound
 			}
 			if status != 0 {
-				http.Error(w, `{"error":{"message":"not found"}}`, status)
+				http.Error(w, `{"error":{"code":404,"message":"Generation not found"}}`, status)
 				return
 			}
-			_, _ = io.WriteString(w, `{"data":{"id":"`+id+`","total_cost":`+billed+`,"model":"`+orGLM+
-				`","provider_name":"Baidu","native_tokens_prompt":990,"native_tokens_completion":48}}`)
+			_, _ = io.WriteString(w, `{"data":{"id":"`+id+`","total_cost":`+billed+`,"model":"`+orGLMVersion+
+				`","provider_name":"Baidu","native_tokens_prompt":990,"native_tokens_completion":48,"native_tokens_cached":512,`+
+				`"native_tokens_reasoning":0,"tokens_prompt":1000,"tokens_completion":50,"cache_discount":0.0001}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/key":
 			if r.Header.Get("Authorization") != "Bearer "+orFakeKey {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -449,19 +464,21 @@ func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
 			f.mu.Lock()
 			f.auth, f.body = append(f.auth, r.Header.Get("Authorization")), append(f.body, body)
 			f.gens++
-			gen := fmt.Sprintf("gen-%d", f.gens)
+			gen, msg := fmt.Sprintf("gen-%d", f.gens), fmt.Sprintf("msg_%d", f.gens)
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Generation-Id", gen)
+			w.Header().Set("Request-Id", gen)
 			if f.cost == "cut" {
 				// The stream breaks before its final usage (B4).
-				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+gen+"\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n")
+				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+msg+"\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n")
 				w.(http.Flusher).Flush()
 				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
 					_ = conn.Close()
 				}
 				return
 			}
-			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+gen+"\",\"provider\":\"Baidu\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n"+
+			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+msg+"\",\"provider\":\"Baidu\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n"+
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50,\"cost\":"+f.cost+"}}\n\n"+
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 		default:

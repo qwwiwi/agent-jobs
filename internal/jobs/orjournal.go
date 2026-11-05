@@ -61,6 +61,7 @@ type ORBilled struct {
 	// The native token counts (the provider's own tokenizer) of the generations read.
 	NativeTokensPrompt     int64 `json:"native_tokens_prompt"`
 	NativeTokensCompletion int64 `json:"native_tokens_completion"`
+	NativeTokensCached     int64 `json:"native_tokens_cached"` // the record's native_tokens_cached
 	// CheckedAt is when the lookup ran (UTC, RFC 3339); empty when it did not run.
 	CheckedAt string `json:"checked_at,omitempty"`
 }
@@ -248,8 +249,13 @@ func (jr *orJournal) onKill(orj *openRouterJob) func() {
 // can lag the response by a few seconds; what is still missing then is left to --reconcile.
 var generationLookupWait = 20 * time.Second
 
-// generationRetryDelay is the wait before a generation not found yet is asked for again.
+// generationRetryDelay is the first wait before a generation not found yet is asked for again; each
+// further wait doubles, up to generationRetryGrowth times the first.
 var generationRetryDelay = 2 * time.Second
+
+// generationRetryGrowth caps the backoff of a generation lookup: OpenRouter's record usually lags the
+// response by a few seconds, so the waits stay short enough for several tries within the window.
+const generationRetryGrowth = 3
 
 // generationLookupWorkers bounds the generation requests in flight at once.
 const generationLookupWorkers = 4
@@ -267,10 +273,43 @@ type generationData struct {
 	ProviderName           string   `json:"provider_name"`
 	NativeTokensPrompt     *int64   `json:"native_tokens_prompt"`
 	NativeTokensCompletion *int64   `json:"native_tokens_completion"`
+	NativeTokensCached     *int64   `json:"native_tokens_cached"`
+}
+
+// orStatusError is an OpenRouter answer other than 200 (and 404): its status and the message of its
+// error object, when it has one.
+type orStatusError struct {
+	url     string
+	status  int
+	message string
+}
+
+func (e *orStatusError) Error() string {
+	if e.message == "" {
+		return fmt.Sprintf("get %s: HTTP %d", e.url, e.status)
+	}
+	return fmt.Sprintf("get %s: HTTP %d: %s", e.url, e.status, e.message)
+}
+
+// maxORErrorMessage caps the error message kept from an OpenRouter error body.
+const maxORErrorMessage = 200
+
+// orErrorMessage is the message of an OpenRouter error body ({"error":{"message":...}}), "" when it has
+// none; printable and capped.
+func orErrorMessage(b []byte) string {
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(b, &body) != nil {
+		return ""
+	}
+	return Printable(body.Error.Message, maxORErrorMessage)
 }
 
 // orGet reads base+path with the key and decodes its {"data": ...} into out. HTTP 404 is
-// errGenerationNotFound; an error never carries the key.
+// errGenerationNotFound, another status an *orStatusError; an error never carries the key.
 func orGet(ctx context.Context, client *http.Client, base, key, path string, out any) (retry bool, err error) {
 	u := strings.TrimRight(base, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -291,9 +330,9 @@ func orGet(ctx context.Context, client *http.Client, base, key, path string, out
 	case resp.StatusCode == http.StatusNotFound:
 		return true, errGenerationNotFound
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
-		return true, fmt.Errorf("get %s: HTTP %d", u, resp.StatusCode)
+		return true, &orStatusError{u, resp.StatusCode, scrubKey(orErrorMessage(b), key)}
 	case resp.StatusCode != http.StatusOK:
-		return false, fmt.Errorf("get %s: HTTP %d", u, resp.StatusCode)
+		return false, &orStatusError{u, resp.StatusCode, scrubKey(orErrorMessage(b), key)}
 	case len(b) > maxGenerationBytes:
 		return false, fmt.Errorf("get %s: more than %d bytes", u, maxGenerationBytes)
 	}
@@ -309,9 +348,11 @@ func orGet(ctx context.Context, client *http.Client, base, key, path string, out
 	return false, nil
 }
 
-// fetchGeneration reads one generation's record, asking again every retry while it is not found yet
-// (or OpenRouter answers 5xx / 429) until ctx ends.
+// fetchGeneration reads one generation's record, asking again while it is not found yet (404: its
+// record lags the response) or OpenRouter answers 5xx / 429, first after retry, each wait doubling up to
+// generationRetryGrowth times retry, until ctx ends. A 400 is permanent: the id is not a generation id.
 func fetchGeneration(ctx context.Context, client *http.Client, base, key, id string, retry time.Duration) (generationData, error) {
+	delay, maxDelay := retry, retry*generationRetryGrowth
 	for {
 		var d generationData
 		again, err := orGet(ctx, client, base, key, "/v1/generation?id="+url.QueryEscape(id), &d)
@@ -321,14 +362,19 @@ func fetchGeneration(ctx context.Context, client *http.Client, base, key, id str
 			}
 			return d, nil
 		}
+		var se *orStatusError
+		if errors.As(err, &se) && se.status == http.StatusBadRequest {
+			return d, fmt.Errorf("%w (not a generation id: OpenRouter refuses it)", err)
+		}
 		if !again {
 			return d, err
 		}
 		select {
 		case <-ctx.Done():
 			return d, err
-		case <-time.After(retry):
+		case <-time.After(delay):
 		}
+		delay = min(delay*2, maxDelay)
 	}
 }
 
@@ -381,6 +427,9 @@ func LookupGenerations(ctx context.Context, client *http.Client, base, key strin
 		}
 		if r.d.NativeTokensCompletion != nil {
 			out.NativeTokensCompletion += *r.d.NativeTokensCompletion
+		}
+		if r.d.NativeTokensCached != nil {
+			out.NativeTokensCached += *r.d.NativeTokensCached
 		}
 	}
 	out.Providers, out.Models = sortedKeys(providers), sortedKeys(models)

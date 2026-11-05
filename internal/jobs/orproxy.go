@@ -383,6 +383,7 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	u.ok = resp.StatusCode == http.StatusOK
+	u.genID = generationIDFromHeader(resp.Header)
 	u.stream = strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32<<10)
@@ -475,8 +476,9 @@ type responseUsage struct {
 	Tokens  TokenUsage
 	Cost    float64
 	HasCost bool
-	// GenID is OpenRouter's generation id of a 200 response (its message id), Provider the provider it
-	// names ("" when it names none).
+	// GenID is OpenRouter's generation id of a 200 response (its X-Generation-Id header; the body's id
+	// is a message id, which the generation endpoint refuses), Provider the provider its body names (""
+	// when it names none).
 	GenID    string
 	Provider string
 }
@@ -485,7 +487,8 @@ type responseUsage struct {
 // or one JSON body.
 type usageReader struct {
 	stream bool
-	ok     bool // the response is a 200: its id is a generation
+	ok     bool   // the response is a 200: genID is a generation
+	genID  string // the response header's generation id (generationIDFromHeader)
 	line   []byte
 	body   []byte
 	skip   bool
@@ -560,7 +563,6 @@ func (u *usageReader) event(line []byte) {
 		Type    string     `json:"type"`
 		Usage   *usageJSON `json:"usage"`
 		Message struct {
-			ID       string     `json:"id"`
 			Provider string     `json:"provider"`
 			Usage    *usageJSON `json:"usage"`
 		} `json:"message"`
@@ -572,7 +574,7 @@ func (u *usageReader) event(line []byte) {
 		u.stopped = true
 	}
 	if ev.Type == "message_start" {
-		u.noteID(ev.Message.ID, ev.Message.Provider)
+		u.noteProvider(ev.Message.Provider)
 	}
 	u.apply(ev.Message.Usage)
 	u.apply(ev.Usage)
@@ -594,19 +596,19 @@ func (u *usageReader) final() bool {
 func (u *usageReader) result() responseUsage {
 	if !u.stream {
 		var body struct {
-			ID       string     `json:"id"`
 			Provider string     `json:"provider"`
 			Usage    *usageJSON `json:"usage"`
 		}
 		if json.Unmarshal(u.body, &body) == nil {
 			u.apply(body.Usage)
-			u.noteID(body.ID, body.Provider)
+			u.noteProvider(body.Provider)
 		}
 	} else if len(u.line) > 0 && !u.skip {
 		u.event(u.line)
 		u.line = u.line[:0]
 	}
 	res := u.res
+	res.GenID = u.genID
 	if !u.ok {
 		res.GenID, res.Provider = "", ""
 	}
@@ -616,14 +618,27 @@ func (u *usageReader) result() responseUsage {
 // maxGenIDLen caps a generation id or provider name the proxy keeps.
 const maxGenIDLen = 200
 
-// noteID keeps a response's message id and provider when they are short printable tokens.
-func (u *usageReader) noteID(id, provider string) {
-	if id != "" && len(id) <= maxGenIDLen && Printable(id, 0) == id && !strings.Contains(id, " ") {
-		u.res.GenID = id
-	}
+// noteProvider keeps the provider a response's body names when it is a short printable string.
+func (u *usageReader) noteProvider(provider string) {
 	if provider != "" && len(provider) <= maxGenIDLen && Printable(provider, 0) == provider {
 		u.res.Provider = provider
 	}
+}
+
+// generationIDFromHeader is OpenRouter's generation id of a response: its X-Generation-Id header, else
+// its request-id header when that is a generation id (gen-...); "" when neither is a short printable
+// token. The body's id is a message id (msg_...), not a generation id.
+func generationIDFromHeader(h http.Header) string {
+	token := func(id string) bool {
+		return id != "" && len(id) <= maxGenIDLen && Printable(id, 0) == id && !strings.ContainsAny(id, " \t")
+	}
+	if id := strings.TrimSpace(h.Get("X-Generation-Id")); token(id) {
+		return id
+	}
+	if id := strings.TrimSpace(h.Get("Request-Id")); strings.HasPrefix(id, "gen-") && token(id) {
+		return id
+	}
+	return ""
 }
 
 // ReadOpenRouterKey reads OPENROUTER_API_KEY from an env-style key file (KEY=value lines, # comments,
