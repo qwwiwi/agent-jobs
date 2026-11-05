@@ -62,6 +62,11 @@ type orProxy struct {
 	refused   int
 	closed    bool           // close charged what was still in flight: later settles change nothing
 	inflight  sync.WaitGroup // the /v1/messages requests between reserve and settle
+	// genIDs are the OpenRouter generation ids of the successful responses (the cost journal looks them
+	// up), providers the providers the responses named.
+	genIDs    []string
+	genSeen   map[string]bool
+	providers map[string]bool
 
 	ln        net.Listener
 	srv       *http.Server
@@ -193,6 +198,7 @@ func (p *orProxy) settle(hold float64, u responseUsage, how settleOutcome) {
 	defer p.inflight.Done()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.noteGeneration(u)
 	if p.closed {
 		return // close charged the reservation
 	}
@@ -220,6 +226,54 @@ func (p *orProxy) settle(hold float64, u responseUsage, how settleOutcome) {
 		p.cost += math.Max(c, hold)
 		p.uncertain++
 	}
+}
+
+// noteGeneration keeps a response's generation id and provider (p.mu held).
+func (p *orProxy) noteGeneration(u responseUsage) {
+	if u.GenID != "" && !p.genSeen[u.GenID] {
+		if p.genSeen == nil {
+			p.genSeen = map[string]bool{}
+		}
+		p.genSeen[u.GenID] = true
+		p.genIDs = append(p.genIDs, u.GenID)
+	}
+	if u.Provider != "" {
+		if p.providers == nil {
+			p.providers = map[string]bool{}
+		}
+		p.providers[u.Provider] = true
+	}
+}
+
+// generationIDs are the generation ids of the job's responses so far.
+func (p *orProxy) generationIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string{}, p.genIDs...)
+}
+
+// requestCount is how many /v1/messages requests were sent.
+func (p *orProxy) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.requests
+}
+
+// fill puts the proxy's figures into a cost journal line: requests, tokens, the cost (nil and unknown
+// when it is not settled: then the reservation it was charged), generation ids and providers.
+func (p *orProxy) fill(l *ORCostLine) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l.Requests = p.requests
+	l.TokensIn, l.TokensOut, l.CacheRead, l.CacheWrite = p.usage.Input, p.usage.Output, p.usage.CacheRead, p.usage.CacheWrite
+	cost := p.cost + p.reserved
+	if p.uncertain > 0 || p.pending > 0 {
+		l.CostUnknown, l.CostReservedUSD = true, &cost
+	} else {
+		l.CostUSD = &cost
+	}
+	l.GenerationIDs = append([]string{}, p.genIDs...)
+	l.Providers = sortedKeys(p.providers)
 }
 
 // BudgetFailure is the job's failure reason once a request was refused for the budget ("" before).
@@ -328,6 +382,7 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+	u.ok = resp.StatusCode == http.StatusOK
 	u.stream = strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32<<10)
@@ -420,12 +475,17 @@ type responseUsage struct {
 	Tokens  TokenUsage
 	Cost    float64
 	HasCost bool
+	// GenID is OpenRouter's generation id of a 200 response (its message id), Provider the provider it
+	// names ("" when it names none).
+	GenID    string
+	Provider string
 }
 
 // usageReader scans a response body for its usage: SSE `data:` lines (message_start, message_delta)
 // or one JSON body.
 type usageReader struct {
 	stream bool
+	ok     bool // the response is a 200: its id is a generation
 	line   []byte
 	body   []byte
 	skip   bool
@@ -500,7 +560,9 @@ func (u *usageReader) event(line []byte) {
 		Type    string     `json:"type"`
 		Usage   *usageJSON `json:"usage"`
 		Message struct {
-			Usage *usageJSON `json:"usage"`
+			ID       string     `json:"id"`
+			Provider string     `json:"provider"`
+			Usage    *usageJSON `json:"usage"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(bytes.TrimSpace(data), &ev) != nil {
@@ -508,6 +570,9 @@ func (u *usageReader) event(line []byte) {
 	}
 	if ev.Type == "message_stop" {
 		u.stopped = true
+	}
+	if ev.Type == "message_start" {
+		u.noteID(ev.Message.ID, ev.Message.Provider)
 	}
 	u.apply(ev.Message.Usage)
 	u.apply(ev.Usage)
@@ -529,16 +594,36 @@ func (u *usageReader) final() bool {
 func (u *usageReader) result() responseUsage {
 	if !u.stream {
 		var body struct {
-			Usage *usageJSON `json:"usage"`
+			ID       string     `json:"id"`
+			Provider string     `json:"provider"`
+			Usage    *usageJSON `json:"usage"`
 		}
 		if json.Unmarshal(u.body, &body) == nil {
 			u.apply(body.Usage)
+			u.noteID(body.ID, body.Provider)
 		}
 	} else if len(u.line) > 0 && !u.skip {
 		u.event(u.line)
 		u.line = u.line[:0]
 	}
-	return u.res
+	res := u.res
+	if !u.ok {
+		res.GenID, res.Provider = "", ""
+	}
+	return res
+}
+
+// maxGenIDLen caps a generation id or provider name the proxy keeps.
+const maxGenIDLen = 200
+
+// noteID keeps a response's message id and provider when they are short printable tokens.
+func (u *usageReader) noteID(id, provider string) {
+	if id != "" && len(id) <= maxGenIDLen && Printable(id, 0) == id && !strings.Contains(id, " ") {
+		u.res.GenID = id
+	}
+	if provider != "" && len(provider) <= maxGenIDLen && Printable(provider, 0) == provider {
+		u.res.Provider = provider
+	}
 }
 
 // ReadOpenRouterKey reads OPENROUTER_API_KEY from an env-style key file (KEY=value lines, # comments,
@@ -663,9 +748,10 @@ func projectSettingsEnvConflict(work string) (string, error) {
 
 // openRouterJob is what the wrapper prepares for an OpenRouter job before claude starts.
 type openRouterJob struct {
-	proxy *orProxy
-	slug  string
-	note  string
+	proxy    *orProxy
+	slug     string
+	note     string
+	endpoint string // the endpoint the routing policy picked ("" when the endpoints list was not read)
 }
 
 // fetchEndpointsTimeout bounds the endpoints read at a job's start.
@@ -713,7 +799,7 @@ func setupOpenRouter(c Config, model, kind, repo, jobDir, jobID string, budget f
 	if err := startORProxy(p); err != nil {
 		return nil, err
 	}
-	return &openRouterJob{proxy: p, slug: slug, note: plan.Note + "; provider " + string(provider)}, nil
+	return &openRouterJob{proxy: p, slug: slug, note: plan.Note + "; provider " + string(provider), endpoint: plan.Pick}, nil
 }
 
 // env is openRouterEnv for this job's proxy.

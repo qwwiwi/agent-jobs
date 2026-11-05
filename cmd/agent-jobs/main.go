@@ -158,6 +158,12 @@ const usage = `usage: agent-jobs <command> [flags]
                                            context, uptime, sorted by the routing policy (the agent's
                                            providers.openrouter, else the defaults); * = the endpoint
                                            the policy picks. --file reads a saved endpoints JSON
+  openrouter costs --agent A [--days N] [--json] [--reconcile]
+                                           the OpenRouter cost journal (<state>/openrouter-costs.jsonl):
+                                           one line per attempt, the proxy's cost and OpenRouter's billed
+                                           cost (MISMATCH over 10%), totals per day, per model, 30 days,
+                                           headed by the key's usage/limit; --reconcile fills OpenRouter's
+                                           record of runs that lack it
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)

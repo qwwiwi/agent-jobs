@@ -400,13 +400,44 @@ type fakeOpenRouter struct {
 	mu   sync.Mutex
 	auth []string
 	body []map[string]json.RawMessage
+	// Each /v1/messages response gets generation id gen-<n>; /v1/generation serves its record (billed,
+	// a total_cost) with genStatus 0, else answers genStatus; genAuth records that endpoint's auth.
+	gens      int
+	billed    string
+	genStatus int
+	genAuth   []string
 }
 
 func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
-	f := &fakeOpenRouter{cost: cost}
+	f := &fakeOpenRouter{cost: cost, billed: cost}
+	if cost == "cut" {
+		f.billed = "0.002" // OpenRouter bills what the cut stream produced
+	}
 	glm := readFixture(t, orGLM)
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/generation":
+			f.mu.Lock()
+			f.genAuth = append(f.genAuth, r.Header.Get("Authorization"))
+			status, billed, n := f.genStatus, f.billed, f.gens
+			f.mu.Unlock()
+			id := r.URL.Query().Get("id")
+			var k int
+			if _, err := fmt.Sscanf(id, "gen-%d", &k); err != nil || k < 1 || k > n {
+				status = http.StatusNotFound
+			}
+			if status != 0 {
+				http.Error(w, `{"error":{"message":"not found"}}`, status)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":{"id":"`+id+`","total_cost":`+billed+`,"model":"`+orGLM+
+				`","provider_name":"Baidu","native_tokens_prompt":990,"native_tokens_completion":48}}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/key":
+			if r.Header.Get("Authorization") != "Bearer "+orFakeKey {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":{"label":"sk-or-v1-abc...","usage":3.25,"limit":20,"limit_remaining":16.75}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/models/"+orGLM+"/endpoints":
 			if r.Header.Get("Authorization") != "" {
 				t.Errorf("the endpoints list must be read without a key")
@@ -417,18 +448,20 @@ func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			f.auth, f.body = append(f.auth, r.Header.Get("Authorization")), append(f.body, body)
+			f.gens++
+			gen := fmt.Sprintf("gen-%d", f.gens)
 			f.mu.Unlock()
 			w.Header().Set("Content-Type", "text/event-stream")
 			if f.cost == "cut" {
 				// The stream breaks before its final usage (B4).
-				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n")
+				_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+gen+"\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n")
 				w.(http.Flusher).Flush()
 				if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
 					_ = conn.Close()
 				}
 				return
 			}
-			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n"+
+			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\""+gen+"\",\"provider\":\"Baidu\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\n"+
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":50,\"cost\":"+f.cost+"}}\n\n"+
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 		default:
@@ -458,6 +491,9 @@ if [[ $prompt == *KEYPROBE=* ]]; then
   { cat "$key"; echo "cat rc=$?"; printf 'cat "%s"\n' "$key" > ../probe.sh; bash ../probe.sh; echo "script rc=$?"; } > ../key-probe.txt 2>&1
 fi
 echo "first $(send "$ANTHROPIC_AUTH_TOKEN")" >> ../claude-codes.txt
+if [[ $prompt == *FAKE_HANG* ]]; then
+  sleep 60 # until the daemon ends the attempt
+fi
 if [[ $prompt == *FAKE_TWO* ]]; then
   echo "second $(send "$ANTHROPIC_AUTH_TOKEN")" >> ../claude-codes.txt
 fi

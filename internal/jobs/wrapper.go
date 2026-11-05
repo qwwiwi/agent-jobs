@@ -625,6 +625,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	defer st.Close()
 	var prepared *PrepareResult   // the prepare step's result goes into every record of this launch
 	var openRouter *openRouterJob // an OpenRouter job's proxy: its cost goes into every record
+	var costJournal *orJournal    // an OpenRouter job's line in the cost journal
 	record := func(res StreamResult) error {
 		res.Prepare = prepared
 		if openRouter != nil {
@@ -706,13 +707,19 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			return 2
 		}
 		if IsOpenRouterJob(j) {
+			// The attempt's line in the cost journal is written whatever ends it: a start failure here, the
+			// completion below, a SIGTERM from the daemon (onKill), or an early return (the deferred end).
+			costJournal = newORJournal(jobDir, j, stderrLog)
 			orj, fail := wrapperOpenRouter(jobDir, j, stderrLog)
 			if fail != "" {
 				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				costJournal.end(nil, store.StatusFailed, fail, nil)
 				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
 			}
 			openRouter, runEnv = orj, orj.env
 			defer orj.proxy.close()
+			defer costJournal.onKill(orj)()
+			defer costJournal.end(orj, store.StatusFailed, "the wrapper ended without recording the attempt's completion (see stderr.log)", nil)
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, runEnv, observe)
@@ -793,9 +800,20 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		// The covers (F4) come from the job's row; an unreadable row fails closed.
 		res.ReportContractNote = wrapperContractNote(report, func() (*store.Job, error) { return st.Get(id) })
 	}
+	var billed *ORBilled
+	if openRouter != nil {
+		// OpenRouter's own record of the attempt's requests, read as late as possible (it lags a little).
+		billed = openRouter.lookup()
+	}
 	if err := record(res); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: record completion:", err)
 		return 2
+	}
+	if costJournal != nil {
+		final := res
+		openRouter.apply(&final)
+		status, msg := Verdict(code, final, jobDir)
+		costJournal.end(openRouter, status, msg, billed)
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)

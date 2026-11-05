@@ -676,6 +676,7 @@ type routingPlan struct {
 	Provider map[string]any
 	Price    ModelPrice
 	Note     string
+	Pick     string // the endpoint the policy picks ("" when the endpoints list was not read)
 }
 
 // planRouting builds the routing plan of slug from the endpoints list (eps; nil when it could not be
@@ -720,7 +721,7 @@ func planRouting(c Config, slug string, eps []Endpoint, fetchErr error) (routing
 		// sort orders the eligible endpoints (only the policy's explicit order goes first).
 		ranks = nil
 	}
-	return routingPlan{Provider: p.ProviderObject(ranks, low), Price: price,
+	return routingPlan{Provider: p.ProviderObject(ranks, low), Price: price, Pick: pick.Tag,
 		Note: fmt.Sprintf("openrouter %s: policy picks %s (%s, $%g/$%g per 1M in/out), %d eligible endpoint(s), sort %s",
 			slug, pick.Tag, pick.Quantization, pick.Input, pick.Output, len(order), p.Sort)}, nil
 }
