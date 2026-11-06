@@ -1420,11 +1420,25 @@ func TestRemoteTransfersIndirectRefused(t *testing.T) {
 		// An option value is no operand and no option letter: local rsync stays allowed.
 		{"rsync --exclude separate value", `rsync --exclude cache:old ./src/ ./dst/`, false},
 		{"rsync -f attached filter", `rsync -f'-x.cache' ./src/ ./dst/`, false},
-		{"rsync -f glob value still refused", `rsync -f'- *.cache' ./src/ ./dst/`, true}, // by the
-		// .git glob rule (a `*` word in a non-reader's argument), not the remote-host rule
+		// #155: a quoted filter pattern is matcher data, not a glob path (no longer refused).
+		{"rsync -f glob value is filter data", `rsync -f'- *.cache' ./src/ ./dst/`, false},
 		{"rsync --files-from value", `rsync --files-from list.txt ./src/ ./dst/`, false},
 		{"rsync -B separate value", `rsync -B 4096 ./src/ ./dst/`, false},
 		{"find -exec rsync local then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
+		// Find terminators are recognised in context only.
+		{"find -ok plus is not a terminator", `find . -ok rsync a + host:/x \;`, true},
+		{"runner escaped semicolon is an argument", `setsid rsync a \; host:/x`, true},
+		{"find -exec runner then remote after literal plus", `find . -exec setsid rsync + host:/x \;`, true},
+		// Double nesting: the remote operand comes from parallel's input.
+		{"find -exec parallel rsync", `find . -exec parallel rsync ./src/ \;`, true},
+		{"setsid parallel with option rsync", `setsid parallel -j2 rsync ./src/`, true},
+		{"find -exec xargs rsync", `find . -exec xargs -I{} rsync ./src/ {} \;`, true},
+		{"find -exec parallel ssh", `find . -exec parallel ssh ::: host \;`, true},
+		{"find -exec setsid ssh", `find . -exec setsid ssh host ls \;`, true},
+		// Dynamic operands: a static local prefix keeps the word local, otherwise unverifiable.
+		{"dynamic without prefix", `D=x; rsync -a ./src/ "$D"`, true},
+		{"dynamic host prefix", `D=x; rsync -a ./src/ host:"$D"`, true},
+		{"dynamic option cluster", `O=-e; rsync "$O" ssh a b`, true},
 		// Still refused: an -e cluster names the shell.
 		{"rsync -avze ssh still refused", `rsync -avze ssh a host:/b`, true},
 	}
@@ -1580,6 +1594,46 @@ func TestCgroupPathSplitCoprocAndSedScripts(t *testing.T) {
 		{"env variable braces", `echo 1 >> "${OUT}"`, false},
 		{"ansi-c newline elsewhere", `printf $'a\n' > out.txt`, false},
 		{"coproc plain", `coproc cat`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
+// Fix loop of #155 (round 2): an unquoted expansion (bare) may split into several words, so it is
+// neither an option's data value nor a local-prefix operand; filter data and find predicate values
+// that merely contain the words rsync/parallel are data, not code or runners.
+func TestRsyncBareExpansionAndDataValues(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// Unquoted expansion as an option value can inject operands.
+		{"bare exclude value injects remote", `P='cache ./src/ host:/dst/'; setsid rsync --exclude $P`, true},
+		{"bare exclude=value injects remote", `P='cache ./src/ host:/dst/'; rsync --exclude=$P`, true},
+		{"bare -f value injects remote", `P='x ./src/ host:/dst/'; rsync -f $P`, true},
+		{"bare local prefix injects remote", `D='x host:/dst/'; rsync ./src/ ./out/$D`, true},
+		{"bare local prefix setsid", `D='x host:/dst/'; setsid rsync ./src/ ./out/$D`, true},
+		// Filter data that contains the word rsync is not code.
+		{"exclude value with rsync word", `rsync --exclude 'rsync cache' ./src/ ./dst/`, false},
+		{"exclude= value with rsync word", `rsync --exclude='rsync cache' ./src/ ./dst/`, false},
+		{"filter value with rsync word", `rsync -f'- rsync (x)' ./src/ ./dst/`, false},
+		{"python -c rsync still refused", `python3 -c 'import os; os.system("rsync ./src/ host:/dst/")'`, true},
+		{"watch rsync still refused", `watch 'rsync ./src/ host:/dst/'`, true},
+		// A find predicate value named like a runner is data.
+		{"find -name parallel -exec rsync local", `find . -name parallel -exec rsync ./src/ ./dst/ \;`, false},
+		{"find -name parallel -exec rsync remote", `find . -name parallel -exec rsync ./src/ host:/dst/ \;`, true},
+		{"find -exec parallel rsync still refused", `find . -exec parallel rsync ./src/ \;`, true},
+		{"find -exec xargs rsync still refused", `find . -exec xargs rsync ./src/ \;`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
