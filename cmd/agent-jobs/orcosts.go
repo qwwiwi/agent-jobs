@@ -73,12 +73,12 @@ func cmdOpenRouterCosts(args []string, out io.Writer) error {
 			return err
 		}
 		for _, r := range runs {
-			if (r.OpenRouter != nil && r.OpenRouter.CostUSD != nil) || len(r.GenerationIDs) == 0 {
+			if r.OpenRouter != nil && r.OpenRouter.CostUSD != nil {
 				continue
 			}
-			if r.RequestsWithoutGenerationID > 0 {
-				// A billed request without a generation id: OpenRouter's record of the others is not the
-				// run's cost, so no lookup completes it.
+			if r.RequestsWithoutGenerationID > 0 || len(r.GenerationIDs) == 0 {
+				// A billed request without a generation id (or no id at all to look up): OpenRouter's
+				// record of the others is not the run's cost, so no lookup completes it.
 				unresolved++
 				continue
 			}
