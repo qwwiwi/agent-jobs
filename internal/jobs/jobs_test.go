@@ -325,6 +325,14 @@ echo '{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total
 `
 
 const fakeTmux = `#!/bin/bash
+for a in "$@"; do
+  # The pane-mode probe before a line is no keystroke: answer "out of any mode" and keep it out of
+  # the call log the tests compare.
+  if [[ $a == display-message ]]; then
+    echo 0
+    exit 0
+  fi
+done
 printf '%s|' "$@" >> "$FAKE_TMUX_LOG"
 printf '\n' >> "$FAKE_TMUX_LOG"
 `

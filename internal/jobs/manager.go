@@ -505,6 +505,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
 			return nil, err
 		}
+		if len(r.Sources) > 0 { // before any snapshot is taken or budget reserved (#146)
+			if r.plannedSources {
+				return nil, fmt.Errorf("%w; task %s of milestone %d has sources planned (give job_start sources: [] to run it without them)",
+					errOpenRouterSources, r.Task, r.Milestone)
+			}
+			return nil, errOpenRouterSources
+		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)

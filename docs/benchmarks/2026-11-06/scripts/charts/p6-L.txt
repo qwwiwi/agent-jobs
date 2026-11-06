@@ -1,0 +1,27 @@
+A clean, minimalist, professional data table infographic in a dark theme (near-black background #0E0F12, soft gold accent #D4A84B, white and light-grey text, thin divider lines). Style of a top-tier ML benchmark report: flat, crisp sans-serif typography, aligned columns, no 3D, no icons, no emoji. All text in Russian exactly as written. Every number and word in the table must be rendered exactly as given, no extra rows.
+
+Title: «Большие задачи: каждая джоба»
+Subtitle: «Вердикт Codex gpt-6.1-sol · находки ревью H = High, M = Medium, L = Low · цена: Claude – эквивалент API, GLM – реальные деньги»
+
+Table columns: Модель | Результат | Находки | Цена | Время | Примечание
+Color the Результат cell: «решено» gold text, «частично» light grey, «таймаут, ветки нет» muted red. Each issue is a group with a gold group header row showing the issue number and its description.
+
+Group header: «#134 – Раннер гейтов: проверка HEAD, маркер выхода, kill группы, чистое окружение»
+  Opus high | частично | H 1 · M 1 · L 0 | $2.60 | 35 мин | 
+  Sonnet high | частично | H 3 · M 1 · L 0 | $0.51 | 5 мин | 
+  Sonnet medium | частично | H 2 · M 1 · L 0 | $0.25 | 4 мин | 
+  GLM 5.3 | частично | H 2 · M 1 · L 0 | $0.76 | 48 мин | 
+
+Group header: «#119 – Вехи: считать реальные зависимости и занимать все слоты джоб»
+  Opus high | частично | H 1 · M 2 · L 0 | $4.63 | 56 мин | 
+  Sonnet high | решено | H 0 · M 0 · L 1 | $1.25 | 42 мин | 
+  Sonnet medium | частично | H 1 · M 1 · L 1 | $0.72 | 40 мин | 
+  GLM 5.3 | таймаут, ветки нет | — | — | 61 мин | джоба не уложилась в 60 мин
+
+Group header: «#135 – ui-check: оркестратор может запустить код джобы»
+  Opus high | решено | H 0 · M 0 · L 0 | $1.89 | 33 мин | 
+  Sonnet high | частично | H 0 · M 1 · L 0 | $0.68 | 6 мин | 
+  Sonnet medium | частично | H 1 · M 0 · L 0 | $0.34 | 13 мин | 
+  GLM 5.3 | частично | H 1 · M 0 · L 0 | $0.76 | 31 мин | джоба упала, коммит есть
+
+Footer small grey: «Один прогон на клетку · ревью читало код, тесты не запускало · время завышено: шло 5 джоб параллельно»

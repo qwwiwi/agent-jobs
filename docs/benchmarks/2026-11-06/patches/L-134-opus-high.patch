@@ -1,0 +1,757 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..ab67882 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ## [Unreleased]
+ 
+ ### Added
++- Serialized gate runner (#134): `agent-jobs gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] [--lock PATH] -- CMD [ARGS...]` runs one heavy local gate at a time per box (`flock` on `<home>/gate.lock`, a bounded wait that names the holder), only when HEAD of DIR is REV (checked again after the run), in a process group of its own that is killed on the timeout (exit 124), on a stop signal and after the command exits (no orphan suites), without `TELEGRAM_*` in the environment, and always ends stdout with `exit=N`.
+ - The job-done line flags a fast empty coder job (#132): kind fix or general that ended `succeeded` or `cancelled` within three minutes with a repository and not one commit over its base gets `· suspicious: no commits in <N>m` — such a run almost always hit a brief or sandbox mismatch instead of finishing real work. The zero-commits finding is the merge check's own (the head still at the base commit, cached like a merge note; no extra git call), so a job without a worktree is never flagged on a guess; review and research jobs and jobs without a repository are never flagged. The finding is always the latest check's own: each merge check clears it before it runs and records it again only when it sees the head at the base itself (and records "has commits" as soon as its rev-list confirms them), and a requeue (resume) drops it, so a retry whose check fails — a timeout, a missing branch, a worktree that no longer verifies — never flags a job that committed meanwhile. Only the delivered job-done line carries the note: `job_result`'s `done_line` never does — the MCP server runs its own manager, which never ran the merge check, so it has no finding to reuse.
+ - OpenRouter models as job runners (#136): `model: "openrouter:<slug>"` runs a claude job on a model of config `providers.openrouter.models` through a per-job loopback proxy in the wrapper, which holds the key (read from `key_file` at start, never in config.json, claude's environment or any job file), injects the `provider` routing object (routing policy: `sort` price by default, `min_quantization` fp8, `data_collection` deny, `zdr`, `min_uptime_pct` 95, `ignore`, `order`; per model `model_routing`) and enforces the job's budget from OpenRouter's reported usage. Billing `api`; `daily_cap_usd` refuses new jobs past the cap; refused for kind review, codex and `deny_repos`; no resume. `agent-jobs openrouter endpoints <slug>` ranks a model's data-center endpoints by the policy. `job_list` / `job_status` / the HTTP API show `provider`; `job_stats --by provider`. With `providers.openrouter` set, every job's processes are kept from reading the key file's directory by Linux Landlock (the key directory must be outside `$HOME`, the temp dirs and the state dir; codex jobs on codex's native bwrap sandbox, which cannot start under any Landlock ruleset, run their codex process outside the key sandbox with a warning in stderr.log and `system_doctor` under `providers.openrouter.codex_policy` `allow_unprotected`, the default, or are refused under `refuse`); the proxy forwards only `POST /v1/messages` and `count_tokens`, reserves each request's worst case against the budget, and records a request without its final usage at its reservation with the cost unknown.
+ - OpenRouter cost journal: each attempt of an OpenRouter job appends one JSON line to `<state>/openrouter-costs.jsonl` (mode 600, append-only; written on success, failure, budget refusal and on the daemon's SIGTERM) with its tokens, the proxy's cost and OpenRouter's billed record of its generations (`GET /api/v1/generation`, read by the wrapper with the key, which never reaches the line); `agent-jobs openrouter costs --agent A [--days N] [--json] [--reconcile]` lists the runs with both costs (a mismatch over 10% flagged), totals per day, per model and over 30 days, the key's usage and limit (`GET /api/v1/key`), and fills missing OpenRouter records by appending reconcile lines. The proxy removes the key and anything `sk-or-` shaped from upstream error bodies (non-200, forwarded with their own Content-Length) and from a stream's error events before claude sees them.
+diff --git a/cmd/agent-jobs/gaterun.go b/cmd/agent-jobs/gaterun.go
+new file mode 100644
+index 0000000..02010b7
+--- /dev/null
++++ b/cmd/agent-jobs/gaterun.go
+@@ -0,0 +1,46 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"flag"
++	"fmt"
++	"io"
++	"os"
++	"os/signal"
++	"syscall"
++
++	"github.com/qwwiwi/agent-jobs/internal/jobs"
++)
++
++const gateRunUsage = "usage: agent-jobs gate run --head REV [--repo DIR] [--timeout D] [--lock-wait D] [--lock PATH] -- CMD [ARGS...]"
++
++// cmdGateRun is `agent-jobs gate run` (#134): one heavy local gate at a time per box, on the asserted
++// HEAD, in a process group of its own, without TELEGRAM_*, always ending with exit=N on stdout
++// (jobs.RunGate). It returns the exit code; a usage error is GateExitRunner and prints the marker too.
++func cmdGateRun(args []string, stdout, stderr io.Writer) int {
++	fs := flag.NewFlagSet("gate run", flag.ContinueOnError)
++	fs.SetOutput(stderr)
++	repo := fs.String("repo", ".", "the git work tree the command runs in")
++	head := fs.String("head", "", "the commit HEAD must be at (required)")
++	timeout := fs.Duration("timeout", jobs.DefaultGateTimeout, "the command's time limit; then its process group is killed")
++	lockWait := fs.Duration("lock-wait", jobs.DefaultGateLockWait, "how long to wait for another gate on this box")
++	lock := fs.String("lock", "", "the box-wide gate lock (default <agent-jobs home>/gate.lock)")
++	// Flags stop at the command: what follows (its own flags too) is passed through untouched.
++	if err := fs.Parse(args); err != nil {
++		if errors.Is(err, flag.ErrHelp) {
++			fmt.Fprintln(stderr, gateRunUsage)
++		}
++		fmt.Fprintf(stdout, "exit=%d\n", jobs.GateExitRunner)
++		return jobs.GateExitRunner
++	}
++	if fs.NArg() == 0 || *timeout < 0 || *lockWait < 0 {
++		fmt.Fprintln(stderr, gateRunUsage)
++		fmt.Fprintf(stdout, "exit=%d\n", jobs.GateExitRunner)
++		return jobs.GateExitRunner
++	}
++	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
++	defer stop()
++	return jobs.RunGate(ctx, jobs.GateRun{Dir: *repo, Head: *head, Argv: fs.Args(), Timeout: *timeout, LockWait: *lockWait,
++		LockPath: *lock, Env: os.Environ(), Stdout: stdout, Stderr: stderr})
++}
+diff --git a/cmd/agent-jobs/gaterun_test.go b/cmd/agent-jobs/gaterun_test.go
+new file mode 100644
+index 0000000..c3a014f
+--- /dev/null
++++ b/cmd/agent-jobs/gaterun_test.go
+@@ -0,0 +1,53 @@
++package main
++
++import (
++	"bytes"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// `agent-jobs gate run` passes the command's own flags through, takes the lock under the agent-jobs home
++// and always ends stdout with exit=N, also on a usage error.
++func TestGateRunCLI(t *testing.T) {
++	home := t.TempDir()
++	t.Setenv("AGENT_JOBS_HOME", home)
++	t.Setenv("TELEGRAM_BOT_TOKEN", "do-not-pass")
++	repo := t.TempDir()
++	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q",
++		"--allow-empty", "-m", "init"}} {
++		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
++			t.Fatalf("git %v: %v %s", args, err, out)
++		}
++	}
++	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
++	if err != nil {
++		t.Fatal(err)
++	}
++	head := strings.TrimSpace(string(out))
++
++	run := func(args ...string) (int, string, string) {
++		var o, e bytes.Buffer
++		code := cmdGateRun(args, &o, &e)
++		return code, o.String(), e.String()
++	}
++	code, o, e := run("--repo", repo, "--head", head, "--", "/bin/sh", "-c", `echo "arg=$1 tg=${TELEGRAM_BOT_TOKEN:-none}"; exit 4`,
++		"sh", "-x")
++	if code != 4 || o != "arg=-x tg=none\nexit=4\n" {
++		t.Fatalf("code %d, out %q, err %q", code, o, e)
++	}
++	if _, err := os.Stat(filepath.Join(home, "gate.lock")); err != nil {
++		t.Fatalf("the default gate lock is not under the agent-jobs home: %v", err)
++	}
++	for _, args := range [][]string{
++		{"--repo", repo, "--head", head},          // no command
++		{"--repo", repo, "--bogus", "--", "true"}, // unknown flag
++		{"--repo", repo, "--", "true"},            // no --head
++	} {
++		if code, o, _ := run(args...); code != 125 || !strings.HasSuffix(o, "exit=125\n") {
++			t.Fatalf("%v: code %d, out %q", args, code, o)
++		}
++	}
++}
+diff --git a/cmd/agent-jobs/main.go b/cmd/agent-jobs/main.go
+index a8a5586..75bdbab 100644
+--- a/cmd/agent-jobs/main.go
++++ b/cmd/agent-jobs/main.go
+@@ -103,6 +103,12 @@ const usage = `usage: agent-jobs <command> [flags]
+   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
+                                            also when it is gone) out of the merge gate (F9 (b)); a
+                                            later checklist approval gates it again
++  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] [--lock PATH] -- CMD [ARGS...]
++                                           a heavy local gate (check.sh, a pg suite, a build):
++                                           one at a time per box (<home>/gate.lock), HEAD of DIR
++                                           must be REV before and after, own process group killed
++                                           on timeout (exit 124) and after the command, TELEGRAM_*
++                                           dropped; the last stdout line is always exit=N
+   intentions --agent A [--status open|done|dropped] [--json]
+                                            the agent's own goals (intention_* MCP tools), oldest first
+   milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
+@@ -232,6 +238,9 @@ func main() {
+ 	case "stats":
+ 		err = cmdStats(args)
+ 	case "gate":
++		if len(args) > 0 && args[0] == "run" {
++			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
++		}
+ 		err = cmdGate(args)
+ 	case "intentions":
+ 		err = cmdIntentions(args)
+@@ -1489,7 +1498,7 @@ func cmdGate(args []string) error {
+ 	}
+ 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
+ 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
+-			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
++			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO | " + gateRunUsage[len("usage: agent-jobs "):])
+ 	}
+ 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
+ 	agent := agentFlag(fs)
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 7e2fe01..2c05260 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -116,6 +116,8 @@ Audiences live in `internal/mcp/registry.go`: `OrchestratorOnly` and `JobAllowed
+ 
+ **Requirements in job reports** (Wave F, F4; `internal/jobs/requirements.go`). `job_start` `covers` are validated (`ValidateCovers`: checklist IDs, repeats dropped, at most 200) and stored in `jobs.covers` (a resume keeps them). *Covers injection.* `newJob` needs a repo for covers and reads `brief/CHECKLIST.md` and `brief/BRIEF.md` (`Manager.coverContract`): from the given work tree under the checklist lock when it has the checklist (the tools' file), else as committed at the job's base (`git cat-file`); the checklist text is redacted before parsing; `Status` against the repository's latest stored approval must be approved (else the start is refused with the reason); every covered ID must be a row (else refused, naming the IDs) of at most `MaxCoverRowRunes` (4000) characters (else refused, naming the row: the prompt carries rows whole). The covered rows only (ID, verbatim, contract, placeholder-ok; no Rationale, no other rows, no BRIEF) are kept as `jobs.cover_contract` (JSON `store.CoverContract`, with the checklist id, version and source) and `BuildPrompt` renders them after the task with `prompts/requirements.md` (`RenderCoverContract`: each row whole through `RedactPrintable`), so the daemon, not the orchestrator's brief, gives the job its contract; a resume rebuilds the prompt from the same snapshot. The wrapper reads the covers from the job row with the report (`wrapperContractNote`; an unreadable row fails closed with `NoteJobRowUnread`) and `reportContractNote(report, covers)` adds `NoteNoRequirements` (no block) or `NoteRequirementsEmpty` (no line for any covered ID: empty, prose, a table) after the Summary and Not done checks; `OffContractNote` knows all three, so they count as `report_off_contract`. `ParseRequirements` reads the `### Requirements` block of the last Findings / Changes section (ends at the next heading; fences skipped): lines split on `·` (ID, status, then `ran:`, `REDPROOF` and evidence fields). IDs are matched by one matcher, `idTokens` (whole runs of letters, digits and `_` that are checklist IDs: `R01_other` and `x_R01` name no ID), for validation and extraction alike. Both proofs are checked by a positive structure (a list of refused words cannot be complete). `ranCommand` (the `ran:` value): words cleaned (`cleanWord`: wrappers, quotes and brackets off both ends, trailing punctuation), a leading `$` and `VAR=value` (`assignRe`) skipped, then the first word is a `runners` entry (any case) followed by a word that is not a result arrow, or `isProgramPath` (`./`, `../`, `~/`, an absolute path with a directory, or `dir/name` with a `scriptExts` extension). `redProof` accepts only the exact marker (`^REDPROOF` then a non-word character or the end) with content that, without the IDs, passes `redEvidence`: a reference (`testRefRe`: `Test|Benchmark|Fuzz|Example` + capital/digit/`_`, `test_x`, `x_test`, `x.test.y` / `x.spec.y`, `a::b`; or a backticked span or the proof's start that is a `ranCommand`) and `failMarker` (`failRe`: fail/fails/failed/failing, panic/panics/panicked, assertion/AssertionError, `error:`, exit [code|status] N with N ≠ 0; skipped when the word right before is one of `negators` or ends in `n't`); a block line proves the IDs it names, an inline field only the line's own ID; a `done` line is verified only with a `ranCommand` `ran:` and such a proof for its ID, else `claimed`. `RecordStats` stores the claimed count (`job_stats.requirements_claimed`); `job_result` returns `requirements` (lines, claimed, missing lines, uncovered, invalid) and `trailer`, the `Requirements` trailers of `base..head` read with git's trailer parser (`git log --format=%(trailers:key=Requirements,valueonly)`; a `Requirements:` line in a body paragraph is not a trailer; `JobRequirementsTrailers`: the verified worktree's HEAD, else `refs/agent-jobs/jobs/<id>`), shown only. *Brief files.* `JobSettings` adds a repository job's `<work>/brief/BRIEF.md` and `<work>/brief/CHECKLIST.md` (also through the job dir's resolved path) to its protected paths (`briefProtected`: `--protect` for the guard, deny rules for the file tools): a job never writes them; the checklist tools are their only writers.
+ 
++**Gate runner** (#134; `internal/jobs/gaterun.go`, `agent-jobs gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] [--lock PATH] -- CMD [ARGS...]`). For the orchestrator's heavy local gates (`check.sh`, pg suites, builds), not a job: no state dir, no daemon, no shell (CMD runs as given). One gate at a time per box: an exclusive `flock` on `<agent-jobs home>/gate.lock` (every agent of the user), polled until `--lock-wait`; the holder writes one line (pid, start, commit, dir, command) into the lock file, which a waiter prints, and a waiter that runs out of time gives up instead of hanging. Under the lock HEAD of DIR must resolve to the commit REV names (any revision; compared as full ids), else the command never runs; HEAD is checked again after the command, and a moved HEAD fails a passing gate. CMD leads a process group of its own (stdin `/dev/null`, the runner's environment without `TELEGRAM_*`); on the timeout, SIGTERM, SIGINT or SIGHUP the group gets SIGTERM, then SIGKILL after 5 s; once the leader has exited, before it is reaped (so the group id cannot have been reused), the group gets SIGKILL, so no background server or worker of the suite outlives it (a process that left the group with `setsid` is not reached). The last stdout line is always `exit=N`: the command's code, 128+signal, 124 on the timeout, 143 when stopped, 125 when the runner refused or failed (usage, lock, wrong or moved HEAD), 127 when CMD could not start. Inside a job it is refused like every CLI command.
++
+ **Acceptance command** (Wave D; `internal/jobs/acceptance.go`). Opt-in: config `acceptance_allowed` (default false); without it `job_start`, `schedule_add` and `agent-jobs start` refuse a command. At launch the daemon requires both its active permission and the current disk opt-in; enabling requires a daemon restart. The wrapper receives that authorization as `--acceptance-allowed` (absent means denied) and checks `config.json` again before running the command, so a later revocation or invalid edit fails closed (the job then fails «acceptance did not run»). `job_start` / `schedule_add` field `acceptance_cmd`, `agent-jobs start --acceptance-cmd`: one line (no newline, CR or NUL anywhere in the input, checked before trimming, so a trailing or leading one is refused too), valid UTF-8, at most 1 KB, trimmed, stored in `jobs.acceptance_cmd` (a job schedule stores it in `schedules.acceptance_cmd` and passes it to the jobs it fires); refused for `review` and `research` jobs (they change no code). The wrapper, not the daemon, runs it: after claude (or codex) exited 0, report.md is there and the session sweep was complete, so it runs in the job's own containment (the same scope or session) without any extra spawn path. It reads the command from the job row and records the start together with the daemon's deadline for it (`acceptance_started_at`, `acceptance_deadline` = start + the acceptance timeout the wrapper applies + 2 min) in one conditional update that fails once the daemon claimed the job's timeout (below), then runs `/bin/sh -c <cmd>` in `<jobdir>/work` in a process group of its own, recorded as `acceptance_pgid`, stdin `/dev/null`, with a scrubbed environment (only `PATH USER LOGNAME SHELL LANG LC_* TZ TERM` of the wrapper's; `HOME` a fresh `<jobdir>/acceptance-home`, `TMPDIR` its `tmp/`, so nothing finds the agent's dotfiles, credentials or state dir through them; then the job's git environment and the job marker `AGENT_JOBS_JOB`, so it starts no nested job and `doctor procs` finds what it leaves), and **without the guard**. Timeout `acceptance_timeout_minutes` (default 15, at most 60): SIGTERM to the group, SIGKILL after 5 s, result `-1`. While the command runs the wrapper catches SIGTERM, SIGINT and SIGHUP: it ends the command's group the same way and exits 143 without a result or `exit_code`. The daemon's `killJob` (timeout, cancel, stop) also ends the recorded acceptance group after the scope or wrapper group, re-reading the row: while the group's leader is alive and leads it, the whole group is signalled only if the leader carries the job's marker; once the leader is gone (the shell died on SIGTERM while a child that ignores it holds its stdout open, and the daemon's `KillGrace`, shorter than the wrapper's 5 s, killed the wrapper first), the surviving members of the recorded group are found in `/proc` and ended only if every one of them carries the job's marker (a member without it means the pgid is not, or no longer, the job's, and nothing is signalled), each through a pidfd opened before its group and marker are re-checked, SIGTERM, `KillGrace`, SIGKILL. stdout and stderr go to `acceptance.log` (the last 64 KB, a note says how much was cut; a line cut by that cap is dropped whole, so a value split by the cut leaves no part of itself; the file stays raw like `stderr.log`, every read of it is redacted). Then the session is swept again (an incomplete sweep writes the sweep marker and fails the job as usual), and only then the exit code and duration are written to the row (`acceptance_exit`, `acceptance_duration_sec`, `acceptance_pgid` back to 0), before `exit_code`. The daemon re-reads the row when it judges a succeeded run: no recorded result → failed «acceptance did not run», `-1` → «acceptance failed (timeout after Ns)», non-zero → «acceptance failed (exit N)»; the job-done line then ends `· acceptance failed (exit N)` (or `(timeout)`, or `· acceptance did not run` / `· acceptance result unreadable` when no result was recorded), the HTTP API error code is `acceptance_failed`, `job_result` returns `acceptance {cmd, ran, exit, timed_out, duration_sec, log_tail}` (the last 16 KB of the log, opened like `report.md`: `openat` through the state dir with `O_NOFOLLOW` at every level, only a regular file of the agent user with one link, so a hard link or a symlinked job dir is refused) and lists `acceptance.log`; `agent-jobs status <id>` prints an `accept:` line. Timeout race: the daemon's deadline for a job is `started_at` + its timeout, or the later recorded `acceptance_deadline` (never its own config, so changing `acceptance_timeout_minutes` while the daemon runs cannot cut a run short); the row it judges by may predate the acceptance start, so it only preselects, and the decision is `ClaimTimeout`, one conditional update that sets `timed_out_at` only if the row, as it is then, is past both deadlines. SQLite serializes it with the wrapper's start: either the start is recorded first and the claim fails (judged again next tick), or the claim wins and the start fails (the command never runs). A resume resets the acceptance fields and `timed_out_at` (`Requeue`), archives `acceptance.log` with the attempt, and the resumed run is accepted again. Not a security boundary: the command runs the code the job wrote, as the agent user, without the guard or a file-system sandbox, so a job can change the test it is checked with; it catches honest mistakes, not a hostile job.
+ 
+ **Secret redaction** (`internal/jobs/redact.go`). `Redact` runs a fixed list of RE2 rules in order (specific formats first, the generic key=value last, so a value already replaced is not matched again: values never contain `[`): PEM private key blocks (any `-----BEGIN … PRIVATE KEY-----` label: PKCS#1/#8, EC, OPENSSH, ENCRYPTED, and `PGP PRIVATE KEY BLOCK`; also one cut off before its END line), `sk-ant-…`, `sk-…`/`sk-proj-…` at a word start, `gh[pousr]_…`, `github_pat_…`, `xox?-…`, `AKIA`/`ASIA` key ids, the value of `aws_secret_access_key`, `AIza…`, Telegram bot tokens (`<8-10 digits>:<35+>` after a non-token character, the start, or `bot` as in the Bot API URL `/bot<token>/getMe`; nothing after the token is consumed, so two tokens one separator apart are both found), JWTs (`eyJ….….…`), the token after `Bearer`, and the value (16+ characters, no quotes, spaces, brackets or separators) after a key containing `token`, `secret`, `password`, `passwd` or `api[_-]key` followed by `=` or `:`. Every variable-length value is matched whole (no upper bound; RE2 stays linear), so a long credential is never replaced only in part. Each match (or its secret group) becomes `[redacted:<kind>]`; the result is idempotent. Oversized policy: input past `MaxRedactBytes` (4 MiB) is not scanned; it is cut right after the last line break before the cap, however far back (with none, nothing of it is kept), so the incomplete line at the cap goes whole and no value is split into a too-short scanned prefix; everything after the cut is replaced by `[redacted:unscanned N bytes past the 4194304-byte scan cap]`. **PEM blocks** are not a pattern over the whole text but a line scanner (`redactPEM`, one linear pass, run first by `Redact` and so on every redaction and read, cut or not): dropping the partial line at a cut may take a key block's BEGIN or END line with it (now or in a log or report cut by an earlier build), and what is left matches no pattern. A marker is a line of its own, `-----BEGIN|END … PRIVATE KEY( BLOCK)?-----` with indentation, trailing blanks and a CR ignored, and around it only what files and listings put there (a diff or quote prefix `+ - > # |`, an assignment `KEY=` / `key: `, quotes, an escaped `\n`, a trailing comma); a marker quoted inside prose is none, so a report that talks about key blocks keeps its text (a whole block written on one line, as with escaped line breaks in JSON, and a BEGIN marker followed by an escaped `\n`, through the end of that line, are rules of their own). Key body lines are base64 (also with one diff/quote prefix character or a trailing quote or comma), armor headers (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: …,…`, `Version:`, `Comment:`) and blank lines. Redacted: a block from BEGIN through END; a BEGIN with no END after it through the end of the text; an END with no BEGIN before it together with the contiguous run of body lines above it (from the start of the text when the run reaches it; a base64 line shorter than a full key line ends the run unless it is right above the END line, so a word like `ok` above a key body stays); a markerless run of at least two base64 lines of 40–80 characters at the text's start or end or next to a cut note (`[... N earlier bytes cut …]`, `[redacted:unscanned …]`), the middle of a key both of whose markers fell outside a window. Each becomes `[redacted:private-key]`. The acceptance log write cap (`tailBuffer`) also follows the markers of the output it evicts (`pemTracker`, at most 256 bytes of a line kept): when the evicted part opened a block that is still open, the kept tail is redacted from its start until the END line (or to its end). **Redact before cut**: job-derived text that is shortened (`RedactPrintable`: the finish, stop and cancel messages with a scope error, the stop reason, the previous attempt's error in a resume brief, process command lines in sweep notes, `doctor procs` and the resume refusal, the codex `turn.failed` message and stream error, the sweep and idle-close markers, the title on the job-done line) is redacted first, then made printable and redacted again (dropped control characters may join a value), then cut, so a value cut short never escapes its rule. Where it applies: when a job reaches a terminal or stopped status (`Manager.settled`, under the lifecycle lock, after the scope stop and the sweep, so no process of the job is left), `report.md` is opened `O_NOFOLLOW|O_NONBLOCK`, redacted only when it is a regular file, and at most 4 MiB + 1 byte of it is read (`io.LimitReader`; an oversized report's rest is never read, its size comes from `fstat`). The redacted text is written to a unique `os.CreateTemp` file in the job dir (0600, `O_EXCL`), fsynced, renamed over `report.md`, and the dir fsynced; with `keep_raw_reports` the whole original is first streamed the same way into `report.raw.md` (0600). **redaction_pending**: `Store.Claim` sets the job column `redaction_pending` (an attempt may write `report.md` from then on), and `Store.Finish` sets it again in the same update that makes the row terminal, so the mark is persisted before any redaction is tried; the migration that adds the column marks every existing job (queued and running ones write their report later; finished ones were settled by a build that did not redact or may have died before the rewrite; redaction is idempotent and a job without a regular `report.md` is just cleared). It is cleared only after the report of the ended attempt was redacted (or there is no regular `report.md`), and only while the row is not queued or running. A failed rewrite or a daemon that died between `Store.Finish` and the rewrite leaves it set, and every tick (`retryRedactions`, also the daemon's first tick after start) retries those jobs until it succeeds. Readers never rely on it: `job_result`, `agent-jobs result` and the HTTP API's `?report=1` always redact on the fly (`RedactRead`: a report cut at the read cap first loses its whole incomplete last line, all of the text when it has no line break), and the log archive copies `report.md` and `report.attempt-<n>.md` redacted on the fly (`archiveReport`, the same bounded reader and cut as in place), so an archived report is never unredacted even while its in-place redaction is pending. The daemon log redacts job-derived text: the finish and stop lines (status message), the launch refusal, the sweep note (process command lines), scope/adopt errors, notify and cleanup errors. On read: `DoneLine` (so the tmux line and the daemon log), `job_result` (report, error), `agent-jobs result` (the same bounded reader as `job_result`: `openat` with `O_NOFOLLOW|O_NONBLOCK`, regular file of this user with one link, at most 4 MiB), `/v1/jobs/{id}?report=1`, the stats row (`result_subtype`, tool/skill/rule names) and the previous attempt's report or last messages in a fresh-session resume brief. `job_result`'s acceptance `log_tail` is redacted the same way (`ReadAcceptanceLogTail`: at most `acceptanceReadCap` bytes read, a line cut by the read dropped whole, redacted before the cut to the tail size, the tail's incomplete first line dropped), and so is the acceptance note on the job-done line (redacted before it is cut, then `RedactPrintable`). Not redacted: `stream.jsonl`, `stderr.log`, `acceptance.log` on disk (kept raw in the job folder and gzipped raw into the archive) and `prompt.md`.
+diff --git a/internal/jobs/gaterun.go b/internal/jobs/gaterun.go
+new file mode 100644
+index 0000000..c651081
+--- /dev/null
++++ b/internal/jobs/gaterun.go
+@@ -0,0 +1,333 @@
++package jobs
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"time"
++)
++
++// Serialized gate runner (#134): `agent-jobs gate run` runs one heavy local gate (check.sh, a pg suite,
++// a vite build) for the orchestrator so that
++//   - one gate runs at a time per box: an exclusive flock on <agent-jobs home>/gate.lock, shared by
++//     every agent of the user; a waiter gives up after its lock wait instead of hanging;
++//   - it runs on the commit it claims to check: HEAD of the work tree must resolve to the asserted
++//     commit once the lock is held, and still after the command (a checkout meanwhile fails the gate);
++//   - it always ends with the line exit=N on stdout, whatever happened (a refusal, a missing command, a
++//     timeout, a stop signal), so a waiter never waits for a marker that never comes;
++//   - the command is the leader of a process group of its own: on the timeout or a stop the whole group
++//     gets SIGTERM, then SIGKILL after gateKillGrace, and once the leader has exited (before it is
++//     reaped, so the group id cannot be reused) the group gets SIGKILL, so no orphan suite outlives it;
++//   - TELEGRAM_* is dropped from the command's environment.
++//
++// Exit codes: the command's own, 128+signal when a signal ended it, GateExitTimeout on the timeout,
++// GateExitRunner when the runner refused or failed (bad arguments, no lock, wrong HEAD), 127 when the
++// command could not start.
++
++// Gate runner exit codes and defaults.
++const (
++	GateExitTimeout     = 124 // as timeout(1)
++	GateExitRunner      = 125 // as timeout(1): the runner itself failed
++	GateExitNotStarted  = 127
++	DefaultGateTimeout  = 30 * time.Minute
++	DefaultGateLockWait = 60 * time.Minute
++	GateLockName        = "gate.lock"
++	gateKillGrace       = 5 * time.Second
++	gateLockPoll        = 100 * time.Millisecond
++	gateHolderBytes     = 512
++)
++
++// gateEnvDropPrefixes are the variable name prefixes a gate's command never inherits.
++var gateEnvDropPrefixes = []string{"TELEGRAM_"}
++
++// GateRun is one gate run.
++type GateRun struct {
++	Dir      string        // the git work tree the command runs in
++	Head     string        // the commit HEAD must be at (any revision git resolves, compared as full ids); required
++	Argv     []string      // the command and its arguments (no shell)
++	Timeout  time.Duration // the command's limit; 0 = DefaultGateTimeout
++	LockPath string        // the box-wide lock; "" = GateLockPath()
++	LockWait time.Duration // how long to wait for the lock; 0 = DefaultGateLockWait
++	Env      []string      // the base environment; nil = os.Environ()
++	Stdout   io.Writer     // the command's stdout and the exit= line; nil = os.Stdout
++	Stderr   io.Writer     // the command's stderr and the runner's notes; nil = os.Stderr
++}
++
++// GateLockPath is the box-wide gate lock, <agent-jobs home>/gate.lock.
++func GateLockPath() (string, error) {
++	h, err := Home()
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(h, GateLockName), nil
++}
++
++// GateEnv is env without the variables a gate's command never inherits (gateEnvDropPrefixes).
++func GateEnv(env []string) []string {
++	out := make([]string, 0, len(env))
++	for _, kv := range env {
++		k, _, _ := strings.Cut(kv, "=")
++		drop := false
++		for _, p := range gateEnvDropPrefixes {
++			if strings.HasPrefix(k, p) {
++				drop = true
++				break
++			}
++		}
++		if !drop {
++			out = append(out, kv)
++		}
++	}
++	return out
++}
++
++// RunGate runs g and returns its exit code; the last line it writes to g.Stdout is always exit=<code>.
++// ctx ending (the CLI's stop signals) ends the command's group like the timeout, with 128+SIGTERM.
++func RunGate(ctx context.Context, g GateRun) (code int) {
++	if g.Stdout == nil {
++		g.Stdout = os.Stdout
++	}
++	if g.Stderr == nil {
++		g.Stderr = os.Stderr
++	}
++	defer func() { fmt.Fprintf(g.Stdout, "exit=%d\n", code) }()
++	fail := func(format string, a ...any) int {
++		fmt.Fprintf(g.Stderr, "gate: "+format+"\n", a...)
++		return GateExitRunner
++	}
++	if len(g.Argv) == 0 || g.Argv[0] == "" {
++		return fail("no command given")
++	}
++	if strings.TrimSpace(g.Head) == "" {
++		return fail("no --head given: a gate must name the commit it checks")
++	}
++	if strings.HasPrefix(g.Head, "-") {
++		return fail("--head %q is not a revision", g.Head)
++	}
++	if g.Dir == "" {
++		g.Dir = "."
++	}
++	if g.Timeout <= 0 {
++		g.Timeout = DefaultGateTimeout
++	}
++	if g.LockWait <= 0 {
++		g.LockWait = DefaultGateLockWait
++	}
++	if g.Env == nil {
++		g.Env = os.Environ()
++	}
++	if g.LockPath == "" {
++		p, err := GateLockPath()
++		if err != nil {
++			return fail("gate lock: %v", err)
++		}
++		g.LockPath = p
++	}
++
++	unlock, err := lockGate(ctx, g)
++	if err != nil {
++		if ctx.Err() != nil {
++			fmt.Fprintf(g.Stderr, "gate: stopped while waiting for the gate lock %s\n", g.LockPath)
++			return 128 + int(syscall.SIGTERM)
++		}
++		return fail("%v", err)
++	}
++	defer unlock()
++
++	// HEAD is asserted under the lock: the tree may have moved while this gate waited.
++	want, err := gateCommit(g.Dir, g.Head+"^{commit}")
++	if err != nil {
++		return fail("--head %s is not a commit in %s: %v", g.Head, g.Dir, err)
++	}
++	if code := assertGateHead(g, want, "before the run"); code != 0 {
++		return code
++	}
++	writeGateHolder(g, want)
++	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
++
++	start := time.Now()
++	code = runGateCmd(ctx, g)
++	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, time.Since(start).Round(time.Millisecond))
++	if moved := assertGateHead(g, want, "after the run"); moved != 0 && code == 0 {
++		code = moved
++	}
++	return code
++}
++
++// gateCommit resolves rev in dir to a full commit id.
++func gateCommit(dir, rev string) (string, error) {
++	out, err := git(dir, "rev-parse", "--verify", "--quiet", rev)
++	if err != nil {
++		return "", err
++	}
++	id := strings.TrimSpace(out)
++	if id == "" {
++		return "", errors.New("does not resolve")
++	}
++	return id, nil
++}
++
++// assertGateHead returns 0 when HEAD of g.Dir is want, GateExitRunner (with a note) otherwise.
++func assertGateHead(g GateRun, want, when string) int {
++	head, err := gateCommit(g.Dir, "HEAD^{commit}")
++	if err != nil {
++		fmt.Fprintf(g.Stderr, "gate: HEAD of %s %s: %v\n", g.Dir, when, err)
++		return GateExitRunner
++	}
++	if head != want {
++		fmt.Fprintf(g.Stderr, "gate: HEAD of %s is %s %s, not the asserted %s (%s): the gate does not check that commit\n",
++			g.Dir, head, when, want, g.Head)
++		return GateExitRunner
++	}
++	return 0
++}
++
++// lockGate takes the gate lock exclusively, polling until g.LockWait or ctx ends, and returns the unlock.
++func lockGate(ctx context.Context, g GateRun) (func(), error) {
++	dir := filepath.Dir(g.LockPath)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return nil, fmt.Errorf("gate lock dir: %w", err)
++	}
++	f, err := os.OpenFile(g.LockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
++	if err != nil {
++		return nil, fmt.Errorf("open gate lock: %w", err)
++	}
++	deadline := time.Now().Add(g.LockWait)
++	told := false
++	for {
++		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
++		if err == nil {
++			break
++		}
++		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
++			f.Close()
++			return nil, fmt.Errorf("flock gate lock: %w", err)
++		}
++		if !told {
++			fmt.Fprintf(g.Stderr, "gate: waiting up to %s for the gate lock %s, held by: %s\n", g.LockWait, g.LockPath,
++				gateHolder(f))
++			told = true
++		}
++		if time.Now().After(deadline) {
++			holder := gateHolder(f)
++			f.Close()
++			return nil, fmt.Errorf("the gate lock %s is still held after %s (by: %s): another gate runs on this box", g.LockPath,
++				g.LockWait, holder)
++		}
++		select {
++		case <-ctx.Done():
++			f.Close()
++			return nil, ctx.Err()
++		case <-time.After(gateLockPoll):
++		}
++	}
++	return func() {
++		_ = f.Truncate(0)
++		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
++		f.Close()
++	}, nil
++}
++
++// gateHolder is what the lock's holder wrote into it (writeGateHolder), one line.
++func gateHolder(f *os.File) string {
++	b := make([]byte, gateHolderBytes)
++	n, _ := f.ReadAt(b, 0)
++	s := strings.TrimSpace(strings.ToValidUTF8(string(b[:n]), "?"))
++	s = strings.Map(func(r rune) rune {
++		if r < 0x20 || r == 0x7f {
++			return ' '
++		}
++		return r
++	}, s)
++	if s == "" {
++		return "unknown"
++	}
++	return s
++}
++
++// writeGateHolder records the holder in the lock file, for the waiters' notes.
++func writeGateHolder(g GateRun, head string) {
++	f, err := os.OpenFile(g.LockPath, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
++	if err != nil {
++		return
++	}
++	defer f.Close()
++	_ = f.Truncate(0)
++	line := fmt.Sprintf("pid %d since %s at %s in %s: %s", os.Getpid(), time.Now().UTC().Format(time.RFC3339), head, g.Dir,
++		strings.Join(g.Argv, " "))
++	if len(line) > gateHolderBytes-1 {
++		line = line[:gateHolderBytes-1]
++	}
++	_, _ = f.WriteString(line + "\n")
++}
++
++// runGateCmd runs g.Argv in g.Dir as the leader of a process group of its own, stdin /dev/null, with
++// GateEnv(g.Env), and returns its exit code (see RunGate).
++func runGateCmd(ctx context.Context, g GateRun) int {
++	cmd := exec.Command(g.Argv[0], g.Argv[1:]...)
++	cmd.Dir = g.Dir
++	cmd.Env = GateEnv(g.Env)
++	cmd.Stdout, cmd.Stderr = g.Stdout, g.Stderr
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	// A process that left the group (setsid) and still holds a pipe must not hold Wait forever.
++	cmd.WaitDelay = gateKillGrace
++	if err := cmd.Start(); err != nil {
++		fmt.Fprintf(g.Stderr, "gate: start %s: %v\n", g.Argv[0], err)
++		return GateExitNotStarted
++	}
++	pgid := cmd.Process.Pid // Setpgid: the leader's pid is the group id
++	exited := make(chan struct{})
++	go func() {
++		// Wait for the leader's exit without reaping it: while it is a zombie its pid, the group id, stays
++		// allocated, so the group kill below never reaches a group that took the id over.
++		_ = waitExitNoReap(pgid)
++		close(exited)
++	}()
++	endGroup := func() {
++		_ = syscall.Kill(-pgid, syscall.SIGTERM)
++		select {
++		case <-exited:
++		case <-time.After(gateKillGrace):
++			_ = syscall.Kill(-pgid, syscall.SIGKILL)
++			<-exited
++		}
++	}
++	timer := time.NewTimer(g.Timeout)
++	defer timer.Stop()
++	result := 0
++	select {
++	case <-exited:
++	case <-timer.C:
++		fmt.Fprintf(g.Stderr, "gate: timeout after %s: ending process group %d\n", g.Timeout, pgid)
++		endGroup()
++		result = GateExitTimeout
++	case <-ctx.Done():
++		fmt.Fprintf(g.Stderr, "gate: stopped: ending process group %d\n", pgid)
++		endGroup()
++		result = 128 + int(syscall.SIGTERM)
++	}
++	// Nothing of the group outlives its leader (a suite's background servers, workers, watchers).
++	_ = syscall.Kill(-pgid, syscall.SIGKILL)
++	err := cmd.Wait()
++	if result != 0 {
++		return result
++	}
++	if err == nil || errors.Is(err, exec.ErrWaitDelay) {
++		return 0
++	}
++	var ee *exec.ExitError
++	if errors.As(err, &ee) {
++		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
++			return 128 + int(ws.Signal())
++		}
++		return ee.ExitCode()
++	}
++	fmt.Fprintf(g.Stderr, "gate: wait %s: %v\n", g.Argv[0], err)
++	return GateExitRunner
++}
+diff --git a/internal/jobs/gaterun_test.go b/internal/jobs/gaterun_test.go
+new file mode 100644
+index 0000000..5f6534c
+--- /dev/null
++++ b/internal/jobs/gaterun_test.go
+@@ -0,0 +1,240 @@
++package jobs
++
++import (
++	"bytes"
++	"context"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// gateFixture is a repository with two commits (first, second; HEAD at second) and a lock path of its own.
++func gateFixture(t *testing.T) (repo, first, second, lock string) {
++	t.Helper()
++	repo = newRepo(t)
++	first = strings.TrimSpace(gitT(t, repo, "rev-parse", "HEAD"))
++	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	gitT(t, repo, "commit", "-qam", "second")
++	second = strings.TrimSpace(gitT(t, repo, "rev-parse", "HEAD"))
++	return repo, first, second, filepath.Join(t.TempDir(), "gate.lock")
++}
++
++func runGateT(t *testing.T, g GateRun) (int, string, string) {
++	t.Helper()
++	var out, errb bytes.Buffer
++	g.Stdout, g.Stderr = &out, &errb
++	if g.Timeout == 0 {
++		g.Timeout = time.Minute
++	}
++	if g.Env == nil {
++		g.Env = os.Environ()
++	}
++	code := RunGate(context.Background(), g)
++	return code, out.String(), errb.String()
++}
++
++// lastLine is the last non-empty line of s.
++func lastLine(s string) string {
++	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
++	return lines[len(lines)-1]
++}
++
++// gateProcAlive reports a process that exists and is no zombie.
++func gateProcAlive(pid int) bool {
++	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
++	if err != nil {
++		return syscall.Kill(pid, 0) == nil
++	}
++	s := string(b)
++	if i := strings.LastIndexByte(s, ')'); i >= 0 && i+2 < len(s) {
++		return s[i+2] != 'Z'
++	}
++	return true
++}
++
++func readPID(t *testing.T, path string) int {
++	t.Helper()
++	b, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return pid
++}
++
++func waitDead(t *testing.T, pid int) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for gateProcAlive(pid) {
++		if time.Now().After(deadline) {
++			t.Fatalf("process %d of the gate's group is still alive", pid)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++}
++
++// A gate whose work tree is not at the asserted commit never runs and still prints exit=.
++func TestRunGateRefusesWrongHead(t *testing.T) {
++	repo, first, second, lock := gateFixture(t)
++	ran := filepath.Join(t.TempDir(), "ran")
++	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: first, LockPath: lock,
++		Argv: []string{"/bin/sh", "-c", "touch " + ran}})
++	if code != GateExitRunner || lastLine(out) != "exit=125" {
++		t.Fatalf("code %d, out %q", code, out)
++	}
++	if !strings.Contains(errs, "HEAD") || !strings.Contains(errs, second) {
++		t.Fatalf("stderr does not name the HEAD mismatch: %q", errs)
++	}
++	if _, err := os.Stat(ran); err == nil {
++		t.Fatal("the command ran on the wrong HEAD")
++	}
++	// No asserted head at all is refused too: a gate always says which commit it checks.
++	if code, out, _ := runGateT(t, GateRun{Dir: repo, LockPath: lock, Argv: []string{"true"}}); code != GateExitRunner ||
++		lastLine(out) != "exit=125" {
++		t.Fatalf("no head: code %d, out %q", code, out)
++	}
++	// An abbreviated id of the right commit passes.
++	if code, out, _ := runGateT(t, GateRun{Dir: repo, Head: second[:12], LockPath: lock, Argv: []string{"true"}}); code != 0 ||
++		lastLine(out) != "exit=0" {
++		t.Fatalf("right head: code %d, out %q", code, out)
++	}
++}
++
++// The command's exit code is returned and printed as the last line, after the command's own output.
++func TestRunGatePrintsExitMarker(t *testing.T) {
++	repo, _, head, lock := gateFixture(t)
++	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
++		Argv: []string{"/bin/sh", "-c", "echo hello; exit 3"}})
++	if code != 3 || out != "hello\nexit=3\n" {
++		t.Fatalf("code %d, out %q", code, out)
++	}
++	// A command that cannot start still ends with the marker.
++	code, out, _ = runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Argv: []string{"/nonexistent/gate-cmd"}})
++	if code != 127 || lastLine(out) != "exit=127" {
++		t.Fatalf("missing command: code %d, out %q", code, out)
++	}
++	// A gate stopped from outside (ctx) ends its group and prints the marker too.
++	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
++	defer cancel()
++	var o, e bytes.Buffer
++	code = RunGate(ctx, GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute, Env: os.Environ(),
++		Argv: []string{"sleep", "30"}, Stdout: &o, Stderr: &e})
++	if code != 128+int(syscall.SIGTERM) || lastLine(o.String()) != "exit=143" {
++		t.Fatalf("stopped: code %d, out %q, err %q", code, o.String(), e.String())
++	}
++}
++
++// On the timeout the whole process group is killed (a child that ignores SIGTERM too), not just the
++// leader; exit=124.
++func TestRunGateTimeoutKillsProcessGroup(t *testing.T) {
++	repo, _, head, lock := gateFixture(t)
++	pidf := filepath.Join(t.TempDir(), "child.pid")
++	start := time.Now()
++	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: 500 * time.Millisecond,
++		Argv: []string{"/bin/sh", "-c", "(trap '' TERM; exec sleep 60) & echo $! > " + pidf + "; wait"}})
++	if code != GateExitTimeout || lastLine(out) != "exit=124" {
++		t.Fatalf("code %d, out %q, err %q", code, out, errs)
++	}
++	if !strings.Contains(errs, "timeout") {
++		t.Fatalf("stderr does not say timeout: %q", errs)
++	}
++	if d := time.Since(start); d > 20*time.Second {
++		t.Fatalf("the gate took %s past a 500ms timeout", d)
++	}
++	waitDead(t, readPID(t, pidf))
++}
++
++// A suite that leaves a background process behind does not leave an orphan: the group is ended when the
++// leader exits.
++func TestRunGateKillsLeftoversAfterExit(t *testing.T) {
++	repo, _, head, lock := gateFixture(t)
++	pidf := filepath.Join(t.TempDir(), "orphan.pid")
++	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
++		Argv: []string{"/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $! > " + pidf + "; exit 0"}})
++	if code != 0 || lastLine(out) != "exit=0" {
++		t.Fatalf("code %d, out %q", code, out)
++	}
++	waitDead(t, readPID(t, pidf))
++}
++
++// TELEGRAM_* never reaches the gate's command; the rest of the environment does.
++func TestRunGateDropsTelegramEnv(t *testing.T) {
++	repo, _, head, lock := gateFixture(t)
++	env := append(os.Environ(), "TELEGRAM_BOT_TOKEN=secret-value", "TELEGRAM_CHAT_ID=1", "GATE_KEEP=yes")
++	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Argv: []string{"env"}})
++	if code != 0 {
++		t.Fatalf("code %d, out %q", code, out)
++	}
++	if strings.Contains(out, "TELEGRAM_") || strings.Contains(out, "secret-value") {
++		t.Fatalf("TELEGRAM_* leaked into the gate: %q", out)
++	}
++	if !strings.Contains(out, "GATE_KEEP=yes") || !strings.Contains(out, "PATH=") {
++		t.Fatalf("the rest of the environment is missing: %q", out)
++	}
++}
++
++// Two gates on one box never overlap; a gate that cannot get the lock in time gives up with exit=125
++// instead of hanging.
++func TestRunGateSerialized(t *testing.T) {
++	repo, _, head, lock := gateFixture(t)
++	busy := filepath.Join(t.TempDir(), "busy")
++	// mkdir is atomic: it fails when another gate's command is inside.
++	script := "mkdir " + busy + " || exit 9; sleep 0.3; rmdir " + busy
++	var wg sync.WaitGroup
++	codes := make([]int, 3)
++	for i := range codes {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			var o, e bytes.Buffer
++			codes[i] = RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute,
++				LockWait: time.Minute, Env: os.Environ(), Argv: []string{"/bin/sh", "-c", script}, Stdout: &o, Stderr: &e})
++		}()
++	}
++	wg.Wait()
++	for i, c := range codes {
++		if c != 0 {
++			t.Fatalf("gate %d exited %d: two gates ran at once", i, c)
++		}
++	}
++
++	// A held lock and a short wait: the gate gives up, names the holder and still prints the marker.
++	f, err := os.OpenFile(lock, os.O_RDWR|os.O_CREATE, 0o600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
++		t.Fatal(err)
++	}
++	ran := filepath.Join(t.TempDir(), "ran")
++	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 300 * time.Millisecond,
++		Argv: []string{"/bin/sh", "-c", "touch " + ran}})
++	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "lock") {
++		t.Fatalf("held lock: code %d, out %q, err %q", code, out, errs)
++	}
++	if _, err := os.Stat(ran); err == nil {
++		t.Fatal("the command ran without the lock")
++	}
++}
++
++// HEAD moved while the gate ran (a checkout in the same tree): the result is not about the asserted
++// commit, so the gate fails even though the command passed.
++func TestRunGateHeadMovedDuringRun(t *testing.T) {
++	repo, first, head, lock := gateFixture(t)
++	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
++		Argv: []string{"git", "checkout", "-q", first}})
++	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "HEAD") {
++		t.Fatalf("code %d, out %q, err %q", code, out, errs)
++	}
++}
