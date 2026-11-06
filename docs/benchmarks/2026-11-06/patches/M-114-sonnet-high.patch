@@ -1,0 +1,126 @@
+diff --git a/internal/jobs/gate.go b/internal/jobs/gate.go
+index 5a71b3b..14a3bd2 100644
+--- a/internal/jobs/gate.go
++++ b/internal/jobs/gate.go
+@@ -502,22 +502,21 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 	if err != nil {
+ 		return err
+ 	}
+-	// Own pipes rather than StdinPipe/StdoutPipe: the reaper's Wait (startGit) never closes them under a
+-	// read.
++	// Stdin is an own pipe rather than StdinPipe: the reaper's Wait (startGit) never closes it under a
++	// write. Stdout is an io.Pipe fed by the runner's own copy of git's stdout (startGit: a writer that is
++	// no *os.File), not an *os.File read here: so the copy takes part in the reaping protocol, git stays
++	// unreaped, and its group killable, while a process of the group holds the stdout past git's exit
++	// (#114).
+ 	inR, in, err := os.Pipe()
+ 	if err != nil {
+ 		return err
+ 	}
+-	outPipe, outW, err := os.Pipe()
+-	if err != nil {
+-		_, _ = inR.Close(), in.Close()
+-		return err
+-	}
++	outR, outW := io.Pipe()
+ 	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
+ 		"-C", repo, noReplace, "cat-file", "--batch")
+-	_, _ = inR.Close(), outW.Close()
++	_ = inR.Close()
+ 	if err != nil {
+-		_, _ = in.Close(), outPipe.Close()
++		_, _ = in.Close(), outR.Close()
+ 		return fmt.Errorf("git cat-file: %w", err)
+ 	}
+ 	// Bounded like the other daemon git calls (#100): at gitLongTimeout git's group is killed and both
+@@ -527,7 +526,7 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 	deadlineDone := make(chan struct{})
+ 	stop := context.AfterFunc(ctx, func() {
+ 		p.kill()
+-		_, _ = in.Close(), outPipe.Close()
++		_, _ = in.Close(), outR.Close()
+ 		close(deadlineDone)
+ 	})
+ 	defer func() {
+@@ -538,17 +537,19 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 			<-deadlineDone
+ 		}
+ 		if err != nil {
+-			// git may be blocked writing the rest of a blob nobody reads: end it before waiting.
++			// git may be blocked writing the rest of a blob nobody reads: end it before waiting. Closing
++			// the read end frees the runner's copy, blocked on a write nobody reads, so that it can end.
+ 			p.kill()
++			_ = outR.Close()
+ 		}
+ 		_ = in.Close()
+ 		werr := p.wait(ctx)
+ 		if errors.Is(werr, errGitTimeout) || timedOut && (err != nil || werr != nil) {
+ 			err = fmt.Errorf("git cat-file: %w after %s", errGitTimeout, gitLongTimeout)
+ 		}
+-		_ = outPipe.Close()
++		_ = outR.Close()
+ 	}()
+-	out := bufio.NewReader(outPipe)
++	out := bufio.NewReader(outR)
+ 	var total int64
+ 	blob := func(obj string, w io.Writer) error {
+ 		if _, err := fmt.Fprintln(in, obj); err != nil {
+diff --git a/internal/jobs/git_timeout_test.go b/internal/jobs/git_timeout_test.go
+index 014ee40..db67a9a 100644
+--- a/internal/jobs/git_timeout_test.go
++++ b/internal/jobs/git_timeout_test.go
+@@ -329,3 +329,54 @@ exit 0
+ 		}
+ 	}
+ }
++
++// A cat-file that exits at once while a descendant still holds the stdout pipe materializeTree reads does
++// not leave that descendant running past the deadline (#114): the stdout the call reads takes part in the
++// runner's completion protocol, so that git stays unreaped, and its group killable, until the pipe is
++// done or the group is killed.
++func TestMaterializeTreeKillsDescendantAfterCatFileExit(t *testing.T) {
++	repo, sha := gateRepo(t)
++	real, err := exec.LookPath("git")
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := t.TempDir()
++	if strings.ContainsRune(state, '\'') {
++		t.Fatalf("state directory %q has a quote", state)
++	}
++	fakeGitOnPath(t, `for a in "$@"; do
++  if [ "$a" = cat-file ]; then
++    sleep 60 &
++    echo $! > '`+state+`/child'
++    exit 0
++  fi
++done
++exec '`+real+`' "$@"
++`)
++	// A deadline wide enough for the fake to record the child's pid on a busy host, and a wait delay past
++	// it, so that the kill comes from the deadline.
++	shortGitLongTimeout(t, time.Second)
++	origDelay := gitWaitDelay
++	gitWaitDelay = 30 * time.Second
++	t.Cleanup(func() { gitWaitDelay = origDelay })
++	err = returnsWithin(t, 10*time.Second, "materializeTree", func() error {
++		return materializeTree(repo, sha, t.TempDir(), nil)
++	})
++	b, rerr := os.ReadFile(filepath.Join(state, "child"))
++	if rerr != nil {
++		t.Fatal(rerr)
++	}
++	pid, perr := strconv.Atoi(strings.TrimSpace(string(b)))
++	if perr != nil {
++		t.Fatal(perr)
++	}
++	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
++	if !errors.Is(err, errGitTimeout) {
++		t.Fatalf("want errGitTimeout, got %v", err)
++	}
++	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
++		if time.Now().After(deadline) {
++			t.Fatalf("cat-file's descendant %d still runs after the deadline: the group was not killed", pid)
++		}
++	}
++}

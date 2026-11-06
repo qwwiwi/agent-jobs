@@ -1,0 +1,487 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..3c79033 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Merge hook: merges through the API get the same decision as `gh pr merge` (#107): `gh api` `PUT` (`-X` / `--method`, any flag order) to `repos/OWNER/REPO/pulls/N/merge`, pinned by its `sha` field, and `gh api graphql` `mergePullRequest` / `enqueuePullRequest`, pinned by the `expectedHeadOid` among that field's arguments; `enablePullRequestAutoMerge` is refused like `--auto`; a `repositories/ID/…/merge` endpoint only warns. An API merge the hook cannot fully read is refused in a gated repository, its context resolved first (fail closed): an endpoint from a variable or substitution (also a GraphQL mutation posted to `"$EP"`), a body from `--input`, a `-F` field from a file, a query from a variable, a field given more than once (gh sends `-f` fields before `-F` ones whatever their order), and a `$variable` `expectedHeadOid` at `/graphql` or a full URL (gh groups fields into `variables` only for the endpoint `graphql`). The refusal points to `gh pr merge --match-head-commit <sha>` or a literal `gh api -X PUT repos/OWNER/REPO/pulls/N/merge -f sha=<full sha>`; outside a gated repository it still warns.
+ 
+ ### Fixed
++- The guard closes the remaining rsync bypasses of #116 (#155). Three remote transfers got through: `find … -exec rsync --exclude + ./src/ host:/dst/ \;` hid the remote operand because the argv cut treated any `+` as find's terminator — a `+` now terminates only directly after `{}`, find's real rule for the batch form, so a lone `+` is a command argument; `python3 -c '…os.system("rsync …")'` named rsync in inline code, where its argv cannot be seen — an rsync word in inline code or a dynamic word of another program is now refused like an ssh mention there (a shell's or `eval`'s own code is parsed as a nested script, so a local rsync there keeps working); and `DST=host:/dst/; setsid rsync ./src/ "$DST"` used a dynamic operand — a dynamic word in an operand position is now refused for rsync directly, behind a wrapper, after a runner or after `find -exec` (a dynamic `--exclude` value stays data). Double nesting is closed for rsync and ssh alike: a runner reached through an exec option (`find -exec parallel rsync …`, `find -exec parallel ssh …`) is refused, its input feeding the command; ssh behind a nested runner word (`find -exec setsid ssh …`) was missed by the scope-tool scan and is caught now. Two false refusals are lifted: `--log-file-format` is a value option, so `rsync --log-file-format '%f:%l' src/ dst/` is local; and a verified filter pattern (`-f'- *.cache'`, `--exclude '*~'`, `--filter='- *.cache'`) is data rsync matches against file names, not a write target, so the `.git` glob rule no longer rejects it (a glob in `--backup-dir` or `--temp-dir` still is).
+ - The guard refuses `scp`, `sftp` and a remote-reaching `rsync` (#116): only `ssh` was on the out-of-scope list, so a job could copy data to or from a remote host with the operator's keys. `scp` and `sftp` are refused outright (behind wrappers, as a path, in `bash -c`, and where another program runs them, exactly like `ssh`); `rsync` is refused when an `-e`/`--rsh` option (any value) or a `host:path`-shaped argument (`user@host:/x`, `host::module`, `rsync://…`, a ':' before any '/' — `./a:b` stays local) can take it to a remote host. A purely local `rsync`, both paths local, stays allowed: jobs use it inside their worktree. The refusal names the tool and says a job never reaches remote hosts. Docs list them now (skills/agent-jobs/SKILL.md, docs/GUIDE.md, docs/GUIDE.ru.md). Review fix loop: the same rsync test covers the positions where another program runs it — the command of `find -exec`/`-execdir`/`-ok` and the positional of the exec runners (`setsid`, `ionice`, `chroot`, …), with its argv up to find's `;`/`+` terminator — and `rsync` under `xargs`, `parallel` or `entr` is refused outright, its extra arguments coming from stdin; rsync's value-taking options (`--exclude`, `-f`, `-T`, `-B`, …) are consumed first, so a local `rsync --exclude cache:old` is no longer refused for its option values, while `-avze ssh` still is.
+ - Codex brief lint: a bare curl/wget verb without a URL and post-verb negation (#141). Since #133 / PR #140 the network warning fired only on an explicit http(s) URL, so "run curl", «выполни wget», "use curl" went unnoticed; a curl/wget word after an action verb (run, use, execute, fetch, «запусти», «выполни», «используй», up to two words between, e.g. "fetch it with curl") now warns with the same line as the URL rule — one line per conflicting category, duplicate lines deduplicated, and «curl the fixture» or a bare «curl» still passes: without an action verb the word alone is not a fetch request. Negation is now detected after the verb too, within the same clause and only for the listed negation words right after the verb or through a linking verb (is/are/was/быть): "commit nothing", "curl is not needed", «curl не нужен», «пушить не надо»; "commit is not allowed" stays a known-limit warning ("not allowed" is not a listed negation), a bare "no" is not a post-verb negation ("run curl no matter what" is a positive request), and the same verbs keep the pre-verb negation.
+ - OpenRouter jobs no longer stop at claude's own budget (#148): claude priced the OpenRouter slug by its fallback Claude price table (`unrecognized_model`) and ended a job with `error_max_budget_usd` about 15x before its real cost reached `max_budget_usd`. Their claude argv no longer carries `--max-budget-usd`; the job's proxy alone enforces the budget at OpenRouter's real price and the job still fails with `openrouter budget reached`. The recorded cost and `daily_cap_usd` accounting are unchanged; claude jobs keep `--max-budget-usd <job budget>`.
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 7e2fe01..92b1a73 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -277,7 +277,7 @@ What this is and is not: the deny rules and the guard block the *direct spelling
+ - **Guard hook** (PreToolUse, matcher `*`; first a *tool allowlist* (`internal/guard/toolallow.go`): a job may call only Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep, LS, TodoWrite, WebFetch/WebSearch (closed by the deny rules unless kind = research), Skill (the delivered skills), ToolSearch (loads deferred tool schemas), the in-session todo tools TaskCreate/TaskUpdate/TaskList/TaskGet, TaskOutput/BashOutput/TaskStop/KillShell for the job's own background shells (inside its scope), the subagent tool Agent/Task (under its cap) and the job-role MCP tools `mcp__agent-jobs__*`; every other tool, known or future, is refused with the reason; then it inspects Bash, the file tools Write/Edit/MultiEdit/NotebookEdit and the read tools Read/Grep/Glob/LS (see *state reads* below); for a file tool it rejects a `file_path`/`notebook_path` inside a `.git` directory – checked as given (made absolute against the hook's `cwd`, cleaned, case-insensitive `.git` segment, git config/hooks/`$GIT_DIR` paths) and with symlinks resolved on the longest existing prefix (a dangling link is followed by its target; a `..` in that target is walked as the kernel walks it, after the symlinks of the part before it, not dropped lexically, with at most 40 dangling links per resolution: `cfg -> jump/../hooks/pre-commit` with `jump -> .git/objects` reaches `.git/hooks/pre-commit`), so a link in the job dir pointing into `.git` is caught; a path with a `..` segment is rejected outright (the kernel resolves `link/..` after the symlink, while cleaning drops it lexically); paths inside the job worktree's real git dirs (admin dir and common dir, from `git rev-parse` at prepare time, passed to the guard as `--git-dir` – `settings.json` is written after the worktree exists) are rejected whatever they are named). Prefix deny rules miss spellings, so the guard *parses* each command: quotes removed, split on `;` `&&` `||` `|` `&` newlines and parentheses, comments and here-doc bodies skipped, env prefixes and wrappers (`env`, `command`, `exec`, `nohup`, `timeout`, `xargs`, `sudo`, …) stripped, `$(…)`/backticks/`<(…)`, `sh|bash|zsh -c '…'` and `eval` parsed as nested scripts. Around git/gh, a form it cannot resolve statically is rejected with «guard cannot verify this form; write it as a plain command» – git/gh inside `$(…)`, backticks, `<(…)`, an unquoted here-doc body, `eval` or `sh -c`; stdin redirect, here-doc or here-string into git/gh (commit messages go through `-m '…'`, `-m "$(cat <<'EOF' … EOF)"` or `-F <file>`; `-F -`/`/dev/stdin` rejected); a command name, git subcommand, gh subcommand, `-c` value or commit message from a variable/substitution; a glob/brace character (`{ [ ? *`) in any word that decides which program runs – the command name, wrapper names and their option values, the `timeout` duration (`{git,push}`, `/usr/bin/g[i]t`, `timeout {5,git} push`; leading keywords, shell assignments and `[`/`[[` exempt) – or in a git global option or subcommand or a gh subcommand; `eval`/`sh -c` of a variable; a shell reading commands from stdin (`… | sh`, `bash <<EOF`); `env -S`; `xargs git`; attached `-cKEY=V`, `-C.`, `--config-env`, `--exec-path`; `alias` mentioning git/gh; any non-reader program (`find -exec`, `flock`, `trap`, `python -c`, `node -e`, `npx`, …) with git/gh (also `git-<sub>`), a shell or an agent among its arguments – as a whole word, a path base name, or a word inside an argument (`python3 -c '…subprocess.run(["claude", …])'`, `node -e '…codex…'`, `npx @anthropic-ai/claude-code`, `node …/claude-code/cli.js`; words matched: `git`, `gh`, `sh`, `bash`, `zsh`, `dash`, `fish` bounded by characters other than letters, digits, `_`, `-` and a leading `.`; `claude`, `codex`, `gemini`, `aider`, `cursor-agent` also with a `-suffix` (`claude-code`, `gemini-cli`, `aider-chat`, `@google/gemini-cli`, `@openai/codex`)) (readers such as `echo`, `grep`, `cat`, `which` are exempt); `cp`/`mv`/`install`/`ln` with git, gh, `git-<sub>`, a shell or an agent as an argument (a renamed executable; also via `$(which git)`). Program names are compared case-insensitively. It also rejects:
+   - *nothing outside*: `git [global opts: -C, -c, --git-dir, …] push|tag|send-pack|http-push|send-email|imap-send|svn|p4|daemon|request-pull|instaweb|…` in any spelling (`git 'push'`, `/usr/bin/git push`, `/usr/lib/git-core/git-push` – any `git-<sub>` binary is read as `git <sub>`);
+   - *git that runs commands*: a subcommand that is not one of git's own commands (`gitKnown`, from `git --list-cmds=main`) – so an alias or an external `git-*` program never resolves; `filter-branch`, `filter-repo`, `difftool`, `mergetool`, `for-each-repo`, `maintenance`, `hook`; `rebase -x/--exec` (also abbreviated `--ex`), `submodule foreach`, `bisect run`, `archive --exec/--remote`, `clone -u`, `--upload-pack`/`--receive-pack` on any subcommand, `--exec` on `fetch`/`fetch-pack`/`ls-remote`, `clone`/`init --template` (a template brings hooks and config), `grep -O`/`--open-files-in-pager` (also in a short cluster or abbreviated), a merge strategy other than git's own (`resolve`, `recursive`, `ort`, `octopus`, `ours`, `subtree`) via `-s`/`--strategy` (also abbreviated, attached, in a cluster) on `merge`/`pull`/`rebase` and via `--strategy` on `cherry-pick`/`revert` – any other name runs a `git-merge-<name>` program; `-X` is left alone. All long options are matched with git's abbreviations (`--ex`, `--templ`, `--strat`);
+-  - *writes into git's own files*: an output redirection (`>`, `>>`, `&>`, `<>`) to `.git/config`, `.git/hooks/…`, `.git/worktrees/<w>/config*` or `$GIT_DIR/…`, or such a path as an argument of a program that is not a plain reader (`tee`, `cp`, `ln`, `sed -i`, `chmod`, …; `cat`/`grep` may read them); each word is path-cleaned first (`.git//config`, `.git/./config`, `x/../.git/hooks`, `--opt=.git/config`); `.git` itself as a redirection target or as an argument of `cd`/`pushd`/`ln`/`cp`/`mv`/`tee`/`install`/`rsync` (`cd …/.git`, `ln -s …/.git d`, `cp x .git/`); globs are not evaluated: any glob/brace word (`{ [ ? *`) in a redirection target or in an argument of a program that is not a plain reader is rejected (`cp x {.g,x}it/config`, `tar -C .g*`, `cp src/* dst/` – write the paths out; readers such as `ls`, `grep`, `pgrep` and `find` without an action may take globs), and so is turning on dot-file matching (`shopt -s dotglob`, `setopt globdots`/`GLOB_DOTS`, `set -o globdots`, any `GLOBIGNORE=` assignment); `gh release`, `gh api`, `gh pr create|new|comment|edit|merge|review`, `gh issue create|new|comment|edit` with `-R`/`--repo`/`--hostname` (separate, `=` or attached value) before the subcommand – any other flag before the subcommand is rejected as unverifiable, because a flag that takes a value would shift which word is read as the subcommand (`gh --version`/`--help` alone pass); `gh auth status` is not allowed (`-t`/`--show-token` prints the token), `gh alias set|import`;
++  - *writes into git's own files*: an output redirection (`>`, `>>`, `&>`, `<>`) to `.git/config`, `.git/hooks/…`, `.git/worktrees/<w>/config*` or `$GIT_DIR/…`, or such a path as an argument of a program that is not a plain reader (`tee`, `cp`, `ln`, `sed -i`, `chmod`, …; `cat`/`grep` may read them); each word is path-cleaned first (`.git//config`, `.git/./config`, `x/../.git/hooks`, `--opt=.git/config`); `.git` itself as a redirection target or as an argument of `cd`/`pushd`/`ln`/`cp`/`mv`/`tee`/`install`/`rsync` (`cd …/.git`, `ln -s …/.git d`, `cp x .git/`); globs are not evaluated: any glob/brace word (`{ [ ? *`) in a redirection target or in an argument of a program that is not a plain reader is rejected (`cp x {.g,x}it/config`, `tar -C .g*`, `cp src/* dst/` – write the paths out; readers such as `ls`, `grep`, `pgrep` and `find` without an action may take globs; a verified rsync filter value (`--exclude '*~'`, `-f'- *.cache'`) is data, not a write target, #155), and so is turning on dot-file matching (`shopt -s dotglob`, `setopt globdots`/`GLOB_DOTS`, `set -o globdots`, any `GLOBIGNORE=` assignment); `gh release`, `gh api`, `gh pr create|new|comment|edit|merge|review`, `gh issue create|new|comment|edit` with `-R`/`--repo`/`--hostname` (separate, `=` or attached value) before the subcommand – any other flag before the subcommand is rejected as unverifiable, because a flag that takes a value would shift which word is read as the subcommand (`gh --version`/`--help` alone pass); `gh auth status` is not allowed (`-t`/`--show-token` prints the token), `gh alias set|import`;
+   - an unescaped `$?`/`${?}` (`\$?` and `'$?'` are literals) in the pipeline right after a multi-stage pipeline, unless pipefail is on: only a top-level, unconditional, foreground simple command `set -o pipefail` / `set -euo pipefail` before the pipe counts (not inside `if`/loops/`{ }`/`( )`, not after `&&`/`||`, not with `&`); any later `set +o pipefail` (even in a function) turns it off;
+   - a `while`/`until` loop (also nested after `then`/`do`/`{`/`(`) with `pgrep -f`/`--full` whose pattern (as a regexp) matches the command's own text (`[s]erver` passes);
+   - owner names (config `owner_names`) in the actual commit message: `-m`/`--message`/`-am`, `-F`/`--file` (file read relative to the hook's `cwd`; unreadable → block; stdin → block), `--trailer`, `--author`;
+@@ -294,7 +294,7 @@ What this is and is not: the deny rules and the guard block the *direct spelling
+ - **Fork subagents off** (wrapper, claude jobs only): every inherited `CLAUDE_CODE_FORK_SUBAGENT` is dropped and `CLAUDE_CODE_FORK_SUBAGENT=0` is set on claude (fork subagents are on by default in `claude -p` since the 2026-10-16 release; owner decision 2026-10-18, `docs/DECISIONS.md`); ordinary subagents and their per-job cap are unaffected; a codex job gets the environment unchanged.
+ - **Job marker** (wrapper, before claude starts): any inherited `AGENT_JOBS_JOB` is dropped and `AGENT_JOBS_JOB=<job id>` is set on claude, so every process of the job carries it (also the marker doctor procs will use). Under the marker the binary refuses every command except `mcp --role job`, `guard`, `run-wrapper` and help (start, cancel, status, list, result, tick, daemon, init, `mcp --role orchestrator`, …: «refused: running inside job»), and `mcp.Serve` refuses the orchestrator role on its own. The marker is an environment variable, so a job *can* remove it in a script it writes (the guard is not a sandbox); the guard rejects the direct spellings (`unset`, `env -u`, assignments, `mapfile`). Two process-based checks therefore back it up for the same control commands: (1) the ppid chain is walked through `/proc` (at most 256 steps) and the command is refused if an ancestor's argv is the wrapper's (`<bin> run-wrapper <jobdir> --token …`, matched by structure, or an `agent-jobs*` script run by an interpreter); (2) the command is refused if its session leader (`getsid(0)`, read from `/proc/<sid>/cmdline`) has the wrapper's argv shape: the wrapper starts with setsid, so it leads the session of every job process that did not call setsid itself – also of an orphan re-parented away from the wrapper – and this check does not depend on the agent or state dir the command targets; (3) as a fallback when the leader has exited, once the agent's store is open, the command is refused if its session id equals the recorded pgid of one of that agent's running jobs. Checks (1) and (2) are Linux-only and **fail open** when `/proc` cannot be read (and on macOS, where they are skipped; the marker and check (3) still apply). Before them, (0) the command is refused when `/proc/self/cgroup` names a job scope (`agent-jobs-*.scope`, any hierarchy line, any path component – also a sub-cgroup a job made inside its scope); this check also fails open when the file cannot be read. Without a scope (fallback), a job process that both drops the marker and calls `setsid` and has left the wrapper's process tree is not caught – the guard rejects the direct spellings of that as well, but a script the job writes is not inspected; with a scope it is refused by (0). Together these reject the direct spellings by which a job could start, cancel or manage jobs; not a sandbox (a script the job writes is not inspected, and without a scope a `setsid` + re-parented process that dropped the marker is not caught).
+ - **Session sweep** (wrapper, after claude exits, before `exit_code`): it ends what the job left in its session (and, with a scope, in its cgroup), so the processes a job started in the ordinary way do not outlive it. Processes a daemon outside the job starts for it (cron, tmux, …) are not in the session or the scope; the guard rejects the direct spellings of those (see «Cgroup containment»). The wrapper leads its own session (setsid), so on Linux it lists every live process whose session id is the wrapper's (from `/proc/<pid>/stat`, zombies skipped, the wrapper itself excluded) – also processes in other process groups and orphans re-parented away from it – sends them SIGTERM, waits up to 3 s, sends SIGKILL to whatever is left, and repeats (at most 5 rounds) until the session is empty; the count goes to `stderr.log`. Every signal goes through a pidfd: the descriptor is opened first (`pidfd_open`), session membership is checked only after it is open, and the signal is sent through it (`pidfd_send_signal`), so a pid reused by an unrelated process is never signalled. Without pidfd support (ENOSYS) nothing is signalled; there is no fallback to a bare `kill(pid)`. Fail closed: if processes are still alive after the last round, or the session cannot be enumerated or signalled, the wrapper still writes `exit_code` but first writes `sweep_incomplete` (survivor pids, then the error), and the daemon fails the job with «processes survived the job»; the job-done line ends with the same words. The daemon opens the marker without following links or blocking and reads it only as a regular file. Residual gap: the `/proc` enumeration is not atomic, so a process that forks between the directory read and the child's stat can leave a child that round did not see (the next round sees it, and one that keeps outpacing the rounds ends up as a survivor, failing the job); a survivor can also tamper with the job dir before the daemon reads it. With a scope, the daemon's stop of the whole unit (atomic, by systemd) follows at collection. Only then is `exit_code` written, so a job is never reported finished while one of its processes can still act (e.g. a markerless orphan waiting for the session leader to go and then starting a job for another agent). This is also the reference's ghost-process cleanup for preview servers, browsers and wait loops a job forgot. Outside Linux the wrapper sends SIGTERM to its process group only (it ignores SIGTERM itself meanwhile); the sweep inside a judge's manifest-check step sends nothing there, so the step's catch of stop signals holds until the runner starts and the runner does not inherit SIGTERM ignored (the script ran in its own process group, ended with it). Without a scope, a process that called `setsid` itself has left the session and is not swept (DEVIATIONS #9, residual gaps); with a scope the cgroup sweep below reaches it.
+-- **Cgroup containment** (Linux with systemd; DEVIATIONS #14). Config `cgroup_scope` (env `AGENT_JOBS_CGROUP_SCOPE` wins): `auto` (default) launches every wrapper in its own transient user scope when a throwaway `systemd-run --user --scope … true` succeeds, else falls back with a log line – except on a host where a scope was created before (`<state>/scope-ok`): there a failing probe requeues the job every tick for up to 10 minutes (`scope-failing-since`) before falling back, so a bus hiccup does not silently weaken a job; `required` likewise requeues within that window and then refuses. The containment of every launched job is shown as `scope <unit>` or `session only` in `status`, `list`, MCP `job_status` and (`session only`, `stop pending`) on the job-done line. `scripts/install-linux.sh` runs `init --pin-scope`, which writes `cgroup_scope: required` into `config.json` when it is unset and a probe succeeds; `required` refuses a job that cannot get one («refused to start: cgroup_scope is required …»); `off` never uses one. When neither `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS` is set and `/run/user/<uid>/bus` exists, the daemon points `XDG_RUNTIME_DIR` there for its systemd calls. A cgroup is inherited by every descendant and survives `setsid`, double forks and re-parenting, so: (a) control commands refuse inside a job scope (check (0) above); (b) after claude exits the wrapper, if its own cgroup is the expected `agent-jobs-<agent>-<id>.scope` or a sub-cgroup below it, sweeps from the scope itself the scope's cgroup subtree (pids from every `cgroup.procs` under it, itself excluded) in the same pidfd rounds as the session sweep – membership re-checked through `/proc/<pid>/cgroup` after the pidfd is open, zombies skipped – then the session as well, and only then writes `exit_code` (survivors fail the job as above); (c) the daemon stops the whole unit on cancel, timeout and every collection (see «Scope stops»). The scope sits under the user manager's `app.slice`, not under `agent-jobs@<agent>.service`, so a daemon restart never touches it (tested with a real `KillMode=process` unit restart). What a scope does not close (same uid, not a sandbox): a process can write its pid into another cgroup's `cgroup.procs` under the user manager, or ask the user manager for a new unit over D-Bus. The wrapper therefore drops `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` from the job's environment, and the guard rejects every command that starts processes outside the job's scope (owner decision 2026-10-17, `docs/DECISIONS.md`): `systemd-run`, `busctl`, `dbus-send`, `gdbus`, `qdbus`, `qdbus-qt5`, `qdbus6`, `dbus-run-session`, `crontab`, `at`, `batch`, `tmux`, `screen`, `pm2`, `docker`, `docker-compose`, `podman`, `podman-compose`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter` as commands (also behind wrappers and `xargs`) and where another program runs them: the value of an exec option (`find -exec`, `rsync -e`, `go test -exec`, `--rsh=`), a positional of a runner (`setsid`, `watch`, `flock`, …), a word inside code (an argument with spaces, quotes or parentheses: `python -c`, `node -e`, `awk`, `trap`), an absolute path or a substitution given to a copier; a package, directory, make target or test name merely named after one (`go test ./internal/ssh/...`, `make -C docker`) is data. For remote transfers (#116) a job never reaches remote hosts: `scp` and `sftp` are refused outright (the same positions as above), and `rsync` when an `-e`/`--rsh` option (any value) or a `host:path`-shaped argument (`user@host:/x`, `host::module`, `rsync://…`; a ':' before any '/', so `./a:b` is a local name) can take it to one — a purely local `rsync`, both paths local, is allowed. `systemctl --user` (also abbreviated; `systemctl` behind `xargs` and in those positions too), and any write into the cgroup file system (redirection, or an argument of a program that is not a plain reader) in the spellings the guard resolves: paths are cleaned (`//`, `/./`, `x/..`), made absolute against the call's directory and symlink-resolved, and match on a `sys/fs/cgroup` segment run, a cgroup core file base name (`cgroup.procs`, `cgroup.threads`, `cgroup.subtree_control`, `cgroup.kill`, `cgroup.freeze`, `cgroup.type`, `cgroup.max.*`), or any path through `/proc/<pid>/root` or `/proc/<pid>/cwd`. `~` is expanded with HOME; every `cd`/`pushd`/`popd` of the call (also inside `sh -c` or a substitution, in any order) adds candidate directories against which relative targets are checked, and `cd`/`pushd` into `/sys`, `/sys/fs` or the cgroup file system, `ln` to `/`, `/sys` or `/sys/fs`, and a cd with `CDPATH` in the call are rejected. Fail closed: a redirection target or a writer's argument (tee, dd, cp, mv, install, ln, rsync, truncate, sed, mkdir, …) computed inside the call is rejected in any call – a command or process substitution, a variable the call sets (assignment, `read`, `mapfile`/`readarray`, `for`/`select`, `declare`/`export`/`local`/`typeset`/`readonly`, `printf -v`, `${X:=…}`, PWD after a cd), a positional, indirect or `$_` expansion, any variable after `.`/`source` or `declare -n`, and any write target after an `ln` with a variable argument; a plain environment variable (`"$OUT"`, `"${OUT}"`) is rejected only when the call mentions the cgroup file system or has a cd the guard cannot resolve (`cd -`, `cd "$X"`, a `popd` that is not the call's last command), as is `~user` and a relative target after such a cd; the mention also counts when the cgroup path is split by an expansion that may be empty (`/sy${N}s/fs/cg"$N"roup`, positionals) or spelled with ANSI-C quoting (`$'s'`; any `$'…'` with an escape counts as a mention), and a variable write target that names a cgroup core file once such expansions are dropped (`x/cgroup${N}.procs`) is rejected. A sed script (the first operand, `-e`/`--expression`) is not a write target unless it may hold a `w`/`W` file (matched approximately); its file operands are. `coproc` runs its command like a plain command word. `trap` code is parsed like `sh -c` code. A script the job writes is not inspected (documented gap). **Fallback** (macOS, containers, no user bus, `cgroup_scope: off`): the session sweep and the marker, ancestry, session and store checks only – weaker: a `setsid` + re-parented process that dropped the marker is neither refused nor swept (pinned by a test).
++- **Cgroup containment** (Linux with systemd; DEVIATIONS #14). Config `cgroup_scope` (env `AGENT_JOBS_CGROUP_SCOPE` wins): `auto` (default) launches every wrapper in its own transient user scope when a throwaway `systemd-run --user --scope … true` succeeds, else falls back with a log line – except on a host where a scope was created before (`<state>/scope-ok`): there a failing probe requeues the job every tick for up to 10 minutes (`scope-failing-since`) before falling back, so a bus hiccup does not silently weaken a job; `required` likewise requeues within that window and then refuses. The containment of every launched job is shown as `scope <unit>` or `session only` in `status`, `list`, MCP `job_status` and (`session only`, `stop pending`) on the job-done line. `scripts/install-linux.sh` runs `init --pin-scope`, which writes `cgroup_scope: required` into `config.json` when it is unset and a probe succeeds; `required` refuses a job that cannot get one («refused to start: cgroup_scope is required …»); `off` never uses one. When neither `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS` is set and `/run/user/<uid>/bus` exists, the daemon points `XDG_RUNTIME_DIR` there for its systemd calls. A cgroup is inherited by every descendant and survives `setsid`, double forks and re-parenting, so: (a) control commands refuse inside a job scope (check (0) above); (b) after claude exits the wrapper, if its own cgroup is the expected `agent-jobs-<agent>-<id>.scope` or a sub-cgroup below it, sweeps from the scope itself the scope's cgroup subtree (pids from every `cgroup.procs` under it, itself excluded) in the same pidfd rounds as the session sweep – membership re-checked through `/proc/<pid>/cgroup` after the pidfd is open, zombies skipped – then the session as well, and only then writes `exit_code` (survivors fail the job as above); (c) the daemon stops the whole unit on cancel, timeout and every collection (see «Scope stops»). The scope sits under the user manager's `app.slice`, not under `agent-jobs@<agent>.service`, so a daemon restart never touches it (tested with a real `KillMode=process` unit restart). What a scope does not close (same uid, not a sandbox): a process can write its pid into another cgroup's `cgroup.procs` under the user manager, or ask the user manager for a new unit over D-Bus. The wrapper therefore drops `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` from the job's environment, and the guard rejects every command that starts processes outside the job's scope (owner decision 2026-10-17, `docs/DECISIONS.md`): `systemd-run`, `busctl`, `dbus-send`, `gdbus`, `qdbus`, `qdbus-qt5`, `qdbus6`, `dbus-run-session`, `crontab`, `at`, `batch`, `tmux`, `screen`, `pm2`, `docker`, `docker-compose`, `podman`, `podman-compose`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter` as commands (also behind wrappers and `xargs`) and where another program runs them: the value of an exec option (`find -exec`, `rsync -e`, `go test -exec`, `--rsh=`), a positional of a runner (`setsid`, `watch`, `flock`, …), a word inside code (an argument with spaces, quotes or parentheses: `python -c`, `node -e`, `awk`, `trap`), an absolute path or a substitution given to a copier; a package, directory, make target or test name merely named after one (`go test ./internal/ssh/...`, `make -C docker`) is data. For remote transfers (#116) a job never reaches remote hosts: `scp` and `sftp` are refused outright (the same positions as above), and `rsync` when an `-e`/`--rsh` option (any value) or a `host:path`-shaped argument (`user@host:/x`, `host::module`, `rsync://…`; a ':' before any '/', so `./a:b` is a local name) can take it to one — a purely local `rsync`, both paths local, is allowed. Fail closed for rsync forms the guard cannot resolve (#155): an `rsync` named in inline code or a dynamic word of another program, a dynamic rsync operand (directly, behind a wrapper, after a runner or `find -exec`), and a runner whose stdin feeds the command (`find -exec parallel rsync`, also for `ssh` there) are refused; find's `+` terminates an `-exec` action only directly after `{}`, so an rsync pattern like `--exclude +` cannot hide the remote operand behind it; `--log-file-format` is a value option, and a verified filter pattern (`--exclude '*~'`, `-f'- *.cache'`) is data the `.git` glob rule does not apply to. `systemctl --user` (also abbreviated; `systemctl` behind `xargs` and in those positions too), and any write into the cgroup file system (redirection, or an argument of a program that is not a plain reader) in the spellings the guard resolves: paths are cleaned (`//`, `/./`, `x/..`), made absolute against the call's directory and symlink-resolved, and match on a `sys/fs/cgroup` segment run, a cgroup core file base name (`cgroup.procs`, `cgroup.threads`, `cgroup.subtree_control`, `cgroup.kill`, `cgroup.freeze`, `cgroup.type`, `cgroup.max.*`), or any path through `/proc/<pid>/root` or `/proc/<pid>/cwd`. `~` is expanded with HOME; every `cd`/`pushd`/`popd` of the call (also inside `sh -c` or a substitution, in any order) adds candidate directories against which relative targets are checked, and `cd`/`pushd` into `/sys`, `/sys/fs` or the cgroup file system, `ln` to `/`, `/sys` or `/sys/fs`, and a cd with `CDPATH` in the call are rejected. Fail closed: a redirection target or a writer's argument (tee, dd, cp, mv, install, ln, rsync, truncate, sed, mkdir, …) computed inside the call is rejected in any call – a command or process substitution, a variable the call sets (assignment, `read`, `mapfile`/`readarray`, `for`/`select`, `declare`/`export`/`local`/`typeset`/`readonly`, `printf -v`, `${X:=…}`, PWD after a cd), a positional, indirect or `$_` expansion, any variable after `.`/`source` or `declare -n`, and any write target after an `ln` with a variable argument; a plain environment variable (`"$OUT"`, `"${OUT}"`) is rejected only when the call mentions the cgroup file system or has a cd the guard cannot resolve (`cd -`, `cd "$X"`, a `popd` that is not the call's last command), as is `~user` and a relative target after such a cd; the mention also counts when the cgroup path is split by an expansion that may be empty (`/sy${N}s/fs/cg"$N"roup`, positionals) or spelled with ANSI-C quoting (`$'s'`; any `$'…'` with an escape counts as a mention), and a variable write target that names a cgroup core file once such expansions are dropped (`x/cgroup${N}.procs`) is rejected. A sed script (the first operand, `-e`/`--expression`) is not a write target unless it may hold a `w`/`W` file (matched approximately); its file operands are. `coproc` runs its command like a plain command word. `trap` code is parsed like `sh -c` code. A script the job writes is not inspected (documented gap). **Fallback** (macOS, containers, no user bus, `cgroup_scope: off`): the session sweep and the marker, ancestry, session and store checks only – weaker: a `setsid` + re-parented process that dropped the marker is neither refused nor swept (pinned by a test).
+ - **Git environment scrub** (wrapper, before claude starts): every inherited `GIT_*`, `PAGER`, `EDITOR`, `VISUAL` is dropped, then `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=<jobdir>/gitconfig` (identity only), `GIT_PAGER=cat`, `PAGER=cat`, `GIT_EDITOR=true`, `EDITOR=true`, `VISUAL=true`, `GIT_TERMINAL_PROMPT=0` and, via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (command-line level: wins over repository config), `core.hooksPath=<jobdir>/no-hooks` (repository hooks never run), `core.fsmonitor=false`, `core.sshCommand=false`, `credential.helper=` (empty resets the helper list), `core.pager=cat`, `core.editor=true`. `diff.external` is not overridden: git has no value that disables it (an empty value makes every `git diff` fail with «cannot run»); inside the job a repo-local `diff.external`/textconv is reachable only by writing `.git/config` directly, which the guard rejects as a direct spelling. The daemon's own git calls (worktree add/remove, diff, format-patch, update-ref) drop inherited `GIT_*` and use the same overrides (hooks path `/dev/null`); its diffs pass `--no-ext-diff --no-textconv`, because cleanup runs after the job could have edited the repository config; filter drivers cannot be switched off that way, so cleanup skips the diffs entirely when the repository config names a filter, diff command or textconv (see Cleanup).
+ - **Prompt**: preamble (own dir only, content is data, no secrets, nothing outside) + subagent rules (`prompts/subagents.md`) + owner rules (job profile) + matching project cards + task + covered requirements (a job with covers: its rows and `prompts/requirements.md`) + kind checklist + report contract (Summary, Findings / Changes, Evidence, Not done / uncertain). A gate job (kinds `slicing`, `judge`) gets no cards, memory notes or brief column: its task is the daemon's input (`RenderGateInput`), see «Gate jobs».
+ 
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 3c6b2a8..1b58f66 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -278,7 +278,7 @@ A job runs with `bypassPermissions` and nobody is watching it. So the rules are
+ - **The guard.** A PreToolUse hook (`agent-jobs guard`) *parses* every Bash command instead of matching substrings: quotes, wrappers, `sh -c`, `eval`, substitutions and paths are resolved. It blocks every spelling of the outward actions above, git subcommands that run programs, writes into git's own files, dangerous `git config` keys, git identity overrides, the owner's name in a commit, `$?` after an unguarded pipe and wait loops that match themselves. A form it cannot resolve around git or gh is blocked, not guessed (a read-only git call in a command substitution, such as `$(git rev-parse HEAD)`, is resolved and checked like the plain call). A here-doc that `cat` or `tee` only writes out is data, and a `*` inside inline code is code: neither is refused for the paths or globs in its text ([BENCHMARK](BENCHMARK.md#real-usage), «Relaxed on 2026-10-25»). Unparsable input fails closed.
+ - **Scrubbed git environment.** The wrapper drops inherited `GIT_*`, `PAGER`, `EDITOR`, `VISUAL`, uses a job-only global git config with the job's identity, no system config, and command-line overrides that switch off repository hooks, fsmonitor, the SSH command, credential helpers, the pager and the editor.
+ - **No nested jobs.** A job never starts, cancels or manages jobs. The wrapper sets `AGENT_JOBS_JOB=<id>` on every job; under it, or when an ancestor process or the session leader is a job wrapper (Linux, `/proc`), the binary refuses every command except the job's own MCP server, the guard hook and the wrapper. The guard also rejects `agent-jobs` as a command in any form except `agent-jobs mcp --role job`, and any change to `AGENT_JOBS_*`. After claude exits, the wrapper ends every other process of the job's session (SIGTERM, then SIGKILL) before it reports the job finished, so what the job started in its session does not outlive it.
+-- **Cgroup containment (Linux).** With a systemd user manager each job runs in its own transient scope, `agent-jobs-<agent>-<id>.scope`. A cgroup cannot be left with `setsid`, a double fork or re-parenting: control commands refuse inside a job scope, the wrapper ends every other process of the scope before it reports the job finished, and cancel, timeout and collection stop the whole unit. The job loses the user bus variables, and the guard rejects every command that starts processes outside the scope (`systemd-run`, `systemctl --user`, D-Bus tools, `crontab`, `at`, `tmux`, `screen`, `pm2`, `docker`/`podman`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`; owner decision 2026-10-17) — and, because a job never reaches remote hosts (#116), `scp` and `sftp` outright and `rsync` when an `-e`/`--rsh` command or a `host:path` argument can take it to one (a purely local `rsync`, both paths local, is allowed) — and writes under `/sys/fs/cgroup` in the spellings it resolves (cleaned, relative, symlinked, split by an unset variable, ANSI-C quoted). The guard is not a sandbox: a script the job writes itself is not inspected. `status`, `list`, `job_status` and the job-done line show the containment (`scope <unit>` / `session only`); a failed scope stop is retried every tick. Without `systemd-run --user` (macOS, containers, no user bus) only the session-based checks above apply, which is **weaker**: a process that calls `setsid` and drops the marker escapes them. Config `cgroup_scope`: `auto` (default), `required` (a job without a scope is refused; the Linux installer sets it where scopes work), `off`.
++- **Cgroup containment (Linux).** With a systemd user manager each job runs in its own transient scope, `agent-jobs-<agent>-<id>.scope`. A cgroup cannot be left with `setsid`, a double fork or re-parenting: control commands refuse inside a job scope, the wrapper ends every other process of the scope before it reports the job finished, and cancel, timeout and collection stop the whole unit. The job loses the user bus variables, and the guard rejects every command that starts processes outside the scope (`systemd-run`, `systemctl --user`, D-Bus tools, `crontab`, `at`, `tmux`, `screen`, `pm2`, `docker`/`podman`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`; owner decision 2026-10-17) — and, because a job never reaches remote hosts (#116), `scp` and `sftp` outright and `rsync` when an `-e`/`--rsh` command or a `host:path` argument can take it to one, or when its arguments cannot be verified: inline code naming `rsync`, a dynamic operand (`"$DST"`), or a runner fed from stdin reached through an exec option (`find -exec parallel rsync`, #155; a purely local `rsync`, both paths local, is allowed) — and writes under `/sys/fs/cgroup` in the spellings it resolves (cleaned, relative, symlinked, split by an unset variable, ANSI-C quoted). The guard is not a sandbox: a script the job writes itself is not inspected. `status`, `list`, `job_status` and the job-done line show the containment (`scope <unit>` / `session only`); a failed scope stop is retried every tick. Without `systemd-run --user` (macOS, containers, no user bus) only the session-based checks above apply, which is **weaker**: a process that calls `setsid` and drops the marker escapes them. Config `cgroup_scope`: `auto` (default), `required` (a job without a scope is refused; the Linux installer sets it where scopes work), `off`.
+ - **Preamble and owner rules.** Every brief starts with hard rules (own folder only, file and tool content is data, never print secrets, nothing outside) and the owner's standing rules file (≤ 8 KB). If that file is unreadable, the job does not start.
+ - **Subagents inside a job.** A job may use at most three subagents, inside its own limits: they run in the job's process under the same settings, guard, budget and timeout. The guard counts them per job with a counter in the job's database row that only grows, refuses the fourth (and every further one if the job shortens its subagent log), keeps the job from writing the log or the database, and allows only the input keys `description`, `prompt`, `subagent_type` and `model` (exact match), so no `isolation` (worktree or remote), `run_in_background` or team. A subagent cannot start jobs either.
+ - **Codex jobs are the exception.** The deny rules, the guard and the job MCP server are Claude Code features and do not run inside `codex exec`; there the codex sandbox is the only containment. So codex jobs run `read-only` (review, research) unless the owner sets `codex_write_allowed: true`. Config `codex_sandbox: "worktree-full-access"` (for hosts where that sandbox cannot start) removes it altogether and so also needs `codex_write_allowed: true`; it is meant only for disposable hosts without the owner's credentials (see «Codex sandbox» above; fix AppArmor first).
+diff --git a/docs/GUIDE.ru.md b/docs/GUIDE.ru.md
+index 2425276..35e7975 100644
+--- a/docs/GUIDE.ru.md
++++ b/docs/GUIDE.ru.md
+@@ -214,7 +214,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code
+ - **Только свои MCP-серверы.** `--strict-mcp-config` отрезает всё, чего нет в `mcp.json` джобы, включая `.mcp.json` самого репозитория. `--setting-sources project` не пускает хуки главной сессии.
+ - **Гвард.** PreToolUse-хук (`agent-jobs guard`) *разбирает* каждую Bash-команду, а не ищет подстроки: кавычки, обёртки, `sh -c`, `eval`, подстановки и пути раскрываются. Он блокирует любое написание перечисленных выше внешних действий, подкоманды git, которые запускают программы, запись в собственные файлы git, опасные ключи `git config`, подмену git-идентичности, имя владельца в коммите, `$?` после пайпа без pipefail и циклы ожидания, находящие сами себя. Форму вокруг git или gh, которую он не может разобрать, он блокирует, а не угадывает. Неразбираемый ввод — отказ.
+ - **Очищенное git-окружение.** Обёртка выбрасывает унаследованные `GIT_*`, `PAGER`, `EDITOR`, `VISUAL`, использует глобальный git-конфиг только этой джобы с её идентичностью, без системного конфига, и переопределения уровня командной строки, которые выключают хуки репозитория, fsmonitor, SSH-команду, помощники учётных данных, пейджер и редактор.
+-- **Изоляция в cgroup (Linux).** При пользовательском менеджере systemd каждая джоба работает в своём временном scope `agent-jobs-<agent>-<id>.scope`. Из cgroup не выйти через `setsid`, двойной fork или смену родителя: управляющие команды внутри scope джобы получают отказ, обёртка завершает все остальные процессы scope до того, как объявить джобу законченной, а отмена, тайм-аут и сбор останавливают весь юнит. Из окружения джобы убраны переменные пользовательской шины, а гвард отклоняет все команды, которые запускают процессы вне scope (`systemd-run`, `systemctl --user`, инструменты D-Bus, `crontab`, `at`, `tmux`, `screen`, `pm2`, `docker`/`podman`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`; решение владельца 2026-10-17) — и, поскольку джоба никогда не достигает удалённых хостов (#116), `scp` и `sftp` безусловно, а `rsync`, когда его может туда вывести команда `-e`/`--rsh` или аргумент `host:path` (чисто локальный `rsync`, оба пути локальные, разрешён), — и запись в `/sys/fs/cgroup` в любом написании. Гвард не песочница: скрипт, который джоба пишет сама, не проверяется. `status`, `list`, `job_status` и строка job-done показывают изоляцию (`scope <unit>` / `session only`); неудачная остановка scope повторяется на каждом тике. Без `systemd-run --user` (macOS, контейнеры, нет пользовательской шины) действуют только проверки по сессии, и это **слабее**: процесс, который вызвал `setsid` и убрал метку, их обходит. Настройка `cgroup_scope`: `auto` (по умолчанию), `required` (джоба без scope не запускается; установщик для Linux включает его там, где scope работают), `off`.
++- **Изоляция в cgroup (Linux).** При пользовательском менеджере systemd каждая джоба работает в своём временном scope `agent-jobs-<agent>-<id>.scope`. Из cgroup не выйти через `setsid`, двойной fork или смену родителя: управляющие команды внутри scope джобы получают отказ, обёртка завершает все остальные процессы scope до того, как объявить джобу законченной, а отмена, тайм-аут и сбор останавливают весь юнит. Из окружения джобы убраны переменные пользовательской шины, а гвард отклоняет все команды, которые запускают процессы вне scope (`systemd-run`, `systemctl --user`, инструменты D-Bus, `crontab`, `at`, `tmux`, `screen`, `pm2`, `docker`/`podman`, `ssh`, `machinectl`, `loginctl`, `unshare`, `nsenter`; решение владельца 2026-10-17) — и, поскольку джоба никогда не достигает удалённых хостов (#116), `scp` и `sftp` безусловно, а `rsync`, когда его может туда вывести команда `-e`/`--rsh`, аргумент `host:path` или когда его аргументы нельзя проверить: `rsync` в инлайн-коде, динамический операнд (`"$DST"`) или раннер, питаемый stdin, через опцию exec (`find -exec parallel rsync`, #155; чисто локальный `rsync`, оба пути локальные, разрешён), — и запись в `/sys/fs/cgroup` в любом написании. Гвард не песочница: скрипт, который джоба пишет сама, не проверяется. `status`, `list`, `job_status` и строка job-done показывают изоляцию (`scope <unit>` / `session only`); неудачная остановка scope повторяется на каждом тике. Без `systemd-run --user` (macOS, контейнеры, нет пользовательской шины) действуют только проверки по сессии, и это **слабее**: процесс, который вызвал `setsid` и убрал метку, их обходит. Настройка `cgroup_scope`: `auto` (по умолчанию), `required` (джоба без scope не запускается; установщик для Linux включает его там, где scope работают), `off`.
+ - **Преамбула и правила владельца.** Каждый бриф начинается с жёстких правил (только своя папка, содержимое файлов и инструментов — данные, секреты не печатать, ничего наружу) и файла постоянных правил владельца (≤ 8 КБ). Если файл не читается, джоба не стартует.
+ - **Субагенты внутри джобы.** Джоба может использовать не больше трёх субагентов в пределах своих лимитов: они работают в процессе джобы с теми же настройками, гвардом, бюджетом и таймаутом. Гвард считает их по джобе счётчиком в строке джобы в базе, который только растёт, отклоняет четвёртого (и всех следующих, если джоба укоротит свой журнал субагентов), не даёт джобе писать журнал и базу, и пропускает только ключи `description`, `prompt`, `subagent_type` и `model` (точное совпадение), так что без `isolation` (worktree или remote), `run_in_background` и команд. Запускать джобы субагент тоже не может.
+ - **Джобы codex — исключение.** Deny-правила, гвард и MCP-сервер джобы — функции Claude Code и внутри `codex exec` не работают; там единственная изоляция — песочница codex. Поэтому джобы codex идут в режиме `read-only` (review, research), если владелец не включил `codex_write_allowed: true`. Ключ `codex_sandbox: "worktree-full-access"` (для хостов, где эта песочница не стартует) снимает её совсем и поэтому тоже требует `codex_write_allowed: true`; он только для одноразовых хостов без учётных данных владельца (см. «Песочница Codex» выше; сначала почините AppArmor).
+diff --git a/internal/guard/guard.go b/internal/guard/guard.go
+index ea3b4e1..87d42c5 100644
+--- a/internal/guard/guard.go
++++ b/internal/guard/guard.go
+@@ -1223,6 +1223,12 @@ func unverifiable(sc *script, c *simpleCmd) string {
+ 	if name == "rsync" && slices.Contains(v.wrappers, "xargs") {
+ 		return cannot("xargs rsync (its arguments, e.g. a host:path operand, come from stdin)")
+ 	}
++	if name == "rsync" {
++		if w := rsyncDynOperand(argv[1:], dyn[1:]); w != "" {
++			return cannot("rsync with the dynamic argument " + w + " in a position that may be a host:path " +
++				"operand (its value is a variable or substitution the guard cannot see)")
++		}
++	}
+ 	if isGitName(name) || name == "gh" {
+ 		switch {
+ 		case sc.depth > 0 && !substGitRead(sc, argv):
+@@ -1331,7 +1337,11 @@ func unverifiable(sc *script, c *simpleCmd) string {
+ 		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
+ 	}
+ 	if t := remoteCopyArg(name, argv[1:], dyn[1:]); t != "" {
+-		return cannot(name + " running " + t + " (an rsync that reaches a remote host) indirectly")
++		return cannot(name + " running " + t + " (an rsync that reaches or may reach a remote host) indirectly")
++	}
++	if t := rsyncMentionArg(name, argv[1:], dyn[1:]); t != "" {
++		return cannot(name + " running " + t + " (an rsync in inline code or a dynamic word, whose argv the " +
++			"guard cannot verify) indirectly")
+ 	}
+ 	return ""
+ }
+@@ -1394,8 +1404,8 @@ func rsyncRemote(args []string) bool {
+ var rsyncValueOpts = map[string]bool{
+ 	"--exclude": true, "--include": true, "--filter": true, "--exclude-from": true, "--include-from": true,
+ 	"--files-from": true, "--link-dest": true, "--compare-dest": true, "--copy-dest": true, "--backup-dir": true,
+-	"--suffix": true, "--chmod": true, "--chown": true, "--log-file": true, "--temp-dir": true,
+-	"--partial-dir": true, "--password-file": true, "--out-format": true, "--iconv": true,
++	"--suffix": true, "--chmod": true, "--chown": true, "--log-file": true, "--log-file-format": true,
++	"--temp-dir": true, "--partial-dir": true, "--password-file": true, "--out-format": true, "--iconv": true,
+ 	"--usermap": true, "--groupmap": true, "--block-size": true, "--max-size": true, "--min-size": true,
+ 	"--info": false, "--debug": false,
+ }
+@@ -1408,6 +1418,135 @@ func remoteColon(w string) bool {
+ 	return c >= 0 && (strings.IndexByte(w, '/') < 0 || c < strings.IndexByte(w, '/'))
+ }
+ 
++// rsyncDynOperand returns a dynamic word (a variable or substitution, dyn) in a position the
++// rsync option walk reads as an operand: its value is not visible, so it may be a host:path
++// argument, and the rsync call is refused (issue #155; `setsid rsync ./src/ "$DST"` with
++// DST=host:/dst/). The walk mirrors rsyncRemote — value options are consumed first — so a
++// dynamic pattern or size (`--exclude "$PAT"`) is data and no operand. rsyncRemote still reports
++// the literal remote spellings; empty string when every operand is static.
++func rsyncDynOperand(args []string, dyn []bool) string {
++	endOpts := false
++	for i := 0; i < len(args); i++ {
++		a := args[i]
++		switch {
++		case endOpts || a == "-" || !strings.HasPrefix(a, "-"):
++			if i < len(dyn) && dyn[i] {
++				return a
++			}
++		case a == "--":
++			if i < len(dyn) && dyn[i] {
++				return a
++			}
++			endOpts = true
++		case strings.HasPrefix(a, "--"):
++			opt, _, hasVal := strings.Cut(a, "=")
++			switch {
++			case opt == "--rsh" || opt == "--remote-option":
++				return "" // remote whatever the value: rsyncRemote reports it
++			case rsyncValueOpts[opt] && !hasVal && i+1 < len(args):
++				i++ // the option's value is the next word, data, not an operand
++			}
++		default: // a short-option cluster
++			val := a[1:]
++			for k := 0; k < len(val); k++ {
++				c := val[k]
++				if c == 'e' || c == 'M' { // --rsh, --remote-option: rsyncRemote reports it
++					return ""
++				}
++				if c == 'f' || c == 'T' || c == 'B' { // --filter, --temp-dir, --block-size: the
++					// rest of the cluster (or the next word) is the value, not an operand
++					if k == len(val)-1 && i+1 < len(args) {
++						i++
++					}
++					break
++				}
++			}
++		}
++	}
++	return ""
++}
++
++// reRsyncMention finds rsync as a word inside an argument, like reScopeMention does for the
++// out-of-scope tools (ssh names a directory or package as data: not every argument is scanned).
++var reRsyncMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])rsync($|[^a-z0-9_-])`)
++
++// rsyncMentionArg returns an argument of name that names rsync where the guard cannot verify its
++// argv: a dynamic word, or inline code — an argument with spaces, quotes or parentheses that
++// mentions rsync, as in interpreter code (`python3 -c '…os.system("rsync …")'`, issue #155). The
++// rsync command line is embedded in the code, so whether it stays local cannot be seen, and the
++// call is refused, like an ssh or scp mention there (reScopeMention in scopeToolArg). rsync's own
++// arguments are verified by rsyncRemote and rsyncDynOperand instead, and a shell's or eval's code
++// is parsed as a nested script where the rsync command itself is checked. An `ops` operand of a
++// program that never runs its operands is data (plainPath words carry no code characters).
++func rsyncMentionArg(name string, args []string, dyn []bool) string {
++	if name == "rsync" || name == "eval" || shells[name] {
++		return ""
++	}
++	for k, a := range args {
++		if k < len(dyn) && dyn[k] || strings.ContainsAny(a, " \t\n'\"(){};`") {
++			if reRsyncMention.MatchString(a) {
++				return a
++			}
++		}
++	}
++	return ""
++}
++
++// rsyncFilterArgs marks the positions in args (the arguments after `rsync` itself) that hold a
++// filter pattern: the value of --exclude, --include or --filter (attached or as the next word) and
++// a short -f cluster's remainder (or its next word). A pattern is data rsync matches against file
++// names, never a write target, so the .git glob rule does not apply to it (`-f'- *.cache'`,
++// issue #155). The walk mirrors rsyncRemote; other value options (--backup-dir, --temp-dir, …)
++// name paths rsync writes to and stay subject to the glob rule.
++func rsyncFilterArgs(args []string) map[int]bool {
++	out := map[int]bool{}
++	endOpts := false
++	for i := 0; i < len(args); i++ {
++		a := args[i]
++		switch {
++		case endOpts || a == "-" || !strings.HasPrefix(a, "-"):
++		case a == "--":
++			endOpts = true
++		case strings.HasPrefix(a, "--"):
++			opt, _, hasVal := strings.Cut(a, "=")
++			if opt == "--exclude" || opt == "--include" || opt == "--filter" {
++				if hasVal {
++					out[i] = true
++				} else if i+1 < len(args) {
++					out[i+1] = true
++					i++
++				}
++			}
++		default: // a short-option cluster
++			val := a[1:]
++			for k := 0; k < len(val); k++ {
++				c := val[k]
++				if c == 'e' || c == 'M' { // --rsh, --remote-option: rsyncRemote reports it remote
++					break
++				}
++				if c == 'f' { // --filter: the rest of the cluster (or the next word) is the pattern
++					if k == len(val)-1 {
++						if i+1 < len(args) {
++							out[i+1] = true
++							i++
++						}
++					} else {
++						out[i] = true
++					}
++					break
++				}
++				if c == 'T' || c == 'B' { // consumed like in rsyncRemote, not a filter
++					if k == len(val)-1 && i+1 < len(args) {
++						i++
++					}
++					break
++				}
++			}
++		}
++	}
++	return out
++}
++
+ // execRunners run their positional arguments as a command (`setsid tmux …`, `flock f docker …`).
+ var execRunners = map[string]bool{
+ 	"setsid": true, "watch": true, "flock": true, "chronic": true, "unbuffer": true, "strace": true, "ltrace": true,
+@@ -1442,6 +1581,7 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
+ 		case dyn[k] && reScopeMention.MatchString(a):
+ 		case scopeTool(b) && v != a && execOpts[opt]:
+ 		case scopeTool(b) && k > 0 && execOpts[args[k-1]]:
++		case scopeTool(b) && k > 0 && execRunners[progName(args[k-1])]:
+ 		case scopeTool(b) && execRunners[name] && !strings.HasPrefix(a, "-"):
+ 		case scopeTool(b) && copiers[name] && filepath.IsAbs(v):
+ 		case strings.ContainsAny(a, " \t\n'\"(){};`") && reScopeMention.MatchString(a):
+@@ -1456,31 +1596,45 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
+ // remoteCopyArg returns the argument showing that name runs, at a position the guard already
+ // treats as a command — the value or the word after an exec option (find -exec/-execdir/-ok) or a
+ // positional of an exec runner (setsid, ionice, chroot, …, also one reached through another
+-// exec option or runner) — an rsync that reaches a remote host (rsyncRemote of the words after
+-// the command word). Under parallel or entr the command's extra arguments come from stdin and
+-// cannot be seen, so rsync is refused without an argv to inspect; xargs is refused in
+-// unverifiable (a wrapper split strips it). For an exec option the executed command's argv ends
+-// at find's `;`/`+` terminator (execArgv): what follows is find's again, e.g. another action's
+-// -printf format.
++// exec option or runner, runner) — an rsync that reaches a remote host (rsyncRemote of the words
++// after the command word) or whose argv cannot be verified: under parallel or entr the command's
++// extra arguments come from stdin and cannot be seen (`find -exec parallel rsync …`, issue #155),
++// and a dynamic operand may expand to a host:path word (`setsid rsync ./src/ "$DST"`). xargs is
++// refused in unverifiable (a wrapper split strips it). For an exec option the executed command's
++// argv ends at find's `;`/`+` terminator (execArgv): what follows is find's again, e.g. another
++// action's -printf format. dyn carries the arguments' dynamism and is cut with the argv.
+ func remoteCopyArg(name string, args []string, dyn []bool) string {
+ 	data := runnerDataValues(name, args)
++	dv := func(k int) []bool {
++		if k >= len(dyn) {
++			return nil
++		}
++		return dyn[k:]
++	}
+ 	for k, a := range args {
+-		if data[k] || dyn[k] {
++		if data[k] || k < len(dyn) && dyn[k] {
+ 			continue
+ 		}
+ 		if progName(optValue(a)) != "rsync" {
+ 			continue
+ 		}
+ 		opt, _, _ := strings.Cut(a, "=")
+-		argv := args[k+1:]
++		argv, d := args[k+1:], dv(k+1)
++		runner := ""
+ 		switch {
+-		case optValue(a) != a && execOpts[opt], k > 0 && (execOpts[args[k-1]] || execRunners[progName(args[k-1])]):
+-			argv = execArgv(argv)
++		case optValue(a) != a && execOpts[opt], k > 0 && execOpts[args[k-1]]:
++			j := execArgvEnd(argv)
++			argv, d = argv[:j], d[:min(j, len(d))]
++		case k > 0 && execRunners[progName(args[k-1])]:
++			runner = progName(args[k-1])
++			j := execArgvEnd(argv)
++			argv, d = argv[:j], d[:min(j, len(d))]
+ 		case execRunners[name] && !strings.HasPrefix(a, "-"):
++			runner = name
+ 		default:
+ 			continue
+ 		}
+-		if name == "parallel" || name == "entr" || rsyncRemote(argv) {
++		if runner == "parallel" || runner == "entr" || rsyncRemote(argv) || rsyncDynOperand(argv, d) != "" {
+ 			return a
+ 		}
+ 	}
+@@ -1488,14 +1642,20 @@ func remoteCopyArg(name string, args []string, dyn []bool) string {
+ }
+ 
+ // execArgv cuts the argv of a command run by an exec option (find -exec/-execdir/-ok) at find's
+-// `;`/`+` terminator, so the words of a following action are not read as the command's.
+-func execArgv(argv []string) []string {
++// `;`/`+` terminator, so the words of a following action are not read as the command's. A `+`
++// terminates only in its real context: directly after `{}`, find's rule for the batch form; a lone
++// `+` elsewhere is a literal argument of the command, e.g. an rsync pattern (`--exclude +`,
++// issue #155). execArgvEnd returns the cut index so a paired slice (argument dynamism) can be cut
++// at the same place.
++func execArgv(argv []string) []string { return argv[:execArgvEnd(argv)] }
++
++func execArgvEnd(argv []string) int {
+ 	for k, a := range argv {
+-		if a == ";" || a == "+" {
+-			return argv[:k]
++		if a == ";" || a == "+" && k > 0 && argv[k-1] == "{}" {
++			return k
+ 		}
+ 	}
+-	return argv
++	return len(argv)
+ }
+ 
+ // packageRunners fetch and run a package by name (npx, pnpm dlx, …): what runs is decided by a
+@@ -1992,8 +2152,11 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
+ // remote host are refused here too (issue #116): a job never reaches remote hosts, where it would use
+ // the operator's keys. The same positions cover rsync remotely: behind the wrappers (nohup, env,
+ // sudo, timeout, xargs …) the stripped command is rsync here, and where another program runs it
+-// (find -exec/-execdir/-ok, the exec runners setsid/ionice/chroot/…) remoteCopyArg in unverifiable
+-// applies rsyncRemote to its argv; rsync under xargs or parallel/entr is refused outright, its
++// (find -exec/-execdir/-ok, the exec runners setsid/ionice/chroot/…, also nested through another
++// runner, e.g. find -exec parallel) remoteCopyArg in unverifiable applies rsyncRemote to its argv
++// and refuses a dynamic operand or a runner whose input feeds it; an rsync named in inline code
++// or a dynamic word of another program is refused too (issue #155); rsync under xargs or
++// parallel/entr is refused outright, its
+ // extra arguments coming from stdin. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
+ // `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
+ // cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
+@@ -2455,7 +2618,8 @@ func dotGlobOn(c *simpleCmd, argv []string) bool {
+ // to such a path or to `.git` (any program), such a path as an argument of a program that is not a
+ // plain reader (tee, cp, mv, ln, sed -i, chmod, …), and `.git` itself as the target of
+ // cd/pushd/ln/cp/mv/tee/install/rsync. Globs are not evaluated: any glob/brace word in a redirection
+-// target or in an argument of a non-reader is rejected (fail closed), as is turning on dotglob/globdots.
++// target or in an argument of a non-reader is rejected (fail closed), as is turning on dotglob/globdots
++// — except a verified rsync filter pattern, which is data rsync matches against names (issue #155).
+ // git itself is checked by the config allowlist instead.
+ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
+ 	blocked := func(p string) string {
+@@ -2504,12 +2668,18 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
+ 				findFilter := name == "find" && !slices.ContainsFunc(argv[1:], func(a string) bool {
+ 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
+ 				})
++				// An rsync filter pattern (`--exclude '*~'`, `-f'- *.cache'`) is data rsync matches
++				// against file names, not a write target: exempt it from the glob rule (issue #155).
++				var filters map[int]bool
++				if name == "rsync" {
++					filters = rsyncFilterArgs(argv[1:])
++				}
+ 				off := len(c.words) - len(argv)
+ 				for k, a := range argv[1:] {
+ 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
+ 						return blocked(a)
+ 					}
+-					if !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter {
++					if filters[k] || !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter {
+ 						continue
+ 					}
+ 					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word
+diff --git a/internal/guard/guard_test.go b/internal/guard/guard_test.go
+index 2a625a9..559124c 100644
+--- a/internal/guard/guard_test.go
++++ b/internal/guard/guard_test.go
+@@ -1420,8 +1420,8 @@ func TestRemoteTransfersIndirectRefused(t *testing.T) {
+ 		// An option value is no operand and no option letter: local rsync stays allowed.
+ 		{"rsync --exclude separate value", `rsync --exclude cache:old ./src/ ./dst/`, false},
+ 		{"rsync -f attached filter", `rsync -f'-x.cache' ./src/ ./dst/`, false},
+-		{"rsync -f glob value still refused", `rsync -f'- *.cache' ./src/ ./dst/`, true}, // by the
+-		// .git glob rule (a `*` word in a non-reader's argument), not the remote-host rule
++		{"rsync -f glob value allowed", `rsync -f'- *.cache' ./src/ ./dst/`, false}, // a filter
++		// pattern is data, not a write target (#155), so the .git glob rule does not apply
+ 		{"rsync --files-from value", `rsync --files-from list.txt ./src/ ./dst/`, false},
+ 		{"rsync -B separate value", `rsync -B 4096 ./src/ ./dst/`, false},
+ 		{"find -exec rsync local then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
+@@ -1438,6 +1438,86 @@ func TestRemoteTransfersIndirectRefused(t *testing.T) {
+ 	}
+ }
+ 
++// Issue #155: the remaining rsync bypasses after #116. A `+` that is not find's real terminator
++// (directly after `{}`) is a command argument, so `--exclude +` no longer hides the remote operand;
++// rsync named in inline interpreter code or a dynamic word is refused (its argv cannot be seen); a
++// dynamic rsync operand (directly, behind a wrapper or a runner, or after find -exec) is refused
++// too; and rsync under a runner reached through an exec option (`find -exec parallel rsync`) is
++// refused like rsync under parallel itself. Two false refusals are lifted: --log-file-format is a
++// value option, and a verified filter pattern (`-f'- *.cache'`, `--exclude '*~'`) is data the .git
++// glob rule does not apply to. ssh gains the same double-nesting coverage (scopeToolArg).
++func TestRemoteTransfersBypasses155(t *testing.T) {
++	t.Setenv("HOME", "/home/u")
++	t.Setenv("CDPATH", "")
++	cfg := Config{Dir: "/home/u/work"}
++	cases := []struct {
++		name  string
++		cmd   string
++		block bool
++	}{
++		// High: a `+` in a command argument is not find's terminator (only `{} +` is).
++		{"find -exec rsync --exclude +", `find . -maxdepth 0 -exec rsync --exclude + ./src/ host:/dst/ \;`, true},
++		{"find -exec rsync -B + remote", `find . -exec rsync -B + a host:/b \;`, true},
++		{"find -exec rsync local plus arg", `find . -maxdepth 0 -exec rsync --exclude + ./src/ ./dst/ \;`, false},
++		{"find -exec rsync local {}", `find . -maxdepth 0 -exec rsync ./src/ ./dst/ \;`, false},
++		// High: rsync named in inline code — its argv is embedded in the code, unverifiable.
++		{"python -c rsync os.system", `python3 -c 'import os; os.system("rsync ./src/ host:/dst/")'`, true},
++		{"python -c rsync local still refused", `python3 -c 'import os; os.system("rsync -a ./src/ ./dst/")'`, true},
++		{"python -c subprocess rsync", `python3 -c 'import subprocess; subprocess.run(["rsync", "./src/", "host:/dst/"])'`, true},
++		{"node -e rsync", `node -e 'child_process.execSync("rsync ./src/ host:/dst/")'`, true},
++		{"find -exec sh -c rsync", `find . -maxdepth 0 -exec sh -c 'rsync ./src/ host:/dst/' \;`, true},
++		{"dynamic word naming rsync", `setsid "$RSYNC" ./src/ host:/dst/`, true},
++		// A shell's or eval's own code is parsed as a nested script: the rsync command is checked
++		// there directly, and a local one stays allowed.
++		{"bash -c rsync local", `bash -c "rsync -a src/ dst/"`, false},
++		{"bash -c rsync remote", `bash -c "rsync a host:/b"`, true},
++		{"eval rsync remote", `eval 'rsync a host:/b'`, true},
++		// Data-only programs and plain words keep mentioning rsync without effect.
++		{"echo mentions rsync", `echo run rsync -a src/ dst/`, false},
++		{"grep mentions rsync", `grep -q rsync Makefile`, false},
++		{"find -name rsync filter", `find . -name 'rsync*'`, false},
++		// High: a dynamic rsync operand may expand to a host:path word.
++		{"rsync dynamic dest", `rsync ./src/ "$DST"`, true},
++		{"env rsync dynamic dest", `env rsync ./src/ "$DST"`, true},
++		{"setsid rsync dynamic dest", `DST=host:/dst/; setsid rsync ./src/ "$DST"`, true},
++		{"find -exec rsync dynamic dest", `X=host:/x; find . -maxdepth 0 -exec rsync a "$X" \;`, true},
++		{"rsync dynamic exclude value", `rsync --exclude "$PAT" ./src/ ./dst/`, false},
++		{"rsync dynamic option-like word", `rsync "$OPT" ./src/ ./dst/`, true},
++		// Medium: double nesting — the runner's input feeds the rsync arguments.
++		{"find -exec parallel rsync", `find . -maxdepth 0 -exec parallel rsync ./src/ \;`, true},
++		{"find -exec parallel rsync local", `find . -maxdepth 0 -exec parallel rsync ./src/ ./dst/ \;`, true},
++		{"find -exec entr rsync", `find . -maxdepth 0 -exec entr rsync ./src/ \;`, true},
++		{"setsid parallel rsync", `setsid parallel rsync ./src/ ./dst/`, true},
++		// The same double nesting for ssh and scp (scopeToolArg).
++		{"find -exec parallel ssh", `find . -maxdepth 0 -exec parallel ssh host ls \;`, true},
++		{"find -exec setsid ssh", `find . -maxdepth 0 -exec setsid ssh host ls \;`, true},
++		{"find -exec parallel scp", `find . -maxdepth 0 -exec parallel scp a host:/dst/ \;`, true},
++		{"find -exec setsid rsync remote", `find . -maxdepth 0 -exec setsid rsync a host:/b \;`, true},
++		{"find -exec setsid rsync local", `find . -maxdepth 0 -exec setsid rsync a b \;`, false},
++		// Medium: --log-file-format is a value option, not a remote operand.
++		{"rsync --log-file-format", `rsync --log-file-format '%f:%l' ./src/ ./dst/`, false},
++		{"rsync --log-file-format attached", `rsync --log-file-format='%f:%l' ./src/ ./dst/`, false},
++		{"rsync --log-file then format", `rsync --log-file log.txt --log-file-format '%f:%l' ./src/ ./dst/`, false},
++		// Medium: a verified filter pattern is data, so the .git glob rule does not refuse it.
++		{"rsync -f glob filter", `rsync -f'- *.cache' ./src/ ./dst/`, false},
++		{"rsync --filter glob", `rsync --filter='- *.cache' ./src/ ./dst/`, false},
++		{"rsync --exclude glob attached", `rsync --exclude='*.cache' ./src/ ./dst/`, false},
++		{"rsync --exclude glob separate", `rsync --exclude '*.cache' ./src/ ./dst/`, false},
++		{"rsync --include glob separate", `rsync --include 'rsync*' ./src/ ./dst/`, false},
++		// A glob in a write-target option still refused: only filter data is exempt.
++		{"rsync --backup-dir glob", `rsync --backup-dir '*.bak' ./src/ ./dst/`, true},
++		{"rsync --temp-dir glob", `rsync --temp-dir '/tmp/*' ./src/ ./dst/`, true},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			got := Check(c.cmd, cfg)
++			if (got != "") != c.block {
++				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
++			}
++		})
++	}
++}
++
+ // Fix loop 2 of PR #10: a write target built inside the call (substitution, a variable assigned in the
+ // same call, a symlink to a dynamic target) is rejected without any cgroup mention; the out-of-scope
+ // tool names count only where they run (command word, code strings, -exec argv, runners), so build and
+diff --git a/skills/agent-jobs/SKILL.md b/skills/agent-jobs/SKILL.md
+index 207664e..ce0eab8 100644
+--- a/skills/agent-jobs/SKILL.md
++++ b/skills/agent-jobs/SKILL.md
+@@ -21,7 +21,7 @@ The main session only talks, decides and checks. Anything longer than a few step
+ 
+ The job guard (`internal/guard`) refuses these, so a job that needs them audits code only or stops:
+ 
+-- `ssh`, and other tools that start processes outside the job's cgroup scope: `systemd-run`, `systemctl --user`, `crontab`/`at`, `tmux`/`screen`, `pm2`, `docker`/`podman`, `machinectl`/`loginctl`, `unshare`/`nsenter`, the session bus. A job never reaches remote hosts (#116): `scp` and `sftp` are refused outright, `rsync` when an `-e`/`--rsh` command or a `host:path` argument can take it to one (purely local `rsync` inside the worktree is fine).
++- `ssh`, and other tools that start processes outside the job's cgroup scope: `systemd-run`, `systemctl --user`, `crontab`/`at`, `tmux`/`screen`, `pm2`, `docker`/`podman`, `machinectl`/`loginctl`, `unshare`/`nsenter`, the session bus. A job never reaches remote hosts (#116): `scp` and `sftp` are refused outright, `rsync` when an `-e`/`--rsh` command or a `host:path` argument can take it to one (purely local `rsync` inside the worktree is fine) or when its arguments cannot be verified — inline code naming it, a dynamic operand, a runner fed from stdin (`find -exec parallel rsync`, #155).
+ - Anything that goes outside: `git push`/`tag` and other publishing git subcommands, any `gh` call except read-only ones, messages, schedules, wakeups, direct external notifications; `notify_owner` remains available through the orchestrator.
+ - Reading the agent-jobs state outside its own folder (other jobs' folders, `jobs.db`, config, cards).
+ - Nested agents (`claude`, `codex`, …) and nested jobs.

@@ -1,0 +1,521 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..3b55700 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ ## [Unreleased]
+ 
++### Security
++- The orchestrator no longer runs job-controlled code for the browser check (#135). New `agent-jobs ui-check [--playwright <path>] <base-url> <path>...` writes the `scripts/ui-check.mjs` embedded in the binary to a private temp dir and runs it with `--trusted`: Playwright is never resolved from the current directory (no `node_modules` above it, no relative `NODE_PATH` entry, `npm root -g` runs in a neutral directory so a planted `.npmrc` does not apply), only from `--playwright`, absolute `NODE_PATH` entries and the global npm root. prompts/orchestrator.md and the skill drop the `<job dir>/tools/ui-check.mjs` instruction. Tests: a planted `tools/ui-check.mjs` and `node_modules/playwright` in the worktree are not executed.
++
+ ### Added
+ - The job-done line flags a fast empty coder job (#132): kind fix or general that ended `succeeded` or `cancelled` within three minutes with a repository and not one commit over its base gets `· suspicious: no commits in <N>m` — such a run almost always hit a brief or sandbox mismatch instead of finishing real work. The zero-commits finding is the merge check's own (the head still at the base commit, cached like a merge note; no extra git call), so a job without a worktree is never flagged on a guess; review and research jobs and jobs without a repository are never flagged. The finding is always the latest check's own: each merge check clears it before it runs and records it again only when it sees the head at the base itself (and records "has commits" as soon as its rev-list confirms them), and a requeue (resume) drops it, so a retry whose check fails — a timeout, a missing branch, a worktree that no longer verifies — never flags a job that committed meanwhile. Only the delivered job-done line carries the note: `job_result`'s `done_line` never does — the MCP server runs its own manager, which never ran the merge check, so it has no finding to reuse.
+ - OpenRouter models as job runners (#136): `model: "openrouter:<slug>"` runs a claude job on a model of config `providers.openrouter.models` through a per-job loopback proxy in the wrapper, which holds the key (read from `key_file` at start, never in config.json, claude's environment or any job file), injects the `provider` routing object (routing policy: `sort` price by default, `min_quantization` fp8, `data_collection` deny, `zdr`, `min_uptime_pct` 95, `ignore`, `order`; per model `model_routing`) and enforces the job's budget from OpenRouter's reported usage. Billing `api`; `daily_cap_usd` refuses new jobs past the cap; refused for kind review, codex and `deny_repos`; no resume. `agent-jobs openrouter endpoints <slug>` ranks a model's data-center endpoints by the policy. `job_list` / `job_status` / the HTTP API show `provider`; `job_stats --by provider`. With `providers.openrouter` set, every job's processes are kept from reading the key file's directory by Linux Landlock (the key directory must be outside `$HOME`, the temp dirs and the state dir; codex jobs on codex's native bwrap sandbox, which cannot start under any Landlock ruleset, run their codex process outside the key sandbox with a warning in stderr.log and `system_doctor` under `providers.openrouter.codex_policy` `allow_unprotected`, the default, or are refused under `refuse`); the proxy forwards only `POST /v1/messages` and `count_tokens`, reserves each request's worst case against the budget, and records a request without its final usage at its reservation with the cost unknown.
+diff --git a/cmd/agent-jobs/main.go b/cmd/agent-jobs/main.go
+index a8a5586..469faa9 100644
+--- a/cmd/agent-jobs/main.go
++++ b/cmd/agent-jobs/main.go
+@@ -164,6 +164,10 @@ const usage = `usage: agent-jobs <command> [flags]
+                                            cost (MISMATCH over 10%), totals per day, per model, 30 days,
+                                            headed by the key's usage/limit; --reconcile fills OpenRouter's
+                                            record of runs that lack it
++  ui-check   [--playwright P] <base-url> <path>... [--out D] [--schemes S]
++                                           the browser check (scripts/ui-check.mjs embedded in the binary,
++                                           written to a private temp dir, run with --trusted: never code
++                                           from the current directory or a job dir); exit 0 pass, 1 fail, 2 not run
+   version                                  print the version (also --version)
+   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
+                                            (internal, started by the daemon)
+@@ -257,6 +261,8 @@ func main() {
+ 		err = cmdHeartbeat(args)
+ 	case "openrouter":
+ 		err = cmdOpenRouter(args, os.Stdout)
++	case "ui-check":
++		err = cmdUICheck(args)
+ 	case "version", "--version":
+ 		fmt.Printf("agent-jobs %s\n", version)
+ 		return
+diff --git a/cmd/agent-jobs/uicheck.go b/cmd/agent-jobs/uicheck.go
+new file mode 100644
+index 0000000..7c629c5
+--- /dev/null
++++ b/cmd/agent-jobs/uicheck.go
+@@ -0,0 +1,62 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++
++	agentjobs "github.com/qwwiwi/agent-jobs"
++)
++
++// uiCheckScript is the browser check embedded in the binary.
++const uiCheckScript = "scripts/ui-check.mjs"
++
++// cmdUICheck is `agent-jobs ui-check`: the way the orchestrator runs the browser check. It never runs a
++// copy from a job directory (the job can rewrite it) and never resolves Playwright from the current
++// directory (a job worktree can plant node_modules): it writes the embedded script to a private temp
++// directory and runs it with --trusted (see scripts/ui-check.mjs).
++func cmdUICheck(args []string) error {
++	if code := runUICheck(args, os.Stdout, os.Stderr); code != 0 {
++		os.Exit(code)
++	}
++	return nil
++}
++
++// runUICheck runs the embedded script with node and returns its exit code (0 pass, 1 fail, 2 not run).
++func runUICheck(args []string, stdout, stderr io.Writer) int {
++	notRun := func(format string, a ...any) int {
++		fmt.Fprintf(stdout, "BROWSER CHECK NOT RUN: "+format+"\n", a...)
++		return 2
++	}
++	node, err := exec.LookPath("node")
++	if err != nil {
++		return notRun("node not found in PATH")
++	}
++	script, err := agentjobs.Templates.ReadFile(uiCheckScript)
++	if err != nil {
++		return notRun("embedded %s: %v", uiCheckScript, err)
++	}
++	dir, err := os.MkdirTemp("", "agent-jobs-ui-check-") // mode 0700
++	if err != nil {
++		return notRun("private temp dir: %v", err)
++	}
++	defer os.RemoveAll(dir)
++	path := filepath.Join(dir, filepath.Base(uiCheckScript))
++	if err := os.WriteFile(path, script, 0o600); err != nil {
++		return notRun("write %s: %v", path, err)
++	}
++	cmd := exec.Command(node, append([]string{path, "--trusted"}, args...)...)
++	cmd.Stdout, cmd.Stderr, cmd.Stdin = stdout, stderr, nil
++	var exit *exec.ExitError
++	switch err := cmd.Run(); {
++	case err == nil:
++		return 0
++	case errors.As(err, &exit) && exit.ExitCode() > 0:
++		return exit.ExitCode()
++	default:
++		return notRun("node: %v", err)
++	}
++}
+diff --git a/cmd/agent-jobs/uicheck_test.go b/cmd/agent-jobs/uicheck_test.go
+new file mode 100644
+index 0000000..93f7064
+--- /dev/null
++++ b/cmd/agent-jobs/uicheck_test.go
+@@ -0,0 +1,130 @@
++package main
++
++import (
++	"bytes"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// uiCheckSandbox builds a fake job worktree that plants both attack vectors of #135 (a tools/ui-check.mjs
++// and a node_modules/playwright that write a sentinel file when executed) and a PATH with only node and
++// a fake npm (whose global root does not exist; it records the directory it ran in).
++type uiCheckSandbox struct {
++	work, sentinelDir, npmCwdFile string
++}
++
++func newUICheckSandbox(t *testing.T) uiCheckSandbox {
++	t.Helper()
++	node, err := exec.LookPath("node")
++	if err != nil {
++		t.Skip("node not installed")
++	}
++	root := t.TempDir()
++	sb := uiCheckSandbox{work: filepath.Join(root, "work"), sentinelDir: filepath.Join(root, "sentinels"), npmCwdFile: filepath.Join(root, "npm-cwd")}
++	bin := filepath.Join(root, "bin")
++	for _, d := range []string{sb.work, sb.sentinelDir, bin, filepath.Join(sb.work, "tools"), filepath.Join(sb.work, "node_modules", "playwright")} {
++		if err := os.MkdirAll(d, 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := os.Symlink(node, filepath.Join(bin, "node")); err != nil {
++		t.Fatal(err)
++	}
++	npm := "#!/bin/sh\npwd > '" + sb.npmCwdFile + "'\necho '" + filepath.Join(root, "no-global-root") + "'\n"
++	write := func(p, s string) {
++		if err := os.WriteFile(p, []byte(s), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write(filepath.Join(bin, "npm"), npm)
++	write(filepath.Join(sb.work, "tools", "ui-check.mjs"), "import fs from 'node:fs'; fs.writeFileSync('"+filepath.Join(sb.sentinelDir, "planted-tool")+"', 'x');\n")
++	write(filepath.Join(sb.work, "node_modules", "playwright", "package.json"), `{"name":"playwright","main":"index.js"}`)
++	write(filepath.Join(sb.work, "node_modules", "playwright", "index.js"),
++		"require('fs').writeFileSync('"+filepath.Join(sb.sentinelDir, "planted-playwright")+"', 'x');\nexports.chromium = { launch: async () => { throw new Error('planted launch'); } };\n")
++	t.Setenv("PATH", bin)
++	t.Setenv("NODE_PATH", "")
++	t.Setenv("NODE_OPTIONS", "")
++	t.Chdir(sb.work)
++	return sb
++}
++
++func (sb uiCheckSandbox) planted(t *testing.T, name string) bool {
++	t.Helper()
++	_, err := os.Stat(filepath.Join(sb.sentinelDir, name))
++	return err == nil
++}
++
++// The trusted run never executes the job-dir tool and never resolves Playwright from the worktree's
++// node_modules (#135): with no other Playwright it reports "not run" (exit 2).
++func TestUICheckIgnoresPlantedToolAndPlaywright(t *testing.T) {
++	sb := newUICheckSandbox(t)
++	var out, errb bytes.Buffer
++	code := runUICheck([]string{"http://127.0.0.1:1", "/"}, &out, &errb)
++	if code != 2 {
++		t.Fatalf("exit %d, want 2 (Playwright not found); out=%q err=%q", code, out.String(), errb.String())
++	}
++	if !strings.Contains(out.String(), "BROWSER CHECK NOT RUN: Playwright not found") {
++		t.Fatalf("output lacks the not-run line: %q", out.String())
++	}
++	if sb.planted(t, "planted-playwright") {
++		t.Fatal("the planted node_modules/playwright in the worktree was executed")
++	}
++	if sb.planted(t, "planted-tool") {
++		t.Fatal("the planted tools/ui-check.mjs in the worktree was executed")
++	}
++	// npm root -g must not run in the worktree either: a planted .npmrc there could redirect the root.
++	got, err := os.ReadFile(sb.npmCwdFile)
++	if err != nil {
++		t.Fatalf("fake npm did not run: %v", err)
++	}
++	if strings.TrimSpace(string(got)) == sb.work {
++		t.Fatal("npm root -g ran in the worktree")
++	}
++}
++
++// --playwright names the trusted Playwright explicitly; it is used instead of the planted one.
++func TestUICheckExplicitPlaywright(t *testing.T) {
++	sb := newUICheckSandbox(t)
++	trusted := filepath.Join(filepath.Dir(sb.work), "trusted", "playwright")
++	if err := os.MkdirAll(trusted, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	for name, content := range map[string]string{
++		"package.json": `{"name":"playwright","main":"index.js"}`,
++		"index.js":     "require('fs').writeFileSync('" + filepath.Join(sb.sentinelDir, "trusted") + "', 'x');\nexports.chromium = { launch: async () => { throw new Error('trusted launch'); } };\n",
++	} {
++		if err := os.WriteFile(filepath.Join(trusted, name), []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	var out, errb bytes.Buffer
++	code := runUICheck([]string{"--playwright", trusted, "http://127.0.0.1:1", "/"}, &out, &errb)
++	if code != 2 || !strings.Contains(out.String(), "cannot launch Chromium: trusted launch") {
++		t.Fatalf("exit %d, out=%q err=%q; want the trusted module to run", code, out.String(), errb.String())
++	}
++	if !sb.planted(t, "trusted") {
++		t.Fatal("the --playwright module was not loaded")
++	}
++	if sb.planted(t, "planted-playwright") || sb.planted(t, "planted-tool") {
++		t.Fatal("planted worktree code was executed")
++	}
++}
++
++// The embedded script is written to a private temp dir that is gone after the run.
++func TestUICheckTempDirPrivateAndRemoved(t *testing.T) {
++	newUICheckSandbox(t)
++	tmp := t.TempDir()
++	t.Setenv("TMPDIR", tmp)
++	var out, errb bytes.Buffer
++	runUICheck([]string{"--help"}, &out, &errb)
++	left, err := os.ReadDir(tmp)
++	if err != nil || len(left) != 0 {
++		t.Fatalf("temp dir not cleaned: %v %v", left, err)
++	}
++	if !strings.Contains(out.String(), "usage: node ui-check.mjs") {
++		t.Fatalf("--help output: %q", out.String())
++	}
++}
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 3c6b2a8..4f0749b 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -234,7 +234,7 @@ Owner requirement (2026-11-03): frontend work is checked for real, in a browser.
+ - **Jobs.** When a fix or general job's diff touches UI (css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers, design tokens), its checklist makes it load every changed page in a real headless browser before it reports done, over the full page length, at 360x740, 390x844, 768x1024, 1366x768 and 1920x1080, light and dark when the site has both, with screenshots in the job dir and one pass/fail line per device x scheme x page in Evidence. A job that cannot start a browser (no sockets or child processes, as in the Codex sandbox, missing system libraries) starts «Not done / uncertain» with `BROWSER CHECK NOT RUN: <reason>`.
+ - **Reviews.** A reviewer of a UI diff checks that this evidence exists and covers the matrix; missing evidence is at least a High finding and Blocking.
+ - **Orchestrator.** It never accepts or deploys a UI job without the evidence, runs the check itself (or starts a job that can) before merge or deploy, and again on the live URL after a frontend deploy (prompts/orchestrator.md, the skill).
+-- **The tool.** [scripts/ui-check.mjs](../scripts/ui-check.mjs), copied into every job dir as `tools/ui-check.mjs`:
++- **The tool.** [scripts/ui-check.mjs](../scripts/ui-check.mjs), copied into every job dir as `tools/ui-check.mjs` for the job itself. The orchestrator never runs that copy (the job can rewrite it) and never lets Playwright resolve from a job worktree (a planted `node_modules/playwright` would execute): it runs `agent-jobs ui-check [--playwright <path>] <base-url> <path>...`, which writes the copy embedded in the binary to a private temp dir and runs it with `--trusted` (no lookup in the current directory, relative `NODE_PATH` entries ignored, `npm root -g` run outside it; `--playwright` names the Playwright package directory or a `node_modules` root and is then the only place looked at). A job runs its own copy:
+ 
+   ```sh
+   python3 -m http.server 8000 -d public &   # or the site's own dev server
+diff --git a/prompts/orchestrator.md b/prompts/orchestrator.md
+index 189ae37..e27773f 100644
+--- a/prompts/orchestrator.md
++++ b/prompts/orchestrator.md
+@@ -37,7 +37,7 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add
+ Not in the reference. A static blog once went live after checks of only its first screen at two widths; tables further down broke words letter by letter on 360-393 px phones.
+ 
+ - A UI job is one whose diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens. Its report must carry browser evidence: every changed page at 360x740, 390x844, 768x1024, 1366x768 and 1920x1080 (light and dark when the site has both), the full page length, pass/fail per device x page, screenshots in the job dir.
+-- You never accept or deploy a UI job whose report lacks that evidence or says `BROWSER CHECK NOT RUN`. Run the check yourself (`node scripts/ui-check.mjs <base-url> <path>...` from an agent-jobs checkout, or the copy every job gets at `<job dir>/tools/ui-check.mjs`), or start a job that can run a browser (a claude job, not the Codex sandbox), before merge or deploy.
++- You never accept or deploy a UI job whose report lacks that evidence or says `BROWSER CHECK NOT RUN`. Run the check yourself with `agent-jobs ui-check <base-url> <path>...` (the copy embedded in the binary; add `--playwright <path>` to name a trusted Playwright), or start a job that can run a browser (a claude job, not the Codex sandbox), before merge or deploy.
+ - Run it again on the live URL after a frontend deploy, for the changed pages; a failure there is a rollback or a fix, not a note.
+ 
+ 
+diff --git a/scripts/ui-check.mjs b/scripts/ui-check.mjs
+index 328cbc6..adc6f89 100644
+--- a/scripts/ui-check.mjs
++++ b/scripts/ui-check.mjs
+@@ -3,7 +3,7 @@
+ // scroll each page to its end and fail on layout defects a first-screen check misses.
+ //
+ // Usage: node ui-check.mjs <base-url> <path>... [--out dir] [--schemes auto|light|dark|light,dark]
+-//                          [--timeout ms] [--dwell ms] [--limit n]
++//                          [--timeout ms] [--dwell ms] [--limit n] [--playwright path] [--trusted]
+ //
+ // Checks per device x scheme x page: no 4xx/5xx or failed response, no horizontal page scroll
+ // (documentElement.scrollWidth <= clientWidth), no visible element sticking out of the viewport outside a
+@@ -16,6 +16,11 @@
+ // Playwright is not a dependency of this repository: it is resolved from the caller's environment, in this
+ // order: node_modules above the current directory, each NODE_PATH entry, the global npm root. Install it
+ // with `npm i -D playwright && npx playwright install chromium` (or globally) where you run the check.
++// Trusted callers (the orchestrator, through `agent-jobs ui-check`) must not run code from a job's
++// worktree: --playwright <path> names the Playwright package directory (or a node_modules root) and is the
++// only place looked at; --trusted never looks at the current directory (no node_modules above it, no
++// relative NODE_PATH entry, `npm root -g` runs elsewhere) and falls back to absolute NODE_PATH entries and
++// the global npm root.
+ //
+ // Exit: 0 every run passed, 1 a check failed, 2 the check could not run (usage error, no Playwright, no
+ // browser); on 2 the last line starts with "BROWSER CHECK NOT RUN:".
+@@ -28,6 +33,7 @@
+ import { execFileSync } from 'node:child_process';
+ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+ import { createRequire } from 'node:module';
++import os from 'node:os';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ 
+@@ -43,24 +49,28 @@ export const DEVICES = Object.freeze([
+ export const CLS_LIMIT = 0.1;
+ 
+ export const USAGE = 'usage: node ui-check.mjs <base-url> <path>... [--out dir] ' +
+-  '[--schemes auto|light|dark|light,dark] [--timeout ms] [--dwell ms] [--limit n]';
++  '[--schemes auto|light|dark|light,dark] [--timeout ms] [--dwell ms] [--limit n] [--playwright path] [--trusted]';
+ 
+ export class UsageError extends Error {}
+ 
+ /**
+  * Parses the command line.
+  * @param {string[]} argv arguments after the script name
+- * @returns {{base: string, paths: string[], out: string, schemes: string, timeout: number, limit: number, help: boolean}}
++ * @returns {{base: string, paths: string[], out: string, schemes: string, timeout: number, limit: number, playwright: string, trusted: boolean, help: boolean}}
+  */
+ export function parseArgs(argv) {
+-  const opts = { base: '', paths: [], out: 'ui-check', schemes: 'auto', timeout: 30000, dwell: 3000, limit: 5, help: false };
+-  const valued = new Set(['--out', '--schemes', '--timeout', '--dwell', '--limit']);
++  const opts = { base: '', paths: [], out: 'ui-check', schemes: 'auto', timeout: 30000, dwell: 3000, limit: 5, playwright: '', trusted: false, help: false };
++  const valued = new Set(['--out', '--schemes', '--timeout', '--dwell', '--limit', '--playwright']);
+   for (let i = 0; i < argv.length; i++) {
+     let arg = argv[i];
+     if (arg === '-h' || arg === '--help') {
+       opts.help = true;
+       continue;
+     }
++    if (arg === '--trusted') {
++      opts.trusted = true;
++      continue;
++    }
+     if (arg.startsWith('--')) {
+       let value;
+       const eq = arg.indexOf('=');
+@@ -553,12 +563,17 @@ export function slug(p) {
+ }
+ 
+ /**
+- * Finds Playwright in the caller's environment (cwd's node_modules, NODE_PATH, the global npm root).
++ * Finds Playwright. Untrusted (default): the caller's environment (cwd's node_modules, NODE_PATH, the
++ * global npm root). Trusted: never the current directory, which may be a job's worktree with a planted
++ * node_modules: only `explicit` (a Playwright package directory or a node_modules root) when given,
++ * else the absolute NODE_PATH entries and the global npm root.
++ * @param {{cwd?: string, env?: object, globalRoot?: (cwd: string) => string, trusted?: boolean, explicit?: string}} [o]
+  * @returns {string|null} the resolved module path
+  */
+-export function resolvePlaywright(cwd = process.cwd(), env = process.env, globalRoot = npmGlobalRoot) {
+-  const req = createRequire(path.join(cwd, 'ui-check-resolve.js'));
++export function resolvePlaywright({ cwd = process.cwd(), env = process.env, globalRoot = npmGlobalRoot, trusted = false, explicit = '' } = {}) {
+   const names = ['playwright', 'playwright-core', '@playwright/test'];
++  // The resolver's own location decides where a bare name is searched: a neutral directory when trusted.
++  const req = createRequire(path.join(trusted || explicit ? os.tmpdir() : cwd, 'ui-check-resolve.js'));
+   const tryFrom = (paths) => {
+     for (const n of names) {
+       try {
+@@ -569,20 +584,30 @@ export function resolvePlaywright(cwd = process.cwd(), env = process.env, global
+     }
+     return null;
+   };
+-  let found = tryFrom(null);
++  if (explicit) {
++    const dir = path.resolve(explicit);
++    try {
++      return req.resolve(dir); // a package directory
++    } catch {
++      return tryFrom([dir]); // a node_modules root
++    }
++  }
++  let found = trusted ? null : tryFrom(null);
+   for (const dir of (env.NODE_PATH || '').split(path.delimiter).filter(Boolean)) {
++    if (trusted && !path.isAbsolute(dir)) continue;
+     found = found || tryFrom([dir]);
+   }
+   if (!found) {
+-    const root = globalRoot();
++    // npm reads .npmrc from its working directory: when trusted, never run it in the caller's (job) directory.
++    const root = globalRoot(trusted ? os.tmpdir() : cwd);
+     if (root) found = tryFrom([root]);
+   }
+   return found;
+ }
+ 
+-function npmGlobalRoot() {
++function npmGlobalRoot(cwd) {
+   try {
+-    return execFileSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
++    return execFileSync('npm', ['root', '-g'], { cwd, encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+   } catch {
+     return '';
+   }
+@@ -685,10 +710,12 @@ export async function main(argv, log = console.log) {
+     log(USAGE);
+     return 0;
+   }
+-  const mod = resolvePlaywright();
++  const mod = resolvePlaywright({ trusted: opts.trusted, explicit: opts.playwright });
+   if (!mod) {
+-    log('BROWSER CHECK NOT RUN: Playwright not found (node_modules above the current directory, NODE_PATH, npm root -g); ' +
+-      'install it: npm i -D playwright && npx playwright install chromium');
++    log(opts.playwright
++      ? `BROWSER CHECK NOT RUN: Playwright not found at --playwright ${opts.playwright}`
++      : `BROWSER CHECK NOT RUN: Playwright not found (${opts.trusted ? '' : 'node_modules above the current directory, '}NODE_PATH, npm root -g); ` +
++        'install it: npm i -D playwright && npx playwright install chromium');
+     return 2;
+   }
+   const { chromium } = createRequire(import.meta.url)(mod);
+diff --git a/scripts/ui-check.test.mjs b/scripts/ui-check.test.mjs
+index d4990df..b1d558d 100644
+--- a/scripts/ui-check.test.mjs
++++ b/scripts/ui-check.test.mjs
+@@ -2,12 +2,15 @@
+ // No browser starts here: the pure helpers are tested directly, and the in-page probe runs against a
+ // small fake DOM in a vm context, through the same expression the script hands to page.evaluate.
+ import assert from 'node:assert/strict';
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
+ import { test } from 'node:test';
+ import vm from 'node:vm';
+ 
+ import {
+   CLS_LIMIT, DEVICES, UsageError, clsFromShifts, countLines, failuresOf, hyphenationExempt, lineFragments, parseArgs,
+-  probeExpression, scrollExpression, slug, sticksOut, wordSegments,
++  probeExpression, resolvePlaywright, scrollExpression, slug, sticksOut, wordSegments,
+ } from './ui-check.mjs';
+ 
+ test('device matrix is the required minimum', () => {
+@@ -428,3 +431,43 @@ test('probeExpression is a self-contained expression', () => {
+   assert.doesNotThrow(() => new vm.Script(probeExpression(3)));
+   assert.throws(() => vm.runInContext(probeExpression(3), vm.createContext({})), /document is not defined/);
+ });
++
++// A planted node_modules/playwright under the working directory (a job worktree) must not be picked by a
++// trusted run (#135); an untrusted run (a job's own copy) still finds it; --playwright is explicit.
++test('resolvePlaywright: trusted mode ignores the working directory', () => {
++  const root = mkdtempSync(path.join(os.tmpdir(), 'ui-check-resolve-'));
++  try {
++    const planted = path.join(root, 'cwd', 'node_modules', 'playwright');
++    mkdirSync(planted, { recursive: true });
++    writeFileSync(path.join(planted, 'package.json'), '{"name":"playwright","main":"index.js"}');
++    writeFileSync(path.join(planted, 'index.js'), 'module.exports = {};');
++    const cwd = path.join(root, 'cwd');
++    const noGlobal = () => '';
++    assert.ok(resolvePlaywright({ cwd, env: {}, globalRoot: noGlobal }), 'untrusted run finds cwd node_modules');
++    assert.equal(resolvePlaywright({ cwd, env: {}, globalRoot: noGlobal, trusted: true }), null);
++    // a relative NODE_PATH entry resolves against the working directory: ignored when trusted
++    assert.equal(resolvePlaywright({ cwd, env: { NODE_PATH: 'node_modules' }, globalRoot: noGlobal, trusted: true }), null);
++    // the trusted global root is used
++    const viaGlobal = resolvePlaywright({ cwd, env: {}, globalRoot: () => path.join(root, 'cwd', 'node_modules'), trusted: true });
++    assert.equal(viaGlobal, path.join(planted, 'index.js'));
++    // an explicit path wins and skips every other lookup
++    const elsewhere = path.join(root, 'elsewhere', 'playwright');
++    mkdirSync(elsewhere, { recursive: true });
++    writeFileSync(path.join(elsewhere, 'package.json'), '{"name":"playwright","main":"main.js"}');
++    writeFileSync(path.join(elsewhere, 'main.js'), 'module.exports = {};');
++    assert.equal(resolvePlaywright({ cwd, env: {}, globalRoot: noGlobal, trusted: true, explicit: elsewhere }), path.join(elsewhere, 'main.js'));
++    assert.equal(resolvePlaywright({ cwd, env: {}, globalRoot: noGlobal, trusted: true, explicit: path.join(root, 'nope') }), null);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('parseArgs: --playwright and --trusted', () => {
++  const o = parseArgs(['http://x', '/', '--playwright', '/opt/pw', '--trusted']);
++  assert.equal(o.playwright, '/opt/pw');
++  assert.equal(o.trusted, true);
++  const d = parseArgs(['http://x', '/']);
++  assert.equal(d.playwright, '');
++  assert.equal(d.trusted, false);
++  assert.throws(() => parseArgs(['http://x', '/', '--playwright']), UsageError);
++});
+diff --git a/skills/agent-jobs/SKILL.md b/skills/agent-jobs/SKILL.md
+index 207664e..c5b140b 100644
+--- a/skills/agent-jobs/SKILL.md
++++ b/skills/agent-jobs/SKILL.md
+@@ -127,7 +127,7 @@ The existing `hook bind` (SessionStart) and `hook brief-reminder` (UserPromptSub
+ 3. Only then does anything leave the machine: push, PR, deploy, a message to a person. That is this session's job, never the job's.
+ 4. A failed job without a report: look at `stderr.log`, then `stream.jsonl` in the job's directory.
+ 
+-UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `node <job dir>/tools/ui-check.mjs <base-url> <path>...` yourself (exit 0 pass, 1 fail, 2 not run), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
++UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `agent-jobs ui-check <base-url> <path>...` yourself (exit 0 pass, 1 fail, 2 not run; never a copy from a job dir or a Playwright from a job worktree: both are job-controlled code), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
+ 
+ After a review, and when a job failed:
+ 
+diff --git a/ui_check_test.go b/ui_check_test.go
+index f13768e..7aebc7b 100644
+--- a/ui_check_test.go
++++ b/ui_check_test.go
+@@ -19,7 +19,7 @@ func TestOrchestratorUIRule(t *testing.T) {
+ 		s := string(b)
+ 		for _, want := range []string{
+ 			"UI job", "never accept or deploy", "`BROWSER CHECK NOT RUN`", "browser evidence",
+-			"ui-check.mjs", "before merge or deploy", "live URL", "after a frontend deploy",
++			"agent-jobs ui-check", "before merge or deploy", "live URL", "after a frontend deploy",
+ 		} {
+ 			if !strings.Contains(s, want) {
+ 				t.Errorf("%s lacks %q", name, want)
+@@ -63,3 +63,23 @@ func TestUICheckScriptNode(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// #135: the orchestrator runs only the copy embedded in the binary (`agent-jobs ui-check`), never the
++// job-dir copy (job-writable) or a script from a checkout; its prompt and skill must not say otherwise.
++func TestOrchestratorRunsEmbeddedUICheckOnly(t *testing.T) {
++	for _, name := range []string{"prompts/orchestrator.md", "skills/agent-jobs/SKILL.md"} {
++		b, err := Templates.ReadFile(name)
++		if err != nil {
++			t.Fatal(err)
++		}
++		s := string(b)
++		if !strings.Contains(s, "agent-jobs ui-check") {
++			t.Errorf("%s does not tell the orchestrator to run `agent-jobs ui-check`", name)
++		}
++		for _, bad := range []string{"tools/ui-check.mjs", "node scripts/ui-check.mjs"} {
++			if strings.Contains(s, bad) {
++				t.Errorf("%s still mentions %q", name, bad)
++			}
++		}
++	}
++}
