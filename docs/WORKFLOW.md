@@ -72,7 +72,7 @@ When a job finishes, the session gets one line:
 
 Read the report with `job_result` (or `agent-jobs result --agent <agent> <id>`):
 
-1. Read «Not done / uncertain» first. It is where the job names what it skipped or could not verify.
+1. Read «Not done / uncertain» first. It is where the job names what it skipped or could not verify. The default result is compact (`not_done`, `summary`, `forks`, `commits`, section sizes); fetch more with `sections: [...]` or `detail: "full"` (`--full` on the CLI).
 2. Then read the diff against `base_commit`, not just the report. The report is a claim, not a result.
 3. Only then merge, deploy or report onward.
 

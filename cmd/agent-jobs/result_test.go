@@ -114,3 +114,45 @@ func TestResultAcceptanceRedacted(t *testing.T) {
 		t.Fatalf("result:\n%s", out)
 	}
 }
+
+// `result` prints the compact view (Not done, Summary, Forks, section sizes) by default and all of
+// report.md with --full; both redacted.
+func TestResultCompactAndFull(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	j := &store.Job{ID: "261106-150000-cafe", Agent: "test", Title: "t", Kind: "general", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", TimeoutMinutes: 45, CreatedAt: now, StartedAt: &now, FinishedAt: &now}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	dir := m.JobDir(j.ID)
+	_ = m.Close()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tok := "ghp_" + strings.Repeat("Q", 36)
+	report := "## Summary\nsummary text " + tok + "\n\n## Evidence\n" + strings.Repeat("evidence line\n", 500) +
+		"\n## Not done / uncertain\nBLOCKED: blocker text\n\n## Forks\nnone\n\n## Progress\n- 10:00 UTC step\n"
+	if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compact := captureStdout(t, func() error { return cmdResult([]string{"--agent", "test", j.ID}) })
+	for _, want := range []string{"## Not done / uncertain\nBLOCKED: blocker text", "## Summary\nsummary text [redacted:github]", "## Forks\nnone",
+		"Evidence 7013 B", "--full"} {
+		if !strings.Contains(compact, want) {
+			t.Fatalf("compact result lacks %q:\n%s", want, compact)
+		}
+	}
+	if strings.Contains(compact, "evidence line") || strings.Contains(compact, "10:00 UTC step") || strings.Contains(compact, tok) {
+		t.Fatalf("compact result is not compact or not redacted:\n%s", compact)
+	}
+	full := captureStdout(t, func() error { return cmdResult([]string{"--agent", "test", "--full", j.ID}) })
+	if !strings.Contains(full, "evidence line") || !strings.Contains(full, "10:00 UTC step") || strings.Contains(full, tok) ||
+		strings.Index(full, "BLOCKED: blocker text") > strings.Index(full, "summary text") {
+		t.Fatalf("--full result:\n%s", full)
+	}
+}
