@@ -476,7 +476,7 @@ func (p *orProxy) forwardBody(w http.ResponseWriter, body io.Reader, u *usageRea
 // orLineScrubber writes a 200 response body a complete line at a time: each line without the key, and
 // an error line (orErrorLine: an SSE error event, a JSON error body) through scrubORSecrets, so without
 // anything key-shaped either. Other bytes pass unchanged. A line longer than maxProxyJSONResponse (model
-// output, never an error event) is passed on in pieces, each without the key.
+// output, never an error event) is passed on in pieces, each scrubbed of the key on its own.
 type orLineScrubber struct {
 	w    io.Writer
 	key  string
