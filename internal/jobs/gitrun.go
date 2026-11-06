@@ -57,6 +57,13 @@ type gitProc struct {
 	killed   chan struct{} // closed by kill, after the group was signalled
 	killOnce sync.Once
 
+	// held, when not nil (startGitHeld), is closed by releaseStreams once the caller is done with the
+	// streams it reads or writes itself (*os.File ends the runner does not copy, #114): until then, or
+	// until kill, the reaper keeps git unreaped, so that its PID still reserves the group's ID and a kill
+	// at the deadline also reaches a descendant that holds such a stream after git has exited.
+	held     chan struct{}
+	heldOnce sync.Once
+
 	// mu orders the group kill against the reaping. reap sets reaped under mu right before git is
 	// reaped, and kill signals the group only under mu while reaped is false. Until then git is running
 	// or a zombie, so its PID, which is the group's ID, stays allocated: the group kill reaches git's
@@ -72,6 +79,18 @@ type gitProc struct {
 // Stdout and Stderr distinct writers. A writer that is no *os.File is fed by the runner through a pipe
 // of its own, never by exec, so that the runner can close it (see gitProc.outs).
 func startGit(dir string, env []string, setup func(*exec.Cmd), args ...string) (*gitProc, error) {
+	return startGitProc(dir, env, setup, false, args...)
+}
+
+// startGitHeld is startGit for a caller that reads or writes git's streams itself (an *os.File Stdout,
+// Stdin): git is not reaped before the caller has called releaseStreams or kill (see gitProc.held). The
+// caller must call one of them, or the call never ends.
+func startGitHeld(dir string, env []string, setup func(*exec.Cmd), args ...string) (*gitProc, error) {
+	return startGitProc(dir, env, setup, true, args...)
+}
+
+// startGitProc is startGit, with git held unreaped for the caller's own streams when held is true.
+func startGitProc(dir string, env []string, setup func(*exec.Cmd), held bool, args ...string) (*gitProc, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(slices.Clip(env), "GIT_TERMINAL_PROMPT=0")
@@ -81,6 +100,9 @@ func startGit(dir string, env []string, setup func(*exec.Cmd), args ...string) (
 	}
 	p := &gitProc{cmd: cmd, name: "git " + strings.Join(args, " "), done: make(chan error, 1),
 		copied: make(chan struct{}), killed: make(chan struct{})}
+	if held {
+		p.held = make(chan struct{})
+	}
 	var dsts []io.Writer
 	var ends []*os.File // the write ends, git's after the start
 	closeEnds := func() {
@@ -168,6 +190,14 @@ func (p *gitProc) reap() {
 		}
 		t.Stop()
 	}
+	// The caller's own streams have no end the runner can see: their holders are git's group until the
+	// caller is done with them or the group is killed, which kill does while git still reserves its ID.
+	if p.held != nil {
+		select {
+		case <-p.held:
+		case <-p.killed:
+		}
+	}
 	p.mu.Lock()
 	p.reaped = true
 	p.mu.Unlock()
@@ -201,6 +231,14 @@ func (p *gitProc) signal() {
 func (p *gitProc) kill() {
 	p.signal()
 	p.killOnce.Do(func() { close(p.killed) })
+}
+
+// releaseStreams tells the reaper of a startGitHeld git that the caller is done with the streams it
+// handles itself, so that git may be reaped once it has exited (once; a no-op for startGit).
+func (p *gitProc) releaseStreams() {
+	if p.held != nil {
+		p.heldOnce.Do(func() { close(p.held) })
+	}
 }
 
 // wait returns git's result, or errGitTimeout once ctx has ended: then git's group is killed and git gets

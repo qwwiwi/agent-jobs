@@ -1,0 +1,72 @@
+diff --git a/internal/jobs/resume_skills_test.go b/internal/jobs/resume_skills_test.go
+index 29fe3e3..e3888dd 100644
+--- a/internal/jobs/resume_skills_test.go
++++ b/internal/jobs/resume_skills_test.go
+@@ -234,6 +234,53 @@ func TestResumeLegacySkillsAfterCleanupRefused(t *testing.T) {
+ 	}
+ }
+ 
++// A job queued by resume before manifests existed has delivered skills and no manifest. The
++// launch-time check must refuse it even though admission already passed.
++func TestResumeQueuedLegacySkillsRefusedAtLaunch(t *testing.T) {
++	m, _ := skillsManager(t)
++	j := enqueue(t, m, "resume guard", func(r *StartRequest) { r.Kind = "fix" })
++	if err := m.Store.Claim(j.ID, "skills-test", m.Now()); err != nil {
++		t.Fatal(err)
++	}
++	j = get(t, m, j.ID)
++	work := filepath.Join(m.JobDir(j.ID), "work")
++	if err := os.MkdirAll(work, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := m.deliverSkills(j, "skills-test", work); err != nil {
++		t.Fatal(err)
++	}
++	j = get(t, m, j.ID)
++	if len(j.SkillsDelivered) == 0 || j.SkillsManifest == "" || j.RepoPath != "" {
++		t.Fatal("fixture must have recorded deliveries and no repository")
++	}
++	if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("original task\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if err := m.Store.Finish(j.ID, "skills-test", store.StatusFailed, 7, 0.4, 1, "turn limit", m.Now()); err != nil {
++		t.Fatal(err)
++	}
++	// Admitted while the manifest is still recorded, so the job is queued for its next attempt.
++	if _, err := m.Resume(j.ID, "continue", Limits{}); err != nil {
++		t.Fatalf("resume with a manifest refused at admission: %v", err)
++	}
++	if err := m.Store.Claim(j.ID, "resume-test", m.Now()); err != nil {
++		t.Fatal(err)
++	}
++	// Turn the claimed row into a legacy one: names recorded, manifest gone.
++	if err := m.Store.SetSkillsDelivered(j.ID, "resume-test", j.SkillsDelivered, j.SkillsNote); err != nil {
++		t.Fatal(err)
++	}
++	legacy := get(t, m, j.ID)
++	if len(legacy.SkillsDelivered) == 0 || legacy.SkillsManifest != "" {
++		t.Fatalf("fixture must be a legacy row: delivered=%v manifest=%q", legacy.SkillsDelivered, legacy.SkillsManifest)
++	}
++	_, err := m.prepareResume(legacy, "resume-test")
++	if err == nil || !strings.Contains(err.Error(), "no verifiable baseline") {
++		t.Fatalf("queued legacy delivery must be refused at launch: %v", err)
++	}
++}
++
+ func TestResumeDeliveredSkillsSymlinkedWorkRefused(t *testing.T) {
+ 	for _, mode := range []string{"admission", "launch"} {
+ 		for _, name := range []string{"CLAUDE.md", ".claude/settings.local.json"} {
+diff --git a/internal/mcp/source_files_test.go b/internal/mcp/source_files_test.go
+index 5c979fa..283f22d 100644
+--- a/internal/mcp/source_files_test.go
++++ b/internal/mcp/source_files_test.go
+@@ -72,6 +72,9 @@ func TestJobStartRejectsNonCanonicalSources(t *testing.T) {
+ 		{"symlink parent with dotdot", dir + "/linked/../report.md"},
+ 		{"trailing slash on regular file", origin + "/"},
+ 		{"dot component", dir + "/./report.md"},
++		{"double slash in the middle", dir + "//report.md"},
++		{"double slash after the root", "//" + strings.TrimPrefix(origin, "/")},
++		{"double slash before a trailing component", dir + "/linked//report.md"},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {
