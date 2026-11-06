@@ -410,6 +410,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: heartbeats: %w", err)
 	}
+	if _, err := db.Exec(idlePickSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: idle pick: %w", err)
+	}
 	if _, err := db.Exec(waiversSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)

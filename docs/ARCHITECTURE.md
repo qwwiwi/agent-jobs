@@ -324,6 +324,17 @@ What this is and is not: the deny rules and the guard block the *direct spelling
 - after an unanswered lookup the next ones are skipped for `MemoryBreaker` (1 min) with «skipped: …» as the reason;
 - no brain configured: no section at all (briefs as before).
 
+## Idle pick
+
+*Issue #165.* Off by default (`idle_pick.enabled`). `internal/jobs/idlepick.go`, `internal/store/idlepick.go`. It replaces an hourly «anything to do?» wake: the daemon tells the orchestrator what is ready at the moment its queue empties, on the delivery the orchestrator receives anyway.
+
+- **Where it rides.** `deliverDone` (`internal/jobs/finish.go`) asks `idleNote(batch)` for the batch it is about to type, single or coalesced, and appends `· idle: …` to that same line; the note is recorded (`idle_pick_events`, kind `note`) only after tmux accepted the line, so a failed delivery composes it again on the retry. There is no separate wake for a transition.
+- **Queue-empty transition.** A note is considered only when no job is `queued`, `running` or `stopped` and no job-done line outside the batch is still pending (the last line of the epoch carries it). Right before typing, `idleStillEmpty` counts the active jobs again: a job enqueued since the note was composed drops it and spends nothing, so the next queue-empty delivery carries it. The window between this check and tmux is the unavoidable race of a daemon that does not hold the MCP server's enqueue; a note that slips through is harmless text.
+- **Queue epoch.** There is no counter. An epoch is everything since the last evaluation: the batch is evaluated only if no `eval`, `note` or `recovery` event is at or after its latest `finished_at`. The events live in SQLite (table `idle_pick_events`: id, at, kind; pruned after a week), so repeated ticks and a restarted daemon never evaluate or say an epoch twice, and a delivery held in a coalescing window is evaluated when it goes out.
+- **Ready work.** `idleReadyWork`: for each open milestone, `TaskStatuses` = `ready` and no job on the task (a task with a job of its own, failed or in review, belongs to the orchestrator's decision, and a `blocked` one waits for an accepted dependency), plus the agent's `open` intentions. Read-only: the daemon never calls `job_start`.
+- **Gate.** `idleGate`: at least `cooldown_seconds` (default 600) since the last `note`/`recovery` event and fewer than `max_wakes_per_day` (default 8) of them in the last 24 hours. A held-back note is stored as `suppressed`, which does not spend the epoch. An evaluation with nothing ready is stored as `eval` and delivers nothing.
+- **Recovery scan.** `idleRecovery`, run every tick after `notifyPending` but acting at most once per `recovery_scan_seconds` (default 21600; `-1` off): with the queue empty, no line pending, a finish newer than the last evaluation, and a notify target set, it evaluates once (event `scan`) and, if work is ready and the gate allows, types a line of its own, `[jobs:idle] idle: …` (event `recovery`). It exists for the epochs a delivery-time evaluation could not cover; it is the only idle line that is not on a job-done delivery.
+
 ## Heartbeat
 
 *Reference: «демон сам решает, есть ли повод разбудить агента ради его собственных целей. Сначала дешёвая проверка на Go …, потом маленькая модель решает»; the model is Sonnet, not Haiku (DEVIATIONS #1).* Off by default (`heartbeat.enabled`). `internal/jobs/heartbeat.go`, `internal/store/heartbeats.go`.

@@ -208,6 +208,9 @@ type Config struct {
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
+	// IdlePick makes the job-done line of the last job of an emptied queue say what is ready to do next
+	// (#165), so no hourly wake is needed to look for it. Off by default.
+	IdlePick IdlePickConfig `json:"idle_pick"`
 	// ModelPrices adds or overrides list prices (USD per million tokens) by model name, used to estimate
 	// the cost of attempts that ended without a reported one (killed, timed out, codex). A model with no
 	// price here or in the built-in table keeps an unknown cost.
@@ -612,6 +615,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.IdlePick.validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	// An empty listen is the default socket (HTTPAPISocket), resolved against the state dir when served.

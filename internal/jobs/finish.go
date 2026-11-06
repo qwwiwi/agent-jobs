@@ -410,9 +410,20 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
+	// An emptied queue adds its idle note to this same line (#165), never a line of its own.
+	note := m.idleNote(batch)
+	if note != "" && !m.idleStillEmpty() {
+		note = ""
+	}
+	if note != "" {
+		line += " · " + note
+	}
 	if err := m.sendTmuxLocked(target, line); err != nil {
 		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
 		return errors.Is(err, errTmuxTimeout), nil
+	}
+	if note != "" {
+		m.recordIdle(store.IdleNote, m.Now())
 	}
 	for _, j := range batch {
 		if afterDoneLineSent != nil {
