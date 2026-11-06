@@ -1164,7 +1164,7 @@ var (
 	// reScopeMention finds an out-of-scope tool (outOfScopeTools, systemctl) as a word inside code
 	// (`python3 -c '…["tmux", …]'`, `watch 'docker run …'`); not `at`, `batch`, `screen`: plain words.
 	// It is not used on every argument: a package, directory or make target named ssh or docker is data.
-	reScopeMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((ssh)($|[^a-z0-9_-])|` +
+	reScopeMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((ssh|scp|sftp)($|[^a-z0-9_-])|` +
 		`(systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session|crontab|tmux|pm2|docker|podman|` +
 		`machinectl|loginctl|unshare|nsenter)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
@@ -1333,6 +1333,46 @@ func unverifiable(sc *script, c *simpleCmd) string {
 // scopeTool reports a lower-cased base name that starts processes outside the job's scope.
 func scopeTool(b string) bool { return outOfScopeTools[b] || b == "systemctl" }
 
+// rsyncRemote reports whether rsync args can reach a remote host: any -e/--rsh option (whatever
+// command it names — the default remote shell is ssh), or a path argument in rsync's remote
+// spelling (host:/x, host::module, user@host:/x, rsync://h/m; a ':' before any '/'). Purely local
+// copies (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay allowed: a job
+// uses rsync inside its worktree.
+func rsyncRemote(args []string) bool {
+	endOpts := false
+	for _, a := range args {
+		switch {
+		case a == "--":
+			endOpts = true
+		case !endOpts && a != "-" && strings.HasPrefix(a, "-"):
+			if rsyncRshOpt(a) {
+				return true
+			}
+		case remoteColon(a):
+			return true
+		}
+	}
+	return false
+}
+
+// rsyncRshOpt reports an rsync option word that names the remote shell: -e and --rsh with any
+// spelling of the value (`-e ssh`, `-essh`, `-avze ssh`, `--rsh ssh`, `--rsh=ssh`). Among rsync's
+// short options only -e takes a shell, so a short cluster containing an 'e' is one (fail closed).
+func rsyncRshOpt(a string) bool {
+	if strings.HasPrefix(a, "--") {
+		return a == "--rsh" || strings.HasPrefix(a, "--rsh=")
+	}
+	return strings.HasPrefix(a, "-") && strings.Contains(a[1:], "e")
+}
+
+// remoteColon reports a word with a ':' before any '/', rsync's own remote spelling (`host:/x`,
+// `host::module`, `user@host:/x`, `rsync://h/m`): the host part precedes the first path separator,
+// so the guard follows the same rule. `./a:b` and `/a:b` (the ':' after a '/') are local names.
+func remoteColon(w string) bool {
+	c := strings.IndexByte(w, ':')
+	return c >= 0 && (strings.IndexByte(w, '/') < 0 || c < strings.IndexByte(w, '/'))
+}
+
 // execRunners run their positional arguments as a command (`setsid tmux …`, `flock f docker …`).
 var execRunners = map[string]bool{
 	"setsid": true, "watch": true, "flock": true, "chronic": true, "unbuffer": true, "strace": true, "ltrace": true,
@@ -1432,13 +1472,16 @@ func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 // outOfScopeTools start processes outside the job's cgroup scope: the user's service manager and session
 // bus (a new transient unit), and daemons or schedulers that run a command for the caller in their own
 // cgroup (cron, at, tmux/screen servers, pm2, containers, ssh, logind/machined), or a new namespace that
-// blinds the cgroup check (unshare, nsenter). Owner decision 2026-10-17 (docs/DECISIONS.md).
+// blinds the cgroup check (unshare, nsenter). scp and sftp are here too (issue #116): they reach a
+// remote host over ssh with the operator's keys, and a job never reaches remote hosts. rsync is not:
+// it depends on its arguments, so checkUserManager decides (rsyncRemote). Owner decision 2026-10-17
+// (docs/DECISIONS.md).
 var outOfScopeTools = map[string]bool{
 	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "qdbus-qt5": true,
 	"qdbus6": true, "dbus-run-session": true,
 	"crontab": true, "at": true, "batch": true, "tmux": true, "screen": true, "pm2": true, "docker": true,
-	"docker-compose": true, "podman": true, "podman-compose": true, "ssh": true, "machinectl": true,
-	"loginctl": true, "unshare": true, "nsenter": true,
+	"docker-compose": true, "podman": true, "podman-compose": true, "ssh": true, "scp": true, "sftp": true,
+	"machinectl": true, "loginctl": true, "unshare": true, "nsenter": true,
 }
 
 // cgroupControlFiles are the cgroup v2 core files: writing there moves processes between cgroups
@@ -1865,7 +1908,9 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
 // bus clients, cron/at, tmux/screen, pm2, docker/podman, ssh, machinectl/loginctl, unshare/nsenter) are
 // rejected as commands (behind wrappers and xargs too: argvOf strips env/sudo/timeout/xargs/…); where
 // another program runs them (find -exec, setsid, python -c, a copied binary) they and systemctl are
-// caught by scopeToolArg in unverifiable. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
+// caught by scopeToolArg in unverifiable. scp and sftp (always over ssh) and an rsync that can reach a
+// remote host are refused here too (issue #116): a job never reaches remote hosts, where it would use
+// the operator's keys. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
 // `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
 // cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
 func checkUserManager(scripts []*script, cmd string, cfg Config) string {
@@ -1874,6 +1919,14 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 			return ""
 		}
 		name := progName(argv[0])
+		if name == "scp" || name == "sftp" {
+			return "blocked by guard: `" + name + "` copies files to or from a remote host over ssh (with the " +
+				"operator's keys); a job never reaches remote hosts."
+		}
+		if name == "rsync" && rsyncRemote(argv[1:]) {
+			return "blocked by guard: `rsync` is given a remote host (an -e/--rsh command or a host:path " +
+				"argument); a job never reaches remote hosts."
+		}
 		if outOfScopeTools[name] {
 			sandbox := ""
 			if name == "docker" && cfg.Sandbox != "" {
