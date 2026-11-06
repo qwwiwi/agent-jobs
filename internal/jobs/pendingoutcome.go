@@ -12,29 +12,33 @@ const maxPendingOutcomeItems = 5
 
 // PendingOutcomeReminder surfaces recent unreviewed results to the bound orchestrator session.
 // Delivery does not acknowledge a result; only job_outcome clears the reminder. The block is injected
-// only when its semantic state (job ids and statuses) changed since the last emission, after
+// only when its semantic state (job ids, statuses and attempts) changed since the last emission, after
 // hooks.repeat_after_seconds, or in a new context epoch (StartHookEpoch); otherwise "" (#166). It
-// records what it returns, so call it once per hook run.
-func (m *Manager) PendingOutcomeReminder(sessionID string) (string, error) {
+// does not record what it returns: the caller prints Text and then calls Commit on the emission (or
+// Release when printing failed), so a block that never reached the context is injected again. nil means
+// nothing to inject. Call it once per hook run.
+func (m *Manager) PendingOutcomeReminder(sessionID string) (*HookEmission, error) {
 	bound, err := m.StopHookHolds(sessionID)
 	if err != nil || !bound {
-		return "", err
+		return nil, err
 	}
 	now := m.Now()
 	rows, err := m.Store.PendingOutcomes(m.Agent, now.Add(-7*24*time.Hour))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	hash := ""
 	if len(rows) > 0 {
 		h := sha256.New()
 		for _, j := range rows {
-			fmt.Fprintf(h, "%s\x00%s\n", j.ID, j.Status)
+			// The attempt is part of the state: a resumed job that fails again is a new obligation.
+			fmt.Fprintf(h, "%s\x00%s\x00%d\n", j.ID, j.Status, j.Attempt)
 		}
 		hash = hex.EncodeToString(h.Sum(nil))
 	}
-	if !m.shouldEmitHook(sessionID, hookKindOutcome, hash) {
-		return "", nil
+	e := m.planHook(sessionID, hookKindOutcome, hash)
+	if e == nil {
+		return nil, nil
 	}
 	var items []string
 	for _, j := range rows[:min(len(rows), maxPendingOutcomeItems)] {
@@ -54,5 +58,6 @@ func (m *Manager) PendingOutcomeReminder(sessionID string) (string, error) {
 			RedactPrintable(j.Title, MaxTitleRunes), text))
 	}
 	head := fmt.Sprintf("[jobs:pending-outcome] %d finished jobs without job_outcome: ", len(rows))
-	return capItems(head, items, len(rows), ", ", "", m.Config().Hooks.Max()), nil
+	e.Text = capItems(head, items, len(rows), ", ", "", m.Config().Hooks.Max())
+	return e, nil
 }

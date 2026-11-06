@@ -207,9 +207,11 @@ func (m *Manager) BindHookSession(in SessionStartInput, pane string) error {
 		return err
 	}
 	// SessionStart also fires after a compaction: a new context epoch, so the next reminder is a fresh
-	// snapshot. A state that cannot be written only means one more emission later.
-	if err := m.StartHookEpoch(in.SessionID); err != nil && m.Log != nil {
-		m.Log.Printf("hook bind: %v", err)
+	// snapshot. A state that cannot be written must not hide it: the old epoch and hash would suppress the
+	// block, so the next one is forced out (a duplicate later, never a loss).
+	if err := m.StartHookEpoch(in.SessionID); err != nil {
+		m.forceHookSnapshot.Store(true)
+		m.logf("hook bind: %v", err)
 	}
 	return nil
 }

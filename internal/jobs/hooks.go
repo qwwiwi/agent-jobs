@@ -136,6 +136,23 @@ func capText(s string, maxBytes int) string {
 	return cutRunes(s, maxBytes-len(truncationMarker)) + truncationMarker
 }
 
+// HookMaxBytesOf returns hooks.max_bytes of agent's config without opening its state; the default when
+// agent is empty or its config cannot be read (a hook must still answer).
+func HookMaxBytesOf(agent string) int {
+	if agent == "" {
+		return DefaultHookMaxBytes
+	}
+	dir, err := StateDir(agent)
+	if err != nil {
+		return DefaultHookMaxBytes
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		return DefaultHookMaxBytes
+	}
+	return cfg.Hooks.Max()
+}
+
 // CapHookBlock is capText with the configured cap, for the blocks of the hooks.
 func (m *Manager) CapHookBlock(s string) string { return capText(s, m.Config().Hooks.Max()) }
 
@@ -171,15 +188,21 @@ type hookEmitState struct {
 	Kinds     map[string]hookEmitRecord `json:"kinds"`
 }
 
-// withHookState runs fn on the emission state of sessionID under an exclusive flock, and saves the
-// state when fn reports a change. A state of another session starts empty. Errors are the caller's
-// to treat as «emit anyway»: a duplicate is better than a silent loss.
-func (m *Manager) withHookState(sessionID string, fn func(*hookEmitState) bool) error {
+// hookStateTx is the emission state of one session held under the exclusive flock of hook-emit.json.lock.
+// Errors of its users are theirs to treat as «emit anyway»: a duplicate is better than a silent loss.
+type hookStateTx struct {
+	lock *os.File
+	path string
+	st   hookEmitState
+}
+
+// lockHookState takes the lock (waiting at most half a second) and reads the state of sessionID; a state
+// of another session starts empty.
+func (m *Manager) lockHookState(sessionID string) (*hookStateTx, error) {
 	lock, err := os.OpenFile(filepath.Join(m.StateDir, hookEmitFile+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("hook state lock: %w", err)
+		return nil, fmt.Errorf("hook state lock: %w", err)
 	}
-	defer lock.Close()
 	locked := false
 	for range 50 {
 		if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
@@ -189,39 +212,64 @@ func (m *Manager) withHookState(sessionID string, fn func(*hookEmitState) bool) 
 		time.Sleep(10 * time.Millisecond)
 	}
 	if !locked {
-		return fmt.Errorf("hook state lock: %w", err)
+		_ = lock.Close()
+		return nil, fmt.Errorf("hook state lock: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
-
-	path := filepath.Join(m.StateDir, hookEmitFile)
-	var st hookEmitState
-	b, err := os.ReadFile(path)
+	tx := &hookStateTx{lock: lock, path: filepath.Join(m.StateDir, hookEmitFile)}
+	b, err := os.ReadFile(tx.path)
 	switch {
 	case err == nil:
-		if json.Unmarshal(b, &st) != nil {
-			st = hookEmitState{}
+		if json.Unmarshal(b, &tx.st) != nil {
+			tx.st = hookEmitState{}
 		}
 	case !errors.Is(err, os.ErrNotExist):
-		return fmt.Errorf("hook state: %w", err)
+		tx.close()
+		return nil, fmt.Errorf("hook state: %w", err)
 	}
-	if st.SessionID != sessionID {
-		st = hookEmitState{SessionID: sessionID}
+	if tx.st.SessionID != sessionID {
+		tx.st = hookEmitState{SessionID: sessionID}
 	}
-	if !fn(&st) {
-		return nil
-	}
-	out, err := json.Marshal(st)
+	return tx, nil
+}
+
+// save writes the state (temp file and rename).
+func (tx *hookStateTx) save() error {
+	out, err := json.Marshal(tx.st)
 	if err != nil {
 		return fmt.Errorf("hook state: %w", err)
 	}
-	tmp := path + ".tmp"
+	tmp := tx.path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return fmt.Errorf("hook state: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := os.Rename(tmp, tx.path); err != nil {
 		return fmt.Errorf("hook state: %w", err)
 	}
 	return nil
+}
+
+// close releases the lock (idempotent).
+func (tx *hookStateTx) close() {
+	if tx == nil || tx.lock == nil {
+		return
+	}
+	_ = syscall.Flock(int(tx.lock.Fd()), syscall.LOCK_UN)
+	_ = tx.lock.Close()
+	tx.lock = nil
+}
+
+// withHookState runs fn on the emission state of sessionID under the lock, and saves the state when fn
+// reports a change.
+func (m *Manager) withHookState(sessionID string, fn func(*hookEmitState) bool) error {
+	tx, err := m.lockHookState(sessionID)
+	if err != nil {
+		return err
+	}
+	defer tx.close()
+	if !fn(&tx.st) {
+		return nil
+	}
+	return tx.save()
 }
 
 // StartHookEpoch begins a new context epoch of sessionID (SessionStart: startup, resume, clear and
@@ -234,46 +282,96 @@ func (m *Manager) StartHookEpoch(sessionID string) error {
 	})
 }
 
-// shouldEmitHook decides whether the block of kind with the given semantic state hash is injected now,
-// and records the decision. An empty hash is «nothing pending»: never emitted, but remembered, so the
-// same jobs reappearing later count as a change. When the state cannot be read or written the block is
-// emitted (the error is logged).
-func (m *Manager) shouldEmitHook(sessionID, kind, hash string) bool {
+// HookEmission is a block a hook decided to inject. The decision is made under the state lock, and the
+// lock stays held until the caller reports the outcome of delivery: Commit after the text reached
+// stdout (it records the emission), Release when it did not (nothing is recorded, so the next run
+// injects it again). A decision, a successful write and the record are thus one serialized step, and a
+// run that never delivers (a write error, the hook's timeout) cannot mark an unseen block as emitted.
+type HookEmission struct {
+	// Text is the block to print.
+	Text string
+
+	tx   *hookStateTx // nil: the state was unavailable (fail open), so nothing can be recorded
+	kind string
+	rec  hookEmitRecord
+}
+
+// Line returns the text of e, "" for a nil emission (nothing to inject).
+func (e *HookEmission) Line() string {
+	if e == nil {
+		return ""
+	}
+	return e.Text
+}
+
+// Commit records the emission and releases the lock. A state that cannot be written only means one more
+// emission later. Safe on a nil emission and after Release.
+func (e *HookEmission) Commit() error {
+	if e == nil || e.tx == nil || e.tx.lock == nil {
+		return nil
+	}
+	defer e.tx.close()
+	if e.tx.st.Kinds == nil {
+		e.tx.st.Kinds = map[string]hookEmitRecord{}
+	}
+	e.tx.st.Kinds[e.kind] = e.rec
+	return e.tx.save()
+}
+
+// Release drops the emission without recording it and releases the lock. Safe on a nil emission and
+// after Commit.
+func (e *HookEmission) Release() {
+	if e != nil {
+		e.tx.close()
+	}
+}
+
+// planHook decides whether the block of kind with the given semantic state hash is injected now. It
+// returns nil for «not now». An empty hash is «nothing pending»: never emitted, but remembered, so the
+// same jobs reappearing later count as a change. The returned emission (Text unset) holds the state lock
+// until Commit or Release. When the state cannot be read the block is emitted (the error is logged)
+// and cannot be recorded. A failed epoch reset (BindHookSession) forces the next block out.
+func (m *Manager) planHook(sessionID, kind, hash string) *HookEmission {
 	now := m.Now()
+	force := m.forceHookSnapshot.Swap(false)
 	if hash == "" && !m.hookRecordHasState(sessionID, kind) {
 		// Nothing pending and nothing to forget: write no file (the prompt hook is otherwise read-only).
-		return false
+		return nil
 	}
-	emit := true
-	err := m.withHookState(sessionID, func(st *hookEmitState) bool {
-		rec, ok := st.Kinds[kind]
-		if hash == "" {
-			emit = false
-			if ok && rec.Hash == "" && rec.Epoch == st.Epoch {
-				return false
-			}
-			rec.Hash, rec.Epoch = "", st.Epoch
-		} else {
-			emit = !ok || rec.Epoch != st.Epoch || rec.Hash != hash ||
-				now.Sub(time.Unix(rec.LastEmitted, 0)) >= m.Config().Hooks.RepeatAfter()
-			if !emit {
-				return false
-			}
-			rec = hookEmitRecord{Epoch: st.Epoch, Hash: hash, LastEmitted: now.Unix()}
-		}
-		if st.Kinds == nil {
-			st.Kinds = map[string]hookEmitRecord{}
-		}
-		st.Kinds[kind] = rec
-		return true
-	})
+	tx, err := m.lockHookState(sessionID)
 	if err != nil {
-		if m.Log != nil {
-			m.Log.Printf("hook dedupe: %v (emitting)", err)
+		m.logf("hook dedupe: %v (emitting)", err)
+		if hash == "" {
+			return nil
 		}
-		return hash != ""
+		return &HookEmission{}
 	}
-	return emit
+	rec, ok := tx.st.Kinds[kind]
+	if hash == "" {
+		if !ok || rec.Hash != "" || rec.Epoch != tx.st.Epoch {
+			if tx.st.Kinds == nil {
+				tx.st.Kinds = map[string]hookEmitRecord{}
+			}
+			tx.st.Kinds[kind] = hookEmitRecord{Epoch: tx.st.Epoch}
+			if err := tx.save(); err != nil {
+				m.logf("hook dedupe: %v", err)
+			}
+		}
+		tx.close()
+		return nil
+	}
+	if !force && ok && rec.Epoch == tx.st.Epoch && rec.Hash == hash &&
+		now.Sub(time.Unix(rec.LastEmitted, 0)) < m.Config().Hooks.RepeatAfter() {
+		tx.close()
+		return nil
+	}
+	return &HookEmission{tx: tx, kind: kind, rec: hookEmitRecord{Epoch: tx.st.Epoch, Hash: hash, LastEmitted: now.Unix()}}
+}
+
+func (m *Manager) logf(format string, args ...any) {
+	if m.Log != nil {
+		m.Log.Printf(format, args...)
+	}
 }
 
 // hookRecordHasState reports, without the lock, whether the state file holds a non-empty record of kind

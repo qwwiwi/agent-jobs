@@ -94,3 +94,27 @@ func TestStopHookDecisionByteCap(t *testing.T) {
 		t.Errorf("one job needs no tail: %q", one.Reason)
 	}
 }
+
+// The skills picker obeys hooks.max_bytes at every cap, counts the tasks it leaves out, and keeps the
+// pointer to milestone_set.
+func TestSkillsPickerCappedRespectsMaxBytes(t *testing.T) {
+	var tasks []string
+	for i := range 30 {
+		tasks = append(tasks, fmt.Sprintf(`{"key":"%032d","title":"t"}`, i))
+	}
+	input := `{"hook_event_name":"PreToolUse","tool_name":"mcp__agent-jobs__milestone_create","tool_input":{"title":"m","tasks":[` +
+		strings.Join(tasks, ",") + `]}}`
+	for max := MinHookMaxBytes; max <= 2000; max += 37 {
+		got, err := SkillsPickerCapped(strings.NewReader(input), max)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) > max || !strings.Contains(got, "and ") || !strings.Contains(got, "milestone_set") || !utf8.ValidString(got) {
+			t.Fatalf("max %d: %d bytes %q", max, len(got), got)
+		}
+	}
+	job := `{"hook_event_name":"PreToolUse","tool_name":"job_start","tool_input":{"title":"t","brief":"b"}}`
+	if got, err := SkillsPickerCapped(strings.NewReader(job), MinHookMaxBytes); err != nil || len(got) > MinHookMaxBytes || got == "" {
+		t.Errorf("job_start note at the minimum cap: %d bytes, %v", len(got), err)
+	}
+}
