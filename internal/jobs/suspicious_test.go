@@ -2,8 +2,10 @@ package jobs
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -138,5 +140,103 @@ func TestSuspiciousNoteOnDoneLine(t *testing.T) {
 	}
 	if strings.Contains(slowLine, "suspicious") || !strings.Contains(slowLine, "merges cleanly onto main at ") {
 		t.Fatalf("committing job's line: %q\n%s", slowLine, b)
+	}
+}
+
+// #132 fix loop 1: the zero-commits finding never outlives the check that made it. The first check
+// of an empty job arms the note; once the job's head gains a commit, a later check that fails — a
+// timeout, a missing base branch, a worktree that no longer verifies — must leave the note off: the
+// flag fires only on the latest check's own finding, never on a stale one.
+func TestSuspiciousStaleFindingNeverFlags(t *testing.T) {
+	// breakIt makes the recheck return through one of its not-checked paths, after the job's head
+	// has moved past its base.
+	cases := []struct {
+		name    string
+		breakIt func(t *testing.T, m *Manager, repo, work string)
+	}{
+		{
+			name: "timed out check",
+			breakIt: func(t *testing.T, m *Manager, repo, work string) {
+				old := MergeCheckTimeout
+				MergeCheckTimeout = time.Nanosecond
+				t.Cleanup(func() { MergeCheckTimeout = old })
+			},
+		},
+		{
+			name: "branch missing",
+			breakIt: func(t *testing.T, m *Manager, repo, work string) {
+				gitT(t, repo, "update-ref", "-d", "refs/heads/main")
+			},
+		},
+		{
+			name: "worktree not verified",
+			breakIt: func(t *testing.T, m *Manager, repo, work string) {
+				if err := os.Remove(filepath.Join(work, ".git")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := newManager(t)
+			repo := newRepo(t)
+			j := enqueue(t, m, "plain brief", func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "exit_code", 15*time.Second, func() bool {
+				_, ok := readExitCode(m.JobDir(j.ID))
+				return ok
+			})
+			j = get(t, m, j.ID)
+			// The first check finds the head still at the base: the note is armed.
+			m.checkMerge(j)
+			if no, ok := m.noCommitsOverBase(j); !ok || !no {
+				t.Fatalf("empty check: noCommits %t, ok %t", no, ok)
+			}
+			// The head gains a commit after the check (a failed delivery's retry window).
+			work := filepath.Join(m.JobDir(j.ID), "work")
+			gitT(t, work, "commit", "-q", "--allow-empty", "-m", "late work")
+			c.breakIt(t, m, repo, work)
+			m.checkMerge(j)
+			if !strings.Contains(j.MergeNote, "not checked") {
+				t.Fatalf("recheck note: %q", j.MergeNote)
+			}
+			// The recheck failed: a fast succeeded line must not carry the stale finding.
+			flagged := *j
+			flagged.Status = store.StatusSucceeded
+			flagged.DurationSec = 60
+			if note := m.suspiciousNote(&flagged); note != "" {
+				t.Fatalf("stale finding still flags the job: %q", note)
+			}
+		})
+	}
+}
+
+// #132 fix loop 1: a requeued (resumed) job drops the stopped attempt's zero-commits finding — the
+// next attempt's line is judged by its own merge check, not by the attempt that was stopped empty.
+func TestSuspiciousNoteClearedOnResume(t *testing.T) {
+	m := newManager(t)
+	sessionsHome(t, true)
+	repo := newRepo(t)
+	st := startAndStop(t, m, func(r *StartRequest) { r.RepoPath = repo; r.Kind = "fix" })
+	j := get(t, m, st.ID)
+	// The merge check of the stopped attempt found the head still at the base.
+	m.checkMerge(j)
+	if no, ok := m.noCommitsOverBase(j); !ok || !no {
+		t.Fatalf("stopped job: noCommits %t, ok %t", no, ok)
+	}
+	if _, err := m.Resume(st.ID, "NEW_FACT_1: go on", Limits{MaxBudgetUSD: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if no, ok := m.noCommitsOverBase(get(t, m, st.ID)); ok && no {
+		t.Fatal("the resume kept the stopped attempt's zero-commits finding")
+	}
+	flagged := *get(t, m, st.ID)
+	flagged.Status = store.StatusSucceeded
+	flagged.DurationSec = 60
+	if note := m.suspiciousNote(&flagged); note != "" {
+		t.Fatalf("resumed job flagged on the old finding: %q", note)
 	}
 }

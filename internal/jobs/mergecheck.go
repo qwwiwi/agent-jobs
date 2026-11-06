@@ -145,8 +145,14 @@ func gitCtxOK(ctx context.Context, dir string, args ...string) (string, error) {
 // worktree or commits of its own; a job whose head is still its base records that finding in the
 // cache instead (noCommitsOverBase reuses it, no git call of its own). A merge-tree result is cached
 // against the job's head and the branch tip it was checked at (until the job is notified); a failed
-// or timed out check is not.
+// or timed out check is not. The zero-commits finding (#132) is always the latest check's own: every
+// check clears it first (clearNoCommits) and records it again only when it sees the head at the base
+// itself, so a retry whose check fails (a timeout, a missing branch) never flags a job that
+// committed meanwhile.
 func (m *Manager) MergeNote(j *store.Job) string {
+	// The zero-commits finding (#132) never survives into a new check: it is set again below only
+	// when this check positively sees the head at the base commit.
+	m.clearNoCommits(j.ID)
 	if j.RepoPath == "" || j.BaseCommit == "" {
 		return ""
 	}
@@ -183,6 +189,9 @@ func (m *Manager) MergeNote(j *store.Job) string {
 		m.cacheNoCommits(j.ID, head)
 		return ""
 	}
+	// rev-list confirmed commits over the base: the fast-empty note (#132) can never fire on this
+	// check, whatever the branch tip lookup or the merge itself does next.
+	m.cacheHasCommits(j.ID, head)
 	if j.BaseBranch == "" {
 		return notChecked("the job's base is not a branch (a tag, a commit or a detached HEAD)")
 	}
@@ -263,8 +272,8 @@ func (m *Manager) cacheMergeNote(id, head, tip, note string) {
 }
 
 // cacheNoCommits records that the job's head is its base commit — no commits of its own — for the
-// job-done line's suspicious note (#132). It lives like a merge note, until the job is notified,
-// and is refreshed by each check.
+// job-done line's suspicious note (#132). It lives like a merge note, until the job is notified;
+// each check clears it first (clearNoCommits) and sets it again only from its own finding.
 func (m *Manager) cacheNoCommits(id, head string) {
 	m.mergeMu.Lock()
 	defer m.mergeMu.Unlock()
@@ -272,6 +281,35 @@ func (m *Manager) cacheNoCommits(id, head string) {
 		m.mergeChecks = map[string]mergeCheck{}
 	}
 	m.mergeChecks[id] = mergeCheck{head: head, noCommits: true}
+}
+
+// cacheHasCommits records the opposite of cacheNoCommits (#132): this check's rev-list saw commits
+// over the base, so the fast-empty note cannot fire on it — whatever the branch tip lookup or the
+// merge itself does next.
+func (m *Manager) cacheHasCommits(id, head string) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	if m.mergeChecks == nil {
+		m.mergeChecks = map[string]mergeCheck{}
+	}
+	c, ok := m.mergeChecks[id]
+	if !ok {
+		c = mergeCheck{head: head}
+	}
+	c.noCommits = false
+	m.mergeChecks[id] = c
+}
+
+// clearNoCommits drops the job's cached zero-commits finding (#132) without touching its cached
+// merge note. Every merge check starts with it clear, and a requeue (resume) clears it too: the
+// fast-empty note fires only on a finding the latest check confirmed itself.
+func (m *Manager) clearNoCommits(id string) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	if c, ok := m.mergeChecks[id]; ok && c.noCommits {
+		c.noCommits = false
+		m.mergeChecks[id] = c
+	}
 }
 
 // noCommitsOverBase reports whether the merge check found the job with no commits over its base
