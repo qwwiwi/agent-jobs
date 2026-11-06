@@ -49,6 +49,8 @@ type Manager struct {
 	Log       *log.Logger
 	// Brain is the shared brain from config (brain.Disabled when not configured).
 	Brain brain.Brain
+	// afterOutcome, when set (tests), runs in SetOutcomes right after an item's outcome was committed.
+	afterOutcome func(id string)
 	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
 	MemoryTimeout time.Duration
 
