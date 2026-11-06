@@ -562,6 +562,19 @@ func (m *Manager) JobMCPConfig(kind string) map[string]any {
 	}}
 }
 
+// jobMCPConfigFor is JobMCPConfig for job j: a crew job with an advisor (issue #169) gets
+// AdvisorEnvVar in its server's environment, so its server offers advisor_ask.
+func (m *Manager) jobMCPConfigFor(j *store.Job) map[string]any {
+	c := m.JobMCPConfig(j.Kind)
+	if !j.Crew.HasAdvisor() || j.Runner == store.RunnerCodex {
+		return c
+	}
+	if srv, ok := c["mcpServers"].(map[string]any)[JobMCPServerName].(map[string]any); ok {
+		srv["env"] = map[string]string{AdvisorEnvVar: "1"}
+	}
+	return c
+}
+
 // prepare creates the job directory: prompt.md, settings.json, mcp.json, work/, base_commit.
 func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Config) error {
 	rules, err := m.readOwnerRules()
@@ -620,7 +633,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Confi
 	}
 	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only), none for a
 	// gate job; --strict-mcp-config makes this the complete list.
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig(j.Kind)); err != nil {
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.jobMCPConfigFor(j)); err != nil {
 		return err
 	}
 	work := filepath.Join(dir, "work")

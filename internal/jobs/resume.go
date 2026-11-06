@@ -997,7 +997,7 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.JobSettings(j, gitDirs...)); err != nil {
 		return err
 	}
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig(j.Kind)); err != nil {
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.jobMCPConfigFor(j)); err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(dir, gitConfigFile)); err != nil && !errors.Is(err, os.ErrNotExist) {

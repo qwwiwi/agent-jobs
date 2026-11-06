@@ -26,6 +26,9 @@ const (
 	// SocketOpCheckMark is check_mark: the daemon records a completion mark for a check
 	// (jobs.Manager.MarkCheck). It works with or without a brain.
 	SocketOpCheckMark = "check_mark"
+	// SocketOpAdvisor is advisor_ask (issue #169): the daemon runs a short read-only claude -p on a crew
+	// job's advisor model (jobs.Manager.AskAdvisor) and answers with its text.
+	SocketOpAdvisor = "advisor_ask"
 )
 
 // MaxSocketMessage bounds one request or response on the socket.
@@ -43,6 +46,9 @@ type SocketRequest struct {
 	Urgency string `json:"urgency,omitempty"`
 	// Check is check_mark's check name; its note goes in Text.
 	Check string `json:"check,omitempty"`
+	// Question and Context are advisor_ask's input.
+	Question string `json:"question,omitempty"`
+	Context  string `json:"context,omitempty"`
 }
 
 // SocketResponse is the daemon's answer; Error is set when the call failed.
@@ -124,6 +130,13 @@ func (c SocketClient) NotifyOwner(ctx context.Context, text, urgency string) (Ob
 // CheckMark asks the daemon to record a completion mark for the check; the answer is the check.
 func (c SocketClient) CheckMark(ctx context.Context, name, note string) (Object, error) {
 	resp, err := c.do(ctx, SocketRequest{Op: SocketOpCheckMark, Check: name, Text: note})
+	return resp.Result, err
+}
+
+// AdvisorAsk asks the daemon to consult the crew job's advisor model; the answer is the advice and
+// the call's record.
+func (c SocketClient) AdvisorAsk(ctx context.Context, question, background string) (Object, error) {
+	resp, err := c.do(ctx, SocketRequest{Op: SocketOpAdvisor, Question: question, Context: background})
 	return resp.Result, err
 }
 

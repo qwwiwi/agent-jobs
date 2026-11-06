@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -100,7 +101,7 @@ func (m *Manager) ServeBrain(ctx context.Context) error {
 // HandleBrainRequest answers one proxy call from the process peer (its pid from the socket's peer
 // credentials): only for a running job of this agent that peer belongs to (peerJob; the job id in
 // the request must name that job, so a job never acts as another), only search, write,
-// notify_owner and check_mark; a write always gets the job's provenance (brain.ForJob) and its path
+// notify_owner, check_mark and advisor_ask (a crew job's advisor call, AskAdvisor); a write always gets the job's provenance (brain.ForJob) and its path
 // is recorded; a notification is the job's own (rate limited per job); a mark carries the job's id.
 func (m *Manager) HandleBrainRequest(ctx context.Context, peer int, r brain.SocketRequest) brain.SocketResponse {
 	fail := func(err error) brain.SocketResponse { return brain.SocketResponse{Error: err.Error()} }
@@ -178,6 +179,12 @@ func (m *Manager) HandleBrainRequest(ctx context.Context, peer int, r brain.Sock
 			return fail(err)
 		}
 		return brain.SocketResponse{Result: checkObject(c)}
+	case brain.SocketOpAdvisor:
+		a, err := m.AskAdvisor(ctx, j, r.Question, r.Context)
+		if err != nil {
+			return fail(err)
+		}
+		return brain.SocketResponse{Result: advisorObject(a)}
 	}
 	return fail(fmt.Errorf("op %q is not available to a job", r.Op))
 }
@@ -214,6 +221,19 @@ func (m *Manager) peerJob(pid int) (*store.Job, error) {
 		return j, nil
 	}
 	return nil, none
+}
+
+// advisorObject is an advisor answer as the proxy's JSON answer.
+func advisorObject(a *AdvisorAnswer) brain.Object {
+	b, err := json.Marshal(a)
+	if err != nil {
+		return brain.Object{"advice": a.Advice}
+	}
+	var o brain.Object
+	if err := json.Unmarshal(b, &o); err != nil {
+		return brain.Object{"advice": a.Advice}
+	}
+	return o
 }
 
 // checkObject is a check as the proxy's JSON answer (what a job may see of it).

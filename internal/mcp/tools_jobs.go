@@ -133,6 +133,10 @@ type JobView struct {
 	Waiting string `json:"waiting,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
+	// Crew (crew jobs only, issue #169): the advisor setup, its calls as a timeline and the cost split
+	// main / advisor; CrewError says why it could not be read.
+	Crew      *jobs.CrewView `json:"crew,omitempty"`
+	CrewError string         `json:"crew_error,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -143,7 +147,7 @@ func fmtTS(t *time.Time) string {
 }
 
 func view(m *jobs.Manager, j *store.Job) JobView {
-	return JobView{
+	v := JobView{
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Provider: jobs.JobProvider(j), Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
 		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
@@ -158,6 +162,17 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
 		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.MilestoneWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
+	v.Crew, v.CrewError = crewView(m, j)
+	return v
+}
+
+// crewView is JobView.Crew and CrewError (nil and "" for a plain job).
+func crewView(m *jobs.Manager, j *store.Job) (*jobs.CrewView, string) {
+	c, err := m.Crew(j)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return c, ""
 }
 
 // launchCodexSandbox is JobView.CodexSandbox ("" for a claude job, or when it cannot be read).
@@ -201,26 +216,30 @@ func getJob(m *jobs.Manager, id string) (*store.Job, error) {
 // kind × complexity table picks the model); with neither the call is rejected (owner 2026-10-17:
 // no classifier, no guessing). Limits follow the defaults and ceilings.
 type JobStartInput struct {
-	Title           string   `json:"title" jsonschema:"short title; shown in the job-done line"`
-	Kind            string   `json:"kind" jsonschema:"review | fix | research | general (sets the checklist and whether web tools are open: only research)"`
-	Brief           string   `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
-	Model           string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec, or openrouter:<slug> (a slug of config providers.openrouter.models, e.g. openrouter:z-ai/glm-5.3), which runs claude -p on that OpenRouter model: billing api (real money), budget enforced per job and by the provider's daily_cap_usd, not for review jobs or denied repos, no resume; give this or complexity"`
-	Complexity      string   `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
-	MaxTurns        int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 200 for fix and general, 80 for other kinds; ceiling 200"`
-	TimeoutMinutes  int      `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
-	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
-	Repo            string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
-	Base            string   `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
-	Runner          string   `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
-	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
-	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
-	OwnerWaits      bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
-	Covers          []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence); without the block, or with no line for any covered ID, it is off contract; ran: and REDPROOF fields are shown when given, never required. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
-	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); optional, stored on the job. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job gets large when it has covers, else small (refused instead when config size_required is on, default off); review, research and the gate kinds are exempt"`
-	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
-	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
-	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
-	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
+	Title               string   `json:"title" jsonschema:"short title; shown in the job-done line"`
+	Kind                string   `json:"kind" jsonschema:"review | fix | research | general (sets the checklist and whether web tools are open: only research)"`
+	Brief               string   `json:"brief" jsonschema:"the full brief, written for a stranger: goal, boundaries, what counts as done, what not to do"`
+	Model               string   `json:"model,omitempty" jsonschema:"explicit model: for claude --model (sonnet, opus, fable or a full id), or a gpt-* model, which runs the job on codex exec, or openrouter:<slug> (a slug of config providers.openrouter.models, e.g. openrouter:z-ai/glm-5.3), which runs claude -p on that OpenRouter model: billing api (real money), budget enforced per job and by the provider's daily_cap_usd, not for review jobs or denied repos, no resume; give this or complexity"`
+	Complexity          string   `json:"complexity,omitempty" jsonschema:"light | normal | hard; picks the model by kind when no model is given; give this or model"`
+	MaxTurns            int      `json:"max_turns,omitempty" jsonschema:"turn limit; default 200 for fix and general, 80 for other kinds; ceiling 200"`
+	TimeoutMinutes      int      `json:"timeout_minutes,omitempty" jsonschema:"wall-clock limit in minutes; default 45, ceiling 180"`
+	MaxBudgetUSD        float64  `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
+	Repo                string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
+	Base                string   `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
+	Runner              string   `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
+	ReasoningEffort     string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
+	AcceptanceCmd       string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
+	OwnerWaits          bool     `json:"owner_waits,omitempty" jsonschema:"true when the owner asked for this job and waits for its result: the job-done line ends with 'owner waits' and this session cannot end a turn silently until you write to the owner and call owner_replied"`
+	Covers              []string `json:"covers,omitempty" jsonschema:"checklist requirement IDs this job works on (R01, R03i, G02; Wave F): the report must then carry a ### Requirements block in Findings / Changes, one line per ID (R01 · done|partial|missing|placeholder|not-touched · evidence); without the block, or with no line for any covered ID, it is off contract; ran: and REDPROOF fields are shown when given, never required. The covered rows (ID, verbatim, contract) are read from the repo's brief/CHECKLIST.md and put into the job's prompt; an ID missing there refuses the start"`
+	Size                string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); optional, stored on the job. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job gets large when it has covers, else small (refused instead when config size_required is on, default off); review, research and the gate kinds are exempt"`
+	Milestone           int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
+	Task                string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
+	Sources             []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
+	AdvisorModel        string   `json:"advisor_model,omitempty" jsonschema:"crew job (claude runner only, refused for codex): a stronger claude model (opus, fable or a full id) the job may consult with the job-role tool advisor_ask at a design fork; each call is a short read-only claude -p in the job's work tree (Read, Glob, Grep only), recorded and shown in job_status / job_result with the cost split main / advisor"`
+	AdvisorMaxCalls     int      `json:"advisor_max_calls,omitempty" jsonschema:"crew job: at most this many advisor_ask calls; default 2, ceiling 5; needs advisor_model"`
+	AdvisorMaxBudgetUSD float64  `json:"advisor_max_budget_usd,omitempty" jsonschema:"crew job: the advisor calls' spend cap in USD, on top of max_budget_usd; default 2, ceiling 10; a call past it is refused; needs advisor_model"`
+	PairedWith          string   `json:"paired_with,omitempty" jsonschema:"optional id of another job of this agent on the same brief (typically a plain job next to a crew job): job_stats lists the pair side by side (status, outcome, cost main / advisor)"`
+	Skills              []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
 }
 
 func addJobStart(s *sdk.Server, d Deps) {
@@ -241,6 +260,8 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
 			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
+			Crew: jobs.CrewRequest{AdvisorModel: in.AdvisorModel, AdvisorMaxCalls: in.AdvisorMaxCalls,
+				AdvisorMaxBudgetUSD: in.AdvisorMaxBudgetUSD, PairedWith: in.PairedWith},
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -322,6 +343,9 @@ type JobResultOutput struct {
 	// "### Requirements" block read against the covers (claimed stays empty since 2026-10-25).
 	Covers       []string          `json:"covers,omitempty"`
 	Requirements *RequirementsView `json:"requirements,omitempty"`
+	// Crew (crew jobs only, issue #169): the advisor calls as a timeline and the cost split main / advisor.
+	Crew      *jobs.CrewView `json:"crew,omitempty"`
+	CrewError string         `json:"crew_error,omitempty"`
 }
 
 // RequirementsView is the Requirements block of a covered job's report and its commit trailers.
@@ -382,6 +406,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
 		}
+		out.Crew, out.CrewError = crewView(m, j)
 		if !out.Finished {
 			out.Note = "job is " + j.Status + "; the session gets a [jobs:job-done] line when it ends"
 			return nil, out, nil

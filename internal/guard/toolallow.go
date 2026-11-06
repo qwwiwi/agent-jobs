@@ -8,7 +8,7 @@ const JobMCPToolPrefix = "mcp__agent-jobs__"
 // internal/mcp keeps the two equal): the only MCP tools a job may call. The guard matches the fully
 // qualified names exactly: a prefix match would also admit another server whose name starts with
 // "agent-jobs__" (mcp__agent-jobs__other__send is tool "send" of server "agent-jobs__other").
-var JobMCPTools = []string{"memory_search", "memory_write", "notify_owner", "check_mark"}
+var JobMCPTools = []string{"memory_search", "memory_write", "notify_owner", "check_mark", "advisor_ask"}
 
 // allowedTools are the tools a job may call (an allowlist: the reference forbids tools that reach a
 // person or outlive the run, and a new Claude Code tool must not pass just because it is unknown).

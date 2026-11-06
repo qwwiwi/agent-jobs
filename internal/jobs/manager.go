@@ -198,6 +198,9 @@ type StartRequest struct {
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
+	// Crew makes a crew job (issue #169): an advisor model the job may consult with advisor_ask, its caps,
+	// and an optional paired_with job to compare with in job_stats. Zero = a plain job.
+	Crew CrewRequest
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -507,6 +510,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
+	crew, err := m.validateCrew(r, runner)
+	if err != nil {
+		return nil, err
+	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
 		return nil, err
@@ -604,7 +611,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
+		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources), Crew: crew,
 	}
 	return j, nil
 }

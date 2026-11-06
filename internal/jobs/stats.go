@@ -717,6 +717,9 @@ type StatsReport struct {
 	GuardRules []NameCount  `json:"guard_rules"`
 	Skills     []SkillUse   `json:"skills"`
 	Tools      []NameCount  `json:"tools"`
+	// CrewPairs are the jobs started with paired_with (issue #169) finished in the window, each next to
+	// the job it names: status, outcome, turns, cost main / advisor.
+	CrewPairs []CrewPair `json:"crew_pairs,omitempty"`
 }
 
 // TopN bounds the guard-rule and tool lists of a stats report.
@@ -758,6 +761,9 @@ func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) 
 	rep, err := Summarize(rows, by)
 	if !since.IsZero() {
 		rep.Since = since.UTC().Format(time.RFC3339)
+	}
+	if err == nil {
+		rep.CrewPairs, err = m.crewPairs(ctx, rows)
 	}
 	return rep, err
 }
