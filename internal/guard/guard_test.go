@@ -1382,6 +1382,62 @@ func TestRemoteTransfersRefused(t *testing.T) {
 	}
 }
 
+// Review fix loop of #116: the rsync remote-host check also applies where another program runs
+// rsync with an argv the guard sees (find -exec/-execdir/-ok, the exec runners: setsid, ionice,
+// chroot; behind the wrappers, as with nohup/env), and rsync under xargs or parallel is refused
+// outright: their added arguments come from stdin and cannot be verified. An option value is no
+// operand and no option letter, so a local `rsync --exclude cache:old` and `-f'- *.cache'` stay
+// allowed. ssh/scp in the same positions were already refused (outOfScopeTools + scopeToolArg).
+func TestRemoteTransfersIndirectRefused(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// rsync run by another program, its argv visible to the guard.
+		{"find -exec rsync remote", `find . -maxdepth 0 -exec rsync ./src/ host:/dst/ \;`, true},
+		{"find -execdir rsync remote", `find . -execdir rsync a host:/b \;`, true},
+		{"find -ok rsync remote", `find . -ok rsync a host:/b \;`, true},
+		{"find -exec rsync plus", `find . -exec rsync a host:/b +`, true},
+		{"find -exec rsync -e ssh", `find . -exec rsync -e ssh a b \;`, true},
+		{"setsid rsync remote", `setsid rsync ./src/ host:/dst/`, true},
+		{"ionice rsync remote", `ionice -c 2 rsync a host:/b`, true},
+		{"chroot rsync remote", `chroot /tmp rsync a host:/b`, true},
+		{"nohup rsync remote", `nohup rsync a host:/b`, true},
+		{"env rsync remote", `env rsync a host:/b`, true},
+		// rsync under xargs and parallel: the added arguments come from stdin, unverifiable.
+		{"xargs rsync", `printf '%s\n' host:/dst/ | xargs rsync ./src/`, true},
+		{"xargs -I rsync", `printf '%s\n' host:/x | xargs -I{} rsync ./src/ {}`, true},
+		{"xargs -r rsync local", `printf '%s\n' | xargs -r rsync ./src/ ./dst/`, true},
+		{"parallel rsync", `printf '%s\n' host:/x | parallel rsync ./src/`, true},
+		// ssh and scp in the same positions (already refused through outOfScopeTools).
+		{"setsid ssh", `setsid ssh host ls`, true},
+		{"find -exec scp", `find . -maxdepth 0 -exec scp a host:/dst/ \;`, true},
+		{"setsid scp", `setsid scp a host:/dst/`, true},
+		// An option value is no operand and no option letter: local rsync stays allowed.
+		{"rsync --exclude separate value", `rsync --exclude cache:old ./src/ ./dst/`, false},
+		{"rsync -f attached filter", `rsync -f'-x.cache' ./src/ ./dst/`, false},
+		{"rsync -f glob value still refused", `rsync -f'- *.cache' ./src/ ./dst/`, true}, // by the
+		// .git glob rule (a `*` word in a non-reader's argument), not the remote-host rule
+		{"rsync --files-from value", `rsync --files-from list.txt ./src/ ./dst/`, false},
+		{"rsync -B separate value", `rsync -B 4096 ./src/ ./dst/`, false},
+		{"find -exec rsync local then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
+		// Still refused: an -e cluster names the shell.
+		{"rsync -avze ssh still refused", `rsync -avze ssh a host:/b`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}
+
 // Fix loop 2 of PR #10: a write target built inside the call (substitution, a variable assigned in the
 // same call, a symlink to a dynamic target) is rejected without any cgroup mention; the out-of-scope
 // tool names count only where they run (command word, code strings, -exec argv, runners), so build and
