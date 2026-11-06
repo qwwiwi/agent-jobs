@@ -109,14 +109,20 @@ func recordQuick(dir, category, text string, now time.Time) error {
 // stored, one "<unix time> <category> <bytes>" line each.
 const DroppedInjectionsFile = "injections-dropped"
 
-// maxDroppedFileBytes bounds the dropped-injections file; past it nothing more is added.
+// maxDroppedFileBytes bounds the dropped-injections file; past it no line is added and only the
+// saturation marker (SaturatedInjectionsFile) records that injections are still being lost.
 const maxDroppedFileBytes = 1 << 20
+
+// SaturatedInjectionsFile holds the unix time of the latest injection lost after the dropped file was
+// full. It outlives the entries that age out of a report's window, so a report knows it is incomplete.
+const SaturatedInjectionsFile = "injections-dropped.saturated"
 
 // noteDroppedInjection appends one line to the dropped-injections file. Best effort by design: the
 // hook this serves must never fail or wait for it.
 func noteDroppedInjection(dir, category string, bytes int, at time.Time) {
 	path := filepath.Join(dir, DroppedInjectionsFile)
 	if fi, err := os.Stat(path); err == nil && fi.Size() > maxDroppedFileBytes {
+		_ = os.WriteFile(filepath.Join(dir, SaturatedInjectionsFile), []byte(strconv.FormatInt(at.Unix(), 10)+"\n"), 0o600)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -125,6 +131,17 @@ func noteDroppedInjection(dir, category string, bytes int, at time.Time) {
 	}
 	defer f.Close()
 	_, _ = fmt.Fprintf(f, "%d %s %d\n", at.Unix(), category, bytes)
+}
+
+// droppedSaturated reports whether an injection was lost, uncounted, at or after since because the
+// dropped-injections file was full.
+func droppedSaturated(dir string, since time.Time) bool {
+	b, err := os.ReadFile(filepath.Join(dir, SaturatedInjectionsFile))
+	if err != nil {
+		return false
+	}
+	at, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return err == nil && at >= since.Unix()
 }
 
 // droppedInjections counts the lines of the dropped-injections file at or after since, and their bytes.
@@ -258,6 +275,9 @@ type WakeStatsReport struct {
 	// injection numbers above are a lower bound by this much.
 	InjectionsUnrecorded     int `json:"injections_unrecorded"`
 	InjectionBytesUnrecorded int `json:"injection_bytes_unrecorded"`
+	// InjectionsUncounted is true when injections were lost beyond what the two counts above hold (the
+	// dropped-injections file was full): the numbers are a lower bound even when the counts are 0.
+	InjectionsUncounted bool `json:"injections_uncounted,omitempty"`
 }
 
 // WakeStats summarizes the recorded deliveries and injections at or after since (zero = all).
@@ -296,6 +316,7 @@ func (m *Manager) WakeStats(since time.Time) (WakeStatsReport, error) {
 	}
 	sort.Slice(rep.Days, func(a, b int) bool { return rep.Days[a].Day < rep.Days[b].Day })
 	rep.InjectionsUnrecorded, rep.InjectionBytesUnrecorded = droppedInjections(m.StateDir, since)
+	rep.InjectionsUncounted = droppedSaturated(m.StateDir, since)
 	order := append(slices.Clone(WakeCategories), InjectionCategories...)
 	keys := make([]string, 0, len(byCat))
 	for k := range byCat {

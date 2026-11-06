@@ -83,6 +83,9 @@ func printIncomplete(rep jobs.WakeStatsReport) {
 		fmt.Printf("incomplete: %d hook injections (%d bytes) could not be stored; the injection numbers are a lower bound\n",
 			rep.InjectionsUnrecorded, rep.InjectionBytesUnrecorded)
 	}
+	if rep.InjectionsUncounted {
+		fmt.Println("incomplete: more hook injections were lost after the dropped-injections file filled up; the injection numbers are a lower bound")
+	}
 }
 
 // cmdSLO is `slo record NAME SECONDS` and `slo show`.

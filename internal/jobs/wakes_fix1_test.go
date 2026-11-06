@@ -332,6 +332,35 @@ func TestSLONoteNotRepeatedAfterFailedMark(t *testing.T) {
 	}
 }
 
+// #170 fix loop 2: once the dropped-injections file is full, further losses leave a marker, so a report
+// whose window no longer holds any of the file's old entries still says it is incomplete.
+func TestWakeStatsIncompleteAfterDroppedFileSaturated(t *testing.T) {
+	m := newManager(t)
+	old := time.Now().Add(-72 * time.Hour)
+	var sb strings.Builder
+	for sb.Len() <= maxDroppedFileBytes {
+		sb.WriteString(fmt.Sprintf("%d %s 10\n", old.Unix(), InjectBriefReminder))
+	}
+	if err := os.WriteFile(filepath.Join(m.StateDir, DroppedInjectionsFile), []byte(sb.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db := rawDB(t, m)
+	mustExec(t, db, `CREATE TRIGGER fail_inj BEFORE INSERT ON orchestrator_wakes BEGIN SELECT RAISE(ABORT, 'planted fault'); END`)
+	if err := RecordHookInjection("test", InjectBriefReminder, "lost after saturation", time.Now()); err == nil {
+		t.Fatal("the planted fault did not surface")
+	}
+	rep, err := m.WakeStats(time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.InjectionsUnrecorded != 0 || !rep.InjectionsUncounted {
+		t.Fatalf("a loss after saturation is not reported: %+v", rep)
+	}
+	if later, _ := m.WakeStats(time.Now().Add(time.Hour)); later.InjectionsUncounted {
+		t.Fatalf("since is ignored: %+v", later)
+	}
+}
+
 // #170 fix loop 1: an injection a hook could not store is counted in the report as unrecorded.
 func TestWakeStatsReportsDroppedInjections(t *testing.T) {
 	m := newManager(t)
