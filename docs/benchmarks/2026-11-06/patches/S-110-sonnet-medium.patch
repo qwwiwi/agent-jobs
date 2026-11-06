@@ -1,0 +1,66 @@
+diff --git a/internal/jobs/testproc_test.go b/internal/jobs/testproc_test.go
+index b0c75df..ffc62f4 100644
+--- a/internal/jobs/testproc_test.go
++++ b/internal/jobs/testproc_test.go
+@@ -79,11 +79,7 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
+ 			c := exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
+ 			c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"="+mode)
+ 			c.Stdout, c.Stderr = io.Discard, io.Discard
+-			if err := c.Start(); err != nil {
+-				t.Fatal(err)
+-			}
+-			done := make(chan error, 1)
+-			go func() { done <- c.Wait() }()
++			done := startJoined(t, c)
+ 			var pid int
+ 			var home string
+ 			waitFor(t, "daemon pid", 30*time.Second, func() bool {
+@@ -121,6 +117,48 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
+ 	}
+ }
+ 
++// startJoined starts c and registers its end in t.Cleanup right away (SIGKILL, then the join of the
++// wait goroutine), so a failed wait later in the test cannot leave c running (#110). The returned
++// channel gets the result of c.Wait.
++func startJoined(t testing.TB, c *exec.Cmd) <-chan error {
++	t.Helper()
++	if err := c.Start(); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	finished := make(chan struct{})
++	go func() {
++		done <- c.Wait()
++		close(finished)
++	}()
++	t.Cleanup(func() {
++		_ = c.Process.Kill()
++		<-finished
++	})
++	return done
++}
++
++// #110: a helper started with startJoined is killed and joined when the test ends, even if the test
++// bails out before it ever waits for the helper.
++func TestStartJoinedKillsHelperOnEarlyExit(t *testing.T) {
++	var pid int
++	var done <-chan error
++	t.Run("early exit", func(t *testing.T) {
++		c := exec.Command("sleep", "120")
++		done = startJoined(t, c)
++		pid = c.Process.Pid
++		// Returning here stands for a t.Fatal from a failed wait before any kill.
++	})
++	select {
++	case <-done:
++	case <-time.After(10 * time.Second):
++		t.Fatal("helper still running after its subtest ended")
++	}
++	if alive(pid) {
++		t.Fatalf("helper %d is still alive after its subtest ended", pid)
++	}
++}
++
+ // procHasArg reports whether pid's command line has the argument arg (false when unreadable).
+ func procHasArg(pid int, arg string) bool {
+ 	argv, err := procCmdline(pid)

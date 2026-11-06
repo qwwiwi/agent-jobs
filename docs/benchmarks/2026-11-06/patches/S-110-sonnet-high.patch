@@ -1,0 +1,86 @@
+diff --git a/internal/jobs/testproc_test.go b/internal/jobs/testproc_test.go
+index b0c75df..2686937 100644
+--- a/internal/jobs/testproc_test.go
++++ b/internal/jobs/testproc_test.go
+@@ -51,6 +51,10 @@ func TestOwnedHelperDaemon(t *testing.T) {
+ 	if os.Getenv(ownedHelperEnv) == "" {
+ 		t.Skip("helper of TestStartedDaemonNeverOutlivesItsTest")
+ 	}
++	if os.Getenv(ownedHelperMode) == "idle" {
++		time.Sleep(2 * time.Minute) // never starts a daemon or writes the pid file
++		return
++	}
+ 	newManager(t)
+ 	// No pipe on its output: a daemon that writes to a closed pipe dies of SIGPIPE, which would hide
+ 	// the leak (a quiet daemon writes nothing for hours).
+@@ -76,14 +80,9 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
+ 	for _, mode := range modes {
+ 		t.Run(mode, func(t *testing.T) {
+ 			pidFile := filepath.Join(t.TempDir(), "daemon.pid")
+-			c := exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
+-			c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"="+mode)
+-			c.Stdout, c.Stderr = io.Discard, io.Discard
+-			if err := c.Start(); err != nil {
+-				t.Fatal(err)
+-			}
++			c, exited, werr := startOwnedHelper(t, mode, pidFile)
+ 			done := make(chan error, 1)
+-			go func() { done <- c.Wait() }()
++			go func() { <-exited; done <- *werr }()
+ 			var pid int
+ 			var home string
+ 			waitFor(t, "daemon pid", 30*time.Second, func() bool {
+@@ -121,6 +120,53 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
+ 	}
+ }
+ 
++// startOwnedHelper starts the helper child of TestStartedDaemonNeverOutlivesItsTest in the given mode and
++// returns it with a channel closed once it has been waited for and the wait's error (valid after the
++// close). Its end (SIGKILL, then the wait) is registered in t.Cleanup right after a successful Start,
++// before any wait on its pid file, so a t.Fatal on a failed wait cannot leave it running (#110).
++func startOwnedHelper(t *testing.T, mode, pidFile string) (c *exec.Cmd, exited <-chan struct{}, werr *error) {
++	t.Helper()
++	c = exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
++	c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"="+mode)
++	c.Stdout, c.Stderr = io.Discard, io.Discard
++	if err := c.Start(); err != nil {
++		t.Fatal(err)
++	}
++	ch := make(chan struct{})
++	var err error
++	go func() {
++		err = c.Wait()
++		close(ch)
++	}()
++	// The one Wait runs in the goroutine above; the cleanup only kills and then joins it.
++	t.Cleanup(func() {
++		_ = c.Process.Kill()
++		<-ch
++	})
++	return c, ch, &err
++}
++
++// #110: the helper is ended when the test that started it ends, even if that test never reaches its
++// wait on the helper's pid file (the wait fails with t.Fatal). The idle helper never writes the pid file.
++func TestOwnedHelperEndsWithItsTestWhenTheWaitFails(t *testing.T) {
++	var c *exec.Cmd
++	var exited <-chan struct{}
++	t.Run("starts and fails", func(t *testing.T) {
++		c, exited, _ = startOwnedHelper(t, "idle", filepath.Join(t.TempDir(), "daemon.pid"))
++		// Stand-in for the failed waitFor: the subtest ends here, only its cleanups run.
++	})
++	// Safety net so a failing assertion does not leave the idle helper running either.
++	t.Cleanup(func() {
++		_ = c.Process.Kill()
++		<-exited
++	})
++	select {
++	case <-exited:
++	case <-time.After(5 * time.Second):
++		t.Fatal("the helper is still running after the test that started it ended")
++	}
++}
++
+ // procHasArg reports whether pid's command line has the argument arg (false when unreadable).
+ func procHasArg(pid int, arg string) bool {
+ 	argv, err := procCmdline(pid)

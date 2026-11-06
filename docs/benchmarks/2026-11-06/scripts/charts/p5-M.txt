@@ -1,0 +1,27 @@
+A clean, minimalist, professional data table infographic in a dark theme (near-black background #0E0F12, soft gold accent #D4A84B, white and light-grey text, thin divider lines). Style of a top-tier ML benchmark report: flat, crisp sans-serif typography, aligned columns, no 3D, no icons, no emoji. All text in Russian exactly as written. Every number and word in the table must be rendered exactly as given, no extra rows.
+
+Title: «Средние задачи: каждая джоба»
+Subtitle: «Вердикт Codex gpt-6.1-sol · находки ревью H = High, M = Medium, L = Low · цена: Claude – эквивалент API, GLM – реальные деньги»
+
+Table columns: Модель | Результат | Находки | Цена | Время | Примечание
+Color the Результат cell: «решено» gold text, «частично» light grey, «таймаут, ветки нет» muted red. Each issue is a group with a gold group header row showing the issue number and its description.
+
+Group header: «#154 – Отчёт теряется, когда фоновое уведомление добавляет лишнее событие»
+  Opus high | частично | H 1 · M 0 · L 0 | $1.64 | 49 мин | 
+  Sonnet high | частично | H 1 · M 1 · L 0 | $0.40 | 20 мин | 
+  Sonnet medium | частично | H 1 · M 1 · L 0 | $0.35 | 23 мин | 
+  GLM 5.3 | частично | H 1 · M 0 · L 0 | $0.51 | 38 мин | 
+
+Group header: «#155 – Гард: оставшиеся обходы rsync (find +, python -c, $VAR)»
+  Opus high | частично | H 3 · M 1 · L 0 | $6.00 | 56 мин | 
+  Sonnet high | частично | H 1 · M 2 · L 0 | $1.06 | — | 1-я попытка без отчёта, дозапуск
+  Sonnet medium | частично | H 3 · M 1 · L 0 | $0.55 | — | 1-я попытка без отчёта, дозапуск
+  GLM 5.3 | частично | H 3 · M 1 · L 0 | $0.86 | 50 мин | 
+
+Group header: «#114 – Git-раннер: потомки cat-file переживают таймаут»
+  Opus high | решено | H 0 · M 0 · L 0 | $1.13 | 31 мин | 
+  Sonnet high | решено | H 0 · M 1 · L 0 | $0.42 | — | 1-я попытка без отчёта, дозапуск
+  Sonnet medium | решено | H 0 · M 1 · L 0 | $0.31 | 33 мин | 
+  GLM 5.3 | решено | H 0 · M 0 · L 1 | $0.32 | 40 мин | джоба упала, коммит есть
+
+Footer small grey: «Один прогон на клетку · ревью читало код, тесты не запускало · время завышено: шло 5 джоб параллельно»

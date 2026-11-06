@@ -1,0 +1,202 @@
+diff --git a/internal/jobs/hardening1_test.go b/internal/jobs/hardening1_test.go
+index c663484..ed6c4a9 100644
+--- a/internal/jobs/hardening1_test.go
++++ b/internal/jobs/hardening1_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+@@ -111,7 +112,8 @@ func TestCodexForgedTerminalIgnored(t *testing.T) {
+ 	}
+ }
+ 
+-// The tee keeps the last result line, also one without a trailing newline, and skips other lines.
++// The tee keeps the last result line (also one without a trailing newline), skips other lines, and
++// sums turns/cost over the result events (each covers its own run, #154).
+ func TestResultTee(t *testing.T) {
+ 	var out bytes.Buffer
+ 	tee := &resultTee{w: &out}
+@@ -127,11 +129,46 @@ func TestResultTee(t *testing.T) {
+ 	if out.String() != in {
+ 		t.Fatal("the tee must pass every byte through")
+ 	}
+-	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 2 || r.CostUSD != 0.75 {
++	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 3 || r.CostUSD != 1.25 {
+ 		t.Fatalf("result: %+v", r)
+ 	}
+ }
+ 
++// A trailing `result` event from a background task's notification turn (#154): the report is the
++// last result text that has the report sections, turns and cost are the run total, and the last
++// event still says how the runner ended.
++func TestResultTeeTrailingNotification(t *testing.T) {
++	report := "## Summary\nok\n\n## Not done / uncertain\nnothing"
++	line := func(turns int, cost float64, text string) string {
++		b, err := json.Marshal(map[string]any{"type": "result", "subtype": "success", "is_error": false,
++			"num_turns": turns, "total_cost_usd": cost, "result": text})
++		if err != nil {
++			t.Fatal(err)
++		}
++		return string(b) + "\n"
++	}
++	in := strings.Join([]string{
++		line(87, 1.5, report),
++		`{"type":"assistant","message":{"id":"n1","content":[{"type":"text","text":"notification text"}]}}` + "\n",
++		line(1, 0.25, "notification text"),
++	}, "")
++	tee := &resultTee{w: io.Discard}
++	if _, err := tee.Write([]byte(in)); err != nil {
++		t.Fatal(err)
++	}
++	tee.end()
++	r := tee.res
++	if !r.Found || r.Subtype != "success" || r.IsError || r.Results != 2 {
++		t.Fatalf("result: %+v", r)
++	}
++	if r.Turns != 88 || r.CostUSD != 1.75 {
++		t.Fatalf("turns/cost %d/%v, want the run total 88/1.75", r.Turns, r.CostUSD)
++	}
++	if r.Text != report {
++		t.Fatalf("text %q, want the report of the earlier result", r.Text)
++	}
++}
++
+ // A fallback marker the job wrote in a launch that is no resume is ignored: the planted session is not
+ // recorded and the next resume does not continue it.
+ func TestFallbackMarkerIgnoredOutsideResume(t *testing.T) {
+diff --git a/internal/jobs/idle_test.go b/internal/jobs/idle_test.go
+index 4edde32..cebc071 100644
+--- a/internal/jobs/idle_test.go
++++ b/internal/jobs/idle_test.go
+@@ -26,7 +26,8 @@ func idleManager(t *testing.T) *Manager {
+ }
+ 
+ // A result, then silence with only the job MCP server alive: the wrapper closes claude, the job
+-// succeeds with turns/cost of the last result, and report.md comes from the stream's report text.
++// succeeds with the run total of turns/cost over the result events, and report.md comes from the
++// stream's report text.
+ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
+ 	m := idleManager(t)
+ 	start := time.Now()
+@@ -37,8 +38,8 @@ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
+ 	if took := time.Since(start); took > 12*time.Second {
+ 		t.Fatalf("closed after %s, want within the grace period", took)
+ 	}
+-	if j.Turns != 6 || j.CostUSD != 0.75 {
+-		t.Fatalf("turns/cost %d/%v, want the last result's 6/0.75", j.Turns, j.CostUSD)
++	if j.Turns != 10 || j.CostUSD != 1.25 {
++		t.Fatalf("turns/cost %d/%v, want the run total 10/1.25", j.Turns, j.CostUSD)
+ 	}
+ 	if !strings.Contains(j.Error, ReasonIdleClosed) {
+ 		t.Fatalf("job row does not record the idle close: %q", j.Error)
+@@ -98,8 +99,8 @@ func TestIdleAfterResultNotClosedWhileWorking(t *testing.T) {
+ 			if took := time.Since(start); took < 2500*time.Millisecond {
+ 				t.Fatalf("job ended after %s: closed early", took)
+ 			}
+-			if j.Turns != 3 {
+-				t.Fatalf("turns %d, want the final result's 3", j.Turns)
++			if j.Turns != 4 {
++				t.Fatalf("turns %d, want the run total over the result events 4", j.Turns)
+ 			}
+ 			if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), IdleClosedMarker)); err == nil {
+ 				t.Fatal("idle marker written for a job that exited by itself")
+@@ -231,3 +232,23 @@ func TestReportFallbackOnlyAfterSuccess(t *testing.T) {
+ 		t.Fatal("report.md written from assistant text after a non-success result")
+ 	}
+ }
++
++// A background task's notification wakes the session after its report (#154): the stream carries a
++// second `result` event whose text is the notification turn's short message. The report is the last
++// result text that has the report sections, turns and cost are the run total (both results summed),
++// and the job does not fail with NoteNoSummary over the trailing notification turn.
++func TestTrailingNotificationResultKeepsReport(t *testing.T) {
++	m := newManager(t)
++	noAutoContinue(m)
++	j := runToEnd(t, m, enqueue(t, m, "FAKE_BG_NOTIFY", nil).ID)
++	if j.Status != store.StatusSucceeded || j.Error != "" {
++		t.Fatalf("job: %s %q", j.Status, j.Error)
++	}
++	if j.Turns != 88 || j.CostUSD != 1.75 || j.CostUnknown {
++		t.Fatalf("turns/cost %d/%v unknown=%v, want the run total 88/1.75", j.Turns, j.CostUSD, j.CostUnknown)
++	}
++	report := "## Summary\nbg notify ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing\n\n## Progress\n- 10:00 UTC done\n"
++	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); r != report {
++		t.Fatalf("report.md not the first result's report: %q", r)
++	}
++}
+diff --git a/internal/jobs/jobs_test.go b/internal/jobs/jobs_test.go
+index b587fe4..70c36ca 100644
+--- a/internal/jobs/jobs_test.go
++++ b/internal/jobs/jobs_test.go
+@@ -264,6 +264,15 @@ if [[ $prompt == *FAKE_IDLE* ]]; then
+   fi
+ fi
+ if [[ $prompt == *FAKE_EXIT3* ]]; then exit 3; fi
++if [[ $prompt == *FAKE_BG_NOTIFY* ]]; then
++  # A background task's notification wakes the session after its report (#154): the full-report
++  # result of the run, then one more turn that prints its own short result. Turn counts and costs
++  # are per run; only the report text differs from the notification turn's message.
++  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":87,"total_cost_usd":1.5,"result":"## Summary\nbg notify ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing\n\n## Progress\n- 10:00 UTC done"}'
++  echo '{"type":"assistant","message":{"id":"n1","content":[{"type":"text","text":"Это уведомление от моего же таймера ожидания."}]}}'
++  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.25,"result":"Это уведомление от моего же таймера ожидания."}'
++  exit 0
++fi
+ if [[ $prompt == *FAKE_ASSISTANT_REPORT* ]]; then
+   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"## Summary\nfrom assistant"}]}}'
+   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.01,"result":""}'
+diff --git a/internal/jobs/resume_idle_test.go b/internal/jobs/resume_idle_test.go
+index 94e9d09..d6eb45a 100644
+--- a/internal/jobs/resume_idle_test.go
++++ b/internal/jobs/resume_idle_test.go
+@@ -80,8 +80,8 @@ func TestIdleCloseOnFallbackRun(t *testing.T) {
+ 	if j.Status != store.StatusSucceeded || j.RunMode != store.RunFallback || !strings.Contains(j.Error, ReasonIdleClosed) {
+ 		t.Fatalf("row: %+v (stderr %s)", j, readFile(t, filepath.Join(dir, "stderr.log")))
+ 	}
+-	if j.Turns != 6 || j.CostUSD != 0.75 || j.CostUnknown {
+-		t.Fatalf("turns/cost %d/%v unknown=%v, want the last result's 6/0.75", j.Turns, j.CostUSD, j.CostUnknown)
++	if j.Turns != 10 || j.CostUSD != 1.25 || j.CostUnknown {
++		t.Fatalf("turns/cost %d/%v unknown=%v, want the run total 10/1.25", j.Turns, j.CostUSD, j.CostUnknown)
+ 	}
+ 	if r := readFile(t, filepath.Join(dir, "report.md")); !strings.HasPrefix(r, "## Summary\nidle ok") {
+ 		t.Fatalf("report.md: %q", r)
+diff --git a/internal/jobs/wrapper.go b/internal/jobs/wrapper.go
+index ab02e6f..0f8be42 100644
+--- a/internal/jobs/wrapper.go
++++ b/internal/jobs/wrapper.go
+@@ -48,8 +48,9 @@ type StreamResult struct {
+ 	PrepareFailure string         `json:",omitempty"`
+ 	ReportText     string         `json:"-"` // last report from trusted assistant stdout
+ 	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
+-	// second one is a line another process wrote into the pipe), for codex its terminal turn events
+-	// (turn.completed, turn.failed: codex exec runs one turn).
++	// second one is claude's own when a background task's notification wakes the session for one more
++	// turn, issue #154, or a line another process wrote into the pipe), for codex its terminal turn
++	// events (turn.completed, turn.failed: codex exec runs one turn).
+ 	Results int `json:"-"`
+ 	// AfterEnd counts the codex events read after its first terminal turn event.
+ 	AfterEnd int `json:"-"`
+@@ -243,6 +244,20 @@ func (t *resultTee) end() {
+ 		}
+ 		if r, ok := parseResultLine(t.line); ok {
+ 			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
++			if t.res.Found {
++				// A later `result` event (issue #154): a background task's notification can wake the
++				// session after its run already ended, and that one extra turn prints its own result.
++				// Its num_turns and total_cost_usd cover that turn only, so the job's totals are the
++				// sum over the result events. The report is the last result text that follows the
++				// report contract: a trailing notification's short text never replaces a report an
++				// earlier result already delivered. The last event still says how the runner ended
++				// (subtype, error flag), as before.
++				r.Turns += t.res.Turns
++				r.CostUSD += t.res.CostUSD
++				if !isReport(r.Text) && isReport(t.res.Text) {
++					r.Text = t.res.Text
++				}
++			}
+ 			t.res = r
+ 		}
+ 	}

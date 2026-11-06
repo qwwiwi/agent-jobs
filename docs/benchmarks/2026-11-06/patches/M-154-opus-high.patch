@@ -1,0 +1,236 @@
+diff --git a/internal/jobs/hardening1_test.go b/internal/jobs/hardening1_test.go
+index c663484..a0aed2b 100644
+--- a/internal/jobs/hardening1_test.go
++++ b/internal/jobs/hardening1_test.go
+@@ -111,7 +111,7 @@ func TestCodexForgedTerminalIgnored(t *testing.T) {
+ 	}
+ }
+ 
+-// The tee keeps the last result line, also one without a trailing newline, and skips other lines.
++// The tee merges the result lines, also one without a trailing newline, and skips other lines.
+ func TestResultTee(t *testing.T) {
+ 	var out bytes.Buffer
+ 	tee := &resultTee{w: &out}
+@@ -127,7 +127,8 @@ func TestResultTee(t *testing.T) {
+ 	if out.String() != in {
+ 		t.Fatal("the tee must pass every byte through")
+ 	}
+-	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 2 || r.CostUSD != 0.75 {
++	// The last result's state; turns are the run total (num_turns is per query: 1 + 2, #154).
++	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 3 || r.CostUSD != 0.75 {
+ 		t.Fatalf("result: %+v", r)
+ 	}
+ }
+diff --git a/internal/jobs/idle_test.go b/internal/jobs/idle_test.go
+index 4edde32..ede9050 100644
+--- a/internal/jobs/idle_test.go
++++ b/internal/jobs/idle_test.go
+@@ -26,7 +26,7 @@ func idleManager(t *testing.T) *Manager {
+ }
+ 
+ // A result, then silence with only the job MCP server alive: the wrapper closes claude, the job
+-// succeeds with turns/cost of the last result, and report.md comes from the stream's report text.
++// succeeds with the run total of turns/cost, and report.md comes from the stream's report text.
+ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
+ 	m := idleManager(t)
+ 	start := time.Now()
+@@ -38,7 +38,7 @@ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
+ 		t.Fatalf("closed after %s, want within the grace period", took)
+ 	}
+ 	if j.Turns != 6 || j.CostUSD != 0.75 {
+-		t.Fatalf("turns/cost %d/%v, want the last result's 6/0.75", j.Turns, j.CostUSD)
++		t.Fatalf("turns/cost %d/%v, want the run total 6/0.75", j.Turns, j.CostUSD)
+ 	}
+ 	if !strings.Contains(j.Error, ReasonIdleClosed) {
+ 		t.Fatalf("job row does not record the idle close: %q", j.Error)
+@@ -98,8 +98,9 @@ func TestIdleAfterResultNotClosedWhileWorking(t *testing.T) {
+ 			if took := time.Since(start); took < 2500*time.Millisecond {
+ 				t.Fatalf("job ended after %s: closed early", took)
+ 			}
+-			if j.Turns != 3 {
+-				t.Fatalf("turns %d, want the final result's 3", j.Turns)
++			// The run total: the waiting result's 1 turn + the final result's 3 (num_turns is per query, #154).
++			if j.Turns != 4 {
++				t.Fatalf("turns %d, want the run total 4", j.Turns)
+ 			}
+ 			if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), IdleClosedMarker)); err == nil {
+ 				t.Fatal("idle marker written for a job that exited by itself")
+diff --git a/internal/jobs/jobs_test.go b/internal/jobs/jobs_test.go
+index b587fe4..2eafe41 100644
+--- a/internal/jobs/jobs_test.go
++++ b/internal/jobs/jobs_test.go
+@@ -223,7 +223,8 @@ if [[ $prompt == *FAKE_IDLE* ]]; then
+   if [[ $prompt == *FAKE_IDLE_OK* ]]; then
+     echo '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$report"'"}]}}'
+     echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"Background agents are still running."}'
+-    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":6,"total_cost_usd":0.75,"result":"All done."}'
++    # As claude: num_turns counts this query only, total_cost_usd is the session's running total.
++    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.75,"result":"All done."}'
+     pause 60
+   fi
+   if [[ $prompt == *FAKE_IDLE_OWNREPORT* ]]; then
+@@ -308,6 +309,15 @@ if [[ $prompt == *FAKE_WAIT_SUBAGENTS_ONCE* && ! -d ../attempts ]]; then
+   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Waiting for the subagent notifications."}'
+   exit 0
+ fi
++if [[ $prompt == *FAKE_BG_NOTIFY* ]]; then
++  # Issue #154: the report result, then a background task's notification wakes the session for one more
++  # turn and claude prints a second result (num_turns counts that query only, total_cost_usd the session).
++  echo '{"type":"assistant","message":{"id":"bn1","content":[{"type":"text","text":"## Summary\nbg done\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}]}}'
++  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":87,"total_cost_usd":3.2,"result":"## Summary\nbg done\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
++  echo '{"type":"assistant","message":{"id":"bn2","content":[{"type":"text","text":"This is a notification from my own wait timer."}]}}'
++  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":3.25,"result":"This is a notification from my own wait timer."}'
++  exit 0
++fi
+ if [[ $prompt == *FAKE_MIDTASK* ]]; then
+   # Ends its turn mid-task: the final message is no report.
+   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Now let me check the remaining callers in store.go."}'
+diff --git a/internal/jobs/multiresult_test.go b/internal/jobs/multiresult_test.go
+new file mode 100644
+index 0000000..4f125f4
+--- /dev/null
++++ b/internal/jobs/multiresult_test.go
+@@ -0,0 +1,76 @@
++package jobs
++
++import (
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++)
++
++// twoResultStream is the shape of issue #154: the report result, then a background task's notification
++// wakes the session for one more turn and claude prints a second, short result.
++const twoResultStream = `{"type":"system","subtype":"init"}
++{"type":"assistant","message":{"id":"a1","content":[{"type":"text","text":"## Summary\nall done\n\n## Not done / uncertain\nnothing"}]}}
++{"type":"result","subtype":"success","is_error":false,"num_turns":87,"total_cost_usd":3.2,"result":"## Summary\nall done\n\n## Not done / uncertain\nnothing"}
++{"type":"assistant","message":{"id":"a2","content":[{"type":"text","text":"This is a notification from my own wait timer."}]}}
++{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":3.25,"result":"This is a notification from my own wait timer."}
++`
++
++// The wrapper's tee keeps the report of the last result that has one, sums the turns of every result
++// (claude counts num_turns per query) and keeps the session's running cost.
++func TestTeeTrailingResultKeepsReport(t *testing.T) {
++	tee := &resultTee{w: io.Discard}
++	_, _ = tee.Write([]byte(twoResultStream))
++	tee.end()
++	r := tee.res
++	if !r.Found || r.Subtype != "success" || r.IsError || r.Results != 2 {
++		t.Fatalf("result: %+v", r)
++	}
++	if !strings.HasPrefix(r.Text, "## Summary\nall done") {
++		t.Fatalf("text taken from the trailing notification turn: %q", r.Text)
++	}
++	if r.Turns != 88 || r.CostUSD != 3.25 {
++		t.Fatalf("turns/cost %d/%v, want the run total 88/3.25", r.Turns, r.CostUSD)
++	}
++
++	// ParseStream (stream.jsonl) reads the same way.
++	path := filepath.Join(t.TempDir(), "stream.jsonl")
++	if err := os.WriteFile(path, []byte(twoResultStream), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	if p := ParseStream(path); !strings.HasPrefix(p.Text, "## Summary\nall done") || p.Turns != 88 || p.CostUSD != 3.25 {
++		t.Fatalf("ParseStream: %+v", p)
++	}
++
++	// A trailing result that is a report itself replaces the earlier one.
++	again := twoResultStream + `{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":3.3,"result":"## Summary\nrewritten"}` + "\n"
++	tee = &resultTee{w: io.Discard}
++	_, _ = tee.Write([]byte(again))
++	tee.end()
++	if tee.res.Text != "## Summary\nrewritten" || tee.res.Turns != 90 || tee.res.Results != 3 {
++		t.Fatalf("third result: %+v", tee.res)
++	}
++}
++
++// A job whose session got a trailing notification turn after its report succeeds with that report and
++// the run's total turns (issue #154).
++func TestTrailingNotificationResultKeepsReport(t *testing.T) {
++	m := newManager(t)
++	noAutoContinue(m)
++	j := runToEnd(t, m, enqueue(t, m, "FAKE_BG_NOTIFY", nil).ID)
++	if j.Status != store.StatusSucceeded || j.Error != "" {
++		t.Fatalf("job: %s %q", j.Status, j.Error)
++	}
++	if j.Turns != 88 || j.CostUSD != 3.25 {
++		t.Fatalf("turns/cost %d/%v, want the run total 88/3.25", j.Turns, j.CostUSD)
++	}
++	if r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md")); !strings.HasPrefix(r, "## Summary\nbg done") {
++		t.Fatalf("report.md lost the report: %q", r)
++	}
++	if line := DoneLine(j, 0); strings.Contains(line, "report has no") || strings.Contains(line, "failed") {
++		t.Fatalf("done line: %s", line)
++	}
++}
+diff --git a/internal/jobs/wrapper.go b/internal/jobs/wrapper.go
+index ab02e6f..2e0166e 100644
+--- a/internal/jobs/wrapper.go
++++ b/internal/jobs/wrapper.go
+@@ -47,9 +47,10 @@ type StreamResult struct {
+ 	Prepare        *PrepareResult `json:",omitempty"`
+ 	PrepareFailure string         `json:",omitempty"`
+ 	ReportText     string         `json:"-"` // last report from trusted assistant stdout
+-	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
+-	// second one is a line another process wrote into the pipe), for codex its terminal turn events
+-	// (turn.completed, turn.failed: codex exec runs one turn).
++	// Results counts the `result` events read from the runner's stdout (claude prints one per query: a
++	// second one comes from a background task's notification waking the session for another turn, or is
++	// a line another process wrote into the pipe), for codex its terminal turn events (turn.completed,
++	// turn.failed: codex exec runs one turn).
+ 	Results int `json:"-"`
+ 	// AfterEnd counts the codex events read after its first terminal turn event.
+ 	AfterEnd int `json:"-"`
+@@ -100,7 +101,7 @@ type resultEvent struct {
+ 	Result       string  `json:"result"`
+ }
+ 
+-// ParseStream returns the last `result` event in stream.jsonl (zero value if none).
++// ParseStream returns the `result` events in stream.jsonl merged by mergeResult (zero value if none).
+ func ParseStream(path string) StreamResult {
+ 	var out StreamResult
+ 	f, err := os.Open(path)
+@@ -112,12 +113,29 @@ func ParseStream(path string) StreamResult {
+ 	sc.Buffer(make([]byte, 0, 1<<20), maxStreamLine)
+ 	for sc.Scan() {
+ 		if r, ok := parseResultLine(sc.Bytes()); ok {
+-			out = r
++			out = mergeResult(out, r)
+ 		}
+ 	}
+ 	return out
+ }
+ 
++// mergeResult folds the result event r into prev, the results read before it (issue #154). A background
++// task's notification can wake a finished claude session for one more turn, which prints a second
++// result: the run's state (subtype, error) is the last result's, but its turns are the sum of every
++// result's num_turns (claude counts them per query), its cost the session's running total_cost_usd, and
++// its text the last result text that is a report, so a short trailing turn does not replace the report.
++func mergeResult(prev, r StreamResult) StreamResult {
++	if !prev.Found {
++		return r
++	}
++	r.Turns += prev.Turns
++	r.CostUSD = max(r.CostUSD, prev.CostUSD)
++	if !isReport(r.Text) && isReport(prev.Text) {
++		r.Text = prev.Text
++	}
++	return r
++}
++
+ // maxStreamLine is the longest stream line read; a longer one is skipped.
+ const maxStreamLine = 64 << 20
+ 
+@@ -243,7 +261,7 @@ func (t *resultTee) end() {
+ 		}
+ 		if r, ok := parseResultLine(t.line); ok {
+ 			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
+-			t.res = r
++			t.res = mergeResult(t.res, r)
+ 		}
+ 	}
+ 	if !t.skip && bytes.Contains(t.line, []byte(`"usage"`)) {

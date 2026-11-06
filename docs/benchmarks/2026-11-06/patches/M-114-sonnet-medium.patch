@@ -1,0 +1,96 @@
+diff --git a/internal/jobs/gate.go b/internal/jobs/gate.go
+index 5a71b3b..c7bb332 100644
+--- a/internal/jobs/gate.go
++++ b/internal/jobs/gate.go
+@@ -508,18 +508,22 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 	if err != nil {
+ 		return err
+ 	}
+-	outPipe, outW, err := os.Pipe()
+-	if err != nil {
+-		_, _ = inR.Close(), in.Close()
+-		return err
+-	}
++	// Stdout is an io.Pipe, no *os.File: the runner copies git's stdout into it, so that the copy takes
++	// part in the pre-reap completion protocol (#114). A descendant of git that holds stdout after git's
++	// exit keeps the PID reservation until the group is killed, rather than outliving the deadline.
++	outPipe, outW := io.Pipe()
+ 	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
+ 		"-C", repo, noReplace, "cat-file", "--batch")
+-	_, _ = inR.Close(), outW.Close()
++	_ = inR.Close()
+ 	if err != nil {
+ 		_, _ = in.Close(), outPipe.Close()
+ 		return fmt.Errorf("git cat-file: %w", err)
+ 	}
++	// Once every copy has ended the reader sees EOF (or the copy's error).
++	go func() {
++		<-p.copied
++		_ = outW.Close()
++	}()
+ 	// Bounded like the other daemon git calls (#100): at gitLongTimeout git's group is killed and both
+ 	// pipes are closed, so that a read or write blocked on a git that stopped answering ends.
+ 	ctx, cancel := context.WithTimeout(context.Background(), gitLongTimeout)
+@@ -540,6 +544,8 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 		if err != nil {
+ 			// git may be blocked writing the rest of a blob nobody reads: end it before waiting.
+ 			p.kill()
++			// Nobody reads the rest: the runner's copy must not block on the pipe.
++			_ = outPipe.Close()
+ 		}
+ 		_ = in.Close()
+ 		werr := p.wait(ctx)
+diff --git a/internal/jobs/git_timeout_test.go b/internal/jobs/git_timeout_test.go
+index 014ee40..88db3d1 100644
+--- a/internal/jobs/git_timeout_test.go
++++ b/internal/jobs/git_timeout_test.go
+@@ -329,3 +329,49 @@ exit 0
+ 		}
+ 	}
+ }
++
++// A git cat-file that exits while a process of its group still holds the stdout pipe materializeTree
++// reads does not leave that process running past the deadline (#114): the manually read stream takes
++// part in the runner's completion protocol, so the group is killed while git still reserves its ID.
++func TestMaterializeTreeKillsChildHoldingStdout(t *testing.T) {
++	repo, sha := gateRepo(t)
++	real, err := exec.LookPath("git")
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := t.TempDir()
++	t.Setenv("FAKE_GIT_STATE", state)
++	fakeGitOnPath(t, `for a in "$@"; do
++  if [ "$a" = cat-file ]; then
++    sleep 60 &
++    echo $! > "$FAKE_GIT_STATE/child"
++    exit 0
++  fi
++done
++exec '`+real+`' "$@"
++`)
++	shortGitLongTimeout(t, time.Second)
++	origDelay := gitWaitDelay
++	gitWaitDelay = 30 * time.Second
++	t.Cleanup(func() { gitWaitDelay = origDelay })
++	err = returnsWithin(t, 10*time.Second, "materializeTree", func() error {
++		return materializeTree(repo, sha, t.TempDir(), nil)
++	})
++	b, rerr := os.ReadFile(filepath.Join(state, "child"))
++	if rerr != nil {
++		t.Fatal(rerr)
++	}
++	pid, rerr := strconv.Atoi(strings.TrimSpace(string(b)))
++	if rerr != nil {
++		t.Fatal(rerr)
++	}
++	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
++	if !errors.Is(err, errGitTimeout) {
++		t.Fatalf("want errGitTimeout, got %v", err)
++	}
++	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
++		if time.Now().After(deadline) {
++			t.Fatalf("cat-file's child %d still runs after the deadline", pid)
++		}
++	}
++}
