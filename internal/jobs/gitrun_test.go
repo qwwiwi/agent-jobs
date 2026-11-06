@@ -247,3 +247,37 @@ exit 1
 		}
 	}
 }
+
+// A held git (startGitHeld, #114) is not reaped before the caller is done with its streams: until
+// releaseStreams the group kill still reaches it after its exit, and releaseStreams lets the reaper go on.
+func TestGitHeldReapedOnlyAfterRelease(t *testing.T) {
+	kills := recordGroupKills(t)
+	fakeGitOnPath(t, "exit 0\n")
+	p, err := startGitHeld("", os.Environ(), nil, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// git exits at once, but stays unreaped: the zombie's PID still reserves the group.
+	for deadline := time.Now().Add(5 * time.Second); !processGone(t, p.cmd.Process.Pid); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the fake git did not exit")
+		}
+	}
+	select {
+	case err := <-p.done:
+		t.Fatalf("a held git was reaped before releaseStreams: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	p.signal()
+	if k := kills(); len(k) != 1 || k[0] != p.cmd.Process.Pid {
+		t.Fatalf("want one kill of group %d before the release, got %v", p.cmd.Process.Pid, k)
+	}
+	p.releaseStreams()
+	if err := returnsWithin(t, 10*time.Second, "git", func() error { return <-p.done }); err != nil {
+		t.Fatal(err)
+	}
+	p.kill()
+	if k := kills(); len(k) != 1 {
+		t.Fatalf("a reaped git's group was signalled: %v", k)
+	}
+}

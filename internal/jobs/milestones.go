@@ -52,9 +52,12 @@ var reTaskKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`)
 type MilestoneTaskInput struct {
 	Key       string    `json:"key" jsonschema:"task key, unique in the milestone: T1, T2, ..."`
 	Title     string    `json:"title,omitempty" jsonschema:"one line; required for a new task"`
-	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles"`
-	Covers    *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
-	Skills    *[]string `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
+	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles. Add an edge only when the tasks really conflict: they edit the same files or modules, share a money path, or one consumes the other's output. Tasks that only sit near each other in the plan wait for nothing and run in parallel. Every edge needs a reason in depends_why"`
+	// DependsWhy justifies each depends_on edge in one line (dependency key -> the files/modules the two
+	// tasks share, or the output consumed). An edge with no reason is dropped (#119).
+	DependsWhy *map[string]string `json:"depends_why,omitempty" jsonschema:"one line per depends_on edge, by dependency key: the files or modules the two tasks share, or the output one consumes from the other, e.g. {\"T2\": \"both edit internal/orders/place.go\"}. An edge without a reason is dropped and reported in depends_dropped. Requires depends_on"`
+	Covers     *[]string          `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
+	Skills     *[]string          `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
 	// Sources (G02) are planned like covers: nil keeps the stored list, empty clears it.
 	Sources *[]string `json:"sources,omitempty" jsonschema:"currently DISABLED (G02 deferred, owner decision 2026-10-26: the text-parsing guard could still be bypassed; it returns with OS-level isolation): a non-empty list is refused, an empty or absent one changes nothing. When enabled: https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
 }
@@ -67,7 +70,7 @@ type MilestoneCreate struct {
 	Branch      string               `json:"branch,omitempty" jsonschema:"optional integration branch: job_start on a task takes it as the default base"`
 	ChecklistID string               `json:"checklist_id,omitempty" jsonschema:"optional: the id of the repo's brief/CHECKLIST.md; task covers must then be its live rows"`
 	Order       int                  `json:"order,omitempty" jsonschema:"position among the repo's milestones, lowest first; default 0"`
-	MaxParallel int                  `json:"max_parallel,omitempty" jsonschema:"at most this many of the milestone's jobs run at once (1 = one after another); default no cap of its own"`
+	MaxParallel int                  `json:"max_parallel,omitempty" jsonschema:"at most this many of the milestone's jobs run at once (1 = one after another); leave it unset (the default) so the independent tasks fill every free job slot: the cap of the daemon (max_running) is the only limit"`
 	Tasks       []MilestoneTaskInput `json:"tasks" jsonschema:"the tasks, at least one"`
 }
 
@@ -108,7 +111,10 @@ type MilestoneTaskView struct {
 	Title     string   `json:"title"`
 	Status    string   `json:"status"`
 	DependsOn []string `json:"depends_on"`
-	Covers    []string `json:"covers"`
+	// DependsWhy is the reason of each depends_on edge, by dependency key (an edge stored before
+	// reasons existed has none).
+	DependsWhy map[string]string `json:"depends_why"`
+	Covers     []string          `json:"covers"`
 	// Skills are the task's planned skills edits ([] = none planned: its jobs get their defaults).
 	Skills    []string           `json:"skills"`
 	Jobs      []MilestoneJobView `json:"jobs"`
@@ -149,6 +155,9 @@ type MilestoneView struct {
 	ClosedAt    string              `json:"closed_at,omitempty"`
 	CloseNote   string              `json:"close_note,omitempty"`
 	Tasks       []MilestoneTaskView `json:"tasks,omitempty"`
+	// DependsDropped lists the depends_on edges the last milestone_create/milestone_set dropped for want
+	// of a reason, as "T3 -> T1" (T3 would have waited for T1); empty on every other read.
+	DependsDropped []string `json:"depends_dropped,omitempty"`
 	// Ready are the keys of the tasks a job can start on now.
 	Ready    []string           `json:"ready,omitempty"`
 	Progress *MilestoneProgress `json:"progress,omitempty"`
@@ -254,7 +263,10 @@ func (m *Manager) liveRows(repo, id string) ([]string, error) {
 // applyTasks merges the task inputs into tasks (upsert by key) and drops the keys in drop; it returns the
 // whole new task list and the changed tasks, or an error for an invalid key, title, dependency (unknown
 // key, itself, a cycle) or cover (not a live row when live is not nil).
-func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []string, live []string) (all, changed []store.MilestoneTask, err error) {
+//
+// A depends_on edge is kept only with a reason (depends_why, else the reason stored for the same edge);
+// the edges dropped for want of one come back as "T3 -> T1".
+func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []string, live []string) (all, changed []store.MilestoneTask, dropped []string, err error) {
 	all = slices.Clone(tasks)
 	idx := map[string]int{}
 	for i, t := range all {
@@ -265,20 +277,20 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 	for _, ti := range in {
 		key := strings.TrimSpace(ti.Key)
 		if !reTaskKey.MatchString(key) {
-			return nil, nil, fmt.Errorf("task key %q must be 1-32 letters, digits, '.', '_' or '-' (T1, T2, ...)", Printable(key, 40))
+			return nil, nil, nil, fmt.Errorf("task key %q must be 1-32 letters, digits, '.', '_' or '-' (T1, T2, ...)", Printable(key, 40))
 		}
 		if seen[key] {
-			return nil, nil, fmt.Errorf("task %s is given twice", key)
+			return nil, nil, nil, fmt.Errorf("task %s is given twice", key)
 		}
 		seen[key] = true
 		title, err := oneLine("task "+key+" title", ti.Title, MaxMilestoneTitleRunes, false)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		i, ok := idx[key]
 		if !ok {
 			if title == "" {
-				return nil, nil, fmt.Errorf("task %s: title is required for a new task", key)
+				return nil, nil, nil, fmt.Errorf("task %s: title is required for a new task", key)
 			}
 			all = append(all, store.MilestoneTask{Key: key})
 			i = len(all) - 1
@@ -291,14 +303,22 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		t.Dropped = false
 		if ti.Sources != nil {
 			if err := refuseSources(*ti.Sources); err != nil {
-				return nil, nil, fmt.Errorf("task %s: %w", key, err)
+				return nil, nil, nil, fmt.Errorf("task %s: %w", key, err)
 			}
 			if t.Sources, err = ValidateSources(*ti.Sources); err != nil {
-				return nil, nil, fmt.Errorf("task %s: %w", key, err)
+				return nil, nil, nil, fmt.Errorf("task %s: %w", key, err)
 			}
 		}
+		if ti.DependsWhy != nil && ti.DependsOn == nil {
+			return nil, nil, nil, fmt.Errorf("task %s: depends_why needs depends_on (it justifies those edges)", key)
+		}
 		if ti.DependsOn != nil {
-			t.DependsOn = trimList(*ti.DependsOn)
+			kept, why, lost, err := justifyEdges(*t, trimList(*ti.DependsOn), ti.DependsWhy)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			t.DependsOn, t.DependsWhy = kept, why
+			dropped = append(dropped, lost...)
 		}
 		if ti.Covers != nil {
 			t.Covers = trimList(*ti.Covers)
@@ -313,7 +333,7 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		key = strings.TrimSpace(key)
 		i, ok := idx[key]
 		if !ok {
-			return nil, nil, fmt.Errorf("drop: task %q is not in the milestone", Printable(key, 40))
+			return nil, nil, nil, fmt.Errorf("drop: task %q is not in the milestone", Printable(key, 40))
 		}
 		if !all[i].Dropped {
 			all[i].Dropped = true
@@ -321,10 +341,10 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 		}
 	}
 	if len(all) == 0 {
-		return nil, nil, errors.New("a milestone needs at least one task")
+		return nil, nil, nil, errors.New("a milestone needs at least one task")
 	}
 	if len(all) > MaxMilestoneTasks {
-		return nil, nil, fmt.Errorf("a milestone has at most %d tasks", MaxMilestoneTasks)
+		return nil, nil, nil, fmt.Errorf("a milestone has at most %d tasks", MaxMilestoneTasks)
 	}
 	for _, t := range all {
 		if !touched[t.Key] {
@@ -337,18 +357,55 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
 			rows = nil
 		}
 		if err := checkTask(t, idx, rows); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if cyc := findCycle(all); cyc != "" {
-		return nil, nil, fmt.Errorf("depends_on has a cycle: %s", cyc)
+		return nil, nil, nil, fmt.Errorf("depends_on has a cycle: %s", cyc)
 	}
 	for _, t := range all {
 		if touched[t.Key] {
 			changed = append(changed, t)
 		}
 	}
-	return all, changed, nil
+	return all, changed, dropped, nil
+}
+
+// MaxDependsWhyRunes bounds the reason of one depends_on edge.
+const MaxDependsWhyRunes = 200
+
+// justifyEdges keeps the edges of task t (deps, already trimmed) that carry a reason: the one given in
+// why, else the one stored for the same edge. It returns the kept edges, their reasons and the dropped
+// edges as "T3 -> T1". A reason for a key that is not in deps is refused: it is a typo or a stale edge.
+func justifyEdges(t store.MilestoneTask, deps []string, why *map[string]string) (kept []string, reasons map[string]string, dropped []string, err error) {
+	given := map[string]string{}
+	if why != nil {
+		for k, v := range *why {
+			k = strings.TrimSpace(k)
+			if !slices.Contains(deps, k) {
+				return nil, nil, nil, fmt.Errorf("task %s: depends_why names %q, which is not in its depends_on", t.Key, Printable(k, 40))
+			}
+			r, err := oneLine("task "+t.Key+" depends_why "+k, v, MaxDependsWhyRunes, false)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			given[k] = r
+		}
+	}
+	kept, reasons = []string{}, map[string]string{}
+	for _, d := range deps {
+		r := given[d]
+		if r == "" {
+			r = t.DependsWhy[d]
+		}
+		if r == "" {
+			dropped = append(dropped, t.Key+" -> "+d)
+			continue
+		}
+		kept = append(kept, d)
+		reasons[d] = r
+	}
+	return kept, reasons, dropped, nil
 }
 
 // trimEdits trims skills edits and drops blank ones, keeping order and repeats: edits apply in order
@@ -600,7 +657,7 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
 			live = []string{}
 		}
 	}
-	_, tasks, err := applyTasks(nil, in.Tasks, nil, live)
+	_, tasks, droppedEdges, err := applyTasks(nil, in.Tasks, nil, live)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +672,7 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
 	if err != nil {
 		return nil, err
 	}
-	return m.MilestoneTree(ctx, mid)
+	return m.treeWithDropped(ctx, mid, droppedEdges)
 }
 
 // SetMilestone edits a milestone in place (milestone_set): its fields, its tasks (upsert by key, drop),
@@ -678,12 +735,13 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 		}
 	}
 	now := m.Now()
+	var droppedEdges []string
 	err = m.Store.UpdateMilestone(ctx, in.ID, now, func(ms *store.Milestone, tasks []store.MilestoneTask,
 		jobs []*store.Job) (*store.Milestone, []store.MilestoneTask, error) {
 		all, changed := tasks, []store.MilestoneTask(nil)
 		if len(in.Tasks) > 0 || len(in.Drop) > 0 {
 			var err error
-			if all, changed, err = applyTasks(tasks, in.Tasks, in.Drop, live); err != nil {
+			if all, changed, droppedEdges, err = applyTasks(tasks, in.Tasks, in.Drop, live); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -737,7 +795,17 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 	if err != nil {
 		return nil, err
 	}
-	return m.MilestoneTree(ctx, in.ID)
+	return m.treeWithDropped(ctx, in.ID, droppedEdges)
+}
+
+// treeWithDropped is MilestoneTree with the edges the write dropped for want of a reason attached.
+func (m *Manager) treeWithDropped(ctx context.Context, id int64, dropped []string) (*MilestoneView, error) {
+	v, err := m.MilestoneTree(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	v.DependsDropped = dropped
+	return v, nil
 }
 
 // MilestoneRepoID is the opaque id of a milestone's repository (its stored main worktree): the first 12
@@ -831,7 +899,7 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
 	v.Tasks, v.Ready = []MilestoneTaskView{}, []string{}
 	for _, t := range tasks {
 		tv := MilestoneTaskView{Key: t.Key, Title: t.Title, Status: st[t.Key], DependsOn: nonNilList(t.DependsOn),
-			Covers: nonNilList(t.Covers), Skills: nonNilList(t.Skills), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
+			DependsWhy: nonNilMap(t.DependsWhy), Covers: nonNilList(t.Covers), Skills: nonNilList(t.Skills), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
 			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt), Sources: nonNilList(t.Sources)}
 		if tv.Jobs == nil {
 			tv.Jobs = []MilestoneJobView{}
@@ -892,6 +960,13 @@ func nonNilList(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+func nonNilMap(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
 }
 
 // acceptanceMet counts the covered IDs the latest judge verdict of the milestone's checklist found met;

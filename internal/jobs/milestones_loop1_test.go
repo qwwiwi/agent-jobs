@@ -41,7 +41,7 @@ func TestMilestoneLaunchRechecks(t *testing.T) {
 		if _, err := m.Stop(j5.ID, ""); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}},
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1"), DependsWhy: why("T1")}},
 			Drop: []string{"T3", "T4"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -118,7 +118,7 @@ func TestMilestonePriorTakesReworked(t *testing.T) {
 	t.Run("[R04] a reworked dependency's report is the prior result", func(t *testing.T) {
 		m := newManager(t)
 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -220,7 +220,7 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
 	m := newManager(t)
 	sessionsHome(t, false) // fresh session: the fallback prompt carries the prior results
 	v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +303,7 @@ func TestPriorCapTinyLimits(t *testing.T) {
 	}
 	m := newManager(t)
 	v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 	if err != nil {
 		t.Fatal(err)
 	}

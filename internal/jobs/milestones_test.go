@@ -15,6 +15,15 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
+// why gives every dependency in keys the same one-line reason (milestone edges need one, #119).
+func why(keys ...string) *map[string]string {
+	m := map[string]string{}
+	for _, k := range keys {
+		m[k] = "shares files"
+	}
+	return &m
+}
+
 func deps(keys ...string) *[]string { return &keys }
 
 func taskOf(t *testing.T, v *MilestoneView, key string) MilestoneTaskView {
@@ -54,7 +63,7 @@ func TestMilestoneCreateSetGetList(t *testing.T) {
 		m := newManager(t)
 		ctx := context.Background()
 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "Stage one", Goal: "ship it", Order: 2, Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "store"}, {Key: "T2", Title: "tools", DependsOn: deps("T1")}, {Key: "T3", Title: "docs"},
+			{Key: "T1", Title: "store"}, {Key: "T2", Title: "tools", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "docs"},
 		}})
 		if err != nil {
 			t.Fatal(err)
@@ -65,7 +74,7 @@ func TestMilestoneCreateSetGetList(t *testing.T) {
 			t.Fatalf("created: %+v", v)
 		}
 		v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "Stage 1", Tasks: []MilestoneTaskInput{
-			{Key: "T4", Title: "examples", DependsOn: deps("T3")}, {Key: "T1", Covers: deps("R01")},
+			{Key: "T4", Title: "examples", DependsOn: deps("T3"), DependsWhy: why("T3")}, {Key: "T1", Covers: deps("R01")},
 		}, Drop: []string{"T3"}})
 		if err != nil {
 			t.Fatal(err)
@@ -115,9 +124,9 @@ func TestMilestoneRefusesCyclesAndUnknownKeys(t *testing.T) {
 			tasks []MilestoneTaskInput
 			want  string
 		}{
-			"cycle":     {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T2")}, {Key: "T2", Title: "b", DependsOn: deps("T1")}}, "cycle"},
-			"unknown":   {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T9")}}, "not a task"},
-			"self":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T1")}}, "itself"},
+			"cycle":     {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T2"), DependsWhy: why("T2")}, {Key: "T2", Title: "b", DependsOn: deps("T1"), DependsWhy: why("T1")}}, "cycle"},
+			"unknown":   {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T9"), DependsWhy: why("T9")}}, "not a task"},
+			"self":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T1"), DependsWhy: why("T1")}}, "itself"},
 			"duplicate": {[]MilestoneTaskInput{{Key: "T1", Title: "a"}, {Key: "T1", Title: "b"}}, "twice"},
 			"bad key":   {[]MilestoneTaskInput{{Key: "T 1", Title: "a"}}, "task key"},
 			"no title":  {[]MilestoneTaskInput{{Key: "T1"}}, "title is required"},
@@ -131,11 +140,11 @@ func TestMilestoneRefusesCyclesAndUnknownKeys(t *testing.T) {
 			t.Error("milestone without a title accepted")
 		}
 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "a"}, {Key: "T2", Title: "b", DependsOn: deps("T1")}, {Key: "T3", Title: "c", DependsOn: deps("T2")}}})
+			{Key: "T1", Title: "a"}, {Key: "T2", Title: "b", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "c", DependsOn: deps("T2"), DependsWhy: why("T2")}}})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "renamed", Tasks: []MilestoneTaskInput{{Key: "T1", DependsOn: deps("T3")}}}); err == nil ||
+		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "renamed", Tasks: []MilestoneTaskInput{{Key: "T1", DependsOn: deps("T3"), DependsWhy: why("T3")}}}); err == nil ||
 			!strings.Contains(err.Error(), "T1 -> T3 -> T2 -> T1") {
 			t.Fatalf("cycle through set: %v", err)
 		}
@@ -164,7 +173,7 @@ func TestMilestoneTaskLifecycle(t *testing.T) {
 		past := time.Now().Add(-time.Hour)
 		m.Now = func() time.Time { return past }
 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}, {Key: "T3", Title: "side", DependsOn: deps("T1")},
+			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "side", DependsOn: deps("T1"), DependsWhy: why("T1")},
 		}})
 		if err != nil {
 			t.Fatal(err)
@@ -301,7 +310,7 @@ func TestMilestonePriorResults(t *testing.T) {
 		integ := gitT(t, repo, "rev-parse", "HEAD")
 		gitT(t, repo, "checkout", "-q", "main")
 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "chain", Repo: repo, Branch: "integ",
-			Tasks: []MilestoneTaskInput{{Key: "T1", Title: "first step"}, {Key: "T2", Title: "second step", DependsOn: deps("T1")}}})
+			Tasks: []MilestoneTaskInput{{Key: "T1", Title: "first step"}, {Key: "T2", Title: "second step", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 		if err != nil {
 			t.Fatal(err)
 		}

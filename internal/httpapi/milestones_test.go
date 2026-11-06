@@ -21,6 +21,15 @@ import (
 
 // mcpCall calls an orchestrator tool of m over an in-memory MCP session and returns its JSON result,
 // decoded as generic JSON.
+// why gives every dependency in keys the same one-line reason (milestone edges need one, #119).
+func why(keys ...string) *map[string]string {
+	m := map[string]string{}
+	for _, k := range keys {
+		m[k] = "shares files"
+	}
+	return &m
+}
+
 func mcpCall(t *testing.T, m *jobs.Manager, name string, args map[string]any) any {
 	t.Helper()
 	s, err := mcp.NewServer(mcp.RoleOrchestrator, mcp.Deps{Manager: m})
@@ -77,7 +86,7 @@ func TestMilestonesSameJSONAsMCP(t *testing.T) {
 		}
 		ctx := context.Background()
 		v, err := f.m.CreateMilestone(ctx, jobs.MilestoneCreate{Title: "Stage", Repo: repo, Branch: "integ", Tasks: []jobs.MilestoneTaskInput{
-			{Key: "T1", Title: "one"}, {Key: "T2", Title: "two", DependsOn: &[]string{"T1"}}}})
+			{Key: "T1", Title: "one"}, {Key: "T2", Title: "two", DependsOn: &[]string{"T1"}, DependsWhy: why("T1")}}})
 		if err != nil {
 			t.Fatal(err)
 		}

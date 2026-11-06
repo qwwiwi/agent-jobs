@@ -164,6 +164,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            cost (MISMATCH over 10%), totals per day, per model, 30 days,
                                            headed by the key's usage/limit; --reconcile fills OpenRouter's
                                            record of runs that lack it
+  ui-check   <base-url> <path>... [--out dir] [--schemes S] [--playwright path] [--timeout ms] [--dwell ms] [--limit n]
+                                           the orchestrator's browser check: runs the copy of
+                                           scripts/ui-check.mjs embedded in this binary from a private
+                                           temp dir, never a job dir copy, never Playwright from the
+                                           current directory; exit 0 pass, 1 fail, 2 not run
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -257,6 +262,8 @@ func main() {
 		err = cmdHeartbeat(args)
 	case "openrouter":
 		err = cmdOpenRouter(args, os.Stdout)
+	case "ui-check":
+		os.Exit(runUICheck(args, os.Stdout, os.Stderr))
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
