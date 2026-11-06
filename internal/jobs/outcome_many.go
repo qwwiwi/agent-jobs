@@ -11,8 +11,10 @@ const MaxOutcomeBatch = 500
 
 // OutcomeItem is one job's outcome in a batch.
 type OutcomeItem struct {
-	ID      string `json:"id"`
-	Outcome string `json:"outcome"`
+	// ID and Outcome are omitempty so the MCP schema does not require them: a missing one is refused
+	// for that item alone (SetOutcome), not for the whole batch.
+	ID      string `json:"id,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
 	Note    string `json:"note,omitempty"`
 }
 
@@ -41,16 +43,17 @@ func (m *Manager) SetOutcomes(items []OutcomeItem) ([]OutcomeResult, error) {
 	for i, it := range items {
 		id := strings.TrimSpace(it.ID)
 		res[i].ID = id
-		if err := m.SetOutcome(id, it.Outcome, it.Note); err != nil {
-			res[i].Error = err.Error()
-			continue
-		}
-		j, err := m.Store.Get(id)
+		outcome, note, err := m.setOutcome(id, it.Outcome, it.Note)
 		if err != nil {
 			res[i].Error = err.Error()
 			continue
 		}
-		res[i].OK, res[i].Outcome, res[i].OutcomeNote = true, j.Outcome, j.OutcomeNote
+		if m.afterOutcome != nil {
+			m.afterOutcome(id)
+		}
+		// The write is acknowledged with what it committed: a re-read could show another request's
+		// overwrite, or fail after the outcome was already recorded.
+		res[i].OK, res[i].Outcome, res[i].OutcomeNote = true, outcome, note
 	}
 	return res, nil
 }

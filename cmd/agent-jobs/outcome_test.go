@@ -87,3 +87,28 @@ func TestCmdOutcomeBatch(t *testing.T) {
 		t.Fatal("--input with positionals accepted")
 	}
 }
+
+// Incomplete items (no outcome, no id) fail on their own and the valid ones are recorded, as in MCP.
+func TestCmdOutcomeIncompleteItems(t *testing.T) {
+	m := outcomeFixture(t)
+	in := `[{"id":"a1","outcome":"accepted"},{"id":"a2"},{"outcome":"accepted"},{"note":"n"}]`
+	c := captureStdoutErr(t, func() error {
+		return cmdOutcome([]string{"--agent", "test", "--input", "-", "--json"}, strings.NewReader(in))
+	})
+	if c.err == nil || !strings.Contains(c.err.Error(), "3 of 4 outcomes not recorded") {
+		t.Fatalf("exit: %v", c.err)
+	}
+	var out struct {
+		Recorded int                  `json:"recorded"`
+		Failed   int                  `json:"failed"`
+		Results  []jobs.OutcomeResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(c.stdout), &out); err != nil || out.Recorded != 1 || out.Failed != 3 || len(out.Results) != 4 {
+		t.Fatalf("json: %v %+v", err, out)
+	}
+	for id, want := range map[string]string{"a1": "accepted", "a2": ""} {
+		if j, _ := m.Store.Get(id); j.Outcome != want {
+			t.Errorf("%s: outcome %q, want %q", id, j.Outcome, want)
+		}
+	}
+}

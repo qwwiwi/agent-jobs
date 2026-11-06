@@ -101,3 +101,52 @@ func TestSetOutcomesBatchBounds(t *testing.T) {
 		t.Fatalf("oversized batch: %v", err)
 	}
 }
+
+// An item that was committed is acknowledged with the values it wrote, whatever happens to the row
+// afterwards: a concurrent overwrite, a cleared outcome or a failing read must neither substitute another
+// outcome, nor empty it, nor turn a recorded item into a failure.
+func TestSetOutcomesAcknowledgesCommittedValues(t *testing.T) {
+	for name, after := range map[string]func(*testing.T, *Manager, string){
+		"overwritten": func(t *testing.T, m *Manager, id string) {
+			if err := m.Store.SetOutcome(id, m.Agent, OutcomeDiscarded, "other request", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"cleared": func(t *testing.T, m *Manager, id string) {
+			if err := m.Store.SetOutcome(id, m.Agent, "", "", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"read fails": func(t *testing.T, m *Manager, id string) {
+			if err := m.Store.Close(); err != nil { // every later read of the store fails
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := newManager(t)
+			insertOutcomeJob(t, m, "j1", m.Agent, store.StatusSucceeded)
+			m.afterOutcome = func(id string) { after(t, m, id) }
+			res, err := m.SetOutcomes([]OutcomeItem{{ID: " j1 ", Outcome: " " + OutcomeAccepted + " ", Note: " shipped "}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r := res[0]; !r.OK || r.Error != "" || r.ID != "j1" || r.Outcome != OutcomeAccepted || r.OutcomeNote != "shipped" {
+				t.Fatalf("result %+v, want ok with accepted/shipped", r)
+			}
+		})
+	}
+}
+
+// An incomplete item (no id, no outcome) fails on its own and never stops the others.
+func TestSetOutcomesIncompleteItems(t *testing.T) {
+	m := newManager(t)
+	insertOutcomeJob(t, m, "ok1", m.Agent, store.StatusSucceeded)
+	res, err := m.SetOutcomes([]OutcomeItem{{ID: "ok1", Outcome: OutcomeAccepted}, {ID: "ok1"}, {Outcome: OutcomeAccepted}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res[0].OK || res[1].OK || !strings.Contains(res[1].Error, "outcome") || res[2].OK || !strings.Contains(res[2].Error, "id is required") {
+		t.Fatalf("results: %+v", res)
+	}
+}

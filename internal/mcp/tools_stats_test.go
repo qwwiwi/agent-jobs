@@ -135,3 +135,36 @@ func TestJobOutcomeManyTool(t *testing.T) {
 		t.Fatalf("empty items: %q", msg)
 	}
 }
+
+// An item without id or outcome is not a malformed request: the schema lets it through and it fails on
+// its own, so the valid items around it are still recorded (the CLI behaves the same way).
+func TestJobOutcomeManyIncompleteItems(t *testing.T) {
+	m := newManager(t)
+	done := time.Now()
+	insertRow(t, m, "ok1", store.StatusSucceeded, &done, 1)
+	insertRow(t, m, "ok2", store.StatusFailed, &done, 1)
+	cs := connect(t, mustServer(t, m))
+	var out JobOutcomeManyOutput
+	call(t, cs, "job_outcome_many", map[string]any{"items": []map[string]any{
+		{"id": "ok1", "outcome": "accepted"},
+		{"id": "ok2"},
+		{"outcome": "accepted"},
+		{"note": "only a note"},
+	}}, &out)
+	if out.Recorded != 1 || out.Failed != 3 || len(out.Results) != 4 || !out.Results[0].OK {
+		t.Fatalf("counts: %+v", out)
+	}
+	if r := out.Results[1]; r.OK || r.ID != "ok2" || !strings.Contains(r.Error, "must be one of") {
+		t.Errorf("missing outcome: %+v", r)
+	}
+	for _, i := range []int{2, 3} {
+		if r := out.Results[i]; r.OK || !strings.Contains(r.Error, "id is required") {
+			t.Errorf("missing id, item %d: %+v", i, r)
+		}
+	}
+	for id, want := range map[string]string{"ok1": "accepted", "ok2": ""} {
+		if j, err := m.Store.Get(id); err != nil || j.Outcome != want {
+			t.Errorf("%s: %+v %v, want outcome %q", id, j, err, want)
+		}
+	}
+}
