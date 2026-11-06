@@ -241,9 +241,13 @@ func ValidateLimits(turns int, budget float64, timeout int) (int, float64, int, 
 	return turns, budget, timeout, nil
 }
 
+// idRandom is the random source of the id's 16-bit suffix: crypto/rand, swapped only by tests that
+// need to force a collision deterministically.
+var idRandom = rand.Read
+
 func newID(now time.Time) string {
 	b := make([]byte, 2)
-	_, _ = rand.Read(b)
+	_, _ = idRandom(b)
 	return now.Format("060102-150405") + "-" + hex.EncodeToString(b)
 }
 
@@ -349,54 +353,91 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	cleanup, err := m.copySourceFiles(j)
-	if err != nil {
-		return nil, err
-	}
 	inserted := false
+	cleanup := func() {}
 	defer func() {
 		if !inserted {
 			cleanup()
 		}
 	}()
+	// The id's random part is 16 bits (newID), so two starts in the same second can draw the same
+	// one: the insert's UNIQUE constraint is the atomic check, and a retry redraws only the random
+	// part, at the job's own creation time, leaving the id format alone (#129). The source snapshots
+	// are bound to each candidate id: a redraw removes only the folder this attempt created (never a
+	// folder that was already there) and copies again under the next id, so an inserted job always
+	// finds its own sources under its own id.
+	for try := 0; ; try++ {
+		c, cerr := m.copySourceFiles(j)
+		if cerr != nil {
+			// A candidate whose folder already exists on disk is as taken as its row: redraw, and
+			// leave that folder alone (this attempt created nothing under it).
+			if errors.Is(cerr, errJobDirExists) && try < idRedraws {
+				j.ID = newID(j.CreatedAt)
+				continue
+			}
+			return nil, cerr
+		}
+		cleanup = c
+		ok, ierr := m.insertQueued(j)
+		if errors.Is(ierr, store.ErrJobIDExists) && try < idRedraws {
+			cleanup() // the folder of this attempt only; the next candidate owns the cleanup from here
+			cleanup = func() {}
+			j.ID = newID(j.CreatedAt)
+			continue
+		}
+		if ierr != nil {
+			return nil, ierr
+		}
+		inserted = ok
+		if ok {
+			m.logSize(j)
+		}
+		return j, nil
+	}
+}
+
+// idRedraws is how many times an enqueue redraws the id's random part after the insert hit an
+// existing id: with 16 bits of randomness, a handful of redraws clears any realistic collision
+// (the frozen-clock test draws 2000 ids inside one second and needs a few); the bound keeps a
+// full second from spinning forever.
+const idRedraws = 64
+
+// insertQueued inserts the queued row through the path its runner selects: the openrouter budget
+// cap, the codex daily cap, else plain. It reports whether the row was inserted; a cap that
+// refuses returns its error, so a false ok always comes with one.
+func (m *Manager) insertQueued(j *store.Job) (bool, error) {
 	if IsOpenRouterJob(j) {
 		capUSD := m.Config().Providers.OpenRouter.DailyCap()
 		since := j.CreatedAt.Add(-OpenRouterCapWindow)
 		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		if !ok {
 			spent, _ := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, since)
-			return nil, fmt.Errorf("openrouter daily cap reached: the openrouter jobs of agent %s in the last 24 hours spent or "+
+			return false, fmt.Errorf("openrouter daily cap reached: the openrouter jobs of agent %s in the last 24 hours spent or "+
 				"may still spend $%.2f (queued, running and stopped jobs count at their whole budget), this job's budget "+
 				"$%.2f would pass the cap $%.2f (providers.openrouter.daily_cap_usd); give a smaller max_budget_usd or wait",
 				m.Agent, spent, j.MaxBudgetUSD, capUSD)
 		}
-		inserted = true
-		m.logSize(j)
-		return j, nil
+		return true, nil
 	}
 	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
 		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		if !ok {
 			n, _ := m.Store.CountCodexSince(m.Agent, j.CreatedAt.Add(-CodexCapWindow))
-			return nil, fmt.Errorf("codex daily cap reached: %d codex jobs of agent %s in the last 24 hours, limit %d "+
+			return false, fmt.Errorf("codex daily cap reached: %d codex jobs of agent %s in the last 24 hours, limit %d "+
 				"(config codex_jobs_per_day, per agent; 0 turns it off); start a claude job or wait", n, m.Agent, limit)
 		}
-		inserted = true
-		m.logSize(j)
-		return j, nil
+		return true, nil
 	}
 	if err := m.Store.Insert(j); err != nil {
-		return nil, err
+		return false, err
 	}
-	inserted = true
-	m.logSize(j)
-	return j, nil
+	return true, nil
 }
 
 // CodexCapWindow is the window of the codex daily cap.
