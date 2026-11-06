@@ -1,0 +1,222 @@
+diff --git a/gate_script_test.go b/gate_script_test.go
+new file mode 100644
+index 0000000..9498691
+--- /dev/null
++++ b/gate_script_test.go
+@@ -0,0 +1,128 @@
++package agentjobs
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// runGate runs scripts/gate.sh with args and returns the combined output and the script's own exit code.
++func runGate(t *testing.T, env []string, args ...string) (string, int) {
++	t.Helper()
++	cmd := exec.Command("bash", append([]string{"scripts/gate.sh"}, args...)...)
++	cmd.Env = append(os.Environ(), env...)
++	out, err := cmd.CombinedOutput()
++	code := 0
++	if err != nil {
++		ee, ok := err.(*exec.ExitError)
++		if !ok {
++			t.Fatal(err)
++		}
++		code = ee.ExitCode()
++	}
++	return string(out), code
++}
++
++func gateLock(t *testing.T) []string {
++	t.Helper()
++	return []string{"GATE_LOCK=" + filepath.Join(t.TempDir(), "gate.lock")}
++}
++
++func TestGatePrintsExitMarker(t *testing.T) {
++	env := gateLock(t)
++	out, code := runGate(t, env, "--", "bash", "-c", "exit 7")
++	if code != 7 || !strings.Contains(out, "exit=7") {
++		t.Fatalf("code=%d out=%q, want 7 and exit=7", code, out)
++	}
++	out, code = runGate(t, env, "--", "true")
++	if code != 0 || !strings.Contains(out, "exit=0") {
++		t.Fatalf("code=%d out=%q, want 0 and exit=0", code, out)
++	}
++}
++
++func TestGateRefusesWrongHead(t *testing.T) {
++	env := gateLock(t)
++	out, code := runGate(t, env, "--head", "deadbeefdeadbeef", "--", "true")
++	if code != 126 || !strings.Contains(out, "exit=126") || strings.Contains(out, "lock acquired") {
++		t.Fatalf("code=%d out=%q, want refusal with exit=126", code, out)
++	}
++	head, err := exec.Command("git", "rev-parse", "HEAD").Output()
++	if err != nil {
++		t.Skip("not a git checkout")
++	}
++	out, code = runGate(t, env, "--head", strings.TrimSpace(string(head))[:12], "--", "true")
++	if code != 0 {
++		t.Fatalf("matching HEAD refused: code=%d out=%q", code, out)
++	}
++}
++
++func TestGateDropsTelegramEnv(t *testing.T) {
++	env := append(gateLock(t), "TELEGRAM_BOT_TOKEN=secret", "TELEGRAM_X=1", "KEEP_ME=ok")
++	out, code := runGate(t, env, "--", "bash", "-c", `echo "tg=[${TELEGRAM_BOT_TOKEN-}${TELEGRAM_X-}] keep=$KEEP_ME"`)
++	if code != 0 || !strings.Contains(out, "tg=[] keep=ok") {
++		t.Fatalf("code=%d out=%q, want TELEGRAM_* dropped and KEEP_ME kept", code, out)
++	}
++}
++
++func TestGateTimeoutKillsProcessGroup(t *testing.T) {
++	env := gateLock(t)
++	pidFile := filepath.Join(t.TempDir(), "child.pid")
++	// The background sleep is a grandchild: only a group kill reaches it.
++	script := "sleep 300 & echo $! > " + pidFile + "; wait"
++	start := time.Now()
++	out, code := runGate(t, env, "--timeout", "1", "--", "bash", "-c", script)
++	if code != 124 || !strings.Contains(out, "exit=124") {
++		t.Fatalf("code=%d out=%q, want 124", code, out)
++	}
++	if time.Since(start) > 30*time.Second {
++		t.Fatalf("timeout took %v", time.Since(start))
++	}
++	b, err := os.ReadFile(pidFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
++	time.Sleep(300 * time.Millisecond)
++	if syscall.Kill(pid, 0) == nil {
++		// A zombie still answers signal 0; only a live process is a failure.
++		st, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
++		if len(st) > 0 && !strings.Contains(string(st), ") Z") {
++			_ = syscall.Kill(pid, syscall.SIGKILL)
++			t.Fatalf("grandchild %d survived the timeout", pid)
++		}
++	}
++}
++
++func TestGateSerializes(t *testing.T) {
++	env := gateLock(t)
++	first := exec.Command("bash", "scripts/gate.sh", "--", "sleep", "3")
++	first.Env = append(os.Environ(), env...)
++	if err := first.Start(); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(700 * time.Millisecond)
++	// The second gate cannot take the lock within 1s while the first holds it.
++	out, code := runGate(t, env, "--wait", "1", "--", "true")
++	if code != 125 || !strings.Contains(out, "exit=125") || !strings.Contains(out, "busy") {
++		t.Fatalf("code=%d out=%q, want busy lock exit=125", code, out)
++	}
++	_ = first.Wait()
++	if out, code = runGate(t, env, "--", "true"); code != 0 {
++		t.Fatalf("code=%d out=%q after release", code, out)
++	}
++}
++
++func TestGateUsageErrors(t *testing.T) {
++	env := gateLock(t)
++	if out, code := runGate(t, env); code != 125 || !strings.Contains(out, "exit=125") {
++		t.Fatalf("no command: code=%d out=%q", code, out)
++	}
++	if out, code := runGate(t, env, "--timeout", "abc", "--", "true"); code != 125 || !strings.Contains(out, "exit=125") {
++		t.Fatalf("bad timeout: code=%d out=%q", code, out)
++	}
++}
+diff --git a/scripts/gate.sh b/scripts/gate.sh
+new file mode 100755
+index 0000000..fe4d9de
+--- /dev/null
++++ b/scripts/gate.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++# Serialized gate runner (#134): one heavy gate at a time per box.
++#   gate.sh [--head <sha>] [--timeout <secs>] [--lock <file>] [--wait <secs>] -- <command> [args...]
++# - takes an exclusive flock (GATE_LOCK, default $TMPDIR/agent-jobs-gate.lock), so gates queue instead of OOMing the host;
++# - --head: refuses to run when `git rev-parse HEAD` does not start with <sha> (gate on the wrong HEAD);
++# - runs the command in its own process group and kills the whole group on timeout (no orphan suites);
++# - drops TELEGRAM_* from the command's environment;
++# - always prints a final `exit=<code>` line (124 timeout, 125 usage/lock, 126 wrong HEAD).
++set -uo pipefail
++
++head_want=""
++timeout_s=0
++wait_s=3600
++lock="${GATE_LOCK:-${TMPDIR:-/tmp}/agent-jobs-gate.lock}"
++
++finish() { echo "exit=$1"; exit "$1"; }
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --head) head_want="${2:-}"; shift 2 || finish 125 ;;
++    --timeout) timeout_s="${2:-}"; shift 2 || finish 125 ;;
++    --lock) lock="${2:-}"; shift 2 || finish 125 ;;
++    --wait) wait_s="${2:-}"; shift 2 || finish 125 ;;
++    --) shift; break ;;
++    *) echo "gate: unknown argument: $1" >&2; finish 125 ;;
++  esac
++done
++[ $# -gt 0 ] || { echo "gate: no command after --" >&2; finish 125; }
++case "$timeout_s$wait_s" in *[!0-9]*) echo "gate: --timeout and --wait must be whole seconds" >&2; finish 125 ;; esac
++
++if [ -n "$head_want" ]; then
++  head_now="$(git rev-parse HEAD 2>/dev/null || true)"
++  case "$head_now" in
++    "$head_want"*) ;;
++    *) echo "gate: HEAD is '${head_now:-unknown}', expected '$head_want'" >&2; finish 126 ;;
++  esac
++fi
++
++exec 9>"$lock" || { echo "gate: cannot open lock $lock" >&2; finish 125; }
++if ! flock -w "$wait_s" 9; then
++  echo "gate: lock $lock busy for ${wait_s}s" >&2
++  finish 125
++fi
++echo "gate: lock acquired, running: $*"
++
++# Own session = own process group, so one kill reaches the whole tree.
++unset_args=()
++while IFS= read -r v; do unset_args+=(-u "$v"); done < <(compgen -e | grep '^TELEGRAM_' || true)
++env ${unset_args[@]+"${unset_args[@]}"} \
++  setsid --wait "$@" 9>&- &
++pid=$!
++
++timed_out_flag="$(mktemp)"
++rm -f "$timed_out_flag"
++watcher=""
++if [ "$timeout_s" -gt 0 ]; then
++  (
++    exec >/dev/null 2>&1 # a lingering sleep must not hold the caller's output pipe open
++    sleep "$timeout_s"
++    : > "$timed_out_flag"
++    # setsid child leads its own group; pid is the setsid process (same pid after exec).
++    kill -TERM -- "-$pid" 2>/dev/null || true
++    sleep 5
++    kill -KILL -- "-$pid" 2>/dev/null || true
++  ) 9>&- &
++  watcher=$!
++fi
++
++wait "$pid"
++code=$?
++if [ -n "$watcher" ]; then
++  kill "$watcher" 2>/dev/null || true
++  wait "$watcher" 2>/dev/null || true
++fi
++# Leftover members of the group (a suite that outlived its parent) die with it.
++kill -KILL -- "-$pid" 2>/dev/null || true
++if [ -e "$timed_out_flag" ]; then
++  rm -f "$timed_out_flag"
++  echo "gate: timeout after ${timeout_s}s, process group killed" >&2
++  code=124
++fi
++finish "$code"

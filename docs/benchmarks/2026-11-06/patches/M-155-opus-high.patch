@@ -1,0 +1,525 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..605e08d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Merge hook: merges through the API get the same decision as `gh pr merge` (#107): `gh api` `PUT` (`-X` / `--method`, any flag order) to `repos/OWNER/REPO/pulls/N/merge`, pinned by its `sha` field, and `gh api graphql` `mergePullRequest` / `enqueuePullRequest`, pinned by the `expectedHeadOid` among that field's arguments; `enablePullRequestAutoMerge` is refused like `--auto`; a `repositories/ID/…/merge` endpoint only warns. An API merge the hook cannot fully read is refused in a gated repository, its context resolved first (fail closed): an endpoint from a variable or substitution (also a GraphQL mutation posted to `"$EP"`), a body from `--input`, a `-F` field from a file, a query from a variable, a field given more than once (gh sends `-f` fields before `-F` ones whatever their order), and a `$variable` `expectedHeadOid` at `/graphql` or a full URL (gh groups fields into `variables` only for the endpoint `graphql`). The refusal points to `gh pr merge --match-head-commit <sha>` or a literal `gh api -X PUT repos/OWNER/REPO/pulls/N/merge -f sha=<full sha>`; outside a gated repository it still warns.
+ 
+ ### Fixed
++- Remaining remote-rsync bypasses of the guard (#155): a find action's command line ends at a `;` or at a `+` right after `{}` only, so `find -exec rsync --exclude + ./src/ host:/dst/ \;` no longer hides its remote operand; rsync named inside inline code the guard does not parse (`python3 -c '…os.system("rsync …")'`, `node -e`, `perl -e`) is refused; an rsync operand from a variable or substitution (`DST=host:/dst/; setsid rsync ./src/ "$DST"`), an option word with an expansion, or an unquoted expansion is refused unless its literal text before the expansion already holds a '/' (`./"$X"`), while a quoted variable value of a known option (`--exclude "$PAT"`) stays data; runners nested in a find action or another runner are followed (`find -exec parallel rsync|ssh`, `find -exec setsid ssh h \;` are refused). False refusals fixed: `rsync --log-file-format '%f:%l'` consumes its value, and a quoted filter pattern (`-f'- *.cache'`, `--exclude '*.o'`) is exempt from the `.git` glob rule.
+ - The guard refuses `scp`, `sftp` and a remote-reaching `rsync` (#116): only `ssh` was on the out-of-scope list, so a job could copy data to or from a remote host with the operator's keys. `scp` and `sftp` are refused outright (behind wrappers, as a path, in `bash -c`, and where another program runs them, exactly like `ssh`); `rsync` is refused when an `-e`/`--rsh` option (any value) or a `host:path`-shaped argument (`user@host:/x`, `host::module`, `rsync://…`, a ':' before any '/' — `./a:b` stays local) can take it to a remote host. A purely local `rsync`, both paths local, stays allowed: jobs use it inside their worktree. The refusal names the tool and says a job never reaches remote hosts. Docs list them now (skills/agent-jobs/SKILL.md, docs/GUIDE.md, docs/GUIDE.ru.md). Review fix loop: the same rsync test covers the positions where another program runs it — the command of `find -exec`/`-execdir`/`-ok` and the positional of the exec runners (`setsid`, `ionice`, `chroot`, …), with its argv up to find's `;`/`+` terminator — and `rsync` under `xargs`, `parallel` or `entr` is refused outright, its extra arguments coming from stdin; rsync's value-taking options (`--exclude`, `-f`, `-T`, `-B`, …) are consumed first, so a local `rsync --exclude cache:old` is no longer refused for its option values, while `-avze ssh` still is.
+ - Codex brief lint: a bare curl/wget verb without a URL and post-verb negation (#141). Since #133 / PR #140 the network warning fired only on an explicit http(s) URL, so "run curl", «выполни wget», "use curl" went unnoticed; a curl/wget word after an action verb (run, use, execute, fetch, «запусти», «выполни», «используй», up to two words between, e.g. "fetch it with curl") now warns with the same line as the URL rule — one line per conflicting category, duplicate lines deduplicated, and «curl the fixture» or a bare «curl» still passes: without an action verb the word alone is not a fetch request. Negation is now detected after the verb too, within the same clause and only for the listed negation words right after the verb or through a linking verb (is/are/was/быть): "commit nothing", "curl is not needed", «curl не нужен», «пушить не надо»; "commit is not allowed" stays a known-limit warning ("not allowed" is not a listed negation), a bare "no" is not a post-verb negation ("run curl no matter what" is a positive request), and the same verbs keep the pre-verb negation.
+ - OpenRouter jobs no longer stop at claude's own budget (#148): claude priced the OpenRouter slug by its fallback Claude price table (`unrecognized_model`) and ended a job with `error_max_budget_usd` about 15x before its real cost reached `max_budget_usd`. Their claude argv no longer carries `--max-budget-usd`; the job's proxy alone enforces the budget at OpenRouter's real price and the job still fails with `openrouter budget reached`. The recorded cost and `daily_cap_usd` accounting are unchanged; claude jobs keep `--max-budget-usd <job budget>`.
+diff --git a/internal/guard/guard.go b/internal/guard/guard.go
+index ea3b4e1..bba191d 100644
+--- a/internal/guard/guard.go
++++ b/internal/guard/guard.go
+@@ -1168,6 +1168,8 @@ var (
+ 		`(systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session|crontab|tmux|pm2|docker|podman|` +
+ 		`machinectl|loginctl|unshare|nsenter)($|[^a-z0-9_]))`)
+ 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
++	// reRsyncMention finds rsync as a word inside code (`os.system("rsync …")`), not `rsyncd.conf`.
++	reRsyncMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])rsync($|[^a-z0-9_-])`)
+ )
+ 
+ // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
+@@ -1330,7 +1332,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
+ 	if t := scopeToolArg(name, argv[1:], dyn[1:]); t != "" {
+ 		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
+ 	}
+-	if t := remoteCopyArg(name, argv[1:], dyn[1:]); t != "" {
++	if t := remoteCopyArg(name, argv[1:], dyn[1:], c.bare[v.start+1:]); t != "" {
+ 		return cannot(name + " running " + t + " (an rsync that reaches a remote host) indirectly")
+ 	}
+ 	return ""
+@@ -1339,53 +1341,127 @@ func unverifiable(sc *script, c *simpleCmd) string {
+ // scopeTool reports a lower-cased base name that starts processes outside the job's scope.
+ func scopeTool(b string) bool { return outOfScopeTools[b] || b == "systemctl" }
+ 
+-// rsyncRemote reports whether rsync args can reach a remote host: any -e/--rsh option (whatever
+-// command it names — the default remote shell is ssh), a -M/--remote-option word (its value goes to
+-// the remote side), or a path argument in rsync's remote spelling (host:/x, host::module,
+-// user@host:/x, rsync://h/m; a ':' before any '/'). Options that take a value are consumed first
+-// (rsyncValueOpts, and the short -f/-T/-B that take the rest of their cluster), so a value is
+-// never read as an operand (`--exclude cache:old`) or as an option letter (`-f'- *.cache'`).
+-// Purely local copies (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay
+-// allowed: a job uses rsync inside its worktree.
+-func rsyncRemote(args []string) bool {
++// rsyncRemote reports whether rsync args can reach a remote host (scanRsync). dyn and bare are the
++// args' simpleCmd.dyn/.bare (nil: all literal); homeSet: the call may change HOME (reHomeSet).
++func rsyncRemote(args []string, dyn, bare []bool, homeSet bool) bool {
++	return scanRsync(args, dyn, bare, homeSet).remote
++}
++
++// rsyncScan is what scanRsync finds in rsync's args.
++type rsyncScan struct {
++	remote bool
++	// filter[i]: args[i] is a filter pattern (the value of --exclude/--include/--filter or -f) or
++	// carries one attached (`--exclude=*.o`, `-f'- *.cache'`): rsync matches it, it names no path.
++	filter []bool
++}
++
++// scanRsync reads rsync's args. remote reports that they can reach a remote host: any -e/--rsh
++// option (whatever command it names — the default remote shell is ssh), a -M/--remote-option word
++// (its value goes to the remote side), a path argument in rsync's remote spelling (host:/x,
++// host::module, user@host:/x, rsync://h/m; a ':' before any '/'), or a word the guard cannot read
++// (issue #155): an operand from a variable or substitution whose literal text before the expansion
++// holds no '/' (`"$DST"` may be host:/dst/; `./"$X"` cannot be), an option word with an expansion
++// outside a known option's value (`"$OPT"`, `-$X` may be -e ssh), or any unquoted expansion (the
++// shell may split it into more words, a host:path among them), and a tilde operand the shell
++// expands from the environment (tildeVariable: `~+`, `~-`, the directory stack, `~` when the call
++// may set HOME). Options that take a value are
++// consumed first (rsyncValueOpts, and the short -f/-T/-B that take the rest of their cluster), so a
++// value is never read as an operand (`--exclude cache:old`) or as an option letter
++// (`-f'- *.cache'`); a quoted value from a variable (`--exclude "$PAT"`) is one data word. Purely
++// local copies (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay allowed: a
++// job uses rsync inside its worktree.
++func scanRsync(args []string, dyn, bare []bool, homeSet bool) rsyncScan {
++	r := rsyncScan{filter: make([]bool, len(args))}
++	isDyn := func(i int) bool { return i < len(dyn) && dyn[i] }
++	isBare := func(i int) bool { return i < len(bare) && bare[i] }
++	remote := func() rsyncScan { r.remote = true; return r }
+ 	endOpts := false
+ 	for i := 0; i < len(args); i++ {
+ 		a := args[i]
++		if isBare(i) {
++			return remote()
++		}
+ 		switch {
+ 		case endOpts || a == "-" || !strings.HasPrefix(a, "-"):
+-			if remoteColon(a) {
+-				return true
++			if remoteColon(a) || (isDyn(i) && !localPrefix(a)) || tildeVariable(a, homeSet) {
++				return remote()
+ 			}
+ 		case a == "--":
+ 			endOpts = true
+ 		case strings.HasPrefix(a, "--"):
+ 			opt, _, hasVal := strings.Cut(a, "=")
++			_, known := rsyncValueOpts[opt]
+ 			switch {
+ 			case opt == "--rsh" || opt == "--remote-option":
+-				return true
+-			case rsyncValueOpts[opt] && !hasVal && i+1 < len(args):
++				return remote()
++			case isDyn(i) && !(known && hasVal && !strings.ContainsAny(opt, "$`")):
++				return remote() // the expansion may be (or add) any option
++			case hasVal:
++				r.filter[i] = rsyncFilterOpts[opt]
++			case rsyncValueOpts[opt] && i+1 < len(args):
+ 				i++ // the option's value is the next word
++				if isBare(i) {
++					return remote()
++				}
++				r.filter[i] = rsyncFilterOpts[opt]
+ 			}
+ 		default: // a short-option cluster
+ 			val := a[1:]
+ 			for k := 0; k < len(val); k++ {
+ 				c := val[k]
+ 				if c == 'e' || c == 'M' { // --rsh, --remote-option: remote whatever the value
+-					return true
++					return remote()
++				}
++				if isDyn(i) && (c == '$' || c == '`') { // an option letter from an expansion
++					return remote()
+ 				}
+ 				if c == 'f' || c == 'T' || c == 'B' { // --filter, --temp-dir, --block-size: the
+ 					// rest of the cluster (or the next word) is the value, not options
+-					if k == len(val)-1 && i+1 < len(args) {
++					if k < len(val)-1 {
++						r.filter[i] = c == 'f'
++					} else if i+1 < len(args) {
+ 						i++
++						if isBare(i) {
++							return remote()
++						}
++						r.filter[i] = c == 'f'
+ 					}
+ 					break
+ 				}
+ 			}
+ 		}
+ 	}
+-	return false
++	return r
++}
++
++// localPrefix reports a word whose literal text before its first expansion (`$`, a backtick) holds
++// a '/' with no ':' before it: whatever the expansion adds, the ':' cannot precede the first '/', so
++// rsync reads the word as a local path (`./"$X"`, `/tmp/$X`).
++func localPrefix(w string) bool {
++	lit := w
++	if i := strings.IndexAny(w, "$`"); i >= 0 {
++		lit = w[:i]
++	}
++	return strings.IndexByte(lit, '/') >= 0 && !remoteColon(lit)
+ }
+ 
++// tildeVariable reports a word whose leading tilde the shell expands from a variable the call may
++// set: `~+` (PWD), `~-` (OLDPWD), the directory stack (`~1`, `~+2`, `~-1`), and `~` (HOME) when
++// homeSet. `~user` (the password database) is not one.
++func tildeVariable(w string, homeSet bool) bool {
++	if !strings.HasPrefix(w, "~") {
++		return false
++	}
++	prefix, _, _ := strings.Cut(w[1:], "/")
++	if prefix == "" {
++		return homeSet
++	}
++	return prefix[0] == '+' || prefix[0] == '-' || (prefix[0] >= '0' && prefix[0] <= '9')
++}
++
++// rsyncFilterOpts are the rsyncValueOpts whose value is a filter pattern (matched, never a path).
++var rsyncFilterOpts = map[string]bool{"--exclude": true, "--include": true, "--filter": true}
++
+ // rsyncValueOpts are rsync's long options whose value is data: a pattern, a path or a format. The
+ // value is consumed (attached, or as the next word when true) before the operand scan, so
+ // `--exclude cache:old` is not read as a remote operand. --info and --debug take their value
+@@ -1395,7 +1471,7 @@ var rsyncValueOpts = map[string]bool{
+ 	"--exclude": true, "--include": true, "--filter": true, "--exclude-from": true, "--include-from": true,
+ 	"--files-from": true, "--link-dest": true, "--compare-dest": true, "--copy-dest": true, "--backup-dir": true,
+ 	"--suffix": true, "--chmod": true, "--chown": true, "--log-file": true, "--temp-dir": true,
+-	"--partial-dir": true, "--password-file": true, "--out-format": true, "--iconv": true,
++	"--partial-dir": true, "--password-file": true, "--out-format": true, "--log-file-format": true, "--iconv": true,
+ 	"--usermap": true, "--groupmap": true, "--block-size": true, "--max-size": true, "--min-size": true,
+ 	"--info": false, "--debug": false,
+ }
+@@ -1427,10 +1503,12 @@ var execOpts = map[string]bool{
+ // scopeToolArg returns the out-of-scope tool an argument of name runs (as found in args), or "". Only the
+ // places where it runs count: the value of an exec option, a positional of an execRunner, an absolute
+ // path given to a copier (a renamed binary), a substitution naming it, or a word inside code (an
+-// argument with spaces, quotes or parentheses). A package, directory, make target or test name such as
++// argument with spaces, quotes or parentheses). A runner may be nested (`find -exec setsid ssh`,
++// `setsid parallel ssh`; execContext). A package, directory, make target or test name such as
+ // `./internal/ssh/...`, `make -C docker` or `-run Tmux` is data.
+ func scopeToolArg(name string, args []string, dyn []bool) string {
+ 	data := runnerDataValues(name, args)
++	runner, _ := execContext(name, args)
+ 	for k, a := range args {
+ 		if data[k] {
+ 			continue
+@@ -1442,7 +1520,7 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
+ 		case dyn[k] && reScopeMention.MatchString(a):
+ 		case scopeTool(b) && v != a && execOpts[opt]:
+ 		case scopeTool(b) && k > 0 && execOpts[args[k-1]]:
+-		case scopeTool(b) && execRunners[name] && !strings.HasPrefix(a, "-"):
++		case scopeTool(b) && runner[k] != "":
+ 		case scopeTool(b) && copiers[name] && filepath.IsAbs(v):
+ 		case strings.ContainsAny(a, " \t\n'\"(){};`") && reScopeMention.MatchString(a):
+ 		default:
+@@ -1457,45 +1535,109 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
+ // treats as a command — the value or the word after an exec option (find -exec/-execdir/-ok) or a
+ // positional of an exec runner (setsid, ionice, chroot, …, also one reached through another
+ // exec option or runner) — an rsync that reaches a remote host (rsyncRemote of the words after
+-// the command word). Under parallel or entr the command's extra arguments come from stdin and
+-// cannot be seen, so rsync is refused without an argv to inspect; xargs is refused in
+-// unverifiable (a wrapper split strips it). For an exec option the executed command's argv ends
+-// at find's `;`/`+` terminator (execArgv): what follows is find's again, e.g. another action's
+-// -printf format.
+-func remoteCopyArg(name string, args []string, dyn []bool) string {
++// the command word, with their dynamism: a variable operand may be host:path). Under parallel or
++// entr — the outer program or a runner nested in it (`find -exec parallel rsync`) — the command's
++// extra arguments come from stdin and cannot be seen, so rsync is refused without an argv to
++// inspect; xargs is refused in unverifiable (a wrapper split strips it). The command's argv ends
++// at find's terminator of its -exec/-execdir/-ok/-okdir action (execContext): what follows is
++// find's again, e.g. another action's -printf format. rsync named inside inline code
++// (`python3 -c '…os.system("rsync …")'`, `node -e`, `perl -e`) has no argv the guard can read and
++// is refused — a word that looks like code (spaces, quotes, parentheses) or the value of an exec
++// option (`perl -e system+q+rsync+…`) — unless the code is shell code the guard parses itself
++// (sh -c, trap, watch) or the program is rsync (its own args are read by checkUserManager). A
++// tilde operand under a runner counts as one HOME may change (rsyncRemote homeSet): this check
++// does not see the rest of the call.
++func remoteCopyArg(name string, args []string, dyn, bare []bool) string {
+ 	data := runnerDataValues(name, args)
++	runner, end := execContext(name, args)
+ 	for k, a := range args {
+-		if data[k] || dyn[k] {
+-			continue
+-		}
+-		if progName(optValue(a)) != "rsync" {
++		if data[k] {
+ 			continue
+ 		}
+ 		opt, _, _ := strings.Cut(a, "=")
+-		argv := args[k+1:]
+-		switch {
+-		case optValue(a) != a && execOpts[opt], k > 0 && (execOpts[args[k-1]] || execRunners[progName(args[k-1])]):
+-			argv = execArgv(argv)
+-		case execRunners[name] && !strings.HasPrefix(a, "-"):
+-		default:
++		execValue := (optValue(a) != a && execOpts[opt]) || (k > 0 && execOpts[args[k-1]])
++		isRsync := progName(optValue(a)) == "rsync"
++		code := strings.ContainsAny(a, " \t\n'\"(){};`") || execValue
++		if !isRsync && code && name != "rsync" && !shellCodeParsed(name) && reRsyncMention.MatchString(a) {
++			return a
++		}
++		if dyn[k] || !isRsync || !(execValue || runner[k] != "") {
+ 			continue
+ 		}
+-		if name == "parallel" || name == "entr" || rsyncRemote(argv) {
++		e := end[k]
++		if stdinRunners[runner[k]] || rsyncRemote(args[k+1:e], dyn[k+1:e], bare[k+1:e], true) {
+ 			return a
+ 		}
+ 	}
+ 	return ""
+ }
+ 
+-// execArgv cuts the argv of a command run by an exec option (find -exec/-execdir/-ok) at find's
+-// `;`/`+` terminator, so the words of a following action are not read as the command's.
+-func execArgv(argv []string) []string {
++// stdinRunners are the exec runners that add arguments read from stdin to the command they run.
++var stdinRunners = map[string]bool{"parallel": true, "entr": true}
++
++// shellCodeParsed reports a program whose code arguments are shell code the guard parses as a
++// nested script (parseAll): the commands in it are checked like any other.
++func shellCodeParsed(name string) bool {
++	return shells[name] || name == "eval" || name == "trap" || name == "watch"
++}
++
++// execContext maps each of name's args to the command line it belongs to. runner[k] is the exec
++// runner whose positional args[k] is ("" for none): name itself when it is a runner, or a runner
++// reached as a positional of another runner (`setsid parallel rsync`) or as the command of a find
++// action (`find -exec setsid -f ssh h \;`). end[k] is where that command line ends: find's
++// terminator of the -exec/-execdir/-ok/-okdir action holding args[k] (findEnd), else len(args).
++func execContext(name string, args []string) (runner []string, end []int) {
++	runner, end = make([]string, len(args)), make([]int, len(args))
++	// line marks args[s:e] as one command line; cur is the runner of its positionals, and the first
++	// word is the command itself when first is set.
++	line := func(s, e int, cur string, first bool) {
++		for j := s; j < e; j++ {
++			end[j] = e
++			a := args[j]
++			if strings.HasPrefix(a, "-") && !(first && j == s) {
++				continue
++			}
++			runner[j] = cur
++			command := cur != "" || (first && j == s) || (j > 0 && execOpts[args[j-1]])
++			if command && execRunners[progName(a)] {
++				cur = progName(a)
++			}
++		}
++	}
++	if name != "find" {
++		cur := ""
++		if execRunners[name] {
++			cur = name
++		}
++		line(0, len(args), cur, false)
++		return runner, end
++	}
++	for k := 0; k < len(args); k++ {
++		end[k] = len(args)
++		if findExec[args[k]] {
++			e := k + 1 + findEnd(args[k+1:], args[k])
++			line(k+1, e, "", true)
++			if e < len(args) {
++				end[e] = len(args) // the terminator is find's
++			}
++			k = e
++		}
++	}
++	return runner, end
++}
++
++// findEnd returns the index in argv (the words after the find action, -exec/-execdir/-ok/-okdir)
++// of the action's terminator, len(argv) when there is none: a `;` word, or for -exec/-execdir a `+`
++// right after a `{}` word (find takes a `+` anywhere else, and any `+` of -ok/-okdir, as an
++// ordinary argument: `-exec rsync --exclude + a h:/b \;`).
++func findEnd(argv []string, action string) int {
++	plus := action == "-exec" || action == "-execdir"
+ 	for k, a := range argv {
+-		if a == ";" || a == "+" {
+-			return argv[:k]
++		if a == ";" || (plus && a == "+" && k > 1 && argv[k-1] == "{}") {
++			return k
+ 		}
+ 	}
+-	return argv
++	return len(argv)
+ }
+ 
+ // packageRunners fetch and run a package by name (npx, pnpm dlx, …): what runs is decided by a
+@@ -1998,7 +2140,7 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
+ // `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
+ // cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
+ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
+-	if r := eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
++	if r := eachCmd(scripts, func(c *simpleCmd, argv []string) string {
+ 		if len(argv) == 0 {
+ 			return ""
+ 		}
+@@ -2007,9 +2149,11 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
+ 			return "blocked by guard: `" + name + "` copies files to or from a remote host over ssh (with the " +
+ 				"operator's keys); a job never reaches remote hosts."
+ 		}
+-		if name == "rsync" && rsyncRemote(argv[1:]) {
+-			return "blocked by guard: `rsync` is given a remote host (an -e/--rsh command or a host:path " +
+-				"argument); a job never reaches remote hosts."
++		off := len(c.words) - len(argv) + 1 // argvOf is a suffix of the words
++		if name == "rsync" && rsyncRemote(argv[1:], c.dyn[off:], c.bare[off:], reHomeSet.MatchString(cmd)) {
++			return "blocked by guard: `rsync` is given a remote host (an -e/--rsh command, a host:path " +
++				"argument, or an operand or option from a variable the guard cannot read); a job never reaches " +
++				"remote hosts."
+ 		}
+ 		if outOfScopeTools[name] {
+ 			sandbox := ""
+@@ -2505,7 +2649,17 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
+ 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
+ 				})
+ 				off := len(c.words) - len(argv)
++				var rsyncFilter []bool
++				if name == "rsync" {
++					rsyncFilter = scanRsync(argv[1:], c.dyn[off+1:], c.bare[off+1:], false).filter
++				}
+ 				for k, a := range argv[1:] {
++					// An rsync filter pattern (`--exclude .git`, `-f'- *.cache'`, `--exclude '*.o'`) is
++					// matched by rsync and names no path, unless an unquoted glob in it lets the shell
++					// expand it into other words (issue #155).
++					if k < len(rsyncFilter) && rsyncFilter[k] && !c.glob[off+k+1] {
++						continue
++					}
+ 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
+ 						return blocked(a)
+ 					}
+diff --git a/internal/guard/guard_test.go b/internal/guard/guard_test.go
+index 2a625a9..def2fa0 100644
+--- a/internal/guard/guard_test.go
++++ b/internal/guard/guard_test.go
+@@ -1420,8 +1420,8 @@ func TestRemoteTransfersIndirectRefused(t *testing.T) {
+ 		// An option value is no operand and no option letter: local rsync stays allowed.
+ 		{"rsync --exclude separate value", `rsync --exclude cache:old ./src/ ./dst/`, false},
+ 		{"rsync -f attached filter", `rsync -f'-x.cache' ./src/ ./dst/`, false},
+-		{"rsync -f glob value still refused", `rsync -f'- *.cache' ./src/ ./dst/`, true}, // by the
+-		// .git glob rule (a `*` word in a non-reader's argument), not the remote-host rule
++		// #155: a quoted filter pattern is rsync's data, exempt from the .git glob rule.
++		{"rsync -f quoted glob filter", `rsync -f'- *.cache' ./src/ ./dst/`, false},
+ 		{"rsync --files-from value", `rsync --files-from list.txt ./src/ ./dst/`, false},
+ 		{"rsync -B separate value", `rsync -B 4096 ./src/ ./dst/`, false},
+ 		{"find -exec rsync local then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
+diff --git a/internal/guard/rsync_bypass_155_test.go b/internal/guard/rsync_bypass_155_test.go
+new file mode 100644
+index 0000000..cb74dee
+--- /dev/null
++++ b/internal/guard/rsync_bypass_155_test.go
+@@ -0,0 +1,119 @@
++package guard
++
++import "testing"
++
++// Issue #155: remote rsync still got past the guard after #116 through a literal `+` inside a
++// find -exec argv, inline interpreter code and a dynamic operand; a local rsync with a
++// --log-file-format value or a `-f'- *.cache'` filter was falsely refused; and a double nesting
++// (find -exec parallel rsync|ssh) hid the remote argument in parallel's input.
++func TestRsyncBypasses155(t *testing.T) {
++	t.Setenv("HOME", "/home/u")
++	t.Setenv("CDPATH", "")
++	cfg := Config{Dir: "/home/u/work"}
++	cases := []struct {
++		name  string
++		cmd   string
++		block bool
++	}{
++		// High: a `+` that is an option value, not find's terminator.
++		{"find -exec rsync --exclude +", `find . -maxdepth 0 -exec rsync --exclude + ./src/ host:/dst/ \;`, true},
++		{"find -exec rsync + operand", `find . -exec rsync + ./src/ host:/dst/ \;`, true},
++		{"find -exec rsync plus terminator remote", `find . -exec rsync a host:/b {} +`, true},
++		{"find -exec rsync then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
++		// High: rsync inside inline interpreter code.
++		{"python -c os.system rsync", `python3 -c 'import os; os.system("rsync ./src/ host:/dst/")'`, true},
++		{"python -c subprocess rsync", `python3 -c 'import subprocess; subprocess.run(["rsync", "a", "h:/b"])'`, true},
++		{"perl -e rsync", `perl -e 'system("rsync a h:/b")'`, true},
++		{"node -e rsync", `node -e 'require("child_process").execSync("rsync a h:/b")'`, true},
++		{"setsid sh-less watch rsync", `watch 'rsync a h:/b'`, true},
++		{"python -c plain", `python3 -c 'print(1)'`, false},
++		{"python -c word rsync_x", `python3 -c 'print("rsyncd.conf")'`, false},
++		// High: a dynamic operand.
++		{"setsid rsync $DST", `DST=host:/dst/; setsid rsync ./src/ "$DST"`, true},
++		{"rsync $DST", `DST=host:/dst/; rsync ./src/ "$DST"`, true},
++		{"rsync subst operand", `rsync ./src/ "$(echo host:/dst/)"`, true},
++		{"find -exec rsync $DST", `find . -exec rsync ./src/ "$DST" \;`, true},
++		{"rsync dynamic -e value", `rsync "$OPT" ./src/ ./dst/`, true},
++		{"rsync local literal", `setsid rsync ./src/ ./dst/`, false},
++		{"rsync dynamic exclude value", `rsync --exclude "$PAT" ./src/ ./dst/`, false},
++		// Medium: option values that are data.
++		{"rsync --log-file-format", `rsync --log-file-format '%f:%l' ./src/ ./dst/`, false},
++		{"rsync -f glob filter", `rsync -f'- *.cache' ./src/ ./dst/`, false},
++		{"rsync --exclude glob", `rsync --exclude '*.cache' ./src/ ./dst/`, false},
++		{"rsync unquoted glob exclude refused", `rsync --exclude *.cache ./src/ ./dst/`, true},
++		{"rsync bare $PAT exclude refused", `rsync --exclude $PAT ./src/ ./dst/`, true},
++		{"find -exec setsid -f rsync remote", `find . -exec setsid -f rsync a h:/b \;`, true},
++		{"find -exec setsid ssh", `find . -exec setsid ssh h \;`, true},
++		{"setsid setsid rsync quoted ; hides nothing", `setsid setsid rsync a ';' h:/b`, true},
++		{"find -exec rsync {} + then -exec remote", `find . -exec rsync -a {} + -exec rsync a h:/b \;`, true},
++		{"sh -c local rsync stays allowed", `sh -c 'rsync -a ./src/ ./dst/'`, false},
++		{"bash -c remote rsync refused", `bash -c 'rsync a h:/b'`, true},
++		{"rsync glob operand still refused", `rsync ./src/* ./dst/`, true},
++		// Review follow-ups: tilde operands from a variable, code without spaces, filter values.
++		{"rsync ~/ with HOME set", `HOME=host:; rsync -a ./src/ ~/dst/`, true},
++		{"rsync ~- (OLDPWD)", `OLDPWD=host:/dst/; rsync -a ./src/ ~-`, true},
++		{"rsync ~+ (PWD)", `rsync -a ./src/ ~+/x`, true},
++		{"rsync ~/ plain HOME", `rsync -a ./src/ ~/dst/`, false},
++		{"perl -e code without spaces", `perl -e system+q+rsync+,q+./src/+,q+host:/dst/+`, true},
++		{"rsync own operand naming rsync", `rsync -a ./src/ "./rsync notes/"`, false},
++		{"rsync --out-format naming rsync", `rsync --out-format 'rsync: %n' ./src/ ./dst/`, false},
++		{"rsync --exclude .git", `rsync -a --exclude .git ./src/ ./dst/`, false},
++		{"rsync .git operand still refused", `rsync -a ./src/ .git`, true},
++		// Medium: double nesting, the remote argument from parallel's input.
++		{"find -exec parallel rsync", `find . -maxdepth 0 -exec parallel rsync ./src/ \;`, true},
++		{"setsid parallel rsync", `setsid parallel rsync ./src/`, true},
++		{"find -exec parallel ssh", `find . -maxdepth 0 -exec parallel ssh \;`, true},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			got := Check(c.cmd, cfg)
++			if (got != "") != c.block {
++				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
++			}
++		})
++	}
++}
++
++// findEnd stops at a `;` or at a `+` right after `{}`; any other `+` is an argument (#155).
++func TestFindEnd155(t *testing.T) {
++	cases := []struct {
++		action string
++		argv   []string
++		want   int
++	}{
++		{"-exec", []string{"rsync", "--exclude", "+", "a", "h:/b", ";"}, 5},
++		{"-exec", []string{"rsync", "-a", "{}", "+", "-printf", "x"}, 3},
++		{"-execdir", []string{"rsync", "-a", "{}", "+"}, 3},
++		{"-exec", []string{"rsync", "+", "a"}, 3},
++		{"-exec", []string{"+"}, 1},
++		{"-exec", []string{"{}", "+"}, 2},
++		// -ok/-okdir take no `+` form: find passes `{} +` on as arguments.
++		{"-ok", []string{"rsync", "-a", "{}", "+", "h:/b", ";"}, 5},
++		{"-okdir", []string{"rsync", "{}", "+"}, 3},
++	}
++	for _, c := range cases {
++		if got := findEnd(c.argv, c.action); got != c.want {
++			t.Errorf("findEnd(%q, %s) = %d, want %d", c.argv, c.action, got, c.want)
++		}
++	}
++}
++
++// execContext follows nested runners and ends a find action's command line at its terminator (#155).
++func TestExecContext155(t *testing.T) {
++	args := []string{".", "-exec", "parallel", "-j2", "rsync", "a", ";", "-printf", "%p:%y"}
++	runner, end := execContext("find", args)
++	if runner[4] != "parallel" || end[4] != 6 {
++		t.Errorf("rsync: runner %q end %d, want parallel 6", runner[4], end[4])
++	}
++	if runner[8] != "" || end[8] != len(args) {
++		t.Errorf("-printf value: runner %q end %d, want none %d", runner[8], end[8], len(args))
++	}
++	runner, _ = execContext("setsid", []string{"-f", "parallel", "rsync", "a"})
++	if runner[1] != "setsid" || runner[2] != "parallel" {
++		t.Errorf("setsid parallel rsync: runners %q", runner)
++	}
++	runner, _ = execContext("make", []string{"parallel", "rsync"})
++	if runner[0] != "" || runner[1] != "" {
++		t.Errorf("make targets are no command: runners %q", runner)
++	}
++}
