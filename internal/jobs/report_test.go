@@ -73,3 +73,53 @@ func TestReportSections(t *testing.T) {
 		t.Fatalf("sections: %q", got)
 	}
 }
+
+const forksReport = "## Summary\nok\n\n## Not done / uncertain\nnothing\n\n## Forks\n" +
+	"- polling / inotify / the daemon already polls elsewhere\n- field as text / parsed list / consumers want the raw lines\n\n" +
+	"## Progress\n- 10:00 UTC done\n"
+
+// Forks is a section of its own: found by name next to Not done and Progress, absent from a report
+// without it (not an error), "none" kept as written, and a heading-looking line in a fence is no section.
+func TestReportSectionForks(t *testing.T) {
+	want := "- polling / inotify / the daemon already polls elsewhere\n- field as text / parsed list / consumers want the raw lines"
+	if s, ok := ReportSection(forksReport, SectionForks); !ok || s != want {
+		t.Fatalf("forks: %q %v", s, ok)
+	}
+	got := ReportSections(forksReport, SectionNotDone, SectionForks, SectionProgress)
+	if got[0] != "nothing" || got[1] != want || got[2] != "- 10:00 UTC done" {
+		t.Fatalf("sections: %q", got)
+	}
+	if s, ok := ReportSection(sampleReport, SectionForks); ok || s != "" {
+		t.Fatalf("report without forks: %q %v", s, ok)
+	}
+	if s, ok := ReportSection("## Summary\nok\n\n## forks\nnone\n", SectionForks); !ok || s != "none" {
+		t.Fatalf("none / heading case: %q %v", s, ok)
+	}
+	fenced := "## Summary\nok\n\n## Evidence\n```\n## Forks\n- fake / fake / fake\n```\n\n## Not done / uncertain\nnothing\n"
+	if s, ok := ReportSection(fenced, SectionForks); ok {
+		t.Fatalf("a fenced heading counted as the Forks section: %q", s)
+	}
+	// Forks does not swallow the section after it, and ReadFirst keeps it whole.
+	if out := ReadFirst(forksReport); !strings.Contains(out, "## Forks\n- polling") || strings.Index(out, "## Not done") != 0 {
+		t.Fatalf("read first:\n%s", out)
+	}
+}
+
+// The contract asks for a Forks section between Not done / uncertain and Progress: up to 5 entries of
+// "choice / rejected alternative / reason", `none` allowed; the four-section rule stays.
+func TestReportContractAsksForForks(t *testing.T) {
+	b, err := agentjobs.Templates.ReadFile("prompts/report-contract.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(b)
+	nd, fk, pr := strings.Index(c, "## Not done / uncertain"), strings.Index(c, "## Forks"), strings.Index(c, "## Progress")
+	if !(nd >= 0 && fk > nd && pr > fk) {
+		t.Fatalf("Forks must sit between Not done / uncertain and Progress:\n%s", c)
+	}
+	for _, want := range []string{"exactly these four sections", "at most 5", "choice / rejected alternative / reason", "`none`"} {
+		if !strings.Contains(c, want) {
+			t.Errorf("report-contract.md lacks %q", want)
+		}
+	}
+}

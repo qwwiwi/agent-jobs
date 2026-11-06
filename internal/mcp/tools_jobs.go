@@ -299,7 +299,11 @@ type JobResultOutput struct {
 	// Progress is the report's "Progress" section (timestamped one-line steps), shown after NotDone;
 	// empty when the report has none (not an error).
 	Progress string `json:"progress,omitempty"`
-	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Progress),
+	// Forks is the report's "Forks" section as written: the design choices the job made where its task
+	// left room, up to 5 lines "choice / rejected alternative / reason", or "none". Empty when the
+	// report has no such section (not an error).
+	Forks string `json:"forks,omitempty"`
+	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Forks, Progress),
 	// secret-looking values redacted.
 	Report          string   `json:"report,omitempty"`
 	ReportMissing   bool     `json:"report_missing,omitempty"`
@@ -410,8 +414,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 			// Always redacted on the fly: the report of a job whose in-place redaction is still pending
 			// (or of a running job) may hold raw secrets.
 			out.Report, out.ReportTruncated = jobs.RedactRead(report, truncated), truncated
-			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress)
-			out.NotDone, out.Progress = secs[0], secs[1]
+			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress, jobs.SectionForks)
+			out.NotDone, out.Progress, out.Forks = secs[0], secs[1], secs[2]
 			if len(j.Covers) > 0 {
 				out.Requirements = &RequirementsView{Requirements: jobs.ParseRequirements(out.Report, j.Covers)}
 			}

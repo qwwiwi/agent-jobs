@@ -6,6 +6,7 @@ import "strings"
 const (
 	SectionNotDone  = "Not done / uncertain"
 	SectionProgress = "Progress"
+	SectionForks    = "Forks"
 )
 
 // reportSection is one "## " section of a report: its heading line and its body.
