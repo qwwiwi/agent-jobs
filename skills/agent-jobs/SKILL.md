@@ -77,7 +77,7 @@ Inside a job:
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
 | `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
-| `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, covers?, skills?}]`), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel`; a task's `skills` are the `job_start` skills edits its jobs get |
+| `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, depends_why?, covers?, skills?}]`; each `depends_on` edge needs a one-line reason in `depends_why` or it is dropped), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel`; a task's `skills` are the `job_start` skills edits its jobs get |
 | `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; any edit of a done milestone while a task is not done or dropped reopens it) |
 | `milestone_get` | the tree: each task's derived status (blocked, running, review, done, failed, ready, dropped) and jobs, `ready` keys, progress |
 | `milestone_list` | by repo and order; `repo` + `tree: true` is the whole project in one call; pass the returned `cursor` as the next `updated_since` |
@@ -127,7 +127,7 @@ The existing `hook bind` (SessionStart) and `hook brief-reminder` (UserPromptSub
 3. Only then does anything leave the machine: push, PR, deploy, a message to a person. That is this session's job, never the job's.
 4. A failed job without a report: look at `stderr.log`, then `stream.jsonl` in the job's directory.
 
-UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `node <job dir>/tools/ui-check.mjs <base-url> <path>...` yourself (exit 0 pass, 1 fail, 2 not run), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
+UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `agent-jobs ui-check <base-url> <path>... [--playwright <abs path>]` yourself (the ui-check.mjs embedded in the binary; exit 0 pass, 1 fail, 2 not run), never a script from a job dir or worktree (the job can rewrite it), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
 
 After a review, and when a job failed:
 

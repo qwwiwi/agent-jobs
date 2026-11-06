@@ -121,10 +121,10 @@ agent-jobs result --agent my-agent <id>   # строка о завершении
 Один вызов создаёт этап; дальше сессия запускает джобу на каждую готовую задачу (`job_start` с `milestone` и `task`), здесь сначала T1, T2 — когда T1 сделана:
 
 ```json
-{"title": "Auth v2", "repo": "/home/me/src/project", "max_parallel": 2, "tasks": [
+{"title": "Auth v2", "repo": "/home/me/src/project", "tasks": [
   {"key": "T1", "title": "Sessions table"},
-  {"key": "T2", "title": "Login API", "depends_on": ["T1"]},
-  {"key": "T3", "title": "Docs for the login API", "depends_on": ["T2"]}]}
+  {"key": "T2", "title": "Login API", "depends_on": ["T1"], "depends_why": {"T1": "reads the sessions table T1 creates"}},
+  {"key": "T3", "title": "Docs for the login API", "depends_on": ["T2"], "depends_why": {"T2": "documents the endpoints T2 adds"}}]}
 ```
 
 Подробности, JSON-схема и эндпоинты: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones) (на английском).
