@@ -116,10 +116,9 @@ const (
 )
 
 // pluginExecKeys are the plugin manifest keys that start code outside the guard: hooks, MCP servers,
-// LSP servers. A view of a plugin without allow_hooks drops them, and the files they default to.
-// The rest of the manifest is an allowlist (pluginManifestKeys).
+// LSP servers. A view of a plugin without allow_hooks drops them silently; the rest of the manifest
+// is an allowlist (pluginManifestKeys) and so is the top level of the view (pluginViewTop).
 var pluginExecKeys = []string{"hooks", "mcpServers", "lspServers"}
-var pluginExecEntries = []string{"hooks", ".mcp.json", ".lsp.json"}
 
 // loadedPlugin is one plugin as resolved for a job.
 type loadedPlugin struct {

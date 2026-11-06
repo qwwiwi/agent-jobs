@@ -20,8 +20,11 @@ import (
 // write, guard --protect) of the plugin's regular files and directories, read without following a
 // symlink anywhere below the resolved plugin root. The job never gets a path into the live plugin,
 // so neither a link to a file outside nor a change to the plugin after the copy reaches what claude
-// loads. Without allow_hooks the copy is filtered: no hooks, MCP or LSP files, a manifest reduced to
-// known keys, and no markdown file whose front matter is not plain YAML with allowed keys only.
+// loads. Without allow_hooks the copy is filtered: at the top level only the manifest directory, the
+// markdown component directories and the license (never hooks/, .mcp.json, .lsp.json, monitors/,
+// bin/, workflows/, settings.json or whatever a later claude loads by default), a manifest reduced to
+// known keys, and no markdown file whose front matter is not plain YAML with allowed keys only or
+// whose body runs shell commands (!`cmd`, a ```! block).
 
 const (
 	// maxViewDepth bounds the directory nesting of a snapshot, maxViewEntries the entries it visits,
@@ -40,6 +43,26 @@ var pluginManifestKeys = []string{"$schema", "name", "version", "description", "
 
 // pluginManifestPaths are the manifest keys that name component paths ("./dir" or a list of them).
 var pluginManifestPaths = []string{"commands", "agents", "skills", "outputStyles"}
+
+// pluginViewTop are the top-level entries a filtered snapshot copies (with the first component of
+// each manifest component path it keeps): the manifest, the default markdown component directories.
+// Everything else at the top is left out, so a default location claude loads code from (hooks/,
+// .mcp.json, .lsp.json, monitors/, bin/ on the PATH, workflows/, settings.json ...), also one a later
+// claude adds, never reaches the job. Files a component needs live in its own directory.
+var pluginViewTop = []string{".claude-plugin", "skills", "commands", "agents", "output-styles"}
+
+// pluginHookTop are the default hook and server files, left out of a filtered snapshot like the
+// others but, being what allow_hooks is about, without a warning.
+var pluginHookTop = []string{"hooks", ".mcp.json", ".lsp.json"}
+
+// pluginReservedTop are top-level names a manifest component path may not lead into: the default
+// places claude loads code or settings from. Such a path refuses the plugin.
+var pluginReservedTop = []string{".claude-plugin", "hooks", ".mcp.json", ".lsp.json", "monitors", "bin",
+	"workflows", "settings.json"}
+
+// fmShellRe finds the shell a skill or command body runs when it is loaded: inline !`cmd` or a fenced
+// block opened with ```! (or ~~~!).
+var fmShellRe = regexp.MustCompile("(?m)!`|^[ \\t]*(?:`{3,}|~{3,})[ \\t]*!")
 
 // frontMatterKeys are the root keys a markdown file of a filtered snapshot may set in its front
 // matter: what skills, commands, agents and the GitHub templates of superpowers 7.0.2 use, and the
@@ -147,7 +170,8 @@ func fmOddRune(r rune) bool {
 
 // pluginSnapshot copies a plugin tree into a job's view.
 type pluginSnapshot struct {
-	filter  bool // without allow_hooks
+	filter  bool     // without allow_hooks
+	top     []string // the top-level entries a filtered snapshot copies
 	warns   []string
 	entries int
 	bytes   int64
@@ -158,11 +182,14 @@ type pluginSnapshot struct {
 func buildPluginView(ps *pluginSource, viewDir string, filter bool) ([]string, error) {
 	var manifest []byte
 	var warns []string
+	top := slices.Clone(pluginViewTop)
 	if filter && ps.manifest != nil {
+		var roots []string
 		var err error
-		if manifest, warns, err = sanitizeManifest(ps.manifest); err != nil {
+		if manifest, warns, roots, err = sanitizeManifest(ps.manifest); err != nil {
 			return nil, err
 		}
+		top = append(top, roots...)
 	}
 	if err := os.RemoveAll(viewDir); err != nil {
 		return nil, err
@@ -176,7 +203,7 @@ func buildPluginView(ps *pluginSource, viewDir string, filter bool) ([]string, e
 		return nil, err
 	}
 	defer root.Close()
-	s := &pluginSnapshot{filter: filter, warns: warns}
+	s := &pluginSnapshot{filter: filter, top: top, warns: warns}
 	if err := s.copyDir(root, viewDir, "", 0); err != nil {
 		return nil, err
 	}
@@ -212,18 +239,29 @@ func (s *pluginSnapshot) copyDir(dir *os.File, dst, rel string, depth int) error
 	if err := os.Mkdir(dst, 0o700); err != nil {
 		return err
 	}
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		return fmt.Errorf("%s: %w", rel, err)
+	var names []string
+	for {
+		chunk, err := dir.Readdirnames(1024)
+		names = append(names, chunk...)
+		if s.entries += len(chunk); s.entries > maxViewEntries {
+			return fmt.Errorf("more than %d entries", maxViewEntries)
+		}
+		if errors.Is(err, io.EOF) || (err == nil && len(chunk) == 0) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
 	}
 	slices.Sort(names)
 	dfd := int(dir.Fd())
+	var leftTop []string
 	for _, name := range names {
 		r := filepath.Join(rel, name)
-		if s.entries++; s.entries > maxViewEntries {
-			return fmt.Errorf("more than %d entries", maxViewEntries)
-		}
-		if s.filter && depth == 0 && slices.Contains(pluginExecEntries, name) {
+		if s.filter && depth == 0 && !s.keepTop(name) {
+			if !slices.Contains(pluginHookTop, name) { // the expected ones go without a warning
+				leftTop = append(leftTop, name)
+			}
 			continue
 		}
 		if s.filter && r == filepath.Join(".claude-plugin", "plugin.json") {
@@ -233,7 +271,20 @@ func (s *pluginSnapshot) copyDir(dir *os.File, dst, rel string, depth int) error
 			return err
 		}
 	}
+	if len(leftTop) > 0 {
+		s.warns = append(s.warns, fmt.Sprintf("top-level entries left out of the view (not plugin components; allow_hooks is off): %s",
+			truncate(strings.Join(leftTop, ", "), 400)))
+	}
 	return nil
+}
+
+// keepTop reports whether a filtered snapshot copies the top-level entry name.
+func (s *pluginSnapshot) keepTop(name string) bool {
+	if slices.Contains(s.top, name) {
+		return true
+	}
+	upper := strings.ToUpper(name)
+	return strings.HasPrefix(upper, "LICENSE") || strings.HasPrefix(upper, "LICENCE")
 }
 
 // copyEntry copies the entry name of the directory dfd: a directory or a regular file, opened without
@@ -287,7 +338,11 @@ func (s *pluginSnapshot) copyEntry(dfd int, name, dst, rel string, depth int) er
 	}
 	// The check reads the very bytes that are written: what was checked is what the job gets.
 	if s.filter && strings.EqualFold(filepath.Ext(name), ".md") {
-		if why := frontMatterProblem(b); why != "" {
+		why := frontMatterProblem(b)
+		if why == "" && fmShellRe.Match(b) {
+			why = "the body runs shell commands (!`cmd` or a ```! block)"
+		}
+		if why != "" {
 			s.leaveOut(rel, why+" (allow_hooks is off)")
 			return nil
 		}
@@ -314,11 +369,11 @@ func writeSnapshotFile(p string, b []byte, mode os.FileMode) error {
 }
 
 // sanitizeManifest is the plugin.json of a filtered snapshot: only pluginManifestKeys, and of the
-// component paths only those that stay inside the plugin. A component path into .claude-plugin
-// refuses the plugin (claude would load from a directory a view does not treat as components).
-func sanitizeManifest(man map[string]json.RawMessage) ([]byte, []string, error) {
+// component paths only those that stay inside the plugin. A component path into a reserved top-level
+// name (pluginReservedTop: .claude-plugin, hooks/, monitors/, bin/ ...) refuses the plugin. roots are
+// the first components of the kept component paths, which the snapshot copies too.
+func sanitizeManifest(man map[string]json.RawMessage) (b []byte, warns, roots []string, err error) {
 	clean := map[string]json.RawMessage{}
-	var warns []string
 	for _, k := range slices.Sorted(maps.Keys(man)) {
 		v := man[k]
 		switch {
@@ -334,25 +389,31 @@ func sanitizeManifest(man map[string]json.RawMessage) ([]byte, []string, error) 
 				continue
 			}
 			leaves := false
+			var firsts []string
 			for _, p := range paths {
-				inside, intoManifest := manifestPathInside(p)
-				if intoManifest {
-					return nil, nil, fmt.Errorf("manifest key %s points into .claude-plugin (%q)", k, truncate(p, 80))
+				first, inside := manifestPathRoot(p)
+				if inside && slices.ContainsFunc(pluginReservedTop, func(r string) bool { return strings.EqualFold(r, first) }) {
+					return nil, nil, nil, fmt.Errorf("manifest key %s points into %s (%q)", k, first, truncate(p, 80))
 				}
 				leaves = leaves || !inside
+				firsts = append(firsts, first)
 			}
 			if leaves {
 				warns = append(warns, fmt.Sprintf("manifest key %s left out of the view: a path leaves the plugin", k))
 				continue
 			}
+			for _, f := range firsts {
+				if f != "." && !slices.Contains(roots, f) {
+					roots = append(roots, f)
+				}
+			}
 		}
 		clean[k] = v
 	}
-	b, err := json.MarshalIndent(clean, "", "  ")
-	if err != nil {
-		return nil, nil, err
+	if b, err = json.MarshalIndent(clean, "", "  "); err != nil {
+		return nil, nil, nil, err
 	}
-	return append(b, '\n'), warns, nil
+	return append(b, '\n'), warns, roots, nil
 }
 
 // manifestPathList reads a component path value: a string or a list of strings.
@@ -368,16 +429,15 @@ func manifestPathList(v json.RawMessage) ([]string, bool) {
 	return nil, false
 }
 
-// manifestPathInside reports whether the component path p stays inside the plugin root, and whether
-// it leads into the root's .claude-plugin directory.
-func manifestPathInside(p string) (inside, intoManifest bool) {
+// manifestPathRoot is the first component of the component path p below the plugin root ("." for
+// the root itself), and whether p stays inside the root at all.
+func manifestPathRoot(p string) (first string, inside bool) {
 	if p == "" || filepath.IsAbs(p) || strings.ContainsAny(p, "\x00\\") {
-		return false, false
+		return "", false
 	}
 	c := filepath.ToSlash(filepath.Clean(p))
 	if c == ".." || strings.HasPrefix(c, "../") {
-		return false, false
+		return "", false
 	}
-	first := strings.SplitN(c, "/", 2)[0]
-	return true, strings.EqualFold(first, ".claude-plugin")
+	return strings.SplitN(c, "/", 2)[0], true
 }

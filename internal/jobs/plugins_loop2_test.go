@@ -187,6 +187,69 @@ func TestPluginViewManifestSanitized(t *testing.T) {
 	}
 }
 
+// Fix loop 2 (found by the in-job review): the top level of a filtered snapshot is an allowlist, so
+// default code locations other than hooks/ (monitors/, bin/ on the PATH, workflows/, settings.json)
+// stay out; a manifest path into one of them refuses the plugin; a body that runs shell on load
+// (!`cmd`, a ```! block) stays out too. allow_hooks keeps everything.
+func TestPluginViewTopLevelAllowlist(t *testing.T) {
+	m := newManager(t)
+	dir := makePlugin(t, "px", "1.0.0", nil)
+	writeTree(t, dir, map[string]string{
+		"monitors/monitors.json": `[{"name":"m","command":"EXEC_MARKER"}]`,
+		"bin/tool":               "#!/bin/sh\necho EXEC_MARKER\n",
+		"workflows/w.js":         "EXEC_MARKER\n",
+		"settings.json":          `{"agent":"EXEC_MARKER"}`,
+		"scripts/x.sh":           "EXEC_MARKER\n",
+		"LICENSE":                "MIT\n",
+		"custom/c/SKILL.md":      "---\nname: c\n---\nCUSTOM_SKILL\n",
+		"skills/inline/SKILL.md": "---\nname: inline\n---\nRun !`echo EXEC_MARKER` first.\n",
+		"commands/fenced.md":     "---\ndescription: f\n---\n```!\necho EXEC_MARKER\n```\n",
+		"commands/tilde.md":      "~~~ !\necho EXEC_MARKER\n~~~\n",
+		"skills/fine/SKILL.md":   "---\nname: fine\n---\nUse `code` and say hi!\n\n```bash\necho ok\n```\n",
+		"skills/fine/run.sh":     "echo ok\n",
+	})
+	mb, _ := json.Marshal(map[string]any{"name": "px", "skills": []any{"./skills", "./custom"}})
+	writeTree(t, dir, map[string]string{".claude-plugin/plugin.json": string(mb)})
+	view := filepath.Join(t.TempDir(), "view")
+	warns, err := buildPluginView(snapshotSource(t, m, JobPlugin{Path: dir}), view, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := reachable(t, view)
+	for rel, body := range files {
+		if strings.Contains(body, "EXEC_MARKER") {
+			t.Errorf("the filtered snapshot exposes %s", rel)
+		}
+	}
+	for _, want := range []string{"LICENSE", "custom/c/SKILL.md", "skills/fine/SKILL.md", "skills/fine/run.sh", "skills/using-x/SKILL.md"} {
+		if _, ok := files[filepath.FromSlash(want)]; !ok {
+			t.Errorf("the filtered snapshot lost %s", want)
+		}
+	}
+	joined := strings.Join(warns, "\n")
+	for _, want := range []string{"monitors", "bin", "workflows", "settings.json", filepath.FromSlash("skills/inline/SKILL.md"), filepath.FromSlash("commands/fenced.md")} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warnings do not name %s: %q", want, warns)
+		}
+	}
+	// Unfiltered (allow_hooks): everything but links.
+	full := filepath.Join(t.TempDir(), "full")
+	if _, err := buildPluginView(snapshotSource(t, m, JobPlugin{Path: dir}), full, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(full, "monitors", "monitors.json")); err != nil {
+		t.Errorf("allow_hooks snapshot lost monitors: %v", err)
+	}
+	// A component path into a reserved top-level name refuses the plugin.
+	for _, into := range []string{"./bin", "./monitors/x", "./HOOKS", "./.claude-plugin/hidden"} {
+		mb, _ := json.Marshal(map[string]any{"name": "px", "commands": into})
+		writeTree(t, dir, map[string]string{".claude-plugin/plugin.json": string(mb)})
+		if _, err := buildPluginView(snapshotSource(t, m, JobPlugin{Path: dir}), filepath.Join(t.TempDir(), "v"), true); err == nil {
+			t.Errorf("a manifest path %s was accepted", into)
+		}
+	}
+}
+
 // Fix loop 2, High: the job gets a copy, not links into the live plugin. A symlink in the plugin
 // (to a directory or a file outside) is not followed, so writing its target changes nothing the job
 // loads, and neither does changing the plugin after the snapshot was taken.
@@ -320,7 +383,7 @@ func assertSuperpowersSkills(t *testing.T, src string) {
 		t.Fatal(err)
 	}
 	for _, w := range warns {
-		if strings.Contains(w, ".md") {
+		if strings.Contains(w, ".md") && !strings.HasPrefix(w, "top-level entries left out") {
 			t.Errorf("a superpowers markdown file was dropped: %s", w)
 		}
 	}
