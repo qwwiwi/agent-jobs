@@ -13,6 +13,15 @@ import (
 )
 
 // treeJSON is the milestone tree as milestone_get returns it (the manager call behind the MCP tool).
+// why gives every dependency in keys the same one-line reason (milestone edges need one, #119).
+func why(keys ...string) *map[string]string {
+	m := map[string]string{}
+	for _, k := range keys {
+		m[k] = "shares files"
+	}
+	return &m
+}
+
 func treeJSON(t *testing.T, id int64) string {
 	t.Helper()
 	m, err := jobs.Open("test")
@@ -47,7 +56,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
 		input := filepath.Join(t.TempDir(), "milestone.json")
 		if err := os.WriteFile(input, []byte(`{"title": "from the file", "goal": "ship it", "max_parallel": 1,
-			"tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "covers": ["R01"]}]}`), 0o644); err != nil {
+			"tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "depends_why": {"T1": "shares files"}, "covers": ["R01"]}]}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		out := captureStdout(t, func() error {
@@ -81,7 +90,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
 
 		// The manager's validation, word for word: a cycle, no tasks, an unknown field, no input.
 		cycle := jobs.MilestoneCreate{Title: "loop", Tasks: []jobs.MilestoneTaskInput{
-			{Key: "T1", Title: "a", DependsOn: &[]string{"T2"}}, {Key: "T2", Title: "b", DependsOn: &[]string{"T1"}}}}
+			{Key: "T1", Title: "a", DependsOn: &[]string{"T2"}, DependsWhy: why("T2")}, {Key: "T2", Title: "b", DependsOn: &[]string{"T1"}, DependsWhy: why("T1")}}}
 		m, err := jobs.Open("test")
 		if err != nil {
 			t.Fatal(err)
@@ -134,7 +143,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
 		id := strconv.FormatInt(v.ID, 10)
 		out := captureStdout(t, func() error {
 			return cmdMilestoneEdit("set", []string{"--agent", "test", id, "--input", "-", "--title", "Stage renamed"},
-				strings.NewReader(`{"goal": "new goal", "tasks": [{"key": "T3", "title": "three", "depends_on": ["T1"]}], "drop": ["T2"]}`))
+				strings.NewReader(`{"goal": "new goal", "tasks": [{"key": "T3", "title": "three", "depends_on": ["T1"], "depends_why": {"T1": "shares files"}}], "drop": ["T2"]}`))
 		})
 		got := decodeTree(t, out)
 		status := map[string]string{}
