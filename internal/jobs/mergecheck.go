@@ -142,8 +142,10 @@ func gitCtxOK(ctx context.Context, dir string, args ...string) (string, error) {
 // MergeNote is the job-done line's merge check of a repository job with commits beyond its base:
 // whether `git merge-tree --write-tree` (objects only, no ref moves) merges the job's head onto the
 // current tip of its base branch, within MergeCheckTimeout. "" for a job without a repository, a
-// worktree or commits of its own. A merge-tree result is cached against the job's head and the
-// branch tip it was checked at (until the job is notified); a failed or timed out check is not.
+// worktree or commits of its own; a job whose head is still its base records that finding in the
+// cache instead (noCommitsOverBase reuses it, no git call of its own). A merge-tree result is cached
+// against the job's head and the branch tip it was checked at (until the job is notified); a failed
+// or timed out check is not.
 func (m *Manager) MergeNote(j *store.Job) string {
 	if j.RepoPath == "" || j.BaseCommit == "" {
 		return ""
@@ -170,6 +172,7 @@ func (m *Manager) MergeNote(j *store.Job) string {
 		return notChecked(err.Error())
 	}
 	if head == j.BaseCommit {
+		m.cacheNoCommits(j.ID, head)
 		return ""
 	}
 	ahead, err := run(j.RepoPath, "rev-list", "--count", j.BaseCommit+".."+head)
@@ -177,6 +180,7 @@ func (m *Manager) MergeNote(j *store.Job) string {
 		return notChecked(err.Error())
 	}
 	if ahead == "0" {
+		m.cacheNoCommits(j.ID, head)
 		return ""
 	}
 	if j.BaseBranch == "" {
@@ -231,8 +235,13 @@ func (m *Manager) MergeNote(j *store.Job) string {
 	return note
 }
 
-// mergeCheck is a cached merge-tree result: the note for the job's head merged onto tip.
-type mergeCheck struct{ head, tip, note string }
+// mergeCheck is a cached merge-tree result: the note for the job's head merged onto tip, or — with
+// noCommits set — that the head was still the base commit, so the job has no commits of its own
+// (tip is then empty).
+type mergeCheck struct {
+	head, tip, note string
+	noCommits       bool
+}
 
 func (m *Manager) cachedMergeNote(id, head, tip string) (string, bool) {
 	m.mergeMu.Lock()
@@ -250,7 +259,30 @@ func (m *Manager) cacheMergeNote(id, head, tip, note string) {
 	if m.mergeChecks == nil {
 		m.mergeChecks = map[string]mergeCheck{}
 	}
-	m.mergeChecks[id] = mergeCheck{head, tip, note}
+	m.mergeChecks[id] = mergeCheck{head: head, tip: tip, note: note}
+}
+
+// cacheNoCommits records that the job's head is its base commit — no commits of its own — for the
+// job-done line's suspicious note (#132). It lives like a merge note, until the job is notified,
+// and is refreshed by each check.
+func (m *Manager) cacheNoCommits(id, head string) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	if m.mergeChecks == nil {
+		m.mergeChecks = map[string]mergeCheck{}
+	}
+	m.mergeChecks[id] = mergeCheck{head: head, noCommits: true}
+}
+
+// noCommitsOverBase reports whether the merge check found the job with no commits over its base
+// (its head still the base commit): the check's own finding, no git call of its own. ok is false
+// when it is not known — no repository or worktree, or a check that did not run (or could not) —
+// so the suspicious note is never added on a guess.
+func (m *Manager) noCommitsOverBase(j *store.Job) (no, ok bool) {
+	m.mergeMu.Lock()
+	defer m.mergeMu.Unlock()
+	c, ok := m.mergeChecks[j.ID]
+	return c.noCommits, ok
 }
 
 // forgetMergeNote drops the cached merge check of a job that has been notified.
