@@ -102,8 +102,9 @@ func TestPluginViewDropsFrontMatterHooks(t *testing.T) {
 	}
 }
 
-// A symlinked directory inside the plugin is scanned too: a link must not smuggle a hooked skill past
-// the view.
+// A symlinked directory inside the plugin must not smuggle a hooked skill past the view. Since fix loop
+// 2 the view is a copy that does not follow links at all: the linked directory, clean or not, is left
+// out with a warning (TestPluginViewIsDetachedSnapshot).
 func TestPluginViewScansSymlinkedDirs(t *testing.T) {
 	m := newManager(t)
 	dir := makePlugin(t, "px", "1.0.0", nil)
@@ -127,8 +128,11 @@ func TestPluginViewScansSymlinkedDirs(t *testing.T) {
 			t.Errorf("the view exposes %s with executable front matter through a symlinked dir", rel)
 		}
 	}
-	if !strings.Contains(files[filepath.FromSlash("skills/linked/good/SKILL.md")], "GOOD_LINKED_SKILL") {
-		t.Errorf("the clean skill behind the link is gone: %v", files)
+	if _, ok := files[filepath.FromSlash("skills/linked/good/SKILL.md")]; ok {
+		t.Errorf("the view follows the symlinked directory: %v", files)
+	}
+	if _, w := m.JobPlugins(j); !strings.Contains(strings.Join(w, "\n"), filepath.FromSlash("skills/linked")) {
+		t.Errorf("warnings do not name the skipped link: %q", w)
 	}
 }
 
@@ -227,9 +231,9 @@ func TestPluginBootstrapInResumedSession(t *testing.T) {
 	}
 }
 
-// execFrontMatter fails closed: whatever it cannot read as plain block YAML keeps the file out.
+// The front matter check fails closed: whatever it cannot read as plain block YAML keeps the file
+// out (fix loop 2 made it an allowlist: TestFrontMatterAllowlist).
 func TestExecFrontMatter(t *testing.T) {
-	dir := t.TempDir()
 	for _, tc := range []struct {
 		name, body string
 		out        bool
@@ -237,8 +241,8 @@ func TestExecFrontMatter(t *testing.T) {
 		{"no front matter", "# title\nhooks: in the body\n", false},
 		{"clean", "---\nname: a\ndescription: uses hooks in prose\nallowed-tools: Bash\n---\nbody\n", false},
 		{"block scalar", "---\nname: a\ndescription: |\n  hooks: inside a block scalar\n---\n", false},
-		{"crlf clean", "---\r\nname: a\r\n---\r\n", false},
-		{"horizontal rule", "----\nhooks: x\n", false},
+		{"crlf clean", "---\r\nname: a\r\n---\r\n", true}, // fix loop 2: CR is refused
+		{"horizontal rule", "----\nhooks: x\n", true},     // fix loop 2: an opener other than "---" is refused
 		{"hooks", "---\nname: a\nhooks:\n  Stop: []\n---\n", true},
 		{"hooks spaced", "---\nhooks :\n  Stop: []\n---\n", true},
 		{"mcp servers", "---\nmcpServers: {x: {command: y}}\n---\n", true},
@@ -253,12 +257,8 @@ func TestExecFrontMatter(t *testing.T) {
 		{"tab indent", "---\nname: a\n\thooks: {}\n---\n", true},
 		{"unterminated", "---\nname: a\n", true},
 	} {
-		p := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "_")+".md")
-		if err := os.WriteFile(p, []byte(tc.body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if got := execFrontMatter(p); (got != "") != tc.out {
-			t.Errorf("%s: execFrontMatter = %q, want out=%v", tc.name, got, tc.out)
+		if got := frontMatterProblem([]byte(tc.body)); (got != "") != tc.out {
+			t.Errorf("%s: frontMatterProblem = %q, want out=%v", tc.name, got, tc.out)
 		}
 	}
 }

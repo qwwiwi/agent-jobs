@@ -131,10 +131,24 @@ func TestPluginNameResolvedThroughInstalledPlugins(t *testing.T) {
 	writeInstalled(v1, "1.0.0")
 	m.Cfg.JobPlugins = []JobPlugin{{Name: "px@mkt", AllowHooks: true}}
 
+	// The job gets a snapshot of the install (fix loop 2), allow_hooks too: its manifest says which.
+	snapshotVersion := func(j *store.Job) string {
+		t.Helper()
+		got := pluginDirArgs(argvOf(t, m, j.ID))
+		if len(got) != 1 || !under(got[0], m.JobDir(j.ID)) {
+			t.Fatalf("--plugin-dir %v, want a snapshot in the job dir", got)
+		}
+		var man struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal([]byte(readFile(t, filepath.Join(got[0], ".claude-plugin", "plugin.json"))), &man); err != nil {
+			t.Fatal(err)
+		}
+		return man.Version
+	}
 	j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
-	real1, _ := filepath.EvalSymlinks(v1)
-	if got := pluginDirArgs(argvOf(t, m, j.ID)); len(got) != 1 || (got[0] != v1 && got[0] != real1) {
-		t.Fatalf("--plugin-dir %v, want %s", got, v1)
+	if v := snapshotVersion(j); v != "1.0.0" {
+		t.Fatalf("snapshot of version %q, want 1.0.0", v)
 	}
 	views, _ := m.JobPlugins(j)
 	if len(views) != 1 || views[0].Name != "px" || views[0].Version != "1.0.0" {
@@ -143,9 +157,8 @@ func TestPluginNameResolvedThroughInstalledPlugins(t *testing.T) {
 	// A plugin update moves installPath: the next job follows without a config edit.
 	writeInstalled(v2, "2.0.0")
 	j = runToEnd(t, m, enqueue(t, m, "x", nil).ID)
-	real2, _ := filepath.EvalSymlinks(v2)
-	if got := pluginDirArgs(argvOf(t, m, j.ID)); len(got) != 1 || (got[0] != v2 && got[0] != real2) {
-		t.Fatalf("after update --plugin-dir %v, want %s", got, v2)
+	if v := snapshotVersion(j); v != "2.0.0" {
+		t.Fatalf("after update a snapshot of version %q, want 2.0.0", v)
 	}
 	if views, _ = m.JobPlugins(j); len(views) != 1 || views[0].Version != "2.0.0" {
 		t.Fatalf("plugin view after update %+v", views)
@@ -248,11 +261,20 @@ func TestPluginHooksDisabledByDefault(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "hooks", "hooks.json")); err != nil {
 		t.Fatalf("the plugin's own hooks were touched: %v", err)
 	}
-	// allow_hooks passes the plugin directory itself.
+	// allow_hooks gets an unfiltered snapshot (fix loop 2: never the live plugin directory).
 	m.Cfg.JobPlugins = []JobPlugin{{Path: dir, AllowHooks: true}}
 	j = runToEnd(t, m, enqueue(t, m, "x", nil).ID)
-	if got := pluginDirArgs(argvOf(t, m, j.ID)); len(got) != 1 || (got[0] != dir && !strings.HasSuffix(got[0], filepath.Base(dir))) {
-		t.Fatalf("allow_hooks: --plugin-dir %v, want %s", got, dir)
+	got := pluginDirArgs(argvOf(t, m, j.ID))
+	if len(got) != 1 || got[0] == dir || !under(got[0], m.JobDir(j.ID)) {
+		t.Fatalf("allow_hooks: --plugin-dir %v, want a snapshot in the job dir", got)
+	}
+	for _, kept := range []string{"hooks/hooks.json", ".mcp.json"} {
+		if _, err := os.Stat(filepath.Join(got[0], filepath.FromSlash(kept))); err != nil {
+			t.Errorf("allow_hooks: the snapshot lacks %s: %v", kept, err)
+		}
+	}
+	if !strings.Contains(readFile(t, filepath.Join(got[0], ".claude-plugin", "plugin.json")), "mcpServers") {
+		t.Error("allow_hooks: the snapshot manifest lost mcpServers")
 	}
 }
 
@@ -368,7 +390,8 @@ func TestPluginBootstrapSymlinkRefused(t *testing.T) {
 	if strings.Contains(promptOf(t, m, j.ID), "SYMLINK_SECRET_MARKER") {
 		t.Fatal("a symlinked SKILL.md was followed into the prompt")
 	}
-	if _, warns := m.JobPlugins(j); len(warns) != 1 {
+	// One warning for the bootstrap, one for the link the view does not copy (fix loop 2).
+	if _, warns := m.JobPlugins(j); len(warns) != 2 || !strings.Contains(strings.Join(warns, "\n"), "bootstrap skill linked") {
 		t.Fatalf("warnings %q", warns)
 	}
 }
