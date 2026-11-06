@@ -52,6 +52,34 @@ func TestHookBindFailedEpochResetEmitsSnapshot(t *testing.T) {
 	}
 }
 
+// Loop 2: a failed epoch reset followed by a failed stdout write must not leave the old suppression behind
+// for the next process (the force flag lives in one manager only).
+func TestHookBindFailedEpochAndFailedStdoutStillEmitsNext(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	h.finish("a1", "first")
+	if out := h.bind(); !strings.Contains(out, "a1 first") {
+		t.Fatalf("first SessionStart: %q", out)
+	}
+	if err := os.Mkdir(filepath.Join(h.stateDir(), "hook-emit.json.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var errs bytes.Buffer
+	if code := runHook([]string{"bind", "--agent", "test"}, strings.NewReader(bindEvent("s1", h.orch)), failingWriter{}, &errs, h.open); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errs.String())
+	}
+	// A fresh process (new manager, no in-memory flag) must emit the post-compaction snapshot.
+	// The state is still unwritable, so the emission cannot be recorded (stderr says so); stdout matters.
+	var out bytes.Buffer
+	errs.Reset()
+	in := `{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}`
+	if code := runHook([]string{"brief-reminder", "--agent", "test"}, strings.NewReader(in), &out, &errs, h.open); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errs.String())
+	}
+	if !strings.Contains(out.String(), "a1 first") {
+		t.Errorf("next hook after a failed epoch reset and a failed stdout: %q, want the snapshot", out.String())
+	}
+}
+
 // A reminder the hook could not write to stdout is not recorded as emitted.
 func TestHookPendingOutcomeStdoutFailureIsNotRecorded(t *testing.T) {
 	t.Run("brief-reminder", func(t *testing.T) {

@@ -274,12 +274,26 @@ func (m *Manager) withHookState(sessionID string, fn func(*hookEmitState) bool) 
 
 // StartHookEpoch begins a new context epoch of sessionID (SessionStart: startup, resume, clear and
 // compaction all start one), so every deduplicated block is emitted once more.
+//
+// The new epoch must outlive a failed write and a failed delivery: when the state cannot be saved, the
+// old record (previous epoch, hash, time) would keep suppressing the snapshot in every later process. So
+// the old record is dropped from disk instead; an absent record means «emit», and stays that way until a
+// delivery is recorded. Only when even that fails is the error returned (the caller then forces the
+// block out of this process).
 func (m *Manager) StartHookEpoch(sessionID string) error {
-	return m.withHookState(sessionID, func(st *hookEmitState) bool {
+	err := m.withHookState(sessionID, func(st *hookEmitState) bool {
 		st.Epoch++
 		st.Kinds = nil
 		return true
 	})
+	if err == nil {
+		return nil
+	}
+	if rerr := os.Remove(filepath.Join(m.StateDir, hookEmitFile)); rerr == nil || errors.Is(rerr, os.ErrNotExist) {
+		m.logf("hook dedupe: %v (dropped the old emission record instead)", err)
+		return nil
+	}
+	return err
 }
 
 // HookEmission is a block a hook decided to inject. The decision is made under the state lock, and the
