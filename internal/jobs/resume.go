@@ -1128,7 +1128,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 // resumeMessage is the new user message of a resumed attempt.
 func (m *Manager) resumeMessage(j *store.Job) string {
 	return fmt.Sprintf("%s\nContinue the task with this update; keep the report contract: your final message is the "+
-		"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Progress.\n"+
+		"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Forks and Progress.\n"+
 		"Limits of this continuation (attempt %d): %d turns, $%g, %d minutes.\n",
 		updateBlock(j.PendingContext), j.Attempt, j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 }
