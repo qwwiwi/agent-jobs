@@ -17,7 +17,8 @@ import (
 
 // fakeAdvisorClaude stands in for the advisor's claude -p: it records each call (argv one per line,
 // stdin, cwd, environment) in $FAKE_ADV_DIR as argv.N / stdin.N / cwd.N / env.N and prints
-// $FAKE_ADV_DIR/out; with $FAKE_ADV_DIR/slow present it sleeps first (a call that runs long).
+// $FAKE_ADV_DIR/out; with $FAKE_ADV_DIR/slow present it records its pid in pid.N and sleeps first (a
+// call that runs long).
 const fakeAdvisorClaude = `#!/bin/bash
 d="$FAKE_ADV_DIR"
 echo call >> "$d/calls"
@@ -26,7 +27,7 @@ printf '%s\n' "$@" > "$d/argv.$n"
 cat > "$d/stdin.$n"
 pwd > "$d/cwd.$n"
 env > "$d/env.$n"
-if [ -f "$d/slow" ]; then sleep 30; fi
+if [ -f "$d/slow" ]; then echo $$ > "$d/pid.$n"; sleep 30; fi
 cat "$d/out" 2>/dev/null
 `
 

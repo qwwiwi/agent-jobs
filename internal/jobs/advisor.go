@@ -173,6 +173,9 @@ func (m *Manager) AskAdvisor(ctx context.Context, j *store.Job, question, backgr
 		return nil, err
 	}
 	m.Log.Printf("job %s: advisor call %d (%s, budget $%.2f)", j.ID, call.N, cr.AdvisorModel, call.BudgetUSD)
+	if m.beforeAdvisorLaunch != nil {
+		m.beforeAdvisorLaunch(j)
+	}
 	wctx, stopWatch := m.whileJobRuns(ctx, j.ID)
 	res := m.advisorCall(wctx, j, call, advisorPrompt(question, background))
 	stopWatch()
@@ -382,7 +385,17 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = maxAdvisorOutput, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := cmd.Run()
+	scope := ""
+	if unit != "" {
+		scope = scopeID
+	}
+	release, err := m.startAdvisor(j, call.N, cmd, scope)
+	if err != nil {
+		// Refused (the job left running) or not startable: no process ran, nothing was spent.
+		return advisorResult{costKnown: errors.Is(err, errAdvisorRefused), err: err}
+	}
+	runErr := cmd.Wait()
+	release()
 	if unit != "" && cctx.Err() != nil {
 		if err := m.stopScope(scopeID); err != nil {
 			m.Log.Printf("job %s: advisor call %d: stop scope: %v", j.ID, call.N, err)
@@ -401,7 +414,13 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 	if parsed {
 		out.cost, out.costKnown = res.knownCost()
 	}
+	var ended error // the job left running: its lifecycle ended the call (endAdvisors)
+	if runErr != nil && !parsed {
+		ended = m.advisorLive(j)
+	}
 	switch {
+	case ended != nil:
+		out.err = fmt.Errorf("the advisor call stopped: %w", ended)
 	case runErr != nil && !parsed:
 		out.err = fmt.Errorf("advisor: %v: %s", runErr, RedactPrintable(stderr.String(), 300))
 	case jerr != nil:

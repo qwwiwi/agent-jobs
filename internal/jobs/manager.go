@@ -82,6 +82,8 @@ type Manager struct {
 	sourcesRetryAt sync.Map
 	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
 	beforeClaim func(*store.Job)
+	// beforeAdvisorLaunch (tests only) runs between an advisor call's reservation and its launch.
+	beforeAdvisorLaunch func(*store.Job)
 
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
@@ -1912,6 +1914,8 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
+	// The row has left running: no advisor call is admitted any more, and the ones running end now.
+	m.noteSweep(j.ID, m.endAdvisors(j.ID))
 	if status == store.StatusTimeout || status == store.StatusFailed {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
@@ -2149,6 +2153,8 @@ func (m *Manager) Cancel(id string) error {
 	if err := m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now); err != nil {
 		return err
 	}
+	// The row has left running: no advisor call is admitted any more, and the ones running end now.
+	m.noteSweep(id, m.endAdvisors(id))
 	m.noteSweep(id, m.sweepEscaped(id))
 	m.settled(id)
 	return nil

@@ -526,6 +526,8 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		RedactPrintable(msg, 800), now); err != nil {
 		return nil, err
 	}
+	// The row has left running: no advisor call is admitted any more, and the ones running end now.
+	m.noteSweep(id, m.endAdvisors(id))
 	// Only now (the row is no longer running) does a process left in the job's session count as a
 	// ghost; it is swept before the transcript digest is taken.
 	note := m.sweepEscaped(id)
