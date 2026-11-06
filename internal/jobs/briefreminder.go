@@ -75,7 +75,7 @@ func (m *Manager) BriefReminder(in UserPromptInput) (string, error) {
 	if m.Config().SizeRequired {
 		line += " " + SizeRuleNote + "."
 	}
-	return line, nil
+	return m.CapHookBlock(line), nil
 }
 
 // checklistNote says what checklist decision is pending in the repository at cwd ("" = none: no brief

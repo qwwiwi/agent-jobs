@@ -205,9 +205,15 @@ type Config struct {
 	SkillsMaxPerJob int `json:"skills_max_per_job"`
 	// SkillsMaxKB caps the total size of one job's skills in KB. 0 = skills.DefaultMaxKB (400).
 	SkillsMaxKB float64 `json:"skills_max_kb"`
+	// JobPlugins are Claude Code plugins (skill packs) loaded into claude jobs with --plugin-dir (see
+	// JobPlugin). Restart-only: allow_hooks lets plugin code run outside the guard.
+	JobPlugins []JobPlugin `json:"job_plugins"`
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
+	// Hooks tunes the text the orchestrator's hooks inject into its context: the repeat interval of an
+	// unchanged block and the byte cap of every block (#166).
+	Hooks HooksConfig `json:"hooks"`
 	// ModelPrices adds or overrides list prices (USD per million tokens) by model name, used to estimate
 	// the cost of attempts that ended without a reported one (killed, timed out, codex). A model with no
 	// price here or in the built-in table keeps an unknown cost.
@@ -542,6 +548,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if c.SkillsMaxKB < 0 {
 		return c, fmt.Errorf("config.json: skills_max_kb %g must be 0 (default %d) or positive", c.SkillsMaxKB, skills.DefaultMaxKB)
 	}
+	if err := validateJobPlugins(c.JobPlugins); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
 	// The daemon, the MCP server and the guard hook run in different directories: a relative path
 	// would name a different file in each (and the hook would protect the wrong one).
 	if c.OwnerRulesPath != "" && !filepath.IsAbs(c.OwnerRulesPath) {
@@ -609,6 +618,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := validatePrices(c.ModelPrices); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.Hooks.validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {

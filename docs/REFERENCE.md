@@ -25,6 +25,8 @@ claude -p --output-format stream-json --verbose --model M \
 
 `--max-budget-usd` is omitted for `runner: openrouter` jobs (#148): their OpenRouter proxy enforces `max_budget_usd`.
 
+Config `job_plugins` adds one `--plugin-dir <dir>` per configured Claude Code plugin to claude jobs of the matching kinds (skill packs such as `superpowers`, which `--setting-sources project` would otherwise keep out). Their hooks and servers are cut from the job's view of the plugin unless `allow_hooks` is set; `deny_skills` become `Skill(<plugin>:<skill>)` deny rules, and `bootstrap_skill` puts one plugin skill's text into the prompt as «Skills bootstrap», standing in for the plugin's SessionStart hook. Codex jobs get none. See GUIDE «Plugins for jobs».
+
 The process is started detached, in its own process group, and writes its exit code to a file itself. So a daemon restart neither kills nor loses the job: the new daemon finds the exit-code file on the next tick.
 
 The kind of work sets a short checklist in the brief:

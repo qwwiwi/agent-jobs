@@ -650,6 +650,9 @@ func cmdStatus(args []string) error {
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
 		}
+		for _, w := range m.PluginWarnings() {
+			fmt.Println("plugins warning:", shown(w))
+		}
 		if err := printMergeGates(m); err != nil {
 			return err
 		}
@@ -680,6 +683,17 @@ func cmdStatus(args []string) error {
 		if j.SkillsNote != "" {
 			fmt.Printf("           %s\n", j.SkillsNote)
 		}
+	}
+	plugins, pluginWarns := m.JobPlugins(j)
+	for _, p := range plugins {
+		hooks := "off"
+		if p.Hooks {
+			hooks = "allowed"
+		}
+		fmt.Printf("plugin:    %s %s (hooks %s)\n", shown(p.Name), shown(p.Version), hooks)
+	}
+	for _, w := range pluginWarns {
+		fmt.Printf("plugin warning: %s\n", shown(w))
 	}
 	if len(j.Sources) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
@@ -2150,19 +2164,24 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if sub == "brief-reminder" {
 		type answer struct {
 			line string
-			warn string
-			err  error
+			// emission is the pending-outcome block inside line; it holds the dedupe state lock until this
+			// goroutine commits it after line reached stdout, or releases it.
+			emission *jobs.HookEmission
+			warn     string
+			err      error
 		}
 		done := make(chan answer, 1)
 		go func() {
-			line, warn, err := briefReminder(args[1:], stdin, openReadOnly)
-			done <- answer{line, warn, err}
+			line, em, warn, err := briefReminder(args[1:], stdin, briefReminderOpener)
+			done <- answer{line, em, warn, err}
 		}()
 		var a answer
 		select {
 		case a = <-done:
 		case <-time.After(briefReminderTimeout):
 			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+			// A worker that answers late is never delivered: its emission is dropped unrecorded.
+			go func() { (<-done).emission.Release() }()
 		}
 		if a.warn != "" {
 			fmt.Fprintln(stderr, a.warn)
@@ -2171,11 +2190,18 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		case errors.Is(a.err, jobs.ErrInJobSession):
 			// A job session: silent, like the job-role refusal in main.
 		case a.err != nil:
+			a.emission.Release()
 			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", a.err, "(no reminder)")
 		case a.line != "":
 			if _, err := fmt.Fprintln(stdout, a.line); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				a.emission.Release()
 				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err)
+			} else if err := a.emission.Commit(); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(emission not recorded)")
 			}
+		default:
+			a.emission.Release()
 		}
 		return 0
 	}
@@ -2215,10 +2241,18 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 			return fail(err)
 		}
 		// SessionStart stdout becomes context, including after a restart or compaction.
-		if line, err := m.PendingOutcomeReminder(in.SessionID); err != nil {
+		em, err := m.PendingOutcomeReminder(in.SessionID)
+		switch {
+		case err != nil:
 			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no pending-outcome reminder)")
-		} else if line != "" {
-			fmt.Fprintln(stdout, line)
+		case em != nil:
+			if _, err := fmt.Fprintln(stdout, em.Text); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				em.Release()
+				fmt.Fprintln(stderr, "agent-jobs hook bind:", err)
+			} else if err := em.Commit(); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(emission not recorded)")
+			}
 		}
 		return 0
 	}
@@ -2244,7 +2278,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if err != nil {
 		return fail(err)
 	}
-	out := jobs.StopHookDecision(in, pending)
+	out := jobs.StopHookDecisionCapped(in, pending, m.Config().Hooks.Max())
 	if out == nil {
 		return 0
 	}
@@ -2353,45 +2387,51 @@ func mergeGateWarningJSON(warning string) preToolUseOutput {
 
 // briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
 // prompt goes on without a reminder.
-const briefReminderTimeout = 2 * time.Second
+var briefReminderTimeout = 2 * time.Second
+
+// briefReminderOpener opens the store for the brief reminder (replaced in tests).
+var briefReminderOpener = openReadOnly
 
 // briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, string, error) {
+//
+// The returned emission (nil when there is no pending-outcome block) is part of line and holds the dedupe
+// state lock: the caller commits it once line reached stdout, or releases it.
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, *jobs.HookEmission, string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	if len(pos) > 0 {
-		return "", "", errors.New("no positional arguments")
+		return "", nil, "", errors.New("no positional arguments")
 	}
 	in, err := jobs.ParseUserPromptInput(stdin)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	m, err := opener(*agent)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	defer m.Close()
 	line, err := m.BriefReminder(in)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
-	pending, err := m.PendingOutcomeReminder(in.SessionID)
+	em, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
+		return line, nil, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
 	}
 	if line == "" {
-		return pending, "", nil
+		return em.Line(), em, "", nil
 	}
-	if pending != "" {
-		line += "\n" + pending
+	if em != nil {
+		line += "\n" + em.Text
 	}
-	return line, "", nil
+	return line, em, "", nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
@@ -2400,14 +2440,15 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	agentFlag(fs)
+	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err == nil && len(pos) > 0 {
 		err = errors.New("no positional arguments")
 	}
 	var msg string
 	if err == nil {
-		msg, err = jobs.SkillsPicker(stdin)
+		// The picker reads no state, only the configured byte cap of the agent (the default when unknown).
+		msg, err = jobs.SkillsPickerCapped(stdin, jobs.HookMaxBytesOf(*agent))
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", jobs.Printable(err.Error(), 300), "(no reminder)")

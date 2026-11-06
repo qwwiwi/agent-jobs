@@ -57,6 +57,10 @@ type Manager struct {
 	memMu        sync.Mutex
 	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
 
+	// forceHookSnapshot is set when a new context epoch could not be recorded: the next hook block is
+	// injected whatever the stale emission state says.
+	forceHookSnapshot atomic.Bool
+
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
 	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
@@ -897,6 +901,8 @@ func claudeBaseArgs(j *store.Job, jobDir string) []string {
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
 	)
+	// The plugins the daemon resolved for this job (plugins.go); none for a gate job or a job with no match.
+	args = append(args, claudePluginArgs(jobDir)...)
 	// The flag outranks an effortLevel in the worktree's project settings; a row from before the effort
 	// was recorded has none and runs at the CLI default.
 	if j.ReasoningEffort != "" {

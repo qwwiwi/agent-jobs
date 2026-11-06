@@ -121,7 +121,7 @@ A job gets `memory_search` and `memory_write` only, through the daemon, and neve
 
 You receive one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m · model <m> · effort <e>`. The report is not pushed into the session.
 
-The existing `hook bind` (SessionStart) and `hook brief-reminder` (UserPromptSubmit), when registered, also surface `[jobs:pending-outcome]` reminders in the bound session until `job_outcome` is recorded. They include succeeded, failed and timed-out jobs finished within seven days, exclude cancelled jobs, and list up to five ids plus the remaining count.
+The existing `hook bind` (SessionStart) and `hook brief-reminder` (UserPromptSubmit), when registered, also surface `[jobs:pending-outcome]` reminders in the bound session until `job_outcome` is recorded. They include succeeded, failed and timed-out jobs finished within seven days, exclude cancelled jobs, and list up to five ids plus a `+N more, see job_list` tail. A block is injected once per state: again only when a job id or status in it changed, after `hooks.repeat_after_seconds` (default 1800), or after a SessionStart (also a compaction); no block is longer than `hooks.max_bytes` (default 1500), and the owner-waits Stop message obeys the same cap.
 
 1. Read it with `job_result` when you are ready. Read the section **«Not done / uncertain» first**: it names what the job did not do or could not verify.
 2. The report is a claim, not a result. Check the diff yourself against `base_commit`: in the worktree while it exists, afterwards `commits.patch`, `staged.patch`, `uncommitted.patch`, `untracked.tar`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`. Run the checks yourself.

@@ -150,7 +150,14 @@ func ownerPendingState(state string) string {
 
 // StopHookDecision is the hook's answer for the bound session: nil allows the stop, otherwise the
 // block with its reason.
+// The reason is capped at DefaultHookMaxBytes (StopHookDecisionCapped takes the configured cap).
 func StopHookDecision(in StopHookInput, pending []*store.OwnerPending) *StopHookOutput {
+	return StopHookDecisionCapped(in, pending, DefaultHookMaxBytes)
+}
+
+// StopHookDecisionCapped is StopHookDecision with the whole reason capped at maxBytes
+// (config hooks.max_bytes): the pending jobs that do not fit are counted in a "+N more, see job_list" tail.
+func StopHookDecisionCapped(in StopHookInput, pending []*store.OwnerPending, maxBytes int) *StopHookOutput {
 	if StopHookSkips(in) || len(pending) == 0 {
 		return nil
 	}
@@ -161,10 +168,10 @@ func StopHookDecision(in StopHookInput, pending []*store.OwnerPending) *StopHook
 	}
 	return &StopHookOutput{
 		Decision: "block",
-		Reason: "Owner waits: the owner asked for " + strings.Join(parts, ", ") + ", and the job has finished. " +
-			"Write the result to the owner over your channel now (read the report with job_result first), " +
-			"then call the agent-jobs tool owner_replied (with job_id, or without one for all). " +
-			"If you already wrote to the owner, just call owner_replied.",
+		Reason: capItems("Owner waits: the owner asked for ", parts, len(parts), ", ", ", and the job has finished. "+
+			"Write the result to the owner over your channel now (read the report with job_result first), "+
+			"then call the agent-jobs tool owner_replied (with job_id, or without one for all). "+
+			"If you already wrote to the owner, just call owner_replied.", maxBytes),
 	}
 }
 
@@ -196,7 +203,17 @@ func (m *Manager) BindHookSession(in SessionStartInput, pane string) error {
 	if err := checkInsideDir(in.Cwd, m.Config().OrchestratorDir); err != nil {
 		return fmt.Errorf("bind refused: %w", err)
 	}
-	return m.Store.BindHookSession(in.SessionID, m.Now())
+	if err := m.Store.BindHookSession(in.SessionID, m.Now()); err != nil {
+		return err
+	}
+	// SessionStart also fires after a compaction: a new context epoch, so the next reminder is a fresh
+	// snapshot. A state that cannot be written must not hide it: the old epoch and hash would suppress the
+	// block, so the next one is forced out (a duplicate later, never a loss).
+	if err := m.StartHookEpoch(in.SessionID); err != nil {
+		m.forceHookSnapshot.Store(true)
+		m.logf("hook bind: %v", err)
+	}
+	return nil
 }
 
 // rePaneID is a tmux pane id (#{pane_id}).
