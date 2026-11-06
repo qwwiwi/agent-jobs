@@ -37,6 +37,28 @@ func startOwned(t testing.TB, cmd *exec.Cmd) (stop func() error) {
 	return stop
 }
 
+// startJoined starts cmd for test t with its wait in a goroutine of its own: exited is closed when
+// the wait returns, and werr then gives its error. Right after the start it registers in t.Cleanup a
+// SIGKILL and the join of that wait, so no path out of the test, a failed waitFor before the test's
+// own kill included, leaves the child running (#110). The kill after the wait has returned is a no-op.
+func startJoined(t testing.TB, cmd *exec.Cmd) (exited <-chan struct{}, werr func() error) {
+	t.Helper()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var err error
+	go func() {
+		err = cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-done
+	})
+	return done, func() error { <-done; return err }
+}
+
 // The helper mode of this test binary (TestMain): the path of the agent-jobs binary under test, the
 // file the helper writes the daemon's pid and its home to, and what it does after the start.
 const (
@@ -79,11 +101,7 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
 			c := exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
 			c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"="+mode)
 			c.Stdout, c.Stderr = io.Discard, io.Discard
-			if err := c.Start(); err != nil {
-				t.Fatal(err)
-			}
-			done := make(chan error, 1)
-			go func() { done <- c.Wait() }()
+			exited, werr := startJoined(t, c)
 			var pid int
 			var home string
 			waitFor(t, "daemon pid", 30*time.Second, func() bool {
@@ -108,8 +126,8 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
 				_ = c.Process.Kill()
 			}
 			select {
-			case err := <-done:
-				if err == nil {
+			case <-exited:
+				if werr() == nil {
 					t.Fatal("the helper test passed; it must fail mid-way")
 				}
 			case <-time.After(30 * time.Second):
