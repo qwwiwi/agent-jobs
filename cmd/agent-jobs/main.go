@@ -83,6 +83,14 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the skills rating: delivered, used, success rate, last
                                            used, median cost, stale flag and a per-repository
                                            breakdown (same as GET /v1/skills)
+  stats wakes --agent A [--since D] [--json]
+                                           what reached the orchestrator session: deliveries and hook
+                                           injections per category per day, batch sizes, bytes (p50, p95)
+  slo        record NAME SECONDS --agent A [--json]
+                                           store one duration; over its slo.targets norm it is a breach,
+                                           noted once on the next delivery to the session
+  slo        show --agent A [--since D] [--json]
+                                           per name: count, p50, p95, last and the configured norm
   skills list   --agent A [--kind K] [--repo R] [--status S] [--json]
   skills search --agent A QUERY [--kind K] [--repo R] [--status S] [--json]
                                            the skill catalog (config skill_roots, same as the
@@ -231,6 +239,8 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "slo":
+		err = cmdSLO(args)
 	case "gate":
 		err = cmdGate(args)
 	case "intentions":
@@ -1818,6 +1828,9 @@ func cmdNotifyOwner(args []string) error {
 }
 
 func cmdStats(args []string) error {
+	if len(args) > 0 && args[0] == "wakes" {
+		return cmdStatsWakes(args[1:])
+	}
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
@@ -2168,6 +2181,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no pending-outcome reminder)")
 		} else if line != "" {
 			fmt.Fprintln(stdout, line)
+			m.RecordInjection(jobs.InjectPendingOutcome, line)
 		}
 		return 0
 	}
@@ -2200,6 +2214,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
 		return fail(err)
 	}
+	m.RecordInjection(jobs.InjectStop, out.Reason)
 	return 0
 }
 
@@ -2332,8 +2347,13 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 	}
 	pending, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
+		recordInjection(*agent, jobs.InjectBriefReminder, line)
 		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
 	}
+	// The hook holds a read-only store: what it injects is recorded (#170) by a short separate write
+	// that is skipped, never waited for, when the store is busy.
+	recordInjection(*agent, jobs.InjectBriefReminder, line)
+	recordInjection(*agent, jobs.InjectPendingOutcome, pending)
 	if line == "" {
 		return pending, "", nil
 	}
@@ -2341,6 +2361,12 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 		line += "\n" + pending
 	}
 	return line, "", nil
+}
+
+// recordInjection counts text a hook added to the session's context. The count is best effort: a busy
+// or older store (no table yet) is not worth a hook failure or a wait.
+func recordInjection(agent, category, text string) {
+	_ = jobs.RecordHookInjection(agent, category, text, time.Now())
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,

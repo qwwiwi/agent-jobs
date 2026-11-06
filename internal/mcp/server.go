@@ -59,6 +59,7 @@ var toolDefs = []toolDef{
 	{"job_resume", addJobResume},
 	{"job_amend", addJobAmend},
 	{"job_stats", addJobStats},
+	{"wake_stats", addWakeStats},
 	{"job_outcome", addJobOutcome},
 	{"skill_list", addSkillList},
 	{"memory_search", addMemorySearch},
@@ -127,6 +128,7 @@ State an explicit model or a complexity (light|normal|hard, mapped to a model by
 When a job ends this session receives one line "[jobs:job-done] job <id> ..." (with notify_coalesce_seconds set, jobs ending close together arrive as one line "[jobs:job-done] N jobs: <id> ...; <id> ..."); the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
 Once you have acted on a result, record what you did with it: job_outcome(id, accepted|extended|reworked|rerun|discarded, note?); job_stats reports the outcome shares and the cost per usable result.
+wake_stats reports what reached this session (lines by category per day, batch sizes, bytes p50/p95, hook injections); a line may end with " · slo breach: <name> <seconds>s > <norm>s" (a duration recorded by agent-jobs slo record went over its norm).
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.
 system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.

@@ -398,6 +398,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner notifications: %w", err)
 	}
+	if _, err := db.Exec(wakesSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: orchestrator wakes: %w", err)
+	}
 	if err := migrateOwnerPending(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: owner pending: %w", err)

@@ -876,7 +876,8 @@ func (m *Manager) sendCheckAlerts(token string) error {
 		}
 		var errs []error
 		for _, batch := range checkMissedBatches(m.missedItems(rows)) {
-			if serr := m.sendTmux(ctx, target, batch.line); serr != nil {
+			members := idStrings(batch.ids)
+			if serr := m.deliverCounted(ctx, target, WakeCheckMissed, WakeCheckMissed+":"+strings.Join(members, ","), members, batch.line); serr != nil {
 				m.Log.Printf("check watchdog: alert not delivered: %v: %s", serr, batch.line)
 				errs = append(errs, m.Store.FailCheckAlertBatchAttempt(token, batch.ids, serr.Error(), MaxCheckAlertAttempts))
 				continue

@@ -47,6 +47,8 @@ Default limits and ceilings. A request above a ceiling is rejected, not silently
 
 When a job has finished, the main session gets one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. With `notify_coalesce_seconds` set, jobs that finish close together arrive as one line, `[jobs:job-done] 3 jobs: <id> …; <id> …; <id> …`, so the session wakes once instead of once per job; a job the owner waits on is never held. The report itself is not poured into the session; the agent fetches it with the `job_result` tool when it is ready to read it.
 
+Every such line, and every hook injection, is counted by category with its bytes (`agent-jobs stats wakes`, MCP `wake_stats`). A duration recorded with `agent-jobs slo record <name> <seconds>` that is over its `slo.targets` norm adds ` · slo breach: <name> <seconds>s > <norm>s` to the end of the next line of any category, once.
+
 ## Where everything is kept
 
 Each job has its own folder `jobs/<id>/` in the system's home directory, and its status, cost and pid live as a row in SQLite. Statuses: queued, running, succeeded, failed, timeout, cancelled; only the first two can change.

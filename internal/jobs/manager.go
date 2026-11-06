@@ -678,6 +678,9 @@ func (m *Manager) tickLocked() error {
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
 	}
+	if err := m.sloInvestigate(); err != nil {
+		errs = append(errs, fmt.Errorf("slo investigate: %w", err))
+	}
 	return errors.Join(errs...)
 }
 

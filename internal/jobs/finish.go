@@ -410,7 +410,8 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
-	if err := m.sendTmuxLocked(target, line); err != nil {
+	ids := batchMembers(batch)
+	if err := m.sendCounted(target, WakeJobDone, WakeJobDone+":"+strings.Join(ids, ","), ids, line); err != nil {
 		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
 		return errors.Is(err, errTmuxTimeout), nil
 	}
@@ -436,6 +437,17 @@ func (m *Manager) coalescedLine(batch []*store.Job) string {
 		parts = append(parts, strings.TrimPrefix(line, doneLinePrefix))
 	}
 	return fmt.Sprintf("[jobs:job-done] %d jobs: %s", len(batch), strings.Join(parts, "; "))
+}
+
+// batchMembers are the ids of a delivery's jobs, sorted: the same batch gives the same identity
+// whatever the order the store returned it in.
+func batchMembers(batch []*store.Job) []string {
+	ids := make([]string, 0, len(batch))
+	for _, j := range batch {
+		ids = append(ids, j.ID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // batchIDs names the jobs of a delivery for the log: "id" or "id1, id2, …".
