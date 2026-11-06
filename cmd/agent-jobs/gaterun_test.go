@@ -9,12 +9,16 @@ import (
 	"testing"
 )
 
-// `agent-jobs gate run` passes the command's own flags through, takes the lock under the agent-jobs home
-// and always ends stdout with exit=N, also on a usage error.
+// `agent-jobs gate run` passes the command's own flags through, takes the box lock (here the test's own,
+// gateRunTestLock), never one under the agent-jobs home, has no flag to pick another lock and always
+// ends stdout with exit=N, also on a usage error.
 func TestGateRunCLI(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AGENT_JOBS_HOME", home)
 	t.Setenv("TELEGRAM_BOT_TOKEN", "do-not-pass")
+	lock := filepath.Join(t.TempDir(), "agent-jobs-gate.lock")
+	gateRunTestLock = lock
+	t.Cleanup(func() { gateRunTestLock = "" })
 	repo := t.TempDir()
 	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q",
 		"--allow-empty", "-m", "init"}} {
@@ -38,13 +42,17 @@ func TestGateRunCLI(t *testing.T) {
 	if code != 4 || o != "arg=-x tg=none\nexit=4\n" {
 		t.Fatalf("code %d, out %q, err %q", code, o, e)
 	}
-	if _, err := os.Stat(filepath.Join(home, "gate.lock")); err != nil {
-		t.Fatalf("the default gate lock is not under the agent-jobs home: %v", err)
+	if _, err := os.Stat(lock); err != nil {
+		t.Fatalf("the gate did not take the box lock: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "gate.lock")); err == nil {
+		t.Fatal("a gate lock under the agent-jobs home: the lock follows the state root")
 	}
 	for _, args := range [][]string{
 		{"--repo", repo, "--head", head},          // no command
 		{"--repo", repo, "--bogus", "--", "true"}, // unknown flag
 		{"--repo", repo, "--", "true"},            // no --head
+		{"--repo", repo, "--head", head, "--lock", filepath.Join(home, "other.lock"), "--", "true"}, // no other lock
 	} {
 		if code, o, _ := run(args...); code != 125 || !strings.HasSuffix(o, "exit=125\n") {
 			t.Fatalf("%v: code %d, out %q", args, code, o)

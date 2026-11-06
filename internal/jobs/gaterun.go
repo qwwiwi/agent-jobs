@@ -5,22 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // Serialized gate runner (#134): `agent-jobs gate run` runs one heavy local gate (check.sh, a pg suite,
 // a vite build) for the orchestrator so that
-//   - one gate runs at a time per box: an exclusive flock on <agent-jobs home>/gate.lock, shared by
-//     every agent of the user; a waiter gives up after its lock wait instead of hanging;
+//   - one gate runs at a time per box: an exclusive flock on one fixed file, GateLockPath(), shared by
+//     every agent, user and state root of the box (never derived from AGENT_JOBS_HOME, HOME, TMPDIR or
+//     a flag, so no two callers can lock different files); a waiter gives up after its lock wait
+//     instead of hanging;
 //   - it runs on the commit it claims to check: HEAD of the work tree must resolve to the asserted
 //     commit once the lock is held, and still after the command (a checkout meanwhile fails the gate);
 //   - it always ends with the line exit=N on stdout, whatever happened (a refusal, a missing command, a
-//     timeout, a stop signal), so a waiter never waits for a marker that never comes;
+//     timeout, a stop signal), on a line of its own also after output that does not end a line, so a
+//     waiter never waits for a marker that never comes;
 //   - the command is the leader of a process group of its own: on the timeout or a stop the whole group
 //     gets SIGTERM, then SIGKILL after gateKillGrace, and once the leader has exited (before it is
 //     reaped, so the group id cannot be reused) the group gets SIGKILL, so no orphan suite outlives it;
@@ -37,7 +42,7 @@ const (
 	GateExitNotStarted  = 127
 	DefaultGateTimeout  = 30 * time.Minute
 	DefaultGateLockWait = 60 * time.Minute
-	GateLockName        = "gate.lock"
+	GateLockName        = "agent-jobs-gate.lock"
 	gateKillGrace       = 5 * time.Second
 	gateLockPoll        = 100 * time.Millisecond
 	gateHolderBytes     = 512
@@ -52,20 +57,29 @@ type GateRun struct {
 	Head     string        // the commit HEAD must be at (any revision git resolves, compared as full ids); required
 	Argv     []string      // the command and its arguments (no shell)
 	Timeout  time.Duration // the command's limit; 0 = DefaultGateTimeout
-	LockPath string        // the box-wide lock; "" = GateLockPath()
+	LockPath string        // tests only: another lock file; "" (every real caller, the CLI has no flag) = GateLockPath()
 	LockWait time.Duration // how long to wait for the lock; 0 = DefaultGateLockWait
 	Env      []string      // the base environment; nil = os.Environ()
 	Stdout   io.Writer     // the command's stdout and the exit= line; nil = os.Stdout
 	Stderr   io.Writer     // the command's stderr and the runner's notes; nil = os.Stderr
 }
 
-// GateLockPath is the box-wide gate lock, <agent-jobs home>/gate.lock.
-func GateLockPath() (string, error) {
-	h, err := Home()
-	if err != nil {
-		return "", err
+// gateLockDirs are the candidate directories of the box-wide gate lock, the first that exists wins:
+// fixed paths, world-writable and sticky, not under any state root and not from the environment
+// (os.TempDir follows TMPDIR, which differs per job). /run/lock is outside a systemd PrivateTmp; /tmp is
+// the fallback where it does not exist (macOS). Only the agentjobs_testhooks build changes it
+// (gaterun_testhooks.go).
+var gateLockDirs = []string{"/run/lock", "/tmp"}
+
+// GateLockPath is the box-wide gate lock, <first of gateLockDirs>/agent-jobs-gate.lock: the same file for
+// every caller on the box, whatever AGENT_JOBS_HOME or HOME says.
+func GateLockPath() string {
+	for _, d := range gateLockDirs[:len(gateLockDirs)-1] {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			return filepath.Join(d, GateLockName)
+		}
 	}
-	return filepath.Join(h, GateLockName), nil
+	return filepath.Join(gateLockDirs[len(gateLockDirs)-1], GateLockName)
 }
 
 // GateEnv is env without the variables a gate's command never inherits (gateEnvDropPrefixes).
@@ -96,7 +110,9 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if g.Stderr == nil {
 		g.Stderr = os.Stderr
 	}
-	defer func() { fmt.Fprintf(g.Stdout, "exit=%d\n", code) }()
+	out := &gateStdout{w: g.Stdout}
+	g.Stdout = out
+	defer func() { out.marker(code) }()
 	fail := func(format string, a ...any) int {
 		fmt.Fprintf(g.Stderr, "gate: "+format+"\n", a...)
 		return GateExitRunner
@@ -123,11 +139,7 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		g.Env = os.Environ()
 	}
 	if g.LockPath == "" {
-		p, err := GateLockPath()
-		if err != nil {
-			return fail("gate lock: %v", err)
-		}
-		g.LockPath = p
+		g.LockPath = GateLockPath()
 	}
 
 	unlock, err := lockGate(ctx, g)
@@ -194,7 +206,7 @@ func lockGate(ctx context.Context, g GateRun) (func(), error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("gate lock dir: %w", err)
 	}
-	f, err := os.OpenFile(g.LockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	f, err := openGateLock(g.LockPath)
 	if err != nil {
 		return nil, fmt.Errorf("open gate lock: %w", err)
 	}
@@ -232,6 +244,76 @@ func lockGate(ctx context.Context, g GateRun) (func(), error) {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// openGateLock opens the gate lock read-write and creates it readable and writable for every user, as it
+// serializes all of them from a shared sticky directory. An existing file is opened without O_CREAT
+// (Linux's fs.protected_regular refuses O_CREAT on another user's file there); it must be a regular
+// file, not a symlink or a fifo someone planted.
+func openGateLock(path string) (*os.File, error) {
+	for range 3 {
+		f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if errors.Is(err, fs.ErrNotExist) {
+			f, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o666)
+			if errors.Is(err, fs.ErrExist) {
+				continue // another gate created it meanwhile
+			}
+			if err == nil {
+				_ = f.Chmod(0o666) // past the umask
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			f.Close()
+			return nil, fmt.Errorf("%s is not a regular file", path)
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("%s keeps appearing and disappearing", path)
+}
+
+// gateStdout carries the command's stdout and the exit= marker; it remembers whether the last byte
+// written ended a line, so the marker always starts a line of its own. A failed write (the reader went
+// away) drops the rest instead of failing, so the command never blocks on a full pipe.
+type gateStdout struct {
+	mu      sync.Mutex
+	w       io.Writer
+	midLine bool
+	broken  bool
+}
+
+func (s *gateStdout) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken || len(p) == 0 {
+		return len(p), nil
+	}
+	n, err := s.w.Write(p)
+	if n > 0 {
+		s.midLine = p[n-1] != '\n'
+	}
+	if err != nil {
+		s.broken = true
+	}
+	return len(p), nil
+}
+
+// marker writes exit=<code> as the last line, after a newline when the output so far did not end one.
+func (s *gateStdout) marker(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nl := ""
+	if s.midLine {
+		nl = "\n"
+	}
+	fmt.Fprintf(s.w, "%sexit=%d\n", nl, code)
 }
 
 // gateHolder is what the lock's holder wrote into it (writeGateHolder), one line.

@@ -103,9 +103,10 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
-  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] [--lock PATH] -- CMD [ARGS...]
+  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
                                            a heavy local gate (check.sh, a pg suite, a build):
-                                           one at a time per box (<home>/gate.lock), HEAD of DIR
+                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
+                                           /tmp/ where /run/lock is missing), HEAD of DIR
                                            must be REV before and after, own process group killed
                                            on timeout (exit 124) and after the command, TELEGRAM_*
                                            dropped; the last stdout line is always exit=N

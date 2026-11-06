@@ -13,7 +13,12 @@ import (
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
 
-const gateRunUsage = "usage: agent-jobs gate run --head REV [--repo DIR] [--timeout D] [--lock-wait D] [--lock PATH] -- CMD [ARGS...]"
+const gateRunUsage = "usage: agent-jobs gate run --head REV [--repo DIR] [--timeout D] [--lock-wait D] -- CMD [ARGS...]"
+
+// gateRunTestLock is set only by this package's tests (a lock in their temp dir); every real run takes the
+// one box-wide lock, jobs.GateLockPath(): no flag or environment variable picks another, so no two gates on
+// the box can lock different files.
+var gateRunTestLock string
 
 // cmdGateRun is `agent-jobs gate run` (#134): one heavy local gate at a time per box, on the asserted
 // HEAD, in a process group of its own, without TELEGRAM_*, always ending with exit=N on stdout
@@ -25,7 +30,6 @@ func cmdGateRun(args []string, stdout, stderr io.Writer) int {
 	head := fs.String("head", "", "the commit HEAD must be at (required)")
 	timeout := fs.Duration("timeout", jobs.DefaultGateTimeout, "the command's time limit; then its process group is killed")
 	lockWait := fs.Duration("lock-wait", jobs.DefaultGateLockWait, "how long to wait for another gate on this box")
-	lock := fs.String("lock", "", "the box-wide gate lock (default <agent-jobs home>/gate.lock)")
 	// Flags stop at the command: what follows (its own flags too) is passed through untouched.
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -42,5 +46,5 @@ func cmdGateRun(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
 	return jobs.RunGate(ctx, jobs.GateRun{Dir: *repo, Head: *head, Argv: fs.Args(), Timeout: *timeout, LockWait: *lockWait,
-		LockPath: *lock, Env: os.Environ(), Stdout: stdout, Stderr: stderr})
+		LockPath: gateRunTestLock, Env: os.Environ(), Stdout: stdout, Stderr: stderr})
 }

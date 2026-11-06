@@ -3,7 +3,9 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -236,5 +238,116 @@ func TestRunGateHeadMovedDuringRun(t *testing.T) {
 		Argv: []string{"git", "checkout", "-q", first}})
 	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "HEAD") {
 		t.Fatalf("code %d, out %q, err %q", code, out, errs)
+	}
+}
+
+// A command whose output does not end a line still leaves exit=N on a line of its own (#134 fix loop).
+func TestRunGateExitMarkerAfterUnterminatedOutput(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Argv: []string{"printf", "hello"}})
+	if code != 0 || out != "hello\nexit=0\n" {
+		t.Fatalf("unterminated: code %d, out %q", code, out)
+	}
+	// Terminated output gets no extra blank line.
+	code, out, _ = runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Argv: []string{"printf", `a\n`}})
+	if code != 0 || out != "a\nexit=0\n" {
+		t.Fatalf("terminated: code %d, out %q", code, out)
+	}
+}
+
+// The default gate lock is one file per box: it does not follow the agent-jobs state root (#134 fix loop).
+func TestGateLockPathIgnoresStateRoot(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	t.Setenv("AGENT_JOBS_HOME", a)
+	t.Setenv("TMPDIR", a)
+	pa := GateLockPath()
+	t.Setenv("AGENT_JOBS_HOME", b)
+	t.Setenv("HOME", b)
+	t.Setenv("TMPDIR", b)
+	pb := GateLockPath()
+	if pa != pb || strings.HasPrefix(pa, a) || strings.HasPrefix(pb, b) {
+		t.Fatalf("the gate lock follows the state root: %q under %q, %q under %q", pa, a, pb, b)
+	}
+}
+
+// Two `agent-jobs gate run` processes with different state roots (AGENT_JOBS_HOME) still share the one
+// box lock, so their commands never overlap (#134 fix loop). The binary under test is the
+// agentjobs_testhooks build: AGENT_JOBS_TEST_GATE_LOCK_DIR moves the box lock into this test's temp dir,
+// so the test never waits for a real gate on the box (go test itself may run under one).
+func TestGateRunSerializedAcrossStateRoots(t *testing.T) {
+	repo, _, head, _ := gateFixture(t)
+	lockDir := t.TempDir()
+	busy := filepath.Join(t.TempDir(), "busy")
+	// mkdir is atomic: it fails when the other gate's command is inside.
+	script := "mkdir " + busy + " || exit 9; sleep 0.5; rmdir " + busy
+	type result struct {
+		code int
+		out  string
+		err  error
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	for i := range results {
+		home := t.TempDir()
+		cmd := exec.Command(selfBin, "gate", "run", "--repo", repo, "--head", head, "--lock-wait", "1m", "--",
+			"/bin/sh", "-c", script)
+		cmd.Env = append(os.Environ(), "AGENT_JOBS_HOME="+home, "AGENT_JOBS_TEST_GATE_LOCK_DIR="+lockDir)
+		var o bytes.Buffer
+		cmd.Stdout = &o
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := cmd.Run()
+			code := 0
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				code, err = ee.ExitCode(), nil
+			}
+			results[i] = result{code, o.String(), err}
+		}()
+	}
+	wg.Wait()
+	for i, r := range results {
+		if r.err != nil || r.code != 0 || lastLine(r.out) != "exit=0" {
+			t.Fatalf("gate %d: code %d, out %q, err %v: the gates of two state roots ran at once", i, r.code, r.out, r.err)
+		}
+	}
+}
+
+// The box lock is created readable and writable for every user (past the umask), reopened without
+// O_CREAT, and a symlink or fifo planted in its place is refused (#134 fix loop).
+func TestOpenGateLockShared(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, GateLockName)
+	old := syscall.Umask(0o077)
+	f, err := openGateLock(path)
+	syscall.Umask(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm() != 0o666 {
+		t.Fatalf("lock mode %v, err %v; want 0666", fi.Mode().Perm(), err)
+	}
+	if f, err = openGateLock(path); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	f.Close()
+	link := filepath.Join(dir, "link.lock")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openGateLock(link); err == nil {
+		f.Close()
+		t.Fatal("a symlinked lock was opened")
+	}
+	fifo := filepath.Join(dir, "fifo.lock")
+	if err := syscall.Mkfifo(fifo, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := openGateLock(fifo); err == nil {
+		f.Close()
+		t.Fatal("a fifo lock was opened")
 	}
 }
