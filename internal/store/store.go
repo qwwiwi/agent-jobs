@@ -42,6 +42,15 @@ var ErrNotFound = errors.New("job not found")
 // ErrImmutable is returned when trying to change a job in a terminal status.
 var ErrImmutable = errors.New("job status is final and cannot change")
 
+// ErrJobIDExists is returned when a new job's id is already taken (the insert's UNIQUE constraint
+// on jobs.id): the caller can redraw the id's random part and retry (#129).
+var ErrJobIDExists = errors.New("job id already exists")
+
+// jobIDTaken reports whether an insert error is the jobs.id UNIQUE constraint: the id is taken.
+func jobIDTaken(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id")
+}
+
 // Job is one row of the jobs table.
 type Job struct {
 	ID             string
@@ -767,6 +776,9 @@ func ts(t *time.Time) any {
 func (s *Store) Insert(j *Job) error {
 	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (`+insertMarks+`)`, insertArgs(j)...)
 	if err != nil {
+		if jobIDTaken(err) {
+			return ErrJobIDExists
+		}
 		return fmt.Errorf("insert job: %w", err)
 	}
 	return nil
@@ -780,6 +792,9 @@ func (s *Store) InsertCapped(j *Job, since time.Time, limit int) (bool, error) {
 	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (SELECT COUNT(*) FROM jobs
 		WHERE agent = ? AND runner = ? AND created_at >= ?) < ?`, args...)
 	if err != nil {
+		if jobIDTaken(err) {
+			return false, ErrJobIDExists
+		}
 		return false, fmt.Errorf("insert job: %w", err)
 	}
 	n, err := res.RowsAffected()
@@ -794,6 +809,9 @@ func (s *Store) InsertBudgetCapped(j *Job, since time.Time, capUSD float64) (boo
 	args := append(insertArgs(j), j.Agent, j.Provider, since.Unix(), j.MaxBudgetUSD, capUSD)
 	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (`+providerSpendSQL+`) + ? <= ?`, args...)
 	if err != nil {
+		if jobIDTaken(err) {
+			return false, ErrJobIDExists
+		}
 		return false, fmt.Errorf("insert job: %w", err)
 	}
 	n, err := res.RowsAffected()
