@@ -133,6 +133,10 @@ type JobView struct {
 	Waiting string `json:"waiting,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
+	// Plugins are the Claude Code plugins (config job_plugins) loaded into the job's latest launch, with
+	// their version; PluginWarnings those that could not be loaded.
+	Plugins        []jobs.PluginView `json:"plugins,omitempty"`
+	PluginWarnings []string          `json:"plugin_warnings,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -143,7 +147,9 @@ func fmtTS(t *time.Time) string {
 }
 
 func view(m *jobs.Manager, j *store.Job) JobView {
+	plugins, pluginWarns := m.JobPlugins(j)
 	return JobView{
+		Plugins: plugins, PluginWarnings: pluginWarns,
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Provider: jobs.JobProvider(j), Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
 		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
@@ -317,6 +323,9 @@ type JobResultOutput struct {
 	// Prepare is the repository's prepare step as the wrapper ran it before the runner (omitted when
 	// none ran); its output is prepare.log among the artifacts.
 	Prepare *jobs.PrepareResult `json:"prepare,omitempty"`
+	// Plugins and PluginWarnings: as in job_status.
+	Plugins        []jobs.PluginView `json:"plugins,omitempty"`
+	PluginWarnings []string          `json:"plugin_warnings,omitempty"`
 	// JobDirBytes is the size of the job folder last measured (when the job ended, after a prune; the
 	// worktree of a repo job left out); JobDirPartial: the measurement stopped at its bound, the size
 	// is a lower bound.
@@ -394,6 +403,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 		out.JobDirBytes, out.JobDirPartial = j.DirBytes, j.DirPartial
 		out.Acceptance = acceptanceView(m, j)
 		out.Prepare = m.PrepareResultOf(j)
+		out.Plugins, out.PluginWarnings = m.JobPlugins(j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {
 			if fi, err := os.Lstat(filepath.Join(dir, f)); err == nil && fi.Mode().IsRegular() {
