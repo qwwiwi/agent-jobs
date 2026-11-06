@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -50,7 +51,11 @@ type MilestoneTask struct {
 	Key         string
 	Title       string
 	DependsOn   []string
-	Covers      []string
+	// DependsWhy is the one-line reason of each depends_on edge, by the dependency's key (the files or
+	// modules the two tasks share, or the output one consumes from the other). An edge stored before
+	// reasons existed has none.
+	DependsWhy map[string]string
+	Covers     []string
 	// Skills are the task's planned skills edits (job_start's syntax: name, +name, -name; G01): a job
 	// started on the task without skills of its own gets them. nil = none planned.
 	Skills    []string
@@ -101,6 +106,8 @@ CREATE INDEX IF NOT EXISTS jobs_milestone ON jobs(milestone_id);
 var milestoneMigrations = []string{
 	// G01: a task's planned skills edits (JoinNames; '' = none planned).
 	`ALTER TABLE milestone_tasks ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
+	// #119: the reason of each depends_on edge (a JSON object, dependency key -> reason; '' = none).
+	`ALTER TABLE milestone_tasks ADD COLUMN depends_why TEXT NOT NULL DEFAULT ''`,
 }
 
 // milestoneStamp is the updated_at of a milestone write: the database's clock in Unix seconds, but never
@@ -234,7 +241,20 @@ func upsertTask(tx *sql.Tx, id int64, t MilestoneTask, now time.Time) error {
 		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), JoinNames(t.Skills), t.Dropped, now.Unix(), now.Unix()); err != nil {
 		return fmt.Errorf("write task %s: %w", t.Key, err)
 	}
+	if _, err := tx.Exec(`UPDATE milestone_tasks SET depends_why = ? WHERE milestone_id = ? AND key = ?`,
+		dependsWhyJSON(t.DependsWhy), id, t.Key); err != nil {
+		return fmt.Errorf("write task %s depends_why: %w", t.Key, err)
+	}
 	return writeTaskSources(tx, id, t)
+}
+
+// dependsWhyJSON stores the edge reasons as a JSON object ("" for none).
+func dependsWhyJSON(why map[string]string) string {
+	if len(why) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(why)
+	return string(b)
 }
 
 // GetMilestone returns one milestone (ErrMilestoneNotFound when there is none).
@@ -344,7 +364,7 @@ func (s *Store) MilestoneTasks(ctx context.Context, id int64) ([]MilestoneTask, 
 }
 
 func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, error) {
-	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at
+	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, skills, depends_why, dropped, created_at, updated_at
 		FROM milestone_tasks WHERE milestone_id = ? ORDER BY rowid`, id)
 	if err != nil {
 		return nil, fmt.Errorf("milestone tasks: %w", err)
@@ -353,12 +373,16 @@ func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, 
 	var out []MilestoneTask
 	for rows.Next() {
 		var t MilestoneTask
-		var deps, covers, skills string
+		var deps, covers, skills, why string
 		var created, updated int64
-		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &skills, &t.Dropped, &created, &updated); err != nil {
+		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &skills, &why, &t.Dropped, &created, &updated); err != nil {
 			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		t.DependsOn, t.Covers, t.Skills = SplitNames(deps), SplitNames(covers), SplitNames(skills)
+		if why != "" {
+			// A value that is not a JSON object leaves the edges without reasons rather than failing the read.
+			_ = json.Unmarshal([]byte(why), &t.DependsWhy)
+		}
 		t.CreatedAt, t.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
 		out = append(out, t)
 	}

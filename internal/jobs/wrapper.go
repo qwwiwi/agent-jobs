@@ -47,9 +47,10 @@ type StreamResult struct {
 	Prepare        *PrepareResult `json:",omitempty"`
 	PrepareFailure string         `json:",omitempty"`
 	ReportText     string         `json:"-"` // last report from trusted assistant stdout
-	// Results counts the `result` events read from the runner's stdout (claude prints one per run; a
-	// second one is a line another process wrote into the pipe), for codex its terminal turn events
-	// (turn.completed, turn.failed: codex exec runs one turn).
+	// Results counts the `result` events read from the runner's stdout (claude prints one per query: a
+	// second one comes from a background task's notification waking the session for another turn, or is
+	// a line another process wrote into the pipe), for codex its terminal turn events (turn.completed,
+	// turn.failed: codex exec runs one turn).
 	Results int `json:"-"`
 	// AfterEnd counts the codex events read after its first terminal turn event.
 	AfterEnd int `json:"-"`
@@ -100,7 +101,7 @@ type resultEvent struct {
 	Result       string  `json:"result"`
 }
 
-// ParseStream returns the last `result` event in stream.jsonl (zero value if none).
+// ParseStream returns the `result` events in stream.jsonl merged by mergeResult (zero value if none).
 func ParseStream(path string) StreamResult {
 	var out StreamResult
 	f, err := os.Open(path)
@@ -112,10 +113,41 @@ func ParseStream(path string) StreamResult {
 	sc.Buffer(make([]byte, 0, 1<<20), maxStreamLine)
 	for sc.Scan() {
 		if r, ok := parseResultLine(sc.Bytes()); ok {
-			out = r
+			out = mergeResult(out, r)
 		}
 	}
 	return out
+}
+
+// mergeResult folds the result event r into prev, the results read before it (issue #154). A background
+// task's notification can wake a finished claude session for one more turn, which prints a second
+// result: the run's state (subtype, error) is the last result's, but its turns are the sum of every
+// result's num_turns (claude counts them per query), its cost the session's running total_cost_usd, and
+// its text the last result text that is a report, so a short trailing turn does not replace the report.
+func mergeResult(prev, r StreamResult) StreamResult {
+	if !prev.Found {
+		return r
+	}
+	r.Turns += prev.Turns
+	r.CostUSD = max(r.CostUSD, prev.CostUSD)
+	if reportRank(r.Text) < reportRank(prev.Text) {
+		r.Text = prev.Text
+	}
+	return r
+}
+
+// reportRank grades a result text by the report sections it has, with the same section parser the
+// final validation uses (reportContractNote): 2 = Summary and Not done / uncertain, 1 = Summary only,
+// 0 = neither. A later text wins a tie, so only a strictly better earlier text is kept.
+func reportRank(text string) int {
+	_, secs := splitReport(text)
+	if _, ok := sectionBody(secs, strings.TrimPrefix(reportHeading, "## ")); !ok {
+		return 0
+	}
+	if _, ok := sectionBody(secs, SectionNotDone); !ok {
+		return 1
+	}
+	return 2
 }
 
 // maxStreamLine is the longest stream line read; a longer one is skipped.
@@ -243,7 +275,7 @@ func (t *resultTee) end() {
 		}
 		if r, ok := parseResultLine(t.line); ok {
 			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
-			t.res = r
+			t.res = mergeResult(t.res, r)
 		}
 	}
 	if !t.skip && bytes.Contains(t.line, []byte(`"usage"`)) {
@@ -870,6 +902,10 @@ func wrapperSandbox(jobDir string) string {
 // wrapperOpenRouter prepares an OpenRouter job's launch from the agent's config.json (<state>/jobs/<id>
 // = jobDir) and the job's row: the failure reason, redacted, when it cannot start.
 func wrapperOpenRouter(jobDir string, j *store.Job, log io.Writer) (*openRouterJob, string) {
+	// A job queued with sources before they were refused at start (#146) does not run either.
+	if len(j.SourceFiles) > 0 || len(j.Sources) > 0 {
+		return nil, "openrouter job not started: " + errOpenRouterSources.Error()
+	}
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return nil, "openrouter: " + err.Error()

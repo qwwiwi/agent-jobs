@@ -18,10 +18,10 @@ func addMilestoneCreate(s *sdk.Server, d Deps) {
 		Name:        "milestone_create",
 		InputSchema: milestoneSchemas["milestone_create"].schema,
 		Description: "Create a milestone (a stage of work) with its tasks in one call and return its tree. Only title and tasks " +
-			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys), covers (requirement IDs) and " +
+			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys, each with a one-line reason in depends_why: set an edge only where the tasks edit the same files or modules, share a money path, or one consumes the other's output; an edge without a reason is dropped and listed in depends_dropped), covers (requirement IDs) and " +
 			"skills (job_start's skills edits, planned once here: a job_start on the task without skills gets them). " +
 			"Run its tasks with job_start(milestone, task): a task waits (blocked) until every task it depends on is done " +
-			"(its job's outcome accepted), independent tasks run in parallel (max_parallel caps them, 1 = one after another). " +
+			"(its job's outcome accepted), independent tasks run in parallel, up to the daemon's max_running (leave max_parallel unset; it caps the milestone, 1 = one after another). " +
 			"A job on a task with depends_on gets a \"Prior results\" section with those tasks' accepted jobs.",
 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in jobs.MilestoneCreate) (*sdk.CallToolResult, jobs.MilestoneView, error) {
 		v, err := d.Manager.CreateMilestone(ctx, in)

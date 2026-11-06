@@ -49,6 +49,8 @@ type Manager struct {
 	Log       *log.Logger
 	// Brain is the shared brain from config (brain.Disabled when not configured).
 	Brain brain.Brain
+	// afterOutcome, when set (tests), runs in SetOutcomes right after an item's outcome was committed.
+	afterOutcome func(id string)
 	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
 	MemoryTimeout time.Duration
 
@@ -68,6 +70,9 @@ type Manager struct {
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
+
+	idleMu   sync.Mutex
+	idleSent string // the ready list of the last idle-slot line (idleslots.go)
 
 	mergeMu     sync.Mutex
 	mergeChecks map[string]mergeCheck // job ID -> its last merge-tree result (MergeNote)
@@ -509,6 +514,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
 			return nil, err
 		}
+		if len(r.Sources) > 0 { // before any snapshot is taken or budget reserved (#146)
+			if r.plannedSources {
+				return nil, fmt.Errorf("%w; task %s of milestone %d has sources planned (give job_start sources: [] to run it without them)",
+					errOpenRouterSources, r.Task, r.Milestone)
+			}
+			return nil, errOpenRouterSources
+		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
@@ -678,6 +690,9 @@ func (m *Manager) tickLocked() error {
 	}
 	if err := m.notifyPending(); err != nil {
 		errs = append(errs, fmt.Errorf("notify: %w", err))
+	}
+	if err := m.nudgeIdleSlots(); err != nil {
+		errs = append(errs, fmt.Errorf("idle slots: %w", err))
 	}
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))

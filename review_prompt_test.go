@@ -108,3 +108,21 @@ func TestReviewPromptUIEvidence(t *testing.T) {
 		t.Error("the UI evidence rule must come before the Blocking subsection it feeds")
 	}
 }
+
+// A reviewer checks every Fork of the executor's report against the code; a Fork the code contradicts
+// or that hides a worse choice is a finding.
+func TestReviewPromptChecksForks(t *testing.T) {
+	b, err := Templates.ReadFile("prompts/kind-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{"Forks:", "a Forks section", "every Fork", "against the code", "rejected alternative"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("kind-review.md lacks %q", want)
+		}
+	}
+	if i := strings.Index(s, "### Blocking"); strings.Index(s, "Forks:") > i {
+		t.Error("the Forks rule must come before the Blocking subsection it feeds")
+	}
+}
