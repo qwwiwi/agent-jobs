@@ -198,6 +198,9 @@ type Config struct {
 	SkillsMaxPerJob int `json:"skills_max_per_job"`
 	// SkillsMaxKB caps the total size of one job's skills in KB. 0 = skills.DefaultMaxKB (400).
 	SkillsMaxKB float64 `json:"skills_max_kb"`
+	// JobPlugins are Claude Code plugins (skill packs) loaded into claude jobs with --plugin-dir (see
+	// JobPlugin). Restart-only: allow_hooks lets plugin code run outside the guard.
+	JobPlugins []JobPlugin `json:"job_plugins"`
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
@@ -517,6 +520,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if c.SkillsMaxKB < 0 {
 		return c, fmt.Errorf("config.json: skills_max_kb %g must be 0 (default %d) or positive", c.SkillsMaxKB, skills.DefaultMaxKB)
+	}
+	if err := validateJobPlugins(c.JobPlugins); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
 	}
 	// The daemon, the MCP server and the guard hook run in different directories: a relative path
 	// would name a different file in each (and the hook would protect the wrong one).

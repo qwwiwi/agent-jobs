@@ -43,6 +43,8 @@ claude -p --output-format stream-json --verbose --model M \
 
 Когда джоба закончилась, главная сессия получает одну строку: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. Сам отчёт в сессию не вливается, агент забирает его тулом `job_result`, когда готов его прочитать.
 
+Конфиг `job_plugins` добавляет по одному `--plugin-dir <dir>` на каждый настроенный плагин Claude Code в claude-джобах подходящих видов (пакеты скиллов вроде `superpowers`, которые `--setting-sources project` иначе не пускает). Хуки и серверы плагина вырезаются из представления плагина для джобы, если не задан `allow_hooks`; `deny_skills` становятся deny-правилами `Skill(<плагин>:<скилл>)`, а `bootstrap_skill` кладёт текст одного скилла плагина в промпт разделом «Skills bootstrap» вместо SessionStart-хука плагина. Codex-джобы плагинов не получают. См. GUIDE «Плагины для джоб».
+
 ## Где всё хранится
 
 У каждой джобы своя папка `jobs/<id>/` в домашнем каталоге системы, а её статус, стоимость и pid лежат строкой в SQLite. Статусы: queued, running, succeeded, failed, timeout, cancelled; меняться могут только первые два.

@@ -994,6 +994,10 @@ func archiveAttempt(dir string, n int) error {
 // refreshJobFiles rewrites the files claude and git read at launch from the agent's config: the job
 // dir is writable by the job, so what the previous attempt may have changed there is not reused.
 func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) error {
+	// A plugin update since the first attempt is picked up; the settings below carry its deny rules.
+	if err := m.preparePlugins(j, dir); err != nil {
+		return err
+	}
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.JobSettings(j, gitDirs...)); err != nil {
 		return err
 	}

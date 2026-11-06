@@ -625,6 +625,9 @@ func cmdStatus(args []string) error {
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
 		}
+		for _, w := range m.PluginWarnings() {
+			fmt.Println("plugins warning:", shown(w))
+		}
 		if err := printMergeGates(m); err != nil {
 			return err
 		}
@@ -655,6 +658,17 @@ func cmdStatus(args []string) error {
 		if j.SkillsNote != "" {
 			fmt.Printf("           %s\n", j.SkillsNote)
 		}
+	}
+	plugins, pluginWarns := m.JobPlugins(j)
+	for _, p := range plugins {
+		hooks := "off"
+		if p.Hooks {
+			hooks = "allowed"
+		}
+		fmt.Printf("plugin:    %s %s (hooks %s)\n", shown(p.Name), shown(p.Version), hooks)
+	}
+	for _, w := range pluginWarns {
+		fmt.Printf("plugin warning: %s\n", shown(w))
 	}
 	if len(j.Sources) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
