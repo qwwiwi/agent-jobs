@@ -26,7 +26,7 @@ func idleManager(t *testing.T) *Manager {
 }
 
 // A result, then silence with only the job MCP server alive: the wrapper closes claude, the job
-// succeeds with turns/cost of the last result, and report.md comes from the stream's report text.
+// succeeds with the run total of turns/cost, and report.md comes from the stream's report text.
 func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
 	m := idleManager(t)
 	start := time.Now()
@@ -38,7 +38,7 @@ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
 		t.Fatalf("closed after %s, want within the grace period", took)
 	}
 	if j.Turns != 6 || j.CostUSD != 0.75 {
-		t.Fatalf("turns/cost %d/%v, want the last result's 6/0.75", j.Turns, j.CostUSD)
+		t.Fatalf("turns/cost %d/%v, want the run total 6/0.75", j.Turns, j.CostUSD)
 	}
 	if !strings.Contains(j.Error, ReasonIdleClosed) {
 		t.Fatalf("job row does not record the idle close: %q", j.Error)
@@ -55,6 +55,20 @@ func TestIdleAfterResultClosesFinishedJob(t *testing.T) {
 	pid := strings.TrimSpace(readFile(t, filepath.Join(dir, "mcp.pid")))
 	if !strings.Contains(s, "job MCP server ["+pid+"]") {
 		t.Fatalf("stderr.log does not show the live job MCP server (pid %s) at the close: %s", pid, s)
+	}
+}
+
+// An introductory report with lowercase headings, then a plain notification result, then silence: the
+// idle close keeps that report and the job succeeds (issue #154).
+func TestIdleAfterResultKeepsIntroReport(t *testing.T) {
+	m := idleManager(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_IDLE_INTRO", nil).ID)
+	if j.Status != store.StatusSucceeded || !strings.Contains(j.Error, ReasonIdleClosed) {
+		t.Fatalf("job: %s %q", j.Status, j.Error)
+	}
+	r := readFile(t, filepath.Join(m.JobDir(j.ID), "report.md"))
+	if !strings.HasPrefix(r, "Final report follows.\n\n## summary\nintro ok") || strings.Contains(r, "ended without a report") {
+		t.Fatalf("report.md lost the report: %q", r)
 	}
 }
 
@@ -98,8 +112,9 @@ func TestIdleAfterResultNotClosedWhileWorking(t *testing.T) {
 			if took := time.Since(start); took < 2500*time.Millisecond {
 				t.Fatalf("job ended after %s: closed early", took)
 			}
-			if j.Turns != 3 {
-				t.Fatalf("turns %d, want the final result's 3", j.Turns)
+			// The run total: the waiting result's 1 turn + the final result's 3 (num_turns is per query, #154).
+			if j.Turns != 4 {
+				t.Fatalf("turns %d, want the run total 4", j.Turns)
 			}
 			if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), IdleClosedMarker)); err == nil {
 				t.Fatal("idle marker written for a job that exited by itself")

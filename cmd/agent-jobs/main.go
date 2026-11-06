@@ -74,6 +74,12 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
+  outcome    --agent A <id> <outcome> [--note N] [--json]
+  outcome    --agent A --input F|- [--json]
+                                           record what you did with finished jobs' results (job_outcome,
+                                           job_outcome_many): one job, or a JSON array of {id, outcome,
+                                           note?} from a file or stdin; each item is answered on its own
+                                           and the exit status is 1 when any failed
   stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
@@ -103,6 +109,13 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
+  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
+                                           a heavy local gate (check.sh, a pg suite, a build):
+                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
+                                           /tmp/ where /run/lock is missing), HEAD of DIR
+                                           must be REV before and after, own process group killed
+                                           on timeout (exit 124) and after the command, TELEGRAM_*
+                                           dropped; the last stdout line is always exit=N
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
@@ -164,6 +177,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            cost (MISMATCH over 10%), totals per day, per model, 30 days,
                                            headed by the key's usage/limit; --reconcile fills OpenRouter's
                                            record of runs that lack it
+  ui-check   <base-url> <path>... [--out dir] [--schemes S] [--playwright path] [--timeout ms] [--dwell ms] [--limit n]
+                                           the orchestrator's browser check: runs the copy of
+                                           scripts/ui-check.mjs embedded in this binary from a private
+                                           temp dir, never a job dir copy, never Playwright from the
+                                           current directory; exit 0 pass, 1 fail, 2 not run
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -231,7 +249,12 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "outcome":
+		err = cmdOutcome(args, os.Stdin)
 	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
+		}
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
@@ -257,6 +280,8 @@ func main() {
 		err = cmdHeartbeat(args)
 	case "openrouter":
 		err = cmdOpenRouter(args, os.Stdout)
+	case "ui-check":
+		os.Exit(runUICheck(args, os.Stdout, os.Stderr))
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -1503,7 +1528,7 @@ func cmdGate(args []string) error {
 	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
-			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
+			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO | " + gateRunUsage[len("usage: agent-jobs "):])
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -2113,19 +2138,24 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if sub == "brief-reminder" {
 		type answer struct {
 			line string
-			warn string
-			err  error
+			// emission is the pending-outcome block inside line; it holds the dedupe state lock until this
+			// goroutine commits it after line reached stdout, or releases it.
+			emission *jobs.HookEmission
+			warn     string
+			err      error
 		}
 		done := make(chan answer, 1)
 		go func() {
-			line, warn, err := briefReminder(args[1:], stdin, openReadOnly)
-			done <- answer{line, warn, err}
+			line, em, warn, err := briefReminder(args[1:], stdin, briefReminderOpener)
+			done <- answer{line, em, warn, err}
 		}()
 		var a answer
 		select {
 		case a = <-done:
 		case <-time.After(briefReminderTimeout):
 			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+			// A worker that answers late is never delivered: its emission is dropped unrecorded.
+			go func() { (<-done).emission.Release() }()
 		}
 		if a.warn != "" {
 			fmt.Fprintln(stderr, a.warn)
@@ -2134,11 +2164,18 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		case errors.Is(a.err, jobs.ErrInJobSession):
 			// A job session: silent, like the job-role refusal in main.
 		case a.err != nil:
+			a.emission.Release()
 			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", a.err, "(no reminder)")
 		case a.line != "":
 			if _, err := fmt.Fprintln(stdout, a.line); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				a.emission.Release()
 				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err)
+			} else if err := a.emission.Commit(); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(emission not recorded)")
 			}
+		default:
+			a.emission.Release()
 		}
 		return 0
 	}
@@ -2178,10 +2215,18 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 			return fail(err)
 		}
 		// SessionStart stdout becomes context, including after a restart or compaction.
-		if line, err := m.PendingOutcomeReminder(in.SessionID); err != nil {
+		em, err := m.PendingOutcomeReminder(in.SessionID)
+		switch {
+		case err != nil:
 			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no pending-outcome reminder)")
-		} else if line != "" {
-			fmt.Fprintln(stdout, line)
+		case em != nil:
+			if _, err := fmt.Fprintln(stdout, em.Text); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				em.Release()
+				fmt.Fprintln(stderr, "agent-jobs hook bind:", err)
+			} else if err := em.Commit(); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(emission not recorded)")
+			}
 		}
 		return 0
 	}
@@ -2207,7 +2252,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if err != nil {
 		return fail(err)
 	}
-	out := jobs.StopHookDecision(in, pending)
+	out := jobs.StopHookDecisionCapped(in, pending, m.Config().Hooks.Max())
 	if out == nil {
 		return 0
 	}
@@ -2316,45 +2361,51 @@ func mergeGateWarningJSON(warning string) preToolUseOutput {
 
 // briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
 // prompt goes on without a reminder.
-const briefReminderTimeout = 2 * time.Second
+var briefReminderTimeout = 2 * time.Second
+
+// briefReminderOpener opens the store for the brief reminder (replaced in tests).
+var briefReminderOpener = openReadOnly
 
 // briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, string, error) {
+//
+// The returned emission (nil when there is no pending-outcome block) is part of line and holds the dedupe
+// state lock: the caller commits it once line reached stdout, or releases it.
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, *jobs.HookEmission, string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	if len(pos) > 0 {
-		return "", "", errors.New("no positional arguments")
+		return "", nil, "", errors.New("no positional arguments")
 	}
 	in, err := jobs.ParseUserPromptInput(stdin)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	m, err := opener(*agent)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	defer m.Close()
 	line, err := m.BriefReminder(in)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
-	pending, err := m.PendingOutcomeReminder(in.SessionID)
+	em, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
+		return line, nil, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
 	}
 	if line == "" {
-		return pending, "", nil
+		return em.Line(), em, "", nil
 	}
-	if pending != "" {
-		line += "\n" + pending
+	if em != nil {
+		line += "\n" + em.Text
 	}
-	return line, "", nil
+	return line, em, "", nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
@@ -2363,14 +2414,15 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	agentFlag(fs)
+	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err == nil && len(pos) > 0 {
 		err = errors.New("no positional arguments")
 	}
 	var msg string
 	if err == nil {
-		msg, err = jobs.SkillsPicker(stdin)
+		// The picker reads no state, only the configured byte cap of the agent (the default when unknown).
+		msg, err = jobs.SkillsPickerCapped(stdin, jobs.HookMaxBytesOf(*agent))
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", jobs.Printable(err.Error(), 300), "(no reminder)")

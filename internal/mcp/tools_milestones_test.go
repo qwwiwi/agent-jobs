@@ -17,13 +17,13 @@ func TestMilestoneTools(t *testing.T) {
 		var v jobs.MilestoneView
 		call(t, cs, "milestone_create", map[string]any{"title": "Stage", "tasks": []any{
 			map[string]any{"key": "T1", "title": "one"},
-			map[string]any{"key": "T2", "title": "two", "depends_on": []any{"T1"}},
+			map[string]any{"key": "T2", "title": "two", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "shares files"}},
 		}}, &v)
 		if v.ID == 0 || len(v.Tasks) != 2 || v.Tasks[1].Status != jobs.TaskBlocked || !slices.Equal(v.Ready, []string{"T1"}) {
 			t.Fatalf("milestone_create: %+v", v)
 		}
 		if msg := callErr(t, cs, "milestone_create", map[string]any{"title": "x", "tasks": []any{
-			map[string]any{"key": "T1", "title": "a", "depends_on": []any{"T1"}}}}); !strings.Contains(msg, "itself") {
+			map[string]any{"key": "T1", "title": "a", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "shares files"}}}}); !strings.Contains(msg, "itself") {
 			t.Fatalf("self dependency: %s", msg)
 		}
 		var got jobs.MilestoneView
@@ -41,7 +41,7 @@ func TestMilestoneTools(t *testing.T) {
 		if len(list.Milestones) != 1 || len(list.Milestones[0].Tasks) != 3 {
 			t.Fatalf("milestone_list tree: %+v", list)
 		}
-		call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}}}}, &got)
+		call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "shares files"}}}}, &got)
 		if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["milestone"], a["task"] = v.ID, "T2" })); !strings.Contains(msg, "blocked") {
 			t.Fatalf("job_start on a blocked task: %s", msg)
 		}

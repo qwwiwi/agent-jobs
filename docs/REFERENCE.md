@@ -47,7 +47,7 @@ Default limits and ceilings. A request above a ceiling is rejected, not silently
 | timeout_minutes | 45 | 180 |
 | concurrent per agent | 2 | |
 
-When a job has finished, the main session gets one line: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. The report itself is not poured into the session; the agent fetches it with the `job_result` tool when it is ready to read it.
+When a job has finished, the main session gets one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. With `notify_coalesce_seconds` set, jobs that finish close together arrive as one line, `[jobs:job-done] 3 jobs: <id> …; <id> …; <id> …`, so the session wakes once instead of once per job; a job the owner waits on is never held. The report itself is not poured into the session; the agent fetches it with the `job_result` tool when it is ready to read it.
 
 ## Where everything is kept
 
