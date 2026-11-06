@@ -2,6 +2,8 @@
 
 The write-up (results, method, caveats, routing) is [../2026-11-06-models.md](../2026-11-06-models.md). This folder holds everything behind it.
 
+Task sizes and what each of the nine tasks asked for: [../2026-11-06-models.md#what-the-task-sizes-mean](../2026-11-06-models.md#what-the-task-sizes-mean).
+
 ## Charts
 
 Generated with `gpt-image-2.6-sunburst` at 2K from the data below (prompts in `scripts/charts/`). Chart labels are in Russian; every number was checked against `data/results.md`. One drawing slip: on the summary chart the Haiku bar is longer than its value, the label «1 из 3» is correct.
