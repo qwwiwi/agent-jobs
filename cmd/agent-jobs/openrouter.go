@@ -17,8 +17,12 @@ import (
 // cmdOpenRouter is `agent-jobs openrouter endpoints <slug>` (issue #136, R9): the endpoints of an
 // OpenRouter model ranked by the routing policy, the one it picks marked.
 func cmdOpenRouter(args []string, out io.Writer) error {
+	if len(args) > 0 && args[0] == "costs" {
+		return cmdOpenRouterCosts(args[1:], out)
+	}
 	if len(args) == 0 || args[0] != "endpoints" {
-		return errors.New("usage: agent-jobs openrouter endpoints <slug> [--agent A] [--json] [--file F]")
+		return errors.New("usage: agent-jobs openrouter endpoints <slug> [--agent A] [--json] [--file F]\n" +
+			"       agent-jobs openrouter costs --agent A [--days N] [--json] [--reconcile]")
 	}
 	fs := flag.NewFlagSet("openrouter endpoints", flag.ContinueOnError)
 	agent := agentFlag(fs)

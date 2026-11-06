@@ -625,6 +625,7 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	defer st.Close()
 	var prepared *PrepareResult   // the prepare step's result goes into every record of this launch
 	var openRouter *openRouterJob // an OpenRouter job's proxy: its cost goes into every record
+	var costJournal *orJournal    // an OpenRouter job's line in the cost journal
 	record := func(res StreamResult) error {
 		res.Prepare = prepared
 		if openRouter != nil {
@@ -706,13 +707,19 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			return 2
 		}
 		if IsOpenRouterJob(j) {
+			// The attempt's line in the cost journal is written whatever ends it: a start failure here, the
+			// completion below, a SIGTERM from the daemon (onKill), or an early return (the deferred end).
+			costJournal = newORJournal(jobDir, j, stderrLog)
 			orj, fail := wrapperOpenRouter(jobDir, j, stderrLog)
 			if fail != "" {
 				fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+				costJournal.end(nil, store.StatusFailed, fail, nil)
 				return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
 			}
 			openRouter, runEnv = orj, orj.env
 			defer orj.proxy.close()
+			defer costJournal.onKill(orj)()
+			defer costJournal.end(orj, store.StatusFailed, "the wrapper ended without recording the attempt's completion (see stderr.log)", nil)
 		}
 	}
 	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, runEnv, observe)
@@ -774,7 +781,15 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		terminalOK = codexStreamFailure(res) == ""
 	}
 	if code == 0 && terminalOK && !sw.Incomplete() && hasReport(jobDir) {
-		if rc := runAcceptanceStep(jobDir, token, stderrLog, &res); rc != 0 {
+		// The acceptance step catches the stop signals itself: meanwhile the journal's SIGTERM handler only
+		// writes the line and leaves the wrapper's exit to the step.
+		costJournal.stopsCaughtElsewhere(true)
+		rc := runAcceptanceStep(jobDir, token, stderrLog, &res)
+		costJournal.stopsCaughtElsewhere(false)
+		if rc != 0 {
+			if rc > 128 {
+				costJournal.end(openRouter, ORStatusKilled, "the acceptance step was ended by a stop signal", nil)
+			}
 			return rc
 		}
 		// A gate job's result (Wave F) is validated and stored here, by the wrapper, never by the orchestrator,
@@ -796,6 +811,21 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 	if err := record(res); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: record completion:", err)
 		return 2
+	}
+	if costJournal != nil {
+		final := res
+		openRouter.apply(&final)
+		status, msg := Verdict(code, final, jobDir)
+		// The completion and its settled cost are recorded: the daemon can collect the job from here on,
+		// and whatever ends the wrapper now, its journal line carries this verdict.
+		costJournal.settle(status, msg)
+		// Only then OpenRouter's own record of the attempt's requests (it lags a little): an optional
+		// lookup that cannot change the job's result, bounded by what is left of the job's deadline.
+		var deadline time.Time
+		if j, err := st.Get(id); err == nil && j.StartedAt != nil {
+			deadline = jobDeadline(j)
+		}
+		costJournal.end(openRouter, status, msg, openRouter.lookup(deadline))
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)

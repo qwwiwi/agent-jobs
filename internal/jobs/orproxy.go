@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +27,10 @@ import (
 // token as ANTHROPIC_AUTH_TOKEN; the proxy checks the token, sets the request's model to the job's slug
 // and its `provider` object to the job's routing, and forwards it to OpenRouter with the real key in
 // Authorization. The key is only in the proxy's memory: never in claude's environment, a file the job
-// can read, a log line or an error. Responses are passed through unchanged, read on the way for their
-// usage (and OpenRouter's usage.cost), which is the job's cost; once the job's budget is spent every
-// further request is refused, and the wrapper fails the job with that reason.
+// can read, a log line or an error. Responses are passed through without the key (an error also without
+// anything key-shaped: forwardErrorBody, orLineScrubber), read on the way for their usage (and
+// OpenRouter's usage.cost), which is the job's cost; once the job's budget is spent every further
+// request is refused, and the wrapper fails the job with that reason.
 
 // maxProxyBody caps a request body the proxy reads (claude sends the whole conversation each turn).
 const maxProxyBody = 64 << 20
@@ -62,6 +64,15 @@ type orProxy struct {
 	refused   int
 	closed    bool           // close charged what was still in flight: later settles change nothing
 	inflight  sync.WaitGroup // the /v1/messages requests between reserve and settle
+	// genIDs are the OpenRouter generation ids of the successful responses (the cost journal looks them
+	// up), providers the providers the responses named.
+	genIDs    []string
+	genSeen   map[string]bool
+	providers map[string]bool
+	// rejected counts the requests OpenRouter answered with an error (not billed), withGenID the others
+	// whose response named a generation id: the rest of requests are billed without one.
+	rejected  int
+	withGenID int
 
 	ln        net.Listener
 	srv       *http.Server
@@ -193,6 +204,13 @@ func (p *orProxy) settle(hold float64, u responseUsage, how settleOutcome) {
 	defer p.inflight.Done()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.noteGeneration(u)
+	switch {
+	case how == settleRejected:
+		p.rejected++
+	case u.GenID != "":
+		p.withGenID++
+	}
 	if p.closed {
 		return // close charged the reservation
 	}
@@ -220,6 +238,57 @@ func (p *orProxy) settle(hold float64, u responseUsage, how settleOutcome) {
 		p.cost += math.Max(c, hold)
 		p.uncertain++
 	}
+}
+
+// noteGeneration keeps a response's generation id and provider (p.mu held).
+func (p *orProxy) noteGeneration(u responseUsage) {
+	if u.GenID != "" && !p.genSeen[u.GenID] {
+		if p.genSeen == nil {
+			p.genSeen = map[string]bool{}
+		}
+		p.genSeen[u.GenID] = true
+		p.genIDs = append(p.genIDs, u.GenID)
+	}
+	if u.Provider != "" {
+		if p.providers == nil {
+			p.providers = map[string]bool{}
+		}
+		p.providers[u.Provider] = true
+	}
+}
+
+// generationIDs are the generation ids of the job's responses so far.
+func (p *orProxy) generationIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string{}, p.genIDs...)
+}
+
+// requestCount is how many /v1/messages requests were sent.
+func (p *orProxy) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.requests
+}
+
+// fill puts the proxy's figures into a cost journal line: requests, tokens, the cost (nil and unknown
+// when it is not settled: then the reservation it was charged), generation ids and providers.
+func (p *orProxy) fill(l *ORCostLine) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l.Requests = p.requests
+	l.TokensIn, l.TokensOut, l.CacheRead, l.CacheWrite = p.usage.Input, p.usage.Output, p.usage.CacheRead, p.usage.CacheWrite
+	cost := p.cost + p.reserved
+	if p.uncertain > 0 || p.pending > 0 {
+		l.CostUnknown, l.CostReservedUSD = true, &cost
+	} else {
+		l.CostUSD = &cost
+	}
+	l.GenerationIDs = append([]string{}, p.genIDs...)
+	l.Providers = sortedKeys(p.providers)
+	// A request still unsettled, or settled without a generation id, may be billed: OpenRouter's record
+	// cannot be summed for it.
+	l.RequestsWithoutGenerationID = max(p.requests-p.rejected-p.withGenID, 0)
 }
 
 // BudgetFailure is the job's failure reason once a request was refused for the budget ("" before).
@@ -318,7 +387,7 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		// A transport error names the URL, never a header. The request may have reached OpenRouter.
-		anthropicError(w, http.StatusBadGateway, "api_error", "agent-jobs openrouter proxy: upstream: "+scrubKey(err.Error(), p.key))
+		anthropicError(w, http.StatusBadGateway, "api_error", "agent-jobs openrouter proxy: upstream: "+scrubORSecrets(err.Error(), p.key))
 		return
 	}
 	defer resp.Body.Close()
@@ -327,17 +396,64 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header()[k] = vs
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
+	u.ok = resp.StatusCode == http.StatusOK
+	u.genID = generationIDFromHeader(resp.Header)
 	u.stream = strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	var whole bool
+	if resp.StatusCode != http.StatusOK {
+		whole = p.forwardErrorBody(w, resp, u)
+	} else {
+		w.WriteHeader(resp.StatusCode)
+		whole = p.forwardBody(w, resp.Body, u)
+	}
+	switch {
+	case !whole:
+	case resp.StatusCode == http.StatusOK && u.final():
+		how = settleDone
+	case resp.StatusCode != http.StatusOK && !u.stream:
+		how = settleRejected
+	}
+}
+
+// forwardErrorBody answers claude with a non-200 response whose body is scrubbed of the key and of
+// anything key-shaped (an upstream error may echo the request's Authorization; claude logs it to
+// stderr.log): read whole (up to maxProxyJSONResponse), passed through scrubORSecrets and written with
+// its own Content-Length. A larger body is not forwarded: claude gets a proxy error of the same status.
+// It reports whether the upstream body was read and written whole.
+func (p *orProxy) forwardErrorBody(w http.ResponseWriter, resp *http.Response, u *usageReader) bool {
+	w.Header().Del("Content-Length")
+	b, rerr := io.ReadAll(io.LimitReader(resp.Body, maxProxyJSONResponse+1))
+	if len(b) > maxProxyJSONResponse {
+		if rerr == nil {
+			_, rerr = io.Copy(io.Discard, resp.Body)
+		}
+		anthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf(
+			"agent-jobs openrouter proxy: upstream HTTP %d with an error body over %d bytes (not forwarded)",
+			resp.StatusCode, maxProxyJSONResponse))
+		return rerr == nil
+	}
+	u.write(b)
+	out := scrubORSecrets(string(b), p.key)
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	w.WriteHeader(resp.StatusCode)
+	_, werr := io.WriteString(w, out)
+	return rerr == nil && werr == nil
+}
+
+// forwardBody copies a 200 response body to claude as it comes, a complete line at a time (an SSE
+// stream's lines, a JSON body's) through orLineScrubber. It reports whether the body was read and
+// written whole.
+func (p *orProxy) forwardBody(w http.ResponseWriter, body io.Reader, u *usageReader) bool {
 	flusher, _ := w.(http.Flusher)
+	sc := &orLineScrubber{w: w, key: p.key}
 	buf := make([]byte, 32<<10)
 	var rerr, werr error
 	for {
 		var n int
-		n, rerr = resp.Body.Read(buf)
+		n, rerr = body.Read(buf)
 		if n > 0 {
 			u.write(buf[:n])
-			if _, werr = w.Write(buf[:n]); werr != nil {
+			if werr = sc.write(buf[:n]); werr != nil {
 				break
 			}
 			if flusher != nil {
@@ -348,14 +464,99 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	whole := werr == nil && errors.Is(rerr, io.EOF)
-	switch {
-	case !whole:
-	case resp.StatusCode == http.StatusOK && u.final():
-		how = settleDone
-	case resp.StatusCode != http.StatusOK && !u.stream:
-		how = settleRejected
+	if werr == nil {
+		werr = sc.end() // the body's last line without a trailing newline, or what a cut stream left
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
+	return werr == nil && errors.Is(rerr, io.EOF)
+}
+
+// orLineScrubber writes a 200 response body a complete line at a time: each line without the key, and
+// an error line (orErrorLine: an SSE error event, a JSON error body) through scrubORSecrets, so without
+// anything key-shaped either. Other bytes pass unchanged. A line longer than maxProxyJSONResponse (model
+// output, never an error event) is passed on in pieces, each scrubbed of the key on its own.
+type orLineScrubber struct {
+	w    io.Writer
+	key  string
+	line []byte
+	over bool // the current line outgrew maxProxyJSONResponse
+}
+
+func (s *orLineScrubber) write(b []byte) error {
+	for len(b) > 0 {
+		chunk := b
+		i := bytes.IndexByte(b, '\n')
+		if i >= 0 {
+			chunk = b[:i+1]
+		}
+		b = b[len(chunk):]
+		switch {
+		case s.over:
+			if _, err := io.WriteString(s.w, scrubKey(string(chunk), s.key)); err != nil {
+				return err
+			}
+		case len(s.line)+len(chunk) > maxProxyJSONResponse:
+			s.over = true
+			held := string(s.line) + string(chunk)
+			s.line = s.line[:0]
+			if _, err := io.WriteString(s.w, scrubKey(held, s.key)); err != nil {
+				return err
+			}
+		default:
+			s.line = append(s.line, chunk...)
+			if i >= 0 {
+				if err := s.end(); err != nil {
+					return err
+				}
+			}
+		}
+		if i >= 0 {
+			s.over = false
+		}
+	}
+	return nil
+}
+
+// end writes the line held so far (its newline, when it has one, kept).
+func (s *orLineScrubber) end() error {
+	if len(s.line) == 0 {
+		return nil
+	}
+	line := string(s.line)
+	s.line = s.line[:0]
+	if orErrorLine(line) {
+		nl := ""
+		if strings.HasSuffix(line, "\n") {
+			nl = "\n"
+		}
+		line = scrubORSecrets(line, s.key) + nl
+	} else {
+		line = scrubKey(line, s.key)
+	}
+	_, err := io.WriteString(s.w, line)
+	return err
+}
+
+// orErrorLine reports whether a body line may carry an error's text: it names "error" and is not a JSON
+// object (an SSE data: line's, or the line itself) of another type without an error field.
+func orErrorLine(line string) bool {
+	if !strings.Contains(line, "error") {
+		return false
+	}
+	data := strings.TrimSpace(line)
+	if d, ok := strings.CutPrefix(data, "data:"); ok {
+		data = strings.TrimSpace(d)
+	}
+	var v struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(data), &v) != nil {
+		return true
+	}
+	return v.Type == "error" || (len(v.Error) > 0 && string(v.Error) != "null")
 }
 
 // proxyAllowed reports whether a request is one the proxy forwards: exactly POST /v1/messages and POST
@@ -420,12 +621,19 @@ type responseUsage struct {
 	Tokens  TokenUsage
 	Cost    float64
 	HasCost bool
+	// GenID is OpenRouter's generation id of a 200 response (its X-Generation-Id header; the body's id
+	// is a message id, which the generation endpoint refuses), Provider the provider its body names (""
+	// when it names none).
+	GenID    string
+	Provider string
 }
 
 // usageReader scans a response body for its usage: SSE `data:` lines (message_start, message_delta)
 // or one JSON body.
 type usageReader struct {
 	stream bool
+	ok     bool   // the response is a 200: genID is a generation
+	genID  string // the response header's generation id (generationIDFromHeader)
 	line   []byte
 	body   []byte
 	skip   bool
@@ -515,7 +723,8 @@ func (u *usageReader) event(line []byte) {
 		Type    string     `json:"type"`
 		Usage   *usageJSON `json:"usage"`
 		Message struct {
-			Usage *usageJSON `json:"usage"`
+			Provider string     `json:"provider"`
+			Usage    *usageJSON `json:"usage"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(bytes.TrimSpace(data), &ev) != nil {
@@ -532,6 +741,9 @@ func (u *usageReader) event(line []byte) {
 		if ev.Usage != nil && !ev.Usage.validCost() {
 			u.res.Cost, u.res.HasCost = 0, false
 		}
+	}
+	if ev.Type == "message_start" {
+		u.noteProvider(ev.Message.Provider)
 	}
 	u.apply(ev.Message.Usage, false)
 	u.apply(ev.Usage, true)
@@ -554,16 +766,47 @@ func (u *usageReader) final() bool {
 func (u *usageReader) result() responseUsage {
 	if !u.stream {
 		var body struct {
-			Usage *usageJSON `json:"usage"`
+			Provider string     `json:"provider"`
+			Usage    *usageJSON `json:"usage"`
 		}
 		if json.Unmarshal(u.body, &body) == nil {
 			u.apply(body.Usage, true)
+			u.noteProvider(body.Provider)
 		}
 	} else if len(u.line) > 0 && !u.skip {
 		u.event(u.line)
 		u.line = u.line[:0]
 	}
-	return u.res
+	res := u.res
+	res.GenID = u.genID
+	if !u.ok {
+		res.GenID, res.Provider = "", ""
+	}
+	return res
+}
+
+// maxGenIDLen caps a generation id or provider name the proxy keeps.
+const maxGenIDLen = 200
+
+// noteProvider keeps the provider a response's body names when it is a short printable string.
+func (u *usageReader) noteProvider(provider string) {
+	if provider != "" && len(provider) <= maxGenIDLen && Printable(provider, 0) == provider {
+		u.res.Provider = provider
+	}
+}
+
+// generationIDFromHeader is OpenRouter's generation id of a response: its X-Generation-Id header, else
+// its request-id header, whichever first is a generation id (gen-<id>, a short printable token); ""
+// when neither is. The body's id is a message id (msg_...), not a generation id.
+func generationIDFromHeader(h http.Header) string {
+	for _, k := range []string{"X-Generation-Id", "Request-Id"} {
+		id := strings.TrimSpace(h.Get(k))
+		if len(id) > len("gen-") && strings.HasPrefix(id, "gen-") && len(id) <= maxGenIDLen && Printable(id, 0) == id &&
+			!strings.ContainsAny(id, " \t") {
+			return id
+		}
+	}
+	return ""
 }
 
 // ReadOpenRouterKey reads OPENROUTER_API_KEY from an env-style key file (KEY=value lines, # comments,
@@ -688,9 +931,10 @@ func projectSettingsEnvConflict(work string) (string, error) {
 
 // openRouterJob is what the wrapper prepares for an OpenRouter job before claude starts.
 type openRouterJob struct {
-	proxy *orProxy
-	slug  string
-	note  string
+	proxy    *orProxy
+	slug     string
+	note     string
+	endpoint string // the endpoint the routing policy picked ("" when the endpoints list was not read)
 }
 
 // fetchEndpointsTimeout bounds the endpoints read at a job's start.
@@ -738,7 +982,7 @@ func setupOpenRouter(c Config, model, kind, repo, jobDir, jobID string, budget f
 	if err := startORProxy(p); err != nil {
 		return nil, err
 	}
-	return &openRouterJob{proxy: p, slug: slug, note: plan.Note + "; provider " + string(provider)}, nil
+	return &openRouterJob{proxy: p, slug: slug, note: plan.Note + "; provider " + string(provider), endpoint: plan.Pick}, nil
 }
 
 // env is openRouterEnv for this job's proxy.
