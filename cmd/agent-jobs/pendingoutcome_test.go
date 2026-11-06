@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -125,25 +127,26 @@ func TestHookPendingOutcome(t *testing.T) {
 	}
 	want := "[jobs:pending-outcome] 7 finished jobs without job_outcome: j1 job 1 title (finished 1h ago), " +
 		"j2 job 2 title (finished 2h ago), j3 job 3 title (finished 3h ago), " +
-		"j4 job 4 title (finished 4h ago), j5 job 5 title (finished 5h ago), and 2 more\n"
+		"j4 job 4 title (finished 4h ago), j5 job 5 title (finished 5h ago), +2 more, see job_list\n"
 	if out := run("bind", bindEvent("s1", orch)); out != want {
 		t.Errorf("SessionStart: got %q, want %q", out, want)
 	}
-	for range 2 {
-		if out := run("brief-reminder", prompt("s1", "hello")); out != want {
-			t.Errorf("UserPromptSubmit: got %q, want %q", out, want)
+	// A burst of identical prompts: the state did not change, so nothing is injected again (#166).
+	for range 3 {
+		if out := run("brief-reminder", prompt("s1", "hello")); out != "" {
+			t.Errorf("UserPromptSubmit with unchanged state: got %q, want nothing", out)
 		}
 	}
 	if out := run("brief-reminder", prompt("s2", "hello")); out != "" {
 		t.Errorf("another session: %q", out)
 	}
-	if out := run("brief-reminder", prompt("s1", "[jobs:job-done] job another succeeded")); out != want {
-		t.Errorf("daemon prompt: got %q, want %q", out, want)
+	if out := run("brief-reminder", prompt("s1", "[jobs:job-done] job another succeeded")); out != "" {
+		t.Errorf("daemon prompt with unchanged state: got %q, want nothing", out)
 	}
 	withBrief := fmt.Sprintf(`{"session_id":"s1","hook_event_name":"UserPromptSubmit","cwd":%q,"prompt":"hello"}`, draftRepo(t))
 	if out := run("brief-reminder", withBrief); !strings.HasPrefix(out, jobs.BriefReminderPrefix+"Checklist: ") ||
-		!strings.HasSuffix(out, want) || strings.Count(out, "[jobs:pending-outcome]") != 1 || strings.Count(out, "\n") != 2 {
-		t.Errorf("checklist and one outcome reminder: %q", out)
+		strings.Contains(out, "[jobs:pending-outcome]") || strings.Count(out, "\n") != 1 {
+		t.Errorf("checklist only, the outcome reminder was already injected: %q", out)
 	}
 	if out := run("bind", bindEvent("restarted", orch)); out != want {
 		t.Errorf("SessionStart after restart: got %q, want %q", out, want)
@@ -165,5 +168,192 @@ func TestHookPendingOutcome(t *testing.T) {
 	}
 	if out := run("bind", bindEvent("restarted", orch)); out != "" {
 		t.Errorf("SessionStart after outcomes: %q", out)
+	}
+}
+
+// pendingOutcomeHarness is a bound orchestrator session with a movable clock for the dedupe tests.
+type pendingOutcomeHarness struct {
+	t    *testing.T
+	orch string
+	now  time.Time
+	m    *jobs.Manager
+}
+
+func newPendingOutcomeHarness(t *testing.T) *pendingOutcomeHarness {
+	t.Helper()
+	h := &pendingOutcomeHarness{t: t, orch: bindableAgent(t, "test"), now: time.Now().Truncate(time.Second)}
+	m, err := h.open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	h.m = m
+	return h
+}
+
+func (h *pendingOutcomeHarness) open(agent string) (*jobs.Manager, error) {
+	m, err := jobs.Open(agent)
+	if err == nil {
+		m.Now = func() time.Time { return h.now }
+	}
+	return m, err
+}
+
+func (h *pendingOutcomeHarness) finish(id, title string) {
+	h.t.Helper()
+	finished := h.now.Add(-time.Minute)
+	if err := h.m.Store.Insert(&store.Job{ID: id, Agent: "test", Title: title, Kind: "fix", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", CreatedAt: finished, FinishedAt: &finished, NotifiedAt: &finished}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *pendingOutcomeHarness) run(sub, input string) string {
+	h.t.Helper()
+	var out, errs bytes.Buffer
+	if code := runHook([]string{sub, "--agent", "test"}, strings.NewReader(input), &out, &errs, h.open); code != 0 || errs.Len() != 0 {
+		h.t.Fatalf("%s: code %d, stderr %q", sub, code, errs.String())
+	}
+	return out.String()
+}
+
+// age moves the recorded last emission back by d: the prompt hook reads the store with the real clock, so
+// the tests age the state instead of moving a clock.
+func (h *pendingOutcomeHarness) age(d time.Duration) {
+	h.t.Helper()
+	dir, err := jobs.StateDir("test")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	path := filepath.Join(dir, "hook-emit.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var st struct {
+		SessionID string                    `json:"session_id"`
+		Epoch     int64                     `json:"epoch"`
+		Kinds     map[string]map[string]any `json:"kinds"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		h.t.Fatal(err)
+	}
+	for _, rec := range st.Kinds {
+		rec["last_emitted"] = rec["last_emitted"].(float64) - d.Seconds()
+	}
+	if b, err = json.Marshal(st); err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *pendingOutcomeHarness) prompt() string {
+	return h.run("brief-reminder", `{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}`)
+}
+
+func (h *pendingOutcomeHarness) bind() string { return h.run("bind", bindEvent("s1", h.orch)) }
+
+func TestHookPendingOutcomeBurstEmitsOnce(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	h.finish("a1", "first")
+	if out := h.bind(); !strings.Contains(out, "a1 first") {
+		t.Fatalf("SessionStart: %q", out)
+	}
+	for i := range 3 {
+		if out := h.prompt(); out != "" {
+			t.Errorf("prompt %d of the burst: %q, want nothing", i+1, out)
+		}
+	}
+}
+
+func TestHookPendingOutcomeChangedStateEmitsAgain(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	h.finish("a1", "first")
+	h.bind()
+	if out := h.prompt(); out != "" {
+		t.Fatalf("unchanged: %q", out)
+	}
+	h.finish("a2", "second")
+	if out := h.prompt(); !strings.Contains(out, "2 finished jobs") || !strings.Contains(out, "a2 second") {
+		t.Errorf("a new finished job: %q", out)
+	}
+	if out := h.prompt(); out != "" {
+		t.Errorf("repeated after the new snapshot: %q", out)
+	}
+	if err := h.m.SetOutcome("a1", jobs.OutcomeAccepted, ""); err != nil {
+		t.Fatal(err)
+	}
+	if out := h.prompt(); !strings.Contains(out, "1 finished jobs") || strings.Contains(out, "a1 first") {
+		t.Errorf("a recorded outcome: %q", out)
+	}
+	if err := h.m.SetOutcome("a2", jobs.OutcomeAccepted, ""); err != nil {
+		t.Fatal(err)
+	}
+	if out := h.prompt(); out != "" {
+		t.Errorf("nothing pending: %q", out)
+	}
+}
+
+func TestHookPendingOutcomeRepeatsAfterInterval(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	h.finish("a1", "first")
+	h.bind()
+	h.age(jobs.DefaultHookRepeatAfter - 2*time.Second)
+	if out := h.prompt(); out != "" {
+		t.Errorf("just before the default repeat interval: %q", out)
+	}
+	h.age(3 * time.Second)
+	if out := h.prompt(); !strings.Contains(out, "a1 first") {
+		t.Errorf("at the default repeat interval: %q", out)
+	}
+	if out := h.prompt(); out != "" {
+		t.Errorf("after the repeat: %q", out)
+	}
+	writeAgentConfig(t, "test", map[string]any{"notify_tmux_target": "orch-session", "orchestrator_dir": h.orch,
+		"hooks": map[string]any{"repeat_after_seconds": 60}})
+	h.age(50 * time.Second)
+	if out := h.prompt(); out != "" {
+		t.Errorf("before the configured interval: %q", out)
+	}
+	h.age(20 * time.Second)
+	if out := h.prompt(); !strings.Contains(out, "a1 first") {
+		t.Errorf("at the configured interval: %q", out)
+	}
+}
+
+func TestHookPendingOutcomeCompactionFreshSnapshot(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	h.finish("a1", "first")
+	first := h.bind()
+	if first == "" || h.prompt() != "" {
+		t.Fatalf("setup: bind %q", first)
+	}
+	// Compaction fires SessionStart again for the same session: a new context epoch.
+	if out := h.bind(); out != first {
+		t.Errorf("SessionStart after compaction: got %q, want the fresh snapshot %q", out, first)
+	}
+	if out := h.prompt(); out != "" {
+		t.Errorf("prompt after the fresh snapshot: %q", out)
+	}
+}
+
+func TestHookPendingOutcomeByteCap(t *testing.T) {
+	h := newPendingOutcomeHarness(t)
+	writeAgentConfig(t, "test", map[string]any{"notify_tmux_target": "orch-session", "orchestrator_dir": h.orch,
+		"hooks": map[string]any{"max_bytes": 600}})
+	for i := 1; i <= 5; i++ {
+		h.finish(fmt.Sprintf("job-%d", i), strings.Repeat("long title ", 11))
+	}
+	out := h.bind()
+	if len(strings.TrimSuffix(out, "\n")) > 600 {
+		t.Errorf("block is %d bytes, cap 600: %q", len(out), out)
+	}
+	if !strings.HasPrefix(out, "[jobs:pending-outcome] 5 finished jobs") || !strings.Contains(out, "more, see job_list") {
+		t.Errorf("truncation marker missing: %q", out)
+	}
+	if !strings.Contains(out, "job-5 ") {
+		t.Errorf("first job dropped: %q", out)
 	}
 }

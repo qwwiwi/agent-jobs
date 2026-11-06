@@ -2193,7 +2193,7 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if err != nil {
 		return fail(err)
 	}
-	out := jobs.StopHookDecision(in, pending)
+	out := jobs.StopHookDecisionCapped(in, pending, m.Config().Hooks.Max())
 	if out == nil {
 		return 0
 	}
