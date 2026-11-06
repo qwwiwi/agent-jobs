@@ -131,6 +131,38 @@ func TestCoalescedBatchAcknowledgedAtomically(t *testing.T) {
 	}
 }
 
+// #170 fix loop 2, H2: the batch {a,b} is typed, its acknowledgement fails, and a is resumed before
+// the retry: the retry is {b}. b was already counted, so the retry adds no record.
+func TestCoalescedRetryRegroupedAfterResumeNotRecounted(t *testing.T) {
+	m := newManager(t)
+	notifyTo(t, m)
+	m.Cfg.NotifyCoalesceSeconds = 120
+	now := coalesceClock(m)
+	db := rawDB(t, m)
+	t0 := *now
+	a := finishAt(t, m, now, t0, nil)
+	b := finishAt(t, m, now, t0.Add(10*time.Second), nil)
+	mustExec(t, db, `CREATE TRIGGER fail_mark BEFORE UPDATE OF notified_at ON jobs WHEN NEW.id = '`+b.ID+`' AND NEW.notified_at IS NOT NULL
+		BEGIN SELECT RAISE(ABORT, 'planted fault'); END`)
+	*now = t0.Add(10 * time.Minute)
+	if err := m.notifyPending(); err == nil {
+		t.Fatal("the planted fault did not surface")
+	}
+	if ws := wakesOf(t, m, WakeJobDone); len(ws) != 1 || ws[0].BatchSize != 2 {
+		t.Fatalf("the typed batch is not recorded once: %+v", ws)
+	}
+	mustExec(t, db, `DROP TRIGGER fail_mark`)
+	// a is resumed: it leaves the pending set while its batch stays unacknowledged.
+	mustExec(t, db, `UPDATE jobs SET status='queued' WHERE id=?`, a.ID)
+	notifyAt(t, m, now, t0.Add(11*time.Minute))
+	if get(t, m, b.ID).NotifiedAt == nil {
+		t.Fatal("b not marked by the retry")
+	}
+	if ws := wakesOf(t, m, WakeJobDone); len(ws) != 1 {
+		t.Fatalf("the regrouped retry was counted again: %+v", ws)
+	}
+}
+
 // #170 fix loop 1, H3: the breach is reserved before its job is queued, so a failure to link the job
 // afterwards cannot make the next tick queue another one for the same breach.
 func TestSLOInvestigateReservedBeforeEnqueue(t *testing.T) {

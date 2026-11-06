@@ -30,6 +30,10 @@ type Wake struct {
 	// Ref is the delivery's identity: a second record with the same kind, category and ref is the
 	// same delivery again (a retry after its mark failed) and is not counted twice. "" = no identity.
 	Ref string `json:"-"`
+	// MemberRefs are the identities of the things a delivery carries (a job's id, attempt and finish
+	// time). A delivery whose members were all counted before is a retry even when the batch
+	// regrouped (a member resumed or cancelled between the attempts). nil = identity by Ref only.
+	MemberRefs []string `json:"-"`
 }
 
 // SLOSample is one recorded duration of an SLO name.
@@ -70,6 +74,12 @@ CREATE TABLE IF NOT EXISTS orchestrator_wakes (
 );
 CREATE INDEX IF NOT EXISTS orchestrator_wakes_at ON orchestrator_wakes(at);
 CREATE UNIQUE INDEX IF NOT EXISTS orchestrator_wakes_ref ON orchestrator_wakes(kind, category, ref) WHERE ref <> '';
+CREATE TABLE IF NOT EXISTS wake_member_refs (
+	kind     TEXT NOT NULL,
+	category TEXT NOT NULL,
+	ref      TEXT NOT NULL,
+	PRIMARY KEY (kind, category, ref)
+);
 CREATE TABLE IF NOT EXISTS slo_samples (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT,
 	name    TEXT NOT NULL,
@@ -96,13 +106,36 @@ CREATE INDEX IF NOT EXISTS slo_breaches_started ON slo_breaches(investigated_at)
 // AddWake records a delivery or an injection. It reports false when a record with the same kind,
 // category and non-empty ref already exists (the same delivery seen again): nothing is added.
 func (s *Store) AddWake(w Wake) (bool, error) {
-	res, err := s.db.Exec(`INSERT OR IGNORE INTO orchestrator_wakes (at, kind, category, bytes, batch_size, members, ref)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, fmt.Errorf("add wake: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if len(w.MemberRefs) > 0 {
+		fresh := 0
+		for _, ref := range w.MemberRefs {
+			res, err := tx.Exec(`INSERT OR IGNORE INTO wake_member_refs (kind, category, ref) VALUES (?, ?, ?)`, w.Kind, w.Category, ref)
+			if err != nil {
+				return false, fmt.Errorf("add wake: %w", err)
+			}
+			if n, err := res.RowsAffected(); err == nil && n > 0 {
+				fresh++
+			}
+		}
+		if fresh == 0 {
+			return false, nil
+		}
+	}
+	res, err := tx.Exec(`INSERT OR IGNORE INTO orchestrator_wakes (at, kind, category, bytes, batch_size, members, ref)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, w.At.Unix(), w.Kind, w.Category, w.Bytes, max(w.BatchSize, 1), w.Members, w.Ref)
 	if err != nil {
 		return false, fmt.Errorf("add wake: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
+		return false, fmt.Errorf("add wake: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("add wake: %w", err)
 	}
 	return n > 0, nil

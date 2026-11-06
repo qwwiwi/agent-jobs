@@ -48,10 +48,16 @@ var InjectionCategories = []string{InjectBriefReminder, InjectPendingOutcome, In
 // recordWake stores one delivery that tmux accepted. A failure to store it is logged: counting never
 // fails or repeats a delivery. A retry of the same delivery (same ref) is not counted again.
 func (m *Manager) recordWake(category, ref string, members []string, bytes int) {
-	_, err := m.Store.AddWake(store.Wake{
+	w := store.Wake{
 		At: m.Now(), Kind: store.WakeDelivery, Category: category, Bytes: bytes,
 		BatchSize: max(len(members), 1), Members: strings.Join(members, ","), Ref: ref,
-	})
+	}
+	if refs, ok := strings.CutPrefix(ref, WakeJobDone+":"); ok && category == WakeJobDone {
+		// A job-done line is retried after a failed mark, possibly regrouped (a member resumed in
+		// between): its identity is that of each job, so a retry of already counted jobs adds nothing.
+		w.MemberRefs = strings.Split(refs, ",")
+	}
+	_, err := m.Store.AddWake(w)
 	if err != nil {
 		m.Log.Printf("record %s delivery: %v", category, err)
 	}
