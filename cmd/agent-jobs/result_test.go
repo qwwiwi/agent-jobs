@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -154,5 +155,44 @@ func TestResultCompactAndFull(t *testing.T) {
 	if !strings.Contains(full, "evidence line") || !strings.Contains(full, "10:00 UTC step") || strings.Contains(full, tok) ||
 		strings.Index(full, "BLOCKED: blocker text") > strings.Index(full, "summary text") {
 		t.Fatalf("--full result:\n%s", full)
+	}
+}
+
+// F1: the compact result of a report whose Evidence is bigger than the job_result response cap still
+// shows "Not done / uncertain" and Forks (the CLI and job_result agree), and a report past the scan cap
+// says so.
+func TestResultCompactLateSections(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	var ids []string
+	for i, n := range []int{22000, jobs.MaxRedactBytes/14 + 10} {
+		j := &store.Job{ID: fmt.Sprintf("261106-16000%d-cafe", i), Agent: "test", Title: "t", Kind: "general", Brief: "b",
+			Status: store.StatusSucceeded, Model: "sonnet", TimeoutMinutes: 45, CreatedAt: now, StartedAt: &now, FinishedAt: &now}
+		if err := m.Store.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(m.JobDir(j.ID), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report := "## Summary\nfixed it\n\n## Evidence\n" + strings.Repeat("evidence line\n", n) +
+			"\n## Not done / uncertain\nBLOCKED: late blocker\n\n## Forks\n- late / fork / reason\n"
+		if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "report.md"), []byte(report), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, j.ID)
+	}
+	_ = m.Close()
+	out := captureStdout(t, func() error { return cmdResult([]string{"--agent", "test", ids[0]}) })
+	if !strings.Contains(out, "## Not done / uncertain\nBLOCKED: late blocker") || !strings.Contains(out, "## Forks\n- late / fork / reason") ||
+		strings.Contains(out, "report cut at") {
+		t.Fatalf("late sections lost:\n%s", out)
+	}
+	out = captureStdout(t, func() error { return cmdResult([]string{"--agent", "test", ids[1]}) })
+	if strings.Contains(out, "late blocker") || !strings.Contains(out, "INCOMPLETE SCAN") {
+		t.Fatalf("report past the scan cap is not marked:\n%s", out)
 	}
 }

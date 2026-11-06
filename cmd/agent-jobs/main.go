@@ -976,7 +976,7 @@ func cmdResult(args []string) error {
 		printResultSummary(m, j, text)
 	}
 	if truncated {
-		fmt.Printf("\n[report cut at %d bytes; full file: %s]\n", jobs.MaxRedactBytes, filepath.Join(m.JobDir(id), "report.md"))
+		fmt.Printf("\n[%s]\n", mcp.IncompleteScanNote(filepath.Join(m.JobDir(id), "report.md")))
 	}
 	return nil
 }

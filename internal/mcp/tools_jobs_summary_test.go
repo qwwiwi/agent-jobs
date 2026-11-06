@@ -282,3 +282,119 @@ func TestJobResultCompactListsCommits(t *testing.T) {
 		t.Fatalf("full view lists commits: %v", full.Commits)
 	}
 }
+
+// lateBlockerReport is a valid report whose Evidence is bigger than the response cap, so "Not done /
+// uncertain" and Forks start past it (the blocker heading at about offset 308000).
+func lateBlockerReport() string {
+	return "## Summary\nfixed it\n\n## Findings / Changes\nchanged a.go\n\n## Evidence\n" + strings.Repeat("evidence line\n", 22000) +
+		"\n## Not done / uncertain\nBLOCKED: late blocker\n\n## Forks\n- late / fork / reason\n\n## Progress\n- 10:00 UTC a\n"
+}
+
+// F1: the sections that must not be missed are found wherever they sit in the report, not only in
+// the first MaxReportBytes (default, sections and full views).
+func TestJobResultRequiredSectionsBeyondResponseCap(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	report := lateBlockerReport()
+	if at := strings.Index(report, "## Not done"); at < MaxReportBytes {
+		t.Fatalf("test report is too small: blocker at %d", at)
+	}
+	id := insertReportJob(t, m, 20, report, nil)
+	var res JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id}, &res)
+	if res.NotDone != "BLOCKED: late blocker" || res.Forks != "- late / fork / reason" || res.Summary != "fixed it" || res.ReportTruncated {
+		t.Fatalf("summary: not_done %q, forks %q, summary %q, truncated %v", res.NotDone, res.Forks, res.Summary, res.ReportTruncated)
+	}
+	var sec JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id, "sections": []string{"Not done / uncertain", "Forks"}}, &sec)
+	if !strings.Contains(sec.Report, "BLOCKED: late blocker") || !strings.Contains(sec.Report, "late / fork") || strings.Contains(sec.Note, "no such section") {
+		t.Fatalf("sections: %q note %q", sec.Report, sec.Note)
+	}
+	var full JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id, "detail": "full"}, &full)
+	if full.NotDone != "BLOCKED: late blocker" || full.Forks != "- late / fork / reason" || full.Progress != "- 10:00 UTC a" ||
+		!full.ReportTruncated || !strings.Contains(full.Note, "report cut at") || len(full.Report) > MaxReportBytes {
+		t.Fatalf("full: not_done %q, forks %q, progress %q, truncated %v", full.NotDone, full.Forks, full.Progress, full.ReportTruncated)
+	}
+}
+
+// F1: a report past the scan cap is marked as an incomplete scan, in every view, and never read in full.
+func TestJobResultIncompleteScanIsMarked(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	report := "## Summary\nfixed it\n\n## Evidence\n" + strings.Repeat("evidence line\n", jobs.MaxRedactBytes/14+10) +
+		"\n## Not done / uncertain\nBLOCKED: past the scan cap\n"
+	id := insertReportJob(t, m, 21, report, nil)
+	for _, args := range []map[string]any{{"id": id}, {"id": id, "sections": []string{"Summary"}}, {"id": id, "detail": "full"}} {
+		var res JobResultOutput
+		call(t, cs, "job_result", args, &res)
+		if !res.ReportTruncated || !strings.Contains(res.Note, "INCOMPLETE SCAN") || strings.Contains(res.NotDone, "past the scan cap") || res.Summary == "" && args["detail"] == nil && args["sections"] == nil {
+			t.Fatalf("%v: truncated %v, not_done %q, note %q", args, res.ReportTruncated, res.NotDone, res.Note)
+		}
+	}
+}
+
+// F2: report_truncated follows the real cut (CapText appends a marker, so comparing lengths is wrong),
+// in the full, sections and summary views, at the boundary.
+func TestJobResultTruncatedFlagAtBoundary(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	// Sections of exactly the cap and one byte over it: Summary heading line + body.
+	body := func(n int) string { return strings.Repeat("x", n) }
+	for i, tc := range []struct {
+		extra int
+		cut   bool
+	}{{0, false}, {1, true}, {11, true}} {
+		// "## Summary\n" is 11 bytes; the section text is that plus the body and "\n".
+		report := "## Summary\n" + body(1000-11-1+tc.extra) + "\n"
+		id := insertReportJob(t, m, 30+i, report, nil)
+		var sec JobResultOutput
+		call(t, cs, "job_result", map[string]any{"id": id, "sections": []string{"Summary"}, "max_bytes": 1000}, &sec)
+		if sec.ReportTruncated != tc.cut || strings.Contains(sec.Report, "[cut: ") != tc.cut {
+			t.Fatalf("sections +%d: truncated %v, %d bytes", tc.extra, sec.ReportTruncated, len(sec.Report))
+		}
+		var full JobResultOutput
+		call(t, cs, "job_result", map[string]any{"id": id, "detail": "full", "max_bytes": 1000}, &full)
+		if full.ReportTruncated != tc.cut {
+			t.Fatalf("full +%d: truncated %v, %d bytes", tc.extra, full.ReportTruncated, len(full.Report))
+		}
+		var sum JobResultOutput
+		call(t, cs, "job_result", map[string]any{"id": id, "max_bytes": 1000 - 12}, &sum)
+		if sum.ReportTruncated != tc.cut {
+			t.Fatalf("summary +%d: truncated %v, summary %d bytes", tc.extra, sum.ReportTruncated, len(sum.Summary))
+		}
+	}
+	// 1011 bytes cut to 1000: the returned text is longer than 1000 because of the marker, still truncated.
+	id := insertReportJob(t, m, 40, "## Summary\n"+body(1011-11-1)+"\n", nil)
+	var full JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id, "detail": "full", "max_bytes": 1000}, &full)
+	if !full.ReportTruncated || len(full.Report) <= 1000 {
+		t.Fatalf("1011 -> 1000: truncated %v, %d bytes", full.ReportTruncated, len(full.Report))
+	}
+}
+
+// F3: with an explicit max_bytes the full view caps not_done, progress and forks too; without it they
+// keep their old size.
+func TestJobResultFullAppliesMaxBytesToEveryField(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	report := "## Summary\nfixed it\n\n## Not done / uncertain\nBLOCKED: first\n" + strings.Repeat("n", 20000) +
+		"\n\n## Forks\n- a / b / c\n" + strings.Repeat("f", 20000) + "\n\n## Progress\n" + strings.Repeat("- 10:00 UTC step\n", 3000)
+	id := insertReportJob(t, m, 50, report, nil)
+	var capped JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id, "detail": "full", "max_bytes": 1000}, &capped)
+	for name, v := range map[string]string{"not_done": capped.NotDone, "progress": capped.Progress, "forks": capped.Forks, "report": capped.Report} {
+		if !strings.Contains(v, "[cut: 1000 of ") || len(v) > 1000+60 {
+			t.Fatalf("%s is not capped: %d bytes", name, len(v))
+		}
+	}
+	if !strings.HasPrefix(capped.NotDone, "BLOCKED: first") || !capped.ReportTruncated {
+		t.Fatalf("capped not_done %q, truncated %v", capped.NotDone[:20], capped.ReportTruncated)
+	}
+	var def JobResultOutput
+	call(t, cs, "job_result", map[string]any{"id": id, "detail": "full"}, &def)
+	if len(def.NotDone) != len("BLOCKED: first\n")+20000 || len(def.Forks) < 20000 || len(def.Progress) < 50000 ||
+		strings.Contains(def.NotDone+def.Forks+def.Progress, "[cut: ") || def.ReportTruncated {
+		t.Fatalf("legacy default changed: not_done %d, forks %d, progress %d", len(def.NotDone), len(def.Forks), len(def.Progress))
+	}
+}

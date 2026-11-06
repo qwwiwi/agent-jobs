@@ -324,8 +324,10 @@ type JobResultOutput struct {
 	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Forks, Progress),
 	// secret-looking values redacted. Full view: the whole report; sections=[...]: just those sections;
 	// the summary view leaves it empty.
-	Report          string   `json:"report,omitempty"`
-	ReportMissing   bool     `json:"report_missing,omitempty"`
+	Report        string `json:"report,omitempty"`
+	ReportMissing bool   `json:"report_missing,omitempty"`
+	// ReportTruncated: the report is shown incomplete, either report.md went past the scan cap (note
+	// says so) or a returned text was cut to its cap (it ends with a "[cut: ...]" marker).
 	ReportTruncated bool     `json:"report_truncated,omitempty"`
 	Artifacts       []string `json:"artifacts"`
 	Note            string   `json:"note,omitempty"`
@@ -395,6 +397,13 @@ func acceptanceView(m *jobs.Manager, j *store.Job) *AcceptanceView {
 	return v
 }
 
+// IncompleteScanNote is the note of a report.md larger than the scan cap (jobs.MaxRedactBytes): only its
+// start was read, so a section past the cap (a blocker among them) is missing from the result.
+func IncompleteScanNote(reportFile string) string {
+	return fmt.Sprintf("INCOMPLETE SCAN: report.md is larger than the %d-byte scan cap, only its start was read; "+
+		"sections past it are missing here (a blocker may be among them); read the file: %s", jobs.MaxRedactBytes, reportFile)
+}
+
 // capFor is the byte cap asked for (clamped to MaxReportBytes), def when none was.
 func capFor(asked, def int) int {
 	if asked <= 0 {
@@ -456,7 +465,10 @@ func addJobResult(s *sdk.Server, d Deps) {
 				out.Artifacts = append(out.Artifacts, filepath.Join(dir, f))
 			}
 		}
-		report, truncated, err := ReadJobReport(m.StateDir, j.ID, MaxReportBytes)
+		// The scan reads up to the redaction scan cap, not the response cap: the sections an orchestrator
+		// must not miss (Not done / uncertain, Forks) are found wherever they sit in the report, and only
+		// the returned texts are cut to the response caps.
+		report, truncated, err := ReadJobReport(m.StateDir, j.ID, jobs.MaxRedactBytes)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			out.ReportMissing = true
@@ -470,21 +482,41 @@ func addJobResult(s *sdk.Server, d Deps) {
 			// Always redacted on the fly: the report of a job whose in-place redaction is still pending
 			// (or of a running job) may hold raw secrets.
 			text := jobs.RedactRead(report, truncated)
+			reportFile := filepath.Join(dir, "report.md")
 			var notes []string
+			// cutReport: a returned text was cut to its cap (it ends with a marker).
+			cutReport := false
 			if len(in.Sections) > 0 {
 				var missing []string
 				out.Report, missing = jobs.ReportSectionTexts(text, in.Sections...)
-				out.Report, _ = jobs.CapText(out.Report, capFor(in.MaxBytes, SectionsBytes))
+				var cut bool
+				out.Report, cut = jobs.CapText(out.Report, capFor(in.MaxBytes, SectionsBytes))
+				cutReport = cutReport || cut
 				if len(missing) > 0 {
 					notes = append(notes, "no such section: "+strings.Join(missing, ", "))
 				}
 			}
 			if full {
+				// Without max_bytes these keep the old bound (the report cap); with it each is cut to it.
+				fieldCap := capFor(in.MaxBytes, MaxReportBytes)
 				secs := jobs.ReportSections(text, jobs.SectionNotDone, jobs.SectionProgress, jobs.SectionForks)
-				out.NotDone, out.Progress, out.Forks = secs[0], secs[1], secs[2]
+				for i, dst := range []*string{&out.NotDone, &out.Progress, &out.Forks} {
+					var cut bool
+					*dst, cut = jobs.CapText(secs[i], fieldCap)
+					cutReport = cutReport || cut
+				}
 				if len(in.Sections) == 0 {
-					out.Report, _ = jobs.CapText(text, capFor(in.MaxBytes, MaxReportBytes))
-					out.ReportTruncated = truncated || len(out.Report) < len(text)
+					var cut bool
+					if in.MaxBytes <= 0 && len(text) > MaxReportBytes {
+						// The old default: the first MaxReportBytes, back to the last whole line, no marker.
+						out.Report, cut = jobs.RedactRead(text[:MaxReportBytes], true), true
+					} else {
+						out.Report, cut = jobs.CapText(text, fieldCap)
+					}
+					cutReport = cutReport || cut
+					if cut {
+						notes = append(notes, fmt.Sprintf("report cut at %d bytes; full file: %s", fieldCap, reportFile))
+					}
 				}
 			} else {
 				d := jobs.DigestReport(text, capFor(in.MaxBytes, SummaryFieldBytes))
@@ -495,15 +527,18 @@ func addJobResult(s *sdk.Server, d Deps) {
 				notes = append(notes, commitsNote, d.SizesHint(),
 					"summary view: job_result with sections=[<name>, ...] returns sections, detail=full the whole report")
 				if len(d.Cut) > 0 {
+					cutReport = true
 					notes = append(notes, "cut at the cap: "+strings.Join(d.Cut, ", "))
 				}
 			}
+			if truncated {
+				// The scan itself is incomplete: a section past the scan cap is not in any field.
+				notes = append(notes, IncompleteScanNote(reportFile))
+			}
+			out.ReportTruncated = truncated || cutReport
 			out.Note = joinNotes(notes...)
 			if len(j.Covers) > 0 {
 				out.Requirements = &RequirementsView{Requirements: jobs.ParseRequirements(text, j.Covers)}
-			}
-			if truncated {
-				out.Note = joinNotes(out.Note, fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md")))
 			}
 		}
 		if len(j.Covers) > 0 {
