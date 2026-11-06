@@ -1164,7 +1164,7 @@ var (
 	// reScopeMention finds an out-of-scope tool (outOfScopeTools, systemctl) as a word inside code
 	// (`python3 -c '…["tmux", …]'`, `watch 'docker run …'`); not `at`, `batch`, `screen`: plain words.
 	// It is not used on every argument: a package, directory or make target named ssh or docker is data.
-	reScopeMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((ssh)($|[^a-z0-9_-])|` +
+	reScopeMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])((ssh|scp|sftp)($|[^a-z0-9_-])|` +
 		`(systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session|crontab|tmux|pm2|docker|podman|` +
 		`machinectl|loginctl|unshare|nsenter)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
@@ -1219,6 +1219,9 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	}
 	if name == "systemctl" && slices.Contains(v.wrappers, "xargs") {
 		return cannot("xargs systemctl (its arguments, e.g. --user, come from stdin)")
+	}
+	if name == "rsync" && slices.Contains(v.wrappers, "xargs") {
+		return cannot("xargs rsync (its arguments, e.g. a host:path operand, come from stdin)")
 	}
 	if isGitName(name) || name == "gh" {
 		switch {
@@ -1327,11 +1330,83 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if t := scopeToolArg(name, argv[1:], dyn[1:]); t != "" {
 		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
 	}
+	if t := remoteCopyArg(name, argv[1:], dyn[1:]); t != "" {
+		return cannot(name + " running " + t + " (an rsync that reaches a remote host) indirectly")
+	}
 	return ""
 }
 
 // scopeTool reports a lower-cased base name that starts processes outside the job's scope.
 func scopeTool(b string) bool { return outOfScopeTools[b] || b == "systemctl" }
+
+// rsyncRemote reports whether rsync args can reach a remote host: any -e/--rsh option (whatever
+// command it names — the default remote shell is ssh), a -M/--remote-option word (its value goes to
+// the remote side), or a path argument in rsync's remote spelling (host:/x, host::module,
+// user@host:/x, rsync://h/m; a ':' before any '/'). Options that take a value are consumed first
+// (rsyncValueOpts, and the short -f/-T/-B that take the rest of their cluster), so a value is
+// never read as an operand (`--exclude cache:old`) or as an option letter (`-f'- *.cache'`).
+// Purely local copies (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay
+// allowed: a job uses rsync inside its worktree.
+func rsyncRemote(args []string) bool {
+	endOpts := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case endOpts || a == "-" || !strings.HasPrefix(a, "-"):
+			if remoteColon(a) {
+				return true
+			}
+		case a == "--":
+			endOpts = true
+		case strings.HasPrefix(a, "--"):
+			opt, _, hasVal := strings.Cut(a, "=")
+			switch {
+			case opt == "--rsh" || opt == "--remote-option":
+				return true
+			case rsyncValueOpts[opt] && !hasVal && i+1 < len(args):
+				i++ // the option's value is the next word
+			}
+		default: // a short-option cluster
+			val := a[1:]
+			for k := 0; k < len(val); k++ {
+				c := val[k]
+				if c == 'e' || c == 'M' { // --rsh, --remote-option: remote whatever the value
+					return true
+				}
+				if c == 'f' || c == 'T' || c == 'B' { // --filter, --temp-dir, --block-size: the
+					// rest of the cluster (or the next word) is the value, not options
+					if k == len(val)-1 && i+1 < len(args) {
+						i++
+					}
+					break
+				}
+			}
+		}
+	}
+	return false
+}
+
+// rsyncValueOpts are rsync's long options whose value is data: a pattern, a path or a format. The
+// value is consumed (attached, or as the next word when true) before the operand scan, so
+// `--exclude cache:old` is not read as a remote operand. --info and --debug take their value
+// attached only, so a separate word after them still counts as an operand (fail closed). --rsh and
+// --remote-option are not here: they are remote whatever their value.
+var rsyncValueOpts = map[string]bool{
+	"--exclude": true, "--include": true, "--filter": true, "--exclude-from": true, "--include-from": true,
+	"--files-from": true, "--link-dest": true, "--compare-dest": true, "--copy-dest": true, "--backup-dir": true,
+	"--suffix": true, "--chmod": true, "--chown": true, "--log-file": true, "--temp-dir": true,
+	"--partial-dir": true, "--password-file": true, "--out-format": true, "--iconv": true,
+	"--usermap": true, "--groupmap": true, "--block-size": true, "--max-size": true, "--min-size": true,
+	"--info": false, "--debug": false,
+}
+
+// remoteColon reports a word with a ':' before any '/', rsync's own remote spelling (`host:/x`,
+// `host::module`, `user@host:/x`, `rsync://h/m`): the host part precedes the first path separator,
+// so the guard follows the same rule. `./a:b` and `/a:b` (the ':' after a '/') are local names.
+func remoteColon(w string) bool {
+	c := strings.IndexByte(w, ':')
+	return c >= 0 && (strings.IndexByte(w, '/') < 0 || c < strings.IndexByte(w, '/'))
+}
 
 // execRunners run their positional arguments as a command (`setsid tmux …`, `flock f docker …`).
 var execRunners = map[string]bool{
@@ -1376,6 +1451,51 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
 		return a
 	}
 	return ""
+}
+
+// remoteCopyArg returns the argument showing that name runs, at a position the guard already
+// treats as a command — the value or the word after an exec option (find -exec/-execdir/-ok) or a
+// positional of an exec runner (setsid, ionice, chroot, …, also one reached through another
+// exec option or runner) — an rsync that reaches a remote host (rsyncRemote of the words after
+// the command word). Under parallel or entr the command's extra arguments come from stdin and
+// cannot be seen, so rsync is refused without an argv to inspect; xargs is refused in
+// unverifiable (a wrapper split strips it). For an exec option the executed command's argv ends
+// at find's `;`/`+` terminator (execArgv): what follows is find's again, e.g. another action's
+// -printf format.
+func remoteCopyArg(name string, args []string, dyn []bool) string {
+	data := runnerDataValues(name, args)
+	for k, a := range args {
+		if data[k] || dyn[k] {
+			continue
+		}
+		if progName(optValue(a)) != "rsync" {
+			continue
+		}
+		opt, _, _ := strings.Cut(a, "=")
+		argv := args[k+1:]
+		switch {
+		case optValue(a) != a && execOpts[opt], k > 0 && (execOpts[args[k-1]] || execRunners[progName(args[k-1])]):
+			argv = execArgv(argv)
+		case execRunners[name] && !strings.HasPrefix(a, "-"):
+		default:
+			continue
+		}
+		if name == "parallel" || name == "entr" || rsyncRemote(argv) {
+			return a
+		}
+	}
+	return ""
+}
+
+// execArgv cuts the argv of a command run by an exec option (find -exec/-execdir/-ok) at find's
+// `;`/`+` terminator, so the words of a following action are not read as the command's.
+func execArgv(argv []string) []string {
+	for k, a := range argv {
+		if a == ";" || a == "+" {
+			return argv[:k]
+		}
+	}
+	return argv
 }
 
 // packageRunners fetch and run a package by name (npx, pnpm dlx, …): what runs is decided by a
@@ -1432,13 +1552,16 @@ func checkNestedAgents(scripts []*script, _ string, _ Config) string {
 // outOfScopeTools start processes outside the job's cgroup scope: the user's service manager and session
 // bus (a new transient unit), and daemons or schedulers that run a command for the caller in their own
 // cgroup (cron, at, tmux/screen servers, pm2, containers, ssh, logind/machined), or a new namespace that
-// blinds the cgroup check (unshare, nsenter). Owner decision 2026-10-17 (docs/DECISIONS.md).
+// blinds the cgroup check (unshare, nsenter). scp and sftp are here too (issue #116): they reach a
+// remote host over ssh with the operator's keys, and a job never reaches remote hosts. rsync is not:
+// it depends on its arguments, so checkUserManager decides (rsyncRemote). Owner decision 2026-10-17
+// (docs/DECISIONS.md).
 var outOfScopeTools = map[string]bool{
 	"systemd-run": true, "busctl": true, "dbus-send": true, "gdbus": true, "qdbus": true, "qdbus-qt5": true,
 	"qdbus6": true, "dbus-run-session": true,
 	"crontab": true, "at": true, "batch": true, "tmux": true, "screen": true, "pm2": true, "docker": true,
-	"docker-compose": true, "podman": true, "podman-compose": true, "ssh": true, "machinectl": true,
-	"loginctl": true, "unshare": true, "nsenter": true,
+	"docker-compose": true, "podman": true, "podman-compose": true, "ssh": true, "scp": true, "sftp": true,
+	"machinectl": true, "loginctl": true, "unshare": true, "nsenter": true,
 }
 
 // cgroupControlFiles are the cgroup v2 core files: writing there moves processes between cgroups
@@ -1865,7 +1988,13 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
 // bus clients, cron/at, tmux/screen, pm2, docker/podman, ssh, machinectl/loginctl, unshare/nsenter) are
 // rejected as commands (behind wrappers and xargs too: argvOf strips env/sudo/timeout/xargs/…); where
 // another program runs them (find -exec, setsid, python -c, a copied binary) they and systemctl are
-// caught by scopeToolArg in unverifiable. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
+// caught by scopeToolArg in unverifiable. scp and sftp (always over ssh) and an rsync that can reach a
+// remote host are refused here too (issue #116): a job never reaches remote hosts, where it would use
+// the operator's keys. The same positions cover rsync remotely: behind the wrappers (nohup, env,
+// sudo, timeout, xargs …) the stripped command is rsync here, and where another program runs it
+// (find -exec/-execdir/-ok, the exec runners setsid/ionice/chroot/…) remoteCopyArg in unverifiable
+// applies rsyncRemote to its argv; rsync under xargs or parallel/entr is refused outright, its
+// extra arguments coming from stdin. `systemctl --user` (also abbreviated `--u`, `--us`, `--use`,
 // `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
 // cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
 func checkUserManager(scripts []*script, cmd string, cfg Config) string {
@@ -1874,6 +2003,14 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 			return ""
 		}
 		name := progName(argv[0])
+		if name == "scp" || name == "sftp" {
+			return "blocked by guard: `" + name + "` copies files to or from a remote host over ssh (with the " +
+				"operator's keys); a job never reaches remote hosts."
+		}
+		if name == "rsync" && rsyncRemote(argv[1:]) {
+			return "blocked by guard: `rsync` is given a remote host (an -e/--rsh command or a host:path " +
+				"argument); a job never reaches remote hosts."
+		}
 		if outOfScopeTools[name] {
 			sandbox := ""
 			if name == "docker" && cfg.Sandbox != "" {
