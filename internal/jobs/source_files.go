@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,10 @@ import (
 
 // MaxSourceFileBytes bounds each local snapshot (at most MaxJobSources files).
 const MaxSourceFileBytes int64 = 2 << 20
+
+// errJobDirExists marks a candidate id whose job folder is already on disk: enqueue treats it like a
+// taken id and redraws, and never deletes that folder (this attempt did not create it).
+var errJobDirExists = errors.New("job directory already exists")
 
 // checkFileSourceOrigins checks the new file syntax without enabling legacy repository clones.
 func checkFileSourceOrigins(origins []string) error {
@@ -157,6 +162,11 @@ func (m *Manager) copySourceFiles(j *store.Job) (cleanup func(), err error) {
 		return cleanup, fmt.Errorf("sources: create jobs directory: %w", err)
 	}
 	if err := os.Mkdir(dir, 0o700); err != nil {
+		// A candidate whose folder already exists is as taken as its row: enqueue redraws (#129).
+		// Nothing was created under it by this call, so the cleanup stays a no-op.
+		if errors.Is(err, os.ErrExist) {
+			return cleanup, fmt.Errorf("sources: create job directory %s: %w", dir, errJobDirExists)
+		}
 		return cleanup, fmt.Errorf("sources: create job directory: %w", err)
 	}
 	cleanup = func() { _ = os.RemoveAll(dir) }

@@ -241,9 +241,13 @@ func ValidateLimits(turns int, budget float64, timeout int) (int, float64, int, 
 	return turns, budget, timeout, nil
 }
 
+// idRandom is the random source of the id's 16-bit suffix: crypto/rand, swapped only by tests that
+// need to force a collision deterministically.
+var idRandom = rand.Read
+
 func newID(now time.Time) string {
 	b := make([]byte, 2)
-	_, _ = rand.Read(b)
+	_, _ = idRandom(b)
 	return now.Format("060102-150405") + "-" + hex.EncodeToString(b)
 }
 
@@ -349,11 +353,8 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	cleanup, err := m.copySourceFiles(j)
-	if err != nil {
-		return nil, err
-	}
 	inserted := false
+	cleanup := func() {}
 	defer func() {
 		if !inserted {
 			cleanup()
@@ -361,15 +362,31 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 	}()
 	// The id's random part is 16 bits (newID), so two starts in the same second can draw the same
 	// one: the insert's UNIQUE constraint is the atomic check, and a retry redraws only the random
-	// part, at the job's own creation time, leaving the id format alone (#129).
+	// part, at the job's own creation time, leaving the id format alone (#129). The source snapshots
+	// are bound to each candidate id: a redraw removes only the folder this attempt created (never a
+	// folder that was already there) and copies again under the next id, so an inserted job always
+	// finds its own sources under its own id.
 	for try := 0; ; try++ {
-		ok, err := m.insertQueued(j)
-		if errors.Is(err, store.ErrJobIDExists) && try < idRedraws {
+		c, cerr := m.copySourceFiles(j)
+		if cerr != nil {
+			// A candidate whose folder already exists on disk is as taken as its row: redraw, and
+			// leave that folder alone (this attempt created nothing under it).
+			if errors.Is(cerr, errJobDirExists) && try < idRedraws {
+				j.ID = newID(j.CreatedAt)
+				continue
+			}
+			return nil, cerr
+		}
+		cleanup = c
+		ok, ierr := m.insertQueued(j)
+		if errors.Is(ierr, store.ErrJobIDExists) && try < idRedraws {
+			cleanup() // the folder of this attempt only; the next candidate owns the cleanup from here
+			cleanup = func() {}
 			j.ID = newID(j.CreatedAt)
 			continue
 		}
-		if err != nil {
-			return nil, err
+		if ierr != nil {
+			return nil, ierr
 		}
 		inserted = ok
 		if ok {
