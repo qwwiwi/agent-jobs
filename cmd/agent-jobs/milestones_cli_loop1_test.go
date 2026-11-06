@@ -171,7 +171,7 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
 		// Parity: every input is refused by both or accepted by both with the same tree.
 		for _, raw := range []string{
 			`{"title": "x", ` + tasks + `}`,
-			`{"title": "x", "goal": "g", "order": 2, "max_parallel": 1, "tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"]}]}`,
+			`{"title": "x", "goal": "g", "order": 2, "max_parallel": 1, "tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "depends_why": {"T1": "shares files"}}]}`,
 			`{"Title": "x", ` + tasks + `}`,
 			`{"title": null, ` + tasks + `}`,
 			`{"title": "x", "goal": null, ` + tasks + `}`,
