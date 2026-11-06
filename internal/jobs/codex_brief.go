@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -36,7 +37,11 @@ func (c Config) CodexBriefWarnings(j *store.Job) []string {
 	var warnings []string
 	for _, rule := range codexBriefRules {
 		if rule.blocked(s, j) && briefRequests(j.Brief, rule.pattern, rule.externalHTTP) {
-			warnings = append(warnings, "The brief asks "+rule.asks+"; you cannot "+rule.reason+" – "+rule.instead+".")
+			warning := "The brief asks " + rule.asks + "; you cannot " + rule.reason + " – " + rule.instead + "."
+			// The curl-verb and URL rules share their message: one line per conflicting category.
+			if !slices.Contains(warnings, warning) {
+				warnings = append(warnings, warning)
+			}
 		}
 	}
 	return warnings
@@ -47,10 +52,42 @@ func briefPattern(pattern string) *regexp.Regexp {
 	return regexp.MustCompile(`(?i)(^|[^\pL\pN_])(` + pattern + `)($|[^\pL\pN_.]|\.(?:$|[^\pL\pN_]))`)
 }
 
-// Negation applies only before the matched verb, within four preceding words,
-// and stops at a clause or line boundary. This is a lexical heuristic:
+// Clause boundaries end a negation scope (#141): sentence end, a comma, a line break,
+// or a coordinating conjunction in either language ("and then" is covered by "then").
+var briefClauseBoundary = regexp.MustCompile(`(?i)[.;,!?]|\r|\n|(^|[^\pL\pN_])(?:but|however|then|а|но|однако|потом|затем)($|[^\pL\pN_])`)
+
+// briefPreVerbClause cuts the text before a matched verb at the last clause boundary:
+// a negation from an earlier clause ("do not push but run curl") never reaches this verb.
+func briefPreVerbClause(text string) string {
+	found := briefClauseBoundary.FindAllStringIndex(text, -1)
+	if len(found) == 0 {
+		return text
+	}
+	return text[found[len(found)-1][1]:]
+}
+
+// briefPostVerbClause cuts the text after a matched verb at the first clause boundary,
+// so a post-verb negation ("run curl not needed but run wget") applies only to its own clause.
+func briefPostVerbClause(text string) string {
+	found := briefClauseBoundary.FindStringIndex(text)
+	if found == nil {
+		return text
+	}
+	return text[:found[0]]
+}
+
+// Negation applies only before the matched verb, within four preceding words inside the
+// verb's own clause, and stops at a clause or line boundary. This is a lexical heuristic:
 // "Don't forget to commit" gives no warning by design; generic sandbox guidance still applies.
 var briefNegation = regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:not|cannot|\pL*n['’]t|never|no|without|не|нельзя|запрещ\pL*|без|никогда)(?:[^\pL\pN_.;,:!?\r\n]+[\pL\pN_]+){0,3}[^\pL\pN_.;,:!?\r\n]*$`)
+
+// Post-verb negation (#141) mirrors briefNegation after the matched verb, within
+// the same clause: the negation word must follow the verb right away or through a
+// linking verb, and only the listed negation words count (English "not" only as
+// "not needed/necessary/required"; a bare "no" is left out — "run curl no matter
+// what" is a positive request). "commit is not allowed" stays a known-limit
+// warning by design: the negation words do not cover "not allowed".
+var briefPostNegation = regexp.MustCompile(`(?i)^[^\pL\pN_.;,:!?\r\n]*(?:(?:is|are|was|were|be|been|being|был\pL*|быть|буд\pL*)[^\pL\pN_.;,:!?\r\n]+){0,2}(?:not[^\pL\pN_.;,:!?\r\n]+(?:needed|necessary|required)|nothing|never|нельзя|не(?:[^\pL\pN_.;,:!?\r\n]+(?:надо|нужно|нужен|нужна))?)($|[^\pL\pN_])`)
 
 func briefRequests(brief string, pattern *regexp.Regexp, externalHTTP bool) bool {
 	for offset := 0; offset < len(brief); {
@@ -59,7 +96,7 @@ func briefRequests(brief string, pattern *regexp.Regexp, externalHTTP bool) bool
 			return false
 		}
 		start, end := offset+match[4], offset+match[5]
-		if !briefNegation.MatchString(brief[:start]) {
+		if !briefNegation.MatchString(briefPreVerbClause(brief[:start])) && !briefPostNegation.MatchString(briefPostVerbClause(brief[end:])) {
 			target := brief
 			if briefHTTPURLs.MatchString(brief[start:end]) {
 				target = brief[start:end]
@@ -91,6 +128,8 @@ var codexBriefRules = []struct {
 		"for a browser or screenshot", "run a socket-dependent browser with network off", "describe the screenshot to take and report the browser check as not run", false},
 	{briefPattern(`psql|pg_virtualenv|postgres\pL*|docker|постгрес\pL*|докер\pL*`), codexOffline,
 		"for PostgreSQL or Docker", "run socket-bound services/tests with network off", "write the tests but do not run socket-bound ones; report the command for the orchestrator", false},
+	{briefPattern("(?:run|running|use|using|start|starting|launch|launching|invoke|execute|exec|fetch|запус\\pL*|запущ\\pL*|вызов\\pL*|вызва\\pL*|выполн\\pL*|используй\\pL*|скача\\pL*)\\s+(?:[\\pL\\pN_]+[^\\pL\\pN_.;,:!?\\r\\n]+){0,2}[`\"']?(?:curl|wget)"), codexOffline,
+		"for external HTTP/curl", "reach external hosts with network off", "use local fixtures or describe the request for the orchestrator", false},
 	{briefPattern(`https?://[^\s<>"` + "`" + `]+`), codexOffline,
 		"for external HTTP/curl", "reach external hosts with network off", "use local fixtures or describe the request for the orchestrator", true},
 	{briefPattern("(?:run|running|start|starting|launch|launching|invoke|execute|запус\\pL*|запущ\\pL*|вызов\\pL*|вызва\\pL*)\\s+[`\"']?(?:codex|кодекс)|(?m:^[\\t ]*(?:[$>][\\t ]*)?codex[\\t ]+(?:exec|review|--?\\pL+))"), codexAlways,

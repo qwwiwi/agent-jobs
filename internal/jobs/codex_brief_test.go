@@ -175,6 +175,34 @@ func TestCodexBriefNegatedRequests(t *testing.T) {
 	}
 }
 
+func TestCodexBriefBareCurlVerbAndPostVerbNegation(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		// A bare curl/wget verb after an action verb warns without an explicit URL (#141).
+		{"run curl to fetch the list", 1},
+		{"выполни wget", 1},
+		{"use curl", 1},
+		{"fetch it with curl", 1},
+		{"выполни curl https://example.invalid", 1},
+		{"do not run curl", 0},
+		{"curl is not needed", 0},
+		{"curl не нужен", 0},
+		{"пушить не надо", 0},
+		{"commit nothing", 0},
+		// Known limit kept: "not allowed" is not a listed post-verb negation word.
+		{"commit is not allowed", 1},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: tc.brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexBriefNegationScope(t *testing.T) {
 	for _, brief := range []string{
 		"Do not commit; git push", "Do not commit. Take a screenshot", "No browser\ngit commit",
@@ -184,6 +212,33 @@ func TestCodexBriefNegationScope(t *testing.T) {
 			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: brief}
 			if got := (Config{}).CodexBriefWarnings(j); len(got) != 1 {
 				t.Fatalf("got %v, want one positive-request warning", got)
+			}
+		})
+	}
+}
+
+// Negation never crosses a clause boundary: the conjunctions but/however/then and
+// а/но/однако/потом/затем start a new clause, so the verb after them is a positive request (#141).
+func TestCodexBriefNegationClauseBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		{"do not push but run curl", 1},
+		{"run curl not needed but run wget", 1},
+		{"не пушь, но выполни curl", 1},
+		{"не коммить, а потом запусти wget", 1},
+		// The same conjunctions without punctuation between the clauses.
+		{"не пушь но выполни curl", 1},
+		{"do not push, however run curl", 1},
+		// Negation after the boundary still governs its own clause.
+		{"do not push but do not run curl", 0},
+		{"не пушь, но не коммить", 0},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: tc.brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
 			}
 		})
 	}
