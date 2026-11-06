@@ -234,6 +234,56 @@ func TestResumeLegacySkillsAfterCleanupRefused(t *testing.T) {
 	}
 }
 
+// A legacy job queued before manifests existed never passes admission; launch must still refuse it.
+func TestResumeLegacySkillsQueuedRefusedAtLaunch(t *testing.T) {
+	// No repository: launch reaches the skill check without worktree metadata.
+	m, _ := skillsManager(t)
+	j := enqueue(t, m, "resume guard", func(r *StartRequest) { r.Kind = "fix" })
+	if err := m.Store.Claim(j.ID, "skills-test", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.deliverSkills(j, "skills-test", work); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	if len(j.SkillsDelivered) == 0 || j.SkillsManifest == "" || j.RepoPath != "" {
+		t.Fatal("fixture must have recorded deliveries with a manifest and no repository")
+	}
+	// Model a pre-manifest delivery: the names are recorded, the manifest is not.
+	if err := m.Store.SetSkillsDelivered(j.ID, "skills-test", j.SkillsDelivered, j.SkillsNote); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("original task\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(j.ID, "skills-test", store.StatusFailed, 7, 0.4, 1, "turn limit", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Queued by an older daemon: the row skips today's admission check entirely.
+	if err := m.Store.Requeue(j.ID, store.ResumeLimits{MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes}, "continue", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "resume-test", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	if j.SkillsManifest != "" || len(j.SkillsDelivered) == 0 || j.Attempt != 2 {
+		t.Fatalf("fixture must be a claimed legacy row: manifest=%q delivered=%v attempt=%d", j.SkillsManifest, j.SkillsDelivered, j.Attempt)
+	}
+	const reason = "no verifiable baseline"
+	if _, err := m.prepareResume(j, "resume-test"); err == nil || !strings.Contains(err.Error(), reason) {
+		t.Fatalf("queued legacy delivery must be refused at launch with %q: %v", reason, err)
+	}
+	if got := get(t, m, j.ID); got.SkillsManifest != "" {
+		t.Fatalf("refused launch recorded a manifest: %q", got.SkillsManifest)
+	}
+}
+
 func TestResumeDeliveredSkillsSymlinkedWorkRefused(t *testing.T) {
 	for _, mode := range []string{"admission", "launch"} {
 		for _, name := range []string{"CLAUDE.md", ".claude/settings.local.json"} {

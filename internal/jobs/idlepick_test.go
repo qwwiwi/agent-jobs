@@ -27,12 +27,14 @@ func newIdleFixture(t *testing.T) *idleFixture {
 	m := newManager(t)
 	ctx := context.Background()
 	dep := func(keys ...string) *[]string { return &keys }
+	// An edge without a reason is dropped (#119), so every edge carries one.
+	why := func(key string) *map[string]string { return &map[string]string{key: "shares files"} }
 	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "Stage", Tasks: []MilestoneTaskInput{
 		{Key: "T1", Title: "first"},
-		{Key: "T2", Title: "second", DependsOn: dep("T1")},
+		{Key: "T2", Title: "second", DependsOn: dep("T1"), DependsWhy: why("T1")},
 		{Key: "T3", Title: "third"},
-		{Key: "T4", Title: "fourth", DependsOn: dep("T2")},
-		{Key: "T5", Title: "fifth", DependsOn: dep("T4")},
+		{Key: "T4", Title: "fourth", DependsOn: dep("T2"), DependsWhy: why("T2")},
+		{Key: "T5", Title: "fifth", DependsOn: dep("T4"), DependsWhy: why("T4")},
 	}})
 	if err != nil {
 		t.Fatal(err)

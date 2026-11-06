@@ -211,6 +211,9 @@ type Config struct {
 	// IdlePick makes the job-done line of the last job of an emptied queue say what is ready to do next
 	// (#165), so no hourly wake is needed to look for it. Off by default.
 	IdlePick IdlePickConfig `json:"idle_pick"`
+	// Hooks tunes the text the orchestrator's hooks inject into its context: the repeat interval of an
+	// unchanged block and the byte cap of every block (#166).
+	Hooks HooksConfig `json:"hooks"`
 	// ModelPrices adds or overrides list prices (USD per million tokens) by model name, used to estimate
 	// the cost of attempts that ended without a reported one (killed, timed out, codex). A model with no
 	// price here or in the built-in table keeps an unknown cost.
@@ -612,6 +615,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := validatePrices(c.ModelPrices); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.Hooks.validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {

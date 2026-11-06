@@ -59,7 +59,7 @@ func TestJobViewShowsMilestoneWaiting(t *testing.T) {
 	if jv.Waiting != "" {
 		t.Fatalf("job_start of a ready task: waiting %q", jv.Waiting)
 	}
-	call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}}}}, &v)
+	call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "shares files"}}}}, &v)
 	want := "waiting for T1 (ready)"
 	call(t, cs, "job_status", map[string]any{"id": jv.ID}, &jv)
 	if jv.Waiting != want {

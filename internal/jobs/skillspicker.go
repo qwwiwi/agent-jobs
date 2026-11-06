@@ -43,7 +43,11 @@ func isTool(toolName, name string) bool {
 
 // SkillsPicker reads a PreToolUse hook input and returns the context the picker adds ("" = none).
 // Another event or tool is no error: it gets nothing.
-func SkillsPicker(r io.Reader) (string, error) {
+func SkillsPicker(r io.Reader) (string, error) { return SkillsPickerCapped(r, DefaultHookMaxBytes) }
+
+// SkillsPickerCapped is SkillsPicker with the context at most maxBytes (config hooks.max_bytes): task keys
+// that do not fit are counted in "and N more".
+func SkillsPickerCapped(r io.Reader, maxBytes int) (string, error) {
 	raw, err := readHookInput(r)
 	if err != nil {
 		return "", err
@@ -71,12 +75,7 @@ func SkillsPicker(r io.Reader) (string, error) {
 		if len(missing) == 0 {
 			return "", nil
 		}
-		keys := missing
-		if len(keys) > maxPickerKeys {
-			keys = append(keys[:maxPickerKeys:maxPickerKeys], fmt.Sprintf("and %d more", len(missing)-maxPickerKeys))
-		}
-		return SkillsPickerPrefix + "skills are planned once per milestone, per task: tasks " + strings.Join(keys, ", ") +
-			" have no skills list" + SkillsPickerMilestoneNote, nil
+		return capText(pickerMilestoneContext(missing, maxBytes), maxBytes), nil
 	case isTool(*raw.ToolName, "job_start"):
 		var in struct {
 			Brief     string           `json:"brief"`
@@ -92,7 +91,36 @@ func SkillsPicker(r io.Reader) (string, error) {
 		if onTask || in.Skills != nil || skills.BriefDeclinesSkills(in.Brief) {
 			return "", nil
 		}
-		return SkillsPickerJobNote, nil
+		return capText(SkillsPickerJobNote, maxBytes), nil
 	}
 	return "", nil
+}
+
+// pickerMilestoneHead and pickerCompactFoot are the fixed text of the milestone context; the compact foot
+// replaces SkillsPickerMilestoneNote when a low hooks.max_bytes leaves no room for the full note.
+const (
+	pickerMilestoneHead = SkillsPickerPrefix + "skills are planned once per milestone, per task: tasks "
+	pickerCompactFoot   = " have no skills list. Plan their skills now in one milestone_set (tasks [{key, skills}]; skill_list lists skills)."
+)
+
+// pickerMilestoneContext names the tasks without a skills list: at most maxPickerKeys keys, fewer when the
+// context would pass maxBytes, always with "and N more" for the tasks left out. With the full note it
+// is the context of old; a cap too low for the note takes the compact foot.
+func pickerMilestoneContext(missing []string, maxBytes int) string {
+	for _, foot := range []string{SkillsPickerMilestoneNote, pickerCompactFoot} {
+		for n := min(len(missing), maxPickerKeys); n >= 0; n-- {
+			keys := missing[:n:n]
+			if n < len(missing) {
+				keys = append(keys, fmt.Sprintf("and %d more", len(missing)-n))
+			}
+			msg := pickerMilestoneHead + strings.Join(keys, ", ") + " have no skills list" + foot
+			if foot == pickerCompactFoot {
+				msg = pickerMilestoneHead + strings.Join(keys, ", ") + foot
+			}
+			if len(msg) <= maxBytes {
+				return msg
+			}
+		}
+	}
+	return pickerMilestoneHead + fmt.Sprintf("%d tasks", len(missing)) + pickerCompactFoot
 }

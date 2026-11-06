@@ -172,8 +172,8 @@ func TestCodexCapCollisionCountsOnce(t *testing.T) {
 }
 
 // The openrouter-capped insert path redraws too, and a collision never reserves the budget twice:
-// after one forced redraw the provider's spend holds exactly this job's budget, and the sources land
-// under the final id (#129). Before the fix the redraw left the sources under the taken id.
+// after one forced redraw the provider's spend holds exactly this job's budget (#129). An openrouter
+// job takes no sources (#146), so the sources-under-the-final-id half is the claude and codex tests'.
 func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
 	m := newManager(t)
 	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
@@ -182,9 +182,8 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
 	m.Now = func() time.Time { return frozen }
 	taken := prefixTaken(t, m, frozen, "0001")
 	setIDSuffixes(t, "0001", "0002")
-	origin := sourceFixture(t, t.TempDir(), "notes.md", "openrouter notes")
 	j, err := m.Enqueue(StartRequest{Title: "openrouter collision", Kind: "general", Brief: "b",
-		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4, Sources: []string{origin}})
+		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,9 +193,6 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
 	spend, err := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, frozen.Add(-time.Hour))
 	if err != nil || spend != 4 {
 		t.Fatalf("reserved $%.2f, %v; want exactly this job's $4.00", spend, err)
-	}
-	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil || string(b) != "openrouter notes" {
-		t.Fatalf("sources under the final id: %q, %v", b, err)
 	}
 	if _, err := os.Stat(m.JobDir(taken)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("taken id %s got a folder: %v", taken, err)

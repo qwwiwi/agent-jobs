@@ -20,9 +20,16 @@ func TestOrchestratorUIRule(t *testing.T) {
 		for _, want := range []string{
 			"UI job", "never accept or deploy", "`BROWSER CHECK NOT RUN`", "browser evidence",
 			"ui-check.mjs", "before merge or deploy", "live URL", "after a frontend deploy",
+			"`agent-jobs ui-check <base-url> <path>...", "embedded in the binary",
 		} {
 			if !strings.Contains(s, want) {
 				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+		// #135: a job can rewrite its own job dir, so the orchestrator never runs the job-dir copy.
+		for _, banned := range []string{"<job dir>/tools/ui-check.mjs", "node scripts/ui-check.mjs"} {
+			if strings.Contains(s, banned) {
+				t.Errorf("%s still tells the orchestrator to run %q", name, banned)
 			}
 		}
 	}
