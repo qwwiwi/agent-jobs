@@ -103,6 +103,12 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
+  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] [--lock PATH] -- CMD [ARGS...]
+                                           a heavy local gate (check.sh, a pg suite, a build):
+                                           one at a time per box (<home>/gate.lock), HEAD of DIR
+                                           must be REV before and after, own process group killed
+                                           on timeout (exit 124) and after the command, TELEGRAM_*
+                                           dropped; the last stdout line is always exit=N
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
@@ -232,6 +238,9 @@ func main() {
 	case "stats":
 		err = cmdStats(args)
 	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
+		}
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
@@ -1489,7 +1498,7 @@ func cmdGate(args []string) error {
 	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
-			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
+			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO | " + gateRunUsage[len("usage: agent-jobs "):])
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)

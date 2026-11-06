@@ -1,0 +1,240 @@
+package jobs
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// gateFixture is a repository with two commits (first, second; HEAD at second) and a lock path of its own.
+func gateFixture(t *testing.T) (repo, first, second, lock string) {
+	t.Helper()
+	repo = newRepo(t)
+	first = strings.TrimSpace(gitT(t, repo, "rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "commit", "-qam", "second")
+	second = strings.TrimSpace(gitT(t, repo, "rev-parse", "HEAD"))
+	return repo, first, second, filepath.Join(t.TempDir(), "gate.lock")
+}
+
+func runGateT(t *testing.T, g GateRun) (int, string, string) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	g.Stdout, g.Stderr = &out, &errb
+	if g.Timeout == 0 {
+		g.Timeout = time.Minute
+	}
+	if g.Env == nil {
+		g.Env = os.Environ()
+	}
+	code := RunGate(context.Background(), g)
+	return code, out.String(), errb.String()
+}
+
+// lastLine is the last non-empty line of s.
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
+// gateProcAlive reports a process that exists and is no zombie.
+func gateProcAlive(pid int) bool {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return syscall.Kill(pid, 0) == nil
+	}
+	s := string(b)
+	if i := strings.LastIndexByte(s, ')'); i >= 0 && i+2 < len(s) {
+		return s[i+2] != 'Z'
+	}
+	return true
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
+func waitDead(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for gateProcAlive(pid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d of the gate's group is still alive", pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A gate whose work tree is not at the asserted commit never runs and still prints exit=.
+func TestRunGateRefusesWrongHead(t *testing.T) {
+	repo, first, second, lock := gateFixture(t)
+	ran := filepath.Join(t.TempDir(), "ran")
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: first, LockPath: lock,
+		Argv: []string{"/bin/sh", "-c", "touch " + ran}})
+	if code != GateExitRunner || lastLine(out) != "exit=125" {
+		t.Fatalf("code %d, out %q", code, out)
+	}
+	if !strings.Contains(errs, "HEAD") || !strings.Contains(errs, second) {
+		t.Fatalf("stderr does not name the HEAD mismatch: %q", errs)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("the command ran on the wrong HEAD")
+	}
+	// No asserted head at all is refused too: a gate always says which commit it checks.
+	if code, out, _ := runGateT(t, GateRun{Dir: repo, LockPath: lock, Argv: []string{"true"}}); code != GateExitRunner ||
+		lastLine(out) != "exit=125" {
+		t.Fatalf("no head: code %d, out %q", code, out)
+	}
+	// An abbreviated id of the right commit passes.
+	if code, out, _ := runGateT(t, GateRun{Dir: repo, Head: second[:12], LockPath: lock, Argv: []string{"true"}}); code != 0 ||
+		lastLine(out) != "exit=0" {
+		t.Fatalf("right head: code %d, out %q", code, out)
+	}
+}
+
+// The command's exit code is returned and printed as the last line, after the command's own output.
+func TestRunGatePrintsExitMarker(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+		Argv: []string{"/bin/sh", "-c", "echo hello; exit 3"}})
+	if code != 3 || out != "hello\nexit=3\n" {
+		t.Fatalf("code %d, out %q", code, out)
+	}
+	// A command that cannot start still ends with the marker.
+	code, out, _ = runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Argv: []string{"/nonexistent/gate-cmd"}})
+	if code != 127 || lastLine(out) != "exit=127" {
+		t.Fatalf("missing command: code %d, out %q", code, out)
+	}
+	// A gate stopped from outside (ctx) ends its group and prints the marker too.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var o, e bytes.Buffer
+	code = RunGate(ctx, GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute, Env: os.Environ(),
+		Argv: []string{"sleep", "30"}, Stdout: &o, Stderr: &e})
+	if code != 128+int(syscall.SIGTERM) || lastLine(o.String()) != "exit=143" {
+		t.Fatalf("stopped: code %d, out %q, err %q", code, o.String(), e.String())
+	}
+}
+
+// On the timeout the whole process group is killed (a child that ignores SIGTERM too), not just the
+// leader; exit=124.
+func TestRunGateTimeoutKillsProcessGroup(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	pidf := filepath.Join(t.TempDir(), "child.pid")
+	start := time.Now()
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: 500 * time.Millisecond,
+		Argv: []string{"/bin/sh", "-c", "(trap '' TERM; exec sleep 60) & echo $! > " + pidf + "; wait"}})
+	if code != GateExitTimeout || lastLine(out) != "exit=124" {
+		t.Fatalf("code %d, out %q, err %q", code, out, errs)
+	}
+	if !strings.Contains(errs, "timeout") {
+		t.Fatalf("stderr does not say timeout: %q", errs)
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("the gate took %s past a 500ms timeout", d)
+	}
+	waitDead(t, readPID(t, pidf))
+}
+
+// A suite that leaves a background process behind does not leave an orphan: the group is ended when the
+// leader exits.
+func TestRunGateKillsLeftoversAfterExit(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	pidf := filepath.Join(t.TempDir(), "orphan.pid")
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+		Argv: []string{"/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $! > " + pidf + "; exit 0"}})
+	if code != 0 || lastLine(out) != "exit=0" {
+		t.Fatalf("code %d, out %q", code, out)
+	}
+	waitDead(t, readPID(t, pidf))
+}
+
+// TELEGRAM_* never reaches the gate's command; the rest of the environment does.
+func TestRunGateDropsTelegramEnv(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	env := append(os.Environ(), "TELEGRAM_BOT_TOKEN=secret-value", "TELEGRAM_CHAT_ID=1", "GATE_KEEP=yes")
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Argv: []string{"env"}})
+	if code != 0 {
+		t.Fatalf("code %d, out %q", code, out)
+	}
+	if strings.Contains(out, "TELEGRAM_") || strings.Contains(out, "secret-value") {
+		t.Fatalf("TELEGRAM_* leaked into the gate: %q", out)
+	}
+	if !strings.Contains(out, "GATE_KEEP=yes") || !strings.Contains(out, "PATH=") {
+		t.Fatalf("the rest of the environment is missing: %q", out)
+	}
+}
+
+// Two gates on one box never overlap; a gate that cannot get the lock in time gives up with exit=125
+// instead of hanging.
+func TestRunGateSerialized(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	busy := filepath.Join(t.TempDir(), "busy")
+	// mkdir is atomic: it fails when another gate's command is inside.
+	script := "mkdir " + busy + " || exit 9; sleep 0.3; rmdir " + busy
+	var wg sync.WaitGroup
+	codes := make([]int, 3)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var o, e bytes.Buffer
+			codes[i] = RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute,
+				LockWait: time.Minute, Env: os.Environ(), Argv: []string{"/bin/sh", "-c", script}, Stdout: &o, Stderr: &e})
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != 0 {
+			t.Fatalf("gate %d exited %d: two gates ran at once", i, c)
+		}
+	}
+
+	// A held lock and a short wait: the gate gives up, names the holder and still prints the marker.
+	f, err := os.OpenFile(lock, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ran := filepath.Join(t.TempDir(), "ran")
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 300 * time.Millisecond,
+		Argv: []string{"/bin/sh", "-c", "touch " + ran}})
+	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "lock") {
+		t.Fatalf("held lock: code %d, out %q, err %q", code, out, errs)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("the command ran without the lock")
+	}
+}
+
+// HEAD moved while the gate ran (a checkout in the same tree): the result is not about the asserted
+// commit, so the gate fails even though the command passed.
+func TestRunGateHeadMovedDuringRun(t *testing.T) {
+	repo, first, head, lock := gateFixture(t)
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+		Argv: []string{"git", "checkout", "-q", first}})
+	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "HEAD") {
+		t.Fatalf("code %d, out %q, err %q", code, out, errs)
+	}
+}
