@@ -1,0 +1,1613 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..e12efc6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ## [Unreleased]
+ 
+ ### Added
++- Milestones use the real dependencies and every slot (#119): each `depends_on` edge carries a one-line reason in the task's `depends_why` (the files or modules both tasks touch, or the output one consumes); an edge given without a reason is dropped and the answer of `milestone_create` / `milestone_set` lists it in `dropped_edges`. A task may list the repo-relative paths it is expected to edit in `touches`; tasks whose touches overlap and that no dependency orders get a derived edge (the later waits, reason `auto: shared paths ...`), recomputed on every write, so shared files and money paths stay serialized. When ready tasks wait and fewer than `max_running` jobs run or queue, the daemon types `[jobs:slots] N slots free, ready: milestone <id> <keys>` into the session, once per change. The docs no longer show `max_parallel: 2` in the example: unset, a milestone uses every `max_running` slot. Store: `milestone_tasks.depends_why` (JSON) and `touches`.
+ - The job-done line flags a fast empty coder job (#132): kind fix or general that ended `succeeded` or `cancelled` within three minutes with a repository and not one commit over its base gets `· suspicious: no commits in <N>m` — such a run almost always hit a brief or sandbox mismatch instead of finishing real work. The zero-commits finding is the merge check's own (the head still at the base commit, cached like a merge note; no extra git call), so a job without a worktree is never flagged on a guess; review and research jobs and jobs without a repository are never flagged. The finding is always the latest check's own: each merge check clears it before it runs and records it again only when it sees the head at the base itself (and records "has commits" as soon as its rev-list confirms them), and a requeue (resume) drops it, so a retry whose check fails — a timeout, a missing branch, a worktree that no longer verifies — never flags a job that committed meanwhile. Only the delivered job-done line carries the note: `job_result`'s `done_line` never does — the MCP server runs its own manager, which never ran the merge check, so it has no finding to reuse.
+ - OpenRouter models as job runners (#136): `model: "openrouter:<slug>"` runs a claude job on a model of config `providers.openrouter.models` through a per-job loopback proxy in the wrapper, which holds the key (read from `key_file` at start, never in config.json, claude's environment or any job file), injects the `provider` routing object (routing policy: `sort` price by default, `min_quantization` fp8, `data_collection` deny, `zdr`, `min_uptime_pct` 95, `ignore`, `order`; per model `model_routing`) and enforces the job's budget from OpenRouter's reported usage. Billing `api`; `daily_cap_usd` refuses new jobs past the cap; refused for kind review, codex and `deny_repos`; no resume. `agent-jobs openrouter endpoints <slug>` ranks a model's data-center endpoints by the policy. `job_list` / `job_status` / the HTTP API show `provider`; `job_stats --by provider`. With `providers.openrouter` set, every job's processes are kept from reading the key file's directory by Linux Landlock (the key directory must be outside `$HOME`, the temp dirs and the state dir; codex jobs on codex's native bwrap sandbox, which cannot start under any Landlock ruleset, run their codex process outside the key sandbox with a warning in stderr.log and `system_doctor` under `providers.openrouter.codex_policy` `allow_unprotected`, the default, or are refused under `refuse`); the proxy forwards only `POST /v1/messages` and `count_tokens`, reserves each request's worst case against the budget, and records a request without its final usage at its reservation with the cost unknown.
+ - OpenRouter cost journal: each attempt of an OpenRouter job appends one JSON line to `<state>/openrouter-costs.jsonl` (mode 600, append-only; written on success, failure, budget refusal and on the daemon's SIGTERM) with its tokens, the proxy's cost and OpenRouter's billed record of its generations (`GET /api/v1/generation`, read by the wrapper with the key, which never reaches the line); `agent-jobs openrouter costs --agent A [--days N] [--json] [--reconcile]` lists the runs with both costs (a mismatch over 10% flagged), totals per day, per model and over 30 days, the key's usage and limit (`GET /api/v1/key`), and fills missing OpenRouter records by appending reconcile lines. The proxy removes the key and anything `sk-or-` shaped from upstream error bodies (non-200, forwarded with their own Content-Length) and from a stream's error events before claude sees them.
+diff --git a/README.md b/README.md
+index 8bea4fb..de5242d 100644
+--- a/README.md
++++ b/README.md
+@@ -111,20 +111,25 @@ Details: [Brief checklist, slicing, judge, release check](docs/GUIDE.md#mcp-tool
+ A large project is split into **milestones** (stages of work, ordered per repository), a milestone into **tasks** (`T1`, `T2`, … with optional `depends_on` and `covers`), and each task is worked on by one or more **jobs**. The **checklist** (`brief/CHECKLIST.md`) stays the acceptance list; a milestone may point at it with `checklist_id`, and is fine without it.
+ 
+ - **No ceremony.** A piece of work with more than one task runs as a milestone by default: one `milestone_create` call with a title and the tasks, no approval step, no brief needed. A single job needs no milestone.
+-- **Order from dependencies.** `job_start(milestone, task)` is refused while the task is blocked (a dependency is not done yet); tasks without dependencies between them run in parallel, `max_parallel` caps a milestone's running jobs (1 = one after another). The daemon checks again at launch: a queued job waits while its task is blocked, and is cancelled when its task was dropped or its milestone closed.
++- **Order from dependencies.** `job_start(milestone, task)` is refused while the task is blocked (a dependency is not done yet); tasks without dependencies between them run in parallel, `max_parallel` caps a milestone's running jobs (1 = one after another; by default there is no cap of its own, so every `max_running` slot of the agent is used). The daemon checks again at launch: a queued job waits while its task is blocked, and is cancelled when its task was dropped or its milestone closed.
++- **Only real dependencies.** A `depends_on` edge is for a real conflict: both tasks edit the same files or modules, or one consumes the other's output. Every edge carries a one-line reason in `depends_why` (`{"T1": "both edit internal/order/book.go"}`); an edge without a reason is dropped, and the answer lists it in `dropped_edges`. A task may list the paths it is expected to edit in `touches`: tasks whose paths overlap are serialized by a derived edge (reason `auto: shared paths ...`, the later task waits), so shared files and money paths never run in parallel whatever the planner wrote.
++- **Free slots are announced.** When ready tasks wait and the agent runs fewer jobs than `max_running`, the daemon types one line into the session: `[jobs:slots] 3 slots free, ready: milestone 4 T8, T9`, again only when that changes.
+ - **Status from the jobs.** A task is `ready`, `blocked` (instead of ready while a dependency is not done), `running`, `review` (its job succeeded, no outcome yet), `done` (outcome `accepted`, `extended` or `reworked`), `failed` or `dropped`, always derived, never set by hand.
+ - **Skills planned once.** Each task may carry `skills` (the `+name` / `-name` edits of `job_start`), chosen in `milestone_create` for the whole stage; a `job_start` on the task gets them unless it gives its own, and the tree shows the plan and what each job got. The optional `hook skills-picker` asks for them there, not at every job.
+ - **Prior results.** A job on a task with `depends_on` gets the accepted results of those tasks in its prompt (commit, diffstat, Summary and Findings of the report, capped) and their full reports in `prior/<key>/report.md`.
+ - **Built for a frontend.** `milestone_get` returns the whole tree (tasks, their jobs, ready tasks, progress, acceptance), `milestone_list` with `repo` and `tree` the whole project in one call, and its `cursor` is the next `updated_since`; `GET /v1/milestones` and `GET /v1/milestones/{id}` of the read-only HTTP API return the same JSON.
+ - **Same on the command line.** `agent-jobs milestone create --input tasks.json --title T`, `milestone set <id> --input edit.json`, `milestone <id>` and `milestones` call the same code as the MCP tools. `milestone create` and `milestone set` print the JSON tree; reads print text and tables by default, `milestone <id> --json` prints the tree of `milestone_get`, `milestones --json` the list of `milestone_list` (summaries) and `milestones --json --tree` each milestone's full tree.
+ 
+-One call creates the stage; then the session starts a job per ready task (`job_start` with `milestone` and `task`), here T1 first, T2 once T1 is done:
++One call creates the stage; then the session starts a job per ready task (`job_start` with `milestone` and `task`), here T1 and T4 at once, T2 once T1 is done:
+ 
+ ```json
+-{"title": "Auth v2", "repo": "/home/me/src/project", "max_parallel": 2, "tasks": [
+-  {"key": "T1", "title": "Sessions table"},
+-  {"key": "T2", "title": "Login API", "depends_on": ["T1"]},
+-  {"key": "T3", "title": "Docs for the login API", "depends_on": ["T2"]}]}
++{"title": "Auth v2", "repo": "/home/me/src/project", "tasks": [
++  {"key": "T1", "title": "Sessions table", "touches": ["db/migrations", "internal/session"]},
++  {"key": "T2", "title": "Login API", "touches": ["internal/api/login.go"],
++   "depends_on": ["T1"], "depends_why": {"T1": "reads the sessions table T1 creates"}},
++  {"key": "T3", "title": "Docs for the login API", "touches": ["docs/login.md"],
++   "depends_on": ["T2"], "depends_why": {"T2": "documents the API T2 defines"}},
++  {"key": "T4", "title": "Fix the history page", "touches": ["web/history"]}]}
+ ```
+ 
+ Details, the JSON schema and the endpoints: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones).
+diff --git a/README.ru.md b/README.ru.md
+index 035ac18..5513079 100644
+--- a/README.ru.md
++++ b/README.ru.md
+@@ -111,20 +111,25 @@ agent-jobs result --agent my-agent <id>   # строка о завершении
+ Большой проект делится на **milestones** (этапы работы, упорядоченные внутри репозитория), milestone — на **задачи** (`T1`, `T2`, … с необязательными `depends_on` и `covers`), а над каждой задачей работает одна или несколько **джоб**. **Чек-лист** (`brief/CHECKLIST.md`) остаётся списком приёмки; milestone может ссылаться на него через `checklist_id`, но обходится и без него.
+ 
+ - **Без церемоний.** Работа больше чем из одной задачи по умолчанию идёт как milestone: один вызов `milestone_create` с названием и задачами, без шага утверждения и без брифа. Одной джобе milestone не нужен.
+-- **Порядок из зависимостей.** `job_start(milestone, task)` отклоняется, пока задача заблокирована (зависимость ещё не сделана); задачи без зависимостей между собой идут параллельно, `max_parallel` ограничивает число идущих джоб milestone (1 — по очереди). Демон проверяет ещё раз при запуске: джоба в очереди ждёт, пока её задача заблокирована, и отменяется, если задачу сняли или milestone закрыли.
++- **Порядок из зависимостей.** `job_start(milestone, task)` отклоняется, пока задача заблокирована (зависимость ещё не сделана); задачи без зависимостей между собой идут параллельно, `max_parallel` ограничивает число идущих джоб milestone (1 — по очереди; по умолчанию своего лимита нет, и milestone занимает все слоты `max_running` агента). Демон проверяет ещё раз при запуске: джоба в очереди ждёт, пока её задача заблокирована, и отменяется, если задачу сняли или milestone закрыли.
++- **Только настоящие зависимости.** Ребро `depends_on` — только для реального конфликта: обе задачи правят одни файлы или модули, либо одна потребляет результат другой. У каждого ребра есть причина в одну строку в `depends_why` (`{"T1": "обе правят internal/order/book.go"}`); ребро без причины отбрасывается, и ответ называет его в `dropped_edges`. Задача может перечислить пути, которые собирается править, в `touches`: задачи с пересекающимися путями выстраиваются выведенным ребром (причина `auto: shared paths ...`, позже стоящая задача ждёт), так что общие файлы и денежные пути никогда не идут параллельно.
++- **Свободные слоты объявляются.** Когда готовые задачи ждут, а у агента идёт меньше джоб, чем `max_running`, демон печатает в сессию одну строку: `[jobs:slots] 3 slots free, ready: milestone 4 T8, T9`, повторно — только когда она меняется.
+ - **Статус из джоб.** Задача бывает `ready`, `blocked` (вместо ready, пока зависимость не сделана), `running`, `review` (джоба успешна, исхода ещё нет), `done` (исход `accepted`, `extended` или `reworked`), `failed` или `dropped`; статус всегда выводится, вручную не ставится.
+ - **Скиллы планируются один раз.** У каждой задачи могут быть `skills` (правки `+name` / `-name` из `job_start`), выбранные в `milestone_create` на весь этап; `job_start` по задаче получает их, если не задал свои, а дерево показывает план и что получила каждая джоба. Необязательный `hook skills-picker` спрашивает о них здесь, а не на каждой джобе.
+ - **Результаты предыдущих задач.** Джоба задачи с `depends_on` получает в промпте принятые результаты этих задач (коммит, diffstat, Summary и Findings отчёта, с ограничением) и их полные отчёты в `prior/<key>/report.md`.
+ - **Сделано для фронтенда.** `milestone_get` возвращает всё дерево (задачи, их джобы, готовые задачи, прогресс, приёмку), `milestone_list` с `repo` и `tree` — весь проект одним вызовом, а его `cursor` — следующий `updated_since`; `GET /v1/milestones` и `GET /v1/milestones/{id}` HTTP API только для чтения отдают тот же JSON.
+ - **То же в командной строке.** `agent-jobs milestone create --input tasks.json --title T`, `milestone set <id> --input edit.json`, `milestone <id>` и `milestones` вызывают тот же код, что и MCP-тулы. `milestone create` и `milestone set` печатают JSON-дерево; чтение по умолчанию печатает текст и таблицы, `milestone <id> --json` — дерево `milestone_get`, `milestones --json` — список `milestone_list` (сводки), а `milestones --json --tree` — полное дерево каждого milestone.
+ 
+-Один вызов создаёт этап; дальше сессия запускает джобу на каждую готовую задачу (`job_start` с `milestone` и `task`), здесь сначала T1, T2 — когда T1 сделана:
++Один вызов создаёт этап; дальше сессия запускает джобу на каждую готовую задачу (`job_start` с `milestone` и `task`), здесь сразу T1 и T4, T2 — когда T1 сделана:
+ 
+ ```json
+-{"title": "Auth v2", "repo": "/home/me/src/project", "max_parallel": 2, "tasks": [
+-  {"key": "T1", "title": "Sessions table"},
+-  {"key": "T2", "title": "Login API", "depends_on": ["T1"]},
+-  {"key": "T3", "title": "Docs for the login API", "depends_on": ["T2"]}]}
++{"title": "Auth v2", "repo": "/home/me/src/project", "tasks": [
++  {"key": "T1", "title": "Sessions table", "touches": ["db/migrations", "internal/session"]},
++  {"key": "T2", "title": "Login API", "touches": ["internal/api/login.go"],
++   "depends_on": ["T1"], "depends_why": {"T1": "reads the sessions table T1 creates"}},
++  {"key": "T3", "title": "Docs for the login API", "touches": ["docs/login.md"],
++   "depends_on": ["T2"], "depends_why": {"T2": "documents the API T2 defines"}},
++  {"key": "T4", "title": "Fix the history page", "touches": ["web/history"]}]}
+ ```
+ 
+ Подробности, JSON-схема и эндпоинты: [docs/GUIDE.md, Milestones](docs/GUIDE.md#milestones) (на английском).
+diff --git a/cmd/agent-jobs/milestones_cli_loop1_test.go b/cmd/agent-jobs/milestones_cli_loop1_test.go
+index 70b10c7..a25b3ae 100644
+--- a/cmd/agent-jobs/milestones_cli_loop1_test.go
++++ b/cmd/agent-jobs/milestones_cli_loop1_test.go
+@@ -171,7 +171,7 @@ func TestMilestoneCLIInputStrict(t *testing.T) {
+ 		// Parity: every input is refused by both or accepted by both with the same tree.
+ 		for _, raw := range []string{
+ 			`{"title": "x", ` + tasks + `}`,
+-			`{"title": "x", "goal": "g", "order": 2, "max_parallel": 1, "tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"]}]}`,
++			`{"title": "x", "goal": "g", "order": 2, "max_parallel": 1, "tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "depends_why": {"T1": "reads its output"}}]}`,
+ 			`{"Title": "x", ` + tasks + `}`,
+ 			`{"title": null, ` + tasks + `}`,
+ 			`{"title": "x", "goal": null, ` + tasks + `}`,
+diff --git a/cmd/agent-jobs/milestones_cli_test.go b/cmd/agent-jobs/milestones_cli_test.go
+index fef59a4..f910677 100644
+--- a/cmd/agent-jobs/milestones_cli_test.go
++++ b/cmd/agent-jobs/milestones_cli_test.go
+@@ -47,7 +47,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
+ 		t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+ 		input := filepath.Join(t.TempDir(), "milestone.json")
+ 		if err := os.WriteFile(input, []byte(`{"title": "from the file", "goal": "ship it", "max_parallel": 1,
+-			"tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "covers": ["R01"]}]}`), 0o644); err != nil {
++			"tasks": [{"key": "T1", "title": "one"}, {"key": "T2", "title": "two", "depends_on": ["T1"], "depends_why": {"T1": "reads its output"}, "covers": ["R01"]}]}`), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+ 		out := captureStdout(t, func() error {
+@@ -81,7 +81,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
+ 
+ 		// The manager's validation, word for word: a cycle, no tasks, an unknown field, no input.
+ 		cycle := jobs.MilestoneCreate{Title: "loop", Tasks: []jobs.MilestoneTaskInput{
+-			{Key: "T1", Title: "a", DependsOn: &[]string{"T2"}}, {Key: "T2", Title: "b", DependsOn: &[]string{"T1"}}}}
++			{Key: "T1", Title: "a", DependsOn: &[]string{"T2"}, DependsWhy: map[string]string{"T2": "x"}}, {Key: "T2", Title: "b", DependsOn: &[]string{"T1"}, DependsWhy: map[string]string{"T1": "x"}}}}
+ 		m, err := jobs.Open("test")
+ 		if err != nil {
+ 			t.Fatal(err)
+@@ -134,7 +134,7 @@ func TestMilestoneCLICreateSet(t *testing.T) {
+ 		id := strconv.FormatInt(v.ID, 10)
+ 		out := captureStdout(t, func() error {
+ 			return cmdMilestoneEdit("set", []string{"--agent", "test", id, "--input", "-", "--title", "Stage renamed"},
+-				strings.NewReader(`{"goal": "new goal", "tasks": [{"key": "T3", "title": "three", "depends_on": ["T1"]}], "drop": ["T2"]}`))
++				strings.NewReader(`{"goal": "new goal", "tasks": [{"key": "T3", "title": "three", "depends_on": ["T1"], "depends_why": {"T1": "reads its output"}}], "drop": ["T2"]}`))
+ 		})
+ 		got := decodeTree(t, out)
+ 		status := map[string]string{}
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 3c6b2a8..ea61b3b 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -386,23 +386,25 @@ A job gets `memory_search` and `memory_write` (and `notify_owner`, see below); e
+ 
+ - **checklist**: the acceptance list of a repository (`brief/CHECKLIST.md`, Wave F); it keeps its name and does not change.
+ - **milestone**: a stage of work. A large project is a sequence of milestones (ordered by `order` within a repository).
+-- **task**: one step of a milestone, keyed `T1`, `T2`, …, with optional `depends_on` (task keys), `covers` (requirement IDs) and `skills` (the skills its jobs get, planned once for the milestone).
++- **task**: one step of a milestone, keyed `T1`, `T2`, …, with optional `depends_on` (task keys, each with a reason in `depends_why`), `touches` (paths it is expected to edit), `covers` (requirement IDs) and `skills` (the skills its jobs get, planned once for the milestone).
+ - **job**: one run (`job_start`) that works on a task; a task may have several jobs (a rerun, a rework).
+ 
+ **Rule:** a piece of work with more than one task is run as a milestone by default: one `milestone_create` call, then one `job_start(milestone, task)` per ready task. A single job needs no milestone, and no brief or checklist is needed for a milestone. There is no approval step: only `title` and `tasks` are required.
+ 
+ | tool | what it does |
+ |---|---|
+-| `milestone_create` | `title` (one line, ≤ 200 characters), `tasks` (`[{key, title, depends_on?, covers?, skills?, sources?}]`, at least one, at most 100; `skills` see *Skills* below; a non-empty `sources` is refused while sources are disabled, see [Sources](#sources-and-the-docker-sandbox)) and optional `goal`, `repo` (stored as its main worktree), `branch` (integration branch), `checklist_id` (the id of the repo's `brief/CHECKLIST.md`; `covers` must then be its live rows), `order`, `max_parallel`; returns the tree |
+-| `milestone_set` | edit in place by `id`: `title`, `goal`, `branch`, `order`, `max_parallel` (0 removes the cap), `status` (open \| done \| dropped), `close_note`; `tasks` upserts by key (a nil `depends_on` / `covers` / `skills` / `sources` keeps the stored list, `[]` clears it (a non-empty `sources` is refused while sources are disabled); editing a dropped task brings it back); `drop` drops keys. Nothing is deleted. `status: done` is refused while a task is not done or dropped; any edit of a done milestone while one of its tasks is not done or dropped reopens it (`status` back to `open`, `closed_at` cleared): a new task, a revived one, but also a title edit while a task's latest job failed after the close; returns the tree |
++| `milestone_create` | `title` (one line, ≤ 200 characters), `tasks` (`[{key, title, depends_on?, depends_why?, touches?, covers?, skills?, sources?}]`, at least one, at most 100; `skills` see *Skills* below; a non-empty `sources` is refused while sources are disabled, see [Sources](#sources-and-the-docker-sandbox)) and optional `goal`, `repo` (stored as its main worktree), `branch` (integration branch), `checklist_id` (the id of the repo's `brief/CHECKLIST.md`; `covers` must then be its live rows), `order`, `max_parallel` (unset: every `max_running` slot); returns the tree, with `dropped_edges` when edges without a reason were dropped |
++| `milestone_set` | edit in place by `id`: `title`, `goal`, `branch`, `order`, `max_parallel` (0 removes the cap), `status` (open \| done \| dropped), `close_note`; `tasks` upserts by key (a nil `depends_on` / `touches` / `covers` / `skills` / `sources` keeps the stored list, `[]` clears it (a non-empty `sources` is refused while sources are disabled); editing a dropped task brings it back); `drop` drops keys. Nothing is deleted. `status: done` is refused while a task is not done or dropped; any edit of a done milestone while one of its tasks is not done or dropped reopens it (`status` back to `open`, `closed_at` cleared): a new task, a revived one, but also a title edit while a task's latest job failed after the close; returns the tree |
+ | `milestone_get` | the tree of one milestone (schema below) |
+ | `milestone_list` | milestones ordered by repo, then `order`, then creation; filters `status`, `repo` (absolute path), `repo_id`, `checklist_id`, `updated_since` (RFC 3339 or Unix seconds; the change cursor, inclusive: pass the `cursor` of the previous answer); `tree: true` gives every milestone its full tree, so `repo` + `tree` is a whole project in one call |
+ 
+ Writes refuse a dependency on an unknown key or on the task itself, and any cycle (`depends_on has a cycle: T1 -> T3 -> T2 -> T1`); a refused call changes nothing.
+ 
++**Only real dependencies (#119).** A `depends_on` edge is for a real conflict: both tasks edit the same files or modules, or one consumes the other's output. Each edge carries a one-line reason (≤ 200 characters) in the task's `depends_why` object, by dependency key: `{"key": "T2", "depends_on": ["T1"], "depends_why": {"T1": "both edit internal/order/book.go"}}`. An edge given without a reason is dropped (the call goes on), and the answer of that `milestone_create` / `milestone_set` names it in `dropped_edges` (`["T2->T1"]`). On `milestone_set` a stored edge listed again keeps its stored reason, and `depends_why` without `depends_on` edits the reasons of the stored edges; a reason for a key not in `depends_on`, or one starting with `auto: `, is refused. Edges stored before #119 keep working without a reason. `touches` lists the repo-relative files or directories a task is expected to edit (≤ 50, no commas, no absolute or `..` paths; a glob is cut to the directory before its first wildcard, `internal/order/*.go` → `internal/order`). Two live tasks whose touches overlap (the same path, or one inside the other) and that no dependency path orders either way get a derived edge: the later task (task order) waits for the earlier, reason `auto: shared paths <paths>`. Derived edges are computed again on every write from the current touches, so they go when the paths stop overlapping. List shared money paths in `touches`: such tasks then never run in parallel, whatever the planner wrote. The tree shows `depends_why` (`{}` when none) and `touches` (`[]`) for every task.
++
+ **Task status** is derived from the task's jobs, never set by hand, decided in this order: `dropped`; `running` (a job is queued, running or stopped); `review` (the latest job succeeded and has no outcome yet); `done` (the latest job's outcome is `accepted`, `extended` or `reworked`: its work was used); `failed` (the latest job failed, timed out or was cancelled, or its outcome is `discarded`); else `blocked` when a dependency that is not dropped is not `done`, else `ready` (no job yet, or the latest one's outcome is `rerun`). `blocked` replaces only `ready`: a task whose own jobs say `running`, `review`, `done` or `failed` shows that. So a task is done when you record `job_outcome(accepted)` for its job; that unblocks the tasks that depend on it.
+ 
+-**Running tasks.** `job_start` takes `milestone` (id) and `task` (key), both or neither. It is refused when the milestone is not open, the task is unknown or `dropped`, a dependency of the task is not done (the error names the dependencies it waits for; this holds for a second job on a running task too), or `repo` is not the milestone's repository. When the milestone has a `branch` that exists in the repository and `base` is not given, the job starts from that branch. Tasks without dependencies between them run in parallel, within `max_running`; `max_parallel` caps the running jobs of one milestone (1 = one after another: the daemon leaves the next job queued until a slot of the milestone is free). The milestone may change while a job waits queued, so the daemon checks it again at launch: a job whose task got a dependency that is not done stays queued until it is; a job whose task was dropped or whose milestone was closed is cancelled (`cancelled before start: task T3 of milestone 4 was dropped`). The check is taken again inside the claim's database transaction, so an edit, a job or an outcome committed between the check and the start is never missed. A job that waits says why: `waiting` in `job_status` and `job_list` (`waiting for T1 (failed)`, or a free slot under `max_parallel`), and on its task in `milestone_get`. It is never cancelled for waiting: a done dependency that got a new job which failed holds it until the dependency is done again or dropped. `job_resume` of a job whose task is dropped or whose milestone is closed is refused; one of a blocked task is queued and waits the same way. The daemon does not start ready tasks by itself.
++**Running tasks.** `job_start` takes `milestone` (id) and `task` (key), both or neither. It is refused when the milestone is not open, the task is unknown or `dropped`, a dependency of the task is not done (the error names the dependencies it waits for; this holds for a second job on a running task too), or `repo` is not the milestone's repository. When the milestone has a `branch` that exists in the repository and `base` is not given, the job starts from that branch. Tasks without dependencies between them run in parallel, within `max_running`; `max_parallel` caps the running jobs of one milestone (1 = one after another: the daemon leaves the next job queued until a slot of the milestone is free). The milestone may change while a job waits queued, so the daemon checks it again at launch: a job whose task got a dependency that is not done stays queued until it is; a job whose task was dropped or whose milestone was closed is cancelled (`cancelled before start: task T3 of milestone 4 was dropped`). The check is taken again inside the claim's database transaction, so an edit, a job or an outcome committed between the check and the start is never missed. A job that waits says why: `waiting` in `job_status` and `job_list` (`waiting for T1 (failed)`, or a free slot under `max_parallel`), and on its task in `milestone_get`. It is never cancelled for waiting: a done dependency that got a new job which failed holds it until the dependency is done again or dropped. `job_resume` of a job whose task is dropped or whose milestone is closed is refused; one of a blocked task is queued and waits the same way. The daemon does not start ready tasks by itself, but it says when slots sit idle: when the agent runs and queues fewer jobs than `max_running` and open milestones have ready tasks, each tick that sees a change types one line into the session, `[jobs:slots] 3 slots free, ready: milestone 4 T8, T9; milestone 7 T2` (at most 20 keys, then `(+N more)`; a milestone at its `max_parallel` offers none, one below it at most the slots it has left). The same line is not sent again until the free count or the ready set changes; without `notify_tmux_target` it goes to the daemon log. Leave `max_parallel` unset unless there is a reason: dependencies and `touches` already keep conflicting tasks apart, and without a cap of its own a milestone uses every `max_running` slot.
+ 
+ **Skills** (G01: planned once per milestone, not per job). Each task may carry `skills`, a list of edits to its jobs' default skills in `job_start`'s syntax (`name` or `+name` adds, `-name` removes, applied in order; blanks dropped; at most 20), chosen when the milestone is created or edited, so the skill choice for a whole stage is made once, in `milestone_create` (and changed with `milestone_set`). Names are checked against the skill catalog then (an unknown or deprecated name refuses the call, with close names; the per-job budget depends on the job's kind and is checked at `job_start`). A `job_start` on the task without `skills` gets the task's list as its edits; `skills` of its own (also `[]`, the plain defaults) replace the plan for that job, and a brief line `skills: none` gives it none. When the catalog no longer accepts a planned name, `job_start` on the task is refused and the error says the names were the task's plan. Skills stay optional: a task without a list has `"skills": []` and its jobs get their defaults; there is no approval step. The tree shows the plan on each task and, per job, `skills` (selected at `job_start`) and `skills_delivered` (linked into its work dir for its latest attempt); `agent-jobs milestone <id>` prints them in the `SKILLS` and `JOBS` columns. The optional `agent-jobs hook skills-picker` asks for the plan at `milestone_create` instead of at every `job_start` (see *Skills picker* under the hooks).
+ 
+@@ -416,14 +418,15 @@ Writes refuse a dependency on an unknown key or on the task itself, and any cycl
+ {
+   "id": 3, "title": "Milestones M1", "goal": "store, MCP, prior results", "repo": "/home/me/agent-jobs",
+   "repo_id": "5d41402abc4b", "branch": "feature/milestones", "checklist_id": "milestones", "order": 1,
+-  "status": "open", "max_parallel": 2, "created_at": "2026-10-25T19:00:00Z", "updated_at": "2026-10-25T19:40:00Z",
++  "status": "open", "created_at": "2026-10-25T19:00:00Z", "updated_at": "2026-10-25T19:40:00Z",
+   "tasks": [
+-    {"key": "T1", "title": "store", "status": "done", "depends_on": [], "covers": ["R01"], "skills": ["+golang"],
++    {"key": "T1", "title": "store", "status": "done", "depends_on": [], "depends_why": {}, "touches": ["internal/store"], "covers": ["R01"], "skills": ["+golang"],
+      "jobs": [{"id": "261025-190102-ab12", "status": "succeeded", "outcome": "accepted", "model": "opus",
+                "cost_usd": 1.2, "turns": 40, "created_at": "…", "finished_at": "…",
+                "skills": ["git-workflows", "golang"], "skills_delivered": ["git-workflows", "golang"]}],
+      "created_at": "…", "updated_at": "…", "sources": []},
+-    {"key": "T2", "title": "tools", "status": "ready", "depends_on": ["T1"], "covers": ["R02"], "skills": [], "jobs": [], "created_at": "…", "updated_at": "…",
++    {"key": "T2", "title": "tools", "status": "ready", "depends_on": ["T1"],
++     "depends_why": {"T1": "calls the store API T1 adds"}, "touches": ["internal/mcp"], "covers": ["R02"], "skills": [], "jobs": [], "created_at": "…", "updated_at": "…",
+      "sources": ["https://github.com/modelcontextprotocol/go-sdk"]}
+   ],
+   "ready": ["T2"],
+diff --git a/internal/httpapi/milestones.go b/internal/httpapi/milestones.go
+index 91bc154..7b1a280 100644
+--- a/internal/httpapi/milestones.go
++++ b/internal/httpapi/milestones.go
+@@ -38,6 +38,14 @@ func apiMilestone(v jobs.MilestoneView) jobs.MilestoneView {
+ 	for i, t := range tasks {
+ 		t.Key, t.Title, t.Status = capField(t.Key), capField(t.Title), capField(t.Status)
+ 		t.DependsOn, t.Covers, t.Skills = capList(t.DependsOn), capList(t.Covers), capList(t.Skills)
++		t.Touches = capList(t.Touches)
++		if t.DependsWhy != nil {
++			why := make(map[string]string, len(t.DependsWhy))
++			for k, r := range t.DependsWhy {
++				why[capField(k)] = capField(r)
++			}
++			t.DependsWhy = why
++		}
+ 		js := t.Jobs
+ 		if js != nil {
+ 			t.Jobs = make([]jobs.MilestoneJobView, len(js))
+diff --git a/internal/httpapi/milestones_test.go b/internal/httpapi/milestones_test.go
+index 5a52fe5..1f002cf 100644
+--- a/internal/httpapi/milestones_test.go
++++ b/internal/httpapi/milestones_test.go
+@@ -77,7 +77,7 @@ func TestMilestonesSameJSONAsMCP(t *testing.T) {
+ 		}
+ 		ctx := context.Background()
+ 		v, err := f.m.CreateMilestone(ctx, jobs.MilestoneCreate{Title: "Stage", Repo: repo, Branch: "integ", Tasks: []jobs.MilestoneTaskInput{
+-			{Key: "T1", Title: "one"}, {Key: "T2", Title: "two", DependsOn: &[]string{"T1"}}}})
++			{Key: "T1", Title: "one"}, {Key: "T2", Title: "two", DependsOn: &[]string{"T1"}, DependsWhy: map[string]string{"T1": "reads its output"}}}})
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+diff --git a/internal/jobs/manager.go b/internal/jobs/manager.go
+index a56e182..df0b0de 100644
+--- a/internal/jobs/manager.go
++++ b/internal/jobs/manager.go
+@@ -72,6 +72,8 @@ type Manager struct {
+ 	hbWG sync.WaitGroup // that heartbeat's goroutine (WaitHeartbeat)
+ 
+ 	cleanupFails map[string]cleanupFail // job ID -> its consecutive cleanup failures (under the lifecycle lock)
++	// lastSlotsLine is the idle-slot line last sent (nudgeIdleSlots, under the lifecycle lock; #119).
++	lastSlotsLine string
+ 
+ 	// prefetching is set while the daemon's background clone run (prefetchInBackground) is on; prefetchWG
+ 	// waits for it.
+@@ -611,7 +613,8 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
+ 
+ // Tick is one daemon pass: collect finished/timed-out jobs, retry scope stops and report redactions
+ // that failed, fire the schedules due this minute, judge the checks (dead-man's switch), start queued
+-// ones (at most max_running running, default 2), send job-done lines, and clean up worktrees whose
++// ones (at most max_running running, default 2), send job-done lines and the idle-slot line (ready
++// milestone tasks while slots are free), and clean up worktrees whose
+ // notify is older than the cleanup delay; then, with the lifecycle lock released, deliver the checks' pending missed alerts.
+ func (m *Manager) Tick() error {
+ 	m.RefreshDaemonConfig()
+@@ -675,6 +678,9 @@ func (m *Manager) tickLocked() error {
+ 	if err := m.notifyPending(); err != nil {
+ 		errs = append(errs, fmt.Errorf("notify: %w", err))
+ 	}
++	if err := m.nudgeIdleSlots(); err != nil {
++		errs = append(errs, fmt.Errorf("slots: %w", err))
++	}
+ 	if err := m.cleanupDue(); err != nil {
+ 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
+ 	}
+diff --git a/internal/jobs/milestone_edges.go b/internal/jobs/milestone_edges.go
+new file mode 100644
+index 0000000..3c593ef
+--- /dev/null
++++ b/internal/jobs/milestone_edges.go
+@@ -0,0 +1,252 @@
++package jobs
++
++import (
++	"fmt"
++	"maps"
++	"path"
++	"slices"
++	"strings"
++	"unicode/utf8"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++)
++
++// Dependency edges of a milestone (#119). Every depends_on edge carries a one-line reason (depends_why):
++// the files or modules both tasks touch, or the output one consumes. An edge given without a reason is
++// dropped, so a chain stricter than the code needs does not hold independent tasks back. Tasks that list
++// overlapping paths (touches) are serialized by a derived edge, whatever the planner wrote: the guardrail
++// for shared files and money paths.
++
++// Edge limits.
++const (
++	MaxEdgeReasonRunes = 200
++	MaxTaskTouches     = 50
++	MaxTouchRunes      = 200
++)
++
++// edgeReasons validates the depends_why input of a task: every key must be one of deps, every reason one
++// line and not marked as derived (AutoEdgePrefix is the daemon's).
++func edgeReasons(key string, why map[string]string, deps []string) (map[string]string, error) {
++	out := map[string]string{}
++	for _, d := range slices.Sorted(maps.Keys(why)) {
++		dk := strings.TrimSpace(d)
++		if !slices.Contains(deps, dk) {
++			return nil, fmt.Errorf("task %s: depends_why names %q, which is not in its depends_on", key, Printable(dk, 40))
++		}
++		r, err := oneLine("task "+key+" depends_why "+dk, why[d], MaxEdgeReasonRunes, false)
++		if err != nil {
++			return nil, err
++		}
++		if strings.HasPrefix(r, store.AutoEdgePrefix) {
++			return nil, fmt.Errorf("task %s: depends_why %s starts with %q, which marks derived edges", key, dk, store.AutoEdgePrefix)
++		}
++		if r != "" {
++			out[dk] = r
++		}
++	}
++	return out, nil
++}
++
++// setDeps applies a task's depends_on (and depends_why) input to t: an edge keeps a reason given now or
++// the one stored for it (a derived reason is not kept: derivation runs again); an edge without one is
++// dropped and its dependency key returned. Only depends_why (no depends_on) edits the reasons of stored edges.
++func setDeps(t *store.MilestoneTask, deps *[]string, why map[string]string) (dropped []string, err error) {
++	if deps == nil {
++		if why == nil {
++			return nil, nil
++		}
++		given, err := edgeReasons(t.Key, why, manualDeps(*t))
++		if err != nil {
++			return nil, err
++		}
++		next := maps.Clone(t.DependsWhy)
++		if next == nil {
++			next = map[string]string{}
++		}
++		maps.Copy(next, given)
++		t.DependsWhy = next
++		return nil, nil
++	}
++	keys := trimList(*deps)
++	given, err := edgeReasons(t.Key, why, keys)
++	if err != nil {
++		return nil, err
++	}
++	nextDeps, nextWhy := []string{}, map[string]string{}
++	for _, d := range keys {
++		r := given[d]
++		if r == "" {
++			if old := t.DependsWhy[d]; !strings.HasPrefix(old, store.AutoEdgePrefix) {
++				r = old
++			}
++		}
++		if r == "" {
++			dropped = append(dropped, d)
++			continue
++		}
++		nextDeps, nextWhy[d] = append(nextDeps, d), r
++	}
++	t.DependsOn, t.DependsWhy = nextDeps, nextWhy
++	return dropped, nil
++}
++
++// manualDeps are the depends_on keys of t whose edge was not derived.
++func manualDeps(t store.MilestoneTask) []string {
++	var out []string
++	for _, d := range t.DependsOn {
++		if !strings.HasPrefix(t.DependsWhy[d], store.AutoEdgePrefix) {
++			out = append(out, d)
++		}
++	}
++	return out
++}
++
++// normTouches validates and normalizes the touches of a task: repo-relative paths of files or directories,
++// cleaned, without a leading "./" or a trailing "/". A glob is cut to the directory before its first
++// wildcard segment (internal/order/*.go -> internal/order): overlap is judged conservatively.
++func normTouches(key string, in []string) ([]string, error) {
++	out := []string{}
++	for _, raw := range in {
++		p := strings.TrimSpace(raw)
++		if p == "" {
++			continue
++		}
++		if !utf8.ValidString(p) || containsControl(p) || strings.Contains(p, ",") || utf8.RuneCountInString(p) > MaxTouchRunes {
++			return nil, fmt.Errorf("task %s: touches %q must be one repo-relative path without commas, at most %d characters",
++				key, Printable(p, 40), MaxTouchRunes)
++		}
++		if strings.HasPrefix(p, "/") {
++			return nil, fmt.Errorf("task %s: touches %q must be relative to the repository", key, Printable(p, 40))
++		}
++		if i := strings.IndexAny(p, "*?["); i >= 0 {
++			p = p[:i]
++			if j := strings.LastIndex(p, "/"); j >= 0 {
++				p = p[:j]
++			} else {
++				p = "."
++			}
++		}
++		p = path.Clean(p)
++		if p == ".." || strings.HasPrefix(p, "../") {
++			return nil, fmt.Errorf("task %s: touches %q leaves the repository", key, Printable(raw, 40))
++		}
++		if !slices.Contains(out, p) {
++			out = append(out, p)
++		}
++	}
++	if len(out) > MaxTaskTouches {
++		return nil, fmt.Errorf("task %s: at most %d touches", key, MaxTaskTouches)
++	}
++	return out, nil
++}
++
++// pathsOverlap reports whether two normalized paths name the same file or one lies inside the other
++// ("." is the whole repository).
++func pathsOverlap(a, b string) bool {
++	return a == b || a == "." || b == "." || strings.HasPrefix(b, a+"/") || strings.HasPrefix(a, b+"/")
++}
++
++// sharedPaths lists the paths of a that overlap a path of b (the narrower of the two), in a's order.
++func sharedPaths(a, b []string) []string {
++	var out []string
++	for _, x := range a {
++		for _, y := range b {
++			if !pathsOverlap(x, y) {
++				continue
++			}
++			p := x
++			if x == "." || (y != "." && len(y) > len(x)) {
++				p = y
++			}
++			if !slices.Contains(out, p) {
++				out = append(out, p)
++			}
++		}
++	}
++	return out
++}
++
++// deriveEdges serializes tasks whose touches overlap (#119 guardrail): derived edges are dropped and
++// derived again from the current paths; for two live tasks sharing a path with no dependency path between
++// them either way, the later one (task order) waits for the earlier one, reason "auto: shared paths ...".
++// Edges are added in task order, each against the graph so far, so none closes a cycle.
++func deriveEdges(all []store.MilestoneTask) error {
++	idx := map[string]int{}
++	for i := range all {
++		idx[all[i].Key] = i
++		t := &all[i]
++		keep := manualDeps(*t)
++		if len(keep) == len(t.DependsOn) {
++			continue
++		}
++		why := map[string]string{}
++		for _, d := range keep {
++			if r, ok := t.DependsWhy[d]; ok {
++				why[d] = r
++			}
++		}
++		t.DependsOn, t.DependsWhy = keep, why
++	}
++	for j := range all {
++		if all[j].Dropped || len(all[j].Touches) == 0 {
++			continue
++		}
++		for i := 0; i < j; i++ {
++			if all[i].Dropped || len(all[i].Touches) == 0 {
++				continue
++			}
++			shared := sharedPaths(all[j].Touches, all[i].Touches)
++			if len(shared) == 0 || reaches(all, idx, j, i) || reaches(all, idx, i, j) {
++				continue
++			}
++			t := &all[j]
++			// The task's list and map may be shared with the caller's copy of the stored tasks: never
++			// written in place.
++			t.DependsOn, t.DependsWhy = slices.Clone(t.DependsOn), maps.Clone(t.DependsWhy)
++			if len(t.DependsOn) >= MaxTaskDeps {
++				return fmt.Errorf("task %s: at most %d depends_on, with the edges derived from shared touches", t.Key, MaxTaskDeps)
++			}
++			reason := store.AutoEdgePrefix + "shared paths " + strings.Join(shared, ", ")
++			if utf8.RuneCountInString(reason) > MaxEdgeReasonRunes {
++				reason = string([]rune(reason)[:MaxEdgeReasonRunes-3]) + "..."
++			}
++			if t.DependsWhy == nil {
++				t.DependsWhy = map[string]string{}
++			}
++			t.DependsOn = append(t.DependsOn, all[i].Key)
++			t.DependsWhy[all[i].Key] = reason
++		}
++	}
++	return nil
++}
++
++// reaches reports whether task from waits for task to, directly or through other tasks.
++func reaches(all []store.MilestoneTask, idx map[string]int, from, to int) bool {
++	seen := map[int]bool{}
++	stack := []int{from}
++	for len(stack) > 0 {
++		n := stack[len(stack)-1]
++		stack = stack[:len(stack)-1]
++		if seen[n] {
++			continue
++		}
++		seen[n] = true
++		for _, d := range all[n].DependsOn {
++			k, ok := idx[d]
++			if !ok {
++				continue
++			}
++			if k == to {
++				return true
++			}
++			stack = append(stack, k)
++		}
++	}
++	return false
++}
++
++// sameTask reports whether a and b store the same dependencies and touches (the parts deriveEdges may
++// change of a task the input did not name).
++func sameTask(a, b store.MilestoneTask) bool {
++	return slices.Equal(a.DependsOn, b.DependsOn) && maps.Equal(a.DependsWhy, b.DependsWhy) && slices.Equal(a.Touches, b.Touches)
++}
+diff --git a/internal/jobs/milestone_slots.go b/internal/jobs/milestone_slots.go
+new file mode 100644
+index 0000000..183b19f
+--- /dev/null
++++ b/internal/jobs/milestone_slots.go
+@@ -0,0 +1,144 @@
++package jobs
++
++import (
++	"context"
++	"fmt"
++	"strings"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++)
++
++// Idle-slot nudge (#119): ready tasks of open milestones get a job only when the orchestrator starts one.
++// When the agent has free slots (max_running minus running and queued jobs) and ready tasks wait, the
++// daemon types one line into the orchestrator session through the job-done tmux path:
++//
++//	[jobs:slots] 3 slots free, ready: milestone 4 T8, T9; milestone 7 T2
++//
++// It is sent again only when the free count or the ready set changes, so an idle orchestrator is not
++// flooded once a minute.
++
++// SlotsTag starts the idle-slot line.
++const SlotsTag = "[jobs:slots]"
++
++// maxSlotKeys caps the ready keys named on one line; the rest are counted.
++const maxSlotKeys = 20
++
++// readyMilestone is the ready tasks of one open milestone a job could start on now.
++type readyMilestone struct {
++	ID   int64
++	Keys []string
++}
++
++// SlotsLine is the idle-slot line for free slots and the ready tasks ("" when there is nothing to say).
++func SlotsLine(free int, ready []readyMilestone) string {
++	if free <= 0 || len(ready) == 0 {
++		return ""
++	}
++	var parts []string
++	named, more := 0, 0
++	for _, r := range ready {
++		var keys []string
++		for _, k := range r.Keys {
++			if named >= maxSlotKeys {
++				more++
++				continue
++			}
++			keys = append(keys, k)
++			named++
++		}
++		if len(keys) > 0 {
++			parts = append(parts, fmt.Sprintf("milestone %d %s", r.ID, strings.Join(keys, ", ")))
++		}
++	}
++	slots := "slots"
++	if free == 1 {
++		slots = "slot"
++	}
++	line := fmt.Sprintf("%s %d %s free, ready: %s", SlotsTag, free, slots, strings.Join(parts, "; "))
++	if more > 0 {
++		line += fmt.Sprintf(" (+%d more)", more)
++	}
++	return line
++}
++
++// readyForSlots lists, per open milestone, the ready tasks (no job yet, every dependency done) a job may
++// start on now: a milestone at its max_parallel (running and queued jobs) offers none, one below it at
++// most the slots it has left.
++func (m *Manager) readyForSlots(ctx context.Context) ([]readyMilestone, error) {
++	open, err := m.Store.ListMilestones(ctx, store.MilestoneFilter{Status: store.MilestoneOpen})
++	if err != nil {
++		return nil, err
++	}
++	var out []readyMilestone
++	for _, ms := range open {
++		tasks, err := m.Store.MilestoneTasks(ctx, ms.ID)
++		if err != nil {
++			return nil, err
++		}
++		jobs, err := m.Store.MilestoneJobs(ctx, ms.ID)
++		if err != nil {
++			return nil, err
++		}
++		left := -1
++		if ms.MaxParallel != nil {
++			busy := 0
++			for _, j := range jobs {
++				if j.Status == store.StatusRunning || j.Status == store.StatusQueued {
++					busy++
++				}
++			}
++			if left = *ms.MaxParallel - busy; left <= 0 {
++				continue
++			}
++		}
++		st := TaskStatuses(tasks, jobs)
++		var keys []string
++		for _, t := range tasks {
++			if st[t.Key] == TaskReady && (left < 0 || len(keys) < left) {
++				keys = append(keys, t.Key)
++			}
++		}
++		if len(keys) > 0 {
++			out = append(out, readyMilestone{ID: ms.ID, Keys: keys})
++		}
++	}
++	return out, nil
++}
++
++// nudgeIdleSlots sends the idle-slot line when it differs from the last one sent (under the lifecycle
++// lock, after launchQueued). Without notify_tmux_target it is logged. A failed delivery is logged and
++// tried again next tick.
++func (m *Manager) nudgeIdleSlots() error {
++	running, err := m.Store.CountRunning()
++	if err != nil {
++		return err
++	}
++	queued, err := m.Store.ListByStatus(store.StatusQueued)
++	if err != nil {
++		return err
++	}
++	free := m.Config().MaxRunningJobs() - running - len(queued)
++	line := ""
++	if free > 0 {
++		ready, err := m.readyForSlots(context.Background())
++		if err != nil {
++			return err
++		}
++		line = SlotsLine(free, ready)
++	}
++	if line == "" || line == m.lastSlotsLine {
++		if line == "" {
++			m.lastSlotsLine = "" // the next free slot with ready tasks is news again
++		}
++		return nil
++	}
++	if t := m.Config().NotifyTmuxTarget; t == "" {
++		m.Log.Printf("notify off (notify_tmux_target not configured): %s", line)
++	} else if err := m.sendTmuxLocked(t, line); err != nil {
++		// A nudge is advice, never a tick failure: logged, and tried again next tick.
++		m.Log.Printf("idle slots line not delivered, retry next tick: %s", RedactText(err.Error()))
++		return nil
++	}
++	m.lastSlotsLine = line
++	return nil
++}
+diff --git a/internal/jobs/milestones.go b/internal/jobs/milestones.go
+index df9db65..f9f4da1 100644
+--- a/internal/jobs/milestones.go
++++ b/internal/jobs/milestones.go
+@@ -52,9 +52,14 @@ var reTaskKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`)
+ type MilestoneTaskInput struct {
+ 	Key       string    `json:"key" jsonschema:"task key, unique in the milestone: T1, T2, ..."`
+ 	Title     string    `json:"title,omitempty" jsonschema:"one line; required for a new task"`
+-	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles"`
+-	Covers    *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
+-	Skills    *[]string `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
++	DependsOn *[]string `json:"depends_on,omitempty" jsonschema:"keys of the tasks this one waits for (their accepted job); no cycles. Only real conflicts: both edit the same files or modules, or this task consumes the other's output. Every edge needs a reason in depends_why: an edge without one is dropped (dropped_edges lists it)"`
++	// DependsWhy is the reason of each edge (#119): nil with depends_on given drops the edges without a
++	// stored reason; without depends_on it edits the reasons of the stored edges.
++	DependsWhy map[string]string `json:"depends_why,omitempty" jsonschema:"one line per depends_on key, why this task waits for it: the files/modules both touch, or the output it consumes (\"T1\": \"both edit internal/order/book.go\"); at most 200 characters"`
++	// Touches are the paths the task is expected to edit (#119): nil keeps the stored list, empty clears it.
++	Touches *[]string `json:"touches,omitempty" jsonschema:"repo-relative files or directories the task is expected to edit (a glob is cut to its directory); tasks whose touches overlap are serialized by a derived edge (reason \"auto: shared paths ...\"), the later task waiting for the earlier. List shared money paths here so they never run in parallel"`
++	Covers  *[]string `json:"covers,omitempty" jsonschema:"requirement IDs the task works on: live rows of the milestone's checklist when it has one, else free-form"`
++	Skills  *[]string `json:"skills,omitempty" jsonschema:"the task's skills, planned once here for all its jobs: edits to a job's default skills in job_start's syntax (name or +name adds, -name removes; [] = the defaults); a job_start on the task without skills of its own gets them. Unknown or deprecated names are refused"`
+ 	// Sources (G02) are planned like covers: nil keeps the stored list, empty clears it.
+ 	Sources *[]string `json:"sources,omitempty" jsonschema:"currently DISABLED (G02 deferred, owner decision 2026-10-26: the text-parsing guard could still be bypassed; it returns with OS-level isolation): a non-empty list is refused, an empty or absent one changes nothing. When enabled: https git URLs a job on the task gets cloned read-only into its folder (sources/<name>) unless job_start gives its own"`
+ }
+@@ -67,7 +72,7 @@ type MilestoneCreate struct {
+ 	Branch      string               `json:"branch,omitempty" jsonschema:"optional integration branch: job_start on a task takes it as the default base"`
+ 	ChecklistID string               `json:"checklist_id,omitempty" jsonschema:"optional: the id of the repo's brief/CHECKLIST.md; task covers must then be its live rows"`
+ 	Order       int                  `json:"order,omitempty" jsonschema:"position among the repo's milestones, lowest first; default 0"`
+-	MaxParallel int                  `json:"max_parallel,omitempty" jsonschema:"at most this many of the milestone's jobs run at once (1 = one after another); default no cap of its own"`
++	MaxParallel int                  `json:"max_parallel,omitempty" jsonschema:"at most this many of the milestone's jobs run at once (1 = one after another); default none: every slot of the agent's max_running. Set it only for a real reason: dependencies and touches already serialize conflicting tasks"`
+ 	Tasks       []MilestoneTaskInput `json:"tasks" jsonschema:"the tasks, at least one"`
+ }
+ 
+@@ -78,7 +83,7 @@ type MilestoneSet struct {
+ 	Goal        *string              `json:"goal,omitempty" jsonschema:"new goal; empty string clears it"`
+ 	Branch      *string              `json:"branch,omitempty" jsonschema:"new integration branch; empty string clears it"`
+ 	Order       *int                 `json:"order,omitempty"`
+-	MaxParallel *int                 `json:"max_parallel,omitempty" jsonschema:"new cap of running jobs; 0 removes it"`
++	MaxParallel *int                 `json:"max_parallel,omitempty" jsonschema:"new cap of running jobs; 0 removes it (every slot of the agent's max_running)"`
+ 	Status      string               `json:"status,omitempty" jsonschema:"open | done | dropped; done is refused while a task is not done or dropped"`
+ 	CloseNote   string               `json:"close_note,omitempty" jsonschema:"one line, at most 300 characters"`
+ 	Tasks       []MilestoneTaskInput `json:"tasks,omitempty" jsonschema:"tasks to add or edit, by key (an edit of a dropped task brings it back)"`
+@@ -108,7 +113,12 @@ type MilestoneTaskView struct {
+ 	Title     string   `json:"title"`
+ 	Status    string   `json:"status"`
+ 	DependsOn []string `json:"depends_on"`
+-	Covers    []string `json:"covers"`
++	// DependsWhy is the reason of each depends_on edge, by key ("auto: shared paths ..." for a derived one;
++	// an edge stored before #119 may have none).
++	DependsWhy map[string]string `json:"depends_why"`
++	// Touches are the paths the task is expected to edit.
++	Touches []string `json:"touches"`
++	Covers  []string `json:"covers"`
+ 	// Skills are the task's planned skills edits ([] = none planned: its jobs get their defaults).
+ 	Skills    []string           `json:"skills"`
+ 	Jobs      []MilestoneJobView `json:"jobs"`
+@@ -156,6 +166,9 @@ type MilestoneView struct {
+ 	Uncovered []string `json:"uncovered,omitempty"`
+ 	// Note says why the checklist part of the tree could not be read ("" when it was, or there is none).
+ 	Note string `json:"note,omitempty"`
++	// DroppedEdges are the depends_on edges of this milestone_create or milestone_set call that were
++	// dropped for want of a reason, as "T2->T1" (#119); set only in the answer of that call.
++	DroppedEdges []string `json:"dropped_edges,omitempty"`
+ }
+ 
+ // MilestonesView is milestone_list's output. Cursor is the next updated_since: the highest updated_at
+@@ -252,33 +265,39 @@ func (m *Manager) liveRows(repo, id string) ([]string, error) {
+ }
+ 
+ // applyTasks merges the task inputs into tasks (upsert by key) and drops the keys in drop; it returns the
+-// whole new task list and the changed tasks, or an error for an invalid key, title, dependency (unknown
+-// key, itself, a cycle) or cover (not a live row when live is not nil).
+-func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []string, live []string) (all, changed []store.MilestoneTask, err error) {
++// whole new task list, the changed tasks and the edges dropped for want of a reason ("T2->T1"), or an
++// error for an invalid key, title, dependency (unknown key, itself, a cycle), reason, touches or cover
++// (not a live row when live is not nil). Edges of overlapping touches are derived again (deriveEdges).
++func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []string, live []string) (all, changed []store.MilestoneTask, dropped []string, err error) {
++	before := map[string]store.MilestoneTask{}
++	for _, t := range tasks {
++		before[t.Key] = t
++	}
+ 	all = slices.Clone(tasks)
+ 	idx := map[string]int{}
+ 	for i, t := range all {
+ 		idx[t.Key] = i
+ 	}
+ 	touched, newCovers := map[string]bool{}, map[string]bool{}
++	var droppedFrom [][2]string // edges dropped for want of a reason: {task, dependency}
+ 	seen := map[string]bool{}
+ 	for _, ti := range in {
+ 		key := strings.TrimSpace(ti.Key)
+ 		if !reTaskKey.MatchString(key) {
+-			return nil, nil, fmt.Errorf("task key %q must be 1-32 letters, digits, '.', '_' or '-' (T1, T2, ...)", Printable(key, 40))
++			return nil, nil, nil, fmt.Errorf("task key %q must be 1-32 letters, digits, '.', '_' or '-' (T1, T2, ...)", Printable(key, 40))
+ 		}
+ 		if seen[key] {
+-			return nil, nil, fmt.Errorf("task %s is given twice", key)
++			return nil, nil, nil, fmt.Errorf("task %s is given twice", key)
+ 		}
+ 		seen[key] = true
+ 		title, err := oneLine("task "+key+" title", ti.Title, MaxMilestoneTitleRunes, false)
+ 		if err != nil {
+-			return nil, nil, err
++			return nil, nil, nil, err
+ 		}
+ 		i, ok := idx[key]
+ 		if !ok {
+ 			if title == "" {
+-				return nil, nil, fmt.Errorf("task %s: title is required for a new task", key)
++				return nil, nil, nil, fmt.Errorf("task %s: title is required for a new task", key)
+ 			}
+ 			all = append(all, store.MilestoneTask{Key: key})
+ 			i = len(all) - 1
+@@ -291,14 +310,23 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
+ 		t.Dropped = false
+ 		if ti.Sources != nil {
+ 			if err := refuseSources(*ti.Sources); err != nil {
+-				return nil, nil, fmt.Errorf("task %s: %w", key, err)
++				return nil, nil, nil, fmt.Errorf("task %s: %w", key, err)
+ 			}
+ 			if t.Sources, err = ValidateSources(*ti.Sources); err != nil {
+-				return nil, nil, fmt.Errorf("task %s: %w", key, err)
++				return nil, nil, nil, fmt.Errorf("task %s: %w", key, err)
+ 			}
+ 		}
+-		if ti.DependsOn != nil {
+-			t.DependsOn = trimList(*ti.DependsOn)
++		d, err := setDeps(t, ti.DependsOn, ti.DependsWhy)
++		if err != nil {
++			return nil, nil, nil, err
++		}
++		for _, dk := range d {
++			droppedFrom = append(droppedFrom, [2]string{key, dk})
++		}
++		if ti.Touches != nil {
++			if t.Touches, err = normTouches(key, *ti.Touches); err != nil {
++				return nil, nil, nil, err
++			}
+ 		}
+ 		if ti.Covers != nil {
+ 			t.Covers = trimList(*ti.Covers)
+@@ -313,18 +341,28 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
+ 		key = strings.TrimSpace(key)
+ 		i, ok := idx[key]
+ 		if !ok {
+-			return nil, nil, fmt.Errorf("drop: task %q is not in the milestone", Printable(key, 40))
++			return nil, nil, nil, fmt.Errorf("drop: task %q is not in the milestone", Printable(key, 40))
+ 		}
+ 		if !all[i].Dropped {
+ 			all[i].Dropped = true
+ 			touched[key] = true
+ 		}
+ 	}
++	// A dropped edge is still checked: an unknown key or the task itself is an error, not a silent drop.
++	for _, e := range droppedFrom {
++		if e[1] == e[0] {
++			return nil, nil, nil, fmt.Errorf("task %s depends on itself", e[0])
++		}
++		if _, ok := idx[e[1]]; !ok {
++			return nil, nil, nil, fmt.Errorf("task %s depends on %q, which is not a task of the milestone", e[0], Printable(e[1], 40))
++		}
++		dropped = append(dropped, e[0]+"->"+e[1])
++	}
+ 	if len(all) == 0 {
+-		return nil, nil, errors.New("a milestone needs at least one task")
++		return nil, nil, nil, errors.New("a milestone needs at least one task")
+ 	}
+ 	if len(all) > MaxMilestoneTasks {
+-		return nil, nil, fmt.Errorf("a milestone has at most %d tasks", MaxMilestoneTasks)
++		return nil, nil, nil, fmt.Errorf("a milestone has at most %d tasks", MaxMilestoneTasks)
+ 	}
+ 	for _, t := range all {
+ 		if !touched[t.Key] {
+@@ -337,18 +375,21 @@ func applyTasks(tasks []store.MilestoneTask, in []MilestoneTaskInput, drop []str
+ 			rows = nil
+ 		}
+ 		if err := checkTask(t, idx, rows); err != nil {
+-			return nil, nil, err
++			return nil, nil, nil, err
+ 		}
+ 	}
+ 	if cyc := findCycle(all); cyc != "" {
+-		return nil, nil, fmt.Errorf("depends_on has a cycle: %s", cyc)
++		return nil, nil, nil, fmt.Errorf("depends_on has a cycle: %s", cyc)
++	}
++	if err := deriveEdges(all); err != nil {
++		return nil, nil, nil, err
+ 	}
+ 	for _, t := range all {
+-		if touched[t.Key] {
++		if old, ok := before[t.Key]; touched[t.Key] || !ok || !sameTask(old, t) {
+ 			changed = append(changed, t)
+ 		}
+ 	}
+-	return all, changed, nil
++	return all, changed, dropped, nil
+ }
+ 
+ // trimEdits trims skills edits and drops blank ones, keeping order and repeats: edits apply in order
+@@ -600,7 +641,7 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
+ 			live = []string{}
+ 		}
+ 	}
+-	_, tasks, err := applyTasks(nil, in.Tasks, nil, live)
++	_, tasks, dropped, err := applyTasks(nil, in.Tasks, nil, live)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -615,7 +656,12 @@ func (m *Manager) CreateMilestone(ctx context.Context, in MilestoneCreate) (*Mil
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return m.MilestoneTree(ctx, mid)
++	v, err := m.MilestoneTree(ctx, mid)
++	if err != nil {
++		return nil, err
++	}
++	v.DroppedEdges = dropped
++	return v, nil
+ }
+ 
+ // SetMilestone edits a milestone in place (milestone_set): its fields, its tasks (upsert by key, drop),
+@@ -678,12 +724,13 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
+ 		}
+ 	}
+ 	now := m.Now()
++	var dropped []string
+ 	err = m.Store.UpdateMilestone(ctx, in.ID, now, func(ms *store.Milestone, tasks []store.MilestoneTask,
+ 		jobs []*store.Job) (*store.Milestone, []store.MilestoneTask, error) {
+ 		all, changed := tasks, []store.MilestoneTask(nil)
+ 		if len(in.Tasks) > 0 || len(in.Drop) > 0 {
+ 			var err error
+-			if all, changed, err = applyTasks(tasks, in.Tasks, in.Drop, live); err != nil {
++			if all, changed, dropped, err = applyTasks(tasks, in.Tasks, in.Drop, live); err != nil {
+ 				return nil, nil, err
+ 			}
+ 		}
+@@ -737,7 +784,12 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return m.MilestoneTree(ctx, in.ID)
++	v, err := m.MilestoneTree(ctx, in.ID)
++	if err != nil {
++		return nil, err
++	}
++	v.DroppedEdges = dropped
++	return v, nil
+ }
+ 
+ // MilestoneRepoID is the opaque id of a milestone's repository (its stored main worktree): the first 12
+@@ -831,7 +883,7 @@ func (m *Manager) tree(ctx context.Context, ms *store.Milestone) (MilestoneView,
+ 	v.Tasks, v.Ready = []MilestoneTaskView{}, []string{}
+ 	for _, t := range tasks {
+ 		tv := MilestoneTaskView{Key: t.Key, Title: t.Title, Status: st[t.Key], DependsOn: nonNilList(t.DependsOn),
+-			Covers: nonNilList(t.Covers), Skills: nonNilList(t.Skills), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
++			DependsWhy: nonNilMap(t.DependsWhy), Touches: nonNilList(t.Touches), Covers: nonNilList(t.Covers), Skills: nonNilList(t.Skills), Jobs: byTask[t.Key], CreatedAt: fmtMilestoneTS(&t.CreatedAt),
+ 			UpdatedAt: fmtMilestoneTS(&t.UpdatedAt), Sources: nonNilList(t.Sources)}
+ 		if tv.Jobs == nil {
+ 			tv.Jobs = []MilestoneJobView{}
+@@ -894,6 +946,13 @@ func nonNilList(s []string) []string {
+ 	return s
+ }
+ 
++func nonNilMap(m map[string]string) map[string]string {
++	if m == nil {
++		return map[string]string{}
++	}
++	return m
++}
++
+ // acceptanceMet counts the covered IDs the latest judge verdict of the milestone's checklist found met;
+ // nil when there is no verdict.
+ func (m *Manager) acceptanceMet(ms *store.Milestone, covered []string) (*int, error) {
+diff --git a/internal/jobs/milestones_acceptance_test.go b/internal/jobs/milestones_acceptance_test.go
+index 1dcdf15..328fddc 100644
+--- a/internal/jobs/milestones_acceptance_test.go
++++ b/internal/jobs/milestones_acceptance_test.go
+@@ -52,6 +52,7 @@ func TestMilestoneLatency(t *testing.T) {
+ 			task := MilestoneTaskInput{Key: fmt.Sprintf("T%d", i), Title: fmt.Sprintf("task %d", i)}
+ 			if i > 10 {
+ 				task.DependsOn = deps(fmt.Sprintf("T%d", i-10))
++				task.DependsWhy = why(fmt.Sprintf("T%d", i-10))
+ 			}
+ 			tasks = append(tasks, task)
+ 		}
+diff --git a/internal/jobs/milestones_edges_test.go b/internal/jobs/milestones_edges_test.go
+new file mode 100644
+index 0000000..77d14e3
+--- /dev/null
++++ b/internal/jobs/milestones_edges_test.go
+@@ -0,0 +1,249 @@
++package jobs
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"testing"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++)
++
++// #119: every depends_on edge carries a reason; an edge given without one is dropped and named in
++// dropped_edges, so independent tasks are not held back by a chain stricter than the code needs.
++func TestMilestoneEdgeNeedsReason(t *testing.T) {
++	m := newManager(t)
++	ctx := context.Background()
++	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "train", Tasks: []MilestoneTaskInput{
++		{Key: "T1", Title: "orders"},
++		{Key: "T2", Title: "login", DependsOn: deps("T1")},
++		{Key: "T3", Title: "order book", DependsOn: deps("T1"), DependsWhy: map[string]string{"T1": " both edit internal/order "}},
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !slices.Equal(v.DroppedEdges, []string{"T2->T1"}) {
++		t.Fatalf("dropped_edges %v, want [T2->T1]", v.DroppedEdges)
++	}
++	if t2 := taskOf(t, v, "T2"); len(t2.DependsOn) != 0 || t2.Status != TaskReady {
++		t.Fatalf("T2 kept an edge without a reason: %+v", t2)
++	}
++	t3 := taskOf(t, v, "T3")
++	if !slices.Equal(t3.DependsOn, []string{"T1"}) || t3.DependsWhy["T1"] != "both edit internal/order" || t3.Status != TaskBlocked {
++		t.Fatalf("T3: %+v", t3)
++	}
++	if !slices.Equal(v.Ready, []string{"T1", "T2"}) {
++		t.Fatalf("ready %v, want T1 T2", v.Ready)
++	}
++	// The reason is stored: a milestone_get sees it, and a set that lists the edge again keeps it.
++	v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T3", DependsOn: deps("T1")}}})
++	if err != nil || len(v.DroppedEdges) != 0 || taskOf(t, v, "T3").DependsWhy["T1"] != "both edit internal/order" {
++		t.Fatalf("relisted edge: %+v %v", v, err)
++	}
++	// depends_why alone edits the reason of a stored edge.
++	v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T3", DependsWhy: map[string]string{"T1": "reads the order table"}}}})
++	if err != nil || taskOf(t, v, "T3").DependsWhy["T1"] != "reads the order table" {
++		t.Fatalf("reason edit: %+v %v", v, err)
++	}
++	got, err := m.MilestoneTree(ctx, v.ID)
++	if err != nil || len(got.DroppedEdges) != 0 || taskOf(t, got, "T3").DependsWhy["T1"] != "reads the order table" {
++		t.Fatalf("stored: %+v %v", got, err)
++	}
++
++	for name, c := range map[string]struct {
++		in   []MilestoneTaskInput
++		want string
++	}{
++		"reason for a key not in depends_on": {[]MilestoneTaskInput{{Key: "T1", Title: "a"}, {Key: "T2", Title: "b",
++			DependsOn: deps("T1"), DependsWhy: map[string]string{"T1": "x", "T9": "y"}}}, "not in its depends_on"},
++		"reason marked as derived": {[]MilestoneTaskInput{{Key: "T1", Title: "a"}, {Key: "T2", Title: "b",
++			DependsOn: deps("T1"), DependsWhy: map[string]string{"T1": "auto: shared paths x"}}}, "derived edges"},
++		"reason on two lines": {[]MilestoneTaskInput{{Key: "T1", Title: "a"}, {Key: "T2", Title: "b",
++			DependsOn: deps("T1"), DependsWhy: map[string]string{"T1": "a\nb"}}}, "control character"},
++		"unknown key without a reason": {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T9")}}, "not a task"},
++		"itself without a reason":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T1")}}, "itself"},
++		"absolute touches":             {[]MilestoneTaskInput{{Key: "T1", Title: "a", Touches: deps("/etc/passwd")}}, "relative to the repository"},
++		"touches out of the repo":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", Touches: deps("src/../../x")}}, "leaves the repository"},
++		"touches with a comma":         {[]MilestoneTaskInput{{Key: "T1", Title: "a", Touches: deps("a,b")}}, "without commas"},
++	} {
++		if _, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "bad", Tasks: c.in}); err == nil || !strings.Contains(err.Error(), c.want) {
++			t.Errorf("%s: %v, want %q", name, err, c.want)
++		}
++	}
++}
++
++// #119 guardrail: tasks whose touches overlap are serialized by a derived edge (the later waits for the
++// earlier) unless a dependency path already orders them; derived edges follow the paths on every edit.
++func TestMilestoneTouchesDeriveEdges(t *testing.T) {
++	m := newManager(t)
++	ctx := context.Background()
++	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "train", Tasks: []MilestoneTaskInput{
++		{Key: "T1", Title: "orders", Touches: deps("./internal/order/")},
++		{Key: "T2", Title: "book", Touches: deps("internal/order/book.go")},
++		{Key: "T3", Title: "history", Touches: deps("web/history")},
++		{Key: "T4", Title: "margin", Touches: deps("internal/order/*.go"), DependsOn: deps("T2"), DependsWhy: why("T2")},
++		{Key: "T5", Title: "no paths"},
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t1, t2, t3, t4 := taskOf(t, v, "T1"), taskOf(t, v, "T2"), taskOf(t, v, "T3"), taskOf(t, v, "T4")
++	if !slices.Equal(t1.Touches, []string{"internal/order"}) || !slices.Equal(t4.Touches, []string{"internal/order"}) {
++		t.Fatalf("normalized touches: T1 %v T4 %v", t1.Touches, t4.Touches)
++	}
++	if !slices.Equal(t2.DependsOn, []string{"T1"}) || t2.DependsWhy["T1"] != "auto: shared paths internal/order/book.go" {
++		t.Fatalf("T2 derived edge: %v %v", t2.DependsOn, t2.DependsWhy)
++	}
++	if len(t3.DependsOn) != 0 || !slices.Equal(t4.DependsOn, []string{"T2"}) {
++		t.Fatalf("T3 %v, T4 %v: T4 reaches T1 through T2 and needs no edge of its own", t3.DependsOn, t4.DependsOn)
++	}
++	if !slices.Equal(v.Ready, []string{"T1", "T3", "T5"}) {
++		t.Fatalf("ready %v", v.Ready)
++	}
++	// T2 moves to other paths: its derived edge goes, and T4 (no longer ordered after T1) gets one.
++	v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", Touches: deps("docs")}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t2, t4 = taskOf(t, v, "T2"), taskOf(t, v, "T4")
++	if len(t2.DependsOn) != 0 || len(t2.DependsWhy) != 0 {
++		t.Fatalf("T2 kept a stale derived edge: %v %v", t2.DependsOn, t2.DependsWhy)
++	}
++	if !slices.Equal(t4.DependsOn, []string{"T2", "T1"}) || t4.DependsWhy["T1"] != "auto: shared paths internal/order" ||
++		t4.DependsWhy["T2"] != why("T2")["T2"] {
++		t.Fatalf("T4: %v %v", t4.DependsOn, t4.DependsWhy)
++	}
++	// A dropped task holds nothing back: dropping T1 leaves T4 only its own edge (T1 is ignored).
++	v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Drop: []string{"T1"}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if t4 = taskOf(t, v, "T4"); !slices.Equal(t4.DependsOn, []string{"T2"}) {
++		t.Fatalf("T4 after dropping T1: %v", t4.DependsOn)
++	}
++}
++
++// #119 acceptance: a milestone of independent tasks, created without max_parallel, fills every slot of
++// the agent's max_running in one tick: no milestone cap of its own holds them back.
++func TestMilestoneIndependentTasksFillAllSlots(t *testing.T) {
++	m := newManager(t)
++	five := 5
++	m.Cfg.MaxRunning = &five
++	ctx := context.Background()
++	var in []MilestoneTaskInput
++	for i := 1; i <= 6; i++ {
++		in = append(in, MilestoneTaskInput{Key: fmt.Sprintf("T%d", i), Title: "independent", Touches: deps(fmt.Sprintf("mod%d", i))})
++	}
++	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "train", Tasks: in})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if v.MaxParallel != nil || len(v.Ready) != 6 {
++		t.Fatalf("max_parallel %v, ready %v", v.MaxParallel, v.Ready)
++	}
++	for _, k := range v.Ready {
++		enqueue(t, m, "FAKE_SLEEP=20", func(r *StartRequest) { r.Milestone, r.Task = v.ID, k })
++	}
++	if err := m.Tick(); err != nil {
++		t.Fatal(err)
++	}
++	n, _ := m.Store.CountRunning()
++	q, _ := m.Store.ListByStatus(store.StatusQueued)
++	if n != 5 || len(q) != 1 {
++		t.Fatalf("running=%d queued=%d, want 5 and 1", n, len(q))
++	}
++}
++
++// #119: the idle-slot line names the free slots and the ready tasks, capped, and respects max_parallel.
++func TestSlotsLine(t *testing.T) {
++	if got := SlotsLine(0, []readyMilestone{{ID: 1, Keys: []string{"T1"}}}); got != "" {
++		t.Fatalf("no free slot: %q", got)
++	}
++	if got := SlotsLine(2, nil); got != "" {
++		t.Fatalf("nothing ready: %q", got)
++	}
++	if got, want := SlotsLine(3, []readyMilestone{{ID: 4, Keys: []string{"T8", "T9"}}, {ID: 7, Keys: []string{"T2"}}}),
++		"[jobs:slots] 3 slots free, ready: milestone 4 T8, T9; milestone 7 T2"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++	var keys []string
++	for i := 1; i <= maxSlotKeys+3; i++ {
++		keys = append(keys, fmt.Sprintf("T%d", i))
++	}
++	if got := SlotsLine(1, []readyMilestone{{ID: 2, Keys: keys}}); !strings.HasPrefix(got, "[jobs:slots] 1 slot free, ready: milestone 2 T1, T2,") ||
++		!strings.HasSuffix(got, fmt.Sprintf("T%d (+3 more)", maxSlotKeys)) {
++		t.Fatalf("capped line: %q", got)
++	}
++}
++
++// #119: when ready tasks wait and the agent runs fewer jobs than max_running, the daemon types one
++// "[jobs:slots]" line into the session; it repeats only when the free slots or the ready set change.
++func TestIdleSlotNudge(t *testing.T) {
++	m := newManager(t)
++	logf := filepath.Join(t.TempDir(), "tmux.log")
++	t.Setenv("FAKE_TMUX_LOG", logf)
++	m.Cfg.NotifyTmuxTarget = "fake-session"
++	three := 3
++	m.Cfg.MaxRunning = &three
++	ctx := context.Background()
++	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "train", Tasks: []MilestoneTaskInput{
++		{Key: "T1", Title: "a"}, {Key: "T2", Title: "b"},
++		{Key: "T3", Title: "c", DependsOn: deps("T1"), DependsWhy: why("T1")},
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	capped, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "serial", MaxParallel: 1, Tasks: []MilestoneTaskInput{
++		{Key: "S1", Title: "x"}, {Key: "S2", Title: "y"}}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	lines := func() []string {
++		b, err := os.ReadFile(logf)
++		if os.IsNotExist(err) {
++			return nil
++		}
++		if err != nil {
++			t.Fatal(err)
++		}
++		var out []string
++		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
++			if strings.Contains(l, "[jobs:slots]") {
++				out = append(out, l)
++			}
++		}
++		return out
++	}
++	tick := func() {
++		t.Helper()
++		if err := m.Tick(); err != nil {
++			t.Fatal(err)
++		}
++	}
++	tick()
++	want := fmt.Sprintf("-l|[jobs:slots] 3 slots free, ready: milestone %d T1, T2; milestone %d S1|", v.ID, capped.ID)
++	if got := lines(); len(got) != 1 || !strings.HasSuffix(got[0], want) {
++		t.Fatalf("first nudge: %q, want suffix %q", got, want)
++	}
++	tick() // nothing changed: no second line
++	if got := lines(); len(got) != 1 {
++		t.Fatalf("repeated nudge: %q", got)
++	}
++	// A job on S1 fills the capped milestone (max_parallel 1) and a slot: the line changes once.
++	enqueue(t, m, "FAKE_SLEEP=20", func(r *StartRequest) { r.Milestone, r.Task = capped.ID, "S1" })
++	tick()
++	want = fmt.Sprintf("-l|[jobs:slots] 2 slots free, ready: milestone %d T1, T2|", v.ID)
++	if got := lines(); len(got) != 2 || !strings.HasSuffix(got[1], want) {
++		t.Fatalf("after S1 started: %q, want suffix %q", got, want)
++	}
++	// Every slot taken: no line, whatever is ready.
++	enqueue(t, m, "FAKE_SLEEP=20", func(r *StartRequest) { r.Milestone, r.Task = v.ID, "T1" })
++	enqueue(t, m, "FAKE_SLEEP=20", func(r *StartRequest) { r.Milestone, r.Task = v.ID, "T2" })
++	tick()
++	if got := lines(); len(got) != 2 {
++		t.Fatalf("no free slot, yet a line: %q", got)
++	}
++}
+diff --git a/internal/jobs/milestones_loop1_test.go b/internal/jobs/milestones_loop1_test.go
+index 64a22c0..7d43350 100644
+--- a/internal/jobs/milestones_loop1_test.go
++++ b/internal/jobs/milestones_loop1_test.go
+@@ -41,7 +41,7 @@ func TestMilestoneLaunchRechecks(t *testing.T) {
+ 		if _, err := m.Stop(j5.ID, ""); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}},
++		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1"), DependsWhy: why("T1")}},
+ 			Drop: []string{"T3", "T4"}}); err != nil {
+ 			t.Fatal(err)
+ 		}
+@@ -118,7 +118,7 @@ func TestMilestonePriorTakesReworked(t *testing.T) {
+ 	t.Run("[R04] a reworked dependency's report is the prior result", func(t *testing.T) {
+ 		m := newManager(t)
+ 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
++			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+@@ -220,7 +220,7 @@ func TestMilestonePriorRefreshedOnResume(t *testing.T) {
+ 	m := newManager(t)
+ 	sessionsHome(t, false) // fresh session: the fallback prompt carries the prior results
+ 	v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
++		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -303,7 +303,7 @@ func TestPriorCapTinyLimits(t *testing.T) {
+ 	}
+ 	m := newManager(t)
+ 	v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
++		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/jobs/milestones_loop2_test.go b/internal/jobs/milestones_loop2_test.go
+index 91a754d..6e66c7b 100644
+--- a/internal/jobs/milestones_loop2_test.go
++++ b/internal/jobs/milestones_loop2_test.go
+@@ -34,7 +34,7 @@ func TestMilestoneClaimRechecksEligibility(t *testing.T) {
+ 	j3 := enqueue(t, m, "do T3", onTask(v.ID, "T3"))
+ 	j4 := enqueue(t, m, "do other T1", onTask(other.ID, "T1"))
+ 	edits := map[string]MilestoneSet{
+-		j2.ID: {ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}}},
++		j2.ID: {ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1"), DependsWhy: why("T1")}}},
+ 		j3.ID: {ID: v.ID, Drop: []string{"T3"}},
+ 		j4.ID: {ID: other.ID, Status: store.MilestoneDropped},
+ 	}
+@@ -131,7 +131,7 @@ func TestMilestoneWaitingReason(t *testing.T) {
+ 	m := newManager(t)
+ 	ctx := context.Background()
+ 	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
++		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -181,7 +181,7 @@ func TestMilestonePriorNamesOutcome(t *testing.T) {
+ 	} {
+ 		m := newManager(t)
+ 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
++			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+diff --git a/internal/jobs/milestones_test.go b/internal/jobs/milestones_test.go
+index 082b803..82bdea7 100644
+--- a/internal/jobs/milestones_test.go
++++ b/internal/jobs/milestones_test.go
+@@ -17,6 +17,15 @@ import (
+ 
+ func deps(keys ...string) *[]string { return &keys }
+ 
++// why gives each dependency key a reason (#119: an edge without one is dropped).
++func why(keys ...string) map[string]string {
++	out := map[string]string{}
++	for _, k := range keys {
++		out[k] = "test: shares a module with " + k
++	}
++	return out
++}
++
+ func taskOf(t *testing.T, v *MilestoneView, key string) MilestoneTaskView {
+ 	t.Helper()
+ 	for _, tv := range v.Tasks {
+@@ -54,7 +63,7 @@ func TestMilestoneCreateSetGetList(t *testing.T) {
+ 		m := newManager(t)
+ 		ctx := context.Background()
+ 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "Stage one", Goal: "ship it", Order: 2, Tasks: []MilestoneTaskInput{
+-			{Key: "T1", Title: "store"}, {Key: "T2", Title: "tools", DependsOn: deps("T1")}, {Key: "T3", Title: "docs"},
++			{Key: "T1", Title: "store"}, {Key: "T2", Title: "tools", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "docs"},
+ 		}})
+ 		if err != nil {
+ 			t.Fatal(err)
+@@ -65,7 +74,7 @@ func TestMilestoneCreateSetGetList(t *testing.T) {
+ 			t.Fatalf("created: %+v", v)
+ 		}
+ 		v, err = m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "Stage 1", Tasks: []MilestoneTaskInput{
+-			{Key: "T4", Title: "examples", DependsOn: deps("T3")}, {Key: "T1", Covers: deps("R01")},
++			{Key: "T4", Title: "examples", DependsOn: deps("T3"), DependsWhy: why("T3")}, {Key: "T1", Covers: deps("R01")},
+ 		}, Drop: []string{"T3"}})
+ 		if err != nil {
+ 			t.Fatal(err)
+@@ -115,9 +124,9 @@ func TestMilestoneRefusesCyclesAndUnknownKeys(t *testing.T) {
+ 			tasks []MilestoneTaskInput
+ 			want  string
+ 		}{
+-			"cycle":     {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T2")}, {Key: "T2", Title: "b", DependsOn: deps("T1")}}, "cycle"},
+-			"unknown":   {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T9")}}, "not a task"},
+-			"self":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T1")}}, "itself"},
++			"cycle":     {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T2"), DependsWhy: why("T2")}, {Key: "T2", Title: "b", DependsOn: deps("T1"), DependsWhy: why("T1")}}, "cycle"},
++			"unknown":   {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T9"), DependsWhy: why("T9")}}, "not a task"},
++			"self":      {[]MilestoneTaskInput{{Key: "T1", Title: "a", DependsOn: deps("T1"), DependsWhy: why("T1")}}, "itself"},
+ 			"duplicate": {[]MilestoneTaskInput{{Key: "T1", Title: "a"}, {Key: "T1", Title: "b"}}, "twice"},
+ 			"bad key":   {[]MilestoneTaskInput{{Key: "T 1", Title: "a"}}, "task key"},
+ 			"no title":  {[]MilestoneTaskInput{{Key: "T1"}}, "title is required"},
+@@ -131,11 +140,11 @@ func TestMilestoneRefusesCyclesAndUnknownKeys(t *testing.T) {
+ 			t.Error("milestone without a title accepted")
+ 		}
+ 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-			{Key: "T1", Title: "a"}, {Key: "T2", Title: "b", DependsOn: deps("T1")}, {Key: "T3", Title: "c", DependsOn: deps("T2")}}})
++			{Key: "T1", Title: "a"}, {Key: "T2", Title: "b", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "c", DependsOn: deps("T2"), DependsWhy: why("T2")}}})
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "renamed", Tasks: []MilestoneTaskInput{{Key: "T1", DependsOn: deps("T3")}}}); err == nil ||
++		if _, err := m.SetMilestone(ctx, MilestoneSet{ID: v.ID, Title: "renamed", Tasks: []MilestoneTaskInput{{Key: "T1", DependsOn: deps("T3"), DependsWhy: why("T3")}}}); err == nil ||
+ 			!strings.Contains(err.Error(), "T1 -> T3 -> T2 -> T1") {
+ 			t.Fatalf("cycle through set: %v", err)
+ 		}
+@@ -164,7 +173,7 @@ func TestMilestoneTaskLifecycle(t *testing.T) {
+ 		past := time.Now().Add(-time.Hour)
+ 		m.Now = func() time.Time { return past }
+ 		v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
+-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}, {Key: "T3", Title: "side", DependsOn: deps("T1")},
++			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}, {Key: "T3", Title: "side", DependsOn: deps("T1"), DependsWhy: why("T1")},
+ 		}})
+ 		if err != nil {
+ 			t.Fatal(err)
+@@ -301,7 +310,7 @@ func TestMilestonePriorResults(t *testing.T) {
+ 		integ := gitT(t, repo, "rev-parse", "HEAD")
+ 		gitT(t, repo, "checkout", "-q", "main")
+ 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "chain", Repo: repo, Branch: "integ",
+-			Tasks: []MilestoneTaskInput{{Key: "T1", Title: "first step"}, {Key: "T2", Title: "second step", DependsOn: deps("T1")}}})
++			Tasks: []MilestoneTaskInput{{Key: "T1", Title: "first step"}, {Key: "T2", Title: "second step", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+diff --git a/internal/mcp/server.go b/internal/mcp/server.go
+index f7d69cc..19eb3ea 100644
+--- a/internal/mcp/server.go
++++ b/internal/mcp/server.go
+@@ -131,7 +131,8 @@ Route: minutes of work, do it yourself; the session needs the result now, a suba
+ A job may use at most 3 subagents inside its own limits and can never start jobs itself.
+ system_doctor, system_logs and activity_report show the health and the work of the job system; trash_move / trash_restore are reversible deletion instead of rm.
+ To change a job's course: job_amend adds context to a queued job; job_stop + job_resume stops a running one and continues it in the same session with your update; job_cancel gives it up.
+-milestone_create / milestone_set / milestone_get / milestone_list: a multi-task piece of work runs as a milestone (tasks with depends_on, one job per task via job_start milestone+task); a single job needs none. Task status is derived from its jobs; a dependency is done once its job's outcome is accepted.
++milestone_create / milestone_set / milestone_get / milestone_list: a multi-task piece of work runs as a milestone (tasks with depends_on, one job per task via job_start milestone+task); a single job needs none. Task status is derived from its jobs; a dependency is done once its job's outcome is accepted. Give a depends_on edge only for a real conflict (same files/modules, or one consumes the other's output), with its one-line reason in depends_why (an edge without one is dropped), and list each task's touches; leave max_parallel unset to use every slot.
++A "[jobs:slots] N slots free, ready: milestone <id> <keys>" line means ready tasks wait while slots are free: job_start them.
+ intention_add, intention_list and intention_set keep the agent's own goals (open, done, dropped; never deleted).
+ schedule_add / schedule_list / schedule_set / schedule_remove: a cron in local time plus a prompt; due prompts arrive as "[jobs:schedule] ..." (do each one), or start a job when the schedule has a kind. Remove a schedule only on the owner's instruction.
+ check_add / check_list / check_set / check_remove: dead-man's switch checks (a cron in local time plus a grace); whatever stays silent while healthy calls check_mark (jobs can); a missed expected time arrives once as "[jobs:check-missed] ...". Remove a check only on the owner's instruction.
+diff --git a/internal/mcp/tools_milestones.go b/internal/mcp/tools_milestones.go
+index 1318420..782fabf 100644
+--- a/internal/mcp/tools_milestones.go
++++ b/internal/mcp/tools_milestones.go
+@@ -20,8 +20,13 @@ func addMilestoneCreate(s *sdk.Server, d Deps) {
+ 		Description: "Create a milestone (a stage of work) with its tasks in one call and return its tree. Only title and tasks " +
+ 			"are required; each task has a key (T1, T2, ...), a title, optional depends_on (keys), covers (requirement IDs) and " +
+ 			"skills (job_start's skills edits, planned once here: a job_start on the task without skills gets them). " +
++			"Tasks may list touches (paths each is expected to edit). A depends_on edge is only for a real conflict (both edit " +
++			"the same files/modules, or one consumes the other's output) and needs a one-line reason in depends_why; an edge " +
++			"without a reason is dropped (dropped_edges lists it). Tasks whose touches overlap are serialized by a derived edge " +
++			"(reason \"auto: shared paths ...\"). " +
+ 			"Run its tasks with job_start(milestone, task): a task waits (blocked) until every task it depends on is done " +
+-			"(its job's outcome accepted), independent tasks run in parallel (max_parallel caps them, 1 = one after another). " +
++			"(its job's outcome accepted), independent tasks run in parallel (max_parallel caps them, 1 = one after another; " +
++			"leave it unset to use every max_running slot). " +
+ 			"A job on a task with depends_on gets a \"Prior results\" section with those tasks' accepted jobs.",
+ 	}, func(ctx context.Context, _ *sdk.CallToolRequest, in jobs.MilestoneCreate) (*sdk.CallToolResult, jobs.MilestoneView, error) {
+ 		v, err := d.Manager.CreateMilestone(ctx, in)
+@@ -37,7 +42,8 @@ func addMilestoneSet(s *sdk.Server, d Deps) {
+ 		Name:        "milestone_set",
+ 		InputSchema: milestoneSchemas["milestone_set"].schema,
+ 		Description: "Edit a milestone in place and return its tree: title, goal, branch, order, max_parallel, status " +
+-			"(open | done | dropped), close_note; tasks to add or edit by key; keys to drop. Nothing is deleted. Closing as done " +
++			"(open | done | dropped), close_note; tasks to add or edit by key (a depends_on edge needs a depends_why reason, " +
++			"as in milestone_create; a stored edge keeps its reason); keys to drop. Nothing is deleted. Closing as done " +
+ 			"is refused while a task is not done or dropped. Task status is derived from its jobs, never set here.",
+ 	}, func(ctx context.Context, req *sdk.CallToolRequest, in jobs.MilestoneSet) (*sdk.CallToolResult, jobs.MilestoneView, error) {
+ 		// The SDK validated and decoded the id as a float64; the raw arguments keep its exact text.
+diff --git a/internal/mcp/tools_milestones_loop2_test.go b/internal/mcp/tools_milestones_loop2_test.go
+index 8061933..fedda35 100644
+--- a/internal/mcp/tools_milestones_loop2_test.go
++++ b/internal/mcp/tools_milestones_loop2_test.go
+@@ -59,7 +59,7 @@ func TestJobViewShowsMilestoneWaiting(t *testing.T) {
+ 	if jv.Waiting != "" {
+ 		t.Fatalf("job_start of a ready task: waiting %q", jv.Waiting)
+ 	}
+-	call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}}}}, &v)
++	call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "reads its output"}}}}, &v)
+ 	want := "waiting for T1 (ready)"
+ 	call(t, cs, "job_status", map[string]any{"id": jv.ID}, &jv)
+ 	if jv.Waiting != want {
+diff --git a/internal/mcp/tools_milestones_test.go b/internal/mcp/tools_milestones_test.go
+index 84b5a92..cfc76d6 100644
+--- a/internal/mcp/tools_milestones_test.go
++++ b/internal/mcp/tools_milestones_test.go
+@@ -17,13 +17,13 @@ func TestMilestoneTools(t *testing.T) {
+ 		var v jobs.MilestoneView
+ 		call(t, cs, "milestone_create", map[string]any{"title": "Stage", "tasks": []any{
+ 			map[string]any{"key": "T1", "title": "one"},
+-			map[string]any{"key": "T2", "title": "two", "depends_on": []any{"T1"}},
++			map[string]any{"key": "T2", "title": "two", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "reads its output"}},
+ 		}}, &v)
+ 		if v.ID == 0 || len(v.Tasks) != 2 || v.Tasks[1].Status != jobs.TaskBlocked || !slices.Equal(v.Ready, []string{"T1"}) {
+ 			t.Fatalf("milestone_create: %+v", v)
+ 		}
+ 		if msg := callErr(t, cs, "milestone_create", map[string]any{"title": "x", "tasks": []any{
+-			map[string]any{"key": "T1", "title": "a", "depends_on": []any{"T1"}}}}); !strings.Contains(msg, "itself") {
++			map[string]any{"key": "T1", "title": "a", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "reads its output"}}}}); !strings.Contains(msg, "itself") {
+ 			t.Fatalf("self dependency: %s", msg)
+ 		}
+ 		var got jobs.MilestoneView
+@@ -41,7 +41,7 @@ func TestMilestoneTools(t *testing.T) {
+ 		if len(list.Milestones) != 1 || len(list.Milestones[0].Tasks) != 3 {
+ 			t.Fatalf("milestone_list tree: %+v", list)
+ 		}
+-		call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}}}}, &got)
++		call(t, cs, "milestone_set", map[string]any{"id": v.ID, "tasks": []any{map[string]any{"key": "T2", "depends_on": []any{"T1"}, "depends_why": map[string]any{"T1": "reads its output"}}}}, &got)
+ 		if msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) { a["milestone"], a["task"] = v.ID, "T2" })); !strings.Contains(msg, "blocked") {
+ 			t.Fatalf("job_start on a blocked task: %s", msg)
+ 		}
+diff --git a/internal/store/milestones.go b/internal/store/milestones.go
+index 3aea64d..8946ce4 100644
+--- a/internal/store/milestones.go
++++ b/internal/store/milestones.go
+@@ -3,6 +3,7 @@ package store
+ import (
+ 	"context"
+ 	"database/sql"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"time"
+@@ -59,8 +60,18 @@ type MilestoneTask struct {
+ 	UpdatedAt time.Time
+ 	// Sources are the git URLs planned for the task's jobs (G02; sources.go stores them).
+ 	Sources []string
++	// DependsWhy is the one-line reason of each depends_on edge, by dependency key (#119): the files or
++	// modules both tasks touch, or the output this task consumes. A reason starting with AutoEdgePrefix
++	// marks an edge derived from overlapping Touches. Legacy edges stored before #119 have none.
++	DependsWhy map[string]string
++	// Touches are the repo-relative paths (files or directories) the task is expected to edit (#119):
++	// tasks whose paths overlap are serialized by a derived edge. nil = none given.
++	Touches []string
+ }
+ 
++// AutoEdgePrefix starts the reason of a depends_on edge the daemon derived from overlapping Touches.
++const AutoEdgePrefix = "auto: "
++
+ // milestonesSchema is applied at the end of every Open, after the jobs columns and the gate tables exist:
+ // the tables, the index of updated_at (milestoneStamp, the cursor) and the index of the jobs of a
+ // milestone; milestoneTriggers follow.
+@@ -101,6 +112,10 @@ CREATE INDEX IF NOT EXISTS jobs_milestone ON jobs(milestone_id);
+ var milestoneMigrations = []string{
+ 	// G01: a task's planned skills edits (JoinNames; '' = none planned).
+ 	`ALTER TABLE milestone_tasks ADD COLUMN skills TEXT NOT NULL DEFAULT ''`,
++	// #119: the reason of each depends_on edge (a JSON object by dependency key) and the paths the task
++	// is expected to touch (JoinNames).
++	`ALTER TABLE milestone_tasks ADD COLUMN depends_why TEXT NOT NULL DEFAULT '{}'`,
++	`ALTER TABLE milestone_tasks ADD COLUMN touches TEXT NOT NULL DEFAULT ''`,
+ }
+ 
+ // milestoneStamp is the updated_at of a milestone write: the database's clock in Unix seconds, but never
+@@ -227,16 +242,34 @@ func (s *Store) CreateMilestone(ms *Milestone, tasks []MilestoneTask, now time.T
+ }
+ 
+ func upsertTask(tx *sql.Tx, id int64, t MilestoneTask, now time.Time) error {
+-	if _, err := tx.Exec(`INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at)
+-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(milestone_id, key) DO UPDATE SET title=excluded.title,
++	why, err := dependsWhyJSON(t.DependsWhy)
++	if err != nil {
++		return fmt.Errorf("write task %s: %w", t.Key, err)
++	}
++	if _, err := tx.Exec(`INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, skills, dropped,
++		depends_why, touches, created_at, updated_at)
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(milestone_id, key) DO UPDATE SET title=excluded.title,
+ 		depends_on=excluded.depends_on, covers=excluded.covers, skills=excluded.skills, dropped=excluded.dropped,
+-		updated_at=excluded.updated_at`,
+-		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), JoinNames(t.Skills), t.Dropped, now.Unix(), now.Unix()); err != nil {
++		depends_why=excluded.depends_why, touches=excluded.touches, updated_at=excluded.updated_at`,
++		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), JoinNames(t.Skills), t.Dropped,
++		why, JoinNames(t.Touches), now.Unix(), now.Unix()); err != nil {
+ 		return fmt.Errorf("write task %s: %w", t.Key, err)
+ 	}
+ 	return writeTaskSources(tx, id, t)
+ }
+ 
++// dependsWhyJSON is the stored form of a task's edge reasons ("{}" for none).
++func dependsWhyJSON(why map[string]string) (string, error) {
++	if len(why) == 0 {
++		return "{}", nil
++	}
++	b, err := json.Marshal(why)
++	if err != nil {
++		return "", fmt.Errorf("depends_why: %w", err)
++	}
++	return string(b), nil
++}
++
+ // GetMilestone returns one milestone (ErrMilestoneNotFound when there is none).
+ func (s *Store) GetMilestone(ctx context.Context, id int64) (*Milestone, error) {
+ 	return getMilestone(ctx, s.db, id)
+@@ -344,8 +377,8 @@ func (s *Store) MilestoneTasks(ctx context.Context, id int64) ([]MilestoneTask,
+ }
+ 
+ func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask, error) {
+-	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at
+-		FROM milestone_tasks WHERE milestone_id = ? ORDER BY rowid`, id)
++	rows, err := q.QueryContext(ctx, `SELECT milestone_id, key, title, depends_on, covers, skills, dropped, depends_why,
++		touches, created_at, updated_at FROM milestone_tasks WHERE milestone_id = ? ORDER BY rowid`, id)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("milestone tasks: %w", err)
+ 	}
+@@ -353,12 +386,18 @@ func milestoneTasks(ctx context.Context, q queryer, id int64) ([]MilestoneTask,
+ 	var out []MilestoneTask
+ 	for rows.Next() {
+ 		var t MilestoneTask
+-		var deps, covers, skills string
++		var deps, covers, skills, why, touches string
+ 		var created, updated int64
+-		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &skills, &t.Dropped, &created, &updated); err != nil {
++		if err := rows.Scan(&t.MilestoneID, &t.Key, &t.Title, &deps, &covers, &skills, &t.Dropped, &why, &touches,
++			&created, &updated); err != nil {
+ 			return nil, fmt.Errorf("scan task: %w", err)
+ 		}
+-		t.DependsOn, t.Covers, t.Skills = SplitNames(deps), SplitNames(covers), SplitNames(skills)
++		t.DependsOn, t.Covers, t.Skills, t.Touches = SplitNames(deps), SplitNames(covers), SplitNames(skills), SplitNames(touches)
++		if why != "" && why != "{}" {
++			if err := json.Unmarshal([]byte(why), &t.DependsWhy); err != nil {
++				return nil, fmt.Errorf("task %s depends_why: %w", t.Key, err)
++			}
++		}
+ 		t.CreatedAt, t.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
+ 		out = append(out, t)
+ 	}
+diff --git a/internal/store/milestones_edges_test.go b/internal/store/milestones_edges_test.go
+new file mode 100644
+index 0000000..352ab57
+--- /dev/null
++++ b/internal/store/milestones_edges_test.go
+@@ -0,0 +1,61 @@
++package store
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++// #119: a milestone_tasks table from before the depends_why and touches columns gains them on Open (its
++// edges keep no reason); the reasons and touches of a task round-trip through create and update.
++func TestMilestoneTaskEdgeReasonsColumns(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "jobs.db")
++	s, err := Open(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.db.Exec(`DROP TABLE milestone_tasks; CREATE TABLE milestone_tasks (
++		milestone_id INTEGER NOT NULL, key TEXT NOT NULL, title TEXT NOT NULL, depends_on TEXT NOT NULL DEFAULT '',
++		covers TEXT NOT NULL DEFAULT '', dropped INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
++		updated_at INTEGER NOT NULL, skills TEXT NOT NULL DEFAULT '', sources TEXT NOT NULL DEFAULT '',
++		PRIMARY KEY (milestone_id, key));
++		INSERT INTO milestones (title, status, created_at, updated_at) VALUES ('old', 'open', 1, 1);
++		INSERT INTO milestone_tasks (milestone_id, key, title, created_at, updated_at) VALUES (1, 'T1', 'old', 1, 1);
++		INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, created_at, updated_at) VALUES (1, 'T2', 'old', 'T1', 1, 1)`); err != nil {
++		t.Fatal(err)
++	}
++	_ = s.Close()
++	if s, err = Open(path); err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++	ctx := context.Background()
++	tasks, err := s.MilestoneTasks(ctx, 1)
++	if err != nil || len(tasks) != 2 || fmt.Sprint(tasks[1].DependsOn) != "[T1]" || tasks[1].DependsWhy != nil || tasks[1].Touches != nil {
++		t.Fatalf("legacy tasks: %+v %v", tasks, err)
++	}
++	id, err := s.CreateMilestone(&Milestone{Title: "new"}, []MilestoneTask{
++		{Key: "T1", Title: "one", Touches: []string{"internal/order"}},
++		{Key: "T2", Title: "two", DependsOn: []string{"T1"}, DependsWhy: map[string]string{"T1": "both edit internal/order, \"quoted\""}}},
++		time.Now())
++	if err != nil {
++		t.Fatal(err)
++	}
++	tasks, err = s.MilestoneTasks(ctx, id)
++	if err != nil || fmt.Sprint(tasks[0].Touches) != "[internal/order]" || tasks[0].DependsWhy != nil ||
++		tasks[1].DependsWhy["T1"] != `both edit internal/order, "quoted"` {
++		t.Fatalf("round trip: %+v %v", tasks, err)
++	}
++	err = s.UpdateMilestone(ctx, id, time.Now(), func(ms *Milestone, ts []MilestoneTask, _ []*Job) (*Milestone, []MilestoneTask, error) {
++		ts[1].DependsOn, ts[1].DependsWhy, ts[1].Touches = nil, nil, []string{"docs"}
++		return ms, ts[1:], nil
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if tasks, _ = s.MilestoneTasks(ctx, id); tasks[1].DependsOn != nil || tasks[1].DependsWhy != nil || fmt.Sprint(tasks[1].Touches) != "[docs]" {
++		t.Fatalf("update: %+v", tasks[1])
++	}
++}

@@ -336,10 +336,57 @@ func (m *Manager) notifyPending() error {
 // job is marked notified: the gap where the session may already act on the line.
 var afterDoneLineSent func(j *store.Job)
 
+// PaneModePoll is how often the target pane is asked whether it left its tmux mode; a variable so
+// tests can shorten it.
+var PaneModePoll = 200 * time.Millisecond
+
+// paneInMode is what #{pane_in_mode} answers for a pane that is in one (copy-mode, view-mode).
+const paneInMode = "1"
+
+// waitPaneOutOfMode polls the target pane until it is out of any tmux mode. A pane in copy-mode
+// swallows send-keys -l and still exits 0, so a line typed into it is lost with no error and the job
+// is marked notified for a notification nobody ever saw. Waiting within ctx keeps the line for the
+// next poll; a pane still in a mode at the deadline is an errTmuxTimeout, which the caller retries
+// on its next tick. A tmux that cannot answer the format (an old one, a target that no longer
+// exists) must not block delivery at all: it is typed as before.
+func (m *Manager) waitPaneOutOfMode(ctx context.Context, target string) error {
+	var seenInMode bool
+	stuck := func() error {
+		return fmt.Errorf("%w: pane %s did not leave its tmux mode within %s (pane_in_mode=%q)",
+			errTmuxTimeout, target, TmuxDeliveryTimeout, paneInMode)
+	}
+	for {
+		out, err := m.runTmuxOutput(ctx, "display-message", "-p", "-t", target, "#{pane_in_mode}")
+		if err != nil {
+			if !errors.Is(err, errTmuxTimeout) {
+				return nil
+			}
+			// The deadline can land on a probe rather than on the wait below; a pane known to be in a
+			// mode is reported as such, so the retried delivery says why it waits.
+			if seenInMode {
+				return stuck()
+			}
+			return err
+		}
+		if strings.TrimSpace(out) != paneInMode {
+			return nil
+		}
+		seenInMode = true
+		select {
+		case <-ctx.Done():
+			return stuck()
+		case <-time.After(PaneModePoll):
+		}
+	}
+}
+
 // sendTmux types the sanitized line literally (-l) and then presses Enter as a separate key,
 // on the configured tmux socket (-L) when there is one. Every tmux call is bound to ctx: on its
 // end the call's process group is killed and errTmuxTimeout returned.
 func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
+	if err := m.waitPaneOutOfMode(ctx, target); err != nil {
+		return err
+	}
 	line = tmuxArgEscape(Printable(line, 0))
 	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
 		return fmt.Errorf("tmux send-keys: %w", err)

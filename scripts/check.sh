@@ -25,16 +25,24 @@ fi
 echo "== go vet"
 go vet ./...
 
+# One run of the suite serves both steps (#172): its -json output goes to a file kept for this run only
+# (manifest-check reads it below) and, rendered back to plain test output, to the log.
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
 echo "== go test"
-go test -count=1 -timeout "$GO_TEST_TIMEOUT" ./...
+test_status=0
+# pipefail makes the pipeline fail when go test does; a failing renderer or tee fails it too.
+go test -count=1 -timeout "$GO_TEST_TIMEOUT" -json ./... | tee "$tmp/go-test.json" | scripts/render-test-json.sh || test_status=$?
+if [ "$test_status" -ne 0 ]; then
+  echo "go test failed (exit $test_status)"
+  exit "$test_status"
+fi
 
 # The judge's manifest-check (examples/manifest-check/README.md): every live requirement needs a passing
 # tagged test. A checkout without a checklist has nothing to check; the judge's run writes the approved one.
 echo "== manifest-check"
 if [ -f brief/CHECKLIST.md ]; then
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  go test -count=1 -timeout "$GO_TEST_TIMEOUT" -json ./... > "$tmp/go-test.json" || true # failing tests are reported by the go test step
   scripts/manifest-check.sh "$tmp/go-test.json"
 else
   echo "skipped: no brief/CHECKLIST.md"

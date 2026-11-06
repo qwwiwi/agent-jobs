@@ -1,0 +1,252 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..a105be3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ - Merge hook: merges through the API get the same decision as `gh pr merge` (#107): `gh api` `PUT` (`-X` / `--method`, any flag order) to `repos/OWNER/REPO/pulls/N/merge`, pinned by its `sha` field, and `gh api graphql` `mergePullRequest` / `enqueuePullRequest`, pinned by the `expectedHeadOid` among that field's arguments; `enablePullRequestAutoMerge` is refused like `--auto`; a `repositories/ID/…/merge` endpoint only warns. An API merge the hook cannot fully read is refused in a gated repository, its context resolved first (fail closed): an endpoint from a variable or substitution (also a GraphQL mutation posted to `"$EP"`), a body from `--input`, a `-F` field from a file, a query from a variable, a field given more than once (gh sends `-f` fields before `-F` ones whatever their order), and a `$variable` `expectedHeadOid` at `/graphql` or a full URL (gh groups fields into `variables` only for the endpoint `graphql`). The refusal points to `gh pr merge --match-head-commit <sha>` or a literal `gh api -X PUT repos/OWNER/REPO/pulls/N/merge -f sha=<full sha>`; outside a gated repository it still warns.
+ 
+ ### Fixed
++- OpenRouter jobs take no `sources` (#146): `providers.openrouter.deny_repos` checks only the job's repository, so a source file from a denied repository, or another job's report about one, could reach the third-party provider. `job_start` (and a milestone task's planned sources) now refuses any sources on an `openrouter:<slug>` model before a snapshot is taken or budget reserved, until a source policy exists.
+ - The guard refuses `scp`, `sftp` and a remote-reaching `rsync` (#116): only `ssh` was on the out-of-scope list, so a job could copy data to or from a remote host with the operator's keys. `scp` and `sftp` are refused outright (behind wrappers, as a path, in `bash -c`, and where another program runs them, exactly like `ssh`); `rsync` is refused when an `-e`/`--rsh` option (any value) or a `host:path`-shaped argument (`user@host:/x`, `host::module`, `rsync://…`, a ':' before any '/' — `./a:b` stays local) can take it to a remote host. A purely local `rsync`, both paths local, stays allowed: jobs use it inside their worktree. The refusal names the tool and says a job never reaches remote hosts. Docs list them now (skills/agent-jobs/SKILL.md, docs/GUIDE.md, docs/GUIDE.ru.md). Review fix loop: the same rsync test covers the positions where another program runs it — the command of `find -exec`/`-execdir`/`-ok` and the positional of the exec runners (`setsid`, `ionice`, `chroot`, …), with its argv up to find's `;`/`+` terminator — and `rsync` under `xargs`, `parallel` or `entr` is refused outright, its extra arguments coming from stdin; rsync's value-taking options (`--exclude`, `-f`, `-T`, `-B`, …) are consumed first, so a local `rsync --exclude cache:old` is no longer refused for its option values, while `-avze ssh` still is.
+ - Codex brief lint: a bare curl/wget verb without a URL and post-verb negation (#141). Since #133 / PR #140 the network warning fired only on an explicit http(s) URL, so "run curl", «выполни wget», "use curl" went unnoticed; a curl/wget word after an action verb (run, use, execute, fetch, «запусти», «выполни», «используй», up to two words between, e.g. "fetch it with curl") now warns with the same line as the URL rule — one line per conflicting category, duplicate lines deduplicated, and «curl the fixture» or a bare «curl» still passes: without an action verb the word alone is not a fetch request. Negation is now detected after the verb too, within the same clause and only for the listed negation words right after the verb or through a linking verb (is/are/was/быть): "commit nothing", "curl is not needed", «curl не нужен», «пушить не надо»; "commit is not allowed" stays a known-limit warning ("not allowed" is not a listed negation), a bare "no" is not a post-verb negation ("run curl no matter what" is a positive request), and the same verbs keep the pre-verb negation.
+ - OpenRouter jobs no longer stop at claude's own budget (#148): claude priced the OpenRouter slug by its fallback Claude price table (`unrecognized_model`) and ended a job with `error_max_budget_usd` about 15x before its real cost reached `max_budget_usd`. Their claude argv no longer carries `--max-budget-usd`; the job's proxy alone enforces the budget at OpenRouter's real price and the job still fails with `openrouter budget reached`. The recorded cost and `daily_cap_usd` accounting are unchanged; claude jobs keep `--max-budget-usd <job budget>`.
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 3c6b2a8..045dd05 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -157,7 +157,7 @@ A model or a complexity is mandatory: with neither the job is rejected. There is
+ 
+ - `key_file` (required, absolute) is an env file with `OPENROUTER_API_KEY=...`, mode 600 (a group- or world-readable file is refused). The key is **never** in `config.json` (a key field there is a config error). The wrapper reads the file when the job starts; a missing or unreadable file fails the job before claude runs. Its directory must be one of its own **outside `$HOME`**, the temp dirs (`/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR`) and the agent-jobs state dir, e.g. `/var/lib/agent-jobs-keys/<agent>/` created once by root, owned by the agent's user, mode 700 (see *The key stays in the wrapper*); otherwise every job of the agent fails at start with `openrouter key protection`.
+ - `models` is the allow-list: any other slug is refused by `job_start`. `daily_cap_usd` (required, > 0) caps what this agent's OpenRouter jobs of the last 24 hours spent or may still spend: a finished job counts at its cost, a queued, running or stopped one (or one that ended without a known cost) at its whole `max_budget_usd`; a job whose budget would pass the cap is refused, and the `job_start` reply shows `openrouter_spent_today: $spent/$cap`.
+-- Refused: kind `review` (and the gate kinds), runner codex, and repositories in `deny_repos` (an absolute entry is a path or glob of the repository path, any other a name or glob of its folder name). An OpenRouter job is never resumed or auto-continued: start a new one with what it left.
++- Refused: kind `review` (and the gate kinds), runner codex, and repositories in `deny_repos` (an absolute entry is a path or glob of the repository path, any other a name or glob of its folder name). An OpenRouter job takes no `sources` (#146): `deny_repos` covers only the job's repository, so a source file or job report would bypass it. An OpenRouter job is never resumed or auto-continued: start a new one with what it left.
+ - **Routing (`routing`, per model `model_routing`).** `sort` `price` (default) | `throughput` | `latency`; `min_quantization` (default `fp8`; an endpoint below it or with an unknown quantization is not used; `any` turns the filter off); `data_collection` `deny` (default) | `allow`; `zdr` (default false); `min_uptime_pct` (default 95, the lower of the endpoint's 30-minute and 1-day uptime); `ignore` and `order` (provider slugs). The cheapest endpoints are often fp4, hence the fp8 default; on 2026-11-04 `moonshotai/kimi-k3.1-pro` had no endpoint at fp8 or better (only fp4/mxfp4/unknown), so it needs a `model_routing` override or every job on it is refused at start.
+ - **How routing is applied.** Claude Code sends no OpenRouter `provider` object. The `:floor` / `:nitro` model variants only choose a sort (price / throughput) and widen the pool with flex / priority tiers, and the account preferences (privacy settings) cover data policy and ignored providers account-wide, with no quantization and nothing per job ([provider selection](https://openrouter.ai/docs/guides/routing/provider-selection), [floor](https://openrouter.ai/docs/guides/routing/model-variants/floor)). OpenRouter's Anthropic-compatible `POST /api/v1/messages` does accept a `provider` object (`MessagesRequest.provider` in its [OpenAPI spec](https://openrouter.ai/docs/openapi/openapi.yaml)). So the wrapper runs a **loopback proxy per job** (127.0.0.1, a kernel-picked port, closed when claude exits): claude gets `ANTHROPIC_BASE_URL` = the proxy and a random per-job `ANTHROPIC_AUTH_TOKEN`; the proxy checks that token, sets the request's `model` to the slug and its `provider` object to the policy (`sort`, `quantizations`, `data_collection`, `zdr`, `ignore` plus the endpoints below the uptime floor, `order` = the policy's order followed by the eligible endpoints ranked cheapest first, fallbacks allowed inside those filters), adds `session_id` (OpenRouter's sticky routing, so the prompt cache stays warm), and forwards it with the real key. The ranking reads the public endpoints list (`/api/v1/models/<slug>/endpoints`, no key) when the job starts; `stderr.log` names the endpoint the policy picks.
+ - **The key stays in the wrapper.** claude's environment loses every `ANTHROPIC_*` variable, the subscription's OAuth variables (`CLAUDE_CODE_OAUTH*`), the cloud-provider switches and credentials and `OPENROUTER_API_KEY`; it gets `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the proxy token), `ANTHROPIC_API_KEY=` (empty), and `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` set to the slug. A request that reaches anything but the proxy carries no usable credential, and the proxy refuses any other token, so a misconfigured job fails instead of falling back to the subscription. A repository whose `.claude/settings*.json` sets one of those variables (or `apiKeyHelper`) is refused at start. The key is in no file the job can read and no log line. With `providers.openrouter` set, **every** job of the agent (openrouter or not) is kept from reading `key_file`'s directory by the kernel: the wrapper starts each process of the job (the runner, its fallback, the acceptance command, the prepare and manifest-check steps, the wrapper's own git) on a thread restricted with Linux Landlock (kernel 5.13+), and every descendant inherits it, so a `cat`, a script the job wrote, another interpreter, a copy, a hard link or `/proc/self/root/...` all get `Permission denied`; only the wrapper (its proxy) reads the key, before the job starts. Landlock can only grant, so the sandbox grants reading beneath every other entry along the path to the key directory: a file created later directly inside one of the key directory's ancestors (`/`, `/var`, `/var/lib`, ...) is unreadable to a job until its next launch. That is why the key directory may not be under `$HOME` (claude rewrites `~/.claude.json` there), a temp dir or the state dir; without Landlock (another OS, a kernel without it) or with such a placement, no job starts while `providers.openrouter` is set. **Codex jobs:** codex's native sandbox is bwrap, which cannot start inside any Landlock domain: the kernel forbids mount(2) to a Landlock-restricted process whatever the ruleset allows (on kernel 6.8, even a ruleset that handles only the execute right and grants it beneath `/` gives `bwrap: Failed to make / slave: Operation not permitted`). `providers.openrouter.codex_policy` decides what a codex job on the native sandbox does while `providers.openrouter` is set: `allow_unprotected` (the default) runs its codex process outside the key sandbox, so codex and every command it runs **can read `key_file`** (stderr.log of each such job starts with `WARNING: openrouter key protection is OFF for this codex job's runner`, and `system_doctor` lists the risk in `warnings`, `codex_sandbox.openrouter_key_protection: unprotected`); the wrapper's own steps of the job (its git, prepare, acceptance, manifest-check) stay inside the key sandbox. `refuse` fails such a job at start (`openrouter key protection`; a `system_doctor` problem). `codex_sandbox: "worktree-full-access"` codex jobs run inside the key sandbox under either policy (`protected`). The guard of every claude job also refuses reading `key_file` (`--no-read`), and the `sk-or-v1-...` shape is redacted from reports. The proxy forwards exactly `POST /v1/messages` and `POST /v1/messages/count_tokens`; any other path or method gets 403 and never reaches OpenRouter.
+diff --git a/internal/jobs/jobid_test.go b/internal/jobs/jobid_test.go
+index ba437ec..cf07e9b 100644
+--- a/internal/jobs/jobid_test.go
++++ b/internal/jobs/jobid_test.go
+@@ -172,8 +172,8 @@ func TestCodexCapCollisionCountsOnce(t *testing.T) {
+ }
+ 
+ // The openrouter-capped insert path redraws too, and a collision never reserves the budget twice:
+-// after one forced redraw the provider's spend holds exactly this job's budget, and the sources land
+-// under the final id (#129). Before the fix the redraw left the sources under the taken id.
++// after one forced redraw the provider's spend holds exactly this job's budget (#129). An openrouter
++// job takes no sources (#146), so the sources-under-the-final-id half is the claude and codex tests'.
+ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	m := newManager(t)
+ 	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
+@@ -182,9 +182,8 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	m.Now = func() time.Time { return frozen }
+ 	taken := prefixTaken(t, m, frozen, "0001")
+ 	setIDSuffixes(t, "0001", "0002")
+-	origin := sourceFixture(t, t.TempDir(), "notes.md", "openrouter notes")
+ 	j, err := m.Enqueue(StartRequest{Title: "openrouter collision", Kind: "general", Brief: "b",
+-		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4, Sources: []string{origin}})
++		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -195,9 +194,6 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	if err != nil || spend != 4 {
+ 		t.Fatalf("reserved $%.2f, %v; want exactly this job's $4.00", spend, err)
+ 	}
+-	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil || string(b) != "openrouter notes" {
+-		t.Fatalf("sources under the final id: %q, %v", b, err)
+-	}
+ 	if _, err := os.Stat(m.JobDir(taken)); !errors.Is(err, os.ErrNotExist) {
+ 		t.Fatalf("taken id %s got a folder: %v", taken, err)
+ 	}
+diff --git a/internal/jobs/manager.go b/internal/jobs/manager.go
+index a56e182..32cf29a 100644
+--- a/internal/jobs/manager.go
++++ b/internal/jobs/manager.go
+@@ -505,6 +505,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
+ 		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
+ 			return nil, err
+ 		}
++		if len(r.Sources) > 0 { // before any snapshot is taken or budget reserved (#146)
++			if r.plannedSources {
++				return nil, fmt.Errorf("%w; task %s of milestone %d has sources planned (give job_start sources: [] to run it without them)",
++					errOpenRouterSources, r.Task, r.Milestone)
++			}
++			return nil, errOpenRouterSources
++		}
+ 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
+ 	}
+ 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
+diff --git a/internal/jobs/openrouter.go b/internal/jobs/openrouter.go
+index 1d893af..ac4952a 100644
+--- a/internal/jobs/openrouter.go
++++ b/internal/jobs/openrouter.go
+@@ -392,6 +392,12 @@ func (r RoutingPolicy) validate(where string) error {
+ 	return nil
+ }
+ 
++// errOpenRouterSources refuses sources on an OpenRouter job (#146): deny_repos covers only the job's
++// repository, so a source file from a denied repository, or a job report about one, would reach the
++// third-party provider. Until a source policy exists, an OpenRouter job takes none.
++var errOpenRouterSources = errors.New("openrouter jobs take no sources (providers.openrouter.deny_repos covers only the job's repo; " +
++	"a source file or job report would reach the third-party provider): start it without sources, or on a claude or codex model")
++
+ // checkOpenRouterJob refuses an OpenRouter job the config does not allow (R2, R5): not configured, a
+ // slug off the allow-list, a review job, a codex runner, or a denied repository (repo may be "").
+ func (c Config) checkOpenRouterJob(slug, kind, runner, repo string) error {
+diff --git a/internal/jobs/openrouter_sources_test.go b/internal/jobs/openrouter_sources_test.go
+index df79b30..72b5ed6 100644
+--- a/internal/jobs/openrouter_sources_test.go
++++ b/internal/jobs/openrouter_sources_test.go
+@@ -1,45 +1,53 @@
+ package jobs
+ 
+ import (
++	"errors"
++	"io"
+ 	"os"
+ 	"path/filepath"
+-	"slices"
+ 	"strings"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/qwwiwi/agent-jobs/internal/store"
+ )
+ 
+-// An openrouter job with file sources (both added on separate branches): the provider and the
+-// source origins survive the store round trip, the accepted job keeps its copied sources, and a
+-// job refused by the daily cap leaves no job folder behind.
++// An openrouter job with file sources (both added on separate branches) is refused before any
++// snapshot is taken (#146): no job folder, no row, no budget reserved, even when the daily cap
++// would refuse it too.
+ func TestOpenRouterJobWithSourceFiles(t *testing.T) {
+ 	m := newManager(t)
+ 	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
+ 	m.Cfg.Providers.OpenRouter.DailyCapUSD = f64(5)
+ 	origin := sourceFixture(t, t.TempDir(), "notes.md", "notes")
+-	j, err := m.Enqueue(StartRequest{Title: "a", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
+-		MaxBudgetUSD: 4, Sources: []string{origin}})
+-	if err != nil {
+-		t.Fatal(err)
++	for _, budget := range []float64{4, 6} { // within the cap, and past it
++		_, err := m.Enqueue(StartRequest{Title: "a", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
++			MaxBudgetUSD: budget, Sources: []string{origin}})
++		if err == nil || !strings.Contains(err.Error(), "openrouter jobs take no sources") {
++			t.Fatalf("budget $%.0f: %v, want the sources refusal", budget, err)
++		}
+ 	}
+-	got, err := m.Store.Get(j.ID)
+-	if err != nil {
++	if entries, err := os.ReadDir(filepath.Join(m.StateDir, "jobs")); err == nil && len(entries) > 0 {
++		t.Fatalf("a refused job left a folder: %v", entries)
++	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+ 		t.Fatal(err)
+ 	}
+-	if got.Provider != store.ProviderOpenRouter || got.Billing != store.BillingAPI || !slices.Equal(got.SourceFiles, []string{origin}) {
+-		t.Fatalf("round trip: provider %q billing %q source_files %v", got.Provider, got.Billing, got.SourceFiles)
+-	}
+-	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil {
+-		t.Fatalf("accepted job lost its sources: %v", err)
+-	}
+-	_, err = m.Enqueue(StartRequest{Title: "b", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
+-		MaxBudgetUSD: 2, Sources: []string{origin}})
+-	if err == nil || !strings.Contains(err.Error(), "openrouter daily cap reached") {
+-		t.Fatalf("over the cap: %v", err)
++	if spend, err := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, time.Now().Add(-time.Hour)); err != nil || spend != 0 {
++		t.Fatalf("a refused job reserved $%.2f, %v", spend, err)
+ 	}
+-	entries, err := os.ReadDir(filepath.Join(m.StateDir, "jobs"))
+-	if err != nil || len(entries) != 1 {
+-		t.Fatalf("capped job left a folder: %v, %v", entries, err)
++}
++
++// A job queued with sources before #146 (or a row changed since) is refused again at launch: the
++// wrapper never starts an openrouter job whose row carries sources.
++func TestWrapperOpenRouterRefusesQueuedSources(t *testing.T) {
++	jobDir := filepath.Join(t.TempDir(), "jobs", "261106-000000-0001")
++	for name, j := range map[string]*store.Job{
++		"source files":   {ID: "f", Model: "openrouter:" + orGLM, Kind: "general", SourceFiles: []string{"/etc/hostname"}},
++		"legacy sources": {ID: "g", Model: "openrouter:" + orGLM, Kind: "general", Sources: []string{"https://github.com/a/b"}},
++	} {
++		orj, reason := wrapperOpenRouter(jobDir, j, io.Discard)
++		if orj != nil || !strings.Contains(reason, "openrouter jobs take no sources") {
++			t.Errorf("%s: started %v, reason %q", name, orj != nil, reason)
++		}
+ 	}
+ }
+diff --git a/internal/jobs/openrouter_test.go b/internal/jobs/openrouter_test.go
+index f7507d5..d6dc567 100644
+--- a/internal/jobs/openrouter_test.go
++++ b/internal/jobs/openrouter_test.go
+@@ -1029,3 +1029,42 @@ func TestOpenRouterBudgetFailureOutranksClaudeExit(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// Issue #146: deny_repos checks only the job's repository, so a source file (from a denied repository,
++// or another job's report about one) would reach the third-party provider. Until a source policy exists,
++// an OpenRouter job takes no sources at all; a subscription job keeps them.
++func TestOpenRouterRefusesSources(t *testing.T) {
++	m := newManager(t)
++	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
++	repo := newRepo(t)
++	m.Cfg.Providers.OpenRouter.DenyRepos = []string{filepath.Base(repo)}
++	denied := sourceFixture(t, repo, "secret.md", "private notes")
++	outside := sourceFixture(t, t.TempDir(), "notes.md", "public notes")
++	prior := enqueue(t, m, "x", nil)
++	if err := os.MkdirAll(m.JobDir(prior.ID), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(m.JobDir(prior.ID), "report.md"), []byte("report on a private repo"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	for name, sources := range map[string][]string{
++		"file in a denied repo": {denied},
++		"file outside any repo": {outside},
++		"another job's report":  {"job:" + prior.ID},
++	} {
++		_, err := m.Enqueue(StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "openrouter:" + orGLM,
++			MaxBudgetUSD: 1, Sources: sources})
++		if err == nil || !strings.Contains(err.Error(), "openrouter jobs take no sources") {
++			t.Errorf("%s: %v, want the sources refusal", name, err)
++		}
++	}
++	if spend, err := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, time.Now().Add(-time.Hour)); err != nil || spend != 0 {
++		t.Fatalf("a refused job reserved $%.2f, %v", spend, err)
++	}
++	// Without sources the OpenRouter job starts; a subscription job keeps its sources.
++	enqueue(t, m, "x", func(r *StartRequest) { r.Model = "openrouter:" + orGLM; r.MaxBudgetUSD = 1 })
++	j := enqueue(t, m, "x", func(r *StartRequest) { r.Sources = []string{outside} })
++	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil || string(b) != "public notes" {
++		t.Fatalf("subscription job sources: %q, %v", b, err)
++	}
++}
+diff --git a/internal/jobs/wrapper.go b/internal/jobs/wrapper.go
+index ab02e6f..686af1c 100644
+--- a/internal/jobs/wrapper.go
++++ b/internal/jobs/wrapper.go
+@@ -870,6 +870,10 @@ func wrapperSandbox(jobDir string) string {
+ // wrapperOpenRouter prepares an OpenRouter job's launch from the agent's config.json (<state>/jobs/<id>
+ // = jobDir) and the job's row: the failure reason, redacted, when it cannot start.
+ func wrapperOpenRouter(jobDir string, j *store.Job, log io.Writer) (*openRouterJob, string) {
++	// A job queued with sources before they were refused at start (#146) does not run either.
++	if len(j.SourceFiles) > 0 || len(j.Sources) > 0 {
++		return nil, "openrouter job not started: " + errOpenRouterSources.Error()
++	}
+ 	abs, err := filepath.Abs(jobDir)
+ 	if err != nil {
+ 		return nil, "openrouter: " + err.Error()
+diff --git a/internal/mcp/tools_jobs.go b/internal/mcp/tools_jobs.go
+index cfb286b..66cc20d 100644
+--- a/internal/mcp/tools_jobs.go
++++ b/internal/mcp/tools_jobs.go
+@@ -219,7 +219,7 @@ type JobStartInput struct {
+ 	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); optional, stored on the job. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job gets large when it has covers, else small (refused instead when config size_required is on, default off); review, research and the gate kinds are exempt"`
+ 	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
+ 	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
+-	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
++	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Refused for openrouter:<slug> models (#146: deny_repos covers only the job repo). Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
+ 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
+ }
+ 

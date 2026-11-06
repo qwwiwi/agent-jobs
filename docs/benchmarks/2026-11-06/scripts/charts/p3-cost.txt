@@ -1,0 +1,18 @@
+A clean, minimalist, professional benchmark infographic in a dark theme (near-black background #0E0F12, soft gold accent #D4A84B, white and light-grey text, thin grid lines). Style of a top-tier ML benchmark report: flat, crisp sans-serif typography, generous spacing, no 3D, no icons, no emoji. All text in Russian exactly as written. Every number must be rendered exactly as given.
+
+Title: «Цена против качества»
+Subtitle: «Средняя цена одной задачи (эквивалент API) и доля полностью решённых задач»
+
+A scatter plot. X axis: «Цена за задачу, $» from 0 to 2.6 with ticks 0, 0.5, 1.0, 1.5, 2.0, 2.5. Y axis: «Решено полностью, %» from 0 to 70 with ticks 0, 10, 20, 30, 40, 50, 60, 70. Five large labeled circles:
+- «Opus high» at x=2.38, y=56 (gold circle), label «$2.38 · 56%»
+- «Sonnet high» at x=0.62, y=44 (light gold circle, emphasized with a gold ring), label «$0.62 · 44%»
+- «Sonnet medium» at x=0.37, y=33 (grey), label «$0.37 · 33%»
+- «GLM 5.3» at x=0.51, y=33 (grey with muted red outline), label «$0.51 · 33% · 4 срыва из 9»
+- «Haiku high» at x=0.07, y=33 (dark grey), label «$0.07 · 1 из 3, только простые»
+A thin dashed gold arrow from Opus high to Sonnet high with label «в 3.8 раза дешевле, −1 задача из 9».
+
+Right side panel «Что это значит для лимита Claude»:
+- «Простые и средние задачи – 57% стоимости кода Opus в бенче»
+- «Перевод их на Sonnet high снимает ~40% нагрузки Opus на кодинг»
+- «Цель была: больше 30%»
+Footer small grey: «Вес Sonnet и Opus в недельном лимите Anthropic не публикует; расчёт по цене API»

@@ -1,0 +1,129 @@
+diff --git a/internal/jobs/trailing_result_test.go b/internal/jobs/trailing_result_test.go
+new file mode 100644
+index 0000000..4a49492
+--- /dev/null
++++ b/internal/jobs/trailing_result_test.go
+@@ -0,0 +1,75 @@
++package jobs
++
++import (
++	"encoding/json"
++	"io"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++const trailingReport = "## Summary\ndone\n\n## Findings / Changes\nx\n\n## Evidence\ny\n\n## Not done / uncertain\nnothing\n\n## Progress\n- ok\n"
++
++// twoResultStream is a claude stream whose session wrote its report in the first result and was woken
++// by a background-task notification for a second, one-turn result (#154).
++func twoResultStream(t *testing.T, second string) string {
++	t.Helper()
++	line := func(m map[string]any) string {
++		b, err := json.Marshal(m)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return string(b) + "\n"
++	}
++	return line(map[string]any{"type": "result", "subtype": "success", "num_turns": 87, "total_cost_usd": 1.5, "result": trailingReport}) +
++		line(map[string]any{"type": "result", "subtype": "success", "num_turns": 1, "total_cost_usd": 1.6, "result": second})
++}
++
++const trailingNotification = "Это уведомление от моего же таймера ожидания; работа завершена."
++
++// The report comes from the last result that has the report sections; turns add up and the cost is the
++// session's total, so a trailing notification turn neither empties report.md nor fails the contract.
++func TestTeeKeepsReportOverTrailingNotificationResult(t *testing.T) {
++	tee := &resultTee{w: io.Discard}
++	_, _ = tee.Write([]byte(twoResultStream(t, trailingNotification)))
++	tee.end()
++	r := tee.res
++	if r.Text != trailingReport {
++		t.Fatalf("report text lost: %q", r.Text)
++	}
++	if r.Turns != 88 || r.CostUSD != 1.6 || r.Results != 2 || !r.Found || r.IsError || r.Subtype != "success" {
++		t.Fatalf("totals: %+v", r)
++	}
++	if n := reportContractNote(r.Text, nil); n != "" {
++		t.Fatalf("contract note %q", n)
++	}
++}
++
++// ParseStream (stream.jsonl read back) merges the same way.
++func TestParseStreamKeepsReportOverTrailingNotificationResult(t *testing.T) {
++	p := filepath.Join(t.TempDir(), "stream.jsonl")
++	if err := os.WriteFile(p, []byte(twoResultStream(t, trailingNotification)), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	r := ParseStream(p)
++	if r.Text != trailingReport || r.Turns != 88 || r.CostUSD != 1.6 {
++		t.Fatalf("parse: %+v", r)
++	}
++}
++
++// When the later result is a report too, it wins; when neither is, the last one stays as before.
++func TestTrailingResultMergeRules(t *testing.T) {
++	later := "## Summary\nnewer\n\n## Not done / uncertain\nnothing\n"
++	tee := &resultTee{w: io.Discard}
++	_, _ = tee.Write([]byte(twoResultStream(t, later)))
++	tee.end()
++	if tee.res.Text != later {
++		t.Fatalf("later report must win: %q", tee.res.Text)
++	}
++	tee = &resultTee{w: io.Discard}
++	_, _ = tee.Write([]byte(claudeResultLine(t, "no report a") + claudeResultLine(t, "no report b")))
++	tee.end()
++	if tee.res.Text != "no report b" {
++		t.Fatalf("last non-report result must stay: %q", tee.res.Text)
++	}
++}
+diff --git a/internal/jobs/wrapper.go b/internal/jobs/wrapper.go
+index ab02e6f..b29a2bf 100644
+--- a/internal/jobs/wrapper.go
++++ b/internal/jobs/wrapper.go
+@@ -100,7 +100,24 @@ type resultEvent struct {
+ 	Result       string  `json:"result"`
+ }
+ 
+-// ParseStream returns the last `result` event in stream.jsonl (zero value if none).
++// mergeResult folds a later `result` event into the earlier ones (#154). A session that started a
++// background task can be woken by its notification for one more short turn, which ends in a second
++// `result`. The later event normally replaces the earlier one, but when the earlier one holds the report
++// and the later one does not, the report text stays: the trailing notification turn must not empty
++// report.md or fail the report contract. Then the run's turns are the sum of both events' turns (each
++// counts its own) and the cost the larger figure (the session total, which the later event includes).
++func mergeResult(prev, next StreamResult) StreamResult {
++	if !prev.Found || !isReport(prev.Text) || isReport(next.Text) {
++		return next
++	}
++	next.Text = prev.Text
++	next.Turns += prev.Turns
++	next.CostUSD = max(next.CostUSD, prev.CostUSD)
++	return next
++}
++
++// ParseStream returns the run's `result` events in stream.jsonl merged by mergeResult: the last one,
++// with the report of an earlier one when the last has none (zero value if none).
+ func ParseStream(path string) StreamResult {
+ 	var out StreamResult
+ 	f, err := os.Open(path)
+@@ -112,7 +129,7 @@ func ParseStream(path string) StreamResult {
+ 	sc.Buffer(make([]byte, 0, 1<<20), maxStreamLine)
+ 	for sc.Scan() {
+ 		if r, ok := parseResultLine(sc.Bytes()); ok {
+-			out = r
++			out = mergeResult(out, r)
+ 		}
+ 	}
+ 	return out
+@@ -243,7 +260,7 @@ func (t *resultTee) end() {
+ 		}
+ 		if r, ok := parseResultLine(t.line); ok {
+ 			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
+-			t.res = r
++			t.res = mergeResult(t.res, r)
+ 		}
+ 	}
+ 	if !t.skip && bytes.Contains(t.line, []byte(`"usage"`)) {

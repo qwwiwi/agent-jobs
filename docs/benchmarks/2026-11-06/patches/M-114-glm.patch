@@ -1,0 +1,223 @@
+diff --git a/internal/jobs/gate.go b/internal/jobs/gate.go
+index 5a71b3b..84903e3 100644
+--- a/internal/jobs/gate.go
++++ b/internal/jobs/gate.go
+@@ -503,7 +503,10 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 		return err
+ 	}
+ 	// Own pipes rather than StdinPipe/StdoutPipe: the reaper's Wait (startGit) never closes them under a
+-	// read.
++	// read. The stdout, read here rather than copied by the runner, is tracked (#114): git's PID, the
++	// group's ID, stays reserved until the read has ended, so that the kill at the deadline still reaches
++	// a descendant of git's group that holds the pipe.
++	var readDone chan struct{} // closed once the manual stdout read has ended
+ 	inR, in, err := os.Pipe()
+ 	if err != nil {
+ 		return err
+@@ -513,8 +516,10 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 		_, _ = inR.Close(), in.Close()
+ 		return err
+ 	}
+-	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
+-		"-C", repo, noReplace, "cat-file", "--batch")
++	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd, gp *gitProc) {
++		c.Stdin, c.Stdout = inR, outW
++		readDone = gp.trackOutput()
++	}, "-C", repo, noReplace, "cat-file", "--batch")
+ 	_, _ = inR.Close(), outW.Close()
+ 	if err != nil {
+ 		_, _ = in.Close(), outPipe.Close()
+@@ -542,11 +547,14 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
+ 			p.kill()
+ 		}
+ 		_ = in.Close()
++		// The read has ended (every blob read, a failed read or the deadline's close of outPipe): release
++		// the runner's reservation of git's PID before waiting (#114).
++		_ = outPipe.Close()
++		close(readDone)
+ 		werr := p.wait(ctx)
+ 		if errors.Is(werr, errGitTimeout) || timedOut && (err != nil || werr != nil) {
+ 			err = fmt.Errorf("git cat-file: %w after %s", errGitTimeout, gitLongTimeout)
+ 		}
+-		_ = outPipe.Close()
+ 	}()
+ 	out := bufio.NewReader(outPipe)
+ 	var total int64
+diff --git a/internal/jobs/git_timeout_test.go b/internal/jobs/git_timeout_test.go
+index 014ee40..0232eb3 100644
+--- a/internal/jobs/git_timeout_test.go
++++ b/internal/jobs/git_timeout_test.go
+@@ -287,6 +287,53 @@ exec '`+real+`' "$@"
+ 	}
+ }
+ 
++// The judge tree's git cat-file hands its stdout to the caller as a file the caller reads itself, so
++// the runner does not copy it (#114): a git that exits at once while a process of its group still
++// holds that stdout does not leave the process running past the deadline. The tracked stream keeps
++// git's PID, the group's ID, reserved, so the kill at the deadline still reaches the holder, and the
++// call is errGitTimeout.
++func TestMaterializeTreeTimeoutKillsCatFileChild(t *testing.T) {
++	repo, sha := gateRepo(t)
++	real, err := exec.LookPath("git")
++	if err != nil {
++		t.Fatal(err)
++	}
++	state := t.TempDir()
++	t.Setenv("FAKE_GIT_STATE", state)
++	// cat-file --batch starts sleep 60 with the inherited stdout, records its pid and exits at once:
++	// the caller's read then blocks on the pipe only the child holds. Every other git call is the real
++	// one, also the ls-tree of the judge tree that runs first.
++	fakeGitOnPath(t, `for a in "$@"; do [ "$a" = cat-file ] && { sleep 60 & echo $! > "$FAKE_GIT_STATE/child"; exit 0; }; done
++exec '`+real+`' "$@"
++`)
++	// A deadline wide enough for the real ls-tree on a busy host, and a wait delay past it, so that the
++	// kill comes from the deadline, not from the reaper's own delay (TestGitTimeoutKillsChildAfterGitExit).
++	shortGitLongTimeout(t, time.Second)
++	origDelay := gitWaitDelay
++	gitWaitDelay = 30 * time.Second
++	t.Cleanup(func() { gitWaitDelay = origDelay })
++	err = returnsWithin(t, 30*time.Second, "materializeTree", func() error {
++		return materializeTree(repo, sha, t.TempDir(), nil)
++	})
++	if !errors.Is(err, errGitTimeout) {
++		t.Fatalf("want errGitTimeout, got %v", err)
++	}
++	b, err := os.ReadFile(filepath.Join(state, "child"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
++	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
++		if time.Now().After(deadline) {
++			t.Fatalf("cat-file's child %d still runs after the deadline: git's group was not killed", pid)
++		}
++	}
++}
++
+ // A git that exits while a process of its group still holds its stdout does not leave that process
+ // running past the deadline (#100): the group is killed while git, not reaped yet, still reserves the
+ // group's ID, and the call is errGitTimeout without output.
+diff --git a/internal/jobs/gitrun.go b/internal/jobs/gitrun.go
+index 2ab5b99..eca3b9e 100644
+--- a/internal/jobs/gitrun.go
++++ b/internal/jobs/gitrun.go
+@@ -48,12 +48,16 @@ type gitProc struct {
+ 
+ 	// outs are the read ends of the output pipes the runner copies (Stdout and Stderr writers that are no
+ 	// file); copied is closed once every copy has ended. closeOutputs closes outs, which ends the copies;
+-	// cut records that it did so before they ended on their own.
++	// cut records that it did so before they ended on their own. manual are the streams the caller
++	// consumes itself (an *os.File it set as Stdout or Stderr, which the runner does not copy),
++	// registered by trackOutput before the start: reap keeps git's PID, the group's ID, reserved until
++	// each of them has ended (see reap, #114).
+ 	outs     []*os.File
+ 	copied   chan struct{}
+ 	copyErr  error // the first copy error, read only after copied
+ 	outOnce  sync.Once
+ 	cut      atomic.Bool
++	manual   []chan struct{}
+ 	killed   chan struct{} // closed by kill, after the group was signalled
+ 	killOnce sync.Once
+ 
+@@ -70,17 +74,18 @@ type gitProc struct {
+ // GIT_TERMINAL_PROMPT=0 (git never waits on a prompt, whatever env holds), in its own process group.
+ // setup, when not nil, sets the command's standard streams before the start: Stdin nil or an *os.File,
+ // Stdout and Stderr distinct writers. A writer that is no *os.File is fed by the runner through a pipe
+-// of its own, never by exec, so that the runner can close it (see gitProc.outs).
+-func startGit(dir string, env []string, setup func(*exec.Cmd), args ...string) (*gitProc, error) {
++// of its own, never by exec, so that the runner can close it (see gitProc.outs); an *os.File the caller
++// reads itself it marks with trackOutput, so that the runner waits for the stream's end (gitProc.manual).
++func startGit(dir string, env []string, setup func(*exec.Cmd, *gitProc), args ...string) (*gitProc, error) {
+ 	cmd := exec.Command("git", args...)
+ 	cmd.Dir = dir
+ 	cmd.Env = append(slices.Clip(env), "GIT_TERMINAL_PROMPT=0")
+ 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+-	if setup != nil {
+-		setup(cmd)
+-	}
+ 	p := &gitProc{cmd: cmd, name: "git " + strings.Join(args, " "), done: make(chan error, 1),
+ 		copied: make(chan struct{}), killed: make(chan struct{})}
++	if setup != nil {
++		setup(cmd, p)
++	}
+ 	var dsts []io.Writer
+ 	var ends []*os.File // the write ends, git's after the start
+ 	closeEnds := func() {
+@@ -143,9 +148,24 @@ func (p *gitProc) cutOutputs() {
+ 	p.closeOutputs()
+ }
+ 
++// trackOutput marks an output stream the caller consumes itself (an *os.File it set as Stdout or
++// Stderr in startGit's setup, which the runner does not copy) and returns the channel to close once
++// that stream has ended: its read hit EOF or an error, or the file was closed. Called from setup,
++// before git starts, it has reap keep git's PID, the group's ID, reserved until the stream has ended,
++// the group is killed or gitWaitDelay passes after git's exit (#114): the kill at a timeout then
++// still reaches a descendant that holds the stream. The runner cannot end the caller's read itself:
++// the caller's own bound closes its end, as materializeTree's deadline does.
++func (p *gitProc) trackOutput() chan struct{} {
++	ch := make(chan struct{})
++	p.manual = append(p.manual, ch)
++	return ch
++}
++
+ // reap waits for git's exit and its output, then marks it reaped and only then reaps it (see mu). Once git
+ // has exited, a process of its group that still holds the output past gitWaitDelay or the kill is ended
+-// with the group while git, a zombie, still reserves the group's ID, and the pipes are closed.
++// with the group while git, a zombie, still reserves the group's ID, and the pipes are closed. A stream
++// the caller consumes itself (trackOutput) joins the same protocol: its end, the kill or gitWaitDelay
++// past git's exit releases the reservation, and the runner leaves ending the caller's read to the caller.
+ func (p *gitProc) reap() {
+ 	if err := gitWaitExit(p.cmd.Process.Pid); err != nil {
+ 		// Nothing to wait for (no such child): no group is signalled from now on, and Wait reports it.
+@@ -168,6 +188,16 @@ func (p *gitProc) reap() {
+ 		}
+ 		t.Stop()
+ 	}
++	// The manually consumed streams keep the PID reservation (#114): a descendant of git's group that
++	// holds one is ended by the group kill that follows, which the reservation keeps valid.
++	for _, ended := range p.manual {
++		select {
++		case <-ended:
++		case <-p.killed: // kill has signalled the group already, while the PID was reserved
++		case <-time.After(gitWaitDelay):
++			p.signal()
++		}
++	}
+ 	p.mu.Lock()
+ 	p.reaped = true
+ 	p.mu.Unlock()
+@@ -197,7 +227,7 @@ func (p *gitProc) signal() {
+ }
+ 
+ // kill ends git's process group (signal), also when git has exited and a process of the group holds its
+-// output, and has the reaper close the output pipes.
++// output, runner-copied or tracked (trackOutput), and has the reaper close the output pipes.
+ func (p *gitProc) kill() {
+ 	p.signal()
+ 	p.killOnce.Do(func() { close(p.killed) })
+@@ -246,7 +276,7 @@ func (p *gitProc) watchUnreaped() {
+ // errGitTimeout; any error but an exit status comes without output.
+ func runGit(ctx context.Context, dir string, env []string, args ...string) (stdout, stderr []byte, err error) {
+ 	var out, errOut bytes.Buffer
+-	p, err := startGit(dir, env, func(c *exec.Cmd) { c.Stdout, c.Stderr = &out, &errOut }, args...)
++	p, err := startGit(dir, env, func(c *exec.Cmd, _ *gitProc) { c.Stdout, c.Stderr = &out, &errOut }, args...)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+diff --git a/internal/jobs/sources.go b/internal/jobs/sources.go
+index 9ffd0c9..e72ab0c 100644
+--- a/internal/jobs/sources.go
++++ b/internal/jobs/sources.go
+@@ -468,7 +468,7 @@ func cloneSource(ctx context.Context, u, target string, maxBytes int64, home str
+ 	var stderr bytes.Buffer
+ 	// git runs helpers (remote-https, index-pack): the whole group is killed on the cap or the timeout,
+ 	// and the clone ends by then plus gitKillGrace even when git is not reaped (gitProc.wait).
+-	p, err := startGit(tmp, sourceEnv(tmp, protocols), func(c *exec.Cmd) { c.Stderr = &limitedWriter{w: &stderr, n: 4 << 10} },
++	p, err := startGit(tmp, sourceEnv(tmp, protocols), func(c *exec.Cmd, _ *gitProc) { c.Stderr = &limitedWriter{w: &stderr, n: 4 << 10} },
+ 		cloneArgs(tmpl, remote, target, pin)...)
+ 	if err != nil {
+ 		return fail("git did not start: " + err.Error())

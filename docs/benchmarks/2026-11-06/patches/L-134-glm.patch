@@ -1,0 +1,705 @@
+diff --git a/internal/jobs/acceptance.go b/internal/jobs/acceptance.go
+index d981255..1653b65 100644
+--- a/internal/jobs/acceptance.go
++++ b/internal/jobs/acceptance.go
+@@ -43,7 +43,6 @@ const (
+ 	AcceptanceLog                   = "acceptance.log"
+ 	// acceptanceReadCap bounds a read of acceptance.log: the kept output and its header line.
+ 	acceptanceReadCap       = AcceptanceLogBytes + 1<<10
+-	acceptanceKillGrace     = 5 * time.Second
+ 	acceptanceDeadlineGrace = 2 * time.Minute // the wrapper's kill, sweep and bookkeeping after the timeout
+ 	acceptanceReasonPrefix  = "acceptance "
+ 	acceptanceHome          = "acceptance-home" // HOME (and TMPDIR under it) of the acceptance command
+@@ -52,6 +51,10 @@ const (
+ 	acceptanceSignalled = -2
+ )
+ 
++// acceptanceKillGrace is the time between SIGTERM and SIGKILL on a gate's timeout; a variable so
++// tests shorten it.
++var acceptanceKillGrace = 5 * time.Second
++
+ // AcceptanceRefusedKinds are the kinds that change no code; acceptance_cmd is refused for them.
+ var AcceptanceRefusedKinds = []string{"review", "research", KindSlicing, KindJudge, KindBriefing}
+ 
+@@ -232,6 +235,8 @@ type wrapperAcceptance struct {
+ 	timeout time.Duration
+ 	st      *store.Store
+ 	id      string
++	// job is the job row, for the gate's head assert (#134).
++	job *store.Job
+ }
+ 
+ // openAcceptance reads the job's acceptance command from <state>/jobs.db (jobDir = <state>/jobs/<id>)
+@@ -252,7 +257,7 @@ func openAcceptance(jobDir, token string) (*wrapperAcceptance, error) {
+ 		_ = st.Close()
+ 		return nil, err
+ 	}
+-	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID}
++	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID, job: j}
+ 	if a.cmd == "" {
+ 		return a, nil
+ 	}
+@@ -296,6 +301,14 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
+ 	// From here on a stop signal must not kill the wrapper before the command's group is gone.
+ 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+ 	defer stop()
++	// The head assert (#134): the gate runs only in the job's own worktree at its own HEAD. Refused,
++	// nothing is recorded and the job fails as an acceptance that did not run, with this exit and the
++	// reason in the marker line.
++	head, why := assertGateHead(jobDir, a.job)
++	if why != "" {
++		gateExitMarker(log, "acceptance", gateNotRunExit, 0, head, "not run: "+why)
++		return 0
++	}
+ 	now := time.Now()
+ 	if err := a.st.SetAcceptanceStarted(a.id, token, now, acceptanceDeadline(now, a.timeout)); err != nil {
+ 		// ErrImmutable: the daemon already decided to time the job out (or it no longer runs).
+@@ -308,6 +321,9 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
+ 		}
+ 	}
+ 	exit, dur := runAcceptance(ctx, jobDir, a.cmd, a.timeout, log, onStart)
++	// Always printed, whatever ended the gate (#134): a waiter reading stderr.log can always tell it
++	// ended and how.
++	gateExitMarker(log, "acceptance", exit, dur, head, "")
+ 	if exit == acceptanceSignalled {
+ 		fmt.Fprintln(log, "run-wrapper: stopped by a signal during the acceptance command; its process group is ended")
+ 		return 128 + int(syscall.SIGTERM)
+@@ -350,7 +366,7 @@ func runAcceptance(ctx context.Context, jobDir, cmdline string, timeout time.Dur
+ 	if err := writeAtomic(filepath.Join(jobDir, AcceptanceLog), body); err != nil {
+ 		fmt.Fprintln(log, "run-wrapper: acceptance: write log:", err)
+ 	}
+-	fmt.Fprintf(log, "run-wrapper: acceptance exit %d after %s\n", exit, dur.Round(time.Second))
++	// The exit marker line is the caller's (#134): it knows the head the gate was asserted to run at.
+ 	return exit, dur
+ }
+ 
+@@ -397,28 +413,56 @@ func runContainedCmd(parent context.Context, jobDir, dir, home, cmdline string,
+ 		fmt.Fprintln(log, "run-wrapper: acceptance environment:", err)
+ 		return 127
+ 	}
+-	return runShellGroup(parent, dir, env, cmdline, timeout, out, log, onStart)
++	return runShellGroup(parent, jobDir, dir, env, cmdline, timeout, out, log, onStart)
+ }
+ 
+ // runShellGroup runs cmdline with /bin/sh -c in dir with env, in a process group of its own (onStart,
+-// when set, gets its id), stdout and stderr to out. On the timeout or when parent ends the group gets
+-// SIGTERM, then SIGKILL after acceptanceKillGrace. It returns the exit code (128+signal when killed by
+-// a signal, store.AcceptanceTimedOut on the timeout, acceptanceSignalled when parent ended, 127 when
+-// it could not start). The acceptance command, the manifest-check step and the prepare step run through it.
+-func runShellGroup(parent context.Context, dir string, env []string, cmdline string, timeout time.Duration, out io.Writer,
++// when set, gets its id), stdout and stderr to out, one gate at a time per box (#134): the box gate
++// lock of jobDir (acquireGateLock) is held from before the command starts until its process group is
++// gone, and waiting for it shares the command's time budget. On the timeout or when parent ends the
++// group gets SIGTERM, then SIGKILL after acceptanceKillGrace. It returns the exit code (128+signal
++// when killed by a signal, store.AcceptanceTimedOut on the timeout — also when the box gate lock did
++// not free in time —, acceptanceSignalled when parent ended, 127 when it could not start). The
++// acceptance command, the manifest-check step and the prepare step run through it.
++func runShellGroup(parent context.Context, jobDir, dir string, env []string, cmdline string, timeout time.Duration, out io.Writer,
+ 	log io.Writer, onStart func(pgid int)) int {
+ 	var err error
+ 	if parent.Err() != nil {
+ 		return acceptanceSignalled
+ 	}
++	// One time budget for waiting for the lock and the run: the gate never overruns the deadline the
++	// wrapper recorded for it, and a queued gate that cannot start in time fails as a timeout.
+ 	ctx, cancel := context.WithTimeout(parent, timeout)
+ 	defer cancel()
++	release := acquireGateLock(ctx, jobDir, log)
++	if release == nil {
++		if parent.Err() != nil {
++			return acceptanceSignalled
++		}
++		if ctx.Err() != nil {
++			return store.AcceptanceTimedOut
++		}
++		// No lock file could be opened (logged): the gate runs without the box gate lock rather than
++		// not at all.
++	} else {
++		defer release()
++	}
+ 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", cmdline)
+ 	cmd.Dir = dir
+ 	cmd.Env = env
+ 	cmd.Stdout, cmd.Stderr = out, out
+ 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
++	// The whole group, not only the leader, gets the TERM: a suite the shell spawned ends with it.
++	// ESRCH is the group being gone already (the command exited as the timeout fired): not an error,
++	// or Wait would report the kill instead of the timeout.
++	cmd.Cancel = func() error {
++		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); errors.Is(err, syscall.ESRCH) {
++			return nil
++		} else if err != nil {
++			return err
++		}
++		return nil
++	}
+ 	// After the grace Go kills the leader and stops waiting for pipes a straggler still holds.
+ 	cmd.WaitDelay = acceptanceKillGrace
+ 	if err = startJobCmd(cmd); err == nil { // in the key sandbox (keysandbox.go)
+diff --git a/internal/jobs/finish.go b/internal/jobs/finish.go
+index f5c44c9..fae90c8 100644
+--- a/internal/jobs/finish.go
++++ b/internal/jobs/finish.go
+@@ -510,8 +510,13 @@ func under(path, dir string) bool {
+ // source repo at that path, with its admin dir under <repo's common git dir>/worktrees/ and equal to
+ // the one recorded at creation, carrying this job's owner mark.
+ func (m *Manager) verifyWorktree(j *store.Job, work string) error {
++	return verifyWorktreeAt(m.JobDir(j.ID), j, work)
++}
++
++// verifyWorktreeAt is verifyWorktree with the job dir given directly, as the wrapper reads it.
++func verifyWorktreeAt(jobDir string, j *store.Job, work string) error {
+ 	var info WorktreeInfo
+-	b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), "worktree.json"))
++	b, err := os.ReadFile(filepath.Join(jobDir, "worktree.json"))
+ 	if err != nil {
+ 		return fmt.Errorf("worktree.json: %w", err)
+ 	}
+diff --git a/internal/jobs/gaterunner.go b/internal/jobs/gaterunner.go
+new file mode 100644
+index 0000000..f348f72
+--- /dev/null
++++ b/internal/jobs/gaterunner.go
+@@ -0,0 +1,176 @@
++package jobs
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++)
++
++// The gate runner (issue #134): the wrapper's heavy local gates — a job's acceptance command (a
++// check.sh, a pg suite), the judge's manifest-check step and the prepare step (an install, a vite
++// build) — all run through runShellGroup, and four rules hold for every one of them:
++//
++//   - One gate at a time per box: a flock at the agent-jobs home (the state dir's parent, shared by
++//     every agent on the box) serializes them, so concurrent jobs never run two heavy gates at once
++//     (OOM). Waiting for the lock shares the gate's own time budget, so a queued gate either starts
++//     within its timeout or fails as a timeout: it never hangs and never overruns the deadline the
++//     wrapper recorded for it.
++//   - Assert HEAD: the acceptance command runs in the job's worktree only after the wrapper proved
++//     the worktree is the job's own (verifyWorktreeAt) and its HEAD descends from the job's base
++//     commit, so a runner that left HEAD somewhere else (it checked out an unrelated commit) cannot
++//     have its gate pass on code that is not the job's.
++//   - Always print exit=: every path that ends a gate prints one marker line with exit= (and the head
++//     it ran at, and how long it took), also when it timed out, was stopped by a signal or was
++//     refused before it started: no gate ends silently, no waiter hangs on a gate that is over.
++//   - Clean env: the prepare step keeps the runner's environment (the real HOME, the package
++//     stores) but never the Telegram gateway's TELEGRAM_* variables; the acceptance and
++//     manifest-check environments are allow-listed (acceptanceEnvKeys) and never carried them.
++
++// gateNotRunExit marks a gate that was refused before its command started (the head assert failed):
++// the job fails as an acceptance that did not run, with this exit and the reason in the marker line.
++const gateNotRunExit = 125
++
++// gateLockName is the box gate lock file's name, in the agent-jobs home (the state dir's parent,
++// shared by every agent on the box) or, when no lock file can be created there, in the state dir
++// itself (per agent: the gate still cannot overlap within one agent's jobs).
++const gateLockName = "gate.lock"
++
++// gateLockPoll is how often the box gate lock is retried while another gate holds it, the polled
++// LOCK_NB pattern of tmux.lock: a holder that dies releases the lock through the kernel (its file
++// descriptor closes), so no gate waits on a stale one.
++const gateLockPoll = 50 * time.Millisecond
++
++// gateLockPaths are where the box gate lock of a job of jobDir (<state>/jobs/<id>) lives: the
++// agent-jobs home first, the state dir as the fallback. Both may be unusable (an unwritable home on
++// an unusual install): the gate then runs without the box gate lock, and the wrapper's log says so.
++func gateLockPaths(jobDir string) []string {
++	abs, err := filepath.Abs(jobDir)
++	if err != nil {
++		return nil
++	}
++	state := filepath.Dir(filepath.Dir(abs))
++	return []string{filepath.Join(filepath.Dir(state), gateLockName), filepath.Join(state, gateLockName)}
++}
++
++// acquireGateLock takes the box gate lock for a gate of jobDir, polling until it gets it or ctx ends.
++// It returns the release func, or nil when it does not hold the lock: then ctx ended (the caller
++// fails the gate: parent ended or the timeout ran out while waiting) or no lock file could be opened
++// (logged; the caller runs the gate without the box gate lock rather than not at all).
++func acquireGateLock(ctx context.Context, jobDir string, log io.Writer) func() {
++	for _, path := range gateLockPaths(jobDir) {
++		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
++		if err != nil {
++			continue
++		}
++		waited := false
++		for {
++			err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
++			if err == nil {
++				return func() {
++					_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
++					_ = f.Close()
++				}
++			}
++			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
++				_ = f.Close()
++				break // try the fallback path
++			}
++			if !waited {
++				waited = true
++				fmt.Fprintf(log, "run-wrapper: gate: waiting for the box gate lock %s\n", path)
++			}
++			select {
++			case <-ctx.Done():
++				fmt.Fprintf(log, "run-wrapper: gate: the box gate lock %s did not free in time; the command is not run\n", path)
++				_ = f.Close()
++				return nil
++			case <-time.After(gateLockPoll):
++			}
++		}
++	}
++	fmt.Fprintln(log, "run-wrapper: gate: no gate lock file could be opened; running without the box gate lock")
++	return nil
++}
++
++// assertGateHead is the acceptance command's head assert: work below jobDir must be the job's own
++// verified worktree whose HEAD descends from the job's base commit, so the gate runs on the job's own
++// code and never on whatever else a runner left checked out. It returns the HEAD commit ("" for a job
++// without a repository, and set when known even on refusal, for the exit marker) and why the gate
++// must not run ("" = it must run).
++func assertGateHead(jobDir string, j *store.Job) (head, why string) {
++	if j.RepoPath == "" || j.BaseCommit == "" {
++		return "", ""
++	}
++	work := filepath.Join(jobDir, "work")
++	if fi, err := os.Lstat(work); err != nil || !fi.IsDir() {
++		return "", "the job's work dir is not there any more"
++	}
++	if err := verifyWorktreeAt(jobDir, j, work); err != nil {
++		return "", "the job's worktree is not verified: " + RedactPrintable(err.Error(), 160)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), MergeCheckTimeout)
++	defer cancel()
++	head, err := gitCtxOK(ctx, work, "rev-parse", "--verify", "HEAD^{commit}")
++	if err != nil {
++		return "", "HEAD of the job's worktree is not a commit: " + RedactPrintable(err.Error(), 160)
++	}
++	// merge-base --is-ancestor exits 1 when HEAD is not a descendant of the base: the runner left the
++	// worktree at a commit of its own choosing, and the gate would pass or fail on code that is not
++	// the job's.
++	_, code, _, err := gitCtx(ctx, work, "merge-base", "--is-ancestor", j.BaseCommit, head)
++	switch {
++	case err != nil:
++		return head, "the worktree HEAD could not be checked against the job's base: " + RedactPrintable(err.Error(), 160)
++	case code != 0:
++		return head, fmt.Sprintf("HEAD %s does not descend from the job's base %s: the gate would not run on the job's own code",
++			shortSHA(head), shortSHA(j.BaseCommit))
++	}
++	return head, ""
++}
++
++// gateExitMarker is the line that ends every gate run in the wrapper's log: the step, the exit code
++// (always printed, with exit=, whatever ended the gate), the head it ran at, how long it took and, on
++// a refusal, why it did not run. A reader of stderr.log always finds this line: no gate ends
++// silently, no waiter hangs on a gate that is already over.
++func gateExitMarker(log io.Writer, step string, exit int, dur time.Duration, head, note string) {
++	if note == "" {
++		switch exit {
++		case store.AcceptanceTimedOut:
++			note = "timeout"
++		case acceptanceSignalled:
++			note = "stopped by a signal"
++		}
++	}
++	line := fmt.Sprintf("run-wrapper: %s exit=%d", step, exit)
++	if head != "" {
++		line += " head=" + shortSHA(head)
++	}
++	if note != "" {
++		line += " (" + RedactPrintable(note, 200) + ")"
++	}
++	fmt.Fprintf(log, "%s after %s\n", line, dur.Round(time.Second))
++}
++
++// gateEnvDropPrefixes are dropped from the environment of a gate that keeps the runner's environment
++// (the prepare step: it needs the real HOME, the package stores and caches): the Telegram gateway's
++// variables must not reach a command the repository's own scripts (a postinstall hook) can read. The
++// acceptance and manifest-check environments are allow-listed (acceptanceEnvKeys) and never carried
++// them.
++var gateEnvDropPrefixes = []string{"TELEGRAM_"}
++
++// dropGateEnv drops every variable whose name starts with one of gateEnvDropPrefixes from env.
++func dropGateEnv(env []string) []string {
++	return slices.DeleteFunc(env, func(kv string) bool {
++		k, _, _ := strings.Cut(kv, "=")
++		return slices.ContainsFunc(gateEnvDropPrefixes, func(p string) bool { return strings.HasPrefix(k, p) })
++	})
++}
+diff --git a/internal/jobs/gaterunner_test.go b/internal/jobs/gaterunner_test.go
+new file mode 100644
+index 0000000..10efcde
+--- /dev/null
++++ b/internal/jobs/gaterunner_test.go
+@@ -0,0 +1,291 @@
++package jobs
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/qwwiwi/agent-jobs/internal/store"
++	"github.com/qwwiwi/agent-jobs/internal/testutil"
++)
++
++// gateJobDir is a job dir with a work dir below a state dir of its own agent-jobs home, so the box
++// gate lock of its gates is that home's gate.lock and no other test's gates contend for it.
++func gateJobDir(t *testing.T) string {
++	t.Helper()
++	jobDir := filepath.Join(testutil.ShortTempDir(t), "test", "jobs", "j1")
++	if err := os.MkdirAll(filepath.Join(jobDir, "work"), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	return jobDir
++}
++
++// One gate at a time per box (#134): a second gate that starts while a first one holds the box gate
++// lock waits for it; its command runs only after the first gate's command ended. Before the lock the
++// two ran concurrently (OOM on a busy box).
++func TestGateLockOneAtATime(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("the order file timestamps need GNU date")
++	}
++	jobDir := gateJobDir(t)
++	work := filepath.Join(jobDir, "work")
++	home := filepath.Dir(filepath.Dir(filepath.Dir(jobDir)))
++	order := filepath.Join(home, "order.txt")
++	logf, err := os.Create(filepath.Join(home, "wrapper.log"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer logf.Close()
++	line := func(name string) string {
++		return fmt.Sprintf("echo %s $(date +%%s%%N) >> %q", name, order)
++	}
++	run := func(cmd string) chan int {
++		done := make(chan int, 1)
++		go func() {
++			done <- runShellGroup(context.Background(), jobDir, work, nil, cmd, time.Minute, io.Discard, logf, nil)
++		}()
++		return done
++	}
++	doneA := run(line("A-start") + "; sleep 1; " + line("A-end"))
++	waitFor(t, "the first gate to start", 10*time.Second, func() bool {
++		b, err := os.ReadFile(order)
++		return err == nil && strings.Contains(string(b), "A-start")
++	})
++	// The second gate starts while the first one holds the lock (A-start is in the order file, A-end
++	// is not yet) and must wait for it.
++	doneB := run(line("B-start") + "; sleep 0.1; " + line("B-end"))
++	for _, done := range []chan int{doneA, doneB} {
++		select {
++		case <-done:
++		case <-time.After(30 * time.Second):
++			t.Fatal("a gate did not end")
++		}
++	}
++	times := map[string]int64{}
++	for _, l := range strings.Split(readFile(t, order), "\n") {
++		name, ns, ok := strings.Cut(strings.TrimSpace(l), " ")
++		if ok {
++			times[name], _ = strconv.ParseInt(ns, 10, 64)
++		}
++	}
++	if len(times) != 4 {
++		t.Fatalf("order file:\n%s", readFile(t, order))
++	}
++	if times["B-start"] < times["A-end"] {
++		t.Fatalf("the second gate's command ran before the first gate's ended (B-start %d < A-end %d)",
++			times["B-start"], times["A-end"])
++	}
++	if log := readAll(t, logf); !strings.Contains(log, "waiting for the box gate lock") {
++		t.Fatalf("the waiting gate never said so:\n%s", log)
++	}
++}
++
++// A gate that cannot take the box gate lock within its own timeout fails as a timeout instead of
++// running alongside the holder or hanging on it (#134: no hung waiters).
++func TestGateLockWaitIsBoundedByTheTimeout(t *testing.T) {
++	jobDir := gateJobDir(t)
++	work := filepath.Join(jobDir, "work")
++	home := filepath.Dir(filepath.Dir(filepath.Dir(jobDir)))
++	ranA, ranB := filepath.Join(home, "a-ran"), filepath.Join(home, "b-ran")
++	logf, err := os.Create(filepath.Join(home, "wrapper.log"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer logf.Close()
++	holder := make(chan int, 1)
++	go func() {
++		holder <- runShellGroup(context.Background(), jobDir, work, nil, "touch "+ranA+"; sleep 1", time.Minute, io.Discard, logf, nil)
++	}()
++	waitFor(t, "the holder to start", 10*time.Second, func() bool {
++		_, err := os.Stat(ranA)
++		return err == nil
++	})
++	start := time.Now()
++	exit := runShellGroup(context.Background(), jobDir, work, nil, "touch "+ranB, 300*time.Millisecond, io.Discard, logf, nil)
++	if exit != store.AcceptanceTimedOut {
++		t.Fatalf("exit %d, want the timeout (%d)", exit, store.AcceptanceTimedOut)
++	}
++	if took := time.Since(start); took > 5*time.Second {
++		t.Fatalf("the waiter hung for %s", took)
++	}
++	if _, err := os.Stat(ranB); err == nil {
++		t.Fatal("a gate ran while another one held the box gate lock")
++	}
++	if log := readAll(t, logf); !strings.Contains(log, "box gate lock") || !strings.Contains(log, "did not free in time") {
++		t.Fatalf("the timed-out waiter never said why:\n%s", log)
++	}
++	select {
++	case <-holder:
++	case <-time.After(30 * time.Second):
++		t.Fatal("the holder never ended")
++	}
++}
++
++// The exit marker line always carries exit= (#134): a gate that ends, however it ends, leaves this
++// line in the wrapper's log.
++func TestGateExitMarkerAlwaysPrinted(t *testing.T) {
++	for _, c := range []struct {
++		step string
++		exit int
++		dur  time.Duration
++		head string
++		note string
++		want string
++	}{
++		{"acceptance", 0, 3 * time.Second, "0123456789abcdef0123", "", "run-wrapper: acceptance exit=0 head=0123456789ab after 3s"},
++		{"prepare", 3, 3200 * time.Millisecond, "", "", "run-wrapper: prepare exit=3 after 3s"},
++		{"manifest-check", 0, 15 * time.Second, "fedcba9876543210fedcba", "", "run-wrapper: manifest-check exit=0 head=fedcba987654 after 15s"},
++		{"acceptance", store.AcceptanceTimedOut, 15 * time.Minute, "", "", "run-wrapper: acceptance exit=-1 (timeout) after 15m0s"},
++		{"acceptance", acceptanceSignalled, 2 * time.Second, "", "", "run-wrapper: acceptance exit=-2 (stopped by a signal) after 2s"},
++		{"acceptance", gateNotRunExit, 0, "abcdefabcdef", "not run: HEAD abcdef does not descend from the job's base",
++			"run-wrapper: acceptance exit=125 head=abcdefabcdef (not run: HEAD abcdef does not descend from the job's base) after 0s"},
++	} {
++		var b bytes.Buffer
++		gateExitMarker(&b, c.step, c.exit, c.dur, c.head, c.note)
++		if got := b.String(); got != c.want+"\n" {
++			t.Errorf("marker(%s, %d, %s, %q, %q) = %q, want %q", c.step, c.exit, c.dur, c.head, c.note, got, c.want+"\n")
++		}
++		if !strings.Contains(b.String(), "exit=") {
++			t.Errorf("marker without exit=: %q", b.String())
++		}
++	}
++}
++
++// The head assert (#134): a job without a repository has nothing to assert; one with a repository but
++// without its work dir is refused.
++func TestAssertGateHead(t *testing.T) {
++	head, why := assertGateHead(t.TempDir(), &store.Job{})
++	if head != "" || why != "" {
++		t.Fatalf("no repository: head %q why %q", head, why)
++	}
++	repo := newRepo(t)
++	base := gitT(t, repo, "rev-parse", "HEAD")
++	head, why = assertGateHead(filepath.Join(t.TempDir(), "j"), &store.Job{RepoPath: repo, BaseCommit: base})
++	if head != "" || why == "" || !strings.Contains(why, "work dir") {
++		t.Fatalf("missing work dir: head %q why %q", head, why)
++	}
++}
++
++// The gate runs at the job's own head: a repo job whose runner committed passes its acceptance
++// command, and the marker line names the head it ran at.
++func TestAcceptanceGateRunsAtTheJobsHead(t *testing.T) {
++	m := acceptanceManager(t, "")
++	repo := newRepo(t)
++	j := enqueue(t, m, "FAKE_ONLY_COMMIT", func(r *StartRequest) {
++		r.Kind = "fix"
++		r.RepoPath = repo
++		r.AcceptanceCmd = `echo GATE_OK; touch ../acc-ran`
++	})
++	j = runToEnd(t, m, j.ID)
++	if j.Status != store.StatusSucceeded || j.Error != "" {
++		t.Fatalf("got %s err=%q", j.Status, j.Error)
++	}
++	dir := m.JobDir(j.ID)
++	if _, err := os.Stat(filepath.Join(dir, "acc-ran")); err != nil {
++		t.Fatalf("the acceptance command did not run: %v", err)
++	}
++	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, "run-wrapper: acceptance exit=0 head=") {
++		t.Fatalf("no exit marker with the head in stderr.log:\n%s", log)
++	}
++}
++
++// A gate on the wrong HEAD is refused (#134): a runner that left the worktree at a commit that does
++// not descend from the job's base cannot have its acceptance command pass on code that is not the
++// job's. The command does not run, nothing is recorded and the job fails as an acceptance that did
++// not run, with the reason in the marker line.
++func TestAcceptanceWrongHeadRefused(t *testing.T) {
++	m := acceptanceManager(t, "")
++	repo := newRepo(t)
++	// An unrelated root commit (same tree, no parent): not in the job's chain.
++	tree := gitT(t, repo, "rev-parse", "HEAD^{tree}")
++	sha := gitT(t, repo, "commit-tree", tree, "-m", "unrelated")
++	j := enqueue(t, m, "FAKE_DETACH "+sha, func(r *StartRequest) {
++		r.Kind = "fix"
++		r.RepoPath = repo
++		r.AcceptanceCmd = `touch ../acc-ran`
++	})
++	j = runToEnd(t, m, j.ID)
++	if j.Status != store.StatusFailed || !strings.HasPrefix(j.Error, "acceptance did not run") {
++		t.Fatalf("got %s err=%q", j.Status, j.Error)
++	}
++	if j.AcceptanceExit != nil || j.AcceptanceStartedAt != nil {
++		t.Fatalf("a refused gate recorded a result: %+v", j)
++	}
++	dir := m.JobDir(j.ID)
++	if _, err := os.Stat(filepath.Join(dir, "acc-ran")); err == nil {
++		t.Fatal("the acceptance command ran on the wrong head")
++	}
++	log := readFile(t, filepath.Join(dir, "stderr.log"))
++	if !strings.Contains(log, "exit=125") || !strings.Contains(log, "does not descend from the job's base") {
++		t.Fatalf("the refusal marker line is missing its exit or its reason:\n%s", log)
++	}
++}
++
++// A prepare step keeps the runner's environment but never the Telegram gateway's variables (#134):
++// what the command starts (a postinstall script of an installed package) cannot read them.
++func TestPrepareEnvDropsTelegram(t *testing.T) {
++	m := newManager(t)
++	repo := newRepo(t)
++	t.Setenv("TELEGRAM_BOT_TOKEN", "12345:TESTTOKEN")
++	t.Setenv("TELEGRAM_PROXY_URL", "http://example.invalid")
++	t.Setenv("PREPARE_KEEP_VAR", "kept")
++	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo), Command: "env > ../prep-env.txt"}}, "")
++	j := runToEnd(t, m, enqueue(t, m, "do it", inRepo(repo)).ID)
++	if j.Status != store.StatusSucceeded || j.Error != "" {
++		t.Fatalf("got %s err=%q", j.Status, j.Error)
++	}
++	env := readFile(t, filepath.Join(m.JobDir(j.ID), "prep-env.txt"))
++	if strings.Contains(env, "TELEGRAM_") || strings.Contains(env, "12345:TESTTOKEN") {
++		t.Fatalf("the prepare env carried the Telegram gateway's variables:\n%s", env)
++	}
++	if !strings.Contains(env, "PREPARE_KEEP_VAR=kept") {
++		t.Fatalf("the prepare env dropped a variable it must keep:\n%s", env)
++	}
++}
++
++// On its timeout the gate's whole process group is ended (#134): a child that ignores SIGTERM (an
++// orphaned suite) does not outlive the gate.
++func TestGateTimeoutKillsProcessGroup(t *testing.T) {
++	if runtime.GOOS != "linux" {
++		t.Skip("the leftover check reads /proc (Linux)")
++	}
++	old := acceptanceKillGrace
++	acceptanceKillGrace = 300 * time.Millisecond
++	t.Cleanup(func() { acceptanceKillGrace = old })
++	jobDir := gateJobDir(t)
++	work := filepath.Join(jobDir, "work")
++	var log bytes.Buffer
++	exit := runShellGroup(context.Background(), jobDir, work, nil,
++		`sh -c 'trap "" TERM; sleep 60' & echo $! > ../child.pid; sleep 60`, 300*time.Millisecond, io.Discard, &log, nil)
++	if exit != store.AcceptanceTimedOut {
++		t.Fatalf("exit %d, want the timeout (%d)", exit, store.AcceptanceTimedOut)
++	}
++	var pid int
++	if _, err := fmt.Sscan(readFile(t, filepath.Join(jobDir, "child.pid")), &pid); err != nil || pid <= 1 {
++		t.Fatalf("child pid: %d %v", pid, err)
++	}
++	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
++	waitFor(t, "the TERM-ignoring child to be killed", 5*time.Second, func() bool { return !procAlive(pid) })
++}
++
++// readAll reads a log file the gates still write to.
++func readAll(t *testing.T, f *os.File) string {
++	t.Helper()
++	if _, err := f.Seek(0, io.SeekStart); err != nil {
++		t.Fatal(err)
++	}
++	b, err := io.ReadAll(f)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(b)
++}
+diff --git a/internal/jobs/jobs_test.go b/internal/jobs/jobs_test.go
+index b587fe4..ab6e7e9 100644
+--- a/internal/jobs/jobs_test.go
++++ b/internal/jobs/jobs_test.go
+@@ -177,6 +177,10 @@ if [[ $prompt == *FAKE_ONLY_COMMIT* ]]; then
+   git add only-commit.txt
+   git -c user.name=T -c user.email=t@example.com commit -qm "only commit"
+ fi
++if [[ $prompt =~ FAKE_DETACH\ ([0-9a-f]{7,40}) ]]; then
++  # Leaves the worktree's HEAD at a commit of the caller's choosing (#134: the wrong-head gate).
++  git checkout -q --detach "${BASH_REMATCH[1]}"
++fi
+ if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
+ if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
+ if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi
+diff --git a/internal/jobs/manifest.go b/internal/jobs/manifest.go
+index d10678b..b5be36a 100644
+--- a/internal/jobs/manifest.go
++++ b/internal/jobs/manifest.go
+@@ -198,12 +198,13 @@ func manifestStep(ctx context.Context, jobDir, token string, st *store.Store, id
+ 	out := &tailBuffer{max: ManifestTailBytes}
+ 	exit := runContainedCmd(ctx, jobDir, checkout, filepath.Join(dir, "home"), cmdline, timeout, out, log, onStart)
+ 	dur := time.Since(now)
++	// Always printed, whatever ended the gate (#134): the head is the commit the checkout holds.
++	gateExitMarker(log, "manifest-check", exit, dur, g.SHA, "")
+ 	if exit == acceptanceSignalled {
+ 		fmt.Fprintln(log, "run-wrapper: stopped by a signal during manifest-check; its process group is ended")
+ 		_ = cleanup()
+ 		return "", 128 + int(syscall.SIGTERM)
+ 	}
+-	fmt.Fprintf(log, "run-wrapper: manifest-check exit %d after %s\n", exit, dur.Round(time.Second))
+ 	// The runner has not started: every other process of the session is the script's.
+ 	if sw := sweepJob(jobDir, log, true); sw.Incomplete() {
+ 		if err := writeSweepMarker(jobDir, sw); err != nil {
+diff --git a/internal/jobs/repoprepare.go b/internal/jobs/repoprepare.go
+index fc5b34e..0a532e3 100644
+--- a/internal/jobs/repoprepare.go
++++ b/internal/jobs/repoprepare.go
+@@ -252,7 +252,9 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id
+ 	if err != nil {
+ 		return fail(r, "%v", err)
+ 	}
+-	env, err := GitEnv(jobDir, os.Environ())
++	// The runner's environment, minus the Telegram gateway's variables (#134): a postinstall script
++	// of whatever the command installs must not read the gateway's tokens.
++	env, err := GitEnv(jobDir, dropGateEnv(os.Environ()))
+ 	if err == nil {
+ 		env, err = JobEnv(jobDir, env)
+ 	}
+@@ -283,7 +285,7 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id
+ 			fmt.Fprintln(log, "run-wrapper: prepare: record process group:", err)
+ 		}
+ 	}
+-	exit := runShellGroup(ctx, dir, env, step.Command, timeout, out, log, recordGroup)
++	exit := runShellGroup(ctx, jobDir, dir, env, step.Command, timeout, out, log, recordGroup)
+ 	dur := time.Since(start)
+ 	body, dropped := keptTail(out)
+ 	if dropped > 0 {
+@@ -292,7 +294,8 @@ func prepareStep(ctx context.Context, jobDir, token string, st *store.Store, id
+ 	if err := writeAtomic(filepath.Join(abs, PrepareLog), body); err != nil {
+ 		fmt.Fprintln(log, "run-wrapper: prepare: write log:", err)
+ 	}
+-	fmt.Fprintf(log, "run-wrapper: prepare exit %d after %s\n", exit, dur.Round(time.Second))
++	// Always printed, whatever ended the gate (#134).
++	gateExitMarker(log, "prepare", exit, dur, "", "")
+ 	if exit == acceptanceSignalled {
+ 		return r, true
+ 	}
