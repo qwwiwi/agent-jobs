@@ -870,6 +870,10 @@ func wrapperSandbox(jobDir string) string {
 // wrapperOpenRouter prepares an OpenRouter job's launch from the agent's config.json (<state>/jobs/<id>
 // = jobDir) and the job's row: the failure reason, redacted, when it cannot start.
 func wrapperOpenRouter(jobDir string, j *store.Job, log io.Writer) (*openRouterJob, string) {
+	// A job queued with sources before they were refused at start (#146) does not run either.
+	if len(j.SourceFiles) > 0 || len(j.Sources) > 0 {
+		return nil, "openrouter job not started: " + errOpenRouterSources.Error()
+	}
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		return nil, "openrouter: " + err.Error()
