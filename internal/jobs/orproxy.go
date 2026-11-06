@@ -67,6 +67,10 @@ type orProxy struct {
 	genIDs    []string
 	genSeen   map[string]bool
 	providers map[string]bool
+	// rejected counts the requests OpenRouter answered with an error (not billed), withGenID the others
+	// whose response named a generation id: the rest of requests are billed without one.
+	rejected  int
+	withGenID int
 
 	ln        net.Listener
 	srv       *http.Server
@@ -199,6 +203,12 @@ func (p *orProxy) settle(hold float64, u responseUsage, how settleOutcome) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.noteGeneration(u)
+	switch {
+	case how == settleRejected:
+		p.rejected++
+	case u.GenID != "":
+		p.withGenID++
+	}
 	if p.closed {
 		return // close charged the reservation
 	}
@@ -274,6 +284,9 @@ func (p *orProxy) fill(l *ORCostLine) {
 	}
 	l.GenerationIDs = append([]string{}, p.genIDs...)
 	l.Providers = sortedKeys(p.providers)
+	// A request still unsettled, or settled without a generation id, may be billed: OpenRouter's record
+	// cannot be summed for it.
+	l.RequestsWithoutGenerationID = max(p.requests-p.rejected-p.withGenID, 0)
 }
 
 // BudgetFailure is the job's failure reason once a request was refused for the budget ("" before).
@@ -372,7 +385,7 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		// A transport error names the URL, never a header. The request may have reached OpenRouter.
-		anthropicError(w, http.StatusBadGateway, "api_error", "agent-jobs openrouter proxy: upstream: "+scrubKey(err.Error(), p.key))
+		anthropicError(w, http.StatusBadGateway, "api_error", "agent-jobs openrouter proxy: upstream: "+scrubORSecrets(err.Error(), p.key))
 		return
 	}
 	defer resp.Body.Close()
@@ -626,17 +639,15 @@ func (u *usageReader) noteProvider(provider string) {
 }
 
 // generationIDFromHeader is OpenRouter's generation id of a response: its X-Generation-Id header, else
-// its request-id header when that is a generation id (gen-...); "" when neither is a short printable
-// token. The body's id is a message id (msg_...), not a generation id.
+// its request-id header, whichever first is a generation id (gen-<id>, a short printable token); ""
+// when neither is. The body's id is a message id (msg_...), not a generation id.
 func generationIDFromHeader(h http.Header) string {
-	token := func(id string) bool {
-		return id != "" && len(id) <= maxGenIDLen && Printable(id, 0) == id && !strings.ContainsAny(id, " \t")
-	}
-	if id := strings.TrimSpace(h.Get("X-Generation-Id")); token(id) {
-		return id
-	}
-	if id := strings.TrimSpace(h.Get("Request-Id")); strings.HasPrefix(id, "gen-") && token(id) {
-		return id
+	for _, k := range []string{"X-Generation-Id", "Request-Id"} {
+		id := strings.TrimSpace(h.Get(k))
+		if len(id) > len("gen-") && strings.HasPrefix(id, "gen-") && len(id) <= maxGenIDLen && Printable(id, 0) == id &&
+			!strings.ContainsAny(id, " \t") {
+			return id
+		}
 	}
 	return ""
 }

@@ -808,11 +808,6 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		// The covers (F4) come from the job's row; an unreadable row fails closed.
 		res.ReportContractNote = wrapperContractNote(report, func() (*store.Job, error) { return st.Get(id) })
 	}
-	var billed *ORBilled
-	if openRouter != nil {
-		// OpenRouter's own record of the attempt's requests, read as late as possible (it lags a little).
-		billed = openRouter.lookup()
-	}
 	if err := record(res); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: record completion:", err)
 		return 2
@@ -821,7 +816,16 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		final := res
 		openRouter.apply(&final)
 		status, msg := Verdict(code, final, jobDir)
-		costJournal.end(openRouter, status, msg, billed)
+		// The completion and its settled cost are recorded: the daemon can collect the job from here on,
+		// and whatever ends the wrapper now, its journal line carries this verdict.
+		costJournal.settle(status, msg)
+		// Only then OpenRouter's own record of the attempt's requests (it lags a little): an optional
+		// lookup that cannot change the job's result, bounded by what is left of the job's deadline.
+		var deadline time.Time
+		if j, err := st.Get(id); err == nil && j.StartedAt != nil {
+			deadline = jobDeadline(j)
+		}
+		costJournal.end(openRouter, status, msg, openRouter.lookup(deadline))
 	}
 	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)

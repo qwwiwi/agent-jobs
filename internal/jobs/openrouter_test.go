@@ -412,6 +412,11 @@ type fakeOpenRouter struct {
 	genSeen   map[string]int
 	genAuth   []string
 	genAsked  []string
+	// genBlock, when set, holds every /v1/generation answer until it is closed (or the request ends);
+	// genHit is closed at the first such request.
+	genBlock chan struct{}
+	genHit   chan struct{}
+	hitOnce  sync.Once
 }
 
 // orGLMVersion is the versioned model name OpenRouter's generation record reports for orGLM.
@@ -431,7 +436,18 @@ func newFakeOpenRouter(t *testing.T, cost string) *fakeOpenRouter {
 			f.genAuth, f.genAsked = append(f.genAuth, r.Header.Get("Authorization")), append(f.genAsked, id)
 			f.genSeen[id]++
 			status, billed, n, early := f.genStatus, f.billed, f.gens, f.genSeen[id] <= f.genNotYet
+			block, hit := f.genBlock, f.genHit
 			f.mu.Unlock()
+			if hit != nil {
+				f.hitOnce.Do(func() { close(hit) })
+			}
+			if block != nil {
+				select {
+				case <-block:
+				case <-r.Context().Done():
+					return
+				}
+			}
 			if !strings.HasPrefix(id, "gen-") {
 				http.Error(w, `{"error":{"code":400,"message":"Invalid generation id"}}`, http.StatusBadRequest)
 				return

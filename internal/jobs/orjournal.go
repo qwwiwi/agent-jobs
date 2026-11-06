@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -66,6 +67,19 @@ type ORBilled struct {
 	CheckedAt string `json:"checked_at,omitempty"`
 }
 
+// MarkUntracked makes b incomplete when n billed requests of the attempt named no generation id:
+// OpenRouter's sum of the other generations is not the attempt's cost, and no reconcile can complete it.
+func (b *ORBilled) MarkUntracked(n int) {
+	if b == nil || n <= 0 {
+		return
+	}
+	note := fmt.Sprintf("%d billed request(s) without a generation id: OpenRouter's record of the attempt is incomplete", n)
+	if b.CostUSD == nil && b.Reason != "" {
+		note += "; " + b.Reason
+	}
+	b.CostUSD, b.Reason = nil, note
+}
+
 // ORCostLine is one line of the journal. A run line has every field; a reconcile line only Type,
 // ReconciledAt, JobID, Attempt and OpenRouter.
 type ORCostLine struct {
@@ -80,12 +94,15 @@ type ORCostLine struct {
 	Model        string `json:"model,omitempty"`    // the OpenRouter slug
 	Endpoint     string `json:"endpoint,omitempty"` // the endpoint the routing policy picked
 	// Providers are the providers the responses named (when they name one).
-	Providers  []string `json:"providers,omitempty"`
-	Requests   int      `json:"requests"`
-	TokensIn   int64    `json:"tokens_in"`
-	TokensOut  int64    `json:"tokens_out"`
-	CacheRead  int64    `json:"cache_read"`
-	CacheWrite int64    `json:"cache_write"`
+	Providers []string `json:"providers,omitempty"`
+	Requests  int      `json:"requests"`
+	// RequestsWithoutGenerationID counts the billed requests whose response named no generation id:
+	// OpenRouter's record of the others is then not the attempt's cost, and it stays incomplete.
+	RequestsWithoutGenerationID int   `json:"requests_without_generation_id,omitempty"`
+	TokensIn                    int64 `json:"tokens_in"`
+	TokensOut                   int64 `json:"tokens_out"`
+	CacheRead                   int64 `json:"cache_read"`
+	CacheWrite                  int64 `json:"cache_write"`
 	// CostUSD is the proxy's cost (OpenRouter's usage.cost of each response, else its tokens at the plan's
 	// price); nil with CostUnknown when a request ended without its final usage (it is charged at its
 	// reservation: CostReservedUSD).
@@ -144,6 +161,19 @@ type orJournal struct {
 	// caughtElsewhere: another handler of the wrapper owns SIGTERM (the acceptance step), so onKill's
 	// handler writes the line without ending the wrapper.
 	caughtElsewhere atomic.Bool
+	// settled is the attempt's verdict once its completion is recorded: whatever ends the wrapper after
+	// that (a SIGTERM during the generation lookup, an early return), the line carries it.
+	settled atomic.Pointer[orVerdict]
+}
+
+// orVerdict is a recorded attempt's status and reason.
+type orVerdict struct{ status, msg string }
+
+// settle marks the attempt's completion as recorded with status and msg. A nil journal does nothing.
+func (jr *orJournal) settle(status, msg string) {
+	if jr != nil {
+		jr.settled.Store(&orVerdict{status, msg})
+	}
 }
 
 // stopsCaughtElsewhere marks (on) or clears the span in which another handler owns SIGTERM. A nil
@@ -171,22 +201,23 @@ func newORJournal(jobDir string, j *store.Job, log io.Writer) *orJournal {
 }
 
 // end writes the attempt's line once: the proxy's figures (orj nil: the job failed before its proxy
-// started, nothing was sent), status and errText, and OpenRouter's record (billed; nil = not looked
-// up). A failure is logged, never the job's.
+// started, nothing was sent), status and errText (the settled verdict instead, once the completion is
+// recorded), and OpenRouter's record (billed; nil = not looked up). A failure is logged, never the job's.
 func (jr *orJournal) end(orj *openRouterJob, status, errText string, billed *ORBilled) {
 	if jr == nil {
 		return // not an OpenRouter job
 	}
 	jr.once.Do(func() {
+		if v := jr.settled.Load(); v != nil {
+			status, errText = v.status, v.msg
+		}
 		l := jr.base
 		l.TSEnd = time.Now().UTC().Format(time.RFC3339)
 		l.Status, l.GenerationIDs = status, []string{}
 		var secrets []string
 		if orj != nil {
 			secrets = []string{orj.proxy.key, orj.proxy.token}
-			for _, s := range secrets {
-				errText = scrubKey(errText, s)
-			}
+			errText = scrubORSecrets(errText, secrets...)
 			l.Endpoint = orj.endpoint
 			orj.proxy.fill(&l)
 		} else {
@@ -204,6 +235,7 @@ func (jr *orJournal) end(orj *openRouterJob, status, errText string, billed *ORB
 			l.OpenRouter = &ORBilled{Generations: len(l.GenerationIDs),
 				Reason: "not looked up; run `agent-jobs openrouter costs --reconcile`"}
 		}
+		l.OpenRouter.MarkUntracked(l.RequestsWithoutGenerationID)
 		if err := appendORCostLine(jr.path, l, secrets...); err != nil {
 			fmt.Fprintln(jr.log, "run-wrapper: openrouter cost journal:", RedactPrintable(err.Error(), 400))
 		}
@@ -221,9 +253,12 @@ func (jr *orJournal) onKill(orj *openRouterJob) func() {
 		for {
 			select {
 			case <-ch:
+				why := "not looked up: the attempt was killed; run `agent-jobs openrouter costs --reconcile`"
+				if jr.settled.Load() != nil {
+					why = "not looked up: the wrapper got SIGTERM during the lookup; run `agent-jobs openrouter costs --reconcile`"
+				}
 				jr.end(orj, ORStatusKilled, "the wrapper got SIGTERM: the daemon ended the attempt (cancel, stop or timeout)",
-					&ORBilled{Generations: len(orj.proxy.generationIDs()),
-						Reason: "not looked up: the attempt was killed; run `agent-jobs openrouter costs --reconcile`"})
+					&ORBilled{Generations: len(orj.proxy.generationIDs()), Reason: why})
 				if jr.caughtElsewhere.Load() {
 					continue // the acceptance step ends the wrapper; a later SIGTERM still does
 				}
@@ -294,9 +329,27 @@ func (e *orStatusError) Error() string {
 // maxORErrorMessage caps the error message kept from an OpenRouter error body.
 const maxORErrorMessage = 200
 
+// orKeyPattern is anything shaped like an OpenRouter key, also inside a word: a key echoed after other
+// text has no word boundary in front of its prefix.
+var orKeyPattern = regexp.MustCompile(`sk-or-[A-Za-z0-9_-]+`)
+
+// scrubORSecrets is msg made printable (whole, not cut) without any of secrets and without anything
+// shaped like an OpenRouter key. It runs on the whole text before any cut: a key cut short no longer
+// matches. Printable comes first, since the control characters it drops may join the parts of a key.
+func scrubORSecrets(msg string, secrets ...string) string {
+	s := Printable(msg, 0)
+	for _, sec := range secrets {
+		s = scrubKey(s, sec)
+	}
+	return orKeyPattern.ReplaceAllString(s, "[redacted]")
+}
+
+// ScrubOpenRouterKeys is scrubORSecrets for the CLI: text without the key or anything key-shaped.
+func ScrubOpenRouterKeys(text, key string) string { return scrubORSecrets(text, key) }
+
 // orErrorMessage is the message of an OpenRouter error body ({"error":{"message":...}}), "" when it has
-// none; printable and capped.
-func orErrorMessage(b []byte) string {
+// none; scrubbed of key (and anything key-shaped) whole, then printable and capped.
+func orErrorMessage(b []byte, key string) string {
 	var body struct {
 		Error struct {
 			Message string `json:"message"`
@@ -305,45 +358,48 @@ func orErrorMessage(b []byte) string {
 	if json.Unmarshal(b, &body) != nil {
 		return ""
 	}
-	return Printable(body.Error.Message, maxORErrorMessage)
+	return Printable(scrubORSecrets(body.Error.Message, key), maxORErrorMessage)
 }
 
 // orGet reads base+path with the key and decodes its {"data": ...} into out. HTTP 404 is
-// errGenerationNotFound, another status an *orStatusError; an error never carries the key.
+// errGenerationNotFound, another status an *orStatusError; an error never carries the key nor anything
+// key-shaped (scrubORSecrets on the whole text, its URL included).
 func orGet(ctx context.Context, client *http.Client, base, key, path string, out any) (retry bool, err error) {
 	u := strings.TrimRight(base, "/") + path
+	su := scrubORSecrets(u, key) // the URL as errors name it
+	scrubbed := func(err error) error { return errors.New(scrubORSecrets(err.Error(), key)) }
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return false, errors.New(scrubKey(err.Error(), key))
+		return false, scrubbed(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return true, errors.New(scrubKey(err.Error(), key))
+		return true, scrubbed(err)
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, maxGenerationBytes+1))
 	switch {
 	case err != nil:
-		return true, fmt.Errorf("read %s: %s", u, scrubKey(err.Error(), key))
+		return true, scrubbed(fmt.Errorf("read %s: %w", u, err))
 	case resp.StatusCode == http.StatusNotFound:
 		return true, errGenerationNotFound
 	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
-		return true, &orStatusError{u, resp.StatusCode, scrubKey(orErrorMessage(b), key)}
+		return true, &orStatusError{su, resp.StatusCode, orErrorMessage(b, key)}
 	case resp.StatusCode != http.StatusOK:
-		return false, &orStatusError{u, resp.StatusCode, scrubKey(orErrorMessage(b), key)}
+		return false, &orStatusError{su, resp.StatusCode, orErrorMessage(b, key)}
 	case len(b) > maxGenerationBytes:
-		return false, fmt.Errorf("get %s: more than %d bytes", u, maxGenerationBytes)
+		return false, fmt.Errorf("get %s: more than %d bytes", su, maxGenerationBytes)
 	}
 	var env struct {
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(b, &env); err != nil || len(env.Data) == 0 || string(env.Data) == "null" {
-		return false, fmt.Errorf("get %s: no data object", u)
+		return false, fmt.Errorf("get %s: no data object", su)
 	}
 	if err := json.Unmarshal(env.Data, out); err != nil {
-		return false, fmt.Errorf("get %s: %v", u, err)
+		return false, scrubbed(fmt.Errorf("get %s: %w", u, err))
 	}
 	return false, nil
 }
@@ -437,8 +493,8 @@ func LookupGenerations(ctx context.Context, client *http.Client, base, key strin
 		out.CostUSD = &sum
 		return out
 	}
-	out.Reason = RedactPrintable(fmt.Sprintf("%d of %d generation(s) not read (%v); run `agent-jobs openrouter costs --reconcile`",
-		len(ids)-out.Found, len(ids), firstErr), 400)
+	out.Reason = RedactPrintable(scrubORSecrets(fmt.Sprintf("%d of %d generation(s) not read (%v); run `agent-jobs openrouter costs --reconcile`",
+		len(ids)-out.Found, len(ids), firstErr), key), 400)
 	return out
 }
 
@@ -451,14 +507,30 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// lookup reads OpenRouter's record of the attempt's generations, bounded by generationLookupWait.
-func (o *openRouterJob) lookup() *ORBilled {
+// generationLookupWindow is how long the lookup at the end of an attempt may take at now:
+// generationLookupWait, cut to what is left of the job's deadline (a zero deadline does not bound it).
+func generationLookupWindow(deadline, now time.Time) time.Duration {
+	w := generationLookupWait
+	if !deadline.IsZero() {
+		w = min(w, deadline.Sub(now))
+	}
+	return max(w, 0)
+}
+
+// lookup reads OpenRouter's record of the attempt's generations, bounded by generationLookupWindow
+// (none left: not looked up).
+func (o *openRouterJob) lookup(deadline time.Time) *ORBilled {
 	ids := o.proxy.generationIDs()
 	if len(ids) == 0 && o.proxy.requestCount() == 0 {
 		zero := 0.0
 		return &ORBilled{CostUSD: &zero, CheckedAt: time.Now().UTC().Format(time.RFC3339)}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), generationLookupWait)
+	w := generationLookupWindow(deadline, time.Now())
+	if w <= 0 {
+		return &ORBilled{Generations: len(ids),
+			Reason: "not looked up: the job's deadline has passed; run `agent-jobs openrouter costs --reconcile`"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), w)
 	defer cancel()
 	b := LookupGenerations(ctx, o.proxy.client, o.proxy.upstream, o.proxy.key, ids, generationRetryDelay)
 	return &b
@@ -541,8 +613,14 @@ func ReadORCosts(path string) ([]ORCostRunView, int, error) {
 	}
 	for i := range runs {
 		r := &runs[i]
-		if b := reconciled[orRunKey(r.JobID, r.Attempt)]; b != nil && (r.OpenRouter == nil || r.OpenRouter.CostUSD == nil) {
+		if b := reconciled[orRunKey(r.JobID, r.Attempt)]; b != nil && (r.OpenRouter == nil || r.OpenRouter.CostUSD == nil) &&
+			r.RequestsWithoutGenerationID == 0 {
 			r.OpenRouter = b
+		}
+		if r.RequestsWithoutGenerationID > 0 && r.OpenRouter != nil && r.OpenRouter.CostUSD != nil {
+			b := *r.OpenRouter
+			b.MarkUntracked(r.RequestsWithoutGenerationID)
+			r.OpenRouter = &b
 		}
 		r.FinalStatus = r.Status
 		r.Mismatch = orMismatch(r.CostUSD, r.OpenRouter)

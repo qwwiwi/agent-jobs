@@ -76,6 +76,12 @@ func cmdOpenRouterCosts(args []string, out io.Writer) error {
 			if (r.OpenRouter != nil && r.OpenRouter.CostUSD != nil) || len(r.GenerationIDs) == 0 {
 				continue
 			}
+			if r.RequestsWithoutGenerationID > 0 {
+				// A billed request without a generation id: OpenRouter's record of the others is not the
+				// run's cost, so no lookup completes it.
+				unresolved++
+				continue
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), orCostsLookupWait)
 			b := jobs.LookupGenerations(ctx, client, cfg.BaseURL, key, r.GenerationIDs, orCostsRetry)
 			cancel()
@@ -108,7 +114,7 @@ func cmdOpenRouterCosts(args []string, out io.Writer) error {
 	}
 	keyNote := ""
 	if keyErr != nil {
-		keyNote = jobs.RedactPrintable(keyErr.Error(), 300)
+		keyNote = jobs.RedactPrintable(jobs.ScrubOpenRouterKeys(keyErr.Error(), key), 300)
 	}
 	if *asJSON {
 		v := struct {
