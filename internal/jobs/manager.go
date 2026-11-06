@@ -57,6 +57,10 @@ type Manager struct {
 	memMu        sync.Mutex
 	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
 
+	// forceHookSnapshot is set when a new context epoch could not be recorded: the next hook block is
+	// injected whatever the stale emission state says.
+	forceHookSnapshot atomic.Bool
+
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
 	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
