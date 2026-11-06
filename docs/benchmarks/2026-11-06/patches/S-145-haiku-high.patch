@@ -1,0 +1,67 @@
+diff --git a/internal/jobs/resume_skills_test.go b/internal/jobs/resume_skills_test.go
+index 29fe3e3..e49bea1 100644
+--- a/internal/jobs/resume_skills_test.go
++++ b/internal/jobs/resume_skills_test.go
+@@ -296,3 +296,48 @@ func TestResumeDeliveredSkillsSymlinkedWorkRefused(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// A job queued before manifests existed keeps delivered skills with no manifest. Admission sees the
++// manifest, so the row loses it afterwards; the launch must still refuse it, edited or not.
++func TestResumeQueuedLegacySkillsLaunchRefused(t *testing.T) {
++	for _, edited := range []bool{false, true} {
++		name := "unchanged"
++		if edited {
++			name = "edited"
++		}
++		t.Run(name, func(t *testing.T) {
++			m, j, work := deliveredResumeSkills(t, false)
++			// Launch verifies the worktree record that job creation writes.
++			if err := m.markWorktree(j, work); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), "prompt.md"), []byte("original task\n"), 0o600); err != nil {
++				t.Fatal(err)
++			}
++			if err := m.Store.Finish(j.ID, "skills-test", store.StatusFailed, 7, 0.4, 1, "turn limit", m.Now()); err != nil {
++				t.Fatal(err)
++			}
++			if _, err := m.Resume(j.ID, "continue", Limits{}); err != nil {
++				t.Fatalf("manifested job refused at admission: %v", err)
++			}
++			if got := get(t, m, j.ID); got.Status != store.StatusQueued {
++				t.Fatalf("admitted resume must be queued: status=%s", got.Status)
++			}
++			if err := m.Store.Claim(j.ID, "resume-test", m.Now()); err != nil {
++				t.Fatal(err)
++			}
++			if err := m.Store.SetSkillsDelivered(j.ID, "resume-test", j.SkillsDelivered, j.SkillsNote); err != nil {
++				t.Fatal(err)
++			}
++			if edited {
++				if err := os.WriteFile(filepath.Join(work, ".claude", "skills", "golang", "SKILL.md"), []byte("changed instructions\n"), 0o644); err != nil {
++					t.Fatal(err)
++				}
++			}
++			const reason = "no verifiable baseline"
++			if _, err := m.prepareResume(get(t, m, j.ID), "resume-test"); err == nil || !strings.Contains(err.Error(), reason) {
++				t.Fatalf("queued legacy delivery launch must refuse with %q: %v", reason, err)
++			}
++		})
++	}
++}
+diff --git a/internal/mcp/source_files_test.go b/internal/mcp/source_files_test.go
+index 5c979fa..548d128 100644
+--- a/internal/mcp/source_files_test.go
++++ b/internal/mcp/source_files_test.go
+@@ -72,6 +72,9 @@ func TestJobStartRejectsNonCanonicalSources(t *testing.T) {
+ 		{"symlink parent with dotdot", dir + "/linked/../report.md"},
+ 		{"trailing slash on regular file", origin + "/"},
+ 		{"dot component", dir + "/./report.md"},
++		{"double slash before leaf", dir + "//report.md"},
++		{"double slash in symlink parent", dir + "/linked//report.md"},
++		{"trailing double slash on regular file", origin + "//"},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {

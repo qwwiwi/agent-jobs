@@ -1,0 +1,30 @@
+A clean, minimalist, professional data table infographic in a dark theme (near-black background #0E0F12, soft gold accent #D4A84B, white and light-grey text, thin divider lines). Style of a top-tier ML benchmark report: flat, crisp sans-serif typography, aligned columns, no 3D, no icons, no emoji. All text in Russian exactly as written. Every number and word in the table must be rendered exactly as given, no extra rows.
+
+Title: «Простые задачи: каждая джоба»
+Subtitle: «Вердикт Codex gpt-6.1-sol · находки ревью H = High, M = Medium, L = Low · цена: Claude – эквивалент API, GLM – реальные деньги»
+
+Table columns: Модель | Результат | Находки | Цена | Время | Примечание
+Color the Результат cell: «решено» gold text, «частично» light grey, «таймаут, ветки нет» muted red. Each issue is a group with a gold group header row showing the issue number and its description.
+
+Group header: «#110 – Тест может оставить зависший помощник, если ожидание PID упало»
+  Opus high | решено | H 0 · M 0 · L 0 | $0.72 | 31 мин | 
+  Sonnet high | решено | H 0 · M 0 · L 1 | $0.34 | 21 мин | 
+  Sonnet medium | решено | H 0 · M 0 · L 0 | $0.24 | 12 мин | 
+  GLM 5.3 | решено | H 0 · M 0 · L 0 | $0.13 | 24 мин | 
+  Haiku high | частично | H 0 · M 2 · L 0 | $0.09 | 50 мин | 
+
+Group header: «#145 – Закрыть пробелы в тестах после ревью #124 и #125»
+  Opus high | решено | H 0 · M 0 · L 0 | $0.95 | 35 мин | 
+  Sonnet high | решено | H 0 · M 0 · L 0 | $0.40 | — | 1-я попытка без отчёта, дозапуск
+  Sonnet medium | решено | H 0 · M 0 · L 0 | $0.24 | 16 мин | 
+  GLM 5.3 | решено | H 0 · M 0 · L 0 | $0.18 | 42 мин | 
+  Haiku high | решено | H 0 · M 0 · L 0 | $0.06 | 31 мин | 
+
+Group header: «#146 – OpenRouter: файловые источники обходят запрет deny_repos»
+  Opus high | решено | H 0 · M 0 · L 0 | $1.83 | 40 мин | 
+  Sonnet high | частично | H 1 · M 0 · L 0 | $0.55 | 40 мин | 
+  Sonnet medium | частично | H 2 · M 0 · L 0 | $0.32 | 14 мин | 
+  GLM 5.3 | частично | H 2 · M 0 · L 0 | $0.53 | 56 мин | джоба упала, коммит есть
+  Haiku high | частично | H 1 · M 0 · L 0 | $0.07 | 34 мин | 
+
+Footer small grey: «Один прогон на клетку · ревью читало код, тесты не запускало · время завышено: шло 5 джоб параллельно»
