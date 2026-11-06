@@ -2383,7 +2383,7 @@ func recordInjection(agent, category, text string) error {
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
-// nothing when it has none. It reads only its input (no state; --agent is accepted and not needed) and
+// nothing when it has none. It reads only its input (--agent only attributes the added context for #170) and
 // always exits 0: an error goes to stderr and the call goes on.
 func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
@@ -2416,8 +2416,10 @@ func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
-	} else if *agent != "" {
+	} else if *agent == "" {
 		// Counted (#170) only with an agent to attribute it to (the registration passes --agent).
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker: no --agent or AGENT_JOBS_AGENT: this injection is not counted")
+	} else {
 		if err := recordInjection(*agent, jobs.InjectSkillsPicker, msg); err != nil {
 			fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
 		}

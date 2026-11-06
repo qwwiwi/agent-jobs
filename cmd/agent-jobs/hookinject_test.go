@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,6 +91,63 @@ func TestHookInjectionsCountedForMergeGateAndSkillsPicker(t *testing.T) {
 	if rep.InjectionBytes != gateBytes+pickBytes || rep.InjectionsUnrecorded != 0 {
 		t.Fatalf("total %d, want %d: %+v", rep.InjectionBytes, gateBytes+pickBytes, rep)
 	}
+}
+
+// #170 fix loop 2 (H4): the documented registration is `hook skills-picker --agent A`, and its context
+// is counted; without any agent (no flag, no AGENT_JOBS_AGENT) the hook says on stderr that the
+// injection is not counted, rather than skipping it silently.
+func TestSkillsPickerAttributionFromRegistrationAndMissing(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	t.Setenv("AGENT_JOBS_AGENT", "")
+	if m, err := jobs.Open("test"); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = m.Close()
+	}
+	pick, _ := json.Marshal(map[string]any{"session_id": "s1", "hook_event_name": "PreToolUse", "cwd": "/",
+		"tool_name": "mcp__agent-jobs__milestone_create", "tool_input": map[string]any{"title": "m", "tasks": []any{
+			map[string]any{"key": "T1", "title": "a"}}}})
+
+	var out, errb bytes.Buffer
+	if code := runHook([]string{"skills-picker"}, bytes.NewReader(pick), &out, &errb, open); code != 0 || out.Len() == 0 {
+		t.Fatalf("no agent: exit %d, out %q", code, out.String())
+	}
+	if !strings.Contains(errb.String(), "not counted") {
+		t.Fatalf("a missing attribution is not surfaced: stderr %q", errb.String())
+	}
+
+	// The registration documented in docs/GUIDE.md supplies --agent, so it is counted.
+	reg := registeredSkillsPickerArgs(t)
+	if len(reg) < 3 || reg[1] != "--agent" {
+		t.Fatalf("the documented registration passes no --agent: %v", reg)
+	}
+	reg[2] = "test" // the docs name the agent A
+	out.Reset()
+	errb.Reset()
+	if code := runHook(reg, bytes.NewReader(pick), &out, &errb, open); code != 0 || errb.Len() != 0 {
+		t.Fatalf("registered command %v: exit %d, stderr %q", reg, code, errb.String())
+	}
+	if n, b := categoryBytes(wakeReport(t, "test"), jobs.InjectSkillsPicker); n != 1 || b != len(hookContext(t, out.String())) {
+		t.Fatalf("registered skills-picker not counted: %d records, %d bytes", n, b)
+	}
+}
+
+// registeredSkillsPickerArgs reads the skills-picker command registered in docs/GUIDE.md and returns
+// its arguments after `agent-jobs hook`.
+func registeredSkillsPickerArgs(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile("../../docs/GUIDE.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const marker = `"command": "agent-jobs hook skills-picker`
+	i := strings.Index(string(b), marker)
+	if i < 0 {
+		t.Fatal("no skills-picker registration in docs/GUIDE.md")
+	}
+	rest := string(b)[i+len(`"command": "agent-jobs hook `):]
+	cmd, _, _ := strings.Cut(rest, `"`)
+	return strings.Fields(cmd)
 }
 
 // #170 fix loop 1: a hook injection that cannot be stored is not lost silently: the hook says so on

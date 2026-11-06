@@ -13,6 +13,12 @@ import (
 // milestone: at milestone_create for every task without a skills list, never on job_start of a task;
 // a plain job_start without skills is still asked. It never blocks (exit 0) and reads no state.
 func TestHookSkillsPicker(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	if m, err := jobs.Open("test"); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = m.Close()
+	}
 	noState := func(string) (*jobs.Manager, error) {
 		t.Fatal("the skills picker opened the state")
 		return nil, nil
@@ -22,7 +28,7 @@ func TestHookSkillsPicker(t *testing.T) {
 		b, _ := json.Marshal(map[string]any{"session_id": "s1", "hook_event_name": "PreToolUse", "cwd": "/",
 			"tool_name": tool, "tool_input": input})
 		var out, errb bytes.Buffer
-		code := runHook([]string{"skills-picker"}, bytes.NewReader(b), &out, &errb, noState)
+		code := runHook([]string{"skills-picker", "--agent", "test"}, bytes.NewReader(b), &out, &errb, noState)
 		if errb.Len() > 0 {
 			t.Errorf("%s: stderr %q", tool, errb.String())
 		}
