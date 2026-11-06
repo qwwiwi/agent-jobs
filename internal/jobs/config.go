@@ -67,6 +67,13 @@ type Config struct {
 	// TmuxSocket is the tmux socket name (`tmux -L <name>`) of the server that holds NotifyTmuxTarget.
 	// Empty = tmux's default socket. Needed for agents whose session runs on a named socket.
 	TmuxSocket string `json:"tmux_socket"`
+	// NotifyCoalesceSeconds holds a finished job's job-done line until this many seconds have passed
+	// since the last held job finished, so jobs finishing close together reach the session as one line
+	// (#162). 0 (the default) = one line per job, at once. Owner-waits jobs are never held.
+	NotifyCoalesceSeconds int `json:"notify_coalesce_seconds"`
+	// NotifyCoalesceMaxSeconds caps the held window from the first held job's finish, however many
+	// jobs keep finishing inside it. 0 = DefaultNotifyCoalesceMax (300 s).
+	NotifyCoalesceMaxSeconds int `json:"notify_coalesce_max_seconds"`
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
 	// GitName / GitEmail is the job's git identity, both or neither (one alone is a config error: the
@@ -272,6 +279,23 @@ func (c Config) OwnerWaitsMaxAge() time.Duration {
 		return time.Duration(c.OwnerWaitsMaxHours) * time.Hour
 	}
 	return DefaultOwnerWaitsMaxHours * time.Hour
+}
+
+// DefaultNotifyCoalesceMax is notify_coalesce_max_seconds when it is not set.
+const DefaultNotifyCoalesceMax = 300 * time.Second
+
+// NotifyCoalesce returns how long after the last held job's finish a job-done line is held for
+// others to join it (0 = never held).
+func (c Config) NotifyCoalesce() time.Duration {
+	return time.Duration(c.NotifyCoalesceSeconds) * time.Second
+}
+
+// NotifyCoalesceMax returns the longest a held job-done line waits from the first held job's finish.
+func (c Config) NotifyCoalesceMax() time.Duration {
+	if c.NotifyCoalesceMaxSeconds > 0 {
+		return time.Duration(c.NotifyCoalesceMaxSeconds) * time.Second
+	}
+	return DefaultNotifyCoalesceMax
 }
 
 // HTTPAPIConfig is the http_api section of config.json.
@@ -531,6 +555,13 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if c.LogArchiveDays != nil && *c.LogArchiveDays < 0 {
 		return c, fmt.Errorf("config.json: log_archive_days %d must be 0 (forever) or more", *c.LogArchiveDays)
+	}
+	if c.NotifyCoalesceSeconds < 0 {
+		return c, fmt.Errorf("config.json: notify_coalesce_seconds %d must be 0 (off) or positive", c.NotifyCoalesceSeconds)
+	}
+	if c.NotifyCoalesceMaxSeconds < 0 {
+		return c, fmt.Errorf("config.json: notify_coalesce_max_seconds %d must be 0 (default %d) or positive",
+			c.NotifyCoalesceMaxSeconds, int(DefaultNotifyCoalesceMax/time.Second))
 	}
 	if c.OwnerWaitsMaxHours < 0 {
 		return c, fmt.Errorf("config.json: owner_waits_max_hours %d must be 0 (default %d) or positive", c.OwnerWaitsMaxHours, DefaultOwnerWaitsMaxHours)

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,10 @@ func LimitsText(j *store.Job) string {
 	return fmt.Sprintf("%d turns · $%g · %dm", j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 }
 
+// doneLinePrefix starts a single job's job-done line; a coalesced line (coalescedLine) carries each
+// job's line without it.
+const doneLinePrefix = "[jobs:job-done] job "
+
 // DoneLine is the one line delivered to the agent's live session.
 // The model and the reasoning effort follow the duration (rows from before the effort was recorded
 // show neither). A job failed because processes survived it says so at the end of the line; a job
@@ -84,7 +89,7 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 			cost = "cost " + cost
 		}
 	}
-	line := fmt.Sprintf("[jobs:job-done] job %s %s %s · %d turns · %s · %dm",
+	line := fmt.Sprintf(doneLinePrefix+"%s %s %s · %d turns · %s · %dm",
 		Printable(j.ID, 64), RedactPrintable(j.Title, MaxTitleRunes), j.Status, j.Turns, cost, (j.DurationSec+30)/60)
 	if j.ReasoningEffort != "" {
 		line += fmt.Sprintf(" · model %s · effort %s", Printable(j.Model, 64), j.ReasoningEffort)
@@ -303,33 +308,143 @@ func (m *Manager) notifyPending() error {
 		}
 		return nil
 	}
+	for _, batch := range m.notifyBatches(jobs, m.Now()) {
+		stalled, err := m.deliverDone(t, batch)
+		if err != nil {
+			return err
+		}
+		if stalled {
+			// A stalled tmux (or lock holder) would cost every other line the same wait: the rest
+			// are retried next tick, the tick goes on.
+			break
+		}
+	}
+	return nil
+}
+
+// maxCoalescedJobs caps how many jobs one coalesced job-done line names; more due at once (a backlog
+// after a long tmux outage) go out as several lines, so a line stays a readable prompt.
+const maxCoalescedJobs = 10
+
+// notifyBatches splits the pending jobs (oldest finish first) into the lines this tick delivers, each
+// a batch of jobs. With notify_coalesce_seconds 0 every job is a line of its own. Otherwise an
+// owner-waits job is still a line of its own, delivered at once and first; the other jobs are held
+// together (dueGroups) and, once due, go out as lines of at most maxCoalescedJobs jobs. Held jobs
+// are only rows not marked notified: nothing of the window lives in memory, so a restarted daemon
+// works it out again from the finish times.
+func (m *Manager) notifyBatches(jobs []*store.Job, now time.Time) [][]*store.Job {
+	c := m.Config()
+	window := c.NotifyCoalesce()
+	var out [][]*store.Job
+	var held []*store.Job
 	for _, j := range jobs {
+		if window <= 0 || j.OwnerWaits {
+			out = append(out, []*store.Job{j})
+			continue
+		}
+		held = append(held, j)
+	}
+	for _, group := range dueGroups(held, now, window, c.NotifyCoalesceMax()) {
+		for len(group) > maxCoalescedJobs {
+			out, group = append(out, group[:maxCoalescedJobs]), group[maxCoalescedJobs:]
+		}
+		out = append(out, group)
+	}
+	return out
+}
+
+// dueGroups rebuilds the coalescing windows from the held jobs' finish times and returns the groups
+// that are due now. Walking the jobs chronologically, a job joins the open group only if it finished
+// inside that group's window (before the last member's finish plus window) and before maxWait from
+// the group's first finish; otherwise the group closed earlier and is due, however late the next job
+// arrived, so a later completion never revives an expired window. The last group is due once window
+// has passed since its last finish or maxWait since its first. A row without a finish time is due at
+// once, as a group of its own.
+func dueGroups(held []*store.Job, now time.Time, window, maxWait time.Duration) [][]*store.Job {
+	var out, timed [][]*store.Job
+	var dated []*store.Job
+	for _, j := range held {
+		if j.FinishedAt == nil {
+			out = append(out, []*store.Job{j})
+			continue
+		}
+		dated = append(dated, j)
+	}
+	sort.SliceStable(dated, func(a, b int) bool { return dated[a].FinishedAt.Before(*dated[b].FinishedAt) })
+	var cur []*store.Job
+	for _, j := range dated {
+		if len(cur) > 0 {
+			first, last := *cur[0].FinishedAt, *cur[len(cur)-1].FinishedAt
+			if !j.FinishedAt.Before(last.Add(window)) || !j.FinishedAt.Before(first.Add(maxWait)) {
+				timed = append(timed, cur)
+				cur = nil
+			}
+		}
+		cur = append(cur, j)
+	}
+	if len(cur) > 0 {
+		first, last := *cur[0].FinishedAt, *cur[len(cur)-1].FinishedAt
+		if !now.Before(last.Add(window)) || !now.Before(first.Add(maxWait)) {
+			timed = append(timed, cur)
+		}
+	}
+	return append(out, timed...)
+}
+
+// deliverDone types one job-done line for batch: a single job's own line (DoneLineFor), or one
+// coalesced line for several. Every job of the batch is marked notified only after tmux accepted the
+// line; a failed delivery keeps all of them pending for the next tick. stalled reports a tmux
+// timeout, after which the caller stops this tick's deliveries; err is a store failure.
+func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, err error) {
+	for _, j := range batch {
 		// An owner-waits job's pending record exists before its line can reach the session, so an
 		// owner_replied right after the line (before the mark below) has a record to clear.
 		if j.OwnerWaits {
 			if err := m.Store.BeginOwnerPending(j.ID, store.OwnerDelivering, m.Now()); err != nil {
-				return err
+				return false, err
 			}
 		}
 		m.checkMerge(j)
-		if err := m.sendTmuxLocked(t, m.DoneLineFor(j)); err != nil {
-			m.Log.Printf("job %s: notify failed, retry next tick: %s", j.ID, RedactText(err.Error()))
-			if errors.Is(err, errTmuxTimeout) {
-				// A stalled tmux (or lock holder) would cost every other line the same wait: the
-				// rest are retried next tick, the tick goes on.
-				break
-			}
-			continue
-		}
+	}
+	line := m.DoneLineFor(batch[0])
+	if len(batch) > 1 {
+		line = m.coalescedLine(batch)
+	}
+	if err := m.sendTmuxLocked(target, line); err != nil {
+		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
+		return errors.Is(err, errTmuxTimeout), nil
+	}
+	for _, j := range batch {
 		if afterDoneLineSent != nil {
 			afterDoneLineSent(j)
 		}
 		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
-			return err
+			return false, err
 		}
 		m.forgetMergeNote(j.ID)
 	}
-	return nil
+	return false, nil
+}
+
+// coalescedLine is the one job-done line for several jobs (#162): "[jobs:job-done] N jobs: " and then
+// each job's own line without its "[jobs:job-done] job " prefix, joined by "; ". Every job keeps the
+// fields of its own line, so nothing a single line says is lost.
+func (m *Manager) coalescedLine(batch []*store.Job) string {
+	parts := make([]string, 0, len(batch))
+	for _, j := range batch {
+		line := m.DoneLineFor(j)
+		parts = append(parts, strings.TrimPrefix(line, doneLinePrefix))
+	}
+	return fmt.Sprintf("[jobs:job-done] %d jobs: %s", len(batch), strings.Join(parts, "; "))
+}
+
+// batchIDs names the jobs of a delivery for the log: "id" or "id1, id2, …".
+func batchIDs(batch []*store.Job) string {
+	ids := make([]string, 0, len(batch))
+	for _, j := range batch {
+		ids = append(ids, j.ID)
+	}
+	return strings.Join(ids, ", ")
 }
 
 // afterDoneLineSent, when set (tests only), runs after tmux accepted a job-done line and before the

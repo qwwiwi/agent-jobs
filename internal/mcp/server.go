@@ -124,7 +124,7 @@ func addManagerTool[In, Out any](s *sdk.Server, d Deps, t *sdk.Tool, h sdk.ToolH
 const orchestratorInstructions = `agent-jobs runs long work as background "claude -p" jobs.
 job_start queues a job and returns its id at once; the daemon starts it within a minute (at most max_running run at a time: config.json key max_running, default 2).
 State an explicit model or a complexity (light|normal|hard, mapped to a model by kind); with neither job_start is rejected: there is no default and no classifier.
-When a job ends this session receives one line "[jobs:job-done] job <id> ..."; the report is not pushed into the session.
+When a job ends this session receives one line "[jobs:job-done] job <id> ..." (with notify_coalesce_seconds set, jobs ending close together arrive as one line "[jobs:job-done] N jobs: <id> ...; <id> ..."); the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
 Once you have acted on a result, record what you did with it: job_outcome(id, accepted|extended|reworked|rerun|discarded, note?); job_stats reports the outcome shares and the cost per usable result.
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
