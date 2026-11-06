@@ -345,6 +345,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `skill_list` | the skill catalog (`skill_roots`): name, status, one-line description, kinds, size, risk, last verified, uses and success rate, a `stale` flag; `query` = local content search (best 10, with a score); `kind`, `repo`, `status` filters. Orchestrator only |
 | `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate, outcome shares (`unrecorded` = finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended), `requirements_claimed` / `claimed_jobs` (0 since 2026-10-25: a `done` line counts without `ran:` or REDPROOF); `since`, `by` = kind \| model \| skill \| effort \| repo (same as `agent-jobs stats --json`) |
 | `job_outcome` | record what you did with a finished job's result: `accepted`, `extended` (used, more work on top), `reworked` (its own work had to be fixed first), `rerun` (again, on another model or brief) or `discarded`, plus an optional note (≤ 300 characters); stored on the job and its stats row, a second call overwrites. Refused for unknown ids, other agents' jobs and queued, running or stopped jobs. Orchestrator only |
+| `job_outcome_many` | `job_outcome` for many jobs in one call (#171): `items` = `[{id, outcome, note?}]`, at most 500. Each item is validated and answered on its own in `results` (`ok` with the recorded `outcome`, or `error`); an unknown id, another agent's job, a queued, running or stopped job, a bad outcome or an over-long note fails only that item and the rest are recorded. Returns `recorded` and `failed` counts. Items run in order (a repeated id ends with its last valid item), a repeat of the same call overwrites with the same result, and an outcome is only what an item names: it is never inferred from a job's status. Orchestrator only |
 
 **Memory, task and team tools** keep the reference's names and are backed by the team's shared brain (gbrain) instead of a store of their own ([deviations #2, #3](DEVIATIONS.md)). Without a `brain` block in `config.json` each of them answers «brain not configured» and nothing else changes.
 
@@ -824,6 +825,8 @@ agent-jobs resume --agent my-agent <id> --context-file update.md [--timeout-minu
 agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs finished > 48 h ago
 agent-jobs archive --agent my-agent --dry-run        # what prune would move into the log archive
 agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
+agent-jobs outcome --agent my-agent <id> accepted --note "shipped"   # job_outcome for one job
+agent-jobs outcome --agent my-agent --input outcomes.json   # job_outcome_many: a JSON array of {id, outcome, note}; "-" = stdin; exit 1 if any item failed (--json)
 agent-jobs doctor procs --agent my-agent [--kill]    # ghost processes; report only without --kill
 agent-jobs intentions --agent my-agent --status open  # the agent's own goals (--json)
 agent-jobs milestone create --agent my-agent --title "Stage 1" --input tasks.json  # milestone_create; tasks.json: [{"key":"T1","title":"..."}]
