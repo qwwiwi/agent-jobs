@@ -65,6 +65,9 @@ type Manager struct {
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
 
+	noteMu       sync.Mutex     // guards noteUnmarked
+	noteUnmarked map[int64]bool // SLO breaches a delivery carried whose noted mark failed (wakes.go)
+
 	mergeMu     sync.Mutex
 	mergeChecks map[string]mergeCheck // job ID -> its last merge-tree result (MergeNote)
 

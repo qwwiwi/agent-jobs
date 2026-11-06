@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS slo_breaches (
 	investigate_job  TEXT NOT NULL DEFAULT '',
 	investigate_skip TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS slo_breaches_unnoted ON slo_breaches(id) WHERE noted_at IS NULL;
+CREATE INDEX IF NOT EXISTS slo_breaches_uninvestigated ON slo_breaches(id) WHERE investigated_at IS NULL;
+CREATE INDEX IF NOT EXISTS slo_breaches_started ON slo_breaches(investigated_at) WHERE investigate_job <> '';
 `
 
 // AddWake records a delivery or an injection. It reports false when a record with the same kind,
@@ -239,6 +242,11 @@ func (s *Store) UninvestigatedSLOBreaches() ([]SLOBreach, error) {
 	return s.queryBreaches(`investigated_at IS NULL`)
 }
 
+// InvestigatePending is the investigate_job of a breach whose investigation is reserved and whose job
+// is not linked yet. It counts as a started investigation (a crash between the reservation and the
+// link must not allow a second job for the breach); job ids never take this form.
+const InvestigatePending = "pending"
+
 // SetSLOBreachInvestigated stores the decision about a breach: the research job started for it, or
 // (jobID "") why none was.
 func (s *Store) SetSLOBreachInvestigated(id int64, at time.Time, jobID, skip string) error {
@@ -246,24 +254,53 @@ func (s *Store) SetSLOBreachInvestigated(id int64, at time.Time, jobID, skip str
 		at.Unix(), jobID, skip, id))
 }
 
-// SLOInvestigationsSince returns the investigation jobs started at or after since, newest first
-// (their breaches' decision times).
-func (s *Store) SLOInvestigationsSince(since time.Time) ([]time.Time, error) {
-	rows, err := s.db.Query(`SELECT investigated_at FROM slo_breaches WHERE investigate_job <> '' AND investigated_at >= ?
-		ORDER BY investigated_at DESC`, since.Unix())
+// ClaimSLOInvestigation decides, in one transaction, whether the breach may start an investigation now:
+// not within cooldown of the latest started one (however long ago it was, so a cooldown over a day is
+// honoured) and fewer than dailyMax started within 24 hours. Allowed, the breach is reserved
+// (investigate_job = InvestigatePending) before any job is queued and reserved is true; the caller then
+// links the job (LinkSLOInvestigation) or releases the reservation (SetSLOBreachInvestigated with "").
+// Refused, the breach is closed with skip as its reason. A breach already decided returns reserved
+// false and an empty skip.
+func (s *Store) ClaimSLOInvestigation(id int64, now time.Time, cooldown time.Duration, dailyMax int) (reserved bool, skip string, err error) {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("slo investigations: %w", err)
+		return false, "", fmt.Errorf("slo investigation: %w", err)
 	}
-	defer rows.Close()
-	var out []time.Time
-	for rows.Next() {
-		var at int64
-		if err := rows.Scan(&at); err != nil {
-			return nil, fmt.Errorf("slo investigations: %w", err)
-		}
-		out = append(out, time.Unix(at, 0))
+	defer func() { _ = tx.Rollback() }()
+	var open int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM slo_breaches WHERE id = ? AND investigated_at IS NULL`, id).Scan(&open); err != nil {
+		return false, "", fmt.Errorf("slo investigation: %w", err)
 	}
-	return out, rows.Err()
+	if open == 0 {
+		return false, "", nil
+	}
+	var inDay int
+	var last sql.NullInt64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM slo_breaches WHERE investigate_job <> '' AND investigated_at >= ?`,
+		now.Add(-24*time.Hour).Unix()).Scan(&inDay); err != nil {
+		return false, "", fmt.Errorf("slo investigation: %w", err)
+	}
+	if err := tx.QueryRow(`SELECT MAX(investigated_at) FROM slo_breaches WHERE investigate_job <> ''`).Scan(&last); err != nil {
+		return false, "", fmt.Errorf("slo investigation: %w", err)
+	}
+	switch {
+	case inDay >= dailyMax:
+		skip = fmt.Sprintf("daily cap: %d investigations in the last 24h", inDay)
+	case last.Valid && now.Sub(time.Unix(last.Int64, 0)) < cooldown:
+		skip = fmt.Sprintf("cooldown: last investigation started %s ago", now.Sub(time.Unix(last.Int64, 0)).Round(time.Second))
+	}
+	job := InvestigatePending
+	if skip != "" {
+		job = ""
+	}
+	if _, err := tx.Exec(`UPDATE slo_breaches SET investigated_at = ?, investigate_job = ?, investigate_skip = ? WHERE id = ?`,
+		now.Unix(), job, skip, id); err != nil {
+		return false, "", fmt.Errorf("slo investigation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, "", fmt.Errorf("slo investigation: %w", err)
+	}
+	return skip == "", skip, nil
 }
 
 // OpenQuickWriter opens the existing database at path for one small write from a hook: no schema

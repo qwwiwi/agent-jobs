@@ -2287,6 +2287,8 @@ func mergeGateHook(args []string, stdin io.Reader, stdout, stderr io.Writer, ope
 		// hook JSON on stdout (mergeGateWarningJSON).
 		if err := json.NewEncoder(stdout).Encode(mergeGateWarningJSON(a.warning)); err != nil {
 			fmt.Fprintln(stderr, a.warning) // the transcript still has it; the warning never blocks
+		} else if err := recordInjection(*agent, jobs.InjectMergeGate, a.warning); err != nil {
+			fmt.Fprintln(stderr, "agent-jobs hook merge-gate:", err)
 		}
 	}
 	return 0
@@ -2347,26 +2349,37 @@ func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Ma
 	}
 	pending, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		recordInjection(*agent, jobs.InjectBriefReminder, line)
-		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
+		warn := fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err)
+		if rerr := recordInjection(*agent, jobs.InjectBriefReminder, line); rerr != nil {
+			warn += "; " + rerr.Error()
+		}
+		return line, warn, nil
 	}
 	// The hook holds a read-only store: what it injects is recorded (#170) by a short separate write
 	// that is skipped, never waited for, when the store is busy.
-	recordInjection(*agent, jobs.InjectBriefReminder, line)
-	recordInjection(*agent, jobs.InjectPendingOutcome, pending)
+	warn := ""
+	if rerr := errors.Join(recordInjection(*agent, jobs.InjectBriefReminder, line),
+		recordInjection(*agent, jobs.InjectPendingOutcome, pending)); rerr != nil {
+		warn = "agent-jobs hook brief-reminder: " + rerr.Error()
+	}
 	if line == "" {
-		return pending, "", nil
+		return pending, warn, nil
 	}
 	if pending != "" {
 		line += "\n" + pending
 	}
-	return line, "", nil
+	return line, warn, nil
 }
 
-// recordInjection counts text a hook added to the session's context. The count is best effort: a busy
-// or older store (no table yet) is not worth a hook failure or a wait.
-func recordInjection(agent, category, text string) {
-	_ = jobs.RecordHookInjection(agent, category, text, time.Now())
+// recordInjection counts text a hook added to the session's context. The write is best effort (a busy
+// or older store is not worth a hook failure or a wait), but a miss is never silent: the error comes
+// back for the hook's stderr and the injection is counted in the dropped-injections file, which
+// `stats wakes` reports as unrecorded.
+func recordInjection(agent, category, text string) error {
+	if err := jobs.RecordHookInjection(agent, category, text, time.Now()); err != nil {
+		return fmt.Errorf("%s injection of %d bytes not recorded: %v", category, len(text), jobs.Printable(err.Error(), 200))
+	}
+	return nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
@@ -2375,7 +2388,7 @@ func recordInjection(agent, category, text string) {
 func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	agentFlag(fs)
+	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err == nil && len(pos) > 0 {
 		err = errors.New("no positional arguments")
@@ -2403,6 +2416,11 @@ func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+	} else if *agent != "" {
+		// Counted (#170) only with an agent to attribute it to (the registration passes --agent).
+		if err := recordInjection(*agent, jobs.InjectSkillsPicker, msg); err != nil {
+			fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+		}
 	}
 	return 0
 }

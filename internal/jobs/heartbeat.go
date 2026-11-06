@@ -739,7 +739,7 @@ func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error
 			return errors.New("notify off: notify_tmux_target is not configured")
 		}
 		id := strconv.FormatInt(h.ID, 10)
-		return m.deliverCounted(ctx, target, WakeHeartbeat, WakeHeartbeat+":"+id, []string{id}, HeartbeatLine(h.ID))
+		return m.deliverPlain(ctx, target, WakeHeartbeat, WakeHeartbeat+":"+id, []string{id}, HeartbeatLine(h.ID))
 	}
 	var derr error
 	if target == "" {

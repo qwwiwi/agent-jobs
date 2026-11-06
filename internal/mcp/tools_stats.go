@@ -47,9 +47,9 @@ func addWakeStats(s *sdk.Server, d Deps) {
 		Name: "wake_stats",
 		Description: "What reached this orchestrator session, measured (not estimated): every line the daemon typed into it " +
 			"by category (job-done, notify-owner, schedule, check-missed, heartbeat) and every hook injection " +
-			"(hook:brief-reminder, hook:pending-outcome, hook:stop), counted per category per local day, with the batch size " +
+			"(hook:brief-reminder, hook:pending-outcome, hook:stop, hook:merge-gate, hook:skills-picker), counted per category per local day, with the batch size " +
 			"(jobs of a coalesced job-done line, alerts of a check-missed line) and the bytes per delivery or injection " +
-			"(total, p50, p95, max). A retried delivery counts once. Same output as `agent-jobs stats wakes --json`.",
+			"(total, p50, p95, max). A retried delivery counts once; injections_unrecorded counts the ones a hook could not store (the injection numbers are then a lower bound). Same output as `agent-jobs stats wakes --json`.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in WakeStatsInput) (*sdk.CallToolResult, jobs.WakeStatsReport, error) {
 		since, err := jobs.ParseSince(in.Since, d.Manager.Now())
 		if err != nil {

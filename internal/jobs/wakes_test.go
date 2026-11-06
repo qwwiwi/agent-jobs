@@ -164,7 +164,7 @@ func TestWakeRetryNotDoubleCounted(t *testing.T) {
 		t.Fatalf("records %+v, lines %q", ws, tmuxLines(t, logf))
 	}
 	// The same delivery seen again.
-	m.recordWake(WakeJobDone, WakeJobDone+":"+j.ID, []string{j.ID}, 10)
+	m.recordWake(WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs([]*store.Job{get(t, m, j.ID)}), ","), []string{j.ID}, 10)
 	if ws := wakesOf(t, m, WakeJobDone); len(ws) != 1 {
 		t.Fatalf("same delivery counted twice: %+v", ws)
 	}

@@ -46,6 +46,7 @@ func cmdStatsWakes(args []string) error {
 	}
 	if len(rep.Categories) == 0 {
 		fmt.Println("no deliveries or injections recorded")
+		printIncomplete(rep)
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
@@ -71,7 +72,17 @@ func cmdStatsWakes(args []string) error {
 		return err
 	}
 	fmt.Printf("\nwakes %d (%d bytes typed), hook injections %d bytes\n", rep.Wakes, rep.WakeBytes, rep.InjectionBytes)
+	printIncomplete(rep)
 	return nil
+}
+
+// printIncomplete says so when hook injections could not be stored: the injection numbers are then a
+// lower bound.
+func printIncomplete(rep jobs.WakeStatsReport) {
+	if rep.InjectionsUnrecorded > 0 {
+		fmt.Printf("incomplete: %d hook injections (%d bytes) could not be stored; the injection numbers are a lower bound\n",
+			rep.InjectionsUnrecorded, rep.InjectionBytesUnrecorded)
+	}
 }
 
 // cmdSLO is `slo record NAME SECONDS` and `slo show`.

@@ -411,7 +411,7 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 		line = m.coalescedLine(batch)
 	}
 	ids := batchMembers(batch)
-	if err := m.sendCounted(target, WakeJobDone, WakeJobDone+":"+strings.Join(ids, ","), ids, line); err != nil {
+	if err := m.sendCounted(target, WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs(batch), ","), ids, line); err != nil {
 		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
 		return errors.Is(err, errTmuxTimeout), nil
 	}
@@ -419,9 +419,13 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 		if afterDoneLineSent != nil {
 			afterDoneLineSent(j)
 		}
-		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
-			return false, err
-		}
+	}
+	// One transaction for the whole batch: a failure leaves every member pending, so the retry is the
+	// same line again (the same delivery identity), never a smaller batch.
+	if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now()); err != nil {
+		return false, err
+	}
+	for _, j := range batch {
 		m.forgetMergeNote(j.ID)
 	}
 	return false, nil
@@ -450,14 +454,34 @@ func batchMembers(batch []*store.Job) []string {
 	return ids
 }
 
-// batchIDs names the jobs of a delivery for the log: "id" or "id1, id2, …".
-func batchIDs(batch []*store.Job) string {
+// batchRefs are the delivery identities of a batch's jobs, sorted by job id. A job's identity is its id,
+// its attempt and when that attempt finished: a job delivered again after a resume (a new attempt, a
+// new finish) is a new delivery, not the retry of the first.
+func batchRefs(batch []*store.Job) []string {
+	sorted := slices.Clone(batch)
+	sort.SliceStable(sorted, func(a, b int) bool { return sorted[a].ID < sorted[b].ID })
+	refs := make([]string, 0, len(sorted))
+	for _, j := range sorted {
+		ref := fmt.Sprintf("%s@%d", j.ID, j.Attempt)
+		if j.FinishedAt != nil {
+			ref += fmt.Sprintf(".%d", j.FinishedAt.Unix())
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// batchIDList are the ids of a batch's jobs, in batch order.
+func batchIDList(batch []*store.Job) []string {
 	ids := make([]string, 0, len(batch))
 	for _, j := range batch {
 		ids = append(ids, j.ID)
 	}
-	return strings.Join(ids, ", ")
+	return ids
 }
+
+// batchIDs names the jobs of a delivery for the log: "id" or "id1, id2, …".
+func batchIDs(batch []*store.Job) string { return strings.Join(batchIDList(batch), ", ") }
 
 // afterDoneLineSent, when set (tests only), runs after tmux accepted a job-done line and before the
 // job is marked notified: the gap where the session may already act on the line.

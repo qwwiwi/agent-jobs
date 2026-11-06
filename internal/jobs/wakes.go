@@ -3,7 +3,9 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -33,13 +35,15 @@ const (
 	InjectBriefReminder  = "hook:brief-reminder"
 	InjectPendingOutcome = "hook:pending-outcome"
 	InjectStop           = "hook:stop"
+	InjectMergeGate      = "hook:merge-gate"
+	InjectSkillsPicker   = "hook:skills-picker"
 )
 
 // WakeCategories are the delivery categories, in the order the report lists them.
 var WakeCategories = []string{WakeJobDone, WakeNotifyOwner, WakeSchedule, WakeCheckMissed, WakeHeartbeat}
 
 // InjectionCategories are the hook injection categories.
-var InjectionCategories = []string{InjectBriefReminder, InjectPendingOutcome, InjectStop}
+var InjectionCategories = []string{InjectBriefReminder, InjectPendingOutcome, InjectStop, InjectMergeGate, InjectSkillsPicker}
 
 // recordWake stores one delivery that tmux accepted. A failure to store it is logged: counting never
 // fails or repeats a delivery. A retry of the same delivery (same ref) is not counted again.
@@ -54,19 +58,22 @@ func (m *Manager) recordWake(category, ref string, members []string, bytes int) 
 }
 
 // RecordInjection stores the bytes of text a hook added to the session's context. Empty text is not
-// an injection.
+// an injection. One that cannot be stored is kept as a line in the dropped-injections file, so the
+// report can say its numbers are a lower bound.
 func (m *Manager) RecordInjection(category, text string) {
 	if text == "" {
 		return
 	}
 	if _, err := m.Store.AddWake(store.Wake{At: m.Now(), Kind: store.WakeInjection, Category: category, Bytes: len(text), BatchSize: 1}); err != nil {
 		m.Log.Printf("record %s injection: %v", category, err)
+		noteDroppedInjection(m.StateDir, category, len(text), m.Now())
 	}
 }
 
 // RecordHookInjection is RecordInjection for a hook that holds a read-only manager: it opens the
 // agent's database for this one write with a short busy wait and gives up quietly (the error is
-// returned for the caller to show on stderr) when the database is busy or has no such table.
+// returned for the caller to show on stderr) when the database is busy or has no such table. An
+// injection it could not store is counted in the dropped-injections file (see WakeStats).
 func RecordHookInjection(agent, category, text string, now time.Time) error {
 	if text == "" {
 		return nil
@@ -75,6 +82,14 @@ func RecordHookInjection(agent, category, text string, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	err = recordQuick(dir, category, text, now)
+	if err != nil {
+		noteDroppedInjection(dir, category, len(text), now)
+	}
+	return err
+}
+
+func recordQuick(dir, category, text string, now time.Time) error {
 	st, err := store.OpenQuickWriter(filepath.Join(dir, "jobs.db"), 300*time.Millisecond)
 	if err != nil {
 		return err
@@ -84,22 +99,113 @@ func RecordHookInjection(agent, category, text string, now time.Time) error {
 	return err
 }
 
+// DroppedInjectionsFile is the file in the state dir that lists the injections that could not be
+// stored, one "<unix time> <category> <bytes>" line each.
+const DroppedInjectionsFile = "injections-dropped"
+
+// maxDroppedFileBytes bounds the dropped-injections file; past it nothing more is added.
+const maxDroppedFileBytes = 1 << 20
+
+// noteDroppedInjection appends one line to the dropped-injections file. Best effort by design: the
+// hook this serves must never fail or wait for it.
+func noteDroppedInjection(dir, category string, bytes int, at time.Time) {
+	path := filepath.Join(dir, DroppedInjectionsFile)
+	if fi, err := os.Stat(path); err == nil && fi.Size() > maxDroppedFileBytes {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "%d %s %d\n", at.Unix(), category, bytes)
+}
+
+// droppedInjections counts the lines of the dropped-injections file at or after since, and their bytes.
+func droppedInjections(dir string, since time.Time) (n, bytes int) {
+	b, err := os.ReadFile(filepath.Join(dir, DroppedInjectionsFile))
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		at, err1 := strconv.ParseInt(f[0], 10, 64)
+		sz, err2 := strconv.Atoi(f[2])
+		if err1 != nil || err2 != nil || at < since.Unix() {
+			continue
+		}
+		n++
+		bytes += sz
+	}
+	return n, bytes
+}
+
 // deliverCounted types line into the session under an already held tmux.lock, adds the pending SLO
 // breach note to it (the note rides on this delivery, never a wake of its own) and, once tmux
 // accepted it, records the delivery and marks the noted breaches. ref identifies the delivery for
 // the retry rule of recordWake; members are the things it carries.
 func (m *Manager) deliverCounted(ctx context.Context, target, category, ref string, members []string, line string) error {
-	note, ids := m.sloNote()
-	if note != "" {
-		line += " · " + note
+	return m.deliver(ctx, target, category, ref, members, line, true)
+}
+
+// deliverPlain is deliverCounted for a line whose text is a fixed contract (the heartbeat wake line is
+// matched exactly): it carries no breach note, which stays pending for the next delivery that may.
+func (m *Manager) deliverPlain(ctx context.Context, target, category, ref string, members []string, line string) error {
+	return m.deliver(ctx, target, category, ref, members, line, false)
+}
+
+func (m *Manager) deliver(ctx context.Context, target, category, ref string, members []string, line string, withNote bool) error {
+	var ids []int64
+	if withNote {
+		var note string
+		note, ids = m.sloNote()
+		if note != "" {
+			line += " · " + note
+		}
 	}
 	if err := m.sendTmux(ctx, target, line); err != nil {
 		return err
 	}
 	if err := m.Store.MarkSLOBreachesNoted(ids, m.Now()); err != nil {
+		// The line is out: the next note leaves these breaches out and the mark is retried then.
 		m.Log.Printf("slo breach note: %v", err)
+		m.holdNoted(ids)
 	}
 	m.recordWake(category, ref, members, len(Printable(line, 0)))
+	return nil
+}
+
+// holdNoted remembers breaches that a delivery carried and whose mark failed.
+func (m *Manager) holdNoted(ids []int64) {
+	m.noteMu.Lock()
+	defer m.noteMu.Unlock()
+	if m.noteUnmarked == nil {
+		m.noteUnmarked = map[int64]bool{}
+	}
+	for _, id := range ids {
+		m.noteUnmarked[id] = true
+	}
+}
+
+// retryHeldNotes tries again to mark the breaches held by holdNoted and returns the ones still held.
+func (m *Manager) retryHeldNotes() map[int64]bool {
+	m.noteMu.Lock()
+	defer m.noteMu.Unlock()
+	if len(m.noteUnmarked) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(m.noteUnmarked))
+	for id := range m.noteUnmarked {
+		ids = append(ids, id)
+	}
+	if err := m.Store.MarkSLOBreachesNoted(ids, m.Now()); err != nil {
+		m.Log.Printf("slo breach note: %v", err)
+		return maps.Clone(m.noteUnmarked)
+	}
+	m.noteUnmarked = nil
 	return nil
 }
 
@@ -142,6 +248,10 @@ type WakeStatsReport struct {
 	Wakes          int                 `json:"wakes"`
 	WakeBytes      int                 `json:"wake_bytes"`
 	InjectionBytes int                 `json:"injection_bytes"`
+	// InjectionsUnrecorded counts the hook injections that could not be stored (and their bytes): the
+	// injection numbers above are a lower bound by this much.
+	InjectionsUnrecorded     int `json:"injections_unrecorded"`
+	InjectionBytesUnrecorded int `json:"injection_bytes_unrecorded"`
 }
 
 // WakeStats summarizes the recorded deliveries and injections at or after since (zero = all).
@@ -179,6 +289,7 @@ func (m *Manager) WakeStats(since time.Time) (WakeStatsReport, error) {
 		rep.Days = append(rep.Days, *d)
 	}
 	sort.Slice(rep.Days, func(a, b int) bool { return rep.Days[a].Day < rep.Days[b].Day })
+	rep.InjectionsUnrecorded, rep.InjectionBytesUnrecorded = droppedInjections(m.StateDir, since)
 	order := append(slices.Clone(WakeCategories), InjectionCategories...)
 	keys := make([]string, 0, len(byCat))
 	for k := range byCat {
@@ -381,27 +492,50 @@ func secText(v float64) string {
 	return fmt.Sprintf("%.1fs", v)
 }
 
-// sloNote is the one line about the breaches no delivery has carried yet ("" = none) and their ids.
-// Breaches of one name are folded into one entry (their count and the worst), so a burst of slow runs
-// is one short note. A failure to read them is logged and gives no note: a delivery never waits on it.
+// secFixed is v with p decimals, trailing zeros dropped.
+func secFixed(v float64, p int) string {
+	s := strconv.FormatFloat(v, 'f', p, 64)
+	if p > 0 {
+		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	}
+	return s
+}
+
+// secPair writes a sample and its norm with the fewest decimals that tell them apart ("600.01s" against
+// "600s", never "600.0s" against "600s").
+func secPair(v, norm float64) (string, string) {
+	p := 0
+	for ; p < 6 && secFixed(v, p) == secFixed(norm, p); p++ {
+	}
+	return secFixed(v, p) + "s", secFixed(norm, p) + "s"
+}
+
+// maxNoteBytes bounds the breach note of one delivery: names that do not fit stay pending for the next
+// delivery, so a burst never grows a line without limit.
+const maxNoteBytes = 400
+
+// sloNote is the one line about the breaches no delivery has carried yet ("" = none) and the ids of
+// those it shows. Breaches of one name are folded into one entry (their count and the worst), so a
+// burst of slow runs is one short note; entries beyond maxNoteBytes are left out and stay pending. A
+// failure to read them is logged and gives no note: a delivery never waits on it.
 func (m *Manager) sloNote() (string, []int64) {
+	held := m.retryHeldNotes()
 	bs, err := m.Store.UnnotedSLOBreaches()
 	if err != nil {
 		m.Log.Printf("slo breach note: %v", err)
 		return "", nil
 	}
-	if len(bs) == 0 {
-		return "", nil
-	}
 	type entry struct {
 		worst store.SLOBreach
 		n     int
+		ids   []int64
 	}
 	var order []string
 	byName := map[string]*entry{}
-	ids := make([]int64, 0, len(bs))
 	for _, b := range bs {
-		ids = append(ids, b.ID)
+		if held[b.ID] {
+			continue // already typed once; its mark is still failing
+		}
 		e := byName[b.Name]
 		if e == nil {
 			e = &entry{worst: b}
@@ -409,25 +543,40 @@ func (m *Manager) sloNote() (string, []int64) {
 			order = append(order, b.Name)
 		}
 		e.n++
+		e.ids = append(e.ids, b.ID)
 		if b.Seconds > e.worst.Seconds {
 			e.worst = b
 		}
 	}
-	parts := make([]string, 0, len(order))
+	var parts []string
+	var ids []int64
+	size := len("slo breach: ")
 	for _, n := range order {
 		e := byName[n]
-		p := fmt.Sprintf("%s %s > %s", n, secText(e.worst.Seconds), secText(e.worst.Target))
+		secs, norm := secPair(e.worst.Seconds, e.worst.Target)
+		p := fmt.Sprintf("%s %s > %s", n, secs, norm)
 		if e.n > 1 {
-			p = fmt.Sprintf("%s %dx, worst %s > %s", n, e.n, secText(e.worst.Seconds), secText(e.worst.Target))
+			p = fmt.Sprintf("%s %dx, worst %s > %s", n, e.n, secs, norm)
 		}
+		if len(parts) > 0 && size+len(p)+2 > maxNoteBytes {
+			break
+		}
+		size += len(p) + 2
 		parts = append(parts, p)
+		ids = append(ids, e.ids...)
+	}
+	if len(parts) == 0 {
+		return "", nil
 	}
 	return "slo breach: " + strings.Join(parts, "; "), ids
 }
 
 // sloInvestigate starts one research job per breach when slo.investigate is on, within the cooldown
-// (since the last started investigation) and the daily cap. A breach that is not investigated for
-// either reason is marked with the reason and never revisited: a burst of breaches has one cause.
+// (since the last started investigation, however long ago) and the daily cap. A breach that is not
+// investigated for either reason is marked with the reason and never revisited: a burst of breaches
+// has one cause. The breach is reserved in the store before its job is queued (ClaimSLOInvestigation)
+// and linked after: a failure between the two leaves a reservation that still counts, so no breach
+// ever starts a second job.
 func (m *Manager) sloInvestigate() error {
 	cfg := m.Config().SLO.Investigate
 	if !cfg.Enabled {
@@ -437,39 +586,33 @@ func (m *Manager) sloInvestigate() error {
 	if err != nil || len(pending) == 0 {
 		return err
 	}
-	now := m.Now()
-	started, err := m.Store.SLOInvestigationsSince(now.Add(-24 * time.Hour))
-	if err != nil {
-		return err
-	}
 	for _, b := range pending {
-		skip := ""
-		switch {
-		case len(started) >= cfg.dailyMax():
-			skip = fmt.Sprintf("daily cap: %d investigations in the last 24h", len(started))
-		case len(started) > 0 && now.Sub(started[0]) < cfg.cooldown():
-			skip = fmt.Sprintf("cooldown: last investigation started %s ago", now.Sub(started[0]).Round(time.Second))
-		}
-		jobID := ""
-		if skip == "" {
-			complexity := cfg.Complexity
-			if complexity == "" {
-				complexity = "light"
-			}
-			j, err := m.Enqueue(StartRequest{
-				Title: "SLO breach: " + b.Name, Kind: "research", Brief: m.sloBrief(b), Complexity: complexity,
-			})
-			if err != nil {
-				skip = "start failed: " + RedactPrintable(err.Error(), 200)
-				m.Log.Printf("slo breach %d (%s): investigation not started: %v", b.ID, b.Name, err)
-			} else {
-				jobID = j.ID
-				started = append([]time.Time{now}, started...)
-				m.Log.Printf("slo breach %d (%s): investigation job %s queued", b.ID, b.Name, j.ID)
-			}
-		}
-		if err := m.Store.SetSLOBreachInvestigated(b.ID, now, jobID, skip); err != nil {
+		now := m.Now()
+		reserved, _, err := m.Store.ClaimSLOInvestigation(b.ID, now, cfg.cooldown(), cfg.dailyMax())
+		if err != nil {
 			return err
+		}
+		if !reserved {
+			continue
+		}
+		complexity := cfg.Complexity
+		if complexity == "" {
+			complexity = "light"
+		}
+		j, err := m.Enqueue(StartRequest{
+			Title: "SLO breach: " + b.Name, Kind: "research", Brief: m.sloBrief(b), Complexity: complexity,
+		})
+		if err != nil {
+			m.Log.Printf("slo breach %d (%s): investigation not started: %v", b.ID, b.Name, err)
+			// Released: a start that failed neither counts against the cap nor blocks the next breach.
+			if serr := m.Store.SetSLOBreachInvestigated(b.ID, now, "", "start failed: "+RedactPrintable(err.Error(), 200)); serr != nil {
+				return serr
+			}
+			continue
+		}
+		m.Log.Printf("slo breach %d (%s): investigation job %s queued", b.ID, b.Name, j.ID)
+		if err := m.Store.SetSLOBreachInvestigated(b.ID, now, j.ID, ""); err != nil {
+			return fmt.Errorf("slo breach %d: job %s queued but not linked (the reservation stays, no second job): %w", b.ID, j.ID, err)
 		}
 	}
 	return nil
@@ -485,10 +628,11 @@ func (m *Manager) sloBrief(b store.SLOBreach) string {
 			}
 		}
 	}
+	secs, norm := secPair(b.Seconds, b.Target)
 	return fmt.Sprintf("The SLO %q was breached: %s against a norm of %s (recorded %s). The last samples of this SLO, newest first: %s.\n\n"+
 		"Research task, read-only: list the most likely causes of the slowdown that can be read from the materials you are given, "+
 		"rank them by likelihood, and name one concrete check for each. Change nothing.",
-		b.Name, secText(b.Seconds), secText(b.Target), b.At.UTC().Format(time.RFC3339), strings.Join(recent, ", "))
+		b.Name, secs, norm, b.At.UTC().Format(time.RFC3339), strings.Join(recent, ", "))
 }
 
 // idStrings is ids as decimal strings, in order.
