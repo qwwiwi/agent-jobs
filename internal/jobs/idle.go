@@ -230,9 +230,11 @@ func finishIdleClosed(jobDir string, res StreamResult, log io.Writer) (int, stri
 	return code, reason
 }
 
-// isReport reports whether text follows the report contract: it starts with the report heading.
+// isReport reports whether text is a report: it has a Summary section, judged by the same section
+// parser as mergeResult and the final validation, so an introductory line or lowercase headings do
+// not disqualify it and a heading that is only quoted in a code fence does not count.
 func isReport(text string) bool {
-	return strings.HasPrefix(strings.TrimSpace(text), reportHeading)
+	return reportRank(text) > 0
 }
 
 // lastReportText returns the last top-level assistant text block in stream.jsonl that is a report

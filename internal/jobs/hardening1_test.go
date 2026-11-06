@@ -111,7 +111,7 @@ func TestCodexForgedTerminalIgnored(t *testing.T) {
 	}
 }
 
-// The tee keeps the last result line, also one without a trailing newline, and skips other lines.
+// The tee merges the result lines, also one without a trailing newline, and skips other lines.
 func TestResultTee(t *testing.T) {
 	var out bytes.Buffer
 	tee := &resultTee{w: &out}
@@ -127,7 +127,8 @@ func TestResultTee(t *testing.T) {
 	if out.String() != in {
 		t.Fatal("the tee must pass every byte through")
 	}
-	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 2 || r.CostUSD != 0.75 {
+	// The last result's state; turns are the run total (num_turns is per query: 1 + 2, #154).
+	if r := tee.res; !r.Found || r.Subtype != "error_max_turns" || !r.IsError || r.Turns != 3 || r.CostUSD != 0.75 {
 		t.Fatalf("result: %+v", r)
 	}
 }
