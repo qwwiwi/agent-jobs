@@ -223,7 +223,16 @@ if [[ $prompt == *FAKE_IDLE* ]]; then
   if [[ $prompt == *FAKE_IDLE_OK* ]]; then
     echo '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$report"'"}]}}'
     echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"Background agents are still running."}'
-    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":6,"total_cost_usd":0.75,"result":"All done."}'
+    # As claude: num_turns counts this query only, total_cost_usd is the session's running total.
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.75,"result":"All done."}'
+    pause 60
+  fi
+  if [[ $prompt == *FAKE_IDLE_INTRO* ]]; then
+    # Issue #154: an introductory, lowercase-heading report, then a plain notification result, then silence.
+    intro='Final report follows.\n\n## summary\nintro ok\n\n## not done / uncertain\nnone'
+    echo '{"type":"assistant","message":{"id":"ia1","content":[{"type":"text","text":"'"$intro"'"}]}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.5,"result":"'"$intro"'"}'
+    echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":0.55,"result":"timer fired"}'
     pause 60
   fi
   if [[ $prompt == *FAKE_IDLE_OWNREPORT* ]]; then
@@ -306,6 +315,15 @@ if [[ $prompt == *FAKE_WAIT_SUBAGENTS_ONCE* && ! -d ../attempts ]]; then
   # Ends its turn waiting for background subagents (#126): they die with the session, no report.
   echo '{"type":"assistant","message":{"id":"ws1","content":[{"type":"text","text":"Waiting for the subagent notifications."}]}}'
   echo '{"type":"result","subtype":"success","is_error":false,"num_turns":4,"total_cost_usd":0.2,"result":"Waiting for the subagent notifications."}'
+  exit 0
+fi
+if [[ $prompt == *FAKE_BG_NOTIFY* ]]; then
+  # Issue #154: the report result, then a background task's notification wakes the session for one more
+  # turn and claude prints a second result (num_turns counts that query only, total_cost_usd the session).
+  echo '{"type":"assistant","message":{"id":"bn1","content":[{"type":"text","text":"## Summary\nbg done\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":87,"total_cost_usd":3.2,"result":"## Summary\nbg done\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}'
+  echo '{"type":"assistant","message":{"id":"bn2","content":[{"type":"text","text":"This is a notification from my own wait timer."}]}}'
+  echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":3.25,"result":"This is a notification from my own wait timer."}'
   exit 0
 fi
 if [[ $prompt == *FAKE_MIDTASK* ]]; then

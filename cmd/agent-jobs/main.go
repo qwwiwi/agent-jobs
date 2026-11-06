@@ -103,6 +103,13 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
+  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
+                                           a heavy local gate (check.sh, a pg suite, a build):
+                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
+                                           /tmp/ where /run/lock is missing), HEAD of DIR
+                                           must be REV before and after, own process group killed
+                                           on timeout (exit 124) and after the command, TELEGRAM_*
+                                           dropped; the last stdout line is always exit=N
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
@@ -164,6 +171,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            cost (MISMATCH over 10%), totals per day, per model, 30 days,
                                            headed by the key's usage/limit; --reconcile fills OpenRouter's
                                            record of runs that lack it
+  ui-check   <base-url> <path>... [--out dir] [--schemes S] [--playwright path] [--timeout ms] [--dwell ms] [--limit n]
+                                           the orchestrator's browser check: runs the copy of
+                                           scripts/ui-check.mjs embedded in this binary from a private
+                                           temp dir, never a job dir copy, never Playwright from the
+                                           current directory; exit 0 pass, 1 fail, 2 not run
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -232,6 +244,9 @@ func main() {
 	case "stats":
 		err = cmdStats(args)
 	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
+		}
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
@@ -257,6 +272,8 @@ func main() {
 		err = cmdHeartbeat(args)
 	case "openrouter":
 		err = cmdOpenRouter(args, os.Stdout)
+	case "ui-check":
+		os.Exit(runUICheck(args, os.Stdout, os.Stderr))
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -1489,7 +1506,7 @@ func cmdGate(args []string) error {
 	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
-			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
+			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO | " + gateRunUsage[len("usage: agent-jobs "):])
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)
