@@ -74,6 +74,12 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
+  outcome    --agent A <id> <outcome> [--note N] [--json]
+  outcome    --agent A --input F|- [--json]
+                                           record what you did with finished jobs' results (job_outcome,
+                                           job_outcome_many): one job, or a JSON array of {id, outcome,
+                                           note?} from a file or stdin; each item is answered on its own
+                                           and the exit status is 1 when any failed
   stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
@@ -231,6 +237,8 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "outcome":
+		err = cmdOutcome(args, os.Stdin)
 	case "gate":
 		err = cmdGate(args)
 	case "intentions":

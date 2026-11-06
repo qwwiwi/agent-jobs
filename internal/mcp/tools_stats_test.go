@@ -83,3 +83,55 @@ func TestJobOutcomeTool(t *testing.T) {
 		t.Fatalf("stats: %+v", rep.Totals)
 	}
 }
+
+// job_outcome_many is orchestrator-only, answers per item (one failing item does not abort the rest),
+// overwrites idempotently and refuses other agents' jobs item by item.
+func TestJobOutcomeManyTool(t *testing.T) {
+	if !slices.Contains(OrchestratorOnly, "job_outcome_many") || slices.Contains(JobAllowed, "job_outcome_many") || Allowed(RoleJob, "job_outcome_many") {
+		t.Fatal("job_outcome_many must be orchestrator-only")
+	}
+	m := newManager(t)
+	done := time.Now()
+	insertRow(t, m, "ok1", store.StatusSucceeded, &done, 2)
+	insertRow(t, m, "ok2", store.StatusFailed, &done, 1)
+	insertRow(t, m, "run1", store.StatusRunning, nil, 0)
+	if err := m.Store.Insert(&store.Job{ID: "alien", Agent: "someone-else", Title: "t", Kind: "general", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", CreatedAt: done, FinishedAt: &done}); err != nil {
+		t.Fatal(err)
+	}
+	cs := connect(t, mustServer(t, m))
+	items := []map[string]any{
+		{"id": "ok1", "outcome": "accepted", "note": "shipped"},
+		{"id": "nope", "outcome": "accepted"},
+		{"id": "alien", "outcome": "accepted"},
+		{"id": "run1", "outcome": "accepted"},
+		{"id": "ok2", "outcome": "bogus"},
+		{"id": "ok2", "outcome": "discarded"},
+	}
+	var out JobOutcomeManyOutput
+	call(t, cs, "job_outcome_many", map[string]any{"items": items}, &out)
+	if out.Recorded != 2 || out.Failed != 4 || len(out.Results) != len(items) {
+		t.Fatalf("counts: %+v", out)
+	}
+	for i, w := range []string{"", "not found", "belongs to agent", "is running", "must be one of", ""} {
+		r := out.Results[i]
+		if r.ID != items[i]["id"] || w == "" && !r.OK || w != "" && (r.OK || !strings.Contains(r.Error, w)) {
+			t.Errorf("item %d: %+v", i, r)
+		}
+	}
+	// The same call again overwrites with the same result.
+	var again JobOutcomeManyOutput
+	call(t, cs, "job_outcome_many", map[string]any{"items": items}, &again)
+	if again.Recorded != 2 || again.Failed != 4 {
+		t.Fatalf("repeat: %+v", again)
+	}
+	for id, want := range map[string]string{"ok1": "accepted", "ok2": "discarded", "run1": "", "alien": ""} {
+		j, err := m.Store.Get(id)
+		if err != nil || j.Outcome != want {
+			t.Errorf("%s: %+v %v, want outcome %q", id, j, err, want)
+		}
+	}
+	if msg := callErr(t, cs, "job_outcome_many", map[string]any{"items": []map[string]any{}}); !strings.Contains(msg, "at least one") {
+		t.Fatalf("empty items: %q", msg)
+	}
+}
