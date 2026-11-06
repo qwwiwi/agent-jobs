@@ -817,17 +817,30 @@ func claudeSettingSources(kind string) string {
 
 func claudeBaseArgs(j *store.Job, jobDir string) []string {
 	model := j.Model
+	budget := []string{"--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD)}
 	if slug, ok := OpenRouterSlug(model); ok {
 		model = slug // the wrapper points claude at OpenRouter (openRouterEnv)
+		// No --max-budget-usd for an OpenRouter job (issue #148): claude does not know the slug's price
+		// and counts its tokens at a fallback Claude price, many times the real one, so its own cap would
+		// stop the job first. Any finite value can still bind first (the price ratio is unknown), so the
+		// flag is left out rather than raised. The budget is not lost: every request of the job goes
+		// through the job's proxy (orproxy.go), which counts it at OpenRouter's real price and refuses
+		// the request past max_budget_usd (the job fails with "openrouter budget reached"); --max-turns
+		// and the timeout still apply. Both fresh and resume argv come from here, as does the wrapper's
+		// fresh-session fallback (it reuses this argv); an openrouter job is never resumed anyway.
+		budget = nil
 	}
 	args := []string{
 		"-p", "--output-format", "stream-json", "--verbose", "--model", model,
-		"--max-turns", fmt.Sprint(j.MaxTurns), "--max-budget-usd", fmt.Sprintf("%g", j.MaxBudgetUSD),
+		"--max-turns", fmt.Sprint(j.MaxTurns),
+	}
+	args = append(args, budget...)
+	args = append(args,
 		"--permission-mode", "bypassPermissions",
 		"--settings", filepath.Join(jobDir, "settings.json"), "--setting-sources", claudeSettingSources(j.Kind),
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
-	}
+	)
 	// The flag outranks an effortLevel in the worktree's project settings; a row from before the effort
 	// was recorded has none and runs at the CLI default.
 	if j.ReasoningEffort != "" {

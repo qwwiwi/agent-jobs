@@ -182,6 +182,8 @@ claude -p --output-format stream-json --verbose --model M \
   --add-dir <jobdir> --session-id <uuid> < prompt.md
 ```
 
+`--max-budget-usd` is omitted for `runner: openrouter` jobs (#148): their OpenRouter proxy enforces `max_budget_usd`.
+
 The reference pins `--no-session-persistence`; here the session id is assigned before launch and stored on the row (`session_id`), so the job can be resumed: a resumed attempt replaces `--session-id <uuid>` with `--resume <uuid>` and reads `resume.md` instead of `prompt.md` (see Resume).
 
 cwd = `<jobdir>/work`. Checked against claude 2.1.301: all flags accepted; `--max-turns` is not listed in `claude --help` but is accepted (real smoke run finished normally with it).
