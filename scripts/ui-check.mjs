@@ -3,7 +3,7 @@
 // scroll each page to its end and fail on layout defects a first-screen check misses.
 //
 // Usage: node ui-check.mjs <base-url> <path>... [--out dir] [--schemes auto|light|dark|light,dark]
-//                          [--timeout ms] [--dwell ms] [--limit n]
+//                          [--timeout ms] [--dwell ms] [--limit n] [--playwright path] [--trusted]
 //
 // Checks per device x scheme x page: no 4xx/5xx or failed response, no horizontal page scroll
 // (documentElement.scrollWidth <= clientWidth), no visible element sticking out of the viewport outside a
@@ -16,6 +16,10 @@
 // Playwright is not a dependency of this repository: it is resolved from the caller's environment, in this
 // order: node_modules above the current directory, each NODE_PATH entry, the global npm root. Install it
 // with `npm i -D playwright && npx playwright install chromium` (or globally) where you run the check.
+// --playwright <path> names the module (a package dir or file) and is the only place looked at.
+// --trusted (set by `agent-jobs ui-check`, the orchestrator's entry point, #135) never looks in the current
+// directory, which may be a job worktree with a planted node_modules: only an absolute --playwright, absolute
+// NODE_PATH entries and the global npm root count.
 //
 // Exit: 0 every run passed, 1 a check failed, 2 the check could not run (usage error, no Playwright, no
 // browser); on 2 the last line starts with "BROWSER CHECK NOT RUN:".
@@ -43,22 +47,30 @@ export const DEVICES = Object.freeze([
 export const CLS_LIMIT = 0.1;
 
 export const USAGE = 'usage: node ui-check.mjs <base-url> <path>... [--out dir] ' +
-  '[--schemes auto|light|dark|light,dark] [--timeout ms] [--dwell ms] [--limit n]';
+  '[--schemes auto|light|dark|light,dark] [--timeout ms] [--dwell ms] [--limit n] [--playwright path] [--trusted]';
 
 export class UsageError extends Error {}
 
 /**
  * Parses the command line.
  * @param {string[]} argv arguments after the script name
- * @returns {{base: string, paths: string[], out: string, schemes: string, timeout: number, limit: number, help: boolean}}
+ * @returns {{base: string, paths: string[], out: string, schemes: string, timeout: number, limit: number,
+ *   playwright: string, trusted: boolean, help: boolean}}
  */
 export function parseArgs(argv) {
-  const opts = { base: '', paths: [], out: 'ui-check', schemes: 'auto', timeout: 30000, dwell: 3000, limit: 5, help: false };
-  const valued = new Set(['--out', '--schemes', '--timeout', '--dwell', '--limit']);
+  const opts = {
+    base: '', paths: [], out: 'ui-check', schemes: 'auto', timeout: 30000, dwell: 3000, limit: 5, playwright: undefined,
+    trusted: false, help: false,
+  };
+  const valued = new Set(['--out', '--schemes', '--timeout', '--dwell', '--limit', '--playwright']);
   for (let i = 0; i < argv.length; i++) {
     let arg = argv[i];
     if (arg === '-h' || arg === '--help') {
       opts.help = true;
+      continue;
+    }
+    if (arg === '--trusted') {
+      opts.trusted = true;
       continue;
     }
     if (arg.startsWith('--')) {
@@ -98,6 +110,8 @@ export function parseArgs(argv) {
     opts[key] = n;
   }
   if (!opts.out) throw new UsageError('--out must not be empty');
+  if (opts.playwright === '') throw new UsageError('--playwright must not be empty');
+  opts.playwright = opts.playwright || '';
   return opts;
 }
 
@@ -554,10 +568,28 @@ export function slug(p) {
 
 /**
  * Finds Playwright in the caller's environment (cwd's node_modules, NODE_PATH, the global npm root).
+ * With opts.playwright only that path is tried (it must be absolute when trusted). With opts.trusted the
+ * current directory and relative NODE_PATH entries are never looked at: a trusted caller may stand in a
+ * job worktree whose node_modules the job controls (#135).
+ * @param {string} cwd
+ * @param {Record<string, string|undefined>} env
+ * @param {() => string} globalRoot returns the global npm root ('' when unknown)
+ * @param {{trusted?: boolean, playwright?: string}} opts
  * @returns {string|null} the resolved module path
  */
-export function resolvePlaywright(cwd = process.cwd(), env = process.env, globalRoot = npmGlobalRoot) {
-  const req = createRequire(path.join(cwd, 'ui-check-resolve.js'));
+export function resolvePlaywright(cwd = process.cwd(), env = process.env, globalRoot = npmGlobalRoot, opts = {}) {
+  const trusted = Boolean(opts.trusted);
+  // Trusted: the require's base is this script's own directory; it only resolves absolute targets or
+  // explicit lookup paths, never the node_modules above the caller's directory.
+  const req = createRequire(path.join(trusted ? path.dirname(fileURLToPath(import.meta.url)) : cwd, 'ui-check-resolve.js'));
+  if (opts.playwright) {
+    if (trusted && !path.isAbsolute(opts.playwright)) return null;
+    try {
+      return req.resolve(path.resolve(cwd, opts.playwright));
+    } catch {
+      return null;
+    }
+  }
   const names = ['playwright', 'playwright-core', '@playwright/test'];
   const tryFrom = (paths) => {
     for (const n of names) {
@@ -569,8 +601,9 @@ export function resolvePlaywright(cwd = process.cwd(), env = process.env, global
     }
     return null;
   };
-  let found = tryFrom(null);
+  let found = trusted ? null : tryFrom(null);
   for (const dir of (env.NODE_PATH || '').split(path.delimiter).filter(Boolean)) {
+    if (trusted && !path.isAbsolute(dir)) continue;
     found = found || tryFrom([dir]);
   }
   if (!found) {
@@ -580,9 +613,12 @@ export function resolvePlaywright(cwd = process.cwd(), env = process.env, global
   return found;
 }
 
+// npm runs in this script's own directory, not the caller's: a project .npmrc there could move the root.
 function npmGlobalRoot() {
   try {
-    return execFileSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return execFileSync('npm', ['root', '-g'], {
+      cwd: path.dirname(fileURLToPath(import.meta.url)), encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
   } catch {
     return '';
   }
@@ -685,10 +721,13 @@ export async function main(argv, log = console.log) {
     log(USAGE);
     return 0;
   }
-  const mod = resolvePlaywright();
+  const mod = resolvePlaywright(process.cwd(), process.env, npmGlobalRoot, opts);
   if (!mod) {
-    log('BROWSER CHECK NOT RUN: Playwright not found (node_modules above the current directory, NODE_PATH, npm root -g); ' +
-      'install it: npm i -D playwright && npx playwright install chromium');
+    let where = 'node_modules above the current directory, NODE_PATH, npm root -g';
+    if (opts.playwright) where = `--playwright ${opts.playwright}${opts.trusted && !path.isAbsolute(opts.playwright) ? ', must be absolute' : ''}`;
+    else if (opts.trusted) where = 'absolute NODE_PATH entries, npm root -g; trusted mode never searches the current directory';
+    log(`BROWSER CHECK NOT RUN: Playwright not found (${where}); ` +
+      'install it: npm i -D playwright && npx playwright install chromium, or pass --playwright <path>');
     return 2;
   }
   const { chromium } = createRequire(import.meta.url)(mod);
