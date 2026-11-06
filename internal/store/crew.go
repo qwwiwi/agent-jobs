@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -133,7 +134,9 @@ const advisorSpendSQL = `SELECT COUNT(*), COALESCE(SUM(CASE WHEN ended_at IS NUL
 
 // ClaimAdvisorCall records the start of an advisor call of running job id when its caps allow one: no
 // other call of the job in flight, fewer than MaxCalls calls, and spend below MaxBudget. The call
-// gets the budget left (MaxBudget minus the spend). Counts and insert run in one IMMEDIATE
+// gets an equal share of the budget left over the calls left, (MaxBudget - spend) / (MaxCalls - calls
+// made): a call whose cost stays unknown counts at its whole budget, and a share keeps one such call
+// (a timeout, a daemon stopped mid-call) from using up the calls after it. Counts and insert run in one IMMEDIATE
 // transaction, so two concurrent calls cannot both pass a cap. A refusal wraps ErrAdvisorLimit.
 func (s *Store) ClaimAdvisorCall(id string, now time.Time, c AdvisorClaim) (*AdvisorCall, error) {
 	ctx := context.Background()
@@ -176,8 +179,15 @@ func (s *Store) ClaimAdvisorCall(id string, now time.Time, c AdvisorClaim) (*Adv
 		return nil, fmt.Errorf("%w: the advisor calls of this job spent or may still spend $%.2f of $%.2f (advisor_max_budget_usd); decide without the advisor",
 			ErrAdvisorLimit, spent, c.MaxBudget)
 	}
+	// The share, rounded to a millionth of a dollar (a clean --max-budget-usd); below a cent there is
+	// nothing left to ask with.
+	share := math.Round((c.MaxBudget-spent)/float64(c.MaxCalls-n)*1e6) / 1e6
+	if share < 0.01 {
+		return nil, fmt.Errorf("%w: the advisor calls of this job spent or may still spend $%.2f of $%.2f (advisor_max_budget_usd); decide without the advisor",
+			ErrAdvisorLimit, spent, c.MaxBudget)
+	}
 	call := &AdvisorCall{JobID: id, N: n + 1, Turn: c.Turn, UntrustedWhy: c.Why, Model: c.Model,
-		BudgetUSD: c.MaxBudget - spent, StartedAt: time.Unix(now.Unix(), 0), Outcome: AdvisorRunning}
+		BudgetUSD: share, StartedAt: time.Unix(now.Unix(), 0), Outcome: AdvisorRunning}
 	if _, err := conn.ExecContext(ctx, `INSERT INTO advisor_calls (job_id, n, turn, why, model, budget_usd, started_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, id, call.N, call.Turn, call.UntrustedWhy, call.Model, call.BudgetUSD, now.Unix()); err != nil {
 		return nil, fmt.Errorf("claim advisor call: %w", err)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -50,9 +51,8 @@ const (
 	advisorWhyRunes    = 300
 )
 
-// AdvisorEnvVar is set (to "1") in the environment of a crew job's MCP server (its mcp.json): only then
-// does the job-role server offer advisor_ask. The daemon checks the job's crew on every call anyway.
-const AdvisorEnvVar = "AGENT_JOBS_ADVISOR"
+// advisorWatchEvery is how often a running advisor call checks that its job still runs.
+var advisorWatchEvery = 10 * time.Second
 
 // AdvisorTools are the only tools of an advisor call: it reads, never writes or runs anything.
 var AdvisorTools = []string{"Read", "Glob", "Grep"}
@@ -173,7 +173,9 @@ func (m *Manager) AskAdvisor(ctx context.Context, j *store.Job, question, backgr
 		return nil, err
 	}
 	m.Log.Printf("job %s: advisor call %d (%s, budget $%.2f)", j.ID, call.N, cr.AdvisorModel, call.BudgetUSD)
-	res := m.advisorCall(ctx, j, call, advisorPrompt(question, background))
+	wctx, stopWatch := m.whileJobRuns(ctx, j.ID)
+	res := m.advisorCall(wctx, j, call, advisorPrompt(question, background))
+	stopWatch()
 	end := m.Now()
 	call.EndedAt = &end
 	call.DurationSec = int(end.Sub(call.StartedAt).Round(time.Second) / time.Second)
@@ -194,6 +196,38 @@ func (m *Manager) AskAdvisor(ctx context.Context, j *store.Job, question, backgr
 		ans.BudgetLeftUSD = math.Max(cr.AdvisorMaxBudgetUSD-store.AdvisorSpend(calls), 0)
 	}
 	return ans, nil
+}
+
+// whileJobRuns returns a context that ends with ctx or once job id is no longer running (cancelled,
+// timed out, finished, gone), checked every advisorWatchEvery: an advisor call never outlives its
+// job. stop ends the watch.
+func (m *Manager) whileJobRuns(ctx context.Context, id string) (context.Context, func()) {
+	wctx, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(advisorWatchEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-t.C:
+			}
+			j, err := m.Store.Get(id)
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				cancel(fmt.Errorf("job %s left running (gone)", id))
+				return
+			case err != nil:
+				continue // a busy database is no reason to kill the call
+			case j.Status != store.StatusRunning:
+				cancel(fmt.Errorf("job %s left running (now %s)", id, j.Status))
+				return
+			}
+		}
+	}()
+	return wctx, func() { cancel(nil); <-done }
 }
 
 // advisorPrompt is the advisor's prompt: its role, the job's question and context (data).
@@ -285,12 +319,26 @@ type advisorResult struct {
 
 // advisorClaudeResult is the part of claude's --output-format json result an advisor call reads.
 type advisorClaudeResult struct {
-	Type         string  `json:"type"`
-	Subtype      string  `json:"subtype"`
-	IsError      bool    `json:"is_error"`
-	Result       string  `json:"result"`
-	NumTurns     int     `json:"num_turns"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
+	Type     string `json:"type"`
+	Subtype  string `json:"subtype"`
+	IsError  bool   `json:"is_error"`
+	Result   string `json:"result"`
+	NumTurns int    `json:"num_turns"`
+	// TotalCostUSD is nil when claude reported none (absent or null).
+	TotalCostUSD *float64 `json:"total_cost_usd"`
+}
+
+// knownCost is the result's cost when it reported a usable one: present, finite and not negative.
+// Anything else leaves the call's cost unknown, so it keeps counting at its whole budget.
+func (r advisorClaudeResult) knownCost() (float64, bool) {
+	if r.Type != "result" || r.TotalCostUSD == nil {
+		return 0, false
+	}
+	c := *r.TotalCostUSD
+	if math.IsNaN(c) || math.IsInf(c, 0) || c < 0 {
+		return 0, false
+	}
+	return c, true
 }
 
 // advisorCall runs claude -p for call in the job's work dir, with the jobs' scrubbed environment, in
@@ -318,18 +366,15 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 	if err != nil {
 		return advisorResult{err: fmt.Errorf("containment: %w", err)}
 	}
-	argv := append([]string{m.Config().claudeBin()}, AdvisorArgs(call.Model, call.BudgetUSD, dir)...)
-	if unit != "" {
-		argv = append(scopeArgv(unit, fmt.Sprintf("agent-jobs advisor %s/%d (agent %s)", j.ID, call.N, m.Agent), m.KillGrace), argv...)
+	argv, env, err := m.advisorCommand(j, call, dir, unit)
+	if err != nil {
+		return advisorResult{err: err}
 	}
 	cctx, cancel := context.WithTimeout(ctx, AdvisorTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, argv[0], argv[1:]...)
 	cmd.Dir = work
-	// No CLAUDE.md of extra dirs: the advisor gets its prompt and what it reads itself.
-	cmd.Env = slices.DeleteFunc(m.spawnEnv(unit), func(kv string) bool {
-		return strings.HasPrefix(kv, "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=")
-	})
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
@@ -347,13 +392,17 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 		return advisorResult{err: fmt.Errorf("the advisor did not answer within %s", AdvisorTimeout)}
 	}
 	if cctx.Err() != nil {
-		return advisorResult{err: fmt.Errorf("the advisor call stopped: %w", cctx.Err())}
+		return advisorResult{err: fmt.Errorf("the advisor call stopped: %w", context.Cause(cctx))}
 	}
 	var res advisorClaudeResult
 	jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &res)
-	out := advisorResult{turns: res.NumTurns, cost: res.TotalCostUSD, costKnown: jerr == nil && res.Type == "result"}
+	parsed := jerr == nil && res.Type == "result"
+	out := advisorResult{turns: res.NumTurns}
+	if parsed {
+		out.cost, out.costKnown = res.knownCost()
+	}
 	switch {
-	case runErr != nil && !out.costKnown:
+	case runErr != nil && !parsed:
 		out.err = fmt.Errorf("advisor: %v: %s", runErr, RedactPrintable(stderr.String(), 300))
 	case jerr != nil:
 		out.err = fmt.Errorf("advisor output is not a claude JSON result: %v", jerr)
@@ -363,6 +412,39 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 		out.text = capAdvice(res.Result, maxAdvisorAnswer)
 	}
 	return out
+}
+
+// advisorCommand is the command line and environment of advisor call call of job j (dir: its
+// AdvisorDir; unit: its scope, "" for none). The environment is the job runner's (RunnerEnv: job
+// marker, job git environment and temp dir, no fork subagents, no user bus) without the brain token.
+// In a scope, systemd-run needs the user bus: it gets the bus variables and reaches claude through
+// `env -u`, so the advisor itself never holds them.
+func (m *Manager) advisorCommand(j *store.Job, call *store.AdvisorCall, dir, unit string) ([]string, []string, error) {
+	base := m.jobSpawnEnv()
+	env, err := RunnerEnv(m.JobDir(j.ID), base, store.RunnerClaude)
+	if err != nil {
+		return nil, nil, fmt.Errorf("advisor environment: %w", err)
+	}
+	// No CLAUDE.md of extra dirs: the advisor gets its prompt and what it reads itself.
+	env = slices.DeleteFunc(env, func(kv string) bool {
+		return strings.HasPrefix(kv, "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=")
+	})
+	argv := append([]string{m.Config().claudeBin()}, AdvisorArgs(call.Model, call.BudgetUSD, dir)...)
+	if unit == "" {
+		return argv, env, nil
+	}
+	drop := []string{"env"}
+	for _, k := range slices.Sorted(maps.Keys(userBusVars)) {
+		drop = append(drop, "-u", k)
+	}
+	argv = append(append(scopeArgv(unit, fmt.Sprintf("agent-jobs advisor %s/%d (agent %s)", j.ID, call.N, m.Agent), m.KillGrace),
+		drop...), argv...)
+	for _, kv := range base {
+		if k, _, _ := strings.Cut(kv, "="); userBusVars[k] {
+			env = append(env, kv)
+		}
+	}
+	return argv, userBusEnv(env), nil
 }
 
 // capAdvice cuts s to at most n bytes on a rune boundary, marking the cut.
@@ -411,11 +493,63 @@ type CrewView struct {
 	AdvisorMaxBudgetUSD float64             `json:"advisor_max_budget_usd,omitempty"`
 	PairedWith          string              `json:"paired_with,omitempty"`
 	Calls               []store.AdvisorCall `json:"advisor_calls"`
-	// CostMainUSD is the main loop's cost (the job's own cost_usd); CostAdvisorUSD the advisor calls'
-	// (a call without a known cost counts at its budget), CostTotalUSD both.
-	CostMainUSD    float64 `json:"cost_main_usd"`
-	CostAdvisorUSD float64 `json:"cost_advisor_usd"`
-	CostTotalUSD   float64 `json:"cost_total_usd"`
+	// CostMainUSD is the main loop's cost (the job's own cost_usd, over all its attempts); CostAdvisorUSD
+	// the advisor calls' (a call without a known cost counts at its budget), CostTotalUSD both.
+	// CostMainUnknown: an attempt of the main loop ended without a reported cost, so CostMainUSD (and
+	// the total) count only the attempts that reported one.
+	CostMainUSD     float64 `json:"cost_main_usd"`
+	CostAdvisorUSD  float64 `json:"cost_advisor_usd"`
+	CostTotalUSD    float64 `json:"cost_total_usd"`
+	CostMainUnknown bool    `json:"cost_main_unknown,omitempty"`
+}
+
+// mainTotals is what the main loop of job j used over all its attempts (the attempts table plus the
+// row, as RecordStats counts them); unknown when any attempt ended without a reported cost.
+type mainTotals struct {
+	cost        float64
+	unknown     bool
+	turns       int
+	durationSec int
+}
+
+func (m *Manager) mainTotals(j *store.Job) (mainTotals, error) {
+	t := mainTotals{cost: j.CostUSD, unknown: j.CostIsUnknown(), turns: j.Turns, durationSec: j.DurationSec}
+	earlier, err := m.Store.Attempts(j.ID)
+	if err != nil {
+		return t, err
+	}
+	for _, a := range earlier {
+		t.cost += a.CostUSD
+		t.unknown = t.unknown || a.CostUnknown
+		t.turns += a.Turns
+		t.durationSec += a.DurationSec
+	}
+	return t, nil
+}
+
+// crewAdvisorCost is what the advisor calls of the crew jobs among rows spent or may still spend: the
+// job_stats totals sum only the jobs' own cost.
+func (m *Manager) crewAdvisorCost(ctx context.Context, rows []*store.JobStats) (float64, error) {
+	in := map[string]bool{}
+	for _, r := range rows {
+		in[r.ID] = true
+	}
+	crew, err := m.Store.CrewJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var v float64
+	for _, j := range crew {
+		if !in[j.ID] || !j.Crew.HasAdvisor() {
+			continue
+		}
+		calls, err := m.Store.AdvisorCalls(j.ID, m.Now(), advisorStaleAfter)
+		if err != nil {
+			return 0, err
+		}
+		v += store.AdvisorSpend(calls)
+	}
+	return v, nil
 }
 
 // Crew returns the crew view of job j, nil for a plain job.
@@ -430,9 +564,13 @@ func (m *Manager) Crew(j *store.Job) (*CrewView, error) {
 	for i := range calls {
 		calls[i].UntrustedWhy = RedactPrintable(calls[i].UntrustedWhy, advisorWhyRunes)
 	}
+	mt, err := m.mainTotals(j)
+	if err != nil {
+		return nil, err
+	}
 	v := &CrewView{AdvisorModel: j.Crew.AdvisorModel, AdvisorMaxCalls: j.Crew.AdvisorMaxCalls,
 		AdvisorMaxBudgetUSD: j.Crew.AdvisorMaxBudgetUSD, PairedWith: j.Crew.PairedWith, Calls: calls,
-		CostMainUSD: j.CostUSD, CostAdvisorUSD: store.AdvisorSpend(calls)}
+		CostMainUSD: mt.cost, CostMainUnknown: mt.unknown, CostAdvisorUSD: store.AdvisorSpend(calls)}
 	v.CostTotalUSD = v.CostMainUSD + v.CostAdvisorUSD
 	return v, nil
 }
@@ -444,8 +582,12 @@ func CrewTimeline(v *CrewView) []string {
 	}
 	var out []string
 	if v.AdvisorModel != "" {
-		out = append(out, fmt.Sprintf("crew: advisor %s, %d/%d calls, cost main $%.4f + advisor $%.4f = $%.4f",
-			v.AdvisorModel, len(v.Calls), v.AdvisorMaxCalls, v.CostMainUSD, v.CostAdvisorUSD, v.CostTotalUSD))
+		line := fmt.Sprintf("crew: advisor %s, %d/%d calls, cost main $%.4f + advisor $%.4f = $%.4f",
+			v.AdvisorModel, len(v.Calls), v.AdvisorMaxCalls, v.CostMainUSD, v.CostAdvisorUSD, v.CostTotalUSD)
+		if v.CostMainUnknown {
+			line += " (main cost partly unknown: an attempt reported none)"
+		}
+		out = append(out, line)
 	}
 	if v.PairedWith != "" {
 		out = append(out, "paired with: "+v.PairedWith)
@@ -463,7 +605,8 @@ func CrewTimeline(v *CrewView) []string {
 }
 
 // CrewPairSide is one job of a crew pair in job_stats: what it cost (main / advisor), how it ended and
-// what the orchestrator made of it (job_outcome, the review verdict).
+// what the orchestrator made of it (job_outcome, the review verdict). Turns, DurationSec and CostMainUSD
+// count every attempt of a resumed job; CostUnknown: an attempt ended without a reported cost.
 type CrewPairSide struct {
 	ID             string  `json:"id"`
 	Model          string  `json:"model"`
@@ -528,8 +671,12 @@ func (m *Manager) crewPairs(ctx context.Context, rows []*store.JobStats) ([]Crew
 
 // pairSide is job j as one side of a crew pair.
 func (m *Manager) pairSide(j *store.Job) (CrewPairSide, error) {
+	mt, err := m.mainTotals(j)
+	if err != nil {
+		return CrewPairSide{}, err
+	}
 	s := CrewPairSide{ID: j.ID, Model: j.Model, Status: j.Status, Outcome: j.Outcome, OutcomeNote: RedactPrintable(j.OutcomeNote, 300),
-		Turns: j.Turns, DurationSec: j.DurationSec, CostMainUSD: j.CostUSD, CostUnknown: j.CostIsUnknown()}
+		Turns: mt.turns, DurationSec: mt.durationSec, CostMainUSD: mt.cost, CostUnknown: mt.unknown}
 	if j.Crew.HasAdvisor() {
 		calls, err := m.Store.AdvisorCalls(j.ID, m.Now(), advisorStaleAfter)
 		if err != nil {

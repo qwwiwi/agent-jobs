@@ -542,6 +542,10 @@ func writeFileReplace(path string, data []byte) error {
 	})
 }
 
+// JobMCPAdvisorFlag is the job-role server's switch (in a crew job's mcp.json args) that makes it offer
+// advisor_ask. The daemon checks the job's crew on every call anyway.
+const JobMCPAdvisorFlag = "--advisor"
+
 // JobMCPServerName is the job-role server's key in the job's mcp.json.
 const JobMCPServerName = "agent-jobs"
 
@@ -563,14 +567,17 @@ func (m *Manager) JobMCPConfig(kind string) map[string]any {
 }
 
 // jobMCPConfigFor is JobMCPConfig for job j: a crew job with an advisor (issue #169) gets
-// AdvisorEnvVar in its server's environment, so its server offers advisor_ask.
+// JobMCPAdvisorFlag on its server's command line, so its server offers advisor_ask (an argument, not
+// an env block: the server sees it whatever the client does with env).
 func (m *Manager) jobMCPConfigFor(j *store.Job) map[string]any {
 	c := m.JobMCPConfig(j.Kind)
 	if !j.Crew.HasAdvisor() || j.Runner == store.RunnerCodex {
 		return c
 	}
 	if srv, ok := c["mcpServers"].(map[string]any)[JobMCPServerName].(map[string]any); ok {
-		srv["env"] = map[string]string{AdvisorEnvVar: "1"}
+		if args, ok := srv["args"].([]string); ok {
+			srv["args"] = append(slices.Clone(args), JobMCPAdvisorFlag)
+		}
 	}
 	return c
 }

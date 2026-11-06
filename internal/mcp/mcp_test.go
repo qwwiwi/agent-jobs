@@ -477,7 +477,7 @@ func TestBinaryRefusesInsideJob(t *testing.T) {
 	}
 	// Serve refuses the orchestrator role under the marker even when called directly.
 	t.Setenv(jobs.JobEnvVar, "x")
-	if err := Serve(context.Background(), RoleOrchestrator, "test"); err == nil || !strings.Contains(err.Error(), "refused") {
+	if err := Serve(context.Background(), RoleOrchestrator, "test", false); err == nil || !strings.Contains(err.Error(), "refused") {
 		t.Fatalf("Serve orchestrator under the marker: %v", err)
 	}
 }

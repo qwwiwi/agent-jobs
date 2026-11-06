@@ -16,7 +16,8 @@ import (
 )
 
 // fakeAdvisorClaude stands in for the advisor's claude -p: it records each call (argv one per line,
-// stdin, cwd) in $FAKE_ADV_DIR as argv.N / stdin.N / cwd.N and prints $FAKE_ADV_DIR/out.
+// stdin, cwd, environment) in $FAKE_ADV_DIR as argv.N / stdin.N / cwd.N / env.N and prints
+// $FAKE_ADV_DIR/out; with $FAKE_ADV_DIR/slow present it sleeps first (a call that runs long).
 const fakeAdvisorClaude = `#!/bin/bash
 d="$FAKE_ADV_DIR"
 echo call >> "$d/calls"
@@ -24,6 +25,8 @@ n=$(wc -l < "$d/calls" | tr -d ' ')
 printf '%s\n' "$@" > "$d/argv.$n"
 cat > "$d/stdin.$n"
 pwd > "$d/cwd.$n"
+env > "$d/env.$n"
+if [ -f "$d/slow" ]; then sleep 30; fi
 cat "$d/out" 2>/dev/null
 `
 
@@ -163,27 +166,28 @@ func TestAdvisorCapEnforcedAndRecorded(t *testing.T) {
 	}
 }
 
-// advisor_max_budget_usd holds: each call gets only the budget left (--max-budget-usd), and once the
-// spend reaches the cap the next call is refused even with calls left.
+// advisor_max_budget_usd holds: each call gets its share of the budget left (--max-budget-usd), and
+// once the spend reaches the cap (claude's budget is checked between turns, so a call can overshoot
+// its share) the next call is refused even with calls left.
 func TestAdvisorBudgetEnforced(t *testing.T) {
 	e := newAdvisor(t)
-	j := e.crewJob(t, 5, 1.0)
+	j := e.crewJob(t, 4, 1.0)
 	e.answer(t, "success", "ok", 1, 0.6)
 	ctx := context.Background()
 	if _, err := e.m.AskAdvisor(ctx, j, "q1", ""); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := argAfter(e.argv(t, 1), "--max-budget-usd"); b != "1" {
-		t.Fatalf("first call budget %q, want 1", b)
+	if b, _ := argAfter(e.argv(t, 1), "--max-budget-usd"); b != "0.25" {
+		t.Fatalf("first call budget %q, want 0.25 (1.0 over 4 calls)", b)
 	}
 	a, err := e.m.AskAdvisor(ctx, j, "q2", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := argAfter(e.argv(t, 2), "--max-budget-usd"); b != "0.4" {
-		t.Fatalf("second call budget %q, want 0.4 (the budget left)", b)
+	if b, _ := argAfter(e.argv(t, 2), "--max-budget-usd"); b != "0.133333" {
+		t.Fatalf("second call budget %q, want 0.133333 (0.4 left over 3 calls)", b)
 	}
-	if a.BudgetLeftUSD != 0 || a.CallsLeft != 3 {
+	if a.BudgetLeftUSD != 0 || a.CallsLeft != 2 {
 		t.Fatalf("left after the second call: %+v", a)
 	}
 	_, err = e.m.AskAdvisor(ctx, j, "q3", "")
@@ -196,10 +200,10 @@ func TestAdvisorBudgetEnforced(t *testing.T) {
 }
 
 // A failed call is recorded as failed and still counts: a call without a reported cost counts at its
-// whole budget, so failures cannot spend past the cap.
+// whole budget (its share of the crew's), so failures cannot spend past the cap.
 func TestAdvisorFailureRecordedAtBudget(t *testing.T) {
 	e := newAdvisor(t)
-	j := e.crewJob(t, 3, 1.0)
+	j := e.crewJob(t, 2, 1.0)
 	if err := os.WriteFile(filepath.Join(e.dir, "out"), []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -210,11 +214,16 @@ func TestAdvisorFailureRecordedAtBudget(t *testing.T) {
 	if err != nil || len(calls) != 1 || calls[0].Outcome != store.AdvisorFailed || !calls[0].CostUnknown || calls[0].Error == "" {
 		t.Fatalf("recorded: %+v %v", calls, err)
 	}
-	if s := store.AdvisorSpend(calls); s != 1.0 {
-		t.Fatalf("spend %v, want the whole budget 1.0", s)
+	if s := store.AdvisorSpend(calls); s != 0.5 {
+		t.Fatalf("spend %v, want the call's whole budget 0.5", s)
 	}
-	if _, err := e.m.AskAdvisor(context.Background(), j, "q", ""); !errors.Is(err, store.ErrAdvisorLimit) {
-		t.Fatalf("after a failure at the whole budget: %v", err)
+	// The second call gets what is left, 0.5, never more: 0.5 + 0.5 stays within the cap.
+	e.answer(t, "success", "ok", 1, 0.2)
+	if _, err := e.m.AskAdvisor(context.Background(), j, "q", ""); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if b, _ := argAfter(e.argv(t, 2), "--max-budget-usd"); b != "0.5" {
+		t.Fatalf("second call budget %q, want 0.5", b)
 	}
 }
 
@@ -223,28 +232,33 @@ func TestAdvisorOneAtATimeAndStale(t *testing.T) {
 	e := newAdvisor(t)
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	e.m.Now = func() time.Time { return now }
-	j := e.crewJob(t, 3, 2.0)
-	claim := store.AdvisorClaim{Model: "opus", MaxCalls: 3, MaxBudget: 2.0, StaleAfter: advisorStaleAfter}
-	if _, err := e.m.Store.ClaimAdvisorCall(j.ID, now, claim); err != nil {
-		t.Fatal(err)
+	j := e.crewJob(t, 2, 2.0)
+	claim := store.AdvisorClaim{Model: "opus", MaxCalls: 2, MaxBudget: 2.0, StaleAfter: advisorStaleAfter}
+	if c, err := e.m.Store.ClaimAdvisorCall(j.ID, now, claim); err != nil || c.BudgetUSD != 1.0 {
+		t.Fatalf("claim: %+v %v (want its share 1.0)", c, err)
 	}
 	if _, err := e.m.AskAdvisor(context.Background(), j, "q", ""); !errors.Is(err, store.ErrAdvisorLimit) ||
 		!strings.Contains(err.Error(), "one at a time") {
 		t.Fatalf("concurrent call: %v", err)
 	}
+	if e.calls() != 0 {
+		t.Fatal("the model ran beside a call in flight")
+	}
 	// Once stale the row no longer blocks as in flight, but it counts at its whole budget (the cost of a
-	// call the daemon lost is unknown): here that is the crew's whole 2.0, so the cap refuses.
+	// call the daemon lost is unknown): its share 1.0, so the next call gets the other 1.0, no more.
 	now = now.Add(advisorStaleAfter + time.Second)
-	_, err := e.m.AskAdvisor(context.Background(), j, "q", "")
-	if !errors.Is(err, store.ErrAdvisorLimit) || !strings.Contains(err.Error(), "advisor_max_budget_usd") {
+	if _, err := e.m.AskAdvisor(context.Background(), j, "q", ""); err != nil {
 		t.Fatalf("after the stale row: %v", err)
 	}
+	if b, _ := argAfter(e.argv(t, 1), "--max-budget-usd"); b != "1" {
+		t.Fatalf("call after the stale row: budget %q, want 1", b)
+	}
 	calls, err := e.m.Store.AdvisorCalls(j.ID, now, advisorStaleAfter)
-	if err != nil || len(calls) != 1 || calls[0].Outcome != store.AdvisorStale || !calls[0].CostUnknown {
+	if err != nil || len(calls) != 2 || calls[0].Outcome != store.AdvisorStale || !calls[0].CostUnknown {
 		t.Fatalf("stale row: %+v %v", calls, err)
 	}
-	if e.calls() != 0 {
-		t.Fatal("the model ran")
+	if s := store.AdvisorSpend(calls); s != 1.1 {
+		t.Fatalf("spend %v, want 1.0 (stale, at its budget) + 0.1", s)
 	}
 }
 
@@ -340,7 +354,7 @@ func TestAdvisorRefusedInCodexJobs(t *testing.T) {
 	if e.calls() != 0 {
 		t.Fatal("the advisor ran for a codex job")
 	}
-	if c := e.m.jobMCPConfigFor(j); strings.Contains(mustJSON(t, c), AdvisorEnvVar) {
+	if c := e.m.jobMCPConfigFor(j); strings.Contains(mustJSON(t, c), JobMCPAdvisorFlag) {
 		t.Fatalf("codex job mcp config offers the advisor: %v", c)
 	}
 }
@@ -358,11 +372,11 @@ func mustJSON(t *testing.T, v any) string {
 func TestAdvisorOnlyForCrewJobs(t *testing.T) {
 	e := newAdvisor(t)
 	crew := e.crewJob(t, 2, 1)
-	if !strings.Contains(mustJSON(t, e.m.jobMCPConfigFor(crew)), `"env":{"`+AdvisorEnvVar+`":"1"}`) {
+	if !strings.Contains(mustJSON(t, e.m.jobMCPConfigFor(crew)), `"`+JobMCPAdvisorFlag+`"`) {
 		t.Fatalf("crew job mcp config: %v", e.m.jobMCPConfigFor(crew))
 	}
 	plain := running(t, e.m)
-	if strings.Contains(mustJSON(t, e.m.jobMCPConfigFor(plain)), AdvisorEnvVar) {
+	if strings.Contains(mustJSON(t, e.m.jobMCPConfigFor(plain)), JobMCPAdvisorFlag) {
 		t.Fatal("plain job mcp config offers the advisor")
 	}
 	if _, err := e.m.AskAdvisor(context.Background(), plain, "q", ""); !errors.Is(err, errNoAdvisor) {

@@ -87,3 +87,38 @@ func TestCrewRoundTripAndConcurrentClaims(t *testing.T) {
 		t.Fatalf("calls: %+v %v", calls, err)
 	}
 }
+
+// Each claim gets an equal share of the budget left over the calls left, rounded to a millionth of a
+// dollar; with less than a cent left the claim is refused as over budget.
+func TestClaimAdvisorCallShare(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Unix(1_800_000_000, 0)
+	j := &Job{ID: "261106-120000-shar", Agent: "a", Title: "t", Kind: "general", Brief: "b", Status: StatusQueued,
+		Model: "sonnet", CreatedAt: now, Crew: &Crew{AdvisorModel: "opus", AdvisorMaxCalls: 3, AdvisorMaxBudgetUSD: 1}}
+	if err := s.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Claim(j.ID, "tok", now); err != nil {
+		t.Fatal(err)
+	}
+	claim := AdvisorClaim{Model: "opus", MaxCalls: 3, MaxBudget: 1, StaleAfter: time.Hour}
+	end := now.Add(time.Minute)
+	for i, c := range []struct{ share, cost float64 }{{0.333333, 0.5}, {0.25, 0.495}} {
+		call, err := s.ClaimAdvisorCall(j.ID, now, claim)
+		if err != nil || call.BudgetUSD != c.share {
+			t.Fatalf("claim %d: %+v %v, want budget %v", i+1, call, err, c.share)
+		}
+		call.EndedAt, call.Outcome, call.CostUSD = &end, AdvisorAnswered, c.cost
+		if err := s.FinishAdvisorCall(call); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 0.005 left for the last call: less than a cent.
+	if _, err := s.ClaimAdvisorCall(j.ID, end, claim); !errors.Is(err, ErrAdvisorLimit) {
+		t.Fatalf("claim with less than a cent left: %v", err)
+	}
+}

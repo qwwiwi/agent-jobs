@@ -168,7 +168,8 @@ const usage = `usage: agent-jobs <command> [flags]
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
-                                           job: only the tools allow-listed for jobs)
+                                           job: only the tools allow-listed for jobs; --advisor:
+                                           a crew job's server, also advisor_ask)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
              [--subagent-db DB --subagent-job ID] [--protect PATH]...
                                            (PreToolUse hook, JSON on stdin)
@@ -299,6 +300,7 @@ func mcpRole(args []string) string {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	_ = fs.String("agent", "", "")
+	_ = fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "")
 	role := fs.String("role", "", "")
 	if _, err := parse(fs, args); err != nil {
 		return ""
@@ -1376,6 +1378,7 @@ func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	roleFlag := fs.String("role", "", "orchestrator|job")
+	advisor := fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "job role: offer advisor_ask (a crew job)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -1386,10 +1389,13 @@ func cmdMCP(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *advisor && role != mcp.RoleJob {
+		return errors.New("--advisor is for the job role only")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// stdout carries the protocol: nothing else may print there.
-	return mcp.Serve(ctx, role, *agent)
+	return mcp.Serve(ctx, role, *agent, *advisor)
 }
 
 func cmdPrune(args []string) error {
@@ -1935,6 +1941,9 @@ func cmdStats(args []string) error {
 		for _, s := range rep.Skills {
 			fmt.Printf("  %-22s %d  %d  %.0f%%  %d  %d\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100, s.Delivered, s.DeliveredUnused)
 		}
+	}
+	if rep.AdvisorCostUSD > 0 {
+		fmt.Printf("\nadvisor calls of crew jobs: $%.2f (not in the totals above)\n", rep.AdvisorCostUSD)
 	}
 	if len(rep.CrewPairs) > 0 {
 		fmt.Println("\ncrew pairs (job vs paired: model, advisor calls, status, outcome, cost main + advisor):")

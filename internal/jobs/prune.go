@@ -165,6 +165,7 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 	pj := m.pruneJob(j, dryRun)
 	if pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
+		m.pruneAdvisorDir(j, dryRun, &pj)
 	}
 	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
 		m.recordDirSize(id) // the disk status reads the recorded size
@@ -258,6 +259,32 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})
 	}
 	return pj
+}
+
+// pruneAdvisorDir removes a pruned crew job's advisor dir (<state>/advisor/<id>: the settings and MCP
+// config of its advisor calls, written by the daemon; the calls themselves stay in the database).
+func (m *Manager) pruneAdvisorDir(j *store.Job, dryRun bool, pj *PruneJob) {
+	p := m.AdvisorDir(j.ID)
+	fi, err := os.Lstat(p)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && pj.Error == "" {
+			pj.Error = err.Error()
+		}
+		return
+	}
+	size := int64(0)
+	if fi.IsDir() {
+		size = treeSize(p)
+	}
+	if !dryRun {
+		if err := removeTree(p); err != nil {
+			if pj.Error == "" {
+				pj.Error = err.Error()
+			}
+			return
+		}
+	}
+	pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "advisor settings of the crew job"})
 }
 
 // pruneSessions removes the claude session files of a pruned job (DEVIATIONS #15): the transcript
