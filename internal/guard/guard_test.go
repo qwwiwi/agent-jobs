@@ -1604,3 +1604,43 @@ func TestCgroupPathSplitCoprocAndSedScripts(t *testing.T) {
 		})
 	}
 }
+
+// Fix loop of #155 (round 2): an unquoted expansion (bare) may split into several words, so it is
+// neither an option's data value nor a local-prefix operand; filter data and find predicate values
+// that merely contain the words rsync/parallel are data, not code or runners.
+func TestRsyncBareExpansionAndDataValues(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// Unquoted expansion as an option value can inject operands.
+		{"bare exclude value injects remote", `P='cache ./src/ host:/dst/'; setsid rsync --exclude $P`, true},
+		{"bare exclude=value injects remote", `P='cache ./src/ host:/dst/'; rsync --exclude=$P`, true},
+		{"bare -f value injects remote", `P='x ./src/ host:/dst/'; rsync -f $P`, true},
+		{"bare local prefix injects remote", `D='x host:/dst/'; rsync ./src/ ./out/$D`, true},
+		{"bare local prefix setsid", `D='x host:/dst/'; setsid rsync ./src/ ./out/$D`, true},
+		// Filter data that contains the word rsync is not code.
+		{"exclude value with rsync word", `rsync --exclude 'rsync cache' ./src/ ./dst/`, false},
+		{"exclude= value with rsync word", `rsync --exclude='rsync cache' ./src/ ./dst/`, false},
+		{"filter value with rsync word", `rsync -f'- rsync (x)' ./src/ ./dst/`, false},
+		{"python -c rsync still refused", `python3 -c 'import os; os.system("rsync ./src/ host:/dst/")'`, true},
+		{"watch rsync still refused", `watch 'rsync ./src/ host:/dst/'`, true},
+		// A find predicate value named like a runner is data.
+		{"find -name parallel -exec rsync local", `find . -name parallel -exec rsync ./src/ ./dst/ \;`, false},
+		{"find -name parallel -exec rsync remote", `find . -name parallel -exec rsync ./src/ host:/dst/ \;`, true},
+		{"find -exec parallel rsync still refused", `find . -exec parallel rsync ./src/ \;`, true},
+		{"find -exec xargs rsync still refused", `find . -exec xargs rsync ./src/ \;`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

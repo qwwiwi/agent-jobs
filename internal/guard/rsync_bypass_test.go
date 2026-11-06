@@ -51,21 +51,26 @@ func TestRsyncRemoteDynamism(t *testing.T) {
 		name string
 		args []string
 		dyn  []bool
+		bare []bool // an expansion outside double quotes: may split into several words
 		want bool
 	}{
-		{"dynamic bare operand", []string{"./src/", "$D"}, []bool{false, true}, true},
-		{"dynamic with local prefix", []string{"./src/", "./out/$D"}, []bool{false, true}, false},
-		{"dynamic with host prefix", []string{"./src/", "h:$D"}, []bool{false, true}, true},
-		{"dynamic filter value is data", []string{"--exclude", "$P", "./src/", "./dst/"}, []bool{false, true, false, false}, false},
-		{"dynamic attached filter is data", []string{"--exclude=$P", "./src/", "./dst/"}, []bool{true, false, false}, false},
-		{"dynamic option name", []string{"--$O", "a", "b"}, []bool{true, false, false}, true},
-		{"dynamic short cluster", []string{"-a$O", "a", "b"}, []bool{true, false, false}, true},
-		{"static dyn shorter than args", []string{"./a", "./b"}, nil, false},
+		{"dynamic bare operand", []string{"./src/", "$D"}, []bool{false, true}, nil, true},
+		{"dynamic with local prefix", []string{"./src/", "./out/$D"}, []bool{false, true}, nil, false},
+		{"dynamic with host prefix", []string{"./src/", "h:$D"}, []bool{false, true}, nil, true},
+		{"dynamic filter value is data", []string{"--exclude", "$P", "./src/", "./dst/"}, []bool{false, true, false, false}, nil, false},
+		{"dynamic attached filter is data", []string{"--exclude=$P", "./src/", "./dst/"}, []bool{true, false, false}, nil, false},
+		{"dynamic option name", []string{"--$O", "a", "b"}, []bool{true, false, false}, nil, true},
+		{"dynamic short cluster", []string{"-a$O", "a", "b"}, []bool{true, false, false}, nil, true},
+		{"static dyn shorter than args", []string{"./a", "./b"}, nil, nil, false},
+		// An unquoted expansion may split: neither an option's data value nor a local prefix.
+		{"bare filter value splits", []string{"--exclude", "$P", "./src/", "./dst/"}, []bool{false, true, false, false}, []bool{false, true, false, false}, true},
+		{"bare attached filter splits", []string{"--exclude=$P", "./src/", "./dst/"}, []bool{true, false, false}, []bool{true, false, false}, true},
+		{"bare local prefix splits", []string{"./src/", "./out/$D"}, []bool{false, true}, []bool{false, true}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := rsyncRemote(c.args, c.dyn); got != c.want {
-				t.Fatalf("rsyncRemote(%q, %v) = %v, want %v", c.args, c.dyn, got, c.want)
+			if got := rsyncRemote(c.args, c.dyn, c.bare); got != c.want {
+				t.Fatalf("rsyncRemote(%q, %v, %v) = %v, want %v", c.args, c.dyn, c.bare, got, c.want)
 			}
 		})
 	}
