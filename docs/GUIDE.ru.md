@@ -165,17 +165,18 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 ## Контракт отчёта
 
-Финальное сообщение джобы — её отчёт, он сохраняется как `report.md`. Ровно четыре раздела в таком порядке, затем раздел Progress:
+Финальное сообщение джобы — её отчёт, он сохраняется как `report.md`. Ровно четыре раздела в таком порядке, затем раздел Forks и раздел Progress:
 
 ```
 ## Summary
 ## Findings / Changes
 ## Evidence
 ## Not done / uncertain
+## Forks
 ## Progress
 ```
 
-«Not done / uncertain» обязателен и читается первым: он заставляет джобу назвать то, чего она не сделала. Progress перечисляет шаги джобы, по строке с временем на шаг (`- HH:MM UTC …`); `job_result` отдаёт оба раздела как `not_done` и `progress`, а `agent-jobs result` печатает их раньше остального. Отчёт без Progress — не ошибка. Джоба, закончившаяся без отчёта, помечается `failed`.
+«Not done / uncertain» обязателен и читается первым: он заставляет джобу назвать то, чего она не сделала. Forks (#168) перечисляет проектные решения, которые джоба приняла там, где задача оставляла выбор: не больше 5 строк `выбор / отвергнутая альтернатива / причина`, либо `none`; молчаливый выбор «наугад» в диффе не виден, а ревью-джоба сверяет каждый Fork с кодом. Progress перечисляет шаги джобы, по строке с временем на шаг (`- HH:MM UTC …`); `job_result` отдаёт разделы как `not_done`, `forks` и `progress`, а `agent-jobs result` печатает Not done и Progress раньше остального. Отчёт без Forks или без Progress — не ошибка. Джоба, закончившаяся без отчёта, помечается `failed`.
 
 **Отчёты вне контракта.** Джоба claude, чей итоговый отчёт без раздела `## Summary`, больше не `succeeded` (#126): она падает с `report has no Summary section: likely stopped mid-task` (скорее всего, модель закончила ход посреди задачи: её последнее сообщение говорит, что она сделала бы дальше, или что ждёт сабагентов, которые умирают вместе с её сессией) при любом `report_contract` и один раз продолжается автоматически, как после лимита ходов; `job_resume` её принимает. Gate-джобы (slicing, judge, briefing), у которых результат — сохранённый блок, остаются под правилом warn / fail ниже. Успешная джоба с отчётом без `## Not done / uncertain` сохраняет статус, но её ошибка говорит `report has no Not done / uncertain section`. Пометка есть в строке job-done и в `job_status` и `job_result` (`error`), а `job_stats` / `agent-jobs stats` считают такие джобы как `report_off_contract` (столбец `OFF-CONTRACT`) по группам. С `report_contract: fail` в config.json такая джоба вместо этого падает с этой пометкой (по умолчанию `warn`). Джоба, запущенная с `covers` (волна F), должна ещё иметь блок `### Requirements` в Findings / Changes хотя бы со строкой для одного покрытого ID; без блока пометка — `report has no ### Requirements block in Findings / Changes (the job has covers)`, с блоком без такой строки (пустым, текстом, таблицей) — `report's ### Requirements block has no line for any covered ID …`, и обе считаются так же. Если run-wrapper не может прочитать строку джобы, он не знает её covers и закрывается отказом: `job row unreadable: the report's ### Requirements block was not checked (fail closed)`. Джобы без `covers` оцениваются как раньше.
 

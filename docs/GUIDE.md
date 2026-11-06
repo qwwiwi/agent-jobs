@@ -209,17 +209,18 @@ Put your real path in, load it with `sudo apparmor_parser -r /etc/apparmor.d/cod
 
 ## Report contract
 
-A job's final message is its report, saved as `report.md`. Exactly four sections, in this order, then a Progress section:
+A job's final message is its report, saved as `report.md`. Exactly four sections, in this order, then a Forks section and a Progress section:
 
 ```
 ## Summary
 ## Findings / Changes
 ## Evidence
 ## Not done / uncertain
+## Forks
 ## Progress
 ```
 
-«Not done / uncertain» is mandatory and is read first: it makes the job name what it did not do. Progress lists the job's steps, one timestamped line each (`- HH:MM UTC …`); `job_result` returns both sections as `not_done` and `progress`, and `agent-jobs result` prints them before the rest. A report without Progress is not an error. A job that ends without a report is marked `failed`.
+«Not done / uncertain» is mandatory and is read first: it makes the job name what it did not do. Forks (#168) lists the design choices the job made where its task left room, at most 5 lines `choice / rejected alternative / reason`, or `none`; a reviewer cannot see a silent coin flip in the diff, and a review job checks every Fork against the code. Progress lists the job's steps, one timestamped line each (`- HH:MM UTC …`); `job_result` returns the sections as `not_done`, `forks` and `progress`, and `agent-jobs result` prints Not done and Progress before the rest. A report without Forks or without Progress is not an error. A job that ends without a report is marked `failed`.
 
 **Off-contract reports.** A claude job whose final report has no `## Summary` section is no longer `succeeded` (#126): it fails with `report has no Summary section: likely stopped mid-task` (the model most likely ended its turn mid-task: its last message says what it would do next, or that it is waiting for subagents, which die with its session), whatever `report_contract` says, and is continued once like a turn-limit stop (see Auto-continue); `job_resume` accepts it. Gate jobs (slicing, judge, briefing), whose stored result is what they deliver, keep the warn / fail rule below. A succeeded job whose report has no `## Not done / uncertain` keeps its status, but its error says `report has no Not done / uncertain section`. The note is on the job-done line and in `job_status` and `job_result` (`error`), and `job_stats` / `agent-jobs stats` count these jobs as `report_off_contract` (column `OFF-CONTRACT`) per group. With `report_contract: fail` in config.json such a job fails with the note instead (default `warn`). A job started with `covers` (Wave F) must also have a `### Requirements` block in Findings / Changes with a line for at least one covered ID (a covered ID without a line is listed under `requirements.missing_lines`); without the block the note is `report has no ### Requirements block in Findings / Changes (the job has covers)`, with a block that has no such line (empty, prose, a table) `report's ### Requirements block has no line for any covered ID …`, both counted the same way. When the run-wrapper cannot read the job's row it cannot know the covers and fails closed: `job row unreadable: the report's ### Requirements block was not checked (fail closed)`. Jobs without `covers` are judged as before.
 
