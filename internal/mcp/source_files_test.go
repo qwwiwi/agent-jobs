@@ -72,6 +72,9 @@ func TestJobStartRejectsNonCanonicalSources(t *testing.T) {
 		{"symlink parent with dotdot", dir + "/linked/../report.md"},
 		{"trailing slash on regular file", origin + "/"},
 		{"dot component", dir + "/./report.md"},
+		{"double slash before file", dir + "//report.md"},
+		{"double slash inside directory", filepath.Dir(dir) + "//" + filepath.Base(dir) + "/report.md"},
+		{"leading double slash", "/" + origin},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := callErr(t, cs, "job_start", startArgs(func(a map[string]any) {
