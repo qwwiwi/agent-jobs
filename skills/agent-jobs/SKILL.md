@@ -127,7 +127,7 @@ The existing `hook bind` (SessionStart) and `hook brief-reminder` (UserPromptSub
 3. Only then does anything leave the machine: push, PR, deploy, a message to a person. That is this session's job, never the job's.
 4. A failed job without a report: look at `stderr.log`, then `stream.jsonl` in the job's directory.
 
-UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `node <job dir>/tools/ui-check.mjs <base-url> <path>...` yourself (exit 0 pass, 1 fail, 2 not run), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
+UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens): never accept or deploy it when its report lacks browser evidence (every changed page at 360x740, 390x844, 768x1024, 1366x768, 1920x1080, light and dark when the site has both, full page length, pass/fail per device x page, screenshots) or says `BROWSER CHECK NOT RUN`. Run `agent-jobs ui-check <base-url> <path>... [--playwright <abs path>]` yourself (the ui-check.mjs embedded in the binary; exit 0 pass, 1 fail, 2 not run), never a script from a job dir or worktree (the job can rewrite it), or start a job that can run a browser, before merge or deploy; after a frontend deploy run it again on the live URL.
 
 After a review, and when a job failed:
 
