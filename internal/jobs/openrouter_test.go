@@ -991,3 +991,41 @@ func TestCodexNativeJobUnderOpenRouterPolicy(t *testing.T) {
 		}
 	}
 }
+
+// Issue #148: claude prices an OpenRouter slug by its fallback Claude table, so its own
+// --max-budget-usd would stop the job long before the proxy's real-price budget. An openrouter job's
+// argv (fresh and resumed) carries no --max-budget-usd; any other claude job keeps its budget unchanged.
+func TestOpenRouterClaudeArgsNoOwnBudget(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/nonexistent/openrouter.env")
+	or := enqueue(t, m, "x", func(r *StartRequest) { r.Model = "openrouter:" + orGLM; r.MaxBudgetUSD = 0.5 })
+	or.SessionID = "s"
+	for name, args := range map[string][]string{"fresh": ClaudeArgs(or, "/jd"), "resume": ResumeClaudeArgs(or, "/jd")} {
+		if slices.Contains(args, "--max-budget-usd") {
+			t.Errorf("%s: openrouter job caps claude's own budget: %q", name, args)
+		}
+		if i := slices.Index(args, "--max-turns"); i < 0 || i+1 >= len(args) || args[i+1] != fmt.Sprint(or.MaxTurns) {
+			t.Errorf("%s: --max-turns must stay: %q", name, args)
+		}
+	}
+	c := enqueue(t, m, "x", func(r *StartRequest) { r.Model = "sonnet"; r.MaxBudgetUSD = 0.5 })
+	c.SessionID = "s"
+	for name, args := range map[string][]string{"fresh": ClaudeArgs(c, "/jd"), "resume": ResumeClaudeArgs(c, "/jd")} {
+		i := slices.Index(args, "--max-budget-usd")
+		if i < 0 || i+1 >= len(args) || args[i+1] != "0.5" {
+			t.Errorf("%s: claude job lacks --max-budget-usd 0.5: %q", name, args)
+		}
+	}
+}
+
+// Issue #148: whatever claude's own result says (an error, its own budget subtype, a non-zero exit),
+// a job whose request the proxy refused for the budget fails with the proxy's reason.
+func TestOpenRouterBudgetFailureOutranksClaudeExit(t *testing.T) {
+	res := StreamResult{Found: true, IsError: true, Subtype: "error_max_budget_usd",
+		ProviderFailure: "openrouter budget reached: the job's requests cost $0.5000"}
+	for _, code := range []int{0, 1} {
+		if st, why := Verdict(code, res, t.TempDir()); st != store.StatusFailed || !strings.HasPrefix(why, "openrouter budget reached") {
+			t.Errorf("exit %d: %s %q", code, st, why)
+		}
+	}
+}

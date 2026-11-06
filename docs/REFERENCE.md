@@ -23,6 +23,8 @@ claude -p --output-format stream-json --verbose --model M \
   --no-session-persistence --add-dir <jobdir> < prompt.md
 ```
 
+`--max-budget-usd` is omitted for `runner: openrouter` jobs (#148): their OpenRouter proxy enforces `max_budget_usd`.
+
 The process is started detached, in its own process group, and writes its exit code to a file itself. So a daemon restart neither kills nor loses the job: the new daemon finds the exit-code file on the next tick.
 
 The kind of work sets a short checklist in the brief:

@@ -508,6 +508,10 @@ type usageReader struct {
 	res    responseUsage
 	// stopped: the stream's message_stop event came (its final usage is in the message_delta before it).
 	stopped bool
+	// finalUsage: the latest message_delta carried its usage (output_tokens or cost); a later delta
+	// without them clears it. message_start's usage is the opening one (input tokens, an output count of
+	// 0 or 1, possibly an opening cost:0): never final.
+	finalUsage bool
 }
 
 func (u *usageReader) write(b []byte) {
@@ -549,7 +553,18 @@ type usageJSON struct {
 	Cost                     *float64 `json:"cost"`
 }
 
-func (u *usageReader) apply(x *usageJSON) {
+// hasFinal reports whether a usage object carries a response's final figures: output_tokens or a valid cost.
+func (x *usageJSON) hasFinal() bool {
+	return x != nil && (x.OutputTokens != nil || x.validCost())
+}
+
+func (x *usageJSON) validCost() bool {
+	return x.Cost != nil && *x.Cost >= 0
+}
+
+// apply takes the largest token counts seen; withCost also takes x's cost (false for message_start's
+// opening usage, whose cost is not the response's).
+func (u *usageReader) apply(x *usageJSON, withCost bool) {
 	if x == nil {
 		return
 	}
@@ -562,7 +577,7 @@ func (u *usageReader) apply(x *usageJSON) {
 	max(&u.res.Tokens.Output, x.OutputTokens)
 	max(&u.res.Tokens.CacheRead, x.CacheReadInputTokens)
 	max(&u.res.Tokens.CacheWrite, x.CacheCreationInputTokens)
-	if x.Cost != nil && *x.Cost >= 0 && (!u.res.HasCost || *x.Cost > u.res.Cost) {
+	if withCost && x.validCost() && (!u.res.HasCost || *x.Cost > u.res.Cost) {
 		u.res.Cost, u.res.HasCost = *x.Cost, true
 	}
 }
@@ -583,27 +598,37 @@ func (u *usageReader) event(line []byte) {
 	if json.Unmarshal(bytes.TrimSpace(data), &ev) != nil {
 		return
 	}
-	if ev.Type == "message_stop" {
+	switch ev.Type {
+	case "message_stop":
 		u.stopped = true
+	case "message_delta":
+		// Completeness and the authoritative cost follow the latest delta (#148): one without output_tokens
+		// or cost clears finalUsage, and one with usage but no cost drops an earlier delta's cost, so the
+		// response is priced by its tokens. Token counts stay the largest seen.
+		u.finalUsage = ev.Usage.hasFinal()
+		if ev.Usage != nil && !ev.Usage.validCost() {
+			u.res.Cost, u.res.HasCost = 0, false
+		}
 	}
 	if ev.Type == "message_start" {
 		u.noteProvider(ev.Message.Provider)
 	}
-	u.apply(ev.Message.Usage)
-	u.apply(ev.Usage)
+	u.apply(ev.Message.Usage, false)
+	u.apply(ev.Usage, true)
 }
 
-// final reports whether the response carried its final usage: a stream's message_stop, or a JSON body
-// (read whole, within maxProxyJSONResponse) with a usage object.
+// final reports whether the response carried its final usage: a stream's message_stop after a latest
+// message_delta with its usage (message_start's opening usage alone is not final, #148), or a JSON body
+// (read whole, within maxProxyJSONResponse) whose usage has output_tokens or a cost.
 func (u *usageReader) final() bool {
 	if u.stream {
 		u.result() // a last event without a trailing newline
-		return u.stopped
+		return u.stopped && u.finalUsage
 	}
 	var body struct {
 		Usage *usageJSON `json:"usage"`
 	}
-	return json.Unmarshal(u.body, &body) == nil && body.Usage != nil
+	return json.Unmarshal(u.body, &body) == nil && body.Usage.hasFinal()
 }
 
 func (u *usageReader) result() responseUsage {
@@ -613,7 +638,7 @@ func (u *usageReader) result() responseUsage {
 			Usage    *usageJSON `json:"usage"`
 		}
 		if json.Unmarshal(u.body, &body) == nil {
-			u.apply(body.Usage)
+			u.apply(body.Usage, true)
 			u.noteProvider(body.Provider)
 		}
 	} else if len(u.line) > 0 && !u.skip {
