@@ -1029,3 +1029,42 @@ func TestOpenRouterBudgetFailureOutranksClaudeExit(t *testing.T) {
 		}
 	}
 }
+
+// Issue #146: deny_repos checks only the job's repository, so a source file (from a denied repository,
+// or another job's report about one) would reach the third-party provider. Until a source policy exists,
+// an OpenRouter job takes no sources at all; a subscription job keeps them.
+func TestOpenRouterRefusesSources(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
+	repo := newRepo(t)
+	m.Cfg.Providers.OpenRouter.DenyRepos = []string{filepath.Base(repo)}
+	denied := sourceFixture(t, repo, "secret.md", "private notes")
+	outside := sourceFixture(t, t.TempDir(), "notes.md", "public notes")
+	prior := enqueue(t, m, "x", nil)
+	if err := os.MkdirAll(m.JobDir(prior.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.JobDir(prior.ID), "report.md"), []byte("report on a private repo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, sources := range map[string][]string{
+		"file in a denied repo": {denied},
+		"file outside any repo": {outside},
+		"another job's report":  {"job:" + prior.ID},
+	} {
+		_, err := m.Enqueue(StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "openrouter:" + orGLM,
+			MaxBudgetUSD: 1, Sources: sources})
+		if err == nil || !strings.Contains(err.Error(), "openrouter jobs take no sources") {
+			t.Errorf("%s: %v, want the sources refusal", name, err)
+		}
+	}
+	if spend, err := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, time.Now().Add(-time.Hour)); err != nil || spend != 0 {
+		t.Fatalf("a refused job reserved $%.2f, %v", spend, err)
+	}
+	// Without sources the OpenRouter job starts; a subscription job keeps its sources.
+	enqueue(t, m, "x", func(r *StartRequest) { r.Model = "openrouter:" + orGLM; r.MaxBudgetUSD = 1 })
+	j := enqueue(t, m, "x", func(r *StartRequest) { r.Sources = []string{outside} })
+	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil || string(b) != "public notes" {
+		t.Fatalf("subscription job sources: %q, %v", b, err)
+	}
+}
