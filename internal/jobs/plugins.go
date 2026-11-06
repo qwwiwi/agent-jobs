@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -203,14 +204,15 @@ func (m *Manager) JobPlugins(j *store.Job) ([]PluginView, []string) {
 	return out, doc.Warnings
 }
 
-// readBounded reads a regular file of at most max bytes, its directory resolved and every component
-// below it opened without following a symlink (openAbsoluteSource).
-func readBounded(path string, max int64) ([]byte, error) {
-	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+// readUnder reads root/rel, a regular file of at most max bytes. Only root (the trusted plugin or
+// config directory) has its symlinks resolved; every component of rel below it is opened without
+// following a symlink (openAbsoluteSource), so a linked directory inside cannot lead outside.
+func readUnder(root, rel string, max int64) ([]byte, error) {
+	r, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil, err
 	}
-	f, err := openAbsoluteSource(filepath.Join(dir, filepath.Base(path)))
+	f, err := openAbsoluteSource(filepath.Join(r, rel))
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +251,7 @@ func installedPluginPath(name string) (path, version string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	file := filepath.Join(cfg, "plugins", "installed_plugins.json")
-	b, err := readBounded(file, maxPluginJSONBytes)
+	b, err := readUnder(filepath.Join(cfg, "plugins"), "installed_plugins.json", maxPluginJSONBytes)
 	if err != nil {
 		return "", "", fmt.Errorf("installed_plugins.json: %w", err)
 	}
@@ -315,7 +316,7 @@ func (m *Manager) findPlugin(p JobPlugin) (*pluginSource, error) {
 		return nil, fmt.Errorf("plugin directory %s is not a directory", src)
 	}
 	ps := &pluginSource{source: src, real: real, version: version}
-	b, err := readBounded(filepath.Join(real, ".claude-plugin", "plugin.json"), maxPluginJSONBytes)
+	b, err := readUnder(real, filepath.Join(".claude-plugin", "plugin.json"), maxPluginJSONBytes)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
@@ -350,9 +351,10 @@ func (m *Manager) findPlugin(p JobPlugin) (*pluginSource, error) {
 }
 
 // readBootstrap reads the plugin's bootstrap skill: SKILL.md, size-bounded, opened without following
-// symlinks, secret-looking values redacted.
+// a symlink anywhere below the plugin root (skills/, the skill directory, SKILL.md), secret-looking
+// values redacted.
 func readBootstrap(real, skill string) (string, error) {
-	b, err := readBounded(filepath.Join(real, "skills", skill, "SKILL.md"), MaxBootstrapBytes)
+	b, err := readUnder(real, filepath.Join("skills", skill, "SKILL.md"), MaxBootstrapBytes)
 	if err != nil {
 		return "", fmt.Errorf("bootstrap skill %s: %w", skill, err)
 	}
@@ -363,19 +365,22 @@ func readBootstrap(real, skill string) (string, error) {
 }
 
 // buildPluginView makes viewDir: the plugin's top-level entries as symlinks, without the hooks, MCP
-// and LSP parts, and with a manifest that no longer names them. The plugin stays untouched.
-func buildPluginView(ps *pluginSource, viewDir string) error {
+// and LSP parts, and with a manifest that no longer names them. A component (skill, command, agent:
+// any .md file, wherever the manifest points) whose own front matter starts hooks or servers is left
+// out too: the entry holding it is mirrored as real directories down to it, everything else stays a
+// symlink. The plugin stays untouched. It returns one warning per component left out.
+func buildPluginView(ps *pluginSource, viewDir string) ([]string, error) {
 	if err := os.RemoveAll(viewDir); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(viewDir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
-	link := func(from, to string) error { return os.Symlink(from, to) }
 	entries, err := os.ReadDir(ps.real)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	vb := &viewBuilder{dropped: map[string]string{}}
 	for _, e := range entries {
 		n := e.Name()
 		switch {
@@ -383,15 +388,168 @@ func buildPluginView(ps *pluginSource, viewDir string) error {
 			continue
 		case n == ".claude-plugin":
 			if err := buildManifestDir(ps, filepath.Join(viewDir, n)); err != nil {
-				return err
+				return nil, err
 			}
 		default:
-			if err := link(filepath.Join(ps.real, n), filepath.Join(viewDir, n)); err != nil {
-				return err
+			src := filepath.Join(ps.real, n)
+			if err := vb.scan(src, n, 0); err != nil {
+				return nil, err
+			}
+			if err := vb.mirror(src, filepath.Join(viewDir, n), n); err != nil {
+				return nil, err
 			}
 		}
 	}
+	var warns []string
+	for _, rel := range slices.Sorted(maps.Keys(vb.dropped)) {
+		warns = append(warns, fmt.Sprintf("%s left out of the view: %s (allow_hooks is off)", rel, vb.dropped[rel]))
+	}
+	return warns, nil
+}
+
+const (
+	// maxViewDepth bounds the directory nesting a view scan follows (a symlink loop ends there);
+	// maxViewEntries the entries it visits; maxFrontMatterBytes what it reads of each .md file.
+	maxViewDepth        = 32
+	maxViewEntries      = 100000
+	maxFrontMatterBytes = 64 << 10
+)
+
+// viewBuilder scans a plugin entry for components with executable front matter and mirrors it.
+type viewBuilder struct {
+	dropped map[string]string // relative path -> why it is left out
+	seen    int
+}
+
+// scan visits src (following symlinks, as claude does when it loads the plugin) and records in
+// dropped every .md file whose front matter starts code outside the guard.
+func (vb *viewBuilder) scan(src, rel string, depth int) error {
+	if vb.seen++; vb.seen > maxViewEntries {
+		return fmt.Errorf("more than %d entries", maxViewEntries)
+	}
+	fi, err := os.Stat(src)
+	if err != nil {
+		return nil // a dangling link: claude finds nothing there either
+	}
+	if fi.IsDir() {
+		if depth >= maxViewDepth {
+			return fmt.Errorf("%s: nested deeper than %d directories", rel, maxViewDepth)
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		for _, e := range entries {
+			if err := vb.scan(filepath.Join(src, e.Name()), filepath.Join(rel, e.Name()), depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if !fi.Mode().IsRegular() || !strings.EqualFold(filepath.Ext(src), ".md") {
+		return nil
+	}
+	if why := execFrontMatter(src); why != "" {
+		vb.dropped[rel] = why
+	}
 	return nil
+}
+
+// mirror puts src at dst: a symlink when nothing below rel was dropped, nothing for a dropped file,
+// else a real directory whose entries are mirrored in turn.
+func (vb *viewBuilder) mirror(src, dst, rel string) error {
+	if _, gone := vb.dropped[rel]; gone {
+		return nil
+	}
+	prefix := rel + string(filepath.Separator)
+	inside := false
+	for d := range vb.dropped {
+		if strings.HasPrefix(d, prefix) {
+			inside = true
+			break
+		}
+	}
+	if !inside {
+		return os.Symlink(src, dst)
+	}
+	if err := os.Mkdir(dst, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := vb.mirror(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name()), filepath.Join(rel, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// frontMatterKeyRe is a top-level key of block-style YAML front matter: a plain key at column 0.
+var frontMatterKeyRe = regexp.MustCompile(`^([^\s#'"{}\[\],&*!|>%@` + "`" + `?:-][^#]*?|-[^\s#]*?)\s*:(\s|$)`)
+
+// execFrontMatter is why the markdown file at path must stay out of a view without hooks: its front
+// matter names hooks, mcpServers or lspServers at the top level, or is not the plain block YAML this
+// check can read (a quoted or flow key, an alias, a merge, a tab indent, no closing line, unreadable).
+// "" = no front matter, or one without those keys.
+func execFrontMatter(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxFrontMatterBytes))
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+	text := strings.TrimLeft(strings.TrimPrefix(string(b), "\ufeff"), " \t\r\n")
+	if !strings.HasPrefix(text, "---") {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if strings.TrimRight(lines[0], " \t\r") != "---" {
+		return "" // a rule like "----" or "--- x" opens no front matter
+	}
+	for _, raw := range lines[1:] {
+		line := strings.TrimRight(raw, " \t\r")
+		switch {
+		case line == "---" || line == "...":
+			return ""
+		case line == "" || strings.HasPrefix(line, "#"):
+			continue
+		case strings.HasPrefix(line, "\t"):
+			return "front matter indented with a tab"
+		case strings.HasPrefix(line, " "):
+			continue // inside the value of the previous top-level key
+		}
+		m := frontMatterKeyRe.FindStringSubmatch(line)
+		if m == nil {
+			return fmt.Sprintf("front matter line %q is not a plain top-level key", truncate(line, 40))
+		}
+		key := strings.TrimSpace(m[1])
+		if key == "<<" {
+			return "front matter merges keys (<<)"
+		}
+		for _, k := range pluginExecKeys {
+			if strings.EqualFold(key, k) {
+				return "front matter sets " + k
+			}
+		}
+	}
+	return "front matter has no closing line"
+}
+
+// truncate shortens s to at most n bytes on a rune boundary.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "..."
 }
 
 func buildManifestDir(ps *pluginSource, dst string) error {
@@ -445,7 +603,10 @@ func (m *Manager) preparePlugins(j *store.Job, dir string) error {
 		if !p.appliesTo(j.Kind) {
 			continue
 		}
-		lp, err := m.loadPlugin(p, filepath.Join(dir, jobPluginsDir, fmt.Sprintf("%d", i)))
+		lp, viewWarns, err := m.loadPlugin(p, filepath.Join(dir, jobPluginsDir, fmt.Sprintf("%d", i)))
+		for _, w := range viewWarns {
+			doc.Warnings = append(doc.Warnings, "plugin "+p.id()+": "+w)
+		}
 		if err != nil {
 			doc.Warnings = append(doc.Warnings, "plugin "+p.id()+": "+err.Error())
 			m.Log.Printf("job %s: plugin %s: %v", j.ID, p.id(), err)
@@ -477,20 +638,21 @@ func (m *Manager) preparePlugins(j *store.Job, dir string) error {
 }
 
 // loadPlugin resolves p and, without allow_hooks, builds its view at viewDir.
-func (m *Manager) loadPlugin(p JobPlugin, viewDir string) (*loadedPlugin, error) {
+func (m *Manager) loadPlugin(p JobPlugin, viewDir string) (*loadedPlugin, []string, error) {
 	ps, err := m.findPlugin(p)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	lp := &loadedPlugin{Name: ps.name, Config: p.id(), Version: ps.version, Source: ps.source, Real: ps.real,
 		Dir: ps.source, Hooks: p.AllowHooks, DenySkills: slices.Clone(p.DenySkills)}
+	var warns []string
 	if !p.AllowHooks {
-		if err := buildPluginView(ps, viewDir); err != nil {
-			return nil, fmt.Errorf("view without hooks: %w", err)
+		if warns, err = buildPluginView(ps, viewDir); err != nil {
+			return nil, nil, fmt.Errorf("view without hooks: %w", err)
 		}
 		lp.Dir = viewDir
 	}
-	return lp, nil
+	return lp, warns, nil
 }
 
 // PluginWarnings are the configured plugins that cannot be loaded now (missing directory, name not
@@ -509,18 +671,48 @@ func (m *Manager) PluginWarnings() []string {
 	return out
 }
 
-// pluginProtected are the paths a job never writes because of plugins: each plugin directory (as
-// resolved and as configured) and the job's views.
+// pluginProtected are the paths a job never writes because of plugins: the job's views, every
+// configured plugin directory (as configured and resolved), whether this job loads it or not, since a
+// later job of another kind does, and, when a plugin is named, the agent's plugin registry directory
+// (<config>/plugins: installed_plugins.json decides a named plugin's next installPath) with each
+// named plugin's current install. The plugins this job loaded are added as resolved for it.
 func (m *Manager) pluginProtected(j *store.Job) []string {
 	doc := readPluginsDoc(m.JobDir(j.ID))
-	if len(doc.Plugins) == 0 {
+	configured := m.Config().JobPlugins
+	if len(doc.Plugins) == 0 && len(configured) == 0 {
 		return nil
 	}
 	out := []string{filepath.Join(m.JobDir(j.ID), jobPluginsDir)}
+	add := func(p string) {
+		if p == "" || !filepath.IsAbs(p) {
+			return
+		}
+		p = filepath.Clean(p)
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+		if real, err := filepath.EvalSymlinks(p); err == nil && !slices.Contains(out, real) {
+			out = append(out, real)
+		}
+	}
 	for _, lp := range doc.Plugins {
-		out = append(out, lp.Source)
-		if lp.Real != lp.Source {
-			out = append(out, lp.Real)
+		add(lp.Source)
+		add(lp.Real)
+	}
+	registry := false
+	for _, p := range configured {
+		if p.Path != "" {
+			add(p.Path)
+			continue
+		}
+		if !registry {
+			if cfg, err := ClaudeConfigDir(); err == nil {
+				add(filepath.Join(cfg, "plugins"))
+			}
+			registry = true
+		}
+		if path, _, err := installedPluginPath(p.Name); err == nil {
+			add(path)
 		}
 	}
 	return out
