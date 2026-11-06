@@ -52,8 +52,32 @@ func briefPattern(pattern string) *regexp.Regexp {
 	return regexp.MustCompile(`(?i)(^|[^\pL\pN_])(` + pattern + `)($|[^\pL\pN_.]|\.(?:$|[^\pL\pN_]))`)
 }
 
-// Negation applies only before the matched verb, within four preceding words,
-// and stops at a clause or line boundary. This is a lexical heuristic:
+// Clause boundaries end a negation scope (#141): sentence end, a comma, a line break,
+// or a coordinating conjunction in either language ("and then" is covered by "then").
+var briefClauseBoundary = regexp.MustCompile(`(?i)[.;,!?]|\r|\n|(^|[^\pL\pN_])(?:but|however|then|а|но|однако|потом|затем)($|[^\pL\pN_])`)
+
+// briefPreVerbClause cuts the text before a matched verb at the last clause boundary:
+// a negation from an earlier clause ("do not push but run curl") never reaches this verb.
+func briefPreVerbClause(text string) string {
+	found := briefClauseBoundary.FindAllStringIndex(text, -1)
+	if len(found) == 0 {
+		return text
+	}
+	return text[found[len(found)-1][1]:]
+}
+
+// briefPostVerbClause cuts the text after a matched verb at the first clause boundary,
+// so a post-verb negation ("run curl not needed but run wget") applies only to its own clause.
+func briefPostVerbClause(text string) string {
+	found := briefClauseBoundary.FindStringIndex(text)
+	if found == nil {
+		return text
+	}
+	return text[:found[0]]
+}
+
+// Negation applies only before the matched verb, within four preceding words inside the
+// verb's own clause, and stops at a clause or line boundary. This is a lexical heuristic:
 // "Don't forget to commit" gives no warning by design; generic sandbox guidance still applies.
 var briefNegation = regexp.MustCompile(`(?i)(^|[^\pL\pN_])(?:not|cannot|\pL*n['’]t|never|no|without|не|нельзя|запрещ\pL*|без|никогда)(?:[^\pL\pN_.;,:!?\r\n]+[\pL\pN_]+){0,3}[^\pL\pN_.;,:!?\r\n]*$`)
 
@@ -72,7 +96,7 @@ func briefRequests(brief string, pattern *regexp.Regexp, externalHTTP bool) bool
 			return false
 		}
 		start, end := offset+match[4], offset+match[5]
-		if !briefNegation.MatchString(brief[:start]) && !briefPostNegation.MatchString(brief[end:]) {
+		if !briefNegation.MatchString(briefPreVerbClause(brief[:start])) && !briefPostNegation.MatchString(briefPostVerbClause(brief[end:])) {
 			target := brief
 			if briefHTTPURLs.MatchString(brief[start:end]) {
 				target = brief[start:end]

@@ -217,6 +217,33 @@ func TestCodexBriefNegationScope(t *testing.T) {
 	}
 }
 
+// Negation never crosses a clause boundary: the conjunctions but/however/then and
+// а/но/однако/потом/затем start a new clause, so the verb after them is a positive request (#141).
+func TestCodexBriefNegationClauseBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		brief string
+		want  int
+	}{
+		{"do not push but run curl", 1},
+		{"run curl not needed but run wget", 1},
+		{"не пушь, но выполни curl", 1},
+		{"не коммить, а потом запусти wget", 1},
+		// The same conjunctions without punctuation between the clauses.
+		{"не пушь но выполни curl", 1},
+		{"do not push, however run curl", 1},
+		// Negation after the boundary still governs its own clause.
+		{"do not push but do not run curl", 0},
+		{"не пушь, но не коммить", 0},
+	} {
+		t.Run(tc.brief, func(t *testing.T) {
+			j := &store.Job{Runner: store.RunnerCodex, Kind: "fix", RepoPath: "repository", Brief: tc.brief}
+			if got := (Config{}).CodexBriefWarnings(j); len(got) != tc.want {
+				t.Fatalf("got %v, want %d warnings", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexBriefHTTPRequests(t *testing.T) {
 	for _, tc := range []struct {
 		brief string
