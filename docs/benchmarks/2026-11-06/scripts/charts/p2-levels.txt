@@ -1,0 +1,17 @@
+A clean, minimalist, professional benchmark infographic in a dark theme (near-black background #0E0F12, soft gold accent #D4A84B, white and light-grey text, thin grid lines). Style of a top-tier ML benchmark report: flat, crisp sans-serif typography, generous spacing, no 3D, no icons, no emoji. All text in Russian exactly as written. Every number must be rendered exactly as given.
+
+Title: «Результат по сложности задач»
+Subtitle: «Сколько задач модель решила полностью (вердикт Codex sol: issue_fixed = yes)»
+
+A heatmap grid, 3 rows × 5 columns. Columns (header): Opus high · Sonnet high · Sonnet medium · GLM 5.3 · Haiku high. Rows (left labels with task numbers in small grey under each label):
+- «Простые» (#110, #145, #146): 3/3 · 2/3 · 2/3 · 2/3 · 1/3
+- «Средние» (#154, #155, #114): 1/3 · 1/3 · 1/3 · 1/3 · «—»
+- «Большие» (#134, #119, #135): 1/3 · 1/3 · 0/3 · 0/3 · «—»
+Cell color intensity: 3/3 bright gold, 2/3 medium gold, 1/3 dim gold, 0/3 dark grey, «—» empty dark cell with text «не запускали».
+
+Right side: a narrow notes column with three short notes:
+1. «#154, #155 и #134 полностью не решила ни одна модель, Opus тоже»
+2. «#119: только Sonnet high решил полностью»
+3. «#146 и #135: полностью решил только Opus»
+
+Bottom gold-bordered callout: «Простые и средние → Sonnet high. Большие, деньги, auth, прод-БД, инфра → Opus.»

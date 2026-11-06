@@ -1,0 +1,141 @@
+diff --git a/internal/jobs/testproc_test.go b/internal/jobs/testproc_test.go
+index b0c75df..83be858 100644
+--- a/internal/jobs/testproc_test.go
++++ b/internal/jobs/testproc_test.go
+@@ -37,6 +37,34 @@ func startOwned(t testing.TB, cmd *exec.Cmd) (stop func() error) {
+ 	return stop
+ }
+ 
++// startHelperOwned starts the helper test process c and returns the channel of its end (c.Wait's
++// error, buffered). The cleanup that kills and joins it is registered right after the start, before
++// any wait, so no path out of the test -- a pid-file wait that fails before the test's own kill
++// included -- leaves the helper running to the end of its two-minute sleep (#110). c.Wait itself
++// runs only in the goroutine that feeds done; the cleanup kills and then waits for that goroutine,
++// on every path and at most once.
++func startHelperOwned(t *testing.T, c *exec.Cmd) <-chan error {
++	t.Helper()
++	if err := c.Start(); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	exited := make(chan struct{})
++	go func() {
++		defer close(exited)
++		done <- c.Wait()
++	}()
++	t.Cleanup(func() {
++		_ = c.Process.Kill()
++		select {
++		case <-exited:
++		case <-time.After(30 * time.Second):
++			t.Errorf("helper pid %d did not end after SIGKILL", c.Process.Pid)
++		}
++	})
++	return done
++}
++
+ // The helper mode of this test binary (TestMain): the path of the agent-jobs binary under test, the
+ // file the helper writes the daemon's pid and its home to, and what it does after the start.
+ const (
+@@ -45,12 +73,18 @@ const (
+ 	ownedHelperMode    = "AGENT_JOBS_TEST_OWNED_MODE"
+ )
+ 
+-// TestOwnedHelperDaemon runs only as the child of TestStartedDaemonNeverOutlivesItsTest: it starts a
+-// daemon, records its pid and then fails mid-way (mode fail) or hangs until it is killed (mode hang).
++// TestOwnedHelperDaemon runs only as the child of the pid-waiting tests of this file: it starts a
++// daemon, records its pid and then fails mid-way (mode fail), hangs until it is killed (mode hang),
++// or hangs before writing the pid file at all (mode stall, the #110 repro: the parent's wait for
++// the file fails meanwhile).
+ func TestOwnedHelperDaemon(t *testing.T) {
+ 	if os.Getenv(ownedHelperEnv) == "" {
+ 		t.Skip("helper of TestStartedDaemonNeverOutlivesItsTest")
+ 	}
++	if os.Getenv(ownedHelperMode) == "stall" {
++		// #110 repro: hang before the pid file, so the parent's wait for it fails while we live.
++		time.Sleep(2 * time.Minute)
++	}
+ 	newManager(t)
+ 	// No pipe on its output: a daemon that writes to a closed pipe dies of SIGPIPE, which would hide
+ 	// the leak (a quiet daemon writes nothing for hours).
+@@ -79,11 +113,7 @@ func TestStartedDaemonNeverOutlivesItsTest(t *testing.T) {
+ 			c := exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
+ 			c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"="+mode)
+ 			c.Stdout, c.Stderr = io.Discard, io.Discard
+-			if err := c.Start(); err != nil {
+-				t.Fatal(err)
+-			}
+-			done := make(chan error, 1)
+-			go func() { done <- c.Wait() }()
++			done := startHelperOwned(t, c)
+ 			var pid int
+ 			var home string
+ 			waitFor(t, "daemon pid", 30*time.Second, func() bool {
+@@ -135,3 +165,67 @@ func procHasArg(pid int, arg string) bool {
+ 	}
+ 	return false
+ }
++
++// The child mode of this test binary for TestFailedPidWaitNeverLeaksHelper (#110): the gate, and
++// the file the child publishes its helper's pid to before its pid wait fails.
++const (
++	pidWaitFailEnv    = "AGENT_JOBS_TEST_PIDWAIT_FAIL"
++	pidWaitFailPidEnv = "AGENT_JOBS_TEST_PIDWAIT_FAIL_PID"
++)
++
++// TestPidWaitFailHelper runs only as the child of TestFailedPidWaitNeverLeaksHelper: it starts the
++// stall helper (it hangs before writing its pid file), publishes the helper's pid for the parent,
++// then dies of the failed pid wait -- the exact t.Fatalf-inside-waitFor path that used to run no
++// cleanup for the helper (#110).
++func TestPidWaitFailHelper(t *testing.T) {
++	pidFile := os.Getenv(ownedHelperPIDFile)
++	if os.Getenv(pidWaitFailEnv) == "" || pidFile == "" {
++		t.Skip("helper of TestFailedPidWaitNeverLeaksHelper")
++	}
++	c := exec.Command(os.Args[0], "-test.run=^TestOwnedHelperDaemon$", "-test.count=1")
++	c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, ownedHelperMode+"=stall")
++	c.Stdout, c.Stderr = io.Discard, io.Discard
++	_ = startHelperOwned(t, c)
++	if err := os.WriteFile(os.Getenv(pidWaitFailPidEnv), []byte(strconv.Itoa(c.Process.Pid)+"\n"), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	// The wait that fails: the stall helper writes the pid file only after its two-minute sleep,
++	// so waitFor ends in its t.Fatalf long before that.
++	waitFor(t, "daemon pid", 2*time.Second, func() bool {
++		_, err := os.ReadFile(pidFile)
++		return err == nil
++	})
++}
++
++// #110: a pid-file wait that fails (the t.Fatalf inside waitFor) before the test's own kill must not
++// leave the helper running to the end of its two-minute sleep. The child test above walks that exact
++// path; this test checks the child failed its wait and that its helper is gone once it did.
++func TestFailedPidWaitNeverLeaksHelper(t *testing.T) {
++	dir := t.TempDir()
++	pidFile := filepath.Join(dir, "daemon.pid")
++	helperPidFile := filepath.Join(dir, "helper.pid")
++	c := exec.Command(os.Args[0], "-test.run=^TestPidWaitFailHelper$", "-test.count=1")
++	c.Env = append(os.Environ(), ownedHelperEnv+"="+selfBin, ownedHelperPIDFile+"="+pidFile, pidWaitFailEnv+"=1", pidWaitFailPidEnv+"="+helperPidFile)
++	c.Stdout, c.Stderr = io.Discard, io.Discard
++	done := startHelperOwned(t, c)
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("the pid-wait helper passed; it must fail its wait")
++		}
++	case <-time.After(30 * time.Second):
++		_ = c.Process.Kill()
++		t.Fatal("pid-wait helper did not end")
++	}
++	b, err := os.ReadFile(helperPidFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	helper, err := strconv.Atoi(strings.TrimSpace(string(b)))
++	if err != nil || helper <= 0 {
++		t.Fatalf("bad helper pid %q", b)
++	}
++	if alive(helper) {
++		t.Fatalf("the failed pid wait leaked its helper (pid %d)", helper)
++	}
++}

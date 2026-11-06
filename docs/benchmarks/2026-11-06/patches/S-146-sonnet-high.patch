@@ -1,0 +1,158 @@
+diff --git a/internal/jobs/jobid_test.go b/internal/jobs/jobid_test.go
+index ba437ec..d45087a 100644
+--- a/internal/jobs/jobid_test.go
++++ b/internal/jobs/jobid_test.go
+@@ -172,8 +172,8 @@ func TestCodexCapCollisionCountsOnce(t *testing.T) {
+ }
+ 
+ // The openrouter-capped insert path redraws too, and a collision never reserves the budget twice:
+-// after one forced redraw the provider's spend holds exactly this job's budget, and the sources land
+-// under the final id (#129). Before the fix the redraw left the sources under the taken id.
++// after one forced redraw the provider's spend holds exactly this job's budget (#129). An openrouter
++// job takes no sources (#146); the sources-under-the-final-id check is in the claude tests above.
+ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	m := newManager(t)
+ 	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
+@@ -182,9 +182,8 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	m.Now = func() time.Time { return frozen }
+ 	taken := prefixTaken(t, m, frozen, "0001")
+ 	setIDSuffixes(t, "0001", "0002")
+-	origin := sourceFixture(t, t.TempDir(), "notes.md", "openrouter notes")
+ 	j, err := m.Enqueue(StartRequest{Title: "openrouter collision", Kind: "general", Brief: "b",
+-		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4, Sources: []string{origin}})
++		Model: "openrouter:" + orGLM, MaxBudgetUSD: 4})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -195,9 +194,6 @@ func TestOpenRouterCapCollisionReservesOnce(t *testing.T) {
+ 	if err != nil || spend != 4 {
+ 		t.Fatalf("reserved $%.2f, %v; want exactly this job's $4.00", spend, err)
+ 	}
+-	if b, err := os.ReadFile(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil || string(b) != "openrouter notes" {
+-		t.Fatalf("sources under the final id: %q, %v", b, err)
+-	}
+ 	if _, err := os.Stat(m.JobDir(taken)); !errors.Is(err, os.ErrNotExist) {
+ 		t.Fatalf("taken id %s got a folder: %v", taken, err)
+ 	}
+diff --git a/internal/jobs/manager.go b/internal/jobs/manager.go
+index a56e182..bc60197 100644
+--- a/internal/jobs/manager.go
++++ b/internal/jobs/manager.go
+@@ -505,6 +505,12 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
+ 		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
+ 			return nil, err
+ 		}
++		// deny_repos knows repositories, not files: a source path inside a denied repo, or another job's
++		// report about one, would reach the provider (#146). Refused until a source policy exists.
++		if len(r.Sources) > 0 {
++			return nil, errors.New("sources are not allowed on an openrouter job: providers.openrouter.deny_repos " +
++				"cannot check a source file's repository or a job report's; start the job without sources")
++		}
+ 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
+ 	}
+ 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
+diff --git a/internal/jobs/openrouter_sources_test.go b/internal/jobs/openrouter_sources_test.go
+index df79b30..3b83017 100644
+--- a/internal/jobs/openrouter_sources_test.go
++++ b/internal/jobs/openrouter_sources_test.go
+@@ -1,25 +1,33 @@
+ package jobs
+ 
+ import (
++	"errors"
+ 	"os"
+ 	"path/filepath"
+-	"slices"
+ 	"strings"
+ 	"testing"
+ 
+ 	"github.com/qwwiwi/agent-jobs/internal/store"
+ )
+ 
+-// An openrouter job with file sources (both added on separate branches): the provider and the
+-// source origins survive the store round trip, the accepted job keeps its copied sources, and a
+-// job refused by the daily cap leaves no job folder behind.
++// An openrouter job takes no file sources (#146: deny_repos cannot check them): the refusal leaves no
++// job folder and no reserved budget, the provider survives the store round trip of a job without
++// sources, and a job refused by the daily cap leaves no job folder behind.
+ func TestOpenRouterJobWithSourceFiles(t *testing.T) {
+ 	m := newManager(t)
+ 	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
+ 	m.Cfg.Providers.OpenRouter.DailyCapUSD = f64(5)
+ 	origin := sourceFixture(t, t.TempDir(), "notes.md", "notes")
+-	j, err := m.Enqueue(StartRequest{Title: "a", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
++	_, err := m.Enqueue(StartRequest{Title: "s", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
+ 		MaxBudgetUSD: 4, Sources: []string{origin}})
++	if err == nil || !strings.Contains(err.Error(), "sources are not allowed on an openrouter job") {
++		t.Fatalf("sources on an openrouter job: %v", err)
++	}
++	if entries, err := os.ReadDir(filepath.Join(m.StateDir, "jobs")); err == nil && len(entries) != 0 {
++		t.Fatalf("refused job left a folder: %v", entries)
++	}
++	j, err := m.Enqueue(StartRequest{Title: "a", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
++		MaxBudgetUSD: 4})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -27,19 +35,21 @@ func TestOpenRouterJobWithSourceFiles(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if got.Provider != store.ProviderOpenRouter || got.Billing != store.BillingAPI || !slices.Equal(got.SourceFiles, []string{origin}) {
++	if got.Provider != store.ProviderOpenRouter || got.Billing != store.BillingAPI || len(got.SourceFiles) != 0 {
+ 		t.Fatalf("round trip: provider %q billing %q source_files %v", got.Provider, got.Billing, got.SourceFiles)
+ 	}
+-	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), SourcesDir, "notes.md")); err != nil {
+-		t.Fatalf("accepted job lost its sources: %v", err)
+-	}
+ 	_, err = m.Enqueue(StartRequest{Title: "b", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
+-		MaxBudgetUSD: 2, Sources: []string{origin}})
++		MaxBudgetUSD: 2})
+ 	if err == nil || !strings.Contains(err.Error(), "openrouter daily cap reached") {
+ 		t.Fatalf("over the cap: %v", err)
+ 	}
+ 	entries, err := os.ReadDir(filepath.Join(m.StateDir, "jobs"))
+-	if err != nil || len(entries) != 1 {
+-		t.Fatalf("capped job left a folder: %v, %v", entries, err)
++	if err != nil && !errors.Is(err, os.ErrNotExist) {
++		t.Fatal(err)
++	}
++	for _, e := range entries {
++		if e.Name() != j.ID {
++			t.Fatalf("capped job left a folder: %s", e.Name())
++		}
+ 	}
+ }
+diff --git a/internal/jobs/openrouter_test.go b/internal/jobs/openrouter_test.go
+index f7507d5..181aaa0 100644
+--- a/internal/jobs/openrouter_test.go
++++ b/internal/jobs/openrouter_test.go
+@@ -1029,3 +1029,28 @@ func TestOpenRouterBudgetFailureOutranksClaudeExit(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// #146: deny_repos checks only the job's repository, so a file source (a path inside a denied repo, or
++// another job's report) would reach the third-party provider. An openrouter job takes no sources; the
++// same sources are fine on a claude job.
++func TestOpenRouterRefusesSources(t *testing.T) {
++	m := newManager(t)
++	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
++	denied := newRepo(t)
++	m.Cfg.Providers.OpenRouter.DenyRepos = []string{filepath.Base(denied)}
++	secret := sourceFixture(t, denied, "secret.md", "private repo content")
++	other := enqueue(t, m, "x", nil)
++	for name, src := range map[string]string{"file in a denied repo": secret, "job report": "job:" + other.ID} {
++		_, err := m.Enqueue(StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "openrouter:" + orGLM,
++			Sources: []string{src}})
++		if err == nil || !strings.Contains(err.Error(), "sources") || !strings.Contains(err.Error(), "openrouter") {
++			t.Errorf("%s: want a sources refusal naming openrouter, got %v", name, err)
++		}
++	}
++	if spend, err := m.Store.ProviderSpendSince(m.Agent, store.ProviderOpenRouter, time.Now().Add(-time.Hour)); err != nil || spend != 0 {
++		t.Errorf("a refused job reserved $%.2f, %v", spend, err)
++	}
++	// The same file on a claude job is unchanged, and an openrouter job without sources still starts.
++	enqueue(t, m, "x", func(r *StartRequest) { r.Sources = []string{secret} })
++	enqueue(t, m, "x", func(r *StartRequest) { r.Model = "openrouter:" + orGLM; r.Sources = []string{} })
++}

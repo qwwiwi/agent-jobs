@@ -329,3 +329,56 @@ exit 0
 		}
 	}
 }
+
+// A git cat-file whose descendant holds the stdout the judge tree reads itself (an *os.File, not a copy
+// of the runner) does not outlive the deadline (#114): git, exited at once, stays unreaped while the
+// stream is in use, so the group kill at the deadline still reaches the descendant, and the call is
+// errGitTimeout.
+func TestMaterializeTreeTimeoutKillsStdoutHolder(t *testing.T) {
+	repo, sha := gateRepo(t)
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	if strings.ContainsRune(state, '\'') {
+		t.Fatalf("state directory %q has a quote", state)
+	}
+	// cat-file leaves a child that inherits its stdin (through fd 3: an async list's own stdin is
+	// /dev/null) and stdout, records the child's pid and exits; every other git call is the real one.
+	fakeGitOnPath(t, `for a in "$@"; do
+	if [ "$a" = cat-file ]; then
+		exec 3<&0
+		sleep 60 <&3 3<&- &
+		echo $! > '`+state+`/child'
+		exit 0
+	fi
+done
+exec '`+real+`' "$@"
+`)
+	// A wait delay past the deadline, so that the kill can only come from the deadline.
+	shortGitLongTimeout(t, time.Second)
+	origDelay := gitWaitDelay
+	gitWaitDelay = 30 * time.Second
+	t.Cleanup(func() { gitWaitDelay = origDelay })
+	err = returnsWithin(t, 10*time.Second, "materializeTree", func() error {
+		return materializeTree(repo, sha, t.TempDir(), nil)
+	})
+	b, rerr := os.ReadFile(filepath.Join(state, "child"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	pid, rerr := strconv.Atoi(strings.TrimSpace(string(b)))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+	if !errors.Is(err, errGitTimeout) {
+		t.Fatalf("want errGitTimeout, got %v", err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); !processGone(t, pid); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("cat-file's child %d still runs after the deadline: git's group was not killed", pid)
+		}
+	}
+}

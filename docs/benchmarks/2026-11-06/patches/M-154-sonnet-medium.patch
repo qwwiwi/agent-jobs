@@ -1,0 +1,85 @@
+diff --git a/internal/jobs/hardening1_test.go b/internal/jobs/hardening1_test.go
+index c663484..2ac7285 100644
+--- a/internal/jobs/hardening1_test.go
++++ b/internal/jobs/hardening1_test.go
+@@ -308,3 +308,33 @@ func TestEscapedCheckRefusesMissingLinuxProc(t *testing.T) {
+ 		t.Fatalf("missing /proc: %v", err)
+ 	}
+ }
++
++const twoResultReport = "## Summary\\nok\\n\\n## Findings / Changes\\n-\\n\\n## Evidence\\n-\\n\\n## Not done / uncertain\\nnothing"
++
++func twoResultStream() string {
++	return `{"type":"result","subtype":"success","is_error":false,"num_turns":87,"total_cost_usd":2.5,"result":"` + twoResultReport + `"}` + "\n" +
++		`{"type":"result","subtype":"success","is_error":false,"num_turns":1,"total_cost_usd":2.6,"result":"This is a notification from my own wait timer"}` + "\n"
++}
++
++// A trailing result event from a background-task notification must not replace the report (#154).
++func TestParseStreamKeepsReportOverTrailingResult(t *testing.T) {
++	p := filepath.Join(t.TempDir(), "stream.jsonl")
++	writeFile(t, p, []byte(twoResultStream()), 0o600)
++	r := ParseStream(p)
++	if !isReport(r.Text) || r.Turns != 88 || r.CostUSD != 2.6 || r.IsError || r.Subtype != "success" {
++		t.Fatalf("result: %+v", r)
++	}
++}
++
++// The tee (the wrapper's trusted view) merges the same way.
++func TestResultTeeKeepsReportOverTrailingResult(t *testing.T) {
++	var out bytes.Buffer
++	tee := &resultTee{w: &out}
++	if _, err := tee.Write([]byte(twoResultStream())); err != nil {
++		t.Fatal(err)
++	}
++	r := tee.res
++	if !isReport(r.Text) || r.Turns != 88 || r.CostUSD != 2.6 || r.Results != 2 {
++		t.Fatalf("result: %+v", r)
++	}
++}
+diff --git a/internal/jobs/wrapper.go b/internal/jobs/wrapper.go
+index ab02e6f..f9dbbc1 100644
+--- a/internal/jobs/wrapper.go
++++ b/internal/jobs/wrapper.go
+@@ -100,7 +100,22 @@ type resultEvent struct {
+ 	Result       string  `json:"result"`
+ }
+ 
+-// ParseStream returns the last `result` event in stream.jsonl (zero value if none).
++// mergeResult folds a later result event into an earlier one. A background task's notification can wake
++// the session for one more turn after the report was written, giving a second result event whose short
++// text is no report (#154): the earlier report text is kept, turns add up and the cost is the run total.
++// Status fields come from the later event.
++func mergeResult(prev, next StreamResult) StreamResult {
++	if !prev.Found || !isReport(prev.Text) || isReport(next.Text) {
++		return next
++	}
++	next.Text = prev.Text
++	next.Turns += prev.Turns
++	next.CostUSD = max(next.CostUSD, prev.CostUSD)
++	return next
++}
++
++// ParseStream returns the run's result from stream.jsonl (zero value if none): the last `result` event,
++// with the report of an earlier one when the last carries none (see mergeResult).
+ func ParseStream(path string) StreamResult {
+ 	var out StreamResult
+ 	f, err := os.Open(path)
+@@ -112,7 +127,7 @@ func ParseStream(path string) StreamResult {
+ 	sc.Buffer(make([]byte, 0, 1<<20), maxStreamLine)
+ 	for sc.Scan() {
+ 		if r, ok := parseResultLine(sc.Bytes()); ok {
+-			out = r
++			out = mergeResult(out, r)
+ 		}
+ 	}
+ 	return out
+@@ -243,6 +258,9 @@ func (t *resultTee) end() {
+ 		}
+ 		if r, ok := parseResultLine(t.line); ok {
+ 			r.Progressed, r.ReportText, r.Results, r.Invalid = true, t.res.ReportText, t.res.Results+1, t.res.Invalid
++			if t.res.Found {
++				r = mergeResult(t.res, r)
++			}
+ 			t.res = r
+ 		}
+ 	}
