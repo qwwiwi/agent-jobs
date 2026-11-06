@@ -412,7 +412,7 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	}
 	// An emptied queue adds its idle note to this same line (#165), never a line of its own. The note
 	// is only a candidate here: its final check runs inside the tmux delivery, under the idle lock.
-	note, epoch := m.idleNote(batch)
+	note, epoch, retry := m.idleDelivery(batch)
 	var rode bool
 	if note == "" {
 		err = m.sendTmuxLocked(target, line)
@@ -436,10 +436,12 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 		}
 	}
 	// The acknowledgement of the line and the record of the note it carried are one transaction: if
-	// either cannot be written, the line stays pending and is delivered again (with the note, composed
-	// afresh), instead of a delivered note that nothing remembers.
+	// either cannot be written, the line stays pending and is delivered again, instead of a delivered
+	// note that nothing remembers. The mark comes from the delivery record saved before typing: a retry
+	// of a delivery that may already have typed its note (tmux accepted it, the acknowledgement failed)
+	// counts the note whatever the queue looks like now, never dropping its bookkeeping.
 	var mark *store.IdleMark
-	if rode {
+	if rode || (retry && note != "") {
 		mark = &store.IdleMark{Kind: store.IdleNote, Epoch: epoch}
 	}
 	ids := make([]string, 0, len(batch))

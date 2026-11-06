@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -18,7 +19,6 @@ const (
 	DefaultIdleCooldown        = 10 * time.Minute
 	DefaultIdleMaxWakes        = 8
 	CeilingIdleMaxWakes        = 48
-	DefaultIdleRecovery        = 6 * time.Hour
 	idleCooldownCeilingSeconds = 86400
 	// idleListed caps the tasks (and the intentions) a note names; the count is always the full one.
 	idleListed = 5
@@ -33,11 +33,8 @@ type IdlePickConfig struct {
 	Enabled bool `json:"enabled"`
 	// CooldownSeconds is the least gap between two idle notes. 0 = 600.
 	CooldownSeconds int `json:"cooldown_seconds"`
-	// MaxWakesPerDay caps the idle notes (and recovery lines) in any 24 hours. 0 = 8, at most 48.
+	// MaxWakesPerDay caps the idle notes in any 24 hours. 0 = 8, at most 48.
 	MaxWakesPerDay int `json:"max_wakes_per_day"`
-	// RecoveryScanSeconds is the gap between recovery scans, which look for a queue-empty transition
-	// that was never evaluated. 0 = 21600 (6 h); -1 = no recovery scan.
-	RecoveryScanSeconds int `json:"recovery_scan_seconds"`
 }
 
 func (c IdlePickConfig) validate() error {
@@ -47,9 +44,6 @@ func (c IdlePickConfig) validate() error {
 			int(DefaultIdleCooldown/time.Second), idleCooldownCeilingSeconds)
 	case c.MaxWakesPerDay < 0 || c.MaxWakesPerDay > CeilingIdleMaxWakes:
 		return fmt.Errorf("idle_pick.max_wakes_per_day %d must be 0 (default %d) .. %d", c.MaxWakesPerDay, DefaultIdleMaxWakes, CeilingIdleMaxWakes)
-	case c.RecoveryScanSeconds < -1:
-		return fmt.Errorf("idle_pick.recovery_scan_seconds %d must be -1 (off), 0 (default %d) or positive", c.RecoveryScanSeconds,
-			int(DefaultIdleRecovery/time.Second))
 	}
 	return nil
 }
@@ -68,17 +62,6 @@ func (c IdlePickConfig) MaxWakes() int {
 		return c.MaxWakesPerDay
 	}
 	return DefaultIdleMaxWakes
-}
-
-// RecoveryEvery is the gap between recovery scans; 0 = no recovery scan.
-func (c IdlePickConfig) RecoveryEvery() time.Duration {
-	switch {
-	case c.RecoveryScanSeconds < 0:
-		return 0
-	case c.RecoveryScanSeconds > 0:
-		return time.Duration(c.RecoveryScanSeconds) * time.Second
-	}
-	return DefaultIdleRecovery
 }
 
 // idleBeforeSend, when set (tests only), runs inside the tmux delivery of a line that carries a note,
@@ -233,8 +216,8 @@ func (m *Manager) idleGate(now time.Time) (ok bool, err error) {
 // when there is none to add: idle pick is off; a job is still queued, running or stopped, or another
 // job-done line is still to come (the last one carries the note); this queue epoch (every job that
 // ended up to now) was already evaluated; nothing is ready; or the cooldown or the daily cap holds it
-// back. The note is not recorded here but, with the acknowledgement of the line, by deliverDone once
-// tmux took the line, so a failed delivery composes it again.
+// back. The note is not recorded as delivered here but, with the acknowledgement of the line, by
+// deliverDone once tmux took the line.
 func (m *Manager) idleNote(batch []*store.Job) (note string, epoch int64) {
 	if !m.Config().IdlePick.Enabled {
 		return "", 0
@@ -291,9 +274,10 @@ func (m *Manager) idleEpochSpent(epoch int64) (bool, error) {
 }
 
 // idleEvaluate reads the ready work of queue epoch epoch and applies the gate, recording an evaluation
-// that found nothing (the epoch is spent) or one the gate held back (the epoch stays open for the
-// recovery scan). It returns the note, or "". A failure to read or to record is returned: the epoch
-// then stays open and the next delivery or scan evaluates it again.
+// that found nothing (the epoch is spent). A note the gate holds back is lost: nothing is recorded and
+// nothing replays it, because a missed note is cheaper than a second wake. It returns the note, or "". A
+// failure to read or to record is returned: the epoch then stays open and the next delivery evaluates it
+// again.
 func (m *Manager) idleEvaluate(epoch int64) (string, error) {
 	now := m.Now()
 	w, err := m.idleReadyWork(context.Background())
@@ -308,7 +292,7 @@ func (m *Manager) idleEvaluate(epoch int64) (string, error) {
 		return "", fmt.Errorf("gate: %w", err)
 	}
 	if !ok {
-		return "", m.Store.AddIdlePickEvent(store.IdleSuppressed, now, epoch)
+		return "", nil
 	}
 	return RedactPrintable(w.text(), 0), nil
 }
@@ -354,58 +338,42 @@ func (m *Manager) logIdle(what string, err error) {
 	}
 }
 
-// idleRecovery is the low-frequency recovery scan: a queue-empty transition whose delivery never got
-// an idle evaluation (idle pick was off then, the evaluation failed, the gate held its note back) is
-// not lost. With the queue empty, no line pending and a job ended since the last evaluation, once per
-// recovery_scan_seconds it reads the ready work and, if there is any and the gate allows, puts the last
-// delivered job's line back on the job-done delivery (RearmLastNotified): the next delivery tick types
-// that job-done line with the idle note on it. The scan never types a line of its own, so it is never
-// a separate wake, and it never starts work.
-func (m *Manager) idleRecovery() error {
-	cfg := m.Config()
-	every := cfg.IdlePick.RecoveryEvery()
-	if !cfg.IdlePick.Enabled || every == 0 || cfg.NotifyTmuxTarget == "" {
-		return nil
+// idleDelivery returns the note a job-done delivery of batch carries and the queue epoch it covers, and
+// whether the note belongs to an earlier attempt of this very delivery. The note is composed once and
+// saved as the delivery's record BEFORE anything is typed; a retry (tmux failed, or the acknowledgement
+// could not be written) reads the record back instead of composing again, so what is acknowledged is what
+// was typed, whatever the queue looks like by then. A record that cannot be saved drops the note: a note
+// nothing remembers is never typed.
+func (m *Manager) idleDelivery(batch []*store.Job) (note string, epoch int64, retry bool) {
+	if !m.Config().IdlePick.Enabled {
+		return "", 0, false
 	}
-	if n, err := m.Store.CountActive(); err != nil || n > 0 {
-		return err
-	}
-	epoch, err := m.Store.FinishSeq()
-	if err != nil || epoch == 0 {
-		return err
-	}
-	if spent, err := m.idleEpochSpent(epoch); err != nil || spent {
-		return err
-	}
-	now := m.Now()
-	scanned, err := m.Store.LastIdlePickEvent(store.IdleScan)
+	key := batchKey(batch)
+	rec, err := m.Store.IdleDeliveryFor(key)
 	if err != nil {
-		return err
+		m.logIdle("delivery record", err)
+		return "", 0, false
 	}
-	if scanned != nil && now.Sub(*scanned) < every {
-		return nil
+	if rec != nil {
+		return rec.Note, rec.Epoch, true
 	}
-	if pending, err := m.Store.PendingNotify(); err != nil || len(pending) > 0 {
-		return err // a line still to come carries the note
-	}
-	note, err := m.idleEvaluate(epoch)
-	if err != nil {
-		return err
-	}
-	if err := m.Store.AddIdlePickEvent(store.IdleScan, now, epoch); err != nil {
-		return err
-	}
+	note, epoch = m.idleNote(batch)
 	if note == "" {
-		return nil
+		return "", 0, false
 	}
-	id, err := m.Store.RearmLastNotified()
-	if err != nil {
-		return err
+	if err := m.Store.SaveIdleDelivery(store.IdleDelivery{Batch: key, Epoch: epoch, Note: note}); err != nil {
+		m.logIdle("delivery record", err)
+		return "", 0, false
 	}
-	if id == "" {
-		m.Log.Printf("idle pick: recovery found ready work but no delivered job to carry the note")
-		return nil
+	return note, epoch, false
+}
+
+// batchKey names a delivery by its jobs, in a stable order.
+func batchKey(batch []*store.Job) string {
+	ids := make([]string, 0, len(batch))
+	for _, j := range batch {
+		ids = append(ids, j.ID)
 	}
-	m.Log.Printf("idle pick: recovery re-armed the job-done line of job %s to carry the idle note", id)
-	return nil
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
 }

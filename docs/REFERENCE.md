@@ -107,7 +107,7 @@ What we learned from mistakes:
 
 Separate from cron there is a «heartbeat»: the daemon itself decides whether there is a reason to wake the agent for its own goals. First a cheap check in Go (has enough time passed, is the daily limit not used up, is it not night), then a small model decides whether the big one is worth waking.
 
-With `idle_pick.enabled` there is a cheaper way to keep the agent busy than an hourly wake: when the last job of the queue has ended, the job-done line it arrives on ends with what is ready (`· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`): milestone tasks whose dependencies are accepted and that have no job yet, and the agent's open intentions. Nothing ready, nothing added; it is never a separate wake, and the daemon never starts the work itself. A recovery scan every 6 hours covers a queue-empty transition that was never evaluated by delivering the last job's job-done line again with the note on it.
+With `idle_pick.enabled` there is a cheaper way to keep the agent busy than an hourly wake: when the last job of the queue has ended, the job-done line it arrives on ends with what is ready (`· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`): milestone tasks whose dependencies are accepted and that have no job yet, and the agent's open intentions. Nothing ready, nothing added; it is never a separate wake, and the daemon never starts the work itself. A note that was missed (idle pick was off, the cooldown or the daily cap held it back) is not made up later: the note rides only a genuine pending job-done line, and a delivered line is never sent again.
 
 ## MCP tools
 

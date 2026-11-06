@@ -33,17 +33,17 @@ func TestIdlePickEvents(t *testing.T) {
 	if n, err := s.LastIdlePickEpoch(IdleNote, IdleEval); err != nil || n != 3 {
 		t.Fatalf("last epoch of two kinds: %d %v", n, err)
 	}
-	if n, err := s.LastIdlePickEpoch(IdleScan); err != nil || n != 0 {
-		t.Fatalf("no scan epoch: %d %v", n, err)
+	if n, err := s.LastIdlePickEpoch("other"); err != nil || n != 0 {
+		t.Fatalf("no epoch of an unknown kind: %d %v", n, err)
 	}
 	if n, err := s.CountIdlePickEvents(now.Add(30*time.Minute), IdleNote); err != nil || n != 1 {
 		t.Fatalf("count since: %d %v", n, err)
 	}
 	// Events older than a week go with the next write.
-	if err := s.AddIdlePickEvent(IdleScan, now.Add(8*24*time.Hour), 0); err != nil {
+	if err := s.AddIdlePickEvent(IdleEval, now.Add(8*24*time.Hour), 0); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.CountIdlePickEvents(time.Unix(0, 0), IdleNote, IdleEval); err != nil || n != 0 {
+	if n, err := s.CountIdlePickEvents(time.Unix(0, 0), IdleNote, IdleEval); err != nil || n != 1 {
 		t.Fatalf("old events kept: %d %v", n, err)
 	}
 }
@@ -134,36 +134,92 @@ func TestMarkNotifiedBatchAtomic(t *testing.T) {
 	}
 }
 
-// #165: the recovery scan re-arms the latest delivered job that is not an owner-waits job.
-func TestRearmLastNotified(t *testing.T) {
+// #165 F4: the delivery record belongs to one batch, is replaced by the next one, and goes with the
+// acknowledgement, in the same transaction.
+func TestIdleDeliveryRecord(t *testing.T) {
 	s := openIdleStore(t)
 	t0 := time.Unix(1_800_000_000, 0)
-	if id, err := s.RearmLastNotified(); err != nil || id != "" {
-		t.Fatalf("empty store: %q %v", id, err)
+	insertJob(t, s, "a", false, t0)
+	if d, err := s.IdleDeliveryFor("a"); err != nil || d != nil {
+		t.Fatalf("empty: %v %v", d, err)
 	}
-	add := func(id string, ownerWaits bool, finished time.Time) {
-		t.Helper()
-		if err := s.Insert(&Job{ID: id, Agent: "agent1", Title: id, Kind: "fix", Brief: "b", Status: StatusSucceeded,
-			Model: "opus", MaxTurns: 10, MaxBudgetUSD: 1, TimeoutMinutes: 5, CreatedAt: t0, FinishedAt: &finished,
-			OwnerWaits: ownerWaits}); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.MarkNotified(id, finished); err != nil {
-			t.Fatal(err)
-		}
+	if err := s.SaveIdleDelivery(IdleDelivery{Batch: "a", Epoch: 3, Note: "idle: x"}); err != nil {
+		t.Fatal(err)
 	}
-	add("old", false, t0)
-	add("newer", false, t0.Add(time.Minute))
-	add("waits", true, t0.Add(time.Hour))
-	id, err := s.RearmLastNotified()
-	if err != nil || id != "newer" {
-		t.Fatalf("rearmed %q %v", id, err)
+	d, err := s.IdleDeliveryFor("a")
+	if err != nil || d == nil || d.Epoch != 3 || d.Note != "idle: x" {
+		t.Fatalf("saved record: %+v %v", d, err)
 	}
-	if j, _ := s.Get("newer"); j.NotifiedAt != nil {
-		t.Fatal("job not pending again")
+	if other, err := s.IdleDeliveryFor("a,b"); err != nil || other != nil {
+		t.Fatalf("record of another batch: %+v %v", other, err)
 	}
-	if j, _ := s.Get("waits"); j.NotifiedAt == nil {
-		t.Fatal("an owner-waits job was re-armed")
+	if err := s.MarkNotifiedBatch([]string{"a"}, t0, &IdleMark{Kind: IdleNote, Epoch: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.IdleDeliveryFor("a"); err != nil || d != nil {
+		t.Fatalf("record kept after the acknowledgement: %+v %v", d, err)
+	}
+}
+
+// #165 F3: opening a database that predates the epoch counter treats the finished jobs as covered (no
+// note for history), except a completion whose job-done line is still pending: that one keeps its epoch
+// open and gets its note on its own line.
+func TestIdlePickUpgradeCoversHistory(t *testing.T) {
+	t0 := time.Unix(1_800_000_000, 0)
+	for _, tc := range []struct {
+		name        string
+		pending     bool
+		wantCovered int64
+	}{
+		{"delivered history only", false, 3},
+		{"pending completion across the upgrade", true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "jobs.db")
+			s, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"a", "b", "c"} {
+				insertJob(t, s, id, false, t0)
+				if id != "c" || !tc.pending {
+					if err := s.MarkNotified(id, t0); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// Back to the schema of a database that predates idle pick.
+			for _, q := range []string{`DROP TRIGGER idle_pick_job_ended`, `DROP TABLE idle_pick_seq`,
+				`DROP TABLE idle_pick_events`, `DROP TABLE idle_pick_delivery`} {
+				if _, err := s.db.Exec(q); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			if n, err := s.FinishSeq(); err != nil || n != 3 {
+				t.Fatalf("epoch counter after the upgrade: %d %v", n, err)
+			}
+			if n, err := s.LastIdlePickEpoch(IdleEval, IdleNote); err != nil || n != tc.wantCovered {
+				t.Fatalf("covered epoch %d, want %d (%v)", n, tc.wantCovered, err)
+			}
+			// A second open changes nothing.
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if s, err = Open(path); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := s.LastIdlePickEpoch(IdleEval, IdleNote); err != nil || n != tc.wantCovered {
+				t.Fatalf("covered epoch after a reopen %d, want %d (%v)", n, tc.wantCovered, err)
+			}
+		})
 	}
 }
 

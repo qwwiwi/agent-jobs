@@ -681,9 +681,6 @@ func (m *Manager) tickLocked() error {
 	if err := m.notifyPending(); err != nil {
 		errs = append(errs, fmt.Errorf("notify: %w", err))
 	}
-	if err := m.idleRecovery(); err != nil {
-		errs = append(errs, fmt.Errorf("idle pick: %w", err))
-	}
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
 	}

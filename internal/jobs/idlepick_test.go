@@ -190,9 +190,6 @@ func TestIdlePickRestartDoesNotReEmit(t *testing.T) {
 	m3 := reopenForIdle(t, m2, f.now)
 	for _, sec := range []int{71, 600, 8 * 3600} {
 		notifyAt(t, m3, f.now, f.t0.Add(time.Duration(sec)*time.Second))
-		if err := m3.idleRecovery(); err != nil {
-			t.Fatal(err)
-		}
 	}
 	if got := tmuxLines(t, f.logf); len(got) != 1 {
 		t.Fatalf("re-emitted after a restart: %q", got)
@@ -284,87 +281,89 @@ func TestIdlePickDailyCap(t *testing.T) {
 	}
 }
 
-// #165: the recovery scan finds an epoch whose delivery never got an idle evaluation (idle pick was
-// off then); a queue that is not empty says nothing, and the cancelled job's own line carries the note.
-func TestIdlePickRecoveryScanBusyQueue(t *testing.T) {
-	f := newIdleFixture(t)
-	f.m.Cfg.IdlePick.Enabled = false
-	f.finish(t, 0)
-	f.notify(t, 1)
-	f.m.Cfg.IdlePick.Enabled = true
-	busy := enqueue(t, f.m, "busy", nil)
-	*f.now = f.t0.Add(2 * time.Minute)
-	if err := f.m.idleRecovery(); err != nil {
-		t.Fatal(err)
-	}
-	if got := tmuxLines(t, f.logf); len(got) != 1 {
-		t.Fatalf("scan with a busy queue: %q", got)
-	}
-	if err := f.m.Cancel(busy.ID); err != nil {
-		t.Fatal(err)
-	}
-	f.notify(t, 3) // the cancelled job's own line: it carries the note, so the epoch is evaluated
-	if err := f.m.idleRecovery(); err != nil {
-		t.Fatal(err)
-	}
-	got := tmuxLines(t, f.logf)
-	if len(got) != 2 || !strings.Contains(got[1], " · idle: ") {
-		t.Fatalf("lines: %q", got)
-	}
-}
-
-// #165 F1: the recovery scan never types a line of its own. A missed epoch with ready work is put back
-// on the job-done delivery path: the last finished job's line is delivered again, carrying the note.
-func TestIdlePickRecoveryScanRidesJobDone(t *testing.T) {
+// #165 F1: an epoch whose delivery got no idle note (idle pick was off then) stays missed: nothing
+// replays a delivered job-done line, however many ticks, days or restarts pass. A note rides only a
+// genuine pending job-done delivery.
+func TestIdlePickMissedNoteIsNotReplayed(t *testing.T) {
 	f := newIdleFixture(t)
 	f.m.Cfg.IdlePick.Enabled = false
 	j := f.finish(t, 0)
 	f.notify(t, 1)
 	f.m.Cfg.IdlePick.Enabled = true
-	*f.now = f.t0.Add(2 * time.Minute)
-	if err := f.m.idleRecovery(); err != nil {
-		t.Fatal(err)
+	m := f.m
+	for _, sec := range []int{2, 600, 7 * 3600, 30 * 3600} {
+		m = reopenForIdle(t, m, f.now)
+		notifyAt(t, m, f.now, f.t0.Add(time.Duration(sec)*time.Second))
 	}
-	if got := tmuxLines(t, f.logf); len(got) != 1 {
-		t.Fatalf("the scan typed a line of its own: %q", got)
-	}
-	f.notify(t, 121) // the next delivery tick
 	got := tmuxLines(t, f.logf)
-	head := f.m.DoneLineFor(get(t, f.m, j.ID))
-	if len(got) != 2 || !strings.HasPrefix(got[1], "[jobs:job-done] ") || strings.Contains(got[1], "[jobs:idle]") ||
-		!strings.HasPrefix(got[1], head+" · idle: 2 ready tasks: ") {
-		t.Fatalf("recovery delivery: %q", got)
+	if len(got) != 1 || got[0] != f.m.DoneLineFor(get(t, m, j.ID)) {
+		t.Fatalf("a missed note produced another delivery: %q", got)
 	}
-	for _, d := range []time.Duration{3 * time.Minute, 7 * time.Hour, 30 * time.Hour} {
-		*f.now = f.t0.Add(d)
-		if err := f.m.idleRecovery(); err != nil {
-			t.Fatal(err)
-		}
-		f.notify(t, int(d/time.Second))
-	}
-	if got := tmuxLines(t, f.logf); len(got) != 2 {
-		t.Fatalf("scanned epoch said again: %q", got)
+	// The next genuine completion carries its note again.
+	finishAt(t, m, f.now, f.t0.Add(31*time.Hour), nil)
+	notifyAt(t, m, f.now, f.t0.Add(31*time.Hour+time.Second))
+	if got := tmuxLines(t, f.logf); len(got) != 2 || !strings.Contains(got[1], " · idle: 2 ready tasks: ") {
+		t.Fatalf("next completion: %q", got)
 	}
 }
 
-// #165 F1: a scan that finds nothing ready re-delivers nothing and spends the epoch.
-func TestIdlePickRecoveryScanNothingReady(t *testing.T) {
-	m := newManager(t)
-	logf := notifyTo(t, m)
-	now := coalesceClock(m)
-	t0 := *now
-	finishAt(t, m, now, t0, nil)
-	notifyAt(t, m, now, t0.Add(time.Second))
-	m.Cfg.IdlePick.Enabled = true
-	for _, d := range []time.Duration{time.Minute, 7 * time.Hour, 14 * time.Hour} {
-		*now = t0.Add(d)
-		if err := m.idleRecovery(); err != nil {
+// resetIdleSchema returns the database of m to the schema of a version without idle pick (no counter,
+// no events, no delivery record), then reopens it: the upgrade.
+func resetIdleSchema(t *testing.T, m *Manager, now *time.Time) *Manager {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(m.StateDir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{`DROP TRIGGER idle_pick_job_ended`, `DROP TABLE idle_pick_seq`,
+		`DROP TABLE idle_pick_events`, `DROP TABLE idle_pick_delivery`} {
+		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
-		notifyAt(t, m, now, t0.Add(d+time.Second))
 	}
-	if got := tmuxLines(t, logf); len(got) != 1 {
-		t.Fatalf("lines: %q", got)
+	_ = db.Close()
+	return reopenForIdle(t, m, now)
+}
+
+// #165 F3: on upgrade the finished history is covered (no note for it), and a completion whose job-done
+// line was still pending across the upgrade gets its note on its own line.
+func TestIdlePickUpgradePendingCompletionGetsNote(t *testing.T) {
+	f := newIdleFixture(t)
+	f.m.Cfg.IdlePick.Enabled = false
+	f.finish(t, 0)
+	f.notify(t, 1) // delivered, never evaluated: history
+	pending := f.finish(t, 10)
+	m2 := resetIdleSchema(t, f.m, f.now)
+	m2.Cfg.IdlePick.Enabled = true
+	notifyAt(t, m2, f.now, f.t0.Add(20*time.Second))
+	got := tmuxLines(t, f.logf)
+	if len(got) != 2 || !strings.HasPrefix(got[1], m2.DoneLineFor(get(t, m2, pending.ID))+" · idle: 2 ready tasks: ") {
+		t.Fatalf("pending completion across the upgrade: %q", got)
+	}
+	if strings.Contains(got[0], "idle:") {
+		t.Fatalf("history noted: %q", got)
+	}
+}
+
+// #165 F3: with every finished job delivered at the upgrade, nothing is noted for the history, and the
+// first completion after it is a new epoch with its note.
+func TestIdlePickUpgradeHistoryIsNotNoted(t *testing.T) {
+	f := newIdleFixture(t)
+	f.m.Cfg.IdlePick.Enabled = false
+	f.finish(t, 0)
+	f.notify(t, 1)
+	m2 := resetIdleSchema(t, f.m, f.now)
+	m2.Cfg.IdlePick.Enabled = true
+	for _, sec := range []int{2, 3600} {
+		notifyAt(t, m2, f.now, f.t0.Add(time.Duration(sec)*time.Second))
+	}
+	if got := tmuxLines(t, f.logf); len(got) != 1 {
+		t.Fatalf("history produced a delivery: %q", got)
+	}
+	finishAt(t, m2, f.now, f.t0.Add(2*time.Hour), nil)
+	notifyAt(t, m2, f.now, f.t0.Add(2*time.Hour+time.Second))
+	if got := tmuxLines(t, f.logf); len(got) != 2 || !strings.Contains(got[1], " · idle: ") {
+		t.Fatalf("first completion after the upgrade: %q", got)
 	}
 }
 
@@ -517,7 +516,7 @@ func failIdleWrites(t *testing.T, m *Manager, fail bool) {
 
 // #165 F4: a note whose bookkeeping cannot be written is not forgotten: the job stays pending (the
 // line is retried like any failed acknowledgement), and once the write works the note is recorded with
-// the job's mark in one step, so a restart or the recovery scan never says it a second time.
+// the job's mark in one step, so a restart never says it a second time.
 func TestIdlePickPersistenceFailureKeepsAcknowledgement(t *testing.T) {
 	f := newIdleFixture(t)
 	failIdleWrites(t, f.m, true)
@@ -541,9 +540,6 @@ func TestIdlePickPersistenceFailureKeepsAcknowledgement(t *testing.T) {
 	m2 := reopenForIdle(t, f.m, f.now)
 	for _, sec := range []int{3, 7 * 3600, 30 * 3600} {
 		*f.now = f.t0.Add(time.Duration(sec) * time.Second)
-		if err := m2.idleRecovery(); err != nil {
-			t.Fatal(err)
-		}
 		if err := m2.notifyPending(); err != nil {
 			t.Fatal(err)
 		}
@@ -553,20 +549,47 @@ func TestIdlePickPersistenceFailureKeepsAcknowledgement(t *testing.T) {
 	}
 }
 
-// #165: recovery_scan_seconds -1 turns the scan off.
-func TestIdlePickRecoveryOff(t *testing.T) {
+// #165 F4: the note's metadata is saved before typing and the retry acknowledges that record, never a
+// recomputation. The note is typed, the acknowledgement fails, the daemon restarts, a job is enqueued,
+// the line is retried: the note still counts for the cooldown, so the next epoch inside it carries none.
+func TestIdlePickRetryAcknowledgesStoredNote(t *testing.T) {
 	f := newIdleFixture(t)
-	f.m.Cfg.IdlePick.Enabled = false
-	f.finish(t, 0)
-	f.notify(t, 1)
-	f.m.Cfg.IdlePick.Enabled = true
-	f.m.Cfg.IdlePick.RecoveryScanSeconds = -1
-	*f.now = f.t0.Add(10 * time.Hour)
-	if err := f.m.idleRecovery(); err != nil {
+	failIdleWrites(t, f.m, true)
+	j := f.finish(t, 0)
+	*f.now = f.t0.Add(time.Second)
+	if err := f.m.notifyPending(); err == nil {
+		t.Fatal("the acknowledgement failure was swallowed")
+	}
+	if got := tmuxLines(t, f.logf); len(got) != 1 || !strings.Contains(got[0], " · idle: ") {
+		t.Fatalf("first attempt: %q", got)
+	}
+	epoch, err := f.m.Store.FinishSeq()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := tmuxLines(t, f.logf); len(got) != 1 {
-		t.Fatalf("scan ran while off: %q", got)
+	if rec, err := f.m.Store.IdleDeliveryFor(j.ID); err != nil || rec == nil || rec.Epoch != epoch || !strings.HasPrefix(rec.Note, "idle: ") {
+		t.Fatalf("delivery record before the retry: %+v %v", rec, err)
+	}
+	failIdleWrites(t, f.m, false)
+	m2 := reopenForIdle(t, f.m, f.now)
+	late := enqueue(t, m2, "late", nil) // the queue is no longer empty when the line is retried
+	notifyAt(t, m2, f.now, f.t0.Add(2*time.Second))
+	if got := get(t, m2, j.ID); got.NotifiedAt == nil {
+		t.Fatal("retry did not acknowledge the line")
+	}
+	if n, err := m2.Store.LastIdlePickEpoch(store.IdleNote); err != nil || n != epoch {
+		t.Fatalf("the delivered note was not recorded: epoch %d, want %d (%v)", n, epoch, err)
+	}
+	if rec, err := m2.Store.IdleDeliveryFor(j.ID); err != nil || rec != nil {
+		t.Fatalf("delivery record kept after the acknowledgement: %+v %v", rec, err)
+	}
+	if err := m2.Cancel(late.ID); err != nil {
+		t.Fatal(err)
+	}
+	notifyAt(t, m2, f.now, f.t0.Add(4*time.Second))
+	got := tmuxLines(t, f.logf)
+	if len(got) != 3 || strings.Contains(got[1], "idle:") || strings.Contains(got[2], "idle:") {
+		t.Fatalf("lines after the retry (no note on a busy queue, none inside the cooldown): %q", got)
 	}
 }
 
@@ -576,7 +599,6 @@ func TestIdlePickConfig(t *testing.T) {
 		`{"idle_pick": {"cooldown_seconds": -1}}`,
 		`{"idle_pick": {"max_wakes_per_day": -1}}`,
 		`{"idle_pick": {"max_wakes_per_day": 1000}}`,
-		`{"idle_pick": {"recovery_scan_seconds": -2}}`,
 	} {
 		if _, err := loadConfigBody(t, body); err == nil || !strings.Contains(err.Error(), "idle_pick.") {
 			t.Fatalf("%s: %v", body, err)
@@ -584,11 +606,11 @@ func TestIdlePickConfig(t *testing.T) {
 	}
 	c, err := loadConfigBody(t, `{}`)
 	if err != nil || c.IdlePick.Enabled || c.IdlePick.Cooldown() != DefaultIdleCooldown ||
-		c.IdlePick.MaxWakes() != DefaultIdleMaxWakes || c.IdlePick.RecoveryEvery() != DefaultIdleRecovery {
+		c.IdlePick.MaxWakes() != DefaultIdleMaxWakes {
 		t.Fatalf("defaults: %+v %v", c.IdlePick, err)
 	}
-	c, err = loadConfigBody(t, `{"idle_pick": {"enabled": true, "cooldown_seconds": 30, "max_wakes_per_day": 3, "recovery_scan_seconds": -1}}`)
-	if err != nil || !c.IdlePick.Enabled || c.IdlePick.Cooldown() != 30*time.Second || c.IdlePick.MaxWakes() != 3 || c.IdlePick.RecoveryEvery() != 0 {
+	c, err = loadConfigBody(t, `{"idle_pick": {"enabled": true, "cooldown_seconds": 30, "max_wakes_per_day": 3}}`)
+	if err != nil || !c.IdlePick.Enabled || c.IdlePick.Cooldown() != 30*time.Second || c.IdlePick.MaxWakes() != 3 {
 		t.Fatalf("values: %+v %v", c.IdlePick, err)
 	}
 }

@@ -14,12 +14,6 @@ const (
 	IdleEval = "eval"
 	// IdleNote: the idle note rode on a job-done delivery.
 	IdleNote = "note"
-	// IdleSuppressed: ready work was found but the cooldown or the daily cap held the note back; the
-	// epoch stays unevaluated, so the recovery scan looks at it again.
-	IdleSuppressed = "suppressed"
-	// IdleScan: a recovery scan ran (whatever it found); spaces the scans. A scan that finds ready work
-	// puts the last finished job's line back on the job-done delivery (RearmLastNotified); it never types.
-	IdleScan = "scan"
 )
 
 // idlePickSchema is applied on every Open (CREATE … IF NOT EXISTS): an older database gains the tables
@@ -39,7 +33,12 @@ CREATE TABLE IF NOT EXISTS idle_pick_seq (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
 	n  INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO idle_pick_seq (id, n) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS idle_pick_delivery (
+	id    INTEGER PRIMARY KEY CHECK (id = 1),
+	batch TEXT NOT NULL,
+	epoch INTEGER NOT NULL,
+	note  TEXT NOT NULL
+);
 CREATE TRIGGER IF NOT EXISTS idle_pick_job_ended AFTER UPDATE OF status ON jobs
 WHEN OLD.status IN ('queued','running','stopped') AND NEW.status NOT IN ('queued','running','stopped')
 BEGIN
@@ -133,38 +132,84 @@ func (s *Store) MarkNotifiedBatch(ids []string, now time.Time, idle *IdleMark) e
 			return err
 		}
 	}
+	if _, err := tx.Exec(`DELETE FROM idle_pick_delivery`); err != nil {
+		return fmt.Errorf("clear idle delivery: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mark notified: %w", err)
 	}
 	return nil
 }
 
-// RearmLastNotified puts the line of the latest delivered job back on the job-done delivery (the job is
-// pending again) and returns its id; "" when there is none. An owner-waits job is never re-armed: its
-// line is tied to an owner reply. The recovery scan uses it so that a missed idle note rides a job-done
-// line instead of a line of its own.
-func (s *Store) RearmLastNotified() (string, error) {
-	tx, err := s.db.Begin()
+// IdleDelivery is the record of the idle note a job-done delivery is about to type: saved before the
+// keystrokes, read back by a retry of the same delivery, deleted with its acknowledgement.
+type IdleDelivery struct {
+	Batch string // the delivery's job ids, sorted, comma-joined
+	Epoch int64
+	Note  string
+}
+
+// SaveIdleDelivery stores the record of the delivery being typed, replacing any older one (a delivery
+// is typed one at a time, so at most one is in flight).
+func (s *Store) SaveIdleDelivery(d IdleDelivery) error {
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO idle_pick_delivery (id, batch, epoch, note) VALUES (1, ?, ?, ?)`,
+		d.Batch, d.Epoch, d.Note); err != nil {
+		return fmt.Errorf("save idle delivery: %w", err)
+	}
+	return nil
+}
+
+// IdleDeliveryFor returns the saved record when it belongs to the delivery of batch (nil: none).
+func (s *Store) IdleDeliveryFor(batch string) (*IdleDelivery, error) {
+	var d IdleDelivery
+	err := s.db.QueryRow(`SELECT batch, epoch, note FROM idle_pick_delivery WHERE id = 1 AND batch = ?`, batch).
+		Scan(&d.Batch, &d.Epoch, &d.Note)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return "", fmt.Errorf("rearm notify: %w", err)
+		return nil, fmt.Errorf("read idle delivery: %w", err)
+	}
+	return &d, nil
+}
+
+// migrateIdlePickSeq starts the queue epoch counter on a database that has no counter row yet (one that
+// predates idle pick, or has just been created): the counter begins at the number of jobs that already
+// ended, and an evaluation event covers all of them, so history is never noted. The exception is a
+// completion whose job-done line is still pending: its epoch is left open, so it gets its note on its
+// own line after the upgrade. The row and the event are written in one transaction.
+func migrateIdlePickSeq(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var id string
-	err = tx.QueryRow(`SELECT id FROM jobs WHERE finished_at IS NOT NULL AND notified_at IS NOT NULL AND owner_waits = 0
-		AND status NOT IN ('queued','running','stopped') ORDER BY finished_at DESC, rowid DESC LIMIT 1`).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
+	res, err := tx.Exec(`INSERT OR IGNORE INTO idle_pick_seq (id, n)
+		SELECT 1, COUNT(*) FROM jobs WHERE status NOT IN ('queued','running','stopped')`)
 	if err != nil {
-		return "", fmt.Errorf("rearm notify: %w", err)
+		return err
 	}
-	if _, err := tx.Exec(`UPDATE jobs SET notified_at = NULL WHERE id = ?`, id); err != nil {
-		return "", fmt.Errorf("rearm notify: %w", err)
+	if inserted, err := res.RowsAffected(); err != nil || inserted == 0 {
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("rearm notify: %w", err)
+	var covered int64
+	if err := tx.QueryRow(`SELECT n FROM idle_pick_seq WHERE id = 1`).Scan(&covered); err != nil {
+		return err
 	}
-	return id, nil
+	var pending bool
+	if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM jobs WHERE status NOT IN ('queued','running','stopped')
+		AND notified_at IS NULL)`).Scan(&pending); err != nil {
+		return err
+	}
+	if pending {
+		covered--
+	}
+	if covered > 0 {
+		if err := addIdlePickEvent(tx, IdleEval, time.Now(), covered); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // LastIdlePickEvent returns the time of the latest event of any of the kinds (nil when none).

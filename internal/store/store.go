@@ -420,6 +420,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate db: idle pick: %w", err)
 		}
 	}
+	if err := migrateIdlePickSeq(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: idle pick: %w", err)
+	}
 	if _, err := db.Exec(waiversSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: checklist waivers: %w", err)
