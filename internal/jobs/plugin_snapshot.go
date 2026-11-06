@@ -323,6 +323,12 @@ func (s *pluginSnapshot) copyEntry(dfd int, name, dst, rel string, depth int) er
 	if now.Mode&unix.S_IFMT == unix.S_IFDIR {
 		return s.copyDir(f, dst, rel, depth+1)
 	}
+	// A file with several links may be a second name for a file the plugin could not read (#192): checked
+	// on the opened descriptor, before any byte is read.
+	if now.Nlink > 1 {
+		s.leaveOut(rel, "a hard link (a view copies files with one link only)")
+		return nil
+	}
 	if now.Size > maxViewFileBytes {
 		return fmt.Errorf("%s: exceeds %d bytes", rel, maxViewFileBytes)
 	}

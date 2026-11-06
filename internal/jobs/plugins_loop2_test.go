@@ -270,10 +270,6 @@ func TestPluginViewIsDetachedSnapshot(t *testing.T) {
 	if err := os.Symlink(filepath.Join(outside, "file.md"), filepath.Join(dir, "commands", "file.md")); err != nil {
 		t.Fatal(err)
 	}
-	// A hardlinked file is copied like any other.
-	if err := os.Link(filepath.Join(dir, "skills", "using-x", "SKILL.md"), filepath.Join(dir, "skills", "using-x", "copy.md")); err != nil {
-		t.Fatal(err)
-	}
 	for _, allowHooks := range []bool{false, true} {
 		m.Cfg.JobPlugins = []JobPlugin{{Path: dir, AllowHooks: allowHooks}}
 		j := runToEnd(t, m, enqueue(t, m, "x", nil).ID)
@@ -288,9 +284,6 @@ func TestPluginViewIsDetachedSnapshot(t *testing.T) {
 			if strings.Contains(body, "LINKED_MARKER") {
 				t.Errorf("allow_hooks=%v: the snapshot exposes %s through a symlink", allowHooks, rel)
 			}
-		}
-		if !strings.Contains(files[filepath.FromSlash("skills/using-x/copy.md")], "USING_X_BOOTSTRAP_MARKER") {
-			t.Errorf("allow_hooks=%v: the hardlinked file was not copied", allowHooks)
 		}
 		_, hooksKept := files[filepath.FromSlash("hooks/hooks.json")]
 		if hooksKept != allowHooks {
@@ -311,6 +304,95 @@ func TestPluginViewIsDetachedSnapshot(t *testing.T) {
 		}
 		writeTree(t, dir, map[string]string{"skills/using-x/SKILL.md": "---\nname: using-x\ndescription: bootstrap\n---\n\nUSING_X_BOOTSTRAP_MARKER: check skills first.\n"})
 		writeTree(t, outside, map[string]string{"linked/SKILL.md": "---\nname: linked\n---\nLINKED_MARKER\n", "file.md": "---\nname: f\n---\nLINKED_MARKER\n"})
+	}
+}
+
+// #192: a hardlink planted in a plugin must not carry a file the plugin could not read into the job.
+// The sentinel stands for a --no-read file of the daemon; it is linked from outside the plugin into
+// a skill file, a markdown command and a data file, and neither mode of allow_hooks may copy it.
+func TestPluginViewRefusesHardlinkedFiles(t *testing.T) {
+	m := newManager(t)
+	dir := makePlugin(t, "px", "1.0.0", nil)
+	// Same filesystem as the plugin, outside it (both live under the test temp dirs).
+	forbidden := filepath.Join(t.TempDir(), "forbidden.txt")
+	if err := os.WriteFile(forbidden, []byte("FORBIDDEN_SENTINEL_192"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{"skills/using-x/data.txt", "skills/using-x/extra.md", "commands/c.md"} {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(forbidden, p); err != nil {
+			t.Skipf("hardlinks unavailable: %v", err)
+		}
+	}
+	for _, allowHooks := range []bool{false, true} {
+		view := filepath.Join(t.TempDir(), "view")
+		warns, err := buildPluginView(snapshotSource(t, m, JobPlugin{Path: dir, AllowHooks: allowHooks}), view, !allowHooks)
+		if err != nil {
+			t.Fatalf("allow_hooks=%v: %v", allowHooks, err)
+		}
+		for rel, body := range reachable(t, view) {
+			if strings.Contains(body, "FORBIDDEN_SENTINEL_192") {
+				t.Errorf("allow_hooks=%v: the snapshot carries a hardlinked file as %s", allowHooks, rel)
+			}
+		}
+		if got := reachable(t, view)[filepath.FromSlash("skills/using-x/SKILL.md")]; !strings.Contains(got, "USING_X_BOOTSTRAP_MARKER") {
+			t.Errorf("allow_hooks=%v: an unrelated file was lost with the hardlinks", allowHooks)
+		}
+		joined := strings.Join(warns, "\n")
+		for _, rel := range []string{"skills/using-x/data.txt", "skills/using-x/extra.md", "commands/c.md"} {
+			if !strings.Contains(joined, filepath.FromSlash(rel)) || !strings.Contains(joined, "hard link") {
+				t.Errorf("allow_hooks=%v: no hard-link warning for %s: %q", allowHooks, rel, warns)
+			}
+		}
+	}
+}
+
+// #192: the manifest and the bootstrap skill are read under the same rule: a hardlinked file is
+// refused, not read.
+func TestPluginManifestAndBootstrapRefuseHardlinks(t *testing.T) {
+	m := newManager(t)
+	forbidden := filepath.Join(t.TempDir(), "forbidden.json")
+	if err := os.WriteFile(forbidden, []byte(`{"name":"FORBIDDEN_SENTINEL_192"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manifest.
+	dir := makePlugin(t, "px", "1.0.0", nil)
+	man := filepath.Join(dir, ".claude-plugin", "plugin.json")
+	if err := os.Remove(man); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(forbidden, man); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	if ps, err := m.findPlugin(JobPlugin{Path: dir}); err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Errorf("a hardlinked manifest was read: %v (source %v)", err, ps)
+	}
+
+	// Bootstrap skill.
+	dir = makePlugin(t, "py", "1.0.0", nil)
+	skill := filepath.Join(dir, "skills", "using-x", "SKILL.md")
+	if err := os.Remove(skill); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(forbidden, skill); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := readBootstrap(dir, "using-x"); err == nil || !strings.Contains(err.Error(), "hard link") || text != "" {
+		t.Errorf("a hardlinked bootstrap was read: %q, %v", text, err)
+	}
+	// The same file with one link is read.
+	if err := os.Remove(skill); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skill, []byte("---\nname: using-x\n---\nPLAIN_OK\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if text, err := readBootstrap(dir, "using-x"); err != nil || !strings.Contains(text, "PLAIN_OK") {
+		t.Errorf("a plain bootstrap was refused: %q, %v", text, err)
 	}
 }
 

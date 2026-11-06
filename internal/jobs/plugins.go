@@ -12,6 +12,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -205,7 +207,7 @@ func (m *Manager) JobPlugins(j *store.Job) ([]PluginView, []string) {
 
 // readUnder reads root/rel, a regular file of at most max bytes. Only root (the trusted plugin or
 // config directory) has its symlinks resolved; every component of rel below it is opened without
-// following a symlink (openAbsoluteSource), so a linked directory inside cannot lead outside.
+// following a symlink (openAbsoluteSource), so a linked directory inside cannot lead outside. A file with more than one hard link is refused.
 func readUnder(root, rel string, max int64) ([]byte, error) {
 	r, err := filepath.EvalSymlinks(root)
 	if err != nil {
@@ -216,14 +218,18 @@ func readUnder(root, rel string, max int64) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return nil, err
 	}
-	if !fi.Mode().IsRegular() {
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, errors.New("not a regular file")
 	}
-	if fi.Size() > max {
+	// Checked on the opened descriptor, before any byte is read (#192).
+	if st.Nlink > 1 {
+		return nil, errors.New("a hard link (a file with several links is not read)")
+	}
+	if st.Size > max {
 		return nil, fmt.Errorf("exceeds %d bytes", max)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, max+1))
