@@ -111,8 +111,14 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		g.Stderr = os.Stderr
 	}
 	out := &gateStdout{w: g.Stdout}
-	g.Stdout = out
 	defer func() { out.marker(code) }()
+	// A file (the CLI's stdout) goes to the command as is: os/exec then copies nothing, so a reader that
+	// stops reading blocks only the command, which the timeout ends, never cmd.Wait and with it the lock.
+	// What the command wrote last is unknown then, so the marker always gets a separator newline.
+	_, direct := g.Stdout.(*os.File)
+	if !direct {
+		g.Stdout = out
+	}
 	fail := func(format string, a ...any) int {
 		fmt.Fprintf(g.Stderr, "gate: "+format+"\n", a...)
 		return GateExitRunner
@@ -164,6 +170,9 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
 
 	start := time.Now()
+	if direct {
+		out.unknownEnd()
+	}
 	code = runGateCmd(ctx, g)
 	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, time.Since(start).Round(time.Millisecond))
 	if moved := assertGateHead(g, want, "after the run"); moved != 0 && code == 0 {
@@ -279,9 +288,9 @@ func openGateLock(path string) (*os.File, error) {
 	return nil, fmt.Errorf("%s keeps appearing and disappearing", path)
 }
 
-// gateStdout carries the command's stdout and the exit= marker; it remembers whether the last byte
-// written ended a line, so the marker always starts a line of its own. A failed write (the reader went
-// away) drops the rest instead of failing, so the command never blocks on a full pipe.
+// gateStdout carries the exit= marker and, when stdout is no file, the command's stdout; it remembers
+// whether the last byte written ended a line, so the marker always starts a line of its own. A failed
+// write (the reader went away) drops the rest instead of failing.
 type gateStdout struct {
 	mu      sync.Mutex
 	w       io.Writer
@@ -303,6 +312,13 @@ func (s *gateStdout) Write(p []byte) (int, error) {
 		s.broken = true
 	}
 	return len(p), nil
+}
+
+// unknownEnd records output written past s (the command's own fd): the marker then starts with a newline.
+func (s *gateStdout) unknownEnd() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.midLine = true
 }
 
 // marker writes exit=<code> as the last line, after a newline when the output so far did not end one.

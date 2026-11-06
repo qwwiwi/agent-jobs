@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,6 +254,24 @@ func TestRunGateExitMarkerAfterUnterminatedOutput(t *testing.T) {
 	if code != 0 || out != "a\nexit=0\n" {
 		t.Fatalf("terminated: code %d, out %q", code, out)
 	}
+	// A file as stdout (the CLI) gets the command's output directly: the marker always follows a newline.
+	for _, c := range []struct{ arg, want string }{{"hello", "hello\nexit=0\n"}, {`a\n`, "a\n\nexit=0\n"}} {
+		f, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e bytes.Buffer
+		code := RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute,
+			Env: os.Environ(), Argv: []string{"printf", c.arg}, Stdout: f, Stderr: &e})
+		f.Close()
+		b, err := os.ReadFile(f.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code != 0 || string(b) != c.want {
+			t.Fatalf("file stdout %q: code %d, out %q, want %q", c.arg, code, b, c.want)
+		}
+	}
 }
 
 // The default gate lock is one file per box: it does not follow the agent-jobs state root (#134 fix loop).
@@ -349,5 +368,60 @@ func TestOpenGateLockShared(t *testing.T) {
 	if f, err := openGateLock(fifo); err == nil {
 		f.Close()
 		t.Fatal("a fifo lock was opened")
+	}
+}
+
+// A caller that keeps its stdout pipe open but stops reading never keeps the box lock: the command
+// blocks on the full pipe, the timeout ends it and the lock is free for the next gate before anyone
+// reads the first gate's output again (#134 fix loop 2).
+func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	first := make(chan int, 1)
+	var firstErr lockedBuffer
+	go func() {
+		defer w.Close()
+		// Far more than a pipe holds (64 KiB on Linux), then it would end on its own.
+		first <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: 500 * time.Millisecond,
+			Env: os.Environ(), Argv: []string{"/bin/sh", "-c", "head -c 1048576 /dev/zero; sleep 0.2"}, Stdout: w, Stderr: &firstErr})
+	}()
+	// Wait until the first gate holds the lock (it wrote the holder line).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if b, _ := os.ReadFile(lock); len(b) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the first gate never took the lock: %q", firstErr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The first gate's stdout stays unread meanwhile.
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 15 * time.Second,
+		Argv: []string{"true"}})
+	// Resume the first gate's reader in any case, so its goroutine ends.
+	got := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		got <- string(b)
+	}()
+	if code != 0 || lastLine(out) != "exit=0" {
+		t.Fatalf("second gate behind an unread first gate: code %d, out %q, err %q (first: %q)", code, out, errs,
+			firstErr.String())
+	}
+	select {
+	case c := <-first:
+		if c != GateExitTimeout {
+			t.Fatalf("first gate exited %d, want %d: %q", c, GateExitTimeout, firstErr.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first gate did not end after its reader resumed")
+	}
+	if o := <-got; !strings.HasSuffix(o, "\nexit=124\n") {
+		t.Fatalf("first gate's output does not end with the marker line: ...%q", o[max(0, len(o)-40):])
 	}
 }
