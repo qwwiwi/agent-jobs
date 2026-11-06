@@ -2,7 +2,10 @@ package jobs
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -282,7 +285,7 @@ func TestIdlePickDailyCap(t *testing.T) {
 }
 
 // #165: the recovery scan finds an epoch whose delivery never got an idle evaluation (idle pick was
-// off then) and says it once as a line of its own; later scans, and a queue that is not empty, say nothing.
+// off then); a queue that is not empty says nothing, and the cancelled job's own line carries the note.
 func TestIdlePickRecoveryScanBusyQueue(t *testing.T) {
 	f := newIdleFixture(t)
 	f.m.Cfg.IdlePick.Enabled = false
@@ -310,28 +313,243 @@ func TestIdlePickRecoveryScanBusyQueue(t *testing.T) {
 	}
 }
 
-func TestIdlePickRecoveryScanOwnLine(t *testing.T) {
+// #165 F1: the recovery scan never types a line of its own. A missed epoch with ready work is put back
+// on the job-done delivery path: the last finished job's line is delivered again, carrying the note.
+func TestIdlePickRecoveryScanRidesJobDone(t *testing.T) {
 	f := newIdleFixture(t)
 	f.m.Cfg.IdlePick.Enabled = false
-	f.finish(t, 0)
+	j := f.finish(t, 0)
 	f.notify(t, 1)
 	f.m.Cfg.IdlePick.Enabled = true
 	*f.now = f.t0.Add(2 * time.Minute)
 	if err := f.m.idleRecovery(); err != nil {
 		t.Fatal(err)
 	}
+	if got := tmuxLines(t, f.logf); len(got) != 1 {
+		t.Fatalf("the scan typed a line of its own: %q", got)
+	}
+	f.notify(t, 121) // the next delivery tick
 	got := tmuxLines(t, f.logf)
-	if len(got) != 2 || !strings.HasPrefix(got[1], "[jobs:idle] idle: 2 ready tasks: ") {
-		t.Fatalf("recovery line: %q", got)
+	head := f.m.DoneLineFor(get(t, f.m, j.ID))
+	if len(got) != 2 || !strings.HasPrefix(got[1], "[jobs:job-done] ") || strings.Contains(got[1], "[jobs:idle]") ||
+		!strings.HasPrefix(got[1], head+" · idle: 2 ready tasks: ") {
+		t.Fatalf("recovery delivery: %q", got)
 	}
 	for _, d := range []time.Duration{3 * time.Minute, 7 * time.Hour, 30 * time.Hour} {
 		*f.now = f.t0.Add(d)
 		if err := f.m.idleRecovery(); err != nil {
 			t.Fatal(err)
 		}
+		f.notify(t, int(d/time.Second))
 	}
 	if got := tmuxLines(t, f.logf); len(got) != 2 {
 		t.Fatalf("scanned epoch said again: %q", got)
+	}
+}
+
+// #165 F1: a scan that finds nothing ready re-delivers nothing and spends the epoch.
+func TestIdlePickRecoveryScanNothingReady(t *testing.T) {
+	m := newManager(t)
+	logf := notifyTo(t, m)
+	now := coalesceClock(m)
+	t0 := *now
+	finishAt(t, m, now, t0, nil)
+	notifyAt(t, m, now, t0.Add(time.Second))
+	m.Cfg.IdlePick.Enabled = true
+	for _, d := range []time.Duration{time.Minute, 7 * time.Hour, 14 * time.Hour} {
+		*now = t0.Add(d)
+		if err := m.idleRecovery(); err != nil {
+			t.Fatal(err)
+		}
+		notifyAt(t, m, now, t0.Add(d+time.Second))
+	}
+	if got := tmuxLines(t, logf); len(got) != 1 {
+		t.Fatalf("lines: %q", got)
+	}
+}
+
+// gateTmux installs a fake tmux that logs its keystrokes like the default one and can be held: while
+// <dir>/hold-probe exists the pane-mode probe (display-message) waits for <dir>/release, and while
+// <dir>/hold-send exists the first send-keys waits for it too. <dir>/waiting names what is waiting.
+func gateTmux(t *testing.T) (dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	t.Setenv("FAKE_TMUX_LOG", filepath.Join(dir, "tmux.log"))
+	script := fmt.Sprintf(`#!/bin/bash
+for a in "$@"; do
+  if [[ $a == display-message ]]; then
+    if [[ -e %[1]s/hold-probe ]]; then echo probe > %[1]s/waiting; while [[ ! -e %[1]s/release ]]; do sleep 0.02; done; fi
+    echo 0
+    exit 0
+  fi
+done
+if [[ $2 == -t && $4 == -l && -e %[1]s/hold-send ]]; then echo send > %[1]s/waiting; while [[ ! -e %[1]s/release ]]; do sleep 0.02; done; fi
+printf '%%s|' "$@" >> "$FAKE_TMUX_LOG"
+printf '\n' >> "$FAKE_TMUX_LOG"
+`, dir)
+	bin := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_JOBS_TMUX_BIN", bin)
+	return dir
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	for i := 0; i < 500; i++ {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s never appeared", path)
+}
+
+// #165 F2: a job enqueued while the delivery waits on tmux (the pane-mode probe, after the final-check
+// window the old hook covered) still cancels the note.
+func TestIdlePickEnqueueDuringTmuxWaitCancelsNote(t *testing.T) {
+	f := newIdleFixture(t)
+	dir := gateTmux(t)
+	f.logf = filepath.Join(dir, "tmux.log")
+	if err := os.WriteFile(filepath.Join(dir, "hold-probe"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	j := f.finish(t, 0)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		*f.now = f.t0.Add(time.Second)
+		if err := f.m.notifyPending(); err != nil {
+			t.Error(err)
+		}
+	}()
+	waitForFile(t, filepath.Join(dir, "waiting"))
+	late := enqueue(t, f.m, "late", nil)
+	if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	got := tmuxLines(t, f.logf)
+	if len(got) != 1 || got[0] != f.m.DoneLineFor(get(t, f.m, j.ID)) {
+		t.Fatalf("stale note typed with job %s queued: %q", late.ID, got)
+	}
+}
+
+// #165 F2: an enqueue that comes while the note is being typed waits for the keystrokes, so the note
+// never lands after the job it was cancelled by.
+func TestIdlePickEnqueueWaitsForTypedNote(t *testing.T) {
+	f := newIdleFixture(t)
+	dir := gateTmux(t)
+	f.logf = filepath.Join(dir, "tmux.log")
+	if err := os.WriteFile(filepath.Join(dir, "hold-send"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.finish(t, 0)
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		*f.now = f.t0.Add(time.Second)
+		if err := f.m.notifyPending(); err != nil {
+			t.Error(err)
+		}
+	}()
+	waitForFile(t, filepath.Join(dir, "waiting"))
+	enqueued := make(chan struct{})
+	go func() {
+		defer close(enqueued)
+		enqueue(t, f.m, "late", nil)
+	}()
+	select {
+	case <-enqueued:
+		t.Fatal("enqueue committed while the idle note was being typed")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := os.WriteFile(filepath.Join(dir, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	<-delivered
+	<-enqueued
+	if got := tmuxLines(t, f.logf); len(got) != 1 || !strings.Contains(got[0], " · idle: ") {
+		t.Fatalf("lines: %q", got)
+	}
+}
+
+// #165 F3: Unix-second stamps must not merge epochs: a job enqueued and cancelled in the very second
+// the previous epoch was evaluated is a new epoch, and its delivery carries the note after the cooldown.
+func TestIdlePickSameSecondEpochsStaySeparate(t *testing.T) {
+	f := newIdleFixture(t)
+	f.finish(t, 0)
+	f.notify(t, 1) // epoch 1 evaluated and noted at t0+1s
+	f.finish(t, 1) // epoch 2: enqueued and cancelled in that same second
+	f.notify(t, 3600)
+	got := tmuxLines(t, f.logf)
+	if len(got) != 2 || !strings.Contains(got[1], " · idle: 2 ready tasks: ") {
+		t.Fatalf("second epoch lost its note: %q", got)
+	}
+	// The same after a restart between the epochs: a later epoch past the cooldown is noted once.
+	m2 := reopenForIdle(t, f.m, f.now)
+	finishAt(t, m2, f.now, f.t0.Add(2*time.Hour), nil)
+	notifyAt(t, m2, f.now, f.t0.Add(2*time.Hour+time.Second))
+	notifyAt(t, m2, f.now, f.t0.Add(2*time.Hour+2*time.Second))
+	if got := tmuxLines(t, f.logf); len(got) != 3 || !strings.Contains(got[2], " · idle: ") {
+		t.Fatalf("third epoch after a restart: %q", got)
+	}
+}
+
+// failIdleWrites makes every insert into the idle_pick_events table fail (or, with fail false, work
+// again) from a second connection to the daemon's database.
+func failIdleWrites(t *testing.T, m *Manager, fail bool) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(m.StateDir, "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	q := `DROP TRIGGER IF EXISTS fail_idle_events`
+	if fail {
+		q = `CREATE TRIGGER fail_idle_events BEFORE INSERT ON idle_pick_events BEGIN SELECT RAISE(ABORT, 'disk full'); END`
+	}
+	if _, err := db.Exec(q); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #165 F4: a note whose bookkeeping cannot be written is not forgotten: the job stays pending (the
+// line is retried like any failed acknowledgement), and once the write works the note is recorded with
+// the job's mark in one step, so a restart or the recovery scan never says it a second time.
+func TestIdlePickPersistenceFailureKeepsAcknowledgement(t *testing.T) {
+	f := newIdleFixture(t)
+	failIdleWrites(t, f.m, true)
+	j := f.finish(t, 0)
+	*f.now = f.t0.Add(time.Second)
+	if err := f.m.notifyPending(); err == nil || !strings.Contains(err.Error(), "idle pick event") {
+		t.Fatalf("the write failure was swallowed: %v", err)
+	}
+	if got := get(t, f.m, j.ID); got.NotifiedAt != nil {
+		t.Fatal("job marked notified although the note could not be recorded")
+	}
+	failIdleWrites(t, f.m, false)
+	f.notify(t, 2)
+	if got := get(t, f.m, j.ID); got.NotifiedAt == nil {
+		t.Fatal("job not marked notified after the write works again")
+	}
+	if at, err := f.m.Store.LastIdlePickEvent(store.IdleNote); err != nil || at == nil {
+		t.Fatalf("note not recorded: %v %v", at, err)
+	}
+	lines := len(tmuxLines(t, f.logf))
+	m2 := reopenForIdle(t, f.m, f.now)
+	for _, sec := range []int{3, 7 * 3600, 30 * 3600} {
+		*f.now = f.t0.Add(time.Duration(sec) * time.Second)
+		if err := m2.idleRecovery(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m2.notifyPending(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tmuxLines(t, f.logf); len(got) != lines {
+		t.Fatalf("delivered epoch said again after a restart: %q", got)
 	}
 }
 
@@ -396,13 +614,17 @@ func TestIdlePickFailedDeliveryRetried(t *testing.T) {
 	}
 }
 
-// #165: a queue epoch evaluated at or after its last finish is spent: a line for a job of that epoch
-// that still comes out adds nothing.
+// #165: a queue epoch that was evaluated (an event covers its epoch number) is spent: a line for a job
+// of that epoch that still comes out adds nothing.
 func TestIdlePickEvaluatedEpochSpent(t *testing.T) {
 	f := newIdleFixture(t)
 	f.m.Cfg.IdlePick.CooldownSeconds = 1 // the cooldown must not be what holds the note back
 	f.finish(t, 0)
-	if err := f.m.Store.AddIdlePickEvent(store.IdleNote, f.t0.Add(5*time.Second)); err != nil {
+	epoch, err := f.m.Store.FinishSeq()
+	if err != nil || epoch == 0 {
+		t.Fatalf("epoch %d %v", epoch, err)
+	}
+	if err := f.m.Store.AddIdlePickEvent(store.IdleNote, f.t0.Add(5*time.Second), epoch); err != nil {
 		t.Fatal(err)
 	}
 	f.notify(t, 10)

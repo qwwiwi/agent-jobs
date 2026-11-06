@@ -786,7 +786,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
 		// again from its own finding when this attempt ends.
 		m.clearNoCommits(id)
-		if err := m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context)); err != nil {
+		if err := m.underIdleLock(func() error {
+			return m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context))
+		}); err != nil {
 			return nil, err
 		}
 		return m.Store.Get(id)
@@ -856,7 +858,7 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
 	// again from its own finding when this attempt ends.
 	m.clearNoCommits(id)
-	return m.Store.Requeue(id, lim, update, "")
+	return m.underIdleLock(func() error { return m.Store.Requeue(id, lim, update, "") })
 }
 
 // neverRan reports whether an attempt ended without claude ever running: its launch was refused or

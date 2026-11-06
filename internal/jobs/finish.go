@@ -410,28 +410,46 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
-	// An emptied queue adds its idle note to this same line (#165), never a line of its own.
-	note := m.idleNote(batch)
-	if note != "" && !m.idleStillEmpty() {
-		note = ""
+	// An emptied queue adds its idle note to this same line (#165), never a line of its own. The note
+	// is only a candidate here: its final check runs inside the tmux delivery, under the idle lock.
+	note, epoch := m.idleNote(batch)
+	var rode bool
+	if note == "" {
+		err = m.sendTmuxLocked(target, line)
+	} else {
+		err = m.withTmuxLock(func(ctx context.Context) error {
+			if err := m.waitPaneOutOfMode(ctx, target); err != nil {
+				return err
+			}
+			var terr error
+			rode, terr = m.typeLineWithNote(ctx, target, line, note, epoch)
+			return terr
+		})
 	}
-	if note != "" {
-		line += " · " + note
-	}
-	if err := m.sendTmuxLocked(target, line); err != nil {
+	if err != nil {
 		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
 		return errors.Is(err, errTmuxTimeout), nil
-	}
-	if note != "" {
-		m.recordIdle(store.IdleNote, m.Now())
 	}
 	for _, j := range batch {
 		if afterDoneLineSent != nil {
 			afterDoneLineSent(j)
 		}
-		if err := m.Store.MarkNotified(j.ID, m.Now()); err != nil {
-			return false, err
-		}
+	}
+	// The acknowledgement of the line and the record of the note it carried are one transaction: if
+	// either cannot be written, the line stays pending and is delivered again (with the note, composed
+	// afresh), instead of a delivered note that nothing remembers.
+	var mark *store.IdleMark
+	if rode {
+		mark = &store.IdleMark{Kind: store.IdleNote, Epoch: epoch}
+	}
+	ids := make([]string, 0, len(batch))
+	for _, j := range batch {
+		ids = append(ids, j.ID)
+	}
+	if err := m.Store.MarkNotifiedBatch(ids, m.Now(), mark); err != nil {
+		return false, err
+	}
+	for _, j := range batch {
 		m.forgetMergeNote(j.ID)
 	}
 	return false, nil
@@ -513,6 +531,12 @@ func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
 	if err := m.waitPaneOutOfMode(ctx, target); err != nil {
 		return err
 	}
+	return m.typeTmux(ctx, target, line)
+}
+
+// typeTmux is the keystrokes of sendTmux: the sanitized line, then Enter, for a pane already out of
+// its tmux mode.
+func (m *Manager) typeTmux(ctx context.Context, target, line string) error {
 	line = tmuxArgEscape(Printable(line, 0))
 	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
 		return fmt.Errorf("tmux send-keys: %w", err)

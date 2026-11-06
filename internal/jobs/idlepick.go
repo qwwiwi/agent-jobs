@@ -2,8 +2,12 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -77,9 +81,59 @@ func (c IdlePickConfig) RecoveryEvery() time.Duration {
 	return DefaultIdleRecovery
 }
 
-// idleBeforeSend, when set (tests only), runs after an idle note was composed and before it is typed:
-// the gap where a job may be enqueued.
+// idleBeforeSend, when set (tests only), runs inside the tmux delivery of a line that carries a note,
+// after the pane is out of its mode and before the final check under the idle lock: a gap where a job
+// may be enqueued.
 var idleBeforeSend func()
+
+// idleLockName is the file under the state dir that serializes the final queue check of an idle note
+// (and the typing of the line it rides) with the insertion of a job into the queue, across processes.
+const idleLockName = "idle.lock"
+
+// takeIdleLock takes <state>/idle.lock (flock), polling until ctx ends. Held by a delivery from its
+// final queue check to the end of its keystrokes, and by Enqueue and Resume only around the insert.
+func (m *Manager) takeIdleLock(ctx context.Context) (release func(), err error) {
+	f, err := os.OpenFile(filepath.Join(m.StateDir, idleLockName), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open idle lock: %w", err)
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			_ = f.Close()
+			return nil, fmt.Errorf("idle lock: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+			return nil, fmt.Errorf("idle lock still held after %s", TmuxDeliveryTimeout)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// underIdleLock runs fn (a job's insertion into the queue) holding the idle lock, so an idle note
+// being checked and typed never races it. The wait is bounded by one tmux delivery: a lock that cannot
+// be had (a stuck holder, an unwritable state dir) is logged and fn runs without it, because a job must
+// never be refused for the sake of a note.
+func (m *Manager) underIdleLock(fn func() error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), TmuxDeliveryTimeout+time.Second)
+	defer cancel()
+	release, err := m.takeIdleLock(ctx)
+	if err != nil {
+		m.Log.Printf("idle pick: queue insert without the idle lock: %s", RedactText(err.Error()))
+		return fn()
+	}
+	defer release()
+	return fn()
+}
 
 // idleWork is what the daemon could tell the orchestrator is ready: tasks of open milestones that
 // have no job yet and whose dependencies are done (TaskStatuses: ready; a task with a job of its own,
@@ -158,105 +212,140 @@ func (w idleWork) text() string {
 }
 
 // idleGate decides whether ready work may be told now. Cooldown and the rolling daily cap count the
-// notes and recovery lines already delivered.
+// notes already delivered.
 func (m *Manager) idleGate(now time.Time) (ok bool, err error) {
 	c := m.Config().IdlePick
-	last, err := m.Store.LastIdlePickEvent(store.IdleNote, store.IdleRecovery)
+	last, err := m.Store.LastIdlePickEvent(store.IdleNote)
 	if err != nil {
 		return false, err
 	}
 	if last != nil && now.Sub(*last) < c.Cooldown() {
 		return false, nil
 	}
-	n, err := m.Store.CountIdlePickEvents(now.Add(-24*time.Hour), store.IdleNote, store.IdleRecovery)
+	n, err := m.Store.CountIdlePickEvents(now.Add(-24*time.Hour), store.IdleNote)
 	if err != nil {
 		return false, err
 	}
 	return n < c.MaxWakes(), nil
 }
 
-// idleNote returns the idle note for the job-done delivery of batch, "" when there is none to add:
-// idle pick is off; a job is still queued, running or stopped, or another job-done line is still to
-// come (the last one carries the note); this queue epoch (everything since the last evaluation) was
-// already evaluated; nothing is ready; or the cooldown or the daily cap holds it back. The note is not
-// recorded here but by idleNoteSent once tmux took the line, so a failed delivery composes it again.
-func (m *Manager) idleNote(batch []*store.Job) string {
+// idleNote returns the idle note for the job-done delivery of batch and the queue epoch it covers, ""
+// when there is none to add: idle pick is off; a job is still queued, running or stopped, or another
+// job-done line is still to come (the last one carries the note); this queue epoch (every job that
+// ended up to now) was already evaluated; nothing is ready; or the cooldown or the daily cap holds it
+// back. The note is not recorded here but, with the acknowledgement of the line, by deliverDone once
+// tmux took the line, so a failed delivery composes it again.
+func (m *Manager) idleNote(batch []*store.Job) (note string, epoch int64) {
 	if !m.Config().IdlePick.Enabled {
-		return ""
+		return "", 0
 	}
 	if n, err := m.Store.CountActive(); err != nil || n > 0 {
 		m.logIdle("queue check", err)
-		return ""
+		return "", 0
+	}
+	// The epoch is read before anything else: a job that ends while the note is composed makes the
+	// final check fail instead of being folded into this epoch.
+	epoch, err := m.Store.FinishSeq()
+	if err != nil {
+		m.logIdle("epoch", err)
+		return "", 0
 	}
 	pending, err := m.Store.PendingNotify()
 	if err != nil {
 		m.logIdle("pending lines", err)
-		return ""
+		return "", 0
 	}
 	inBatch := map[string]bool{}
-	var finished time.Time
 	for _, j := range batch {
 		inBatch[j.ID] = true
-		if j.FinishedAt != nil && j.FinishedAt.After(finished) {
-			finished = *j.FinishedAt
-		}
 	}
 	for _, j := range pending {
 		if !inBatch[j.ID] {
-			return ""
+			return "", 0
 		}
 	}
-	evaluated, err := m.Store.LastIdlePickEvent(store.IdleEval, store.IdleNote, store.IdleRecovery)
+	spent, err := m.idleEpochSpent(epoch)
 	if err != nil {
 		m.logIdle("last evaluation", err)
-		return ""
+		return "", 0
 	}
-	if evaluated != nil && !evaluated.Before(finished) {
-		return ""
+	if spent {
+		return "", 0
 	}
-	return m.idleEvaluate()
+	note, err = m.idleEvaluate(epoch)
+	if err != nil {
+		m.logIdle("evaluation", err)
+		return "", 0
+	}
+	return note, epoch
 }
 
-// idleEvaluate reads the ready work and applies the gate, recording an evaluation that found nothing
-// (the epoch is spent) or one the gate held back (the epoch stays open for the recovery scan). It
-// returns the note, or "".
-func (m *Manager) idleEvaluate() string {
+// idleEpochSpent reports whether queue epoch epoch was already evaluated: an evaluation that found
+// nothing, or a note, covers every epoch up to the one it recorded.
+func (m *Manager) idleEpochSpent(epoch int64) (bool, error) {
+	covered, err := m.Store.LastIdlePickEpoch(store.IdleEval, store.IdleNote)
+	if err != nil {
+		return false, err
+	}
+	return covered >= epoch, nil
+}
+
+// idleEvaluate reads the ready work of queue epoch epoch and applies the gate, recording an evaluation
+// that found nothing (the epoch is spent) or one the gate held back (the epoch stays open for the
+// recovery scan). It returns the note, or "". A failure to read or to record is returned: the epoch
+// then stays open and the next delivery or scan evaluates it again.
+func (m *Manager) idleEvaluate(epoch int64) (string, error) {
 	now := m.Now()
 	w, err := m.idleReadyWork(context.Background())
 	if err != nil {
-		m.logIdle("ready work", err)
-		return ""
+		return "", fmt.Errorf("ready work: %w", err)
 	}
 	if w.empty() {
-		m.recordIdle(store.IdleEval, now)
-		return ""
+		return "", m.Store.AddIdlePickEvent(store.IdleEval, now, epoch)
 	}
 	ok, err := m.idleGate(now)
 	if err != nil {
-		m.logIdle("gate", err)
-		return ""
+		return "", fmt.Errorf("gate: %w", err)
 	}
 	if !ok {
-		m.recordIdle(store.IdleSuppressed, now)
-		return ""
+		return "", m.Store.AddIdlePickEvent(store.IdleSuppressed, now, epoch)
 	}
-	return RedactPrintable(w.text(), 0)
+	return RedactPrintable(w.text(), 0), nil
 }
 
-// idleStillEmpty is the check right before a note is typed: a job enqueued since it was composed
-// cancels it (the epoch goes on, the next queue-empty delivery carries the note).
-func (m *Manager) idleStillEmpty() bool {
+// idleStillEmpty is the check right before a note is typed, under the idle lock: no job is queued,
+// running or stopped and none has ended since the note was composed (it would have a line of its own to
+// carry the note). A job enqueued since cancels the note (the epoch goes on, the next queue-empty
+// delivery carries it).
+func (m *Manager) idleStillEmpty(epoch int64) bool {
+	n, err := m.Store.CountActive()
+	if err != nil || n > 0 {
+		return false
+	}
+	now, err := m.Store.FinishSeq()
+	return err == nil && now == epoch
+}
+
+// typeLineWithNote types line (a job-done line) into target and appends " · note" to it when the note
+// still holds. It runs inside the tmux delivery, so the pane is out of its mode; the final queue check
+// and the keystrokes happen under the idle lock, so no job can be inserted between the check and the
+// typing. rode reports whether the note went out with the line. A lock that cannot be had types the
+// line without the note.
+func (m *Manager) typeLineWithNote(ctx context.Context, target, line, note string, epoch int64) (rode bool, err error) {
 	if idleBeforeSend != nil {
 		idleBeforeSend()
 	}
-	n, err := m.Store.CountActive()
-	return err == nil && n == 0
-}
-
-func (m *Manager) recordIdle(kind string, at time.Time) {
-	if err := m.Store.AddIdlePickEvent(kind, at); err != nil {
-		m.Log.Printf("idle pick: %v", err)
+	release, lerr := m.takeIdleLock(ctx)
+	if lerr != nil {
+		m.logIdle("final check", lerr)
+		return false, m.typeTmux(ctx, target, line)
 	}
+	defer release()
+	if m.idleStillEmpty(epoch) {
+		line += " · " + note
+		rode = true
+	}
+	return rode, m.typeTmux(ctx, target, line)
 }
 
 func (m *Manager) logIdle(what string, err error) {
@@ -265,34 +354,28 @@ func (m *Manager) logIdle(what string, err error) {
 	}
 }
 
-// idleRecoveryLinePrefix starts the line of a recovery scan.
-const idleRecoveryLinePrefix = "[jobs:idle] "
-
 // idleRecovery is the low-frequency recovery scan: a queue-empty transition whose delivery never got
 // an idle evaluation (idle pick was off then, the evaluation failed, the gate held its note back) is
-// not lost. With the queue empty, no line pending and a job finished since the last evaluation, once
-// per recovery_scan_seconds it reads the ready work and, if there is any and the gate allows, types
-// one idle line of its own. It never starts work.
+// not lost. With the queue empty, no line pending and a job ended since the last evaluation, once per
+// recovery_scan_seconds it reads the ready work and, if there is any and the gate allows, puts the last
+// delivered job's line back on the job-done delivery (RearmLastNotified): the next delivery tick types
+// that job-done line with the idle note on it. The scan never types a line of its own, so it is never
+// a separate wake, and it never starts work.
 func (m *Manager) idleRecovery() error {
 	cfg := m.Config()
 	every := cfg.IdlePick.RecoveryEvery()
-	target := cfg.NotifyTmuxTarget
-	if !cfg.IdlePick.Enabled || every == 0 || target == "" {
+	if !cfg.IdlePick.Enabled || every == 0 || cfg.NotifyTmuxTarget == "" {
 		return nil
 	}
 	if n, err := m.Store.CountActive(); err != nil || n > 0 {
 		return err
 	}
-	finished, err := m.Store.LastFinishedAt()
-	if err != nil || finished == nil {
+	epoch, err := m.Store.FinishSeq()
+	if err != nil || epoch == 0 {
 		return err
 	}
-	evaluated, err := m.Store.LastIdlePickEvent(store.IdleEval, store.IdleNote, store.IdleRecovery)
-	if err != nil {
+	if spent, err := m.idleEpochSpent(epoch); err != nil || spent {
 		return err
-	}
-	if evaluated != nil && !evaluated.Before(*finished) {
-		return nil
 	}
 	now := m.Now()
 	scanned, err := m.Store.LastIdlePickEvent(store.IdleScan)
@@ -305,15 +388,24 @@ func (m *Manager) idleRecovery() error {
 	if pending, err := m.Store.PendingNotify(); err != nil || len(pending) > 0 {
 		return err // a line still to come carries the note
 	}
-	note := m.idleEvaluate()
-	m.recordIdle(store.IdleScan, now)
-	if note == "" || !m.idleStillEmpty() {
+	note, err := m.idleEvaluate(epoch)
+	if err != nil {
+		return err
+	}
+	if err := m.Store.AddIdlePickEvent(store.IdleScan, now, epoch); err != nil {
+		return err
+	}
+	if note == "" {
 		return nil
 	}
-	if err := m.sendTmuxLocked(target, idleRecoveryLinePrefix+note); err != nil {
-		m.Log.Printf("idle pick: recovery line not delivered, retry at the next scan: %s", RedactText(err.Error()))
+	id, err := m.Store.RearmLastNotified()
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		m.Log.Printf("idle pick: recovery found ready work but no delivered job to carry the note")
 		return nil
 	}
-	m.recordIdle(store.IdleRecovery, m.Now())
+	m.Log.Printf("idle pick: recovery re-armed the job-done line of job %s to carry the idle note", id)
 	return nil
 }

@@ -378,7 +378,13 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			return nil, cerr
 		}
 		cleanup = c
-		ok, ierr := m.insertQueued(j)
+		// The insert is serialized with the final check of an idle note (#165): a note being typed
+		// never lands after the job that should have cancelled it.
+		var ok bool
+		ierr := m.underIdleLock(func() (err error) {
+			ok, err = m.insertQueued(j)
+			return err
+		})
 		if errors.Is(ierr, store.ErrJobIDExists) && try < idRedraws {
 			cleanup() // the folder of this attempt only; the next candidate owns the cleanup from here
 			cleanup = func() {}
