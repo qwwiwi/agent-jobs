@@ -783,6 +783,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 			}
 			lim = store.ResumeLimits{MaxTurns: t, MaxBudgetUSD: b, TimeoutMinutes: tm}
 		}
+		// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
+		// again from its own finding when this attempt ends.
+		m.clearNoCommits(id)
 		if err := m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context)); err != nil {
 			return nil, err
 		}
@@ -850,6 +853,9 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 		// kept, this one follows.
 		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
 	}
+	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
+	// again from its own finding when this attempt ends.
+	m.clearNoCommits(id)
 	return m.Store.Requeue(id, lim, update, "")
 }
 

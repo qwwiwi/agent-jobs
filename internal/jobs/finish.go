@@ -71,11 +71,13 @@ func LimitsText(j *store.Job) string {
 // whose folder is at least dirNote bytes (Config.JobDirNoteBytes; 0 = never), or too big to measure
 // within the walk's bounds, says how big it is; a resumed attempt
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
+// A coder job that ended fast with no commits over its base carries suspiciousNote (#132).
 // An owner-waits job ends the line with OwnerWaitsMarker.
-func DoneLine(j *store.Job, dirNote int64) string { return doneLine(j, dirNote, "") }
+func DoneLine(j *store.Job, dirNote int64) string { return doneLine(j, dirNote, "", "") }
 
-// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate).
-func doneLine(j *store.Job, dirNote int64, cost string) string {
+// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate) and
+// with suspicious, when it is not empty, marking a fast empty coder job.
+func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 	if cost == "" {
 		cost = CostText(j.CostUSD, j.CostIsUnknown())
 		if j.CostIsUnknown() {
@@ -126,6 +128,9 @@ func doneLine(j *store.Job, dirNote int64, cost string) string {
 	}
 	if j.MergeNote != "" {
 		line += " · " + j.MergeNote
+	}
+	if suspicious != "" {
+		line += " · " + suspicious
 	}
 	if j.OwnerWaits {
 		line += " · " + OwnerWaitsMarker
@@ -228,7 +233,32 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
 		}
 	}
-	return doneLine(j, m.Config().JobDirNoteBytes(), cost)
+	return doneLine(j, m.Config().JobDirNoteBytes(), cost, m.suspiciousNote(j))
+}
+
+// suspiciousFastEmpty is how fast a coder job may finish with no commits of its own before its
+// job-done line flags it: under three minutes almost always means a brief or sandbox mismatch, not
+// finished work (#132).
+const suspiciousFastEmpty = 3 * time.Minute
+
+// suspiciousNote marks a coder job that ended within suspiciousFastEmpty without one commit over
+// its base: kind fix or general (CoderKinds), status succeeded or cancelled — the issue's
+// «blocked», the ending a stopped job or a dropped milestone task gets — and a repository, with
+// the merge check's finding that the head is still the base commit (no extra git call; without a
+// finding there is no note, so a job without a worktree is never flagged on a guess). The minutes
+// are the line's own rounded duration. "" for everything else: never for review or research jobs
+// or a job without a repository, and a job that already failed needs no extra suspicion.
+func (m *Manager) suspiciousNote(j *store.Job) string {
+	if !slices.Contains(CoderKinds, j.Kind) ||
+		(j.Status != store.StatusSucceeded && j.Status != store.StatusCancelled) ||
+		time.Duration(j.DurationSec)*time.Second >= suspiciousFastEmpty ||
+		j.RepoPath == "" {
+		return ""
+	}
+	if no, ok := m.noCommitsOverBase(j); !ok || !no {
+		return ""
+	}
+	return fmt.Sprintf("suspicious: no commits in %dm", (j.DurationSec+30)/60)
 }
 
 // checkMerge records the merge check of a job about to be notified (MergeNote) on its row and on j;
