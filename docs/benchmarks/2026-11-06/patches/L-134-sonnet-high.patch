@@ -1,0 +1,516 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c31f0b0..2466d7f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ ## [Unreleased]
+ 
+ ### Added
++- `scripts/gate.sh`, a serialized gate runner (#134): one heavy local gate (check.sh, a pg suite, a vite build) at a time per box through an flock (`--wait` bounds the queue, exit 75), `--head` asserted against the work tree's HEAD before the wait and once the lock is held (exit 3), a final `exit=<code>` line on every path, the command in its own session with TERM then KILL of the whole process group on `--timeout` (exit 124), on a signal and after a normal end, and `TELEGRAM_*` dropped from the environment. Tests in `gate_script_test.go`.
+ - The job-done line flags a fast empty coder job (#132): kind fix or general that ended `succeeded` or `cancelled` within three minutes with a repository and not one commit over its base gets `· suspicious: no commits in <N>m` — such a run almost always hit a brief or sandbox mismatch instead of finishing real work. The zero-commits finding is the merge check's own (the head still at the base commit, cached like a merge note; no extra git call), so a job without a worktree is never flagged on a guess; review and research jobs and jobs without a repository are never flagged. The finding is always the latest check's own: each merge check clears it before it runs and records it again only when it sees the head at the base itself (and records "has commits" as soon as its rev-list confirms them), and a requeue (resume) drops it, so a retry whose check fails — a timeout, a missing branch, a worktree that no longer verifies — never flags a job that committed meanwhile. Only the delivered job-done line carries the note: `job_result`'s `done_line` never does — the MCP server runs its own manager, which never ran the merge check, so it has no finding to reuse.
+ - OpenRouter models as job runners (#136): `model: "openrouter:<slug>"` runs a claude job on a model of config `providers.openrouter.models` through a per-job loopback proxy in the wrapper, which holds the key (read from `key_file` at start, never in config.json, claude's environment or any job file), injects the `provider` routing object (routing policy: `sort` price by default, `min_quantization` fp8, `data_collection` deny, `zdr`, `min_uptime_pct` 95, `ignore`, `order`; per model `model_routing`) and enforces the job's budget from OpenRouter's reported usage. Billing `api`; `daily_cap_usd` refuses new jobs past the cap; refused for kind review, codex and `deny_repos`; no resume. `agent-jobs openrouter endpoints <slug>` ranks a model's data-center endpoints by the policy. `job_list` / `job_status` / the HTTP API show `provider`; `job_stats --by provider`. With `providers.openrouter` set, every job's processes are kept from reading the key file's directory by Linux Landlock (the key directory must be outside `$HOME`, the temp dirs and the state dir; codex jobs on codex's native bwrap sandbox, which cannot start under any Landlock ruleset, run their codex process outside the key sandbox with a warning in stderr.log and `system_doctor` under `providers.openrouter.codex_policy` `allow_unprotected`, the default, or are refused under `refuse`); the proxy forwards only `POST /v1/messages` and `count_tokens`, reserves each request's worst case against the budget, and records a request without its final usage at its reservation with the cost unknown.
+ - OpenRouter cost journal: each attempt of an OpenRouter job appends one JSON line to `<state>/openrouter-costs.jsonl` (mode 600, append-only; written on success, failure, budget refusal and on the daemon's SIGTERM) with its tokens, the proxy's cost and OpenRouter's billed record of its generations (`GET /api/v1/generation`, read by the wrapper with the key, which never reaches the line); `agent-jobs openrouter costs --agent A [--days N] [--json] [--reconcile]` lists the runs with both costs (a mismatch over 10% flagged), totals per day, per model and over 30 days, the key's usage and limit (`GET /api/v1/key`), and fills missing OpenRouter records by appending reconcile lines. The proxy removes the key and anything `sk-or-` shaped from upstream error bodies (non-200, forwarded with their own Content-Length) and from a stream's error events before claude sees them.
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 3c6b2a8..bc19885 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -674,8 +674,11 @@ Requires Go 1.27, git, the `claude` CLI (tested with 2.1.301 on macOS and 2.1.30
+ go build -ldflags "-X main.version=v0.6.0" -o ~/.local/bin/agent-jobs ./cmd/agent-jobs
+ git config core.hooksPath .githooks   # once per clone: pre-push runs scripts/check.sh
+ scripts/check.sh                       # gofmt, go vet, go test
++scripts/gate.sh --head "$(git rev-parse HEAD)" -- scripts/check.sh   # the same, as a serialized gate
+ ```
+ 
++`scripts/gate.sh` (#134) runs one heavy local gate at a time per box: an flock on `GATE_LOCK` (default `${TMPDIR:-/tmp}/agent-jobs-gate.lock`) queues a second gate behind the first and gives up after `--wait` (default 30m, exit 75); `--head` (required, 7-40 hex characters) is checked against the work tree's HEAD before the wait and again once the lock is held, a mismatch exits 3 before the command starts; the last line is always `exit=<code>`; the command runs as the leader of its own session and on `--timeout` (default 45m, exit 124), on INT/TERM/HUP and after a normal end the whole process group gets TERM, then KILL after `GATE_KILL_GRACE` seconds (default 10); `TELEGRAM_*` variables are dropped from the environment. It needs `flock` and `setsid` (util-linux, Linux).
++
+ Contributing: commit messages are English-only; `scripts/check.sh` (and so the pre-push hook) refuses unpushed commits (`origin/main..HEAD`) whose subject or body contains Cyrillic.
+ 
+ **Initialise an agent**
+diff --git a/gate_script_test.go b/gate_script_test.go
+new file mode 100644
+index 0000000..4c47b85
+--- /dev/null
++++ b/gate_script_test.go
+@@ -0,0 +1,284 @@
++package agentjobs
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// gateRepo makes a git repository with one commit and returns its directory and the commit id.
++func gateRepo(t *testing.T) (string, string) {
++	t.Helper()
++	dir := t.TempDir()
++	for _, args := range [][]string{
++		{"init", "-q"},
++		{"-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
++	} {
++		cmd := exec.Command("git", args...)
++		cmd.Dir = dir
++		if out, err := cmd.CombinedOutput(); err != nil {
++			t.Fatalf("git %v: %v\n%s", args, err, out)
++		}
++	}
++	cmd := exec.Command("git", "rev-parse", "HEAD")
++	cmd.Dir = dir
++	out, err := cmd.Output()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return dir, strings.TrimSpace(string(out))
++}
++
++// gateRun runs scripts/gate.sh in dir with the given extra environment and returns stdout+stderr and the
++// exit code. The lock is a file inside dir unless GATE_LOCK is given.
++func gateRun(t *testing.T, dir string, env []string, args ...string) (string, int) {
++	t.Helper()
++	script, err := filepath.Abs("scripts/gate.sh")
++	if err != nil {
++		t.Fatal(err)
++	}
++	cmd := exec.Command("bash", append([]string{script}, args...)...)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), "GATE_LOCK="+filepath.Join(t.TempDir(), "gate.lock"))
++	cmd.Env = append(cmd.Env, env...)
++	var out bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &out, &out
++	err = cmd.Run()
++	code := 0
++	var ee *exec.ExitError
++	switch {
++	case errors.As(err, &ee):
++		code = ee.ExitCode()
++	case err != nil:
++		t.Fatal(err)
++	}
++	return out.String(), code
++}
++
++// lastLine is the last non-empty line of s.
++func lastLine(s string) string {
++	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
++	return lines[len(lines)-1]
++}
++
++func TestGateExitMarkerAndStatus(t *testing.T) {
++	dir, head := gateRepo(t)
++	for _, tc := range []struct {
++		cmd  string
++		code int
++	}{{"true", 0}, {"exit 7", 7}} {
++		out, code := gateRun(t, dir, nil, "--head", head, "--", "bash", "-c", "echo hello; "+tc.cmd)
++		if code != tc.code {
++			t.Errorf("%q: exit %d, want %d\n%s", tc.cmd, code, tc.code, out)
++		}
++		if !strings.Contains(out, "hello") {
++			t.Errorf("%q: command output missing\n%s", tc.cmd, out)
++		}
++		if got, want := lastLine(out), "exit="+strconv.Itoa(tc.code); got != want {
++			t.Errorf("%q: last line %q, want %q\n%s", tc.cmd, got, want, out)
++		}
++	}
++}
++
++func TestGateUsageErrorsPrintMarker(t *testing.T) {
++	dir, head := gateRepo(t)
++	for name, args := range map[string][]string{
++		"no command":  {"--head", head},
++		"no head":     {"--", "true"},
++		"bad timeout": {"--head", head, "--timeout", "soon", "--", "true"},
++		"bad flag":    {"--nope", "--head", head, "--", "true"},
++	} {
++		out, code := gateRun(t, dir, nil, args...)
++		if code != 2 {
++			t.Errorf("%s: exit %d, want 2\n%s", name, code, out)
++		}
++		if got := lastLine(out); got != "exit=2" {
++			t.Errorf("%s: last line %q, want exit=2\n%s", name, got, out)
++		}
++	}
++}
++
++func TestGateHeadAssert(t *testing.T) {
++	dir, head := gateRepo(t)
++	marker := filepath.Join(dir, "ran")
++
++	out, code := gateRun(t, dir, nil, "--head", strings.Repeat("0", 40), "--", "touch", marker)
++	if code != 3 {
++		t.Fatalf("wrong HEAD: exit %d, want 3\n%s", code, out)
++	}
++	if _, err := os.Stat(marker); err == nil {
++		t.Fatal("the command ran on the wrong HEAD")
++	}
++	if !strings.Contains(out, head) || lastLine(out) != "exit=3" {
++		t.Fatalf("wrong HEAD: output must name the real HEAD and end with exit=3\n%s", out)
++	}
++
++	// A prefix of at least 7 characters matches; a shorter one is a usage error.
++	if out, code = gateRun(t, dir, nil, "--head", head[:7], "--", "touch", marker); code != 0 {
++		t.Fatalf("HEAD prefix: exit %d, want 0\n%s", code, out)
++	}
++	if _, err := os.Stat(marker); err != nil {
++		t.Fatalf("the command did not run on the right HEAD: %v", err)
++	}
++	if out, code = gateRun(t, dir, nil, "--head", head[:5], "--", "true"); code != 2 {
++		t.Fatalf("5-character prefix: exit %d, want 2\n%s", code, out)
++	}
++}
++
++func TestGateTimeoutKillsProcessGroup(t *testing.T) {
++	dir, head := gateRepo(t)
++	pidFile := filepath.Join(dir, "child.pid")
++	// The command starts a grandchild that ignores TERM and would outlive a plain kill of the leader.
++	script := `(trap '' TERM; sleep 300) & echo $! > "$1"; sleep 300`
++	start := time.Now()
++	out, code := gateRun(t, dir, []string{"GATE_KILL_GRACE=1"}, "--head", head, "--timeout", "1", "--", "bash", "-c", script, "x", pidFile)
++	if code != 124 {
++		t.Fatalf("exit %d, want 124\n%s", code, out)
++	}
++	if lastLine(out) != "exit=124" {
++		t.Fatalf("last line %q, want exit=124\n%s", lastLine(out), out)
++	}
++	if d := time.Since(start); d > 30*time.Second {
++		t.Fatalf("took %s: the timeout did not end the run", d)
++	}
++	assertGone(t, pidFile)
++}
++
++func TestGateKillsLeftoversAfterNormalExit(t *testing.T) {
++	dir, head := gateRepo(t)
++	pidFile := filepath.Join(dir, "orphan.pid")
++	out, code := gateRun(t, dir, nil, "--head", head, "--", "bash", "-c", `sleep 300 >/dev/null 2>&1 & echo $! > "$1"`, "x", pidFile)
++	if code != 0 {
++		t.Fatalf("exit %d, want 0\n%s", code, out)
++	}
++	assertGone(t, pidFile)
++}
++
++// assertGone fails unless the process whose pid is in file is dead within a few seconds.
++func assertGone(t *testing.T, file string) {
++	t.Helper()
++	b, err := os.ReadFile(file)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 50; i++ {
++		if err := syscall.Kill(pid, 0); err != nil {
++			return
++		}
++		time.Sleep(100 * time.Millisecond)
++	}
++	_ = syscall.Kill(pid, syscall.SIGKILL)
++	t.Fatalf("process %d survived the gate", pid)
++}
++
++func TestGateDropsTelegramEnv(t *testing.T) {
++	dir, head := gateRepo(t)
++	out, code := gateRun(t, dir, []string{"TELEGRAM_BOT_TOKEN=secret-token", "TELEGRAM_CHAT_ID=1", "KEEP_ME=yes"},
++		"--head", head, "--", "env")
++	if code != 0 {
++		t.Fatalf("exit %d\n%s", code, out)
++	}
++	if strings.Contains(out, "TELEGRAM_") || strings.Contains(out, "secret-token") {
++		t.Fatalf("TELEGRAM_* reached the command\n%s", out)
++	}
++	if !strings.Contains(out, "KEEP_ME=yes") {
++		t.Fatalf("an unrelated variable was dropped\n%s", out)
++	}
++}
++
++func TestGateSerializes(t *testing.T) {
++	dir, head := gateRepo(t)
++	lock := filepath.Join(t.TempDir(), "shared.lock")
++	env := []string{"GATE_LOCK=" + lock}
++	script, err := filepath.Abs("scripts/gate.sh")
++	if err != nil {
++		t.Fatal(err)
++	}
++	started := filepath.Join(dir, "first.started")
++
++	first := exec.Command("bash", script, "--head", head, "--", "bash", "-c", `touch "$1"; sleep 3`, "x", started)
++	first.Dir = dir
++	first.Env = append(os.Environ(), env...)
++	if err := first.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() { _ = first.Process.Kill(); _ = first.Wait() }()
++	for i := 0; ; i++ {
++		if _, err := os.Stat(started); err == nil {
++			break
++		}
++		if i > 100 {
++			t.Fatal("the first gate never started")
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++
++	// While the first gate runs, a second one with a short wait gives up with 75 and never runs its command.
++	marker := filepath.Join(dir, "second.ran")
++	out, code := gateRun(t, dir, env, "--head", head, "--wait", "1", "--", "touch", marker)
++	if code != 75 || lastLine(out) != "exit=75" {
++		t.Fatalf("exit %d, want 75 with exit=75\n%s", code, out)
++	}
++	if _, err := os.Stat(marker); err == nil {
++		t.Fatal("the second gate ran while the first held the lock")
++	}
++
++	// With a longer wait it runs after the first one is done.
++	out, code = gateRun(t, dir, env, "--head", head, "--wait", "30", "--", "touch", marker)
++	if code != 0 || lastLine(out) != "exit=0" {
++		t.Fatalf("exit %d, want 0\n%s", code, out)
++	}
++	if _, err := os.Stat(marker); err != nil {
++		t.Fatalf("the second gate did not run: %v", err)
++	}
++}
++
++func TestGateSignalStopsGroupAndPrintsMarker(t *testing.T) {
++	dir, head := gateRepo(t)
++	script, err := filepath.Abs("scripts/gate.sh")
++	if err != nil {
++		t.Fatal(err)
++	}
++	pidFile := filepath.Join(dir, "child.pid")
++	cmd := exec.Command("bash", script, "--head", head, "--", "bash", "-c", `sleep 300 & echo $! > "$1"; wait`, "x", pidFile)
++	cmd.Dir = dir
++	cmd.Env = append(os.Environ(), "GATE_LOCK="+filepath.Join(t.TempDir(), "gate.lock"), "GATE_KILL_GRACE=1")
++	var out bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &out, &out
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; ; i++ {
++		if b, err := os.ReadFile(pidFile); err == nil && len(b) > 0 {
++			break
++		}
++		if i > 100 {
++			_ = cmd.Process.Kill()
++			t.Fatal("the command never started")
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
++		t.Fatal(err)
++	}
++	err = cmd.Wait()
++	var ee *exec.ExitError
++	if !errors.As(err, &ee) || ee.ExitCode() != 143 {
++		t.Fatalf("exit %v, want 143\n%s", err, out.String())
++	}
++	if lastLine(out.String()) != "exit=143" {
++		t.Fatalf("last line %q, want exit=143\n%s", lastLine(out.String()), out.String())
++	}
++	assertGone(t, pidFile)
++}
+diff --git a/scripts/gate.sh b/scripts/gate.sh
+new file mode 100755
+index 0000000..942e4dc
+--- /dev/null
++++ b/scripts/gate.sh
+@@ -0,0 +1,192 @@
++#!/usr/bin/env bash
++# Serialized gate runner (#134): run one heavy local gate (check.sh, a pg suite, a vite build) at a time
++# per box, on the commit the caller meant, and always say how it ended.
++#
++#   scripts/gate.sh --head "$(git rev-parse HEAD)" [--timeout 45m] [--wait 30m] -- scripts/check.sh
++#
++# - one gate at a time: an flock on GATE_LOCK (default ${TMPDIR:-/tmp}/agent-jobs-gate.lock, one per box)
++#   queues a second gate behind the first; it gives up after --wait (exit 75) instead of hanging for good;
++# - HEAD assert: --head is a commit id (7-40 hex characters, a prefix is enough); the work tree's HEAD is
++#   checked before the wait and again once the lock is held, and a mismatch stops the gate (exit 3) before
++#   the command starts;
++# - exit marker: the last line printed is always `exit=<code>`, also for a usage error, a refused HEAD, a
++#   lock timeout, a timeout and a signal, so a waiter never has to guess whether the run ended;
++# - process group: the command runs as the leader of a new session; on --timeout (exit 124), on INT/TERM/HUP
++#   and after a normal end the whole group gets TERM, then KILL after GATE_KILL_GRACE seconds (default 10),
++#   so no orphan suite outlives the gate;
++# - clean env: TELEGRAM_* variables are dropped before the command starts.
++#
++# Exit codes: the command's own; 2 usage or a missing tool; 3 HEAD mismatch; 75 lock not acquired within
++# --wait; 124 command timed out; 128+N the gate was stopped by signal N. Needs flock and setsid (util-linux).
++set -euo pipefail
++
++rc=1
++pid=""
++watcher=""
++timed_out=0
++trap 'cleanup; echo "exit=$rc"' EXIT
++
++cleanup() {
++  if [ -n "$watcher" ]; then
++    kill "$watcher" 2>/dev/null || true
++    watcher=""
++  fi
++}
++
++fail() { # fail CODE MESSAGE
++  rc="$1"
++  echo "gate: $2"
++  exit "$rc"
++}
++
++usage_fail() { fail 2 "$1 (usage: gate.sh --head SHA [--timeout 45m] [--wait 30m] [--lock FILE] [--dir DIR] -- COMMAND [ARG...])"; }
++
++# to_seconds VALUE: prints whole seconds for N, Ns, Nm or Nh (N >= 1); returns 1 for anything else.
++to_seconds() {
++  local v="$1" n unit=s
++  [[ "$v" =~ ^([0-9]+)([smh]?)$ ]] || return 1
++  n="${BASH_REMATCH[1]}"
++  [ -n "${BASH_REMATCH[2]}" ] && unit="${BASH_REMATCH[2]}"
++  n=$((10#$n))
++  [ "$n" -ge 1 ] || return 1
++  case "$unit" in
++    s) echo "$n" ;;
++    m) echo $((n * 60)) ;;
++    h) echo $((n * 3600)) ;;
++  esac
++}
++
++want=""
++timeout_s=2700
++wait_s=1800
++dir="."
++lock="${GATE_LOCK:-${TMPDIR:-/tmp}/agent-jobs-gate.lock}"
++grace="${GATE_KILL_GRACE:-10}"
++[[ "$grace" =~ ^[0-9]+$ ]] || usage_fail "GATE_KILL_GRACE must be whole seconds"
++
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --)
++      shift
++      break
++      ;;
++    --head | --timeout | --wait | --lock | --dir)
++      [ $# -ge 2 ] || usage_fail "$1 needs a value"
++      case "$1" in
++        --head) want="$2" ;;
++        --timeout) timeout_s="$(to_seconds "$2")" || usage_fail "bad --timeout '$2' (N, Ns, Nm or Nh, at least 1)" ;;
++        --wait) wait_s="$(to_seconds "$2")" || usage_fail "bad --wait '$2' (N, Ns, Nm or Nh, at least 1)" ;;
++        --lock) lock="$2" ;;
++        --dir) dir="$2" ;;
++      esac
++      shift 2
++      ;;
++    *) usage_fail "unknown argument '$1'" ;;
++  esac
++done
++
++[ $# -gt 0 ] || usage_fail "no command after --"
++[ -n "$want" ] || usage_fail "--head is required"
++[[ "$want" =~ ^[0-9a-fA-F]{7,40}$ ]] || usage_fail "--head must be 7-40 hex characters, got '$want'"
++want="${want,,}"
++command -v flock >/dev/null 2>&1 || usage_fail "flock not found (util-linux)"
++command -v setsid >/dev/null 2>&1 || usage_fail "setsid not found (util-linux)"
++[ -d "$dir" ] || usage_fail "--dir '$dir' is not a directory"
++
++check_head() {
++  local actual
++  actual="$(git -C "$dir" rev-parse HEAD 2>/dev/null)" || fail 3 "$dir is not a git work tree, cannot assert HEAD"
++  case "$actual" in
++    "$want"*) head_now="$actual" ;;
++    *) fail 3 "HEAD is $actual, expected $want: not running the gate on the wrong commit" ;;
++  esac
++}
++
++# kill_group: TERM the command's process group, KILL what is left after the grace period. The group id is
++# the pid of the command, which the kernel does not reuse while a member is alive.
++kill_group() {
++  [ -n "$pid" ] || return 0
++  kill -TERM -- "-$pid" 2>/dev/null || return 0
++  local i
++  for ((i = 0; i < grace * 10; i++)); do
++    kill -0 -- "-$pid" 2>/dev/null || return 0
++    sleep 0.1
++  done
++  kill -KILL -- "-$pid" 2>/dev/null || true
++}
++
++on_timeout() {
++  timed_out=1
++  echo "gate: timeout after ${timeout_s}s, stopping process group $pid"
++  kill_group
++}
++
++on_signal() { # on_signal NAME NUMBER
++  echo "gate: caught $1, stopping process group ${pid:-none}"
++  kill_group
++  rc=$((128 + $2))
++  exit "$rc"
++}
++
++head_now=""
++check_head
++
++# One gate at a time. The lock file is only a flock target; fd 9 is closed for the command and the
++# watcher, so a process that escapes the gate cannot keep the lock.
++[ -e "$lock" ] || (umask 0 && : >>"$lock") 2>/dev/null || true
++if ! exec 9<"$lock"; then
++  fail 2 "cannot open lock file $lock"
++fi
++if ! flock -n 9; then
++  echo "gate: waiting up to ${wait_s}s for the lock $lock (held by: $(head -c 300 "$lock" 2>/dev/null | tr '\n' ' '))"
++  flock -w "$wait_s" 9 || fail 75 "lock $lock not acquired within ${wait_s}s"
++fi
++# The wait can be long; the commit the caller meant may have been replaced meanwhile.
++check_head
++printf 'pid=%s head=%s since=%s cmd=%s\n' "$$" "$head_now" "$(date -u +%FT%TZ)" "$*" >"$lock" 2>/dev/null || true
++
++# Clean env: no Telegram credentials for a gate.
++while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^TELEGRAM_' || true)
++
++echo "gate: head=$head_now timeout=${timeout_s}s lock=$lock cmd: $*"
++
++trap 'on_signal INT 2' INT
++trap 'on_signal TERM 15' TERM
++trap 'on_signal HUP 1' HUP
++trap on_timeout USR1
++
++main=$$
++(
++  # cleanup sends TERM; the sleep goes with the watcher so nothing lingers on the gate's output pipe.
++  trap 'kill "$nap" 2>/dev/null || true; exit 0' TERM
++  sleep "$timeout_s" &
++  nap=$!
++  wait "$nap" || true
++  kill -0 "$main" 2>/dev/null && kill -USR1 "$main" 2>/dev/null
++  exit 0
++) 9>&- &
++watcher=$!
++
++cd "$dir"
++status=0
++setsid "$@" 9>&- </dev/null &
++pid=$!
++
++# wait returns early when a trapped signal arrives; the command is done only once it is gone.
++while :; do
++  set +e
++  wait "$pid"
++  status=$?
++  set -e
++  kill -0 "$pid" 2>/dev/null || break
++done
++
++# Whatever the command left in its group (an orphan suite, a dev server) goes with it.
++kill_group
++cleanup
++
++if [ "$timed_out" -eq 1 ]; then
++  status=124
++fi
++rc="$status"
++exit "$rc"

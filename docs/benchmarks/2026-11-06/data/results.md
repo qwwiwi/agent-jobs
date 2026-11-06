@@ -1,0 +1,41 @@
+| level | issue | model | job | usage | sol verdict |
+|---|---|---|---|---|---|
+| S | #110 | opus-high | succeeded | 21 turns · $0.72 · 1860s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #110 | sonnet-high | succeeded | 22 turns · $0.34 · 1259s | critical=0 high=0 medium=0 low=1 issue_fixed=yes |
+| S | #110 | sonnet-medium | succeeded | 17 turns · $0.24 · 719s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #110 | glm | succeeded | 4 turns · $0.13 · 1439s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #110 | haiku-high | succeeded | 66 turns · $0.09 · 2999s | critical=0 high=0 medium=2 low=0 issue_fixed=partly |
+| M | #154 | opus-high | succeeded | 6 turns · $1.64 · 2940s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |
+| M | #154 | sonnet-high | succeeded | 27 turns · $0.40 · 1200s | critical=0 high=1 medium=1 low=0 issue_fixed=partly |
+| M | #154 | sonnet-medium | succeeded | 27 turns · $0.35 · 1379s | critical=0 high=1 medium=1 low=0 issue_fixed=partly |
+| M | #154 | glm | succeeded | 7 turns · $0.51 · 2280s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |
+| L | #134 | opus-high | succeeded | 61 turns · $2.60 · 2100s | critical=0 high=1 medium=1 low=0 issue_fixed=partly |
+| L | #134 | sonnet-high | succeeded | 22 turns · $0.51 · 300s | critical=0 high=3 medium=1 low=0 issue_fixed=partly |
+| L | #134 | sonnet-medium | succeeded | 13 turns · $0.25 · 239s | critical=0 high=2 medium=1 low=0 issue_fixed=partly |
+| L | #134 | glm | succeeded | 8 turns · $0.76 · 2879s | critical=0 high=2 medium=1 low=0 issue_fixed=partly |
+| S | #145 | opus-high | succeeded | 40 turns · $0.95 · 2100s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #145 | sonnet-high | succeeded | 2 turns · $0.40 · 59s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #145 | sonnet-medium | succeeded | 16 turns · $0.24 · 959s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #145 | glm | succeeded | 5 turns · $0.18 · 2520s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #145 | haiku-high | succeeded | 51 turns · $0.06 · 1860s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| M | #155 | opus-high | succeeded | 92 turns · $6.00 · 3360s | critical=0 high=3 medium=1 low=0 issue_fixed=partly |
+| M | #155 | sonnet-high | succeeded | 3 turns · $1.06 · 59s | critical=0 high=1 medium=2 low=0 issue_fixed=partly |
+| M | #155 | sonnet-medium | succeeded | 2 turns · $0.55 · 59s | critical=0 high=3 medium=1 low=0 issue_fixed=partly |
+| M | #155 | glm | succeeded | 1 turns · $0.86 · 3000s | critical=0 high=3 medium=1 low=0 issue_fixed=partly |
+| L | #119 | opus-high | succeeded | 97 turns · $4.63 · 3360s | critical=0 high=1 medium=2 low=0 issue_fixed=partly |
+| L | #119 | sonnet-high | succeeded | 51 turns · $1.25 · 2519s | critical=0 high=0 medium=0 low=1 issue_fixed=yes |
+| L | #119 | sonnet-medium | succeeded | 44 turns · $0.72 · 2399s | critical=0 high=1 medium=1 low=1 issue_fixed=partly |
+| L | #119 | glm | timeout | 16 turns · cost unknown · 3659s | no-review |
+| S | #146 | opus-high | succeeded | 68 turns · $1.83 · 2399s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| S | #146 | sonnet-high | succeeded | 38 turns · $0.55 · 2399s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |
+| S | #146 | sonnet-medium | succeeded | 20 turns · $0.32 · 839s | critical=0 high=2 medium=0 low=0 issue_fixed=partly |
+| S | #146 | glm | failed | 4 turns · $0.53 · 3360s | critical=0 high=2 medium=0 low=0 issue_fixed=partly |
+| S | #146 | haiku-high | succeeded | 52 turns · $0.07 · 2040s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |
+| M | #114 | opus-high | succeeded | 24 turns · $1.13 · 1859s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| M | #114 | sonnet-high | succeeded | 2 turns · $0.42 · 59s | critical=0 high=0 medium=1 low=0 issue_fixed=yes |
+| M | #114 | sonnet-medium | succeeded | 21 turns · $0.31 · 1977s | critical=0 high=0 medium=1 low=0 issue_fixed=yes |
+| L | #135 | opus-high | succeeded | 45 turns · $1.89 · 1980s | critical=0 high=0 medium=0 low=0 issue_fixed=yes |
+| L | #135 | sonnet-high | succeeded | 37 turns · $0.68 · 359s | critical=0 high=0 medium=1 low=0 issue_fixed=partly |
+| L | #135 | sonnet-medium | succeeded | 20 turns · $0.34 · 779s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |
+| M | #114 | glm | failed | 4 turns · $0.32 · 2400s | critical=0 high=0 medium=0 low=1 issue_fixed=yes |
+| L | #135 | glm | failed | 119 turns · $0.76 · 1859s | critical=0 high=1 medium=0 low=0 issue_fixed=partly |

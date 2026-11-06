@@ -1,0 +1,105 @@
+diff --git a/internal/jobs/manager.go b/internal/jobs/manager.go
+index a56e182..ef331ce 100644
+--- a/internal/jobs/manager.go
++++ b/internal/jobs/manager.go
+@@ -561,6 +561,11 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
+ 			}
+ 		}
+ 	}
++	if openRouter && len(r.Sources) > 0 {
++		if err := m.checkOpenRouterSources(r.Sources); err != nil {
++			return nil, err
++		}
++	}
+ 	covers, err := ValidateCovers(r.Covers)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/internal/jobs/openrouter.go b/internal/jobs/openrouter.go
+index 1d893af..eb068ae 100644
+--- a/internal/jobs/openrouter.go
++++ b/internal/jobs/openrouter.go
+@@ -809,3 +809,43 @@ func cut(s string, n int) string {
+ 	}
+ 	return s
+ }
++
++// checkOpenRouterSources refuses sources that would carry a denied repository's content to the provider
++// (#146): a file inside a repository matching deny_repos, or the report of a job run on one.
++func (m *Manager) checkOpenRouterSources(origins []string) error {
++	o := m.Config().Providers.OpenRouter
++	if o == nil {
++		return nil
++	}
++	for _, origin := range origins {
++		var repos []string
++		if id, ok := strings.CutPrefix(origin, "job:"); ok {
++			// An unknown job is refused later, when the snapshot is taken.
++			if j, err := m.Store.Get(id); err == nil && j.RepoPath != "" {
++				repos = append(repos, j.RepoPath)
++			}
++		} else {
++			repos = sourceFileRepos(origin)
++		}
++		for _, repo := range repos {
++			if d := o.deniedRepo(repo); d != "" {
++				return fmt.Errorf("sources %q belong to repository %s, denied to openrouter jobs (providers.openrouter.deny_repos %q)", origin, repo, d)
++			}
++		}
++	}
++	return nil
++}
++
++// sourceFileRepos returns the repository roots (work tree and main worktree) that contain the file at
++// path, resolving symlinks; none when the file is outside any git repository.
++func sourceFileRepos(path string) []string {
++	dir := filepath.Dir(path)
++	if real, err := filepath.EvalSymlinks(dir); err == nil {
++		dir = real
++	}
++	top, err := git(dir, "rev-parse", "--show-toplevel")
++	if err != nil {
++		return nil
++	}
++	return []string{top, mainWorktree(top)}
++}
+diff --git a/internal/jobs/openrouter_sources_test.go b/internal/jobs/openrouter_sources_test.go
+index df79b30..c514284 100644
+--- a/internal/jobs/openrouter_sources_test.go
++++ b/internal/jobs/openrouter_sources_test.go
+@@ -43,3 +43,36 @@ func TestOpenRouterJobWithSourceFiles(t *testing.T) {
+ 		t.Fatalf("capped job left a folder: %v, %v", entries, err)
+ 	}
+ }
++
++// #146: file and job sources of a denied repository never reach an openrouter job.
++func TestOpenRouterSourcesRespectDenyRepos(t *testing.T) {
++	m := newManager(t)
++	m.Cfg.Providers.OpenRouter = orConfig(DefaultOpenRouterBaseURL, "/k")
++	m.Cfg.Providers.OpenRouter.DailyCapUSD = f64(50)
++	denied := newRepo(t)
++	m.Cfg.Providers.OpenRouter.DenyRepos = []string{filepath.Base(denied)}
++	secret := sourceFixture(t, denied, "secret.md", "private")
++	outside := sourceFixture(t, t.TempDir(), "notes.md", "notes")
++	start := func(src string) error {
++		_, err := m.Enqueue(StartRequest{Title: "a", Kind: "general", Brief: "read", Model: "openrouter:" + orGLM,
++			MaxBudgetUSD: 1, Sources: []string{src}})
++		return err
++	}
++	if err := start(secret); err == nil || !strings.Contains(err.Error(), "denied to openrouter jobs") {
++		t.Fatalf("file in a denied repo: %v", err)
++	}
++	// The same file is fine for a claude job.
++	if _, err := m.Enqueue(StartRequest{Title: "c", Kind: "general", Brief: "read", Model: "sonnet", Sources: []string{secret}}); err != nil {
++		t.Fatalf("claude job with the same source: %v", err)
++	}
++	if err := start(outside); err != nil {
++		t.Fatalf("file outside the denied repo: %v", err)
++	}
++	if err := m.Store.Insert(&store.Job{ID: "priv", Agent: m.Agent, Title: "p", Kind: "general", RepoPath: denied,
++		Status: store.StatusSucceeded}); err != nil {
++		t.Fatal(err)
++	}
++	if err := start("job:priv"); err == nil || !strings.Contains(err.Error(), "denied to openrouter jobs") {
++		t.Fatalf("report of a job on a denied repo: %v", err)
++	}
++}
