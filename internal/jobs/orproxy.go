@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +27,10 @@ import (
 // token as ANTHROPIC_AUTH_TOKEN; the proxy checks the token, sets the request's model to the job's slug
 // and its `provider` object to the job's routing, and forwards it to OpenRouter with the real key in
 // Authorization. The key is only in the proxy's memory: never in claude's environment, a file the job
-// can read, a log line or an error. Responses are passed through unchanged, read on the way for their
-// usage (and OpenRouter's usage.cost), which is the job's cost; once the job's budget is spent every
-// further request is refused, and the wrapper fails the job with that reason.
+// can read, a log line or an error. Responses are passed through without the key (an error also without
+// anything key-shaped: forwardErrorBody, orLineScrubber), read on the way for their usage (and
+// OpenRouter's usage.cost), which is the job's cost; once the job's budget is spent every further
+// request is refused, and the wrapper fails the job with that reason.
 
 // maxProxyBody caps a request body the proxy reads (claude sends the whole conversation each turn).
 const maxProxyBody = 64 << 20
@@ -394,19 +396,64 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header()[k] = vs
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
 	u.ok = resp.StatusCode == http.StatusOK
 	u.genID = generationIDFromHeader(resp.Header)
 	u.stream = strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+	var whole bool
+	if resp.StatusCode != http.StatusOK {
+		whole = p.forwardErrorBody(w, resp, u)
+	} else {
+		w.WriteHeader(resp.StatusCode)
+		whole = p.forwardBody(w, resp.Body, u)
+	}
+	switch {
+	case !whole:
+	case resp.StatusCode == http.StatusOK && u.final():
+		how = settleDone
+	case resp.StatusCode != http.StatusOK && !u.stream:
+		how = settleRejected
+	}
+}
+
+// forwardErrorBody answers claude with a non-200 response whose body is scrubbed of the key and of
+// anything key-shaped (an upstream error may echo the request's Authorization; claude logs it to
+// stderr.log): read whole (up to maxProxyJSONResponse), passed through scrubORSecrets and written with
+// its own Content-Length. A larger body is not forwarded: claude gets a proxy error of the same status.
+// It reports whether the upstream body was read and written whole.
+func (p *orProxy) forwardErrorBody(w http.ResponseWriter, resp *http.Response, u *usageReader) bool {
+	w.Header().Del("Content-Length")
+	b, rerr := io.ReadAll(io.LimitReader(resp.Body, maxProxyJSONResponse+1))
+	if len(b) > maxProxyJSONResponse {
+		if rerr == nil {
+			_, rerr = io.Copy(io.Discard, resp.Body)
+		}
+		anthropicError(w, resp.StatusCode, "api_error", fmt.Sprintf(
+			"agent-jobs openrouter proxy: upstream HTTP %d with an error body over %d bytes (not forwarded)",
+			resp.StatusCode, maxProxyJSONResponse))
+		return rerr == nil
+	}
+	u.write(b)
+	out := scrubORSecrets(string(b), p.key)
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	w.WriteHeader(resp.StatusCode)
+	_, werr := io.WriteString(w, out)
+	return rerr == nil && werr == nil
+}
+
+// forwardBody copies a 200 response body to claude as it comes, a complete line at a time (an SSE
+// stream's lines, a JSON body's) through orLineScrubber. It reports whether the body was read and
+// written whole.
+func (p *orProxy) forwardBody(w http.ResponseWriter, body io.Reader, u *usageReader) bool {
 	flusher, _ := w.(http.Flusher)
+	sc := &orLineScrubber{w: w, key: p.key}
 	buf := make([]byte, 32<<10)
 	var rerr, werr error
 	for {
 		var n int
-		n, rerr = resp.Body.Read(buf)
+		n, rerr = body.Read(buf)
 		if n > 0 {
 			u.write(buf[:n])
-			if _, werr = w.Write(buf[:n]); werr != nil {
+			if werr = sc.write(buf[:n]); werr != nil {
 				break
 			}
 			if flusher != nil {
@@ -417,14 +464,99 @@ func (p *orProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	whole := werr == nil && errors.Is(rerr, io.EOF)
-	switch {
-	case !whole:
-	case resp.StatusCode == http.StatusOK && u.final():
-		how = settleDone
-	case resp.StatusCode != http.StatusOK && !u.stream:
-		how = settleRejected
+	if werr == nil {
+		werr = sc.end() // the body's last line without a trailing newline, or what a cut stream left
+		if flusher != nil {
+			flusher.Flush()
+		}
 	}
+	return werr == nil && errors.Is(rerr, io.EOF)
+}
+
+// orLineScrubber writes a 200 response body a complete line at a time: each line without the key, and
+// an error line (orErrorLine: an SSE error event, a JSON error body) through scrubORSecrets, so without
+// anything key-shaped either. Other bytes pass unchanged. A line longer than maxProxyJSONResponse (model
+// output, never an error event) is passed on in pieces, each without the key.
+type orLineScrubber struct {
+	w    io.Writer
+	key  string
+	line []byte
+	over bool // the current line outgrew maxProxyJSONResponse
+}
+
+func (s *orLineScrubber) write(b []byte) error {
+	for len(b) > 0 {
+		chunk := b
+		i := bytes.IndexByte(b, '\n')
+		if i >= 0 {
+			chunk = b[:i+1]
+		}
+		b = b[len(chunk):]
+		switch {
+		case s.over:
+			if _, err := io.WriteString(s.w, scrubKey(string(chunk), s.key)); err != nil {
+				return err
+			}
+		case len(s.line)+len(chunk) > maxProxyJSONResponse:
+			s.over = true
+			held := string(s.line) + string(chunk)
+			s.line = s.line[:0]
+			if _, err := io.WriteString(s.w, scrubKey(held, s.key)); err != nil {
+				return err
+			}
+		default:
+			s.line = append(s.line, chunk...)
+			if i >= 0 {
+				if err := s.end(); err != nil {
+					return err
+				}
+			}
+		}
+		if i >= 0 {
+			s.over = false
+		}
+	}
+	return nil
+}
+
+// end writes the line held so far (its newline, when it has one, kept).
+func (s *orLineScrubber) end() error {
+	if len(s.line) == 0 {
+		return nil
+	}
+	line := string(s.line)
+	s.line = s.line[:0]
+	if orErrorLine(line) {
+		nl := ""
+		if strings.HasSuffix(line, "\n") {
+			nl = "\n"
+		}
+		line = scrubORSecrets(line, s.key) + nl
+	} else {
+		line = scrubKey(line, s.key)
+	}
+	_, err := io.WriteString(s.w, line)
+	return err
+}
+
+// orErrorLine reports whether a body line may carry an error's text: it names "error" and is not a JSON
+// object (an SSE data: line's, or the line itself) of another type without an error field.
+func orErrorLine(line string) bool {
+	if !strings.Contains(line, "error") {
+		return false
+	}
+	data := strings.TrimSpace(line)
+	if d, ok := strings.CutPrefix(data, "data:"); ok {
+		data = strings.TrimSpace(d)
+	}
+	var v struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(data), &v) != nil {
+		return true
+	}
+	return v.Type == "error" || (len(v.Error) > 0 && string(v.Error) != "null")
 }
 
 // proxyAllowed reports whether a request is one the proxy forwards: exactly POST /v1/messages and POST
