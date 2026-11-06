@@ -1420,11 +1420,25 @@ func TestRemoteTransfersIndirectRefused(t *testing.T) {
 		// An option value is no operand and no option letter: local rsync stays allowed.
 		{"rsync --exclude separate value", `rsync --exclude cache:old ./src/ ./dst/`, false},
 		{"rsync -f attached filter", `rsync -f'-x.cache' ./src/ ./dst/`, false},
-		{"rsync -f glob value still refused", `rsync -f'- *.cache' ./src/ ./dst/`, true}, // by the
-		// .git glob rule (a `*` word in a non-reader's argument), not the remote-host rule
+		// #155: a quoted filter pattern is matcher data, not a glob path (no longer refused).
+		{"rsync -f glob value is filter data", `rsync -f'- *.cache' ./src/ ./dst/`, false},
 		{"rsync --files-from value", `rsync --files-from list.txt ./src/ ./dst/`, false},
 		{"rsync -B separate value", `rsync -B 4096 ./src/ ./dst/`, false},
 		{"find -exec rsync local then printf", `find . -exec rsync a b \; -printf '%p:%y\n'`, false},
+		// Find terminators are recognised in context only.
+		{"find -ok plus is not a terminator", `find . -ok rsync a + host:/x \;`, true},
+		{"runner escaped semicolon is an argument", `setsid rsync a \; host:/x`, true},
+		{"find -exec runner then remote after literal plus", `find . -exec setsid rsync + host:/x \;`, true},
+		// Double nesting: the remote operand comes from parallel's input.
+		{"find -exec parallel rsync", `find . -exec parallel rsync ./src/ \;`, true},
+		{"setsid parallel with option rsync", `setsid parallel -j2 rsync ./src/`, true},
+		{"find -exec xargs rsync", `find . -exec xargs -I{} rsync ./src/ {} \;`, true},
+		{"find -exec parallel ssh", `find . -exec parallel ssh ::: host \;`, true},
+		{"find -exec setsid ssh", `find . -exec setsid ssh host ls \;`, true},
+		// Dynamic operands: a static local prefix keeps the word local, otherwise unverifiable.
+		{"dynamic without prefix", `D=x; rsync -a ./src/ "$D"`, true},
+		{"dynamic host prefix", `D=x; rsync -a ./src/ host:"$D"`, true},
+		{"dynamic option cluster", `O=-e; rsync "$O" ssh a b`, true},
 		// Still refused: an -e cluster names the shell.
 		{"rsync -avze ssh still refused", `rsync -avze ssh a host:/b`, true},
 	}
