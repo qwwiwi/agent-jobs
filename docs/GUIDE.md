@@ -908,6 +908,13 @@ agent-jobs version                      # also --version
 
 ## Release checklist
 
+Prepare the changelog in the release worktree with `go run ./cmd/changelog --check`,
+then `go run ./cmd/changelog`, and move the assembled Unreleased entries into the
+new version heading. Normal branches add [fragments](../changelog.d/README.md).
+Validate the English PR title before creation and again before squash merging;
+run `PR_TITLE="$title" scripts/check.sh` with the actual title. The full sequence
+and title-check contract are in [Releasing](RELEASING.md).
+
 Before a tag, replay the install and a test job from a fresh clone of the release commit:
 
 ```bash
