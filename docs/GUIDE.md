@@ -143,6 +143,52 @@ agent-jobs start --agent A --kind fix --title "Update parser" --brief-file brief
   --paths 'docs/parser.md' --on-overlap serialize
 ```
 
+### Fix loop from a review
+
+A hand-made fix brief can lose a blocking finding (one brief lost two High findings
+because only a section range was copied). Start the fix from the review itself:
+
+```json
+{ "kind": "fix", "repo": "/path/to/repo", "review": "<review job id>", "title": "...", "brief": "..." }
+```
+
+`review` is the id of a **succeeded** `review` job of this agent. At start the daemon
+
+- attaches the review's full `report.md` as a source (`job:<id>`, the same snapshot
+  `sources` takes; it is not copied twice if you list it too);
+- parses the `### Blocking` section and puts **every** blocking finding, with its ID
+  and its whole text (continuation lines and sub-bullets included), into the prompt
+  under *Blocking findings to close*; Non-blocking items are left out;
+- adds two lines to the fix checklist: close every finding, and answer every ID in a
+  `### Blocking findings` block of the report (`<ID> · closed|not closed · evidence`).
+
+The review checklist does not fix an ID scheme, so ask for one in the review brief
+("number the blocking findings H1, H2, ..."). An ID is one or two capital letters and a
+number (`F1`, `H2`, `C1`, `M3`), first on the item or right after its `file:line`
+(`` - `a.go:12` — H1: ... ``). The start is refused, with the offending line, when a
+Blocking item has no ID or an ID repeats; when the review has no `### Blocking` section;
+when it is empty (`none`: "nothing to fix"; the verdict SHIP is always empty); and when the
+review job is unknown, belongs to another agent, is not kind `review`, or has not succeeded.
+`review` needs `kind: fix` and a `repo`.
+
+**Control review.** With `review` set, `control_review` defaults to `true`. When the fix
+job succeeds, the daemon queues a control review: kind `review`, the same model, runner
+and reasoning effort as the original review, the same repository, `base` = the fix job's
+published result branch (`branch` on the job), and sources = the original review report
+plus the fix report. Its generated brief asks to verify every blocking ID of the previous
+review is closed, to look for new regressions against the fix's base commit, and to end
+with `Verdict: SHIP`, `SHIP WITH FIXES` or `BLOCK`. The fix's job-done line ends with
+`control review <id> queued`. The chained review counts against the normal caps
+(`max_running`, the codex daily cap): if one refuses it, or the fix published no result
+branch, the line says `control review not queued: <why>` and the fix is not failed.
+A failed, timed-out or cancelled fix queues nothing. Pass `control_review: false` (CLI
+`--control-review=false`) to skip it. The control review does not chain further; whether
+to run another fix loop is the orchestrator's call, and the loop cap stays unchanged.
+
+CLI: `agent-jobs start --kind fix --repo ... --review <review job id> --brief-file brief.md`.
+`job_status` shows `review`, `review_blocking` (the IDs), `control_review`, `control_job`
+and `control_note`.
+
 ### Change course: amend, stop and resume
 
 Every job runs in a claude session whose id is assigned before launch (`claude -p --session-id <uuid>`), and the session is kept on disk, so a job can be corrected without losing what it already knows and did:

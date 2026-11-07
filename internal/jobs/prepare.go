@@ -472,6 +472,13 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if j.Runner == store.RunnerCodex && cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite {
 		check = strings.Replace(check, "and create a local commit.", "and leave files for the wrapper to commit.", 1)
 	}
+	if j.Review != "" {
+		extra, err := fixReviewChecklist()
+		if err != nil {
+			return "", err
+		}
+		check = strings.TrimRight(check, "\n") + "\n" + extra
+	}
 	contract, err := template("prompts/report-contract.md")
 	if err != nil {
 		return "", err
@@ -523,7 +530,7 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s%s\n\n%s\n",
 		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSourceFiles(j.SourceFiles)+renderSources(m.JobDir(j.ID), sources),
-		m.priorResults(j, prior), cover, check, contract)
+		m.priorResults(j, prior), cover+renderReviewBlocking(j), check, contract)
 	return b.String(), nil
 }
 

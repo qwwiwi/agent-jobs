@@ -584,6 +584,8 @@ func cmdStart(args []string) error {
 	var paths multi
 	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
 	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
+	fs.StringVar(&r.Review, "review", "", "fix job: id of a succeeded review job of this agent; its report is attached and every ### Blocking finding ID goes into the prompt")
+	controlReview := fs.Bool("control-review", true, "with --review: queue a control review (same model as the review, base = the fix result branch) when the fix succeeds; --control-review=false turns it off")
 	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
@@ -592,6 +594,16 @@ func cmdStart(args []string) error {
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
 	r.Paths = paths
+	// The flag defaults to true; it is passed on only when given or when --review makes it apply, so
+	// the default alone never trips the "control_review needs review" refusal.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "control-review" {
+			r.ControlReview = controlReview
+		}
+	})
+	if r.Review != "" && r.ControlReview == nil {
+		r.ControlReview = controlReview
+	}
 	if len(sources) > 0 {
 		r.Sources = sources
 	}
@@ -720,6 +732,21 @@ func cmdStatus(args []string) error {
 	}
 	if j.Parent != "" {
 		fmt.Printf("parent:    %s (result %s)\n", j.Parent, j.ParentBase)
+	}
+	if j.Review != "" {
+		ids := make([]string, 0, len(j.ReviewBlocking))
+		for _, f := range j.ReviewBlocking {
+			ids = append(ids, f.ID)
+		}
+		fmt.Printf("review:    %s (blocking %s)\n", j.Review, strings.Join(ids, ", "))
+		switch {
+		case j.ControlJob != "":
+			fmt.Printf("control:   review %s queued\n", j.ControlJob)
+		case j.ControlNote != "":
+			fmt.Printf("control:   %s\n", j.ControlNote)
+		case j.ControlReview:
+			fmt.Printf("control:   review on success\n")
+		}
 	}
 	if len(j.Paths) > 0 {
 		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
