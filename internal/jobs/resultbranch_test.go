@@ -143,3 +143,33 @@ func TestResultBranchCodexWrapper(t *testing.T) {
 		t.Fatalf("wrapper commit missing: %s", subject)
 	}
 }
+
+// A job that moves its worktree to a commit that is not a descendant of its base (a sibling or an
+// orphan history) still has a positive base..head count; it must not be published (#197).
+func TestResultBranchRejectsNonDescendantHead(t *testing.T) {
+	for _, shape := range []string{"sibling", "orphan"} {
+		t.Run(shape, func(t *testing.T) {
+			m := newManager(t)
+			repo := newRepo(t)
+			gitT(t, repo, "commit", "-q", "--allow-empty", "-m", "second")
+			j := runToEnd(t, m, enqueue(t, m, "plain", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" }).ID)
+			work := m.JobDir(j.ID) + "/work"
+			if shape == "sibling" {
+				gitT(t, work, "checkout", "-q", "--detach", "HEAD~1")
+			} else {
+				gitT(t, work, "checkout", "-q", "--orphan", "unrelated")
+			}
+			gitT(t, work, "commit", "-q", "--allow-empty", "-m", "elsewhere")
+			if err := m.publishResultBranch(get(t, m, j.ID)); err != nil {
+				t.Fatal(err)
+			}
+			j = get(t, m, j.ID)
+			if j.Branch != "" || !strings.Contains(j.BranchNote, "not a descendant") {
+				t.Fatalf("non-descendant head published: branch=%q note=%q", j.Branch, j.BranchNote)
+			}
+			if refs := gitT(t, repo, "for-each-ref", "--format=%(refname)", "refs/heads/job/", "refs/heads/feature"); refs != "" {
+				t.Fatalf("created branches: %s", refs)
+			}
+		})
+	}
+}

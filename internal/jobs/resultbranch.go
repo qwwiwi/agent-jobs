@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,6 +65,11 @@ func (m *Manager) publishResultBranch(j *store.Job) error {
 	}
 	if ahead == "0" {
 		return nil
+	}
+	// A positive base..head count also holds for a sibling or an unrelated history the job switched
+	// to; only a descendant of the base is the job's own work.
+	if _, err := runAt(work, "merge-base", "--is-ancestor", j.BaseCommit, head); err != nil {
+		return fail(errors.New("job head is not a descendant of the base commit"))
 	}
 	run := branchGit(func(args ...string) (string, error) { return runAt(j.RepoPath, args...) })
 	branch := "job/" + j.ID
