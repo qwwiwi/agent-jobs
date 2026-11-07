@@ -3,6 +3,7 @@ package guard
 import (
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -1433,6 +1434,10 @@ type cmdView struct {
 	wrapperUnknown string   // first unknown or ambiguous wrapper long option
 	envUnknown     string   // first env long option that is not a full known spelling (abbreviation, unknown)
 	lead           int      // number of leading keywords and shell assignments (before any program word)
+	// gates are the `agent-jobs gate run [gate flags] --` prefixes stripped like wrappers (#208): inside a
+	// job the gate runner is the one agent-jobs form that runs, and the command after `--` is checked as
+	// the real program. checkSelf validates their words.
+	gates []gatePrefix
 }
 
 // split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
@@ -1453,6 +1458,16 @@ func split(words []string) cmdView {
 	v.lead = i
 	for i < len(words) {
 		name := progName(words[i])
+		if isSelf(name) {
+			g, ok := parseGatePrefix(words, i)
+			if !ok {
+				break
+			}
+			g.outer = slices.Clone(v.wrappers)
+			v.gates = append(v.gates, g)
+			i = g.end
+			continue
+		}
 		vf, ok := wrapperValueFlags[name]
 		if !ok {
 			break

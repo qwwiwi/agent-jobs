@@ -14,7 +14,8 @@
 //     (rebase -x, submodule foreach, bisect run, difftool, filter-branch, …), and writes into
 //     .git/config, .git/hooks or $GIT_DIR;
 //   - nested agents (claude, claude-code, codex, gemini, aider, cursor-agent): a job is a leaf;
-//   - agent-jobs itself in any form except `agent-jobs mcp --role job` (no nested jobs), and any change
+//   - agent-jobs itself in any form except `agent-jobs mcp --role job` and the gate runner
+//     `agent-jobs gate run [gate flags] -- CMD`, whose CMD every rule checks (gaterun.go; no nested jobs), and any change
 //     to the AGENT_JOBS_* environment (the AGENT_JOBS_JOB marker the wrapper sets);
 //   - more than three subagents per job (Agent/Task tool), or a subagent that would leave the job
 //     (isolation worktree/remote, background run, agent team);
@@ -2467,13 +2468,26 @@ func sedScriptArgs(argv []string) map[int]bool {
 }
 
 // checkSelf: no nested jobs. agent-jobs as a command (by name or path, behind env/command/exec/nohup,
-// inside sh -c, eval or a substitution) is rejected unless it is exactly `agent-jobs mcp --role job`;
-// as an argument of another program it is caught by the indirect scan in unverifiable.
-func checkSelf(scripts []*script, _ string, _ Config) string {
-	return eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+// inside sh -c, eval or a substitution) is rejected unless it is exactly `agent-jobs mcp --role job` or
+// the gate runner `agent-jobs gate run [gate flags] -- CMD` (gaterun.go: split strips that prefix, so
+// argv here is CMD, checked by every rule as if it ran directly); as an argument of another program it
+// is caught by the indirect scan in unverifiable.
+func checkSelf(scripts []*script, cmd string, cfg Config) string {
+	var sawCD *bool
+	return eachCmd(scripts, func(c *simpleCmd, argv []string) string {
+		if v := split(c.words); len(v.gates) > 0 {
+			if sawCD == nil {
+				cd := newCdView(scripts, cmd, cfg).sawCD
+				sawCD = &cd
+			}
+			if r := checkGatePrefixes(c, v, cfg, *sawCD); r != "" {
+				return r
+			}
+		}
 		if len(argv) > 0 && isSelf(progName(argv[0])) && !jobRoleMCP(argv[1:]) {
 			return "blocked by guard: `" + base(argv[0]) + "` controls jobs. A job never starts, cancels or manages jobs " +
-				"(no nested jobs); only the orchestrator does."
+				"(no nested jobs); only the orchestrator does. The one form a job runs is the gate runner " + gateForm +
+				", which serializes heavy steps."
 		}
 		return ""
 	})

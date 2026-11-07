@@ -320,12 +320,17 @@ func main() {
 
 // refuseInsideJob: no nested jobs. Inside a job – the env marker AGENT_JOBS_JOB is set (the wrapper
 // sets it on every job) or an ancestor process is the job wrapper (Linux /proc) – only the job's own
-// MCP server (`mcp --role job`), the guard hook, run-wrapper and help run; every command that reads or
-// changes the agent's jobs is refused. open() adds the session check once the agent is known.
+// MCP server (`mcp --role job`), the gate runner (`gate run`: it reads no jobs, only takes the box-wide
+// gate lock for a heavy step, #208), the guard hook, run-wrapper and help run; every command that reads
+// or changes the agent's jobs is refused. open() adds the session check once the agent is known.
 func refuseInsideJob(cmd string, args []string) string {
 	switch cmd {
 	case "run-wrapper", "guard", "-h", "--help", "help", "version", "--version":
 		return ""
+	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			return ""
+		}
 	case "mcp":
 		if mcpRole(args) == string(mcp.RoleJob) {
 			return ""
