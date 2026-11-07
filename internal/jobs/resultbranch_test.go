@@ -199,3 +199,42 @@ func TestResultBranchStartRefusesUnidentifiedDefault(t *testing.T) {
 		t.Errorf("refused a name with the default declared: %v", err)
 	}
 }
+
+// A stopped job is never notified (PendingNotify skips it), so its publication must be recovered
+// on its own. Boundary "before": the daemon died before any ref was written. Boundary "after": it
+// died after the refs were written but before SetResultBranch recorded them.
+func TestResultBranchRecoversStoppedJob(t *testing.T) {
+	for _, boundary := range []string{"before-ref-publication", "after-ref-publication"} {
+		t.Run(boundary, func(t *testing.T) {
+			m := newManager(t)
+			repo := newRepo(t)
+			j := enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" })
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "exit_code", 15*time.Second, func() bool { _, ok := readExitCode(m.JobDir(j.ID)); return ok })
+			j = get(t, m, j.ID)
+			if err := m.Store.Finish(j.ID, j.LaunchToken, store.StatusStopped, 1, 0, 1, "stopped", m.Now()); err != nil {
+				t.Fatal(err)
+			}
+			head := gitT(t, m.JobDir(j.ID)+"/work", "rev-parse", "HEAD")
+			if boundary == "after-ref-publication" {
+				gitT(t, repo, "update-ref", "refs/heads/job/"+j.ID, head)
+				gitT(t, repo, "update-ref", "refs/heads/feature", head)
+			}
+			if got := get(t, m, j.ID); got.Status != store.StatusStopped || got.Branch != "" {
+				t.Fatalf("setup: %+v", got)
+			}
+			if err := m.notifyPending(); err != nil {
+				t.Fatal(err)
+			}
+			got := get(t, m, j.ID)
+			if got.Status != store.StatusStopped || got.Branch != "feature" {
+				t.Fatalf("stopped job's publication not recovered: status=%s branch=%q note=%q", got.Status, got.Branch, got.BranchNote)
+			}
+			if tip := gitT(t, repo, "rev-parse", "refs/heads/feature"); tip != head {
+				t.Fatalf("feature at %s, want %s", tip, head)
+			}
+		})
+	}
+}

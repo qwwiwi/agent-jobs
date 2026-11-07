@@ -290,21 +290,35 @@ func (m *Manager) checkMerge(j *store.Job) {
 	}
 }
 
+// recoverResultBranches publishes the result branch of every ended job that has none recorded,
+// stopped jobs included. Jobs without commits are skipped cheaply by publishResultBranch.
+func (m *Manager) recoverResultBranches() error {
+	jobs, err := m.Store.PendingResultBranch()
+	if err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		if err := m.publishResultBranch(j); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // notifyPending delivers job-done lines. A job is marked notified only after tmux accepted the
 // line; a failing tmux keeps it pending and it is retried next tick (cleanup waits for a delivered
 // notify, so the worktree is kept meanwhile). With no target configured, notify is off: the line is
 // written to the log and the job is marked notified right away, so the 30-minute cleanup still runs.
 func (m *Manager) notifyPending() error {
+	// Recover a daemon crash between finishing a row and publishing its branch. This runs before
+	// delivery (and cleanup), so both the notification and job_result carry the recorded outcome.
+	// It is independent of notification: a stopped job is never notified but keeps its commits.
+	if err := m.recoverResultBranches(); err != nil {
+		return err
+	}
 	jobs, err := m.Store.PendingNotify()
 	if err != nil || len(jobs) == 0 {
 		return err
-	}
-	// Recover a daemon crash between finishing a row and publishing its branch. This runs before
-	// delivery (and cleanup), so both the notification and job_result carry the recorded outcome.
-	for _, j := range jobs {
-		if err := m.publishResultBranch(j); err != nil {
-			return err
-		}
 	}
 	t := m.Config().NotifyTmuxTarget
 	if t == "" {
