@@ -1,0 +1,67 @@
+package guard
+
+import "testing"
+
+// Issue #179: the runner chain in front of rsync is parsed per runner (its own options and
+// operands), so an rsync option value or a runner operand is never read as the executed program,
+// while a real rsync reached through flock/parallel/find/xargs keeps its remote checks.
+func TestRsyncRunnerChains(t *testing.T) {
+	t.Setenv("HOME", "/home/u")
+	t.Setenv("CDPATH", "")
+	cfg := Config{Dir: "/home/u/work"}
+	cases := []struct {
+		name  string
+		cmd   string
+		block bool
+	}{
+		// False refusals from the issue: local copies stay allowed.
+		{"setsid exclude value names rsync", `setsid rsync --exclude 'rsync cache' ./src/ ./dst/`, false},
+		{"exclude value with variable names rsync", `rsync --exclude "rsync $P" ./src/ ./dst/`, false},
+		{"find exec exclude values name runners", `find . -exec rsync --exclude parallel --exclude rsync ./src/ ./dst/ \;`, false},
+		{"flock lock file named parallel", `flock parallel rsync ./src/ ./dst/`, false},
+		// More local shapes.
+		{"flock with options", `flock -w 5 -x ./lock rsync -a ./src/ ./dst/`, false},
+		{"setsid flock chain", `setsid -f flock ./lock rsync ./src/ ./dst/`, false},
+		{"nice timeout rsync", `nice -n 5 timeout 30 rsync -a ./src/ ./dst/`, false},
+		{"find exec local", `find . -maxdepth 0 -exec rsync -a ./src/ ./dst/ \;`, false},
+		// The bypass from loop 2 and its variants stay refused.
+		{"flock rsync lock then parallel rsync", `printf '%s\n' host:/dst/ | flock rsync parallel -j 2 rsync ./src/`, true},
+		{"flock parallel rsync remote", `flock ./lock parallel rsync ./src/ ::: host:/dst/`, true},
+		{"parallel rsync remote args", `parallel rsync ./src/ ::: host:/dst/`, true},
+		{"parallel options then rsync", `parallel -j 2 --halt now,fail=1 rsync ./src/ ::: host:/dst/`, true},
+		{"parallel rsync stdin", `echo host:/dst/ | parallel rsync ./src/`, true},
+		{"setsid parallel rsync", `echo h:/x | setsid parallel rsync ./src/`, true},
+		{"xargs rsync stdin", `echo host:/dst/ | xargs rsync ./src/`, true},
+		{"xargs options rsync stdin", `echo host:/dst/ | xargs -n 1 -P 2 rsync ./src/`, true},
+		{"find exec xargs rsync", `find . -exec xargs rsync ./src/ \;`, true},
+		{"find exec parallel rsync", `find . -exec parallel rsync ./src/ ::: h:/x \;`, true},
+		{"flock lock rsync remote", `flock ./lock rsync ./src/ host:/dst/`, true},
+		{"flock lock named rsync then rsync remote", `flock rsync rsync ./src/ host:/dst/`, true},
+		{"setsid rsync remote", `setsid rsync ./src/ host:/dst/`, true},
+		{"find exec remote", `find . -exec rsync --exclude parallel ./src/ host:/dst/ \;`, true},
+		{"flock -c rsync remote", `flock ./lock -c 'rsync ./src/ host:/dst/'`, true},
+		{"unknown runner option fails closed", `flock --zzz ./lock rsync ./src/ host:/dst/`, true},
+		// An outer xargs extends the argv of the command a runner runs.
+		{"xargs flock rsync stdin", `echo h:/x | xargs flock ./l rsync ./src/`, true},
+		{"xargs setsid rsync stdin", `echo h:/x | xargs setsid rsync ./src/`, true},
+		// An unquoted lock file may split into a lock file and a stdin runner.
+		{"bare lock file", `echo h:/x | flock $L rsync ./src/ ./dst/`, true},
+		// time is not modeled: its -o value is not a program, parallel behind it still is.
+		{"flock time -o rsync parallel", `printf '%s\n' h:/x | flock ./l time -o rsync parallel rsync ./src/`, true},
+		// Unmodeled runners and exec options inside a chain keep the position checks.
+		{"setsid ionice remote", `setsid ionice -c 3 rsync ./src/ h:/x`, true},
+		{"setsid ionice local", `setsid ionice -c 3 rsync ./src/ ./dst/`, false},
+		{"setsid fd -x remote", `setsid fd -x rsync ./src/ h:/x`, true},
+		// A runner operand is data, not a program.
+		{"lock file with space named rsync", `flock 'rsync lock' rsync ./src/ ./dst/`, false},
+		{"setsid flock options and excludes", `setsid -f flock -n -w 3 ./l rsync -a --exclude 'rsync x' ./src/ ./dst/`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Check(c.cmd, cfg)
+			if (got != "") != c.block {
+				t.Fatalf("Check(%q) = %q, want block=%v", c.cmd, got, c.block)
+			}
+		})
+	}
+}

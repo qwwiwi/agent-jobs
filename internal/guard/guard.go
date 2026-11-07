@@ -1333,7 +1333,7 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if t := scopeToolArg(name, argv[1:], dyn[1:]); t != "" {
 		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
 	}
-	if t := remoteCopyArg(name, argv[1:], dyn[1:], c.bare[v.start+1:]); t != "" {
+	if t := remoteCopyArg(name, argv[1:], dyn[1:], c.bare[v.start+1:], slices.Contains(v.wrappers, "xargs")); t != "" {
 		return cannot(name + " running " + t + " (an rsync that reaches a remote host) indirectly")
 	}
 	if t := rsyncInCode(name, argv[1:], dyn[1:], c.bare[v.start+1:], ops); t != "" {
@@ -1351,16 +1351,13 @@ func rsyncInCode(name string, args []string, dyn, bare, ops []bool) string {
 	if shells[name] || name == "eval" {
 		return ""
 	}
-	// The value of an rsync option (`--exclude 'rsync cache'`, `-f'- rsync (x)'`) is a pattern, path or
-	// format, not code, once the whole argv is verified (no remote operand, no unquoted expansion).
-	var data map[int]bool
-	if name == "rsync" {
-		if remote, _, d := rsyncScan(args, dyn, bare); !remote {
-			data = d
-		}
-	}
+	// The value of an rsync option (`--exclude 'rsync cache'`, `-f'- rsync (x)'`, `--exclude "rsync $P"`)
+	// is a pattern, path or format, not code, once the whole argv of that rsync is verified (no remote
+	// operand, no unquoted expansion), also for an rsync a runner runs (`setsid rsync --exclude …`).
+	// A runner's own option values and operands (flock's lock file) are data too (walkChain).
+	data := chainData(name, args, dyn, bare)
 	for k, a := range args {
-		if (k < len(ops) && ops[k]) || (data[k] && !dyn[k]) {
+		if (k < len(ops) && ops[k]) || data[k] {
 			continue
 		}
 		if reRsyncMention.MatchString(a) && (dyn[k] || strings.ContainsAny(a, " \t\n'\"(){};`")) {
@@ -1554,18 +1551,83 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
 // files, `:::` lists), so the argv of a command behind them cannot be read.
 var stdinRunners = map[string]bool{"parallel": true, "entr": true, "xargs": true}
 
-// remoteCopyArg returns the argument showing that name runs, at a position the guard already
-// treats as a command — the value or the word after an exec option (find -exec/-execdir/-ok) or a
-// positional of an exec runner (setsid, ionice, chroot, …, also one reached through another
-// exec option or runner) — an rsync that reaches a remote host (rsyncRemote of the words after
-// the command word, with the dynamism of each word). Behind a stdinRunner (parallel, entr, xargs:
-// `find -exec parallel rsync …` too) the command's extra arguments come from its input and cannot
-// be seen, so rsync is refused without an argv to inspect; a plain xargs is refused in
-// unverifiable (a wrapper split strips it). For find's exec option the executed command's argv
-// ends at find's own terminator (findExecEnd): what follows is find's again, e.g. another action's
-// -printf format. Elsewhere (a runner, `--exec=`) nothing ends it: an escaped `\;` is a plain
-// argument of rsync there.
-func remoteCopyArg(name string, args []string, dyn, bare []bool) string {
+// remoteCopyArg returns the argument showing that name runs an rsync that reaches a remote host,
+// or "". The runner chain is read per runner syntax first (walkChain, issue #179): flock's lock
+// file, a runner's option values, find's expression and rsync's own option values are never a
+// program, so `flock parallel rsync a b` runs a local rsync and `flock rsync parallel rsync a` runs
+// parallel. An rsync the chain reaches is checked with rsyncRemote on its own argv (for find's
+// exec option up to find's terminator, findExecEnd; elsewhere nothing ends it: an escaped `\;` is a
+// plain argument of rsync there). Behind a stdinRunner (parallel, entr, xargs) or an outer xargs
+// (stdin) the command's extra arguments come from input and cannot be seen, so an rsync word there
+// is refused without an argv to inspect; so is one after a runner word the walk cannot read (an
+// unknown option, an unquoted expansion). A program the walk does not model (ionice, chroot,
+// fd -x, …) keeps the position heuristic of legacyRemoteCopyArg. A plain rsync under xargs is
+// refused in unverifiable (a wrapper split strips xargs).
+func remoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) string {
+	argv, d, b := chainArgv(name, args, dyn, bare)
+	ch := walkChain(argv, d, b, stdin)
+	for _, r := range ch.rsyncs {
+		if r.at == 0 { // the program itself: checkUserManager checks a plain rsync
+			continue
+		}
+		if r.stdin || rsyncRemote(argv[r.at+1:r.end], d[r.at+1:r.end], b[r.at+1:r.end]) {
+			return argv[r.at]
+		}
+	}
+	for _, t := range ch.tails {
+		for k := max(t.at, 1); k < t.end; k++ {
+			if !d[k] && progName(optValue(argv[k])) == "rsync" {
+				return argv[k]
+			}
+		}
+	}
+	for _, l := range ch.legacy {
+		if l.at == 0 {
+			return legacyRemoteCopyArg(name, args, dyn, bare, stdin)
+		}
+		if t := legacyRemoteCopyArg(progName(argv[l.at]), argv[l.at+1:l.end], d[l.at+1:l.end],
+			b[l.at+1:l.end], l.stdin); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// chainArgv rebuilds the argv of name for walkChain, with dyn and bare padded to its length.
+func chainArgv(name string, args []string, dyn, bare []bool) (argv []string, d, b []bool) {
+	argv = append([]string{name}, args...)
+	d, b = make([]bool, len(argv)), make([]bool, len(argv))
+	copy(d[1:], dyn)
+	copy(b[1:], bare)
+	return argv, d, b
+}
+
+// chainData returns the indexes of args that are data, never a program or code: the option values
+// and operands of the runners in front of a command (walkChain), and the option values of every
+// rsync the chain runs whose argv is verified (rsyncScan: no remote operand, no unquoted expansion).
+func chainData(name string, args []string, dyn, bare []bool) map[int]bool {
+	argv, d, b := chainArgv(name, args, dyn, bare)
+	ch := walkChain(argv, d, b, false)
+	data := map[int]bool{}
+	for k := range ch.data {
+		data[k-1] = true
+	}
+	for _, r := range ch.rsyncs {
+		remote, _, vals := rsyncScan(argv[r.at+1:r.end], d[r.at+1:r.end], b[r.at+1:r.end])
+		if remote {
+			continue
+		}
+		for k := range vals {
+			data[r.at+k] = true // argv index r.at+1+k is args index r.at+k
+		}
+	}
+	return data
+}
+
+// legacyRemoteCopyArg is the position heuristic for a program the runner walk does not model
+// (ionice, chroot, fd -x, go test -exec, …): any rsync word at a command position. stdin marks an
+// argv extended from an outer xargs: an rsync there is refused without an argv to inspect.
+func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) string {
 	data := runnerDataValues(name, args)
 	for k, a := range args {
 		if data[k] || dyn[k] {
@@ -1586,7 +1648,7 @@ func remoteCopyArg(name string, args []string, dyn, bare []bool) string {
 		if name == "find" {
 			end = findExecEnd(args, k)
 		}
-		if stdinRunners[name] || behindStdinRunner(name, args, k) ||
+		if stdin || stdinRunners[name] || behindStdinRunner(name, args, k) ||
 			rsyncRemote(args[k+1:end], dyn[k+1:end], bareFrom(bare, k+1, end)) {
 			return a
 		}
