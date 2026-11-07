@@ -300,11 +300,13 @@ func TestHookPendingOutcomeRepeatsAfterInterval(t *testing.T) {
 	h := newPendingOutcomeHarness(t)
 	h.finish("a1", "first")
 	h.bind()
-	h.age(jobs.DefaultHookRepeatAfter - 2*time.Second)
+	// The windows leave room for slow subprocess runs: last_emitted has whole seconds, and every
+	// h.run is an exec of the binary, which takes over a second under the full suite's parallel load.
+	h.age(jobs.DefaultHookRepeatAfter - time.Minute)
 	if out := h.prompt(); out != "" {
 		t.Errorf("just before the default repeat interval: %q", out)
 	}
-	h.age(3 * time.Second)
+	h.age(time.Minute + time.Second)
 	if out := h.prompt(); !strings.Contains(out, "a1 first") {
 		t.Errorf("at the default repeat interval: %q", out)
 	}
@@ -313,11 +315,11 @@ func TestHookPendingOutcomeRepeatsAfterInterval(t *testing.T) {
 	}
 	writeAgentConfig(t, "test", map[string]any{"notify_tmux_target": "orch-session", "orchestrator_dir": h.orch,
 		"hooks": map[string]any{"repeat_after_seconds": 60}})
-	h.age(50 * time.Second)
+	h.age(30 * time.Second)
 	if out := h.prompt(); out != "" {
 		t.Errorf("before the configured interval: %q", out)
 	}
-	h.age(20 * time.Second)
+	h.age(40 * time.Second)
 	if out := h.prompt(); !strings.Contains(out, "a1 first") {
 		t.Errorf("at the configured interval: %q", out)
 	}
