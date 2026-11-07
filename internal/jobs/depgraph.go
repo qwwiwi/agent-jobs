@@ -158,8 +158,9 @@ func (d *depGraph) reaches(from, to string) bool {
 
 // renewOverlapAdmission is the overlap admission of a job that is requeued (store.ResumeAdmission). The
 // job was not active while it was failed or timed out, so jobs admitted meanwhile never recorded it.
-// It now waits, under its own on_overlap serialize, for the active overlapping jobs of its repository,
-// except those that wait for it (queued ones wait on their own; a running or stopped one holds the
+// It now waits for the active overlapping jobs of its repository, all of them under its own on_overlap
+// serialize, and otherwise those that themselves asked for serialize (their request holds whatever
+// policy the resumed job used), except those that wait for it (queued ones wait on their own; a running or stopped one holds the
 // claim, see jobDependenciesSQL) and those that already wait for it through others. A wait kept from
 // the earlier admission that now closes a cycle is dropped, since its target was admitted behind the
 // job. A cycle that remains (through the parent or a milestone dependency) refuses the resume.
@@ -178,20 +179,21 @@ func renewOverlapAdmission(stored *store.Job, g store.AdmissionGraph) ([]string,
 		waits = append(waits, id)
 	}
 	overlap := slices.Clone(stored.Overlap)
-	if stored.OnOverlap == "serialize" {
-		for _, x := range g.Active {
-			if x.ID == j.ID || x.RepoPath != j.RepoPath || !coderJob(x.Kind) || slices.Contains(waits, x.ID) ||
-				(x.Status != store.StatusQueued && x.Status != store.StatusRunning) {
-				continue
-			}
-			o, ok := overlapOf(&j, x)
-			if !ok || slices.Contains(x.WaitFor, j.ID) || d.reaches(x.ID, j.ID) {
-				continue
-			}
-			waits = append(waits, x.ID)
-			if !slices.ContainsFunc(overlap, func(e store.JobOverlap) bool { return e.ID == x.ID }) {
-				overlap = append(overlap, o)
-			}
+	for _, x := range g.Active {
+		// A peer that asked for serialization is honoured whatever policy the resumed job used: it was
+		// admitted while this job was inactive, so it recorded no wait for it.
+		if x.ID == j.ID || x.RepoPath != j.RepoPath || !coderJob(x.Kind) || slices.Contains(waits, x.ID) ||
+			(stored.OnOverlap != "serialize" && x.OnOverlap != "serialize") ||
+			(x.Status != store.StatusQueued && x.Status != store.StatusRunning) {
+			continue
+		}
+		o, ok := overlapOf(&j, x)
+		if !ok || slices.Contains(x.WaitFor, j.ID) || d.reaches(x.ID, j.ID) {
+			continue
+		}
+		waits = append(waits, x.ID)
+		if !slices.ContainsFunc(overlap, func(e store.JobOverlap) bool { return e.ID == x.ID }) {
+			overlap = append(overlap, o)
 		}
 	}
 	j.WaitFor = waits
