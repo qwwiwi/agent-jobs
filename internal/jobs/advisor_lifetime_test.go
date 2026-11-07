@@ -116,9 +116,18 @@ func (e *advEnv) advisorPID(t *testing.T, n int) int {
 	return pid
 }
 
-// advisorGroupGone reports that no process of group pgid is left (zombies aside).
-func advisorGroupGone(pgid int) bool {
-	return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) || gone(pgid)
+// advisorGroupGone reports that no process of group pgid is left (zombies aside), by enumerating the
+// group's members: a dead leader is no proof that its group is gone (issue #190).
+func advisorGroupGone(t *testing.T, pgid int) bool {
+	t.Helper()
+	if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+		return true
+	}
+	members, err := groupMembers(pgid)
+	if err != nil {
+		t.Fatalf("enumerate process group %d: %v", pgid, err)
+	}
+	return len(members) == 0
 }
 
 // An active advisor call ends with its job's cancel or timeout through the parent lifecycle itself
@@ -170,7 +179,7 @@ func TestAdvisorEndsWithParent(t *testing.T) {
 				if got := get(t, e.m, j.ID); got.Status != want {
 					t.Fatalf("status %s %q, want %s", got.Status, got.Error, want)
 				}
-				if !advisorGroupGone(pid) {
+				if !advisorGroupGone(t, pid) {
 					t.Fatalf("the advisor's process group %d outlived the job's %s", pid, how)
 				}
 				if contain == "scope" {
@@ -319,8 +328,80 @@ func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
 				t.Fatal("the advisor call did not end with its job")
 			}
 			if b, err := os.ReadFile(filepath.Join(e.dir, "pid.1")); err == nil {
-				if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 1 && !advisorGroupGone(pid) {
+				if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 1 && !advisorGroupGone(t, pid) {
 					t.Fatalf("the advisor's process group %d outlived the job's %s", pid, how)
+				}
+			}
+			if runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json")); len(runs) != 0 {
+				t.Fatalf("advisor registrations left: %v", runs)
+			}
+		})
+	}
+}
+
+// An advisor call whose leader exits while a child of it lives on in its process group (holding the
+// call's stdout) does not leave that child behind (issue #190, F2 session): the group's members are
+// enumerated and ended even without the leader, and the registration is dropped only once none is
+// left. "returned": the call came back before its job finished successfully; "draining": the job
+// finished successfully while the call still waited for its inherited pipes, its leader already reaped;
+// "escaped": the child left the call's group (a group of its own in the call's session) and the call
+// came back, so only the escaped-process sweep of the successful finish can end it.
+func TestAdvisorLeaderlessGroupEnded(t *testing.T) {
+	for _, when := range []string{"returned", "draining", "escaped"} {
+		t.Run(when, func(t *testing.T) {
+			e := newAdvisor(t)
+			noAdvisorPolling(t)
+			noAutoContinue(e.m)
+			j := e.crewJob(t, 2, 1.0)
+			marks := []string{"child"}
+			if when == "escaped" {
+				marks = append(marks, "escape")
+			}
+			for _, f := range marks {
+				if err := os.WriteFile(filepath.Join(e.dir, f), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := askInBackground(e, j)
+			leader := e.advisorPID(t, 1)
+			t.Cleanup(func() { _ = syscall.Kill(-leader, syscall.SIGKILL) })
+			var child int
+			waitFor(t, "the advisor's child", 15*time.Second, func() bool {
+				b, err := os.ReadFile(filepath.Join(e.dir, "child.1"))
+				if err != nil {
+					return false
+				}
+				child, err = strconv.Atoi(strings.TrimSpace(string(b)))
+				return err == nil && child > 1
+			})
+			t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+			if when != "draining" {
+				select {
+				case <-done:
+				case <-time.After(20 * time.Second):
+					t.Fatal("the advisor call did not return")
+				}
+			} else {
+				waitFor(t, "the advisor's leader to exit", 15*time.Second, func() bool { return gone(leader) })
+				if runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json")); len(runs) != 1 {
+					t.Skipf("the call was no longer draining its pipes (registrations %v)", runs)
+				}
+			}
+			if _, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now()); !ok {
+				t.Fatal("finish did not record the row")
+			}
+			if !advisorGroupGone(t, leader) {
+				members, _ := groupMembers(leader)
+				t.Fatalf("members %v of the advisor's process group %d outlived its job's successful finish", members, leader)
+			}
+			if !gone(child) {
+				t.Fatalf("the advisor's child %d outlived its job's successful finish", child)
+			}
+			if when == "draining" {
+				select {
+				case <-done:
+				case <-time.After(20 * time.Second):
+					t.Fatal("the advisor call did not return after its job finished")
 				}
 			}
 			if runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json")); len(runs) != 0 {

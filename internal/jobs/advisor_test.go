@@ -18,7 +18,10 @@ import (
 // fakeAdvisorClaude stands in for the advisor's claude -p: it records each call (argv one per line,
 // stdin, cwd, environment) in $FAKE_ADV_DIR as argv.N / stdin.N / cwd.N / env.N and prints
 // $FAKE_ADV_DIR/out; with $FAKE_ADV_DIR/slow present it records its pid in pid.N and sleeps first (a
-// call that runs long).
+// call that runs long); with $FAKE_ADV_DIR/child present it records its pid in pid.N, leaves a child
+// in its process group (holding its stdout) whose pid it records in child.N, and exits; with
+// $FAKE_ADV_DIR/escape present too, that child gets a process group of its own (set -m), in the call's
+// session.
 const fakeAdvisorClaude = `#!/bin/bash
 d="$FAKE_ADV_DIR"
 echo call >> "$d/calls"
@@ -28,6 +31,8 @@ cat > "$d/stdin.$n"
 pwd > "$d/cwd.$n"
 env > "$d/env.$n"
 if [ -f "$d/slow" ]; then echo $$ > "$d/pid.$n"; sleep 30; fi
+if [ -f "$d/escape" ]; then set -m; fi
+if [ -f "$d/child" ]; then echo $$ > "$d/pid.$n"; sleep 30 & echo $! > "$d/child.$n"; fi
 cat "$d/out" 2>/dev/null
 `
 

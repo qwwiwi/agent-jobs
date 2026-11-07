@@ -395,12 +395,7 @@ func (m *Manager) advisorCall(ctx context.Context, j *store.Job, call *store.Adv
 		return advisorResult{costKnown: errors.Is(err, errAdvisorRefused), err: err}
 	}
 	runErr := cmd.Wait()
-	release()
-	if unit != "" && cctx.Err() != nil {
-		if err := m.stopScope(scopeID); err != nil {
-			m.Log.Printf("job %s: advisor call %d: stop scope: %v", j.ID, call.N, err)
-		}
-	}
+	release() // ends what is left of the call (its group, its scope) before it counts as over
 	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
 		return advisorResult{err: fmt.Errorf("the advisor did not answer within %s", AdvisorTimeout)}
 	}

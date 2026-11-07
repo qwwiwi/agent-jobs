@@ -7,9 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -141,7 +143,25 @@ func (m *Manager) startAdvisor(j *store.Job, n int, cmd *exec.Cmd, scope string)
 		return nil, fmt.Errorf("register the advisor call: %w", err)
 	}
 	path := advisorRunPath(dir, n)
-	return func() { _ = os.Remove(path) }, nil
+	// Once cmd has been waited for, its leader is gone, not necessarily its group or its scope: the
+	// registration is dropped only when nothing of the call is left (issue #190). One that cannot be
+	// ended stays registered, so the job's lifecycle (endAdvisors) ends it.
+	return func() {
+		unlock, err := admitLock(dir)
+		if err != nil {
+			m.Log.Printf("job %s: advisor call %d kept registered: %v", j.ID, n, err)
+			return
+		}
+		defer unlock()
+		if _, err := os.Stat(path); err != nil {
+			return // ended (and dropped) by the job's lifecycle already
+		}
+		if note := m.endAdvisorRun(j.ID, r); note != "" {
+			m.Log.Printf("job %s: advisor call %d kept registered: %s", j.ID, n, note)
+			return
+		}
+		_ = os.Remove(path)
+	}, nil
 }
 
 // advisorIsRun reports whether r's process still exists as registered: its pid leads its process
@@ -196,7 +216,9 @@ func (m *Manager) endAdvisors(id string) string {
 }
 
 // endAdvisorRun ends one registered advisor call: its scope's stop ends everything in its cgroup; the
-// kill of its process group covers session containment (and a scope that could not be stopped).
+// kill of its process group covers session containment (and a scope that could not be stopped), and
+// the members of that group are ended and waited for even when its leader is gone (endAdvisorGroup).
+// "" means nothing of the call is left; otherwise the registration must be kept.
 func (m *Manager) endAdvisorRun(id string, r advisorRun) string {
 	var scopeErr error
 	if r.Scope != "" {
@@ -206,11 +228,65 @@ func (m *Manager) endAdvisorRun(id string, r advisorRun) string {
 		if err := syscall.Kill(-r.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return fmt.Sprintf("advisor call %d (process group %d) not killed: %v", r.N, r.PID, err)
 		}
-		m.Log.Printf("job %s: advisor call %d ended with its job", id, r.N)
+		m.Log.Printf("job %s: advisor call %d ended", id, r.N)
+	}
+	var notes []string
+	if note := m.endAdvisorGroup(id, r); note != "" {
+		m.Log.Printf("job %s: %s", id, note)
+		notes = append(notes, note)
 	}
 	if scopeErr != nil {
 		m.Log.Printf("job %s: advisor call %d: stop scope: %v", id, r.N, scopeErr)
-		return fmt.Sprintf("advisor call %d: scope not stopped: %v", r.N, scopeErr)
+		notes = append(notes, fmt.Sprintf("advisor call %d: scope not stopped: %v", r.N, scopeErr))
 	}
-	return ""
+	return strings.Join(notes, "; ")
+}
+
+// advisorMember reports whether pid is a live (non-zombie) member of registered advisor call r's
+// process group that is proven the call's whether or not its leader is still there: it carries job
+// id's marker and started no earlier than the call's leader.
+func advisorMember(id string, r advisorRun) func(int) bool {
+	return func(pid int) bool {
+		p, err := procStatFull(pid)
+		return err == nil && p.state != "Z" && p.pgid == r.PID && procMarker(pid) == id && (r.Start == 0 || p.start >= r.Start)
+	}
+}
+
+// advisorGroupRounds bounds endAdvisorGroup's wait (50 ms each) for the members it killed to go.
+const advisorGroupRounds = 60
+
+// endAdvisorGroup ends the members of registered call r's process group proven the call's
+// (advisorMember), also when the leader has exited or been reaped, each through a pidfd (signalMember),
+// and waits until none is left. A member that is not proven the call's is never signalled. It returns
+// a note when members survived or the group could not be checked ("" when none is left).
+func (m *Manager) endAdvisorGroup(id string, r advisorRun) string {
+	if plausibleGroup(r.PID) != nil || !groupAlive(r.PID) {
+		return ""
+	}
+	isMember := advisorMember(id, r)
+	var signalErr error
+	for round := 0; round < advisorGroupRounds; round++ {
+		pids, err := groupMembers(r.PID)
+		if err != nil {
+			return fmt.Sprintf("advisor call %d: process group %d not checked: %v", r.N, r.PID, err)
+		}
+		pids = slices.DeleteFunc(pids, func(pid int) bool { return !isMember(pid) })
+		if len(pids) == 0 {
+			return ""
+		}
+		if round%20 == 0 {
+			m.Log.Printf("job %s: advisor call %d: ending %d process(es) left in its group %d", id, r.N, len(pids), r.PID)
+			for _, pid := range pids {
+				if _, err := signalMember(pid, isMember, syscall.SIGKILL); err != nil {
+					signalErr = err
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	note := fmt.Sprintf("advisor call %d: processes of its group %d survived SIGKILL", r.N, r.PID)
+	if signalErr != nil {
+		note += ": " + signalErr.Error()
+	}
+	return note
 }

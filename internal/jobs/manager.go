@@ -1989,7 +1989,9 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 	}
 	// The row has left running: no advisor call is admitted any more, and the ones running end now.
 	m.noteSweep(j.ID, m.endAdvisors(j.ID))
-	if status == store.StatusTimeout || status == store.StatusFailed {
+	// A crew job's advisor calls run in sessions of their own, outside the wrapper's session sweep: what
+	// they left outside their group is swept after any finish, a successful one too (issue #190).
+	if status == store.StatusTimeout || status == store.StatusFailed || j.Crew.HasAdvisor() {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
 	m.noteReviewChanges(j)
