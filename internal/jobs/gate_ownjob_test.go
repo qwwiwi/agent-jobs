@@ -99,6 +99,18 @@ func TestGateOwnJobNoProcWaits(t *testing.T) {
 	wantBoundedWait(t, "no /proc, forged holder line", err)
 }
 
+// Without /proc even a real gate of the job holding the flock cannot be verified: it is waited for.
+func TestGateOwnJobNoProcRealHolderWaits(t *testing.T) {
+	lockDir := t.TempDir()
+	lock := filepath.Join(lockDir, GateLockName)
+	startJobGateT(t, lockDir, "victim")
+	old := procRoot
+	procRoot = filepath.Join(t.TempDir(), "no-proc")
+	t.Cleanup(func() { procRoot = old })
+	_, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "victim"})
+	wantBoundedWait(t, "no /proc, a real gate of the job", err)
+}
+
 // A process of the same user that really holds the flock and carries a copied AGENT_JOBS_JOB=victim, but
 // is outside the victim's scope and process tree, is not of the victim job: the victim waits.
 func TestGateOwnJobCopiedMarkerWaits(t *testing.T) {
