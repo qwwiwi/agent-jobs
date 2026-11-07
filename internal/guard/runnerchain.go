@@ -228,9 +228,21 @@ func (ch *runnerChain) flockFrom(argv []string, s chainSpan, from, forks int) {
 // maxFlockForks bounds the readings flockFrom walks (3^n).
 const maxFlockForks = 3
 
-// numeric reports a word that flock -w/-E could take as its value (seconds or an exit code).
+// numeric reports a word that flock -w/-E may take as its value: -w is read with strtod, -E with
+// strtol (`5`, `1e3`, `+5`, `0x10`, `.5`, `inf`, `nan`, leading blanks). Any word those could start
+// to read counts (a superset: an extra reading only adds refusals); on any other word flock exits
+// with an error and runs nothing.
 func numeric(w string) bool {
-	return w != "" && strings.Trim(w, "0123456789.") == ""
+	w = strings.TrimLeft(w, " \t\n\v\f\r")
+	w = strings.TrimLeft(w, "+-")
+	if w == "" {
+		return false
+	}
+	if c := w[0]; c == '.' || c >= '0' && c <= '9' {
+		return true
+	}
+	l := strings.ToLower(w)
+	return strings.HasPrefix(l, "inf") || strings.HasPrefix(l, "nan")
 }
 
 // flockOperand walks flock from its lock file at index i: then the command or `-c` string.

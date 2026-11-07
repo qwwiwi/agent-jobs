@@ -108,3 +108,17 @@ func TestWalkChainStdinAndBare(t *testing.T) {
 		t.Errorf("xargs find: rsyncs = %+v tails = %+v, want one tail", ch.rsyncs, ch.tails)
 	}
 }
+
+// numeric accepts every word flock's strtod (-w) or strtol (-E) may read, and rejects names.
+func TestFlockNumeric(t *testing.T) {
+	for _, w := range []string{"5", "1e3", "+5", "-1", "0x10", ".5", "inf", "NaN", " 7"} {
+		if !numeric(w) {
+			t.Errorf("numeric(%q) = false, want true", w)
+		}
+	}
+	for _, w := range []string{"", "L", "./l", "-a", "--", "x5"} {
+		if numeric(w) {
+			t.Errorf("numeric(%q) = true, want false", w)
+		}
+	}
+}

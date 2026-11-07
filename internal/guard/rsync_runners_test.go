@@ -64,6 +64,12 @@ func TestRsyncRunnerChains(t *testing.T) {
 		{"quoted timeout value", `flock -w "$T" ./l rsync ./a ./b`, false},
 		{"quoted lock variable as option", `L=-n; printf '%s\n' h:/x | flock "$L" rsync parallel rsync ./src/`, true},
 		{"quoted lock variable remote", `flock "$LOCK" rsync ./a h:/x`, true},
+		// `"$X"` may be -w/-E: its value is any word strtod/strtol reads, then the lock file.
+		{"quoted option exponent value", `flock "$X" 1e3 L rsync host:/x /y`, true},
+		{"quoted option signed value", `flock "$X" +5 L rsync host:/x /y`, true},
+		{"quoted option hex value", `flock "$X" 0x10 L rsync host:/x /y`, true},
+		{"quoted option after flag", `flock -s "$X" 1e3 ./l rsync -a ./a host:/x`, true},
+		{"quoted option inf value", `flock "$X" inf L rsync host:/x /y`, true},
 		// A runner operand is data, not a program.
 		{"lock file with space named rsync", `flock 'rsync lock' rsync ./src/ ./dst/`, false},
 		{"setsid flock options and excludes", `setsid -f flock -n -w 3 ./l rsync -a --exclude 'rsync x' ./src/ ./dst/`, false},
