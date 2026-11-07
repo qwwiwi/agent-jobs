@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -36,7 +37,9 @@ const (
 )
 
 const (
-	hookEmitFile    = "hook-emit.json"
+	hookEmitFile = "hook-emit.json"
+	// hookInvalidFile holds the token of the last invalidation made without the state lock (#188).
+	hookInvalidFile = "hook-emit.invalid"
 	hookKindOutcome = "pending_outcome"
 	// moreTailFormat is the explicit tail of a list cut short.
 	moreTailFormat = "+%d more, see job_list"
@@ -178,6 +181,10 @@ type hookEmitRecord struct {
 	Hash string `json:"hash"`
 	// LastEmitted is the unix time of the last emission.
 	LastEmitted int64 `json:"last_emitted"`
+	// Invalid is the invalidation token (hookInvalidFile) that was current when the emission was planned.
+	// A record only suppresses while its token is the current one, so an emission planned before an
+	// invalidation can never suppress after it (#188).
+	Invalid string `json:"invalid,omitempty"`
 }
 
 // hookEmitState is the content of hook-emit.json: per bound session, its context epoch and the
@@ -194,7 +201,13 @@ type hookStateTx struct {
 	lock *os.File
 	path string
 	st   hookEmitState
+	// invalid is the invalidation token read right after the lock was taken ("" = none).
+	invalid string
 }
+
+// hookLockTries is how many times (10 ms apart) lockHookState tries the lock: half a second. A variable so
+// that a test can make the lock time out at once.
+var hookLockTries = 50
 
 // lockHookState takes the lock (waiting at most half a second) and reads the state of sessionID; a state
 // of another session starts empty.
@@ -204,7 +217,7 @@ func (m *Manager) lockHookState(sessionID string) (*hookStateTx, error) {
 		return nil, fmt.Errorf("hook state lock: %w", err)
 	}
 	locked := false
-	for range 50 {
+	for range hookLockTries {
 		if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 			locked = true
 			break
@@ -229,7 +242,40 @@ func (m *Manager) lockHookState(sessionID string) (*hookStateTx, error) {
 	if tx.st.SessionID != sessionID {
 		tx.st = hookEmitState{SessionID: sessionID}
 	}
+	tx.invalid = m.readHookInvalid()
 	return tx, nil
+}
+
+// readHookInvalid returns the current invalidation token, "" when there is none. A token that cannot be
+// read is a distinct value, so records made before it are not trusted.
+func (m *Manager) readHookInvalid() string {
+	b, err := os.ReadFile(filepath.Join(m.StateDir, hookInvalidFile))
+	switch {
+	case err == nil:
+		return strings.TrimSpace(string(b))
+	case errors.Is(err, os.ErrNotExist):
+		return ""
+	default:
+		return "unreadable"
+	}
+}
+
+var hookInvalidSeq atomic.Uint64
+
+// writeHookInvalid publishes a fresh invalidation token (temp file and rename) without taking the state
+// lock.
+func (m *Manager) writeHookInvalid() error {
+	token := fmt.Sprintf("%d-%d-%d", m.Now().UnixNano(), os.Getpid(), hookInvalidSeq.Add(1))
+	path := filepath.Join(m.StateDir, hookInvalidFile)
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	if err := os.WriteFile(tmp, []byte(token), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // save writes the state (temp file and rename).
@@ -287,7 +333,17 @@ func (m *Manager) StartHookEpoch(sessionID string) error {
 		return true
 	})
 	if err == nil {
+		// The fresh state supersedes any earlier invalidation token.
+		if rerr := os.Remove(filepath.Join(m.StateDir, hookInvalidFile)); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			m.logf("hook dedupe: %v", rerr)
+		}
 		return nil
+	}
+	// The record is dropped without the lock, so an emission that holds the lock (planned for the previous
+	// context) may still commit it back. The token makes that record useless: it differs from the one
+	// every later transaction reads (#188).
+	if ierr := m.writeHookInvalid(); ierr != nil {
+		m.logf("hook dedupe: invalidation token: %v", ierr)
 	}
 	if rerr := os.Remove(filepath.Join(m.StateDir, hookEmitFile)); rerr == nil || errors.Is(rerr, os.ErrNotExist) {
 		m.logf("hook dedupe: %v (dropped the old emission record instead)", err)
@@ -374,12 +430,12 @@ func (m *Manager) planHook(sessionID, kind, hash string) *HookEmission {
 		tx.close()
 		return nil
 	}
-	if !force && ok && rec.Epoch == tx.st.Epoch && rec.Hash == hash &&
+	if !force && ok && rec.Epoch == tx.st.Epoch && rec.Hash == hash && rec.Invalid == tx.invalid &&
 		now.Sub(time.Unix(rec.LastEmitted, 0)) < m.Config().Hooks.RepeatAfter() {
 		tx.close()
 		return nil
 	}
-	return &HookEmission{tx: tx, kind: kind, rec: hookEmitRecord{Epoch: tx.st.Epoch, Hash: hash, LastEmitted: now.Unix()}}
+	return &HookEmission{tx: tx, kind: kind, rec: hookEmitRecord{Epoch: tx.st.Epoch, Hash: hash, LastEmitted: now.Unix(), Invalid: tx.invalid}}
 }
 
 func (m *Manager) logf(format string, args ...any) {
