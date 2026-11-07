@@ -15,10 +15,11 @@ import (
 )
 
 // An advisor call's process belongs to its job's lifecycle (issue #169, F2). It is admitted and
-// registered under the advisor lock (<AdvisorDir>/admit.lock), and every path that takes the job out of
-// running (finish, Cancel, Stop) ends the registered calls under the same lock once the row has left
-// running. So either a call registered first (and is ended with the job), or the row left running first
-// (and the call's admission refuses to start its process). The advisor dir is the daemon's, outside the
+// registered under the advisor lock (<AdvisorDir>/admit.lock). The transitions that close admission (the
+// timeout claim and the row leaving running in finish, Cancel and Stop) run under the same lock
+// (closingAdmission, issue #190), and each of those paths then ends the registered calls under it. So
+// either a call registered first (and is ended with the job), or the transition came first (and the
+// call's admission refuses to start its process); none can fall between the check and the start. The advisor dir is the daemon's, outside the
 // job's folder: the job cannot forge a registration. whileJobRuns' polling stays as a fallback.
 
 // advisorRun is the registration of one running advisor call (<AdvisorDir>/run.<n>.json).
@@ -75,6 +76,32 @@ func (m *Manager) advisorLive(j *store.Job) error {
 	return nil
 }
 
+// closingAdmission runs fn, a transition that closes advisor admission for job j (the timeout claim,
+// the row leaving running), under the advisor lock (issue #190): an advisor call that passed its final
+// liveness check holds that lock until its process is started and registered, so the transition either
+// comes first (and the call is refused) or waits for the registration (and endAdvisors then ends it).
+// A plain job never admits an advisor call and takes no lock. Call it with the advisor lock not held;
+// release it before endAdvisors. If the lock cannot be taken, fn runs anyway (a transition must not be
+// lost) and endAdvisors stays the backstop.
+func (m *Manager) closingAdmission(j *store.Job, fn func() error) error {
+	if !j.Crew.HasAdvisor() {
+		return fn()
+	}
+	dir := m.AdvisorDir(j.ID)
+	// Created here too: an admission that creates the dir after this point checks the row after fn.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		m.Log.Printf("job %s: advisor admission not locked: %v", j.ID, err)
+		return fn()
+	}
+	unlock, err := admitLock(dir)
+	if err != nil {
+		m.Log.Printf("job %s: advisor admission not locked: %v", j.ID, err)
+		return fn()
+	}
+	defer unlock()
+	return fn()
+}
+
 // errAdvisorRefused marks an advisor call whose process was never started.
 var errAdvisorRefused = errors.New("the advisor call was not started")
 
@@ -91,6 +118,9 @@ func (m *Manager) startAdvisor(j *store.Job, n int, cmd *exec.Cmd, scope string)
 	defer unlock()
 	if err := m.advisorLive(j); err != nil {
 		return nil, fmt.Errorf("%w: %v", errAdvisorRefused, err)
+	}
+	if m.afterAdvisorAdmit != nil {
+		m.afterAdvisorAdmit(j)
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errAdvisorRefused, err)

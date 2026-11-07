@@ -522,8 +522,10 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
-	if err := m.Store.FinishAttempt(id, "", store.StatusStopped, res.Turns, res.CostUSD, unknown, estimate, dur,
-		RedactPrintable(msg, 800), now); err != nil {
+	if err := m.closingAdmission(j, func() error {
+		return m.Store.FinishAttempt(id, "", store.StatusStopped, res.Turns, res.CostUSD, unknown, estimate, dur,
+			RedactPrintable(msg, 800), now)
+	}); err != nil {
 		return nil, err
 	}
 	// The row has left running: no advisor call is admitted any more, and the ones running end now.

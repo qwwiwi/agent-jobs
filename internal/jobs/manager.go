@@ -96,6 +96,9 @@ type Manager struct {
 	beforeClaim func(*store.Job)
 	// beforeAdvisorLaunch (tests only) runs between an advisor call's reservation and its launch.
 	beforeAdvisorLaunch func(*store.Job)
+	// afterAdvisorAdmit (tests only) runs between an advisor call's final liveness check and the start
+	// of its process, under the advisor lock.
+	afterAdvisorAdmit func(*store.Job)
 
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
@@ -1825,7 +1828,11 @@ func (m *Manager) collect() error {
 			// since. The decision is a conditional update against the row as it is now; it also closes
 			// the start of an acceptance command from here on.
 			beforeTimeoutClaim(j.ID)
-			claimed, err := m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+			var claimed bool
+			err := m.closingAdmission(j, func() (err error) {
+				claimed, err = m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+				return err
+			})
 			if err != nil {
 				m.Log.Printf("job %s: claim timeout: %v", j.ID, err)
 				continue
@@ -1974,7 +1981,9 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		}
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
-	if err := m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now); err != nil {
+	if err := m.closingAdmission(j, func() error {
+		return m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now)
+	}); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
@@ -2214,7 +2223,9 @@ func (m *Manager) Cancel(id string) error {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
-	if err := m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now); err != nil {
+	if err := m.closingAdmission(j, func() error {
+		return m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now)
+	}); err != nil {
 		return err
 	}
 	// The row has left running: no advisor call is admitted any more, and the ones running end now.

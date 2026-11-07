@@ -231,3 +231,101 @@ func TestEndAdvisorsSkipsStaleRegistration(t *testing.T) {
 		t.Fatalf("stale registration kept: %v", runs)
 	}
 }
+
+// The transitions that close advisor admission (Cancel, the timeout claim, finish) are serialized with
+// the advisor's admission (issue #190, F2 admission): an advisor call that passed its final liveness
+// check holds the advisor lock until its process is started and registered, so a transition that comes
+// in after that check waits, and then ends the call it finds registered. A transition can never complete
+// between the check and the start, which would let a paid call launch after the job left running.
+func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
+	for _, how := range []string{"cancel", "stop", "timeout", "finish"} {
+		t.Run(how, func(t *testing.T) {
+			e := newAdvisor(t)
+			noAdvisorPolling(t)
+			noAutoContinue(e.m)
+			j := e.crewJob(t, 2, 1.0)
+			if how == "timeout" {
+				parentGroup(t, e.m, j)
+			}
+			if err := os.WriteFile(filepath.Join(e.dir, "slow"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			paused, release := make(chan struct{}), make(chan struct{})
+			e.m.afterAdvisorAdmit = func(*store.Job) {
+				close(paused)
+				<-release
+			}
+			done := askInBackground(e, j)
+			select {
+			case <-paused:
+			case <-time.After(10 * time.Second):
+				close(release)
+				t.Fatal("the advisor call never passed its liveness check")
+			}
+			transition := make(chan error, 1)
+			go func() {
+				switch how {
+				case "cancel":
+					transition <- e.m.Cancel(j.ID)
+				case "stop":
+					_, err := e.m.Stop(j.ID, "")
+					transition <- err
+				case "timeout":
+					real := e.m.Now
+					e.m.Now = func() time.Time { return real().Add(3 * time.Hour) }
+					transition <- e.m.Tick()
+				default:
+					_, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now())
+					if !ok {
+						transition <- errors.New("finish did not record the row")
+						return
+					}
+					transition <- nil
+				}
+			}()
+			crossed := false
+			select {
+			case <-transition:
+				crossed = true
+			case <-time.After(700 * time.Millisecond):
+			}
+			if crossed {
+				close(release)
+				<-done
+				t.Fatalf("the %s completed between the advisor's liveness check and its start", how)
+			}
+			if got := get(t, e.m, j.ID); got.Status != store.StatusRunning || got.TimedOutAt != nil {
+				close(release)
+				t.Fatalf("the %s changed the row (%s) while an admitted advisor call was starting", how, got.Status)
+			}
+			close(release)
+			select {
+			case err := <-transition:
+				if err != nil {
+					t.Logf("%s: %v", how, err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatalf("the %s did not complete after the advisor call started", how)
+			}
+			if got := get(t, e.m, j.ID); got.Status == store.StatusRunning {
+				t.Fatalf("the job still runs after the %s", how)
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("the advisor call of an ended job succeeded")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("the advisor call did not end with its job")
+			}
+			if b, err := os.ReadFile(filepath.Join(e.dir, "pid.1")); err == nil {
+				if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 1 && !advisorGroupGone(pid) {
+					t.Fatalf("the advisor's process group %d outlived the job's %s", pid, how)
+				}
+			}
+			if runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json")); len(runs) != 0 {
+				t.Fatalf("advisor registrations left: %v", runs)
+			}
+		})
+	}
+}
