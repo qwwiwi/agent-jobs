@@ -481,3 +481,38 @@ func (m *Manager) JobRequirementsTrailers(j *store.Job) ([]string, string) {
 	}
 	return RequirementsTrailers(vals), ""
 }
+
+// MaxCommitLines caps the commit list of the compact job_result.
+const MaxCommitLines = 50
+
+// JobCommits returns "<short sha> <subject>" for each of the job's own commits (base..head, newest
+// first, redacted, at most MaxCommitLines; a last line says how many more), and a note when they could
+// not be read. Nil and "" for a job without a repository or without commits.
+func (m *Manager) JobCommits(j *store.Job) ([]string, string) {
+	if j.RepoPath == "" || j.BaseCommit == "" {
+		return nil, ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), MergeCheckTimeout)
+	defer cancel()
+	head, note := m.jobHead(ctx, j)
+	if note != "" {
+		return nil, "commits not read: " + note
+	}
+	if head == "" || head == j.BaseCommit {
+		return nil, ""
+	}
+	out, err := gitCtxOK(ctx, j.RepoPath, "log", "--no-merges", "--no-show-signature", "--format=%h %s", j.BaseCommit+".."+head)
+	if err != nil {
+		return nil, "commits not read: " + RedactPrintable(err.Error(), 160)
+	}
+	var lines []string
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, RedactPrintable(l, 200))
+		}
+	}
+	if len(lines) > MaxCommitLines {
+		lines = append(lines[:MaxCommitLines], fmt.Sprintf("... and %d more", len(lines)-MaxCommitLines))
+	}
+	return lines, ""
+}

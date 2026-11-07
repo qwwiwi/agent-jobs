@@ -71,7 +71,7 @@ Inside a job:
 | `job_status` | status, turns, cost, time of one job |
 | `job_list` | recent jobs, optionally by status |
 | `job_cancel` | cancel a queued job at once, a running one with SIGTERM then SIGKILL; give up a stopped one |
-| `job_result` | the job-done line, the report, the paths of the saved patches and, for a resumed job, every attempt |
+| `job_result` | the job-done line, a compact report (`not_done`, `summary`, `forks`, `commits`, section sizes), the paths of the saved patches and, for a resumed job, every attempt. More: `sections: ["Evidence"]`, or `detail: "full"` for the whole report and progress |
 | `job_amend` | add context to a job that is still queued (it keeps its place) |
 | `job_stop` | stop a queued or running job but keep its worktree, uncommitted work and session (status `stopped`) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |

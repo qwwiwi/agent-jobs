@@ -51,7 +51,7 @@ const usage = `usage: agent-jobs <command> [flags]
                                            undelivered owner notifications, owner replies pending
   list       --agent A [--limit N] [--status S] [--json]
                                            newest jobs first; --json: the HTTP API's /v1/jobs view
-  result     --agent A <id>                print report.md
+  result     --agent A [--full] <id>       print the compact report (Not done, Summary, Forks, commits, section sizes); --full: all of report.md
   cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
   stop       --agent A <id> [--reason R]   stop a queued/running job, keep work dir and session (resumable)
   resume     --agent A <id> (--context TEXT | --context-file F | stdin)
@@ -967,6 +967,7 @@ func containShort(j *store.Job) string {
 func cmdResult(args []string) error {
 	fs := flag.NewFlagSet("result", flag.ContinueOnError)
 	agent := agentFlag(fs)
+	full := fs.Bool("full", false, "print the whole report.md (default: Not done / uncertain, Summary, Forks, commits and section sizes)")
 	id, err := oneID(fs, args)
 	if err != nil {
 		return err
@@ -1007,11 +1008,36 @@ func cmdResult(args []string) error {
 	}
 	// Redacted on the fly (the in-place redaction may be pending), "Not done / uncertain" first and
 	// "Progress" after it, like job_result.
-	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactRead(text, truncated)))
+	text = jobs.RedactRead(text, truncated)
+	if *full {
+		fmt.Print("\n" + jobs.ReadFirst(text))
+	} else {
+		printResultSummary(m, j, text)
+	}
 	if truncated {
-		fmt.Printf("\n[report cut at %d bytes; full file: %s]\n", jobs.MaxRedactBytes, filepath.Join(m.JobDir(id), "report.md"))
+		fmt.Printf("\n[%s]\n", mcp.IncompleteScanNote(filepath.Join(m.JobDir(id), "report.md")))
 	}
 	return nil
+}
+
+// printResultSummary prints the compact view of a redacted report (what job_result returns by default):
+// "Not done / uncertain" whole (capped with a marker), Summary, Forks, the job's commits and the size of
+// every section.
+func printResultSummary(m *jobs.Manager, j *store.Job, report string) {
+	d := jobs.DigestReport(report, mcp.SummaryFieldBytes)
+	for _, s := range []struct{ name, body string }{{jobs.SectionNotDone, d.NotDone}, {jobs.SectionSummary, d.Summary}, {jobs.SectionForks, d.Forks}} {
+		if s.body != "" {
+			fmt.Printf("\n## %s\n%s\n", s.name, s.body)
+		}
+	}
+	commits, note := m.JobCommits(j)
+	if len(commits) > 0 {
+		fmt.Printf("\n## Commits\n%s\n", strings.Join(commits, "\n"))
+	}
+	if note != "" {
+		fmt.Printf("\n[%s]\n", note)
+	}
+	fmt.Printf("\n[%s; --full prints all of it]\n", d.SizesHint())
 }
 
 func cmdCancel(args []string) error {

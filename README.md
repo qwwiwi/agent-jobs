@@ -64,7 +64,7 @@ On macOS, set it before you load the launchd job. Then edit `~/.agent-jobs/my-ag
 agent-jobs start  --agent my-agent --title "review auth" --kind review \
   --repo ~/src/project --base main --complexity normal --brief-file brief.md   # prints the job id at once
 agent-jobs list   --agent my-agent
-agent-jobs result --agent my-agent <id>   # job-done line + report.md
+agent-jobs result --agent my-agent <id>   # job-done line + compact report (--full: all of report.md)
 ```
 
 Every job needs `--model` or `--complexity`. Full setup (all config keys, the shared brain, the HTTP API, upgrades, macOS): [docs/GUIDE.md → Install and configure](docs/GUIDE.md#install-and-configure).
