@@ -194,6 +194,22 @@ type Job struct {
 	// SourceFiles are absolute paths or job:<id> origins copied into <jobdir>/sources at enqueue.
 	// Kept separate from the disabled repository clones in Sources.
 	SourceFiles []string
+	// Paths and OnOverlap record the declared repository scope and admission policy (#197).
+	Paths     []string
+	OnOverlap string
+	Overlap   []JobOverlap
+	// WaitFor are older overlapping jobs serialized ahead of this job, retained for the done line.
+	WaitFor []string
+	// Parent is an explicit stack edge; ParentBase freezes the parent's successful result at launch.
+	Parent     string
+	ParentBase string
+}
+
+// JobOverlap records the other job and both declarations of each intersecting scope.
+type JobOverlap struct {
+	ID         string   `json:"id"`
+	Paths      []string `json:"paths"`
+	OtherPaths []string `json:"other_paths"`
 }
 
 // CoverContract is what a covered job is told about its requirements: the covered rows of the
@@ -648,6 +664,12 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN skills_manifest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN paths TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE jobs ADD COLUMN on_overlap TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN overlap TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE jobs ADD COLUMN wait_for TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE jobs ADD COLUMN parent TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN parent_base TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -781,7 +803,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
-	cost_estimate_usd, provider, source_files`
+	cost_estimate_usd, provider, source_files, paths, on_overlap, overlap, wait_for, parent, parent_base`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -791,49 +813,28 @@ func ts(t *time.Time) any {
 }
 
 // Insert adds a new job row. Empty Runner / Billing get their defaults.
-func (s *Store) Insert(j *Job) error {
-	_, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) VALUES (`+insertMarks+`)`, insertArgs(j)...)
-	if err != nil {
-		if jobIDTaken(err) {
-			return ErrJobIDExists
-		}
-		return fmt.Errorf("insert job: %w", err)
-	}
-	return nil
+func (s *Store) Insert(j *Job, checks ...JobAdmission) error {
+	_, err := s.insertAdmitted(j, checks, func(q querier) (sql.Result, error) {
+		return q.ExecContext(context.Background(), `INSERT INTO jobs (`+cols+`) VALUES (`+insertMarks+`)`, insertArgs(j)...)
+	})
+	return err
 }
 
-// InsertCapped adds a new job row unless agent already has limit codex jobs created at or after since
-// (the codex daily cap): the count and the insert are one statement, so two processes starting codex
-// jobs at once cannot both pass the cap. It returns false, nothing inserted, at the cap.
-func (s *Store) InsertCapped(j *Job, since time.Time, limit int) (bool, error) {
-	args := append(insertArgs(j), j.Agent, RunnerCodex, since.Unix(), limit)
-	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (SELECT COUNT(*) FROM jobs
-		WHERE agent = ? AND runner = ? AND created_at >= ?) < ?`, args...)
-	if err != nil {
-		if jobIDTaken(err) {
-			return false, ErrJobIDExists
-		}
-		return false, fmt.Errorf("insert job: %w", err)
-	}
-	n, err := res.RowsAffected()
-	return n > 0, err
+// InsertCapped applies the codex daily cap atomically with any overlap admission check.
+func (s *Store) InsertCapped(j *Job, since time.Time, limit int, checks ...JobAdmission) (bool, error) {
+	return s.insertAdmitted(j, checks, func(q querier) (sql.Result, error) {
+		args := append(insertArgs(j), j.Agent, RunnerCodex, since.Unix(), limit)
+		return q.ExecContext(context.Background(), `INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (SELECT COUNT(*) FROM jobs
+			WHERE agent = ? AND runner = ? AND created_at >= ?) < ?`, args...)
+	})
 }
 
-// InsertBudgetCapped inserts j only when the money the provider's jobs of agent created at or after
-// since have spent or may still spend, plus j's own budget, stays within capUSD; it reports whether the
-// row was inserted. The check and the insert are one statement, so two concurrent starts cannot both
-// pass the cap.
-func (s *Store) InsertBudgetCapped(j *Job, since time.Time, capUSD float64) (bool, error) {
-	args := append(insertArgs(j), j.Agent, j.Provider, since.Unix(), j.MaxBudgetUSD, capUSD)
-	res, err := s.db.Exec(`INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (`+providerSpendSQL+`) + ? <= ?`, args...)
-	if err != nil {
-		if jobIDTaken(err) {
-			return false, ErrJobIDExists
-		}
-		return false, fmt.Errorf("insert job: %w", err)
-	}
-	n, err := res.RowsAffected()
-	return n > 0, err
+// InsertBudgetCapped applies the provider budget cap atomically with any overlap admission check.
+func (s *Store) InsertBudgetCapped(j *Job, since time.Time, capUSD float64, checks ...JobAdmission) (bool, error) {
+	return s.insertAdmitted(j, checks, func(q querier) (sql.Result, error) {
+		args := append(insertArgs(j), j.Agent, j.Provider, since.Unix(), j.MaxBudgetUSD, capUSD)
+		return q.ExecContext(context.Background(), `INSERT INTO jobs (`+cols+`) SELECT `+insertMarks+` WHERE (`+providerSpendSQL+`) + ? <= ?`, args...)
+	})
 }
 
 // providerSpendSQL sums, over the jobs of an agent and provider created at or after a time (three
@@ -885,7 +886,7 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles)}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles), sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -906,7 +907,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources, sourceFiles string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -918,12 +919,21 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles)
+		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles, &paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase)
 	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(sourceFiles), &j.SourceFiles); err != nil {
 		return nil, fmt.Errorf("job %s: source_files: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(paths), &j.Paths); err != nil {
+		return nil, fmt.Errorf("job %s: paths: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(overlaps), &j.Overlap); err != nil {
+		return nil, fmt.Errorf("job %s: overlap: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(waitFor), &j.WaitFor); err != nil {
+		return nil, fmt.Errorf("job %s: wait_for: %w", j.ID, err)
 	}
 	if coverContract != "" {
 		j.CoverContract = &CoverContract{}
@@ -1101,7 +1111,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 
 // claimSQL moves a queued job to running (Claim, ClaimOnMilestone): launch token, started_at, id.
 const claimSQL = `UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'`
+	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'` + jobDependenciesSQL
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
 // report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.

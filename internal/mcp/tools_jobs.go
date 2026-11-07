@@ -90,7 +90,13 @@ type JobView struct {
 	SizeWarning string `json:"size_warning,omitempty"`
 	// SameRepoJobs (job_start only): the other queued or running jobs on the same repository, an
 	// advisory (the job is queued anyway).
-	SameRepoJobs string `json:"same_repo_jobs,omitempty"`
+	SameRepoJobs string             `json:"same_repo_jobs,omitempty"`
+	Paths        []string           `json:"paths,omitempty"`
+	OnOverlap    string             `json:"on_overlap,omitempty"`
+	Overlap      []store.JobOverlap `json:"overlap,omitempty"`
+	WaitFor      []string           `json:"wait_for,omitempty"`
+	Parent       string             `json:"parent,omitempty"`
+	ParentBase   string             `json:"parent_base,omitempty"`
 	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
 	BaseBranch string `json:"base_branch,omitempty"`
 	// MergeNote is that check, made when the job-done line was sent.
@@ -139,7 +145,7 @@ type JobView struct {
 	// Milestone and Task are the milestone task the job works on (omitted for none).
 	Milestone int64  `json:"milestone,omitempty"`
 	Task      string `json:"task,omitempty"`
-	// Waiting is why a queued job of a task does not start yet ("waiting for T1 (failed)"; omitted otherwise).
+	// Waiting explains queued job dependencies, a parent stack, or milestone dependencies/slots.
 	Waiting string `json:"waiting,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
@@ -172,7 +178,8 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
-		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.MilestoneWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
+		Paths: j.Paths, OnOverlap: j.OnOverlap, Overlap: j.Overlap, WaitFor: j.WaitFor, Parent: j.Parent, ParentBase: j.ParentBase,
+		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
 }
 
@@ -236,6 +243,9 @@ type JobStartInput struct {
 	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
 	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
 	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Refused for openrouter:<slug> models (#146: deny_repos covers only the job repo). Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
+	Paths           []string `json:"paths,omitempty" jsonschema:"fix/general with repo: expected repository-relative paths or globs (at most 64, 256 bytes each). Go path.Match syntax plus ** as a whole component; a trailing slash includes descendants. Compared with other queued/running fix/general jobs without expanding against the filesystem. Missing paths on either side keep only the same_repo_jobs advisory"`
+	OnOverlap       string   `json:"on_overlap,omitempty" jsonschema:"warn (default): queue and return overlapping jobs and declarations in overlap; serialize: wait queued for those jobs to finish; refuse: reject on overlap. An explicit parent stack handles overlap with that parent. Other overlaps still follow this policy"`
+	Parent          string   `json:"parent,omitempty" jsonschema:"explicit stack: id of a fix/general job of this agent on the same repository. Waits queued for that parent's success and starts from its result commit (including after cleanup); refused if it failed, cancelled, or timed out. Mutually exclusive with base. Recorded in job_status/job_result"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
 }
 
@@ -248,7 +258,8 @@ func addJobStart(s *sdk.Server, d Deps) {
 			"Limits default to 80 turns / $10 / 45 min; above 200 / $50 / 180 they are rejected, never clamped. " +
 			"A codex job counts against the agent's codex daily cap (config codex_jobs_per_day, default 3 in 24 h, 0 = off; " +
 			"past it job_start is refused); its reply shows codex_jobs_today n/limit. " +
-			"same_repo_jobs names other queued or running jobs on the same repository (advisory). A repo job records its " +
+			"same_repo_jobs names other queued or running jobs on the same repository (advisory). Declare paths for overlap detection; " +
+			"on_overlap chooses warn (default), serialize or refuse. parent explicitly stacks on a successful job result. A repo job records its " +
 			"base_branch; its job-done line says whether its commits still merge onto that branch (git merge-tree).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
@@ -257,6 +268,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
 			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
+			Paths: in.Paths, OnOverlap: in.OnOverlap, Parent: in.Parent,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -302,9 +314,12 @@ func addJobStatus(s *sdk.Server, d Deps) {
 
 // JobResultOutput is job_result's output.
 type JobResultOutput struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Finished bool   `json:"finished"`
+	Parent     string   `json:"parent,omitempty"`
+	ParentBase string   `json:"parent_base,omitempty"`
+	WaitFor    []string `json:"wait_for,omitempty"`
+	ID         string   `json:"id"`
+	Status     string   `json:"status"`
+	Finished   bool     `json:"finished"`
 	// DoneLine is the same line the session got when the job ended.
 	DoneLine string `json:"done_line,omitempty"`
 	// CostUnknown: the job's cost was never reported (a codex job, a killed attempt).
@@ -452,7 +467,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 			return nil, JobResultOutput{}, err
 		}
 		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: jobs.RedactText(j.Error),
-			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}}
+			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}, Parent: j.Parent, ParentBase: j.ParentBase, WaitFor: j.WaitFor}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
 		}

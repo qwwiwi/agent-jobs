@@ -131,6 +131,12 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 		}
 		line += ")"
 	}
+	if len(j.WaitFor) > 0 {
+		line += " · serialized wait for " + strings.Join(j.WaitFor, ", ")
+	}
+	if j.Parent != "" {
+		line += " · parent " + j.Parent + " (serialized stack)"
+	}
 	if j.MergeNote != "" {
 		line += " · " + j.MergeNote
 	}
