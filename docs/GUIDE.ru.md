@@ -270,6 +270,27 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
   Плагин, который не найден (нет папки, имени нет в `installed_plugins.json`), — предупреждение, а не отказ джобы: `agent-jobs status` и `system_doctor` (`plugin_warnings`) перечисляют такие среди настроенных, а предупреждения самой джобы лежат в `job_status` / `job_result` (`plugin_warnings`) рядом с `plugins` (имя, версия, источник, разрешены ли хуки). `job_plugins` применяется только после перезапуска (`allow_hooks` — право на исполнение). Возобновлённая джоба находит плагины заново и подхватывает их обновление.
 
+### Пример: superpowers в джобах
+
+Плагин `superpowers` с лицензией MIT содержит 15 скиллов в v7.0.2. Он задаёт подход к написанию кода, тестированию, отладке и ревью в claude-джобах. Доступны 12 скиллов: `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `writing-plans`, `executing-plans`, `receiving-code-review`, `requesting-code-review`, `subagent-driven-development`, `dispatching-parallel-agents`, `writing-skills`, `diagnosing-superpowers` и `using-superpowers`.
+
+Запретите `brainstorming`: он задаёт вопросы человеку и ждёт ответа, а в джобе человека нет. Запретите `finishing-a-development-branch`: он предлагает merge, push или открытие PR, а джобы только коммитят локально. Запретите `using-git-worktrees`: джоба уже работает в собственном detached worktree.
+
+Добавьте в конфиг:
+
+```json
+"job_plugins": [
+  {
+    "name": "superpowers@superpowers-marketplace",
+    "kinds": ["fix", "general", "review"],
+    "deny_skills": ["brainstorming", "finishing-a-development-branch", "using-git-worktrees"],
+    "bootstrap_skill": "using-superpowers"
+  }
+]
+```
+
+`bootstrap_skill` передаёт bootstrap вместо SessionStart-хука, который удаляется из представления плагина по умолчанию. `job_plugins` применяется только после перезапуска демона. В `job_status` новой джобы проверьте, что `plugins` перечисляет имя и версию, а `plugin_warnings` нет. Для другого плагина используйте запись той же формы и сначала изучите его содержимое; оставьте `allow_hooks` выключенным, если не доверяете его хукам: они работают вне guard.
+
 - **Скиллы для джоб.** Джоба запускается с `--setting-sources project` и видит только `.claude/skills` своего репозитория. Чтобы джобы получали скиллы из вашего каталога, укажите его в `skill_roots`: подойдёт любая папка с `index.json` в корне (локальная папка, checkout общего репозитория скиллов); своего каталога agent-jobs не поставляет.
 
   ```json

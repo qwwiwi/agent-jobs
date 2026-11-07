@@ -336,6 +336,27 @@ Full rule list: [docs/ARCHITECTURE.md](ARCHITECTURE.md#rules-enforcement).
 
   A plugin that cannot be found (missing directory, name not in `installed_plugins.json`) is a warning, never a failed job: `agent-jobs status` and `system_doctor` (`plugin_warnings`) list those for the configured plugins, and the job's own warnings are in `job_status` / `job_result` (`plugin_warnings`) next to `plugins` (name, version, source, whether hooks are allowed). `job_plugins` is a restart-only key (`allow_hooks` is an execution permission). A resumed job resolves its plugins again, so it follows a plugin update; a resumed session gets the bootstrap read again in its update message.
 
+### Example: superpowers in jobs
+
+The MIT-licensed `superpowers` plugin has 15 skills in v7.0.2. It shapes how a Claude job writes, tests, debugs and reviews code. The 12 available skills are `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `writing-plans`, `executing-plans`, `receiving-code-review`, `requesting-code-review`, `subagent-driven-development`, `dispatching-parallel-agents`, `writing-skills`, `diagnosing-superpowers` and `using-superpowers`.
+
+Deny `brainstorming` because it asks a human questions and waits; a job has no human in the loop. Deny `finishing-a-development-branch` because it offers to merge, push or open a PR; jobs only commit locally. Deny `using-git-worktrees` because a job already runs in its own detached worktree.
+
+Add this entry to the config:
+
+```json
+"job_plugins": [
+  {
+    "name": "superpowers@superpowers-marketplace",
+    "kinds": ["fix", "general", "review"],
+    "deny_skills": ["brainstorming", "finishing-a-development-branch", "using-git-worktrees"],
+    "bootstrap_skill": "using-superpowers"
+  }
+]
+```
+
+`bootstrap_skill` supplies the bootstrap in place of the SessionStart hook, which is stripped from the default plugin view. `job_plugins` is restart-only, so restart the daemon after editing it. In `job_status` for a new job, check that `plugins` lists the name and version and that there are no `plugin_warnings`. To enable another plugin, use the same entry shape and inspect what it ships first; keep `allow_hooks` false unless you trust its hooks, which run outside the guard.
+
 - **Skills for jobs.** A job runs with `--setting-sources project`, so it sees only its repository's `.claude/skills`. To give jobs skills from a catalog of your own, point `skill_roots` at it: any directory with an `index.json` at its root works (a local folder, a checkout of a shared skills repository); agent-jobs ships no catalog.
 
   ```json
