@@ -209,6 +209,10 @@ type hookStateTx struct {
 // that a test can make the lock time out at once.
 var hookLockTries = 50
 
+// hookAfterEpochSave is a test seam: it runs in StartHookEpoch after a successful save, with the state
+// lock already released. Nil in production.
+var hookAfterEpochSave func()
+
 // lockHookState takes the lock (waiting at most half a second) and reads the state of sessionID; a state
 // of another session starts empty.
 func (m *Manager) lockHookState(sessionID string) (*hookStateTx, error) {
@@ -333,9 +337,12 @@ func (m *Manager) StartHookEpoch(sessionID string) error {
 		return true
 	})
 	if err == nil {
-		// The fresh state supersedes any earlier invalidation token.
-		if rerr := os.Remove(filepath.Join(m.StateDir, hookInvalidFile)); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-			m.logf("hook dedupe: %v", rerr)
+		// The invalidation token stays: a reset that timed out on the lock may have published it while this
+		// one was between unlock and here, and removing it would let a stale emission commit (token "")
+		// match a fresh hook again (#188). The incremented epoch and the cleared records already force an
+		// emission, so keeping the token costs nothing.
+		if hookAfterEpochSave != nil {
+			hookAfterEpochSave()
 		}
 		return nil
 	}
