@@ -55,7 +55,7 @@ func TestJobAdmissionIncludesCapsAndRollsBack(t *testing.T) {
 				j.MaxBudgetUSD = 1
 			}
 			rejected := errors.New("overlap refused")
-			check := func(others []*Job, parent *Job) error { return rejected }
+			check := func(others []*Job, parent *Job, _ map[int64]AdmissionMilestone) error { return rejected }
 			insert := func(c JobAdmission) (bool, error) {
 				switch mode {
 				case "codex":
@@ -73,7 +73,7 @@ func TestJobAdmissionIncludesCapsAndRollsBack(t *testing.T) {
 			if _, err := s.Get(j.ID); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("rejected insert persisted: %v", err)
 			}
-			if ok, err := insert(func(others []*Job, parent *Job) error {
+			if ok, err := insert(func(others []*Job, parent *Job, _ map[int64]AdmissionMilestone) error {
 				j.Paths = []string{"a,b.go"}
 				j.WaitFor = []string{"older"}
 				return nil
@@ -111,5 +111,46 @@ func TestClaimChecksJobDependenciesOnMilestone(t *testing.T) {
 	}
 	if err := s.ClaimOnMilestone(child.ID, "ready", now, 0, check); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A blocker resumed after its serialized successor started must not claim while the successor runs.
+func TestClaimWaitsForRunningSuccessorOfResumedBlocker(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	blocker := &Job{ID: "blocker", Agent: "test", Title: "blocker", Kind: "fix", Brief: "edit", Model: "sonnet", Status: StatusQueued, CreatedAt: now}
+	next := &Job{ID: "next", Agent: "test", Title: "next", Kind: "fix", Brief: "edit", Model: "sonnet", Status: StatusQueued, CreatedAt: now, WaitFor: []string{blocker.ID}}
+	for _, j := range []*Job{blocker, next} {
+		if err := s.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Claim(blocker.ID, "b1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(blocker.ID, "b1", StatusFailed, 0, 0, 0, "boom", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Claim(next.ID, "n1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Requeue(blocker.ID, ResumeLimits{MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Claim(blocker.ID, "b2", now); !errors.Is(err, ErrImmutable) {
+		t.Fatalf("resumed blocker claimed next to the running successor: %v", err)
+	}
+	if got, err := s.ActiveSuccessors(blocker.ID); err != nil || len(got) != 1 || got[0].ID != next.ID {
+		t.Fatalf("successors: %+v %v", got, err)
+	}
+	if err := s.Finish(next.ID, "n1", StatusSucceeded, 0, 0, 0, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Claim(blocker.ID, "b3", now); err != nil {
+		t.Fatalf("blocker still held after the successor ended: %v", err)
 	}
 }

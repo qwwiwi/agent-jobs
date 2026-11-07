@@ -8,9 +8,17 @@ import (
 	"fmt"
 )
 
-// JobAdmission sees the same-repository active jobs and the requested parent under the insert's
-// write lock. It may fill the new job's dependencies. It must not call back into Store.
-type JobAdmission func(others []*Job, parent *Job) error
+// AdmissionMilestone is a milestone as the admission sees it: its tasks and all its jobs, read in
+// the insert's transaction, so a milestone dependency edge can be judged next to the job edges.
+type AdmissionMilestone struct {
+	Tasks []MilestoneTask
+	Jobs  []*Job
+}
+
+// JobAdmission sees the same-repository active jobs, the requested parent and the milestones of the
+// new job and of those active jobs under the insert's write lock. It may fill the new job's
+// dependencies. It must not call back into Store.
+type JobAdmission func(others []*Job, parent *Job, milestones map[int64]AdmissionMilestone) error
 
 func overlapJSON(items []JobOverlap) string {
 	if len(items) == 0 {
@@ -38,8 +46,12 @@ func (s *Store) insertAdmitted(j *Job, checks []JobAdmission, insert func(querie
 					return err
 				}
 			}
+			milestones, err := admissionMilestones(q, j, others)
+			if err != nil {
+				return err
+			}
 			for _, check := range checks {
-				if err := check(others, parent); err != nil {
+				if err := check(others, parent, milestones); err != nil {
 					return err
 				}
 			}
@@ -64,6 +76,47 @@ func (s *Store) insertAdmitted(j *Job, checks []JobAdmission, insert func(querie
 	return inserted, err
 }
 
+// admissionMilestones reads the tasks and jobs of every milestone the new job or an active job belongs to.
+func admissionMilestones(q querier, j *Job, others []*Job) (map[int64]AdmissionMilestone, error) {
+	ids := map[int64]bool{}
+	if j.MilestoneID != 0 {
+		ids[j.MilestoneID] = true
+	}
+	for _, o := range others {
+		if o.MilestoneID != 0 {
+			ids[o.MilestoneID] = true
+		}
+	}
+	out := make(map[int64]AdmissionMilestone, len(ids))
+	ctx := context.Background()
+	for id := range ids {
+		tasks, err := milestoneTasks(ctx, q, id)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := q.QueryContext(ctx, `SELECT `+cols+` FROM jobs WHERE milestone_id=? ORDER BY created_at,rowid`, id)
+		if err != nil {
+			return nil, fmt.Errorf("milestone jobs: %w", err)
+		}
+		var jobs []*Job
+		for rows.Next() {
+			mj, err := scanJob(rows)
+			if err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan job: %w", err)
+			}
+			jobs = append(jobs, mj)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		out[id] = AdmissionMilestone{Tasks: tasks, Jobs: jobs}
+	}
+	return out, nil
+}
+
 func activeRepoJobs(q queryer, repo string) ([]*Job, error) {
 	rows, err := q.QueryContext(context.Background(), `SELECT `+cols+` FROM jobs
   WHERE repo_path=? AND status IN ('queued','running') AND kind IN ('fix','general') ORDER BY created_at,rowid`, repo)
@@ -84,11 +137,24 @@ func activeRepoJobs(q queryer, repo string) ([]*Job, error) {
 
 // The claim statement is shared by normal and milestone jobs. A blocker resumed after the launch
 // check still prevents the claim. Missing dependency rows fail closed. A stopped job may resume.
+// The reverse holds too: a blocker resumed after its serialized successor started (or stopped)
+// waits for that successor, so the two never run side by side. Only a running or stopped successor
+// holds it: a queued one waits for the blocker itself.
 const jobDependenciesSQL = ` AND NOT EXISTS (
  SELECT 1 FROM json_each(jobs.wait_for) w LEFT JOIN jobs d ON d.id=w.value
  WHERE d.id IS NULL OR d.status IN ('queued','running','stopped'))
+ AND NOT EXISTS (
+ SELECT 1 FROM jobs s, json_each(s.wait_for) sw
+ WHERE s.status IN ('running','stopped') AND s.wait_for<>'[]' AND sw.value=jobs.id)
  AND (jobs.parent='' OR (jobs.parent_base<>'' AND EXISTS (
  SELECT 1 FROM jobs p WHERE p.id=jobs.parent AND p.status='succeeded')))`
+
+// ActiveSuccessors lists the running or stopped jobs serialized behind job id. A resumed blocker
+// waits for them (jobDependenciesSQL), so a status caller can say why.
+func (s *Store) ActiveSuccessors(id string) ([]*Job, error) {
+	return s.queryContext(context.Background(), `WHERE status IN ('running','stopped') AND wait_for<>'[]'
+  AND EXISTS (SELECT 1 FROM json_each(jobs.wait_for) sw WHERE sw.value=?) ORDER BY created_at,rowid`, id)
+}
 
 // SetParentBase freezes the parent's result for a queued job before its first claim. Resume keeps
 // that base, even if the parent is later run again. The caller validates the commit in the repository.
