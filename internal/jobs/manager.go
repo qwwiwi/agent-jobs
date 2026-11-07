@@ -1877,6 +1877,8 @@ func (m *Manager) collect() error {
 			if !claimed {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
+			// Read before the kill: the waits of dead processes drop out (#208).
+			gateWait := m.GateWaitOf(j)
 			survivors := m.killJob(j, j.PID, j.PGID)
 			res, killed := m.killedResult(j)
 			if !killed {
@@ -1891,6 +1893,10 @@ func (m *Manager) collect() error {
 				m.writeStopReport(j, dir, stopTimeout, res.Turns)
 			}
 			msg := fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes)
+			if gateWait != nil && gateWait.Waiting {
+				msg += fmt.Sprintf("; %s (this attempt waited %ds for the gate lock, deadline moved by %ds)",
+					gateWait.Note, gateWait.WaitedSec, j.GateWaitSec)
+			}
 			if survivors != "" {
 				msg += "; " + survivors
 			}

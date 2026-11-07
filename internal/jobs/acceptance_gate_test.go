@@ -193,3 +193,80 @@ func TestJobsHeavyStepsNeverOverlap(t *testing.T) {
 		t.Fatal("no heavy step waited: they did not run at the same time, so the test proves nothing")
 	}
 }
+
+// The acceptance step's lock wait is bounded by what the job has left (#208 review): its timeout from the
+// start plus what the gate-wait credit can still add (at most the timeout). A job near that end gives up
+// the wait, naming the holder and the job's time, instead of waiting until the daemon times it out.
+func TestAcceptanceLockWaitBoundedByJobTime(t *testing.T) {
+	m := acceptanceManager(t, "")
+	lock := GateLockPath()
+	holder := holdGateT(t, lock)
+	writeGateHolderLine(lock, gateHolderLine("", ": the orchestrator's check.sh"))
+	j := enqueue(t, m, "FAKE_SLEEP=1", func(r *StartRequest) {
+		withAcceptance(`echo ran > ../acc-ran.txt`)(r)
+		r.TimeoutMinutes = 1
+	})
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	// Started long enough ago that 2 minutes (timeout + the credit cap) less the margin leave ~6 s.
+	started := time.Now().Add(-(2*time.Minute - acceptanceLockMargin - 7*time.Second))
+	mustExec(t, rawDB(t, m), `UPDATE jobs SET started_at=? WHERE id=?`, started.Unix(), j.ID)
+	go func() { time.Sleep(12 * time.Second); holder.release() }()
+	waitFor(t, "exit_code", 20*time.Second, func() bool { _, ok := readExitCode(m.JobDir(j.ID)); return ok })
+	dir := m.JobDir(j.ID)
+	if _, err := os.Stat(filepath.Join(dir, "acc-ran.txt")); err == nil {
+		t.Fatal("the acceptance step waited past the job's time for the gate lock and ran")
+	}
+	log := readFile(t, filepath.Join(dir, "stderr.log"))
+	if !strings.Contains(log, "the orchestrator's check.sh") || !strings.Contains(log, "the job's time") {
+		t.Fatalf("stderr.log does not name the holder and the job's time:\n%s", log)
+	}
+}
+
+// A job the daemon times out while one of its heavy steps waits for the gate lock says so in its reason.
+func TestTimeoutReasonNamesGateWait(t *testing.T) {
+	m := newManager(t)
+	noAutoContinue(m)
+	j := enqueue(t, m, "FAKE_SLEEP=60", func(r *StartRequest) { r.TimeoutMinutes = 1 })
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	st := GateWaitState{Waits: []GateWaitEntry{{PID: os.Getpid(), Since: *j.StartedAt, Holder: "pid 1 job other since x: npm run build"}}}
+	if err := writeAtomic(filepath.Join(m.JobDir(j.ID), GateWaitFile), []byte(mustJSON(t, st))); err != nil {
+		t.Fatal(err)
+	}
+	real := time.Now
+	m.Now = func() time.Time { return real().Add(3 * time.Minute) }
+	if err := m.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	if j.Status != store.StatusTimeout || !strings.HasPrefix(j.Error, "timeout after 1 minutes") ||
+		!strings.Contains(j.Error, "waiting for gate lock held by pid 1 job other since x: npm run build") {
+		t.Fatalf("status %s, error %q: want a timeout naming the gate lock wait", j.Status, j.Error)
+	}
+}
+
+// acceptanceLockWait: start + 2 x timeout less the margin, at most AcceptanceGateLockWait, never negative.
+func TestAcceptanceLockWaitBounds(t *testing.T) {
+	now := time.Unix(1770000000, 0)
+	for _, c := range []struct {
+		started  time.Time
+		timeout  time.Duration
+		want     time.Duration
+		jobBound bool
+	}{
+		{now, 45 * time.Minute, AcceptanceGateLockWait, false},
+		{now, 10 * time.Minute, 19 * time.Minute, true},
+		{now.Add(-15 * time.Minute), 10 * time.Minute, 4 * time.Minute, true},
+		{now.Add(-time.Hour), 10 * time.Minute, 0, true},
+		{time.Time{}, 10 * time.Minute, AcceptanceGateLockWait, false},
+	} {
+		got, bound := acceptanceLockWait(c.started, c.timeout, now)
+		if got != c.want || bound != c.jobBound {
+			t.Errorf("acceptanceLockWait(%v, %s) = %s, %v; want %s, %v", c.started, c.timeout, got, bound, c.want, c.jobBound)
+		}
+	}
+}

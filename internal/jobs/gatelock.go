@@ -493,8 +493,8 @@ func (w *gateWaitRecorder) end(waited time.Duration) {
 }
 
 // edit changes the file under its own flock, taken without blocking (tryFlock); a file that cannot be
-// locked, opened or read is left alone (the
-// record is diagnostic and a timeout credit, never a condition of the gate).
+// locked, opened or read is left alone (the record is diagnostic and a timeout credit, never a condition
+// of the gate).
 func (w *gateWaitRecorder) edit(fn func(*GateWaitState)) {
 	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
