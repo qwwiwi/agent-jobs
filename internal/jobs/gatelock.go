@@ -28,8 +28,9 @@ import (
 //   - bounded: a waiter gives up after its lock wait with an error naming the holder;
 //   - no self-deadlock: a gate whose own process tree holds the lock (the holder is an ancestor: a
 //     gate inside a gate, a gate inside the acceptance command) runs inside it without waiting
-//     (reentrant); one held by another gate of the same job that is no ancestor (a background gate of
-//     the job) fails at once (ErrGateOwnJob) instead of waiting for itself;
+//     (reentrant); one the kernel verifies as of the caller's own job (gateHolderOfJob: it holds the
+//     flock and is an ancestor or runs in the caller's job scope, e.g. a background gate of the job)
+//     fails at once (ErrGateOwnJob) instead of waiting for itself. An unverified holder is waited for;
 //   - released with its holder: flock belongs to the holder's open file, so a holder that is killed
 //     (with its job's process group or scope) releases it, and the queue forgets a killed waiter;
 //   - visible: a waiter inside a job records its wait in <jobdir>/gate-wait.json (gateWaitRecorder),
@@ -56,8 +57,8 @@ const (
 	gateWaitMaxEntries  = 32
 )
 
-// ErrGateOwnJob: the gate lock is held by another gate of the caller's own job, which is no ancestor
-// of the caller. Waiting would wait for the job itself.
+// ErrGateOwnJob: the gate lock is held by a process the kernel verifies as of the caller's own job
+// (gateHolderOfJob). Waiting would wait for the job itself.
 var ErrGateOwnJob = errors.New("the gate lock is held by another gate of this job")
 
 // gateLockReq is one acquisition of the gate lock.
@@ -239,24 +240,26 @@ func gateAncestor(pid int, env []string) bool {
 	return false
 }
 
-// gateHolderOfJob reports whether the lock's holder pid, which its holder line names as of job, really
-// is: the line is in a file anyone can write, so a forged one must not fail another job's gates at once
-// (ErrGateOwnJob). It is when the pid carries job's marker (/proc/<pid>/environ, a gate inside the job)
-// or is an ancestor of this process (the job's wrapper during its acceptance step: this caller descends
-// from it, so it is of the caller's own job), and it really holds the flock on lock (/proc/locks): any
-// process of the same user can find a pid of another job to name. Without /proc the line decides (macOS).
+// gateHolderOfJob reports whether the kernel verifies that the lock's holder pid, which its holder line
+// names as of job, is of the caller's own job: only then does the caller fail at once (ErrGateOwnJob)
+// instead of waiting. The line is in a file anyone can write and the job marker in /proc/<pid>/environ
+// is set by whoever starts the process, so neither decides. Verified means the pid holds the granted
+// flock on lock (/proc/locks) and either is an ancestor of this process (the job's wrapper during its
+// acceptance step) or runs in this process's own job scope (procSameJobScope: a gate of the job left in
+// the background). Anything unverified or unknown (no /proc, an unreadable file, another pid namespace)
+// is false: the caller waits, bounded. Without /proc (macOS) a job's gate therefore always waits.
 func gateHolderOfJob(pid int, job string, lock *os.File) bool {
-	if _, err := procParent(os.Getpid()); err != nil {
-		return true
-	}
 	if !procHoldsFlock(pid, lock) {
 		return false
 	}
-	if procMarker(pid) == job {
-		return true
-	}
+	return procAncestorOfSelf(pid) || procSameJobScope(pid, job)
+}
+
+// procAncestorOfSelf reports whether pid is an ancestor of this process (/proc/<pid>/stat ppid walk; an
+// unreadable step is false).
+func procAncestorOfSelf(pid int) bool {
 	cur := os.Getpid()
-	for range 256 {
+	for range maxAncestry {
 		parent, err := procParent(cur)
 		if err != nil || parent <= 1 {
 			return false
@@ -267,6 +270,34 @@ func gateHolderOfJob(pid int, job string, lock *os.File) bool {
 		cur = parent
 	}
 	return false
+}
+
+// procSameJobScope reports whether pid runs in this process's own job scope: this process's cgroup v2
+// path (/proc/<self>/cgroup) lies in a job scope of job (agent-jobs-<agent>-<job>.scope) and pid's
+// cgroup is that scope or below it. A cgroup is inherited by every descendant and cannot be left with
+// setsid or re-parenting; no scope (session containment), cgroup v1 or an unreadable file is false.
+func procSameJobScope(pid int, job string) bool {
+	self, err := procCgroup(os.Getpid())
+	if err != nil {
+		return false
+	}
+	scope := jobScopePath(self)
+	if scope == "" || !strings.HasSuffix(scope, "-"+job+".scope") {
+		return false
+	}
+	holder, err := procCgroup(pid)
+	return err == nil && inSubtree(holder, scope)
+}
+
+// jobScopePath is cgroup path p up to and including its first job scope component ("" = none).
+func jobScopePath(p string) string {
+	parts := strings.Split(p, "/")
+	for i, c := range parts {
+		if isJobScopeName(c) {
+			return strings.Join(parts[:i+1], "/")
+		}
+	}
+	return ""
 }
 
 // procHoldsFlock reports whether /proc/locks lists a granted FLOCK of pid on f's file (device and inode).

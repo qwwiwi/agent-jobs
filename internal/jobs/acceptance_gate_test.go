@@ -81,13 +81,19 @@ func TestAcceptanceRunsUnderGateLock(t *testing.T) {
 	}
 }
 
-// The acceptance step never waits for a gate of its own job (one left running past the session sweep):
-// it does not run, and the job fails as an acceptance that did not run, naming the holder.
+// The acceptance step never waits for a holder the kernel verifies as of its own job (a gate of the job
+// left running in its scope, an ancestor holding the flock): it does not run, and the job fails as an
+// acceptance that did not run, naming the holder. Tests run without a scope (ScopeOff), so the holder
+// here is the wrapper's ancestor: this test process (the wrapper's parent) holds the flock.
 func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
+	if _, err := os.Stat("/proc/locks"); err != nil {
+		t.Skip("no /proc/locks: nothing is verified, the acceptance step waits (bounded)")
+	}
 	m := acceptanceManager(t, "")
 	j := enqueue(t, m, "do it", withAcceptance(`echo should-not-run > ../acc-ran.txt`))
-	// A gate of the job itself holds the lock (its marker set, holding the flock).
-	gate := startJobGateT(t, filepath.Dir(GateLockPath()), j.ID)
+	holdGateT(t, GateLockPath())
+	gate := os.Getpid()
+	writeGateHolderLine(GateLockPath(), fmt.Sprintf("pid %d job %s since x: held for the test", gate, j.ID))
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusFailed || !IsAcceptanceFailure(j.Error) {
 		t.Fatalf("got %s err=%q, want an acceptance that did not run", j.Status, j.Error)
@@ -96,8 +102,9 @@ func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "acc-ran.txt")); err == nil {
 		t.Fatal("the acceptance command ran while its own job's gate held the lock")
 	}
-	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, fmt.Sprintf("pid %d job %s", gate, j.ID)) {
-		t.Fatalf("stderr.log does not name the holder:\n%s", log)
+	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, fmt.Sprintf("pid %d job %s", gate, j.ID)) ||
+		!strings.Contains(log, ErrGateOwnJob.Error()) {
+		t.Fatalf("stderr.log does not refuse with ErrGateOwnJob naming the holder:\n%s", log)
 	}
 }
 

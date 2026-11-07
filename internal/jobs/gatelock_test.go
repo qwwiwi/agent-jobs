@@ -133,11 +133,17 @@ func TestGateLockOwnTree(t *testing.T) {
 		t.Fatalf("a copied marker passed through: %v", err)
 	}
 
-	// A gate of job j1 left in the background holds the lock (with j1's marker, holding the flock).
+	// A gate of job j1 left in the background holds the lock (holding the flock, in j1's job scope like
+	// this caller: a stand-in /proc gives both the scope's cgroup).
 	held.release()
-	startJobGateT(t, lockDir, "j1")
+	gate := startJobGateT(t, lockDir, "j1")
+	if _, err := os.Stat("/proc/locks"); err != nil {
+		t.Skip("no /proc/locks: a gate of the same job is waited for (bounded)")
+	}
+	j1Scope := "/agents.slice/user@1000.service/app.slice/agent-jobs-thrall-j1.scope"
+	fakeProcT(t, map[int]string{os.Getpid(): j1Scope, gate: j1Scope}, nil, gate)
 	start = time.Now()
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: time.Minute, job: "j1"})
+	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 10 * time.Second, job: "j1"})
 	if !errors.Is(err, ErrGateOwnJob) || !strings.Contains(err.Error(), "job j1 since") || time.Since(start) > 2*time.Second {
 		t.Fatalf("held by a gate of the same job: err %v after %s; want ErrGateOwnJob naming the holder at once", err, time.Since(start))
 	}
@@ -464,15 +470,11 @@ func startMarkedSleeper(t *testing.T, job string) int {
 }
 
 // The holder line is in a file anyone can write (#208 review): a line naming a live pid and a victim
-// job id fails the victim's gates at once only when that pid really is of the victim job (its job
-// marker in /proc/<pid>/environ). A forged one is a held lock like any other: the gate waits, bounded.
+// job id fails the victim's gates at once only when the kernel verifies that pid as of the victim job
+// (gate_ownjob_test.go). A forged one is a held lock like any other: the gate waits, bounded.
 func TestGateLockForgedOwnJobHolder(t *testing.T) {
-	if _, err := procParent(os.Getpid()); err != nil {
-		t.Skip("no /proc: the holder line decides")
-	}
-	lockDir := t.TempDir()
-	lock := filepath.Join(lockDir, GateLockName)
-	holder := holdGateT(t, lock)
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	holdGateT(t, lock)
 	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: forged", startSleeper(t)))
 	_, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "victim"})
 	if err == nil || errors.Is(err, ErrGateOwnJob) {
@@ -485,24 +487,8 @@ func TestGateLockForgedOwnJobHolder(t *testing.T) {
 	if err == nil || errors.Is(err, ErrGateOwnJob) {
 		t.Fatalf("holder line naming a victim process that holds no lock: %v; want the bounded wait's timeout", err)
 	}
-	// An ancestor that holds the flock (the job's wrapper during its acceptance step; here this test
-	// process, for a gate it starts) is of the caller's job: the child gate fails at once.
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: acceptance", os.Getpid()))
-	repo, _, head, _ := gateFixture(t)
-	child := exec.Command(selfBin, "gate", "run", "--repo", repo, "--head", head, "--lock-wait", "20s", "--", "true")
-	child.Env = append(os.Environ(), "AGENT_JOBS_TEST_GATE_LOCK_DIR="+lockDir, JobEnvVar+"=victim")
-	start := time.Now()
-	out, _ := child.CombinedOutput()
-	if !strings.Contains(string(out), ErrGateOwnJob.Error()) || time.Since(start) > 10*time.Second {
-		t.Fatalf("a gate under its own job's holding ancestor after %s:\n%s", time.Since(start), out)
-	}
-	// A real gate of the job holding the lock (one left in the background): ErrGateOwnJob at once.
-	holder.release()
-	gate := startJobGateT(t, lockDir, "victim")
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 10 * time.Second, job: "victim"})
-	if !errors.Is(err, ErrGateOwnJob) || !strings.Contains(err.Error(), fmt.Sprintf("pid %d job victim", gate)) {
-		t.Fatalf("a real gate of the job: %v; want ErrGateOwnJob naming it", err)
-	}
+	// The verified cases (an ancestor holder, a gate in the caller's own job scope) fail at once:
+	// TestGateOwnJobAncestorFails, TestGateOwnJobSameScopeFails.
 }
 
 // startJobGateT starts `agent-jobs gate run` of job (its marker set) holding the gate lock in lockDir
