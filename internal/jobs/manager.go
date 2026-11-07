@@ -173,6 +173,7 @@ type StartRequest struct {
 	Brief          string
 	RepoPath       string
 	Base           string // ref in RepoPath; default HEAD
+	Branch         string // optional result branch; default job/<id>, published only with commits
 	Model          string // explicit model; else picked by kind × complexity
 	Complexity     string // light|normal|hard; model or complexity is required (no default, no classifier)
 	MaxTurns       int    // 0 = default
@@ -578,6 +579,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	if r.Branch != "" {
+		if repo == "" {
+			return nil, errors.New("branch given without repo")
+		}
+		if err := validateResultBranch(func(args ...string) (string, error) { return gitHistory(repo, args...) }, r.Branch); err != nil {
+			return nil, err
+		}
+	}
 	if openRouter && repo != "" {
 		// Checked against both the path given and the main worktree it belongs to.
 		for _, p := range []string{top, repo} {
@@ -628,7 +637,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
 	}
 	return j, nil
