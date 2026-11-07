@@ -162,6 +162,10 @@ type Job struct {
 	DirBytes    int64
 	DirTmpBytes int64
 	DirPartial  bool
+	// GateWaitSec is how long the current attempt waited for the box-wide gate lock (#208): its gates and
+	// its acceptance step, as the daemon read the job's gate-wait.json (capped at the job's timeout). The
+	// job's deadline moves by it, so a lock wait does not eat the job's wall clock. Reset at each launch.
+	GateWaitSec int64
 	// Skills are the catalog skills selected for the job at job_start (E7), sorted by name.
 	Skills []string
 	// SkillsDelivered are the skills linked into the job's work dir for the current attempt (removed
@@ -727,6 +731,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN control_job TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN control_note TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN gate_wait_sec INTEGER NOT NULL DEFAULT 0`,
 }
 
 // idemKeyIndex makes idem_key unique among the jobs that have one: a retried creation (the control review
@@ -866,7 +871,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
 	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
-	crew, review, review_blocking, control_review, control_job, control_note, idem_key`
+	crew, review, review_blocking, control_review, control_job, control_note, idem_key, gate_wait_sec`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -952,7 +957,8 @@ func insertArgs(j *Job) []any {
 		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
 		j.RequestedBranch, j.Branch, j.BranchNote,
 		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
-		crewJSON(j.Crew), j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote, j.IdemKey}
+		crewJSON(j.Crew), j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote, j.IdemKey,
+		j.GateWaitSec}
 }
 
 // blockingJSON is the review_blocking column: "[]" for none.
@@ -1000,7 +1006,8 @@ func scanJob(r scanner) (*Job, error) {
 		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
 		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase, &crew,
-		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote, &j.IdemKey)
+		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote, &j.IdemKey,
+		&j.GateWaitSec)
 	if err != nil {
 		return nil, err
 	}
@@ -1213,7 +1220,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 
 // claimSQL moves a queued job to running (Claim, ClaimOnMilestone): launch token, started_at, id.
 const claimSQL = `UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'` + jobDependenciesSQL
+	gate_wait_sec=0, attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'` + jobDependenciesSQL
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
 // report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.
@@ -1272,6 +1279,13 @@ func (s *Store) FallbackSession(id, token string) (string, error) {
 func (s *Store) SetWrapperResult(id, token, result string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET wrapper_result=?, wrapper_token=? WHERE id=? AND status='running'
 		AND launch_token=? AND launch_token!=''`, result, token, id, token))
+}
+
+// RaiseGateWait records how long the running launch with token waited for the box-wide gate lock
+// (#208), keeping the larger value; the job's deadline moves by it (ClaimTimeout).
+func (s *Store) RaiseGateWait(id, token string, sec int64) error {
+	return affected(s.db.Exec(`UPDATE jobs SET gate_wait_sec=MAX(gate_wait_sec, ?) WHERE id=? AND status='running'
+		AND launch_token=? AND launch_token!=''`, sec, id, token))
 }
 
 // WrapperResult returns the result the wrapper of the launch with token recorded; ok is false when
@@ -1486,7 +1500,7 @@ func (s *Store) SetAcceptanceResult(id, token string, exit, durationSec int) err
 // token. A claim already made stays (true again): the daemon may have died before finishing the row.
 func (s *Store) ClaimTimeout(id, token string, now time.Time) (bool, error) {
 	res, err := s.db.Exec(`UPDATE jobs SET timed_out_at=COALESCE(timed_out_at, ?) WHERE id=? AND status='running'
-		AND launch_token=? AND (timed_out_at IS NOT NULL OR (started_at IS NOT NULL AND ? > started_at + timeout_minutes*60
+		AND launch_token=? AND (timed_out_at IS NOT NULL OR (started_at IS NOT NULL AND ? > started_at + timeout_minutes*60 + gate_wait_sec
 		AND (acceptance_deadline IS NULL OR ? > acceptance_deadline)))`, now.Unix(), id, token, now.Unix(), now.Unix())
 	if err != nil {
 		return false, err

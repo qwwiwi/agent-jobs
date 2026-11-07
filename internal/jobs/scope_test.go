@@ -89,11 +89,13 @@ func TestCgroupScopeConfig(t *testing.T) {
 
 // The wrapper drops the user bus variables from the job: no `systemd-run --user` out of the scope.
 func TestJobEnvDropsUserBus(t *testing.T) {
-	env, err := JobEnv(filepath.Join(t.TempDir(), "jobs", "j1"), []string{"XDG_RUNTIME_DIR=/run/user/1", "DBUS_SESSION_BUS_ADDRESS=unix:path=/x", "KEEP=1"})
+	dir := filepath.Join(t.TempDir(), "jobs", "j1")
+	env, err := JobEnv(dir, []string{"XDG_RUNTIME_DIR=/run/user/1", "DBUS_SESSION_BUS_ADDRESS=unix:path=/x", "KEEP=1",
+		JobDirEnvVar + "=/elsewhere"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(env, " "); got != "KEEP=1 "+JobEnvVar+"=j1" {
+	if got := strings.Join(env, " "); got != "KEEP=1 "+JobEnvVar+"=j1 "+JobDirEnvVar+"="+dir {
 		t.Fatalf("env %q", got)
 	}
 }

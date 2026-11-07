@@ -1209,7 +1209,7 @@ func InsideJob() (string, bool) { return os.LookupEnv(JobEnvVar) }
 var userBusVars = map[string]bool{"DBUS_SESSION_BUS_ADDRESS": true, "XDG_RUNTIME_DIR": true}
 
 // JobEnv returns env without any inherited marker and without the user bus variables, plus
-// AGENT_JOBS_JOB=<id of jobDir>.
+// AGENT_JOBS_JOB=<id of jobDir> and AGENT_JOBS_JOB_DIR=<jobDir, absolute>.
 func JobEnv(jobDir string, env []string) ([]string, error) {
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
@@ -1217,11 +1217,12 @@ func JobEnv(jobDir string, env []string) ([]string, error) {
 	}
 	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {
-		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar && !userBusVars[k] {
+		if k, _, _ := strings.Cut(kv, "="); k != JobEnvVar && k != JobDirEnvVar && !userBusVars[k] {
 			out = append(out, kv)
 		}
 	}
-	return append(out, JobEnvVar+"="+filepath.Base(abs)), nil
+	// The job's folder too: a gate inside the job records its lock wait there (#208).
+	return append(out, JobEnvVar+"="+filepath.Base(abs), JobDirEnvVar+"="+abs), nil
 }
 
 // Job git environment: files in the job dir (written by prepare; created empty here if missing).

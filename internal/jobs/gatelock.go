@@ -1,0 +1,511 @@
+package jobs
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// The box-wide gate lock (#134, #208): one heavy step (a full test suite, a type check, a build,
+// scripts/check.sh) at a time per box, for the main session's `agent-jobs gate run`, the jobs' own
+// `agent-jobs gate run` (allowed inside a job since #208) and the wrapper's acceptance step alike:
+//   - fair: a waiter joins a FIFO queue next to the lock (<lock>.queue, one line per waiter with a
+//     heartbeat it refreshes every poll) and only the first live waiter tries the lock, so a gate that
+//     came later never overtakes; a waiter that died or stopped polling (no heartbeat for
+//     gateQueueStale) drops out of the queue. The holder is not queued;
+//   - bounded: a waiter gives up after its lock wait with an error naming the holder;
+//   - no self-deadlock: a gate whose own process tree holds the lock (the holder is an ancestor: a
+//     gate inside a gate, a gate inside the acceptance command) runs inside it without waiting
+//     (reentrant); one held by another gate of the same job that is no ancestor (a background gate of
+//     the job) fails at once (ErrGateOwnJob) instead of waiting for itself;
+//   - released with its holder: flock belongs to the holder's open file, so a holder that is killed
+//     (with its job's process group or scope) releases it, and the queue forgets a killed waiter;
+//   - visible: a waiter inside a job records its wait in <jobdir>/gate-wait.json (gateWaitRecorder),
+//     which job_list, status and the daemon's timeout read (GateWaitOf, creditGateWait).
+
+// Gate lock environment and files.
+const (
+	// GateHolderEnv is set in the environment of a gate's command: the pid of the gate holding the lock,
+	// for the reentrant check where /proc cannot tell ancestry (macOS).
+	GateHolderEnv = "AGENT_JOBS_GATE_HOLDER"
+	// JobDirEnvVar is the job's folder, set with the job marker (JobEnv): a gate inside the job records
+	// its lock wait there.
+	JobDirEnvVar = "AGENT_JOBS_JOB_DIR"
+	// GateWaitFile is a job's gate lock waits (gateWaitRecorder), in its job dir.
+	GateWaitFile = "gate-wait.json"
+
+	gateQueueSuffix    = ".queue"
+	gateQueueStale     = 5 * time.Second
+	gateQueueMaxBytes  = 64 << 10
+	gateWaitFileMax    = 64 << 10
+	gateWaitMaxEntries = 32
+)
+
+// ErrGateOwnJob: the gate lock is held by another gate of the caller's own job, which is no ancestor
+// of the caller. Waiting would wait for the job itself.
+var ErrGateOwnJob = errors.New("the gate lock is held by another gate of this job")
+
+// gateLockReq is one acquisition of the gate lock.
+type gateLockReq struct {
+	path   string
+	wait   time.Duration
+	job    string    // the caller's job id ("" = not in a job)
+	detail string    // the holder line after "pid N job J since T" (where, what)
+	env    []string  // the caller's environment (GateHolderEnv)
+	notes  io.Writer // waiting notes
+	// waits, when set, records the wait (a job's gate-wait.json).
+	waits *gateWaitRecorder
+}
+
+// gateLease is a held (or reentered) gate lock.
+type gateLease struct {
+	release   func()
+	waited    time.Duration // time spent waiting for the lock (0 = it was free)
+	reentrant bool          // the caller's own process tree holds the lock: nothing was taken
+	holder    string        // reentrant: the holding gate's line
+}
+
+// acquireGateLock takes the box-wide gate lock for r (see the comment above), polling every
+// gateLockPoll until r.wait or ctx ends.
+func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
+		return nil, fmt.Errorf("gate lock dir: %w", err)
+	}
+	f, err := openGateLock(r.path)
+	if err != nil {
+		return nil, fmt.Errorf("open gate lock: %w", err)
+	}
+	if r.notes == nil {
+		r.notes = io.Discard
+	}
+	q := openGateQueue(r.path + gateQueueSuffix)
+	defer q.close()
+	start := time.Now()
+	deadline := start.Add(r.wait)
+	var me *gateEntry
+	waiting := false
+	stopWaiting := func() {
+		if me != nil {
+			q.leave(*me)
+		}
+		if waiting && r.waits != nil {
+			r.waits.end(time.Since(start))
+		}
+	}
+	for {
+		first := me == nil && !q.anyAhead(nil) || me != nil && !q.anyAhead(me)
+		if first {
+			err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+				stopWaiting()
+				f.Close()
+				return nil, fmt.Errorf("flock gate lock: %w", err)
+			}
+		}
+		holder := gateHolder(f)
+		if pid, job := parseGateHolder(holder); pid > 0 && pid != os.Getpid() && alive(pid) {
+			if gateAncestor(pid, r.env) {
+				stopWaiting()
+				f.Close()
+				fmt.Fprintf(r.notes, "gate: the gate lock is held by this gate's own parent (%s): running inside it\n", holder)
+				return &gateLease{release: func() {}, reentrant: true, holder: holder}, nil
+			}
+			if r.job != "" && job == r.job {
+				stopWaiting()
+				f.Close()
+				return nil, fmt.Errorf("%w (%s): a job never waits for itself; let that gate end first", ErrGateOwnJob, holder)
+			}
+		}
+		if !waiting {
+			waiting = true
+			fmt.Fprintf(r.notes, "gate: waiting up to %s for the gate lock %s, held by: %s\n", r.wait, r.path, holder)
+			if r.waits != nil {
+				r.waits.start(start, holder)
+			}
+			if me == nil {
+				e := q.join()
+				me = &e
+			}
+		}
+		if time.Now().After(deadline) {
+			holder = gateHolder(f)
+			stopWaiting()
+			f.Close()
+			return nil, fmt.Errorf("the gate lock %s is still held after %s (by: %s): another gate runs on this box", r.path,
+				r.wait, holder)
+		}
+		select {
+		case <-ctx.Done():
+			stopWaiting()
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(gateLockPoll):
+		}
+	}
+	stopWaiting()
+	lease := &gateLease{release: func() {
+		_ = f.Truncate(0)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}}
+	if waiting {
+		lease.waited = time.Since(start)
+		fmt.Fprintf(r.notes, "gate: waited %s for the gate lock\n", lease.waited.Round(time.Millisecond))
+	}
+	writeGateHolderLine(r.path, gateHolderLine(r.job, r.detail))
+	return lease, nil
+}
+
+// gateHolderLine is what a holder writes into the lock: "pid N job J since T<detail>" (job "-" when not
+// in a job), read by the waiters (parseGateHolder) and shown to them.
+func gateHolderLine(job, detail string) string {
+	if job == "" {
+		job = "-"
+	}
+	return fmt.Sprintf("pid %d job %s since %s%s", os.Getpid(), job, time.Now().UTC().Format(time.RFC3339), detail)
+}
+
+// writeGateHolderLine replaces the holder line of the lock at path.
+func writeGateHolderLine(path, line string) {
+	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_ = f.Truncate(0)
+	if len(line) > gateHolderBytes-1 {
+		line = line[:gateHolderBytes-1]
+	}
+	_, _ = f.WriteString(line + "\n")
+}
+
+// parseGateHolder reads the pid and the job of a holder line ("pid N job J …"; 0 and "" when absent).
+func parseGateHolder(line string) (pid int, job string) {
+	f := strings.Fields(line)
+	if len(f) < 2 || f[0] != "pid" {
+		return 0, ""
+	}
+	pid, err := strconv.Atoi(f[1])
+	if err != nil || pid <= 0 {
+		return 0, ""
+	}
+	if len(f) >= 4 && f[2] == "job" && f[3] != "-" {
+		job = f[3]
+	}
+	return pid, job
+}
+
+// gateAncestor reports whether the gate lock's holder pid is this process's own parent gate: the holder
+// marker in this process's environment names it (GateHolderEnv: set only in the command of a gate or of
+// the acceptance step while it holds the lock), and, where /proc can be read, pid is an ancestor. The
+// marker alone keeps a process that merely descends from a holder (a daemon that ever held the lock, a
+// shell) from passing through without the lock.
+func gateAncestor(pid int, env []string) bool {
+	if envValue(env, GateHolderEnv) != strconv.Itoa(pid) {
+		return false
+	}
+	cur := os.Getpid()
+	for range 256 {
+		parent, err := procParent(cur)
+		if err != nil {
+			return cur == os.Getpid() // no /proc: the marker decides
+		}
+		if parent == pid {
+			return true
+		}
+		if parent <= 1 {
+			return false
+		}
+		cur = parent
+	}
+	return false
+}
+
+// envValue is the value of key in env ("" when absent).
+func envValue(env []string, key string) string {
+	for i := len(env) - 1; i >= 0; i-- {
+		if k, v, ok := strings.Cut(env[i], "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
+// withEnv is env with key set to value (any earlier value dropped).
+func withEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k != key {
+			out = append(out, kv)
+		}
+	}
+	return append(out, key+"="+value)
+}
+
+// gateEntry is one waiter of the gate queue: its ticket (nanoseconds at join, unique in the file), its
+// pid and its last heartbeat (unix milliseconds).
+type gateEntry struct {
+	seq int64
+	pid int
+	hb  int64
+}
+
+// gateQueue is the FIFO of the gate lock's waiters, a file next to the lock shared by every user like the
+// lock itself (openGateLock). Without it (it cannot be opened) waiters only poll the lock.
+type gateQueue struct {
+	f *os.File
+}
+
+func openGateQueue(path string) *gateQueue {
+	f, err := openGateLock(path)
+	if err != nil {
+		return &gateQueue{}
+	}
+	return &gateQueue{f: f}
+}
+
+func (q *gateQueue) close() {
+	if q.f != nil {
+		q.f.Close()
+	}
+}
+
+// update runs fn on the live entries (oldest ticket first) under the queue's own flock and writes back
+// what it returns. Entries of dead processes or without a heartbeat for gateQueueStale are dropped.
+func (q *gateQueue) update(fn func([]gateEntry) []gateEntry) []gateEntry {
+	if q.f == nil {
+		return nil
+	}
+	fd := int(q.f.Fd())
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		return nil
+	}
+	defer func() { _ = syscall.Flock(fd, syscall.LOCK_UN) }()
+	b := make([]byte, gateQueueMaxBytes)
+	n, _ := q.f.ReadAt(b, 0)
+	now := time.Now().UnixMilli()
+	var entries []gateEntry
+	for _, line := range strings.Split(string(b[:n]), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		seq, e1 := strconv.ParseInt(f[0], 10, 64)
+		pid, e2 := strconv.Atoi(f[1])
+		hb, e3 := strconv.ParseInt(f[2], 10, 64)
+		if e1 != nil || e2 != nil || e3 != nil || now-hb > gateQueueStale.Milliseconds() || !alive(pid) {
+			continue
+		}
+		entries = append(entries, gateEntry{seq, pid, hb})
+	}
+	slices.SortFunc(entries, func(a, b gateEntry) int { return int(min(max(a.seq-b.seq, -1), 1)) })
+	entries = fn(entries)
+	var buf bytes.Buffer
+	for _, e := range entries {
+		fmt.Fprintf(&buf, "%d %d %d\n", e.seq, e.pid, e.hb)
+	}
+	if buf.Len() <= gateQueueMaxBytes {
+		_ = q.f.Truncate(0)
+		_, _ = q.f.WriteAt(buf.Bytes(), 0)
+	}
+	return entries
+}
+
+// join adds a waiter and returns its entry.
+func (q *gateQueue) join() gateEntry {
+	e := gateEntry{seq: time.Now().UnixNano(), pid: os.Getpid(), hb: time.Now().UnixMilli()}
+	q.update(func(es []gateEntry) []gateEntry {
+		for slices.ContainsFunc(es, func(o gateEntry) bool { return o.seq == e.seq }) {
+			e.seq++
+		}
+		return append(es, e)
+	})
+	return e
+}
+
+// anyAhead refreshes me's heartbeat (re-adding it with its ticket when it was dropped) and reports
+// whether a live waiter is ahead of it; with me nil, whether anyone waits at all.
+func (q *gateQueue) anyAhead(me *gateEntry) bool {
+	ahead := false
+	q.update(func(es []gateEntry) []gateEntry {
+		if me == nil {
+			ahead = len(es) > 0
+			return es
+		}
+		found := false
+		for i := range es {
+			if es[i].seq == me.seq && es[i].pid == me.pid {
+				es[i].hb, found = time.Now().UnixMilli(), true
+			} else if es[i].seq < me.seq {
+				ahead = true
+			}
+		}
+		if !found {
+			es = append(es, gateEntry{me.seq, me.pid, time.Now().UnixMilli()})
+		}
+		return es
+	})
+	return ahead
+}
+
+// leave removes e from the queue.
+func (q *gateQueue) leave(e gateEntry) {
+	q.update(func(es []gateEntry) []gateEntry {
+		return slices.DeleteFunc(es, func(o gateEntry) bool { return o.seq == e.seq && o.pid == e.pid })
+	})
+}
+
+// GateWaitState is a job's gate-wait.json: its current waits for the gate lock, its last finished ones
+// and the total of all of them (every attempt).
+type GateWaitState struct {
+	Waits     []GateWaitEntry `json:"waits,omitempty"`
+	Done      []GateWaitDone  `json:"done,omitempty"`
+	WaitedSec int64           `json:"waited_sec"`
+}
+
+// GateWaitDone is one finished wait: when it started and how long it took.
+type GateWaitDone struct {
+	Since time.Time `json:"since"`
+	Sec   int64     `json:"sec"`
+}
+
+// Credit is how long the job waited for the gate lock since start (its current attempt) until now: the
+// finished waits that started since then, plus the longest current one (waits that overlap count once
+// as far as they are current). It is what the job's deadline moves by (capped by the caller).
+func (s GateWaitState) Credit(start, now time.Time) time.Duration {
+	var d time.Duration
+	for _, w := range s.Done {
+		if !w.Since.Before(start) && w.Sec > 0 {
+			d += time.Duration(w.Sec) * time.Second
+		}
+	}
+	var cur time.Duration
+	for _, w := range s.Waits {
+		from := w.Since
+		if from.Before(start) {
+			from = start
+		}
+		if c := now.Sub(from); c > cur {
+			cur = c
+		}
+	}
+	return d + cur
+}
+
+// GateWaitEntry is one gate of the job waiting for the lock.
+type GateWaitEntry struct {
+	PID    int       `json:"pid"`
+	Since  time.Time `json:"since"`
+	Holder string    `json:"holder"`
+}
+
+// gateWaitRecorder records one waiter's wait in a job's gate-wait.json, under that file's flock.
+type gateWaitRecorder struct {
+	path  string
+	pid   int
+	since time.Time
+}
+
+// newGateWaitRecorder records into <jobDir>/gate-wait.json; nil when jobDir is "".
+func newGateWaitRecorder(jobDir string) *gateWaitRecorder {
+	if jobDir == "" {
+		return nil
+	}
+	return &gateWaitRecorder{path: filepath.Join(jobDir, GateWaitFile), pid: os.Getpid()}
+}
+
+func (w *gateWaitRecorder) start(since time.Time, holder string) {
+	w.since = since.UTC()
+	w.edit(func(s *GateWaitState) {
+		s.Waits = slices.DeleteFunc(s.Waits, func(e GateWaitEntry) bool { return e.PID == w.pid || !alive(e.PID) })
+		if len(s.Waits) < gateWaitMaxEntries {
+			s.Waits = append(s.Waits, GateWaitEntry{PID: w.pid, Since: since.UTC(), Holder: Printable(holder, 300)})
+		}
+	})
+}
+
+func (w *gateWaitRecorder) end(waited time.Duration) {
+	w.edit(func(s *GateWaitState) {
+		s.Waits = slices.DeleteFunc(s.Waits, func(e GateWaitEntry) bool { return e.PID == w.pid || !alive(e.PID) })
+		sec := int64(waited.Round(time.Second) / time.Second)
+		s.WaitedSec += sec
+		s.Done = append(s.Done, GateWaitDone{Since: w.since, Sec: sec})
+		if n := len(s.Done) - gateWaitMaxEntries; n > 0 {
+			s.Done = s.Done[n:] // the oldest: they started before the current attempt (or count in WaitedSec only)
+		}
+	})
+}
+
+// edit changes the file under its own flock; a file that cannot be opened or read is left alone (the
+// record is diagnostic and a timeout credit, never a condition of the gate).
+func (w *gateWaitRecorder) edit(fn func(*GateWaitState)) {
+	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return
+	}
+	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+	b, err := io.ReadAll(io.LimitReader(f, gateWaitFileMax+1))
+	if err != nil || len(b) > gateWaitFileMax {
+		return
+	}
+	var s GateWaitState
+	if len(bytes.TrimSpace(b)) > 0 && json.Unmarshal(b, &s) != nil {
+		s = GateWaitState{}
+	}
+	fn(&s)
+	out, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	_ = f.Truncate(0)
+	_, _ = f.WriteAt(append(out, '\n'), 0)
+}
+
+// ReadGateWait reads a job's gate-wait.json (OpenJobFile: a regular file of this user in the job's
+// folder) and keeps only the waits of live processes. A missing file is a zero state.
+func ReadGateWait(stateDir, id string) (GateWaitState, error) {
+	f, size, err := OpenJobFile(stateDir, id, GateWaitFile, os.Getuid())
+	if errors.Is(err, os.ErrNotExist) {
+		return GateWaitState{}, nil
+	}
+	if err != nil {
+		return GateWaitState{}, err
+	}
+	defer f.Close()
+	if size > gateWaitFileMax {
+		return GateWaitState{}, fmt.Errorf("%s has %d bytes, at most %d", GateWaitFile, size, gateWaitFileMax)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, gateWaitFileMax))
+	if err != nil {
+		return GateWaitState{}, err
+	}
+	var s GateWaitState
+	if err := json.Unmarshal(b, &s); err != nil {
+		return GateWaitState{}, fmt.Errorf("%s: %w", GateWaitFile, err)
+	}
+	s.Waits = slices.DeleteFunc(s.Waits, func(e GateWaitEntry) bool { return !alive(e.PID) })
+	if s.WaitedSec < 0 {
+		s.WaitedSec = 0
+	}
+	return s, nil
+}

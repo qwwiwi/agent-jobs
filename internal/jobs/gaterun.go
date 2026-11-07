@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -159,7 +160,11 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		g.LockPath = GateLockPath()
 	}
 
-	unlock, err := lockGate(ctx, g)
+	// Inside a job (#208) the holder line names the job, so another gate of the same job never waits for
+	// it, and the wait is recorded in the job's folder for job_list, status and the job's timeout.
+	job := envValue(g.Env, JobEnvVar)
+	lease, err := acquireGateLock(ctx, gateLockReq{path: g.LockPath, wait: g.LockWait, job: job,
+		detail: gateHolderDetail(g, ""), env: g.Env, notes: g.Stderr, waits: newGateWaitRecorder(gateJobDir(g.Env, job))})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintf(g.Stderr, "gate: stopped while waiting for the gate lock %s\n", g.LockPath)
@@ -167,7 +172,7 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		}
 		return fail("%v", err)
 	}
-	defer unlock()
+	defer lease.release()
 
 	// HEAD is asserted under the lock: the tree may have moved while this gate waited.
 	want, err := gateCommit(g.Dir, g.Head+"^{commit}")
@@ -177,12 +182,18 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if code := assertGateHead(g, want, "before the run"); code != 0 {
 		return code
 	}
-	writeGateHolder(g, want)
+	if !lease.reentrant {
+		writeGateHolderLine(g.LockPath, gateHolderLine(job, gateHolderDetail(g, want)))
+	}
 	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
 
 	start := time.Now()
 	if direct {
 		out.unknownEnd()
+	}
+	if !lease.reentrant {
+		// A gate inside this one finds its holder through this marker where /proc cannot tell ancestry.
+		g.Env = withEnv(g.Env, GateHolderEnv, strconv.Itoa(os.Getpid()))
 	}
 	code = runGateCmd(ctx, g, stderr)
 	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, time.Since(start).Round(time.Millisecond))
@@ -261,50 +272,24 @@ func assertGateHead(g GateRun, want, when string) int {
 	return 0
 }
 
-// lockGate takes the gate lock exclusively, polling until g.LockWait or ctx ends, and returns the unlock.
-func lockGate(ctx context.Context, g GateRun) (func(), error) {
-	dir := filepath.Dir(g.LockPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("gate lock dir: %w", err)
+// gateHolderDetail is the holder line's detail after "pid N job J since T": the asserted commit (once
+// known), the work tree and the command.
+func gateHolderDetail(g GateRun, head string) string {
+	at := ""
+	if head != "" {
+		at = " at " + head
 	}
-	f, err := openGateLock(g.LockPath)
-	if err != nil {
-		return nil, fmt.Errorf("open gate lock: %w", err)
+	return fmt.Sprintf("%s in %s: %s", at, g.Dir, strings.Join(g.Argv, " "))
+}
+
+// gateJobDir is the folder of the job a gate runs in ("" outside a job): JobDirEnvVar, when it names
+// that job's folder (its base name is the job id of the marker).
+func gateJobDir(env []string, job string) string {
+	d := envValue(env, JobDirEnvVar)
+	if job == "" || d == "" || !filepath.IsAbs(d) || filepath.Base(d) != job {
+		return ""
 	}
-	deadline := time.Now().Add(g.LockWait)
-	told := false
-	for {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-			f.Close()
-			return nil, fmt.Errorf("flock gate lock: %w", err)
-		}
-		if !told {
-			fmt.Fprintf(g.Stderr, "gate: waiting up to %s for the gate lock %s, held by: %s\n", g.LockWait, g.LockPath,
-				gateHolder(f))
-			told = true
-		}
-		if time.Now().After(deadline) {
-			holder := gateHolder(f)
-			f.Close()
-			return nil, fmt.Errorf("the gate lock %s is still held after %s (by: %s): another gate runs on this box", g.LockPath,
-				g.LockWait, holder)
-		}
-		select {
-		case <-ctx.Done():
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(gateLockPoll):
-		}
-	}
-	return func() {
-		_ = f.Truncate(0)
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}, nil
+	return d
 }
 
 // openGateLock opens the gate lock read-write and creates it readable and writable for every user, as it
@@ -399,22 +384,6 @@ func gateHolder(f *os.File) string {
 		return "unknown"
 	}
 	return s
-}
-
-// writeGateHolder records the holder in the lock file, for the waiters' notes.
-func writeGateHolder(g GateRun, head string) {
-	f, err := os.OpenFile(g.LockPath, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_ = f.Truncate(0)
-	line := fmt.Sprintf("pid %d since %s at %s in %s: %s", os.Getpid(), time.Now().UTC().Format(time.RFC3339), head, g.Dir,
-		strings.Join(g.Argv, " "))
-	if len(line) > gateHolderBytes-1 {
-		line = line[:gateHolderBytes-1]
-	}
-	_, _ = f.WriteString(line + "\n")
 }
 
 // runGateCmd runs g.Argv in g.Dir as the leader of a process group of its own, stdin /dev/null, with

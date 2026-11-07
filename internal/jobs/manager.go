@@ -1857,6 +1857,10 @@ func (m *Manager) collect() error {
 			continue
 		}
 		if j.StartedAt != nil && now.After(jobDeadline(j)) {
+			// Time the job spent waiting for the gate lock is not its own (#208): credit it first.
+			m.creditGateWait(j, now)
+		}
+		if j.StartedAt != nil && now.After(jobDeadline(j)) {
 			// j was read at the start of the tick: the wrapper may have started the acceptance command
 			// since. The decision is a conditional update against the row as it is now; it also closes
 			// the start of an acceptance command from here on.

@@ -46,6 +46,9 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// The wrappers' acceptance steps take the box-wide gate lock (#208): in the hooked binary under test
+	// it is one in this run's temp dir, never the box's, which a real gate may hold.
+	_ = os.Setenv("AGENT_JOBS_TEST_GATE_LOCK_DIR", dir)
 	selfBin = filepath.Join(dir, "agent-jobs")
 	if out, err := exec.Command("go", "build", "-tags", "agentjobs_testhooks", "-o", selfBin, "../../cmd/agent-jobs").CombinedOutput(); err != nil {
 		log.Fatalf("build: %v\n%s", err, out)
