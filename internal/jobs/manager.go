@@ -99,6 +99,9 @@ type Manager struct {
 	// afterAdvisorAdmit (tests only) runs between an advisor call's final liveness check and the start
 	// of its process, under the advisor lock.
 	afterAdvisorAdmit func(*store.Job)
+	// closingLock (tests only) replaces admitLock for the transitions that close advisor admission
+	// (closingAdmission): a test injects a lock failure there.
+	closingLock func(dir string) (func(), error)
 
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)

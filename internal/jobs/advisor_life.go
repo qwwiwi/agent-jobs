@@ -85,8 +85,11 @@ func (m *Manager) advisorLive(j *store.Job) error {
 // liveness check holds that lock until its process is started and registered, so the transition either
 // comes first (and the call is refused) or waits for the registration (and endAdvisors then ends it).
 // A plain job never admits an advisor call and takes no lock. Call it with the advisor lock not held;
-// release it before endAdvisors. If the lock cannot be taken, fn runs anyway (a transition must not be
-// lost) and endAdvisors stays the backstop.
+// release it before endAdvisors. If the advisor dir or the lock cannot be had (descriptors exhausted,
+// say), fn does not run and the error is returned: without the lock the transition could complete while
+// an admitted call is between its check and its start. The row stays running, so the transition is
+// taken again once the lock can be had (the tick retries a timeout, a finish and a dead wrapper's end;
+// a cancel or a stop is retried by its caller or ends with its dead wrapper).
 func (m *Manager) closingAdmission(j *store.Job, fn func() error) error {
 	if !j.Crew.HasAdvisor() {
 		return fn()
@@ -94,13 +97,15 @@ func (m *Manager) closingAdmission(j *store.Job, fn func() error) error {
 	dir := m.AdvisorDir(j.ID)
 	// Created here too: an admission that creates the dir after this point checks the row after fn.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		m.Log.Printf("job %s: advisor admission not locked: %v", j.ID, err)
-		return fn()
+		return fmt.Errorf("advisor admission not serialized, transition deferred: %w", err)
 	}
-	unlock, err := admitLock(dir)
+	lock := admitLock
+	if m.closingLock != nil {
+		lock = m.closingLock
+	}
+	unlock, err := lock(dir)
 	if err != nil {
-		m.Log.Printf("job %s: advisor admission not locked: %v", j.ID, err)
-		return fn()
+		return fmt.Errorf("advisor admission not serialized, transition deferred: %w", err)
 	}
 	defer unlock()
 	return fn()
@@ -266,19 +271,39 @@ func advisorMember(id string, r advisorRun) func(int) bool {
 	}
 }
 
-// advisorMembers lists the processes of call r's process group and session proven the call's.
-func advisorMembers(id string, r advisorRun) ([]int, error) {
+// advisorMembers lists the live processes of call r's process group and session: those proven the
+// call's (advisorMember) and the others that may still be the call's (unproven: no marker, say, after
+// env -u AGENT_JOBS_JOB). reused reports that the ids are proven another's now: r's pid is a process with
+// another start time, so the call's group and session were gone before it was reused (a pid is not
+// reused while its process group or session has a member). A process that started before the call's
+// leader cannot be in its session either, so it is no member at all.
+func advisorMembers(id string, r advisorRun) (proven, unproven []int, reused bool, err error) {
+	if r.Start != 0 {
+		if p, err := procStatFull(r.PID); err == nil && p.start != r.Start {
+			return nil, nil, true, nil
+		}
+	}
 	group, err := groupMembers(r.PID)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
 	session, err := sessionMembers(r.PID)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
 	pids := slices.Compact(slices.Sorted(slices.Values(append(group, session...))))
 	isMember := advisorMember(id, r)
-	return slices.DeleteFunc(pids, func(pid int) bool { return !isMember(pid) }), nil
+	for _, pid := range pids {
+		switch p, err := procStatFull(pid); {
+		case err != nil || p.state == "Z" || (p.pgid != r.PID && p.sid != r.PID):
+			// gone, or no longer a member
+		case isMember(pid):
+			proven = append(proven, pid)
+		case r.Start == 0 || p.start >= r.Start:
+			unproven = append(unproven, pid)
+		}
+	}
+	return proven, unproven, false, nil
 }
 
 // advisorGroupRounds bounds endAdvisorGroup's wait (50 ms each) for the members it killed to go.
@@ -286,9 +311,11 @@ const advisorGroupRounds = 60
 
 // endAdvisorGroup ends the members of registered call r's process group and session proven the call's
 // (advisorMember), also when the leader has exited or been reaped, each through a pidfd (signalMember),
-// and waits until none is left. A member that is not proven the call's is never signalled. Without
-// /proc nothing can be proven: a group that keeps processes keeps the registration (fail closed). It
-// returns a note when members survived or could not be checked ("" when none is left).
+// and waits until none is left. A member that is not proven the call's is never signalled, and while
+// one is there (unless the ids are proven reused) the registration is kept: nothing else can find it
+// (durable ownership, issue #190). Without /proc nothing can be proven: a group that keeps processes
+// keeps the registration (fail closed). It returns a note when members survived or could not be
+// checked ("" when none is left).
 func (m *Manager) endAdvisorGroup(id string, r advisorRun) string {
 	if plausibleGroup(r.PID) != nil {
 		return ""
@@ -305,12 +332,19 @@ func (m *Manager) endAdvisorGroup(id string, r advisorRun) string {
 	isMember := advisorMember(id, r)
 	var signalErr error
 	for round := 0; round < advisorGroupRounds; round++ {
-		pids, err := advisorMembers(id, r)
+		pids, unproven, reused, err := advisorMembers(id, r)
 		if err != nil {
 			return fmt.Sprintf("advisor call %d: process group %d not checked: %v", r.N, r.PID, err)
 		}
-		if len(pids) == 0 {
+		if reused {
 			return ""
+		}
+		if len(pids) == 0 {
+			if len(unproven) == 0 {
+				return ""
+			}
+			return fmt.Sprintf("advisor call %d: %d process(es) in its group or session %d not proven the call's (no job marker), not signalled",
+				r.N, len(unproven), r.PID)
 		}
 		if round%20 == 0 {
 			m.Log.Printf("job %s: advisor call %d: ending %d process(es) left in its group %d", id, r.N, len(pids), r.PID)

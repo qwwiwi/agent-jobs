@@ -520,12 +520,232 @@ func TestAdvisorScopeSurvivorKeepsOwnership(t *testing.T) {
 	if len(runs()) != 1 || gone(desc) {
 		t.Fatalf("a tick whose scope stop failed dropped the registration (%v) or the descendant ended", runs())
 	}
+	// The daemon restarts: the recovery is a fresh manager's, over the same state dir (the kept
+	// registration is all it knows of the call).
+	if err := e.m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m2.Close() })
+	noAutoContinue(m2)
+	if _, err := m2.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
+		t.Fatalf("resume with an advisor survivor after a restart: %v", err)
+	}
+	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+		t.Fatalf("prune with an advisor survivor after a restart: %+v %v %v", pj, ok, err)
+	}
+	if err := m2.Tick(); err != nil {
+		t.Logf("tick: %v", err)
+	}
+	if len(runs()) != 1 || gone(desc) {
+		t.Fatalf("the restarted daemon's tick whose scope stop failed dropped the registration (%v) or the descendant ended", runs())
+	}
 	restore()
-	if err := e.m.Tick(); err != nil {
+	if err := m2.Tick(); err != nil {
 		t.Logf("tick: %v", err)
 	}
 	waitFor(t, "the descendant to end with the retried scope stop", 10*time.Second, func() bool { return gone(desc) })
 	if r := runs(); len(r) != 0 {
 		t.Fatalf("the registration was kept after its scope stopped: %v", r)
+	}
+}
+
+// A transition that closes advisor admission but cannot take the advisor lock (here: descriptors
+// exhausted) is not taken (issue #190, F2 admission): an advisor call that passed its final liveness
+// check may hold the lock, so the row stays running and nothing of the transition happens until the
+// lock can be taken; the retried transition then ends the call it finds registered.
+func TestAdvisorAdmissionLockFailureDefersTransition(t *testing.T) {
+	for _, how := range []string{"cancel", "stop", "timeout", "finish"} {
+		t.Run(how, func(t *testing.T) {
+			e := newAdvisor(t)
+			noAdvisorPolling(t)
+			noAutoContinue(e.m)
+			j := e.crewJob(t, 2, 1.0)
+			if how == "timeout" {
+				parentGroup(t, e.m, j)
+				real := e.m.Now // shifted before any goroutine reads it
+				e.m.Now = func() time.Time { return real().Add(3 * time.Hour) }
+			}
+			if err := os.WriteFile(filepath.Join(e.dir, "slow"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			paused, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			releaseCall := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(releaseCall)
+			e.m.afterAdvisorAdmit = func(*store.Job) {
+				close(paused)
+				<-release
+			}
+			done := askInBackground(e, j)
+			select {
+			case <-paused:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the advisor call never passed its liveness check")
+			}
+			var lockMu sync.Mutex
+			lockFails := true
+			e.m.closingLock = func(dir string) (func(), error) {
+				lockMu.Lock()
+				defer lockMu.Unlock()
+				if lockFails {
+					return nil, fmt.Errorf("open admit lock: %w", syscall.EMFILE)
+				}
+				return admitLock(dir)
+			}
+			transition := func() error {
+				switch how {
+				case "cancel":
+					return e.m.Cancel(j.ID)
+				case "stop":
+					_, err := e.m.Stop(j.ID, "")
+					return err
+				case "timeout":
+					return e.m.Tick()
+				default:
+					if _, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now()); !ok {
+						return errors.New("finish did not record the row")
+					}
+					return nil
+				}
+			}
+			err := transition()
+			t.Logf("%s without the lock: %v", how, err)
+			if got := get(t, e.m, j.ID); got.Status != store.StatusRunning || got.TimedOutAt != nil {
+				t.Fatalf("the %s changed the row (%s, timed out %v) without the advisor lock while an admitted call was starting",
+					how, got.Status, got.TimedOutAt)
+			}
+			if how != "timeout" && err == nil {
+				t.Fatalf("the %s without the advisor lock reported success", how)
+			}
+			releaseCall()
+			pid := e.advisorPID(t, 1)
+			t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+			waitFor(t, "the admitted call's registration", 10*time.Second, func() bool {
+				runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json"))
+				return len(runs) == 1
+			})
+			lockMu.Lock()
+			lockFails = false
+			lockMu.Unlock()
+			if err := transition(); err != nil && how != "timeout" {
+				t.Fatalf("the retried %s: %v", how, err)
+			}
+			if got := get(t, e.m, j.ID); got.Status == store.StatusRunning {
+				t.Fatalf("the job still runs after the retried %s", how)
+			}
+			if !advisorGroupGone(t, pid) {
+				t.Fatalf("the advisor's process group %d outlived the job's retried %s", pid, how)
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("the advisor call of an ended job succeeded")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("the advisor call did not end with its job")
+			}
+			if runs, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json")); len(runs) != 0 {
+				t.Fatalf("advisor registrations left: %v", runs)
+			}
+		})
+	}
+}
+
+// An advisor call (session containment) whose leader exits while a child it started without the job's
+// marker (env -u AGENT_JOBS_JOB) lives on in its group keeps its registration (issue #190, F2 durable
+// ownership): that child cannot be proven the call's, so it is never signalled, and nothing else (the
+// wrapper's session sweep) can find it. The job's finish is not a clean one, resume and prune are
+// refused, also by a restarted daemon over the same state dir, and its tick drops the registration
+// only once the child is gone.
+func TestAdvisorMarkerlessSurvivorKeepsOwnership(t *testing.T) {
+	if !procAvailable() {
+		t.Skip("proving group members needs Linux /proc")
+	}
+	e := newAdvisor(t)
+	noAdvisorPolling(t)
+	noAutoContinue(e.m)
+	j := e.crewJob(t, 2, 1.0)
+	if err := os.WriteFile(filepath.Join(e.dir, "bare"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := askInBackground(e, j)
+	leader := e.advisorPID(t, 1)
+	t.Cleanup(func() { _ = syscall.Kill(-leader, syscall.SIGKILL) })
+	var child int
+	waitFor(t, "the advisor's markerless child", 15*time.Second, func() bool {
+		b, err := os.ReadFile(filepath.Join(e.dir, "child.1"))
+		if err != nil {
+			return false
+		}
+		child, err = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && child > 1
+	})
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+	waitFor(t, "the child to drop the marker", 5*time.Second, func() bool {
+		p, err := procStatFull(child)
+		return err == nil && p.pgid == leader && procMarker(child) == ""
+	})
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the advisor call did not return")
+	}
+	runs := func(m *Manager) []string {
+		r, _ := filepath.Glob(filepath.Join(m.AdvisorDir(j.ID), "run.*.json"))
+		return r
+	}
+	if gone(child) {
+		t.Fatal("the markerless child, not proven the call's, was signalled")
+	}
+	if len(runs(e.m)) != 1 {
+		t.Fatalf("the registration of an advisor call with a live markerless child was dropped: %v", runs(e.m))
+	}
+	if _, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now()); !ok {
+		t.Fatal("finish did not record the row")
+	}
+	got := get(t, e.m, j.ID)
+	if got.Status == store.StatusSucceeded || !strings.Contains(got.Error, ReasonSurvivors) {
+		t.Fatalf("a finish with a markerless advisor survivor counted as clean: %s %q", got.Status, got.Error)
+	}
+	if gone(child) || len(runs(e.m)) != 1 {
+		t.Fatalf("the finish signalled the markerless child or dropped its registration (%v)", runs(e.m))
+	}
+	if err := os.WriteFile(filepath.Join(e.m.JobDir(j.ID), "prompt.md"), []byte("brief\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The daemon restarts: a fresh manager over the same state dir.
+	if err := e.m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m2, err := Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m2.Close() })
+	noAutoContinue(m2)
+	if err := m2.Tick(); err != nil {
+		t.Logf("tick: %v", err)
+	}
+	if gone(child) || len(runs(m2)) != 1 {
+		t.Fatalf("the restarted daemon's tick signalled the markerless child or dropped its registration (%v)", runs(m2))
+	}
+	if _, err := m2.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
+		t.Fatalf("resume with a markerless advisor survivor after a restart: %v", err)
+	}
+	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+		t.Fatalf("prune with a markerless advisor survivor after a restart: %+v %v %v", pj, ok, err)
+	}
+	// The child ends by itself: the next tick finds nothing of the call left and drops the registration.
+	_ = syscall.Kill(child, syscall.SIGKILL)
+	waitFor(t, "the markerless child to end", 10*time.Second, func() bool { return gone(child) })
+	if err := m2.Tick(); err != nil {
+		t.Logf("tick: %v", err)
+	}
+	if r := runs(m2); len(r) != 0 {
+		t.Fatalf("the registration was kept after nothing of the call was left: %v", r)
 	}
 }

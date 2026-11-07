@@ -35,6 +35,7 @@ if [ -f "$d/desc" ]; then setsid sleep 60 </dev/null >/dev/null 2>&1 & echo $! >
 if [ -f "$d/slow" ]; then echo $$ > "$d/pid.$n"; sleep 30; fi
 if [ -f "$d/escape" ]; then set -m; fi
 if [ -f "$d/child" ]; then echo $$ > "$d/pid.$n"; sleep 30 & echo $! > "$d/child.$n"; fi
+if [ -f "$d/bare" ]; then echo $$ > "$d/pid.$n"; env -u AGENT_JOBS_JOB sleep 30 & echo $! > "$d/child.$n"; fi
 cat "$d/out" 2>/dev/null
 `
 
