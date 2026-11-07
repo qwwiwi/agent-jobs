@@ -117,7 +117,8 @@ func (s *Store) LastIdlePickEpoch(kinds ...string) (int64, error) {
 
 // MarkNotifiedBatch is MarkNotified for every job of one delivered line, plus the idle event of the
 // note that rode on it (nil: none), in one transaction: either the line is acknowledged and its note
-// recorded, or neither is and the whole line is retried. Only this batch's saved idle delivery is cleared.
+// recorded, or neither is and the whole line is retried. A saved idle delivery is cleared when its
+// batch matches or all of its members have been notified, including through separate acknowledgements.
 func (s *Store) MarkNotifiedBatch(ids []string, now time.Time, idle *IdleMark) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -136,7 +137,12 @@ func (s *Store) MarkNotifiedBatch(ids []string, now time.Time, idle *IdleMark) e
 	}
 	batch := slices.Clone(ids)
 	slices.Sort(batch)
-	if _, err := tx.Exec(`DELETE FROM idle_pick_delivery WHERE batch = ?`, strings.Join(batch, ",")); err != nil {
+	// Count whole job IDs against the comma-separated batch's member count, so partial or unrelated
+	// acknowledgements preserve it and a missing job cannot count as notified.
+	if _, err := tx.Exec(`DELETE FROM idle_pick_delivery WHERE batch = ? OR (
+		SELECT COUNT(*) FROM jobs WHERE notified_at IS NOT NULL
+		AND instr(',' || idle_pick_delivery.batch || ',', ',' || jobs.id || ',') > 0
+	) = length(batch) - length(replace(batch, ',', '')) + 1`, strings.Join(batch, ",")); err != nil {
 		return fmt.Errorf("clear idle delivery: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -161,7 +161,7 @@ func TestIdleDeliveryRecord(t *testing.T) {
 	}
 }
 
-// #193: only the exact batch that owns a saved delivery may clear it; batch order is irrelevant.
+// #193: an acknowledgement preserves a saved delivery while any member is pending; order is irrelevant.
 func TestMarkNotifiedBatchClearsOnlyMatchingIdleDelivery(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -172,7 +172,7 @@ func TestMarkNotifiedBatchClearsOnlyMatchingIdleDelivery(t *testing.T) {
 		{name: "unrelated acknowledgement", ids: []string{"c"}},
 		{name: "unrelated idle note", ids: []string{"c"}, idle: &IdleMark{Kind: IdleNote, Epoch: 4}},
 		{name: "partial batch", ids: []string{"a"}},
-		{name: "larger batch", ids: []string{"a", "b", "c"}},
+		{name: "larger batch", ids: []string{"a", "b", "c"}, clear: true},
 		{name: "empty batch"},
 		{name: "matching batch", ids: []string{"a", "b"}, idle: &IdleMark{Kind: IdleNote, Epoch: 3}, clear: true},
 		{name: "matching reversed batch without note", ids: []string{"b", "a"}, clear: true},
@@ -200,6 +200,64 @@ func TestMarkNotifiedBatchClearsOnlyMatchingIdleDelivery(t *testing.T) {
 				}
 			} else if got == nil || *got != want {
 				t.Fatalf("unrelated acknowledgement changed saved delivery: got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// #193: after a coalesced delivery fails to record its note, notify-off acknowledges its members
+// separately. Keep the record until the last member is acknowledged, then clear it.
+func TestIdleDeliveryClearedAfterSplitAcknowledgements(t *testing.T) {
+	for _, ids := range [][]string{{"a", "d"}, {"d", "a"}} {
+		t.Run(ids[0]+" first", func(t *testing.T) {
+			s := openIdleStore(t)
+			now := time.Unix(1_800_000_000, 0)
+			for _, id := range []string{"a", "d", "a-prefix"} {
+				insertJob(t, s, id, false, now)
+			}
+			want := IdleDelivery{Batch: "a,d", Epoch: 3, Note: "idle: ready work"}
+			if err := s.SaveIdleDelivery(want); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`CREATE TRIGGER fail_idle BEFORE INSERT ON idle_pick_events BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkNotifiedBatch(ids, now, &IdleMark{Kind: IdleNote, Epoch: want.Epoch}); err == nil {
+				t.Fatal("event write failure not reported")
+			}
+			for _, id := range ids {
+				if j, err := s.Get(id); err != nil || j.NotifiedAt != nil {
+					t.Fatalf("%s acknowledged despite event write failure: %+v %v", id, j, err)
+				}
+			}
+			for _, id := range []string{ids[0], "a-prefix"} {
+				if err := s.MarkNotified(id, now); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := s.IdleDeliveryFor(want.Batch); err != nil || got == nil || *got != want {
+					t.Fatalf("record changed while a member is pending: %+v %v", got, err)
+				}
+			}
+			if _, err := s.db.Exec(`CREATE TRIGGER fail_cleanup BEFORE DELETE ON idle_pick_delivery BEGIN SELECT RAISE(ABORT, 'disk full'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkNotified(ids[1], now); err == nil {
+				t.Fatal("cleanup failure not reported")
+			}
+			if j, err := s.Get(ids[1]); err != nil || j.NotifiedAt != nil {
+				t.Fatalf("last member acknowledged despite cleanup failure: %+v %v", j, err)
+			}
+			if got, err := s.IdleDeliveryFor(want.Batch); err != nil || got == nil || *got != want {
+				t.Fatalf("record changed despite cleanup failure: %+v %v", got, err)
+			}
+			if _, err := s.db.Exec(`DROP TRIGGER fail_cleanup`); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkNotified(ids[1], now); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := s.IdleDeliveryFor(want.Batch); err != nil || got != nil {
+				t.Fatalf("record kept after split acknowledgements: %+v %v", got, err)
 			}
 		})
 	}

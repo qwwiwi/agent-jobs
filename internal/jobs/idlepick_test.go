@@ -595,6 +595,41 @@ func TestIdlePickRetryAcknowledgesStoredNote(t *testing.T) {
 	}
 }
 
+// #193: a restart with notify off acknowledges a failed coalesced delivery one member at a time.
+func TestIdlePickNotifyOffClearsStoredCoalescedDelivery(t *testing.T) {
+	f := newIdleFixture(t)
+	f.m.Cfg.NotifyCoalesceSeconds = 10
+	a := f.finish(t, 0)
+	d := f.finish(t, 1)
+	failIdleWrites(t, f.m, true)
+	*f.now = f.t0.Add(20 * time.Second)
+	if err := f.m.notifyPending(); err == nil || !strings.Contains(err.Error(), "idle pick event") {
+		t.Fatalf("expected idle event write failure: %v", err)
+	}
+	if got := tmuxLines(t, f.logf); len(got) != 1 || !strings.Contains(got[0], "2 jobs:") || !strings.Contains(got[0], " · idle: ") {
+		t.Fatalf("first coalesced delivery: %q", got)
+	}
+	batch := batchKey([]*store.Job{a, d})
+	if saved, err := f.m.Store.IdleDeliveryFor(batch); err != nil || saved == nil {
+		t.Fatalf("coalesced delivery record missing: %+v %v", saved, err)
+	}
+	m := reopenForIdle(t, f.m, f.now)
+	m.Cfg.NotifyTmuxTarget = ""
+	notifyAt(t, m, f.now, f.t0.Add(21*time.Second))
+	for _, id := range []string{a.ID, d.ID} {
+		if get(t, m, id).NotifiedAt == nil {
+			t.Fatalf("%s not acknowledged with notify off", id)
+		}
+	}
+	if saved, err := m.Store.IdleDeliveryFor(batch); err != nil || saved != nil {
+		t.Fatalf("coalesced record kept after split acknowledgements: %+v %v", saved, err)
+	}
+	notifyAt(t, m, f.now, f.t0.Add(22*time.Second))
+	if got := tmuxLines(t, f.logf); len(got) != 1 {
+		t.Fatalf("notify-off retry sent another line: %q", got)
+	}
+}
+
 // #193: an owner-waits acknowledgement delivered before an overdue retry must preserve the
 // retry's saved idle note, even after a restart and while another job keeps the queue busy.
 func TestIdlePickUnrelatedAcknowledgementKeepsStoredNote(t *testing.T) {
