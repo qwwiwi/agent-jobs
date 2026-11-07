@@ -13,7 +13,7 @@ import (
 )
 
 // The acceptance step runs under the box-wide gate lock (#208): while another gate holds it the
-// acceptance command waits, visibly (gate-wait.json, GateWaitOf: "waiting for gate lock held by ..."),
+// acceptance command waits, visibly (gate-wait.json, GateWaitOf: "waiting for gate lock, untrusted holder line: ..."),
 // and its start is recorded only once it holds the lock, so the wait counts neither against the
 // acceptance timeout nor in its duration. While it runs the lock stays held by its wrapper.
 func TestAcceptanceRunsUnderGateLock(t *testing.T) {
@@ -55,7 +55,7 @@ func TestAcceptanceRunsUnderGateLock(t *testing.T) {
 	if s.err != "" {
 		t.Fatal(s.err)
 	}
-	if s.view == nil || !s.view.Waiting || !strings.HasPrefix(s.view.Note, "waiting for gate lock held by pid ") ||
+	if s.view == nil || !s.view.Waiting || !strings.HasPrefix(s.view.Note, "waiting for gate lock, untrusted holder line: pid ") ||
 		!strings.Contains(s.view.Note, "the orchestrator's check.sh") {
 		t.Fatalf("view while waiting: %+v", s.view)
 	}
@@ -81,30 +81,39 @@ func TestAcceptanceRunsUnderGateLock(t *testing.T) {
 	}
 }
 
-// The acceptance step never waits for a holder the kernel verifies as of its own job (a gate of the job
-// left running in its scope, an ancestor holding the flock): it does not run, and the job fails as an
-// acceptance that did not run, naming the holder. Tests run without a scope (ScopeOff), so the holder
-// here is the wrapper's ancestor: this test process (the wrapper's parent) holds the flock.
-func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
-	if _, err := os.Stat("/proc/locks"); err != nil {
-		t.Skip("no /proc/locks: nothing is verified, the acceptance step waits (bounded)")
-	}
+// The acceptance step waits for a gate of its own job like for any other holder (#208): here the holder
+// is the wrapper's ancestor (this test process holds the flock, its holder line naming the job). Once it
+// releases, the acceptance command runs and the job succeeds.
+func TestAcceptanceWaitsForOwnJobGate(t *testing.T) {
 	m := acceptanceManager(t, "")
-	j := enqueue(t, m, "do it", withAcceptance(`echo should-not-run > ../acc-ran.txt`))
-	holdGateT(t, GateLockPath())
-	gate := os.Getpid()
-	writeGateHolderLine(GateLockPath(), fmt.Sprintf("pid %d job %s since x: held for the test", gate, j.ID))
+	j := enqueue(t, m, "do it", withAcceptance(`echo ran > ../acc-ran.txt`))
+	held := holdGateT(t, GateLockPath())
+	writeGateHolderLine(GateLockPath(), fmt.Sprintf("pid %d job %s since x: held for the test", os.Getpid(), j.ID))
+	go func() { time.Sleep(1500 * time.Millisecond); held.release() }()
 	j = runToEnd(t, m, j.ID)
-	if j.Status != store.StatusFailed || !IsAcceptanceFailure(j.Error) {
-		t.Fatalf("got %s err=%q, want an acceptance that did not run", j.Status, j.Error)
+	if j.Status != store.StatusSucceeded || j.AcceptanceExit == nil || *j.AcceptanceExit != 0 {
+		t.Fatalf("got %s err=%q exit=%v, want the acceptance to run after the wait", j.Status, j.Error, j.AcceptanceExit)
 	}
 	dir := m.JobDir(j.ID)
-	if _, err := os.Stat(filepath.Join(dir, "acc-ran.txt")); err == nil {
-		t.Fatal("the acceptance command ran while its own job's gate held the lock")
+	if got := strings.TrimSpace(readFile(t, filepath.Join(dir, "acc-ran.txt"))); got != "ran" {
+		t.Fatalf("acc-ran.txt %q", got)
 	}
-	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, fmt.Sprintf("pid %d job %s", gate, j.ID)) ||
-		!strings.Contains(log, ErrGateOwnJob.Error()) {
-		t.Fatalf("stderr.log does not refuse with ErrGateOwnJob naming the holder:\n%s", log)
+	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, "acceptance: waited ") {
+		t.Fatalf("stderr.log does not report the wait:\n%s", log)
+	}
+}
+
+// The acceptance command gets no gate holder marker (AGENT_JOBS_GATE_HOLDER, which granted reentry
+// before #208's non-reentrant lock): one in the wrapper's environment is dropped like any other variable.
+func TestAcceptanceEnvDropsGateHolderMarker(t *testing.T) {
+	env, err := acceptanceEnv(t.TempDir(), []string{"PATH=/bin", "AGENT_JOBS_GATE_HOLDER=1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "AGENT_JOBS_GATE_HOLDER=") {
+			t.Fatalf("acceptance env carries %s", kv)
+		}
 	}
 }
 
@@ -250,7 +259,7 @@ func TestTimeoutReasonNamesGateWait(t *testing.T) {
 	}
 	j = get(t, m, j.ID)
 	if j.Status != store.StatusTimeout || !strings.HasPrefix(j.Error, "timeout after 1 minutes") ||
-		!strings.Contains(j.Error, "waiting for gate lock held by pid 1 job other since x: npm run build") {
+		!strings.Contains(j.Error, "waiting for gate lock, untrusted holder line: pid 1 job other since x: npm run build") {
 		t.Fatalf("status %s, error %q: want a timeout naming the gate lock wait", j.Status, j.Error)
 	}
 }

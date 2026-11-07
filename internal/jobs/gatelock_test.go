@@ -3,12 +3,10 @@ package jobs
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -103,59 +101,6 @@ func TestGateLockQueueForgetsDeadWaiters(t *testing.T) {
 	}
 }
 
-// A gate never waits for the lock its own process tree holds: under an ancestor's gate it runs inside it
-// (a gate inside a gate, a gate in the acceptance command); a gate of the same job that is no ancestor
-// makes it fail at once, naming the holder, instead of waiting for itself.
-func TestGateLockOwnTree(t *testing.T) {
-	lockDir := t.TempDir()
-	lock := filepath.Join(lockDir, GateLockName)
-	held := holdGateT(t, lock)
-
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job j1 since x: parent gate", os.Getppid()))
-	marker := []string{GateHolderEnv + "=" + strconv.Itoa(os.Getppid())}
-	start := time.Now()
-	l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: time.Minute, job: "j1", env: marker})
-	if err != nil || !l.reentrant || time.Since(start) > 2*time.Second {
-		t.Fatalf("under an ancestor's gate: lease %+v, err %v after %s; want reentrant at once", l, err, time.Since(start))
-	}
-	// An ancestor holding the lock without having marked this process as its gate's command (a daemon
-	// that holds it, a shell) is waited for like any other holder.
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "j2"})
-	if err == nil || !strings.Contains(err.Error(), "still held after") {
-		t.Fatalf("an unmarked descendant of the holder passed through: %v", err)
-	}
-	// A marker naming the holder while it is no ancestor (copied) does not pass either.
-	sleeper := startSleeper(t)
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job - since x: unrelated gate", sleeper))
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond,
-		env: []string{GateHolderEnv + "=" + strconv.Itoa(sleeper)}})
-	if err == nil || !strings.Contains(err.Error(), "unrelated gate") {
-		t.Fatalf("a copied marker passed through: %v", err)
-	}
-
-	// A gate of job j1 left in the background holds the lock (holding the flock, in j1's job scope like
-	// this caller: a stand-in /proc gives both the scope's cgroup).
-	held.release()
-	gate := startJobGateT(t, lockDir, "j1")
-	if _, err := os.Stat("/proc/locks"); err != nil {
-		t.Skip("no /proc/locks: a gate of the same job is waited for (bounded)")
-	}
-	j1Scope := "/agents.slice/user@1000.service/app.slice/agent-jobs-thrall-j1.scope"
-	fakeProcT(t, map[int]string{os.Getpid(): j1Scope, gate: j1Scope}, nil, gate)
-	start = time.Now()
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 10 * time.Second, job: "j1"})
-	if !errors.Is(err, ErrGateOwnJob) || !strings.Contains(err.Error(), "job j1 since") || time.Since(start) > 2*time.Second {
-		t.Fatalf("held by a gate of the same job: err %v after %s; want ErrGateOwnJob naming the holder at once", err, time.Since(start))
-	}
-
-	// Another job's gate: a bounded wait, then an error naming the holder.
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "j2"})
-	if err == nil || errors.Is(err, ErrGateOwnJob) || !strings.Contains(err.Error(), "still held after 300ms (by: pid ") ||
-		!strings.Contains(err.Error(), "job j1 since") {
-		t.Fatalf("held by another job's gate: %v", err)
-	}
-}
-
 // A holder line written by a holder that died is no evidence: the lock itself decides.
 func TestGateLockStaleHolderLine(t *testing.T) {
 	lock := filepath.Join(t.TempDir(), GateLockName)
@@ -167,30 +112,10 @@ func TestGateLockStaleHolderLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: time.Second, job: "j1"})
-	if err != nil || l.reentrant {
-		t.Fatalf("free lock with a stale holder line: lease %+v, err %v", l, err)
+	if err != nil {
+		t.Fatalf("free lock with a stale holder line: %v", err)
 	}
 	l.release()
-}
-
-// A gate inside a gate (the command of `agent-jobs gate run` runs it again, e.g. scripts/check.sh calling
-// the gate runner) runs inside its parent's lock instead of waiting for it until its lock wait ends.
-func TestGateRunNestedRunsInsideParent(t *testing.T) {
-	repo, _, head, _ := gateFixture(t)
-	lockDir := t.TempDir()
-	inner := fmt.Sprintf("%s gate run --repo %s --head %s --lock-wait 3s -- /bin/sh -c 'echo inner-ran'", selfBin, repo, head)
-	cmd := exec.Command(selfBin, "gate", "run", "--repo", repo, "--head", head, "--lock-wait", "3s", "--", "/bin/sh", "-c", inner)
-	cmd.Env = append(os.Environ(), "AGENT_JOBS_TEST_GATE_LOCK_DIR="+lockDir)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("nested gate: %v\nout %s\nerr %s", err, out.String(), errb.String())
-	}
-	if !strings.Contains(out.String(), "inner-ran") || strings.Count(out.String(), "exit=0") != 2 ||
-		!strings.Contains(errb.String(), "running inside it") || time.Since(start) > 3*time.Second {
-		t.Fatalf("nested gate after %s:\nout %s\nerr %s", time.Since(start), out.String(), errb.String())
-	}
 }
 
 // A gate killed while it holds the lock releases it: the flock belongs to the runner's open file and
@@ -219,7 +144,7 @@ func TestGateLockReleasedOnKill(t *testing.T) {
 	suite := readPID(t, marker)
 	t.Cleanup(func() { _ = syscall.Kill(-suite, syscall.SIGKILL) })
 	lock := filepath.Join(lockDir, GateLockName)
-	if pid, _ := parseGateHolder(readFileT(t, lock)); pid != cmd.Process.Pid {
+	if !strings.HasPrefix(readFileT(t, lock), fmt.Sprintf("pid %d job ", cmd.Process.Pid)) {
 		t.Fatalf("holder line %q does not name the runner %d", readFileT(t, lock), cmd.Process.Pid)
 	}
 	// The job is killed: its process group (the runner) and, as the job's scope or session sweep does,
@@ -469,51 +394,30 @@ func startMarkedSleeper(t *testing.T, job string) int {
 	return cmd.Process.Pid
 }
 
-// The holder line is in a file anyone can write (#208 review): a line naming a live pid and a victim
-// job id fails the victim's gates at once only when the kernel verifies that pid as of the victim job
-// (gate_ownjob_test.go). A forged one is a held lock like any other: the gate waits, bounded.
-func TestGateLockForgedOwnJobHolder(t *testing.T) {
-	lock := filepath.Join(t.TempDir(), GateLockName)
-	holdGateT(t, lock)
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: forged", startSleeper(t)))
-	_, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "victim"})
-	if err == nil || errors.Is(err, ErrGateOwnJob) {
-		t.Fatalf("forged holder line: %v; want the bounded wait's timeout, not ErrGateOwnJob", err)
-	}
-	// A real process of the victim job (its marker in /proc/<pid>/environ) that does not hold the flock:
-	// anyone of the same user can find one, so the line is still forged.
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: forged", startMarkedSleeper(t, "victim")))
-	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "victim"})
-	if err == nil || errors.Is(err, ErrGateOwnJob) {
-		t.Fatalf("holder line naming a victim process that holds no lock: %v; want the bounded wait's timeout", err)
-	}
-	// The verified cases (an ancestor holder, a gate in the caller's own job scope) fail at once:
-	// TestGateOwnJobAncestorFails, TestGateOwnJobSameScopeFails.
-}
-
-// startJobGateT starts `agent-jobs gate run` of job (its marker set) holding the gate lock in lockDir
-// until the test ends, and returns the runner's pid once its holder line names it.
-func startJobGateT(t *testing.T, lockDir, job string) int {
-	t.Helper()
-	repo, _, head, _ := gateFixture(t)
-	cmd := exec.Command(selfBin, "gate", "run", "--repo", repo, "--head", head, "--", "sleep", "60")
-	cmd.Env = append(os.Environ(), "AGENT_JOBS_TEST_GATE_LOCK_DIR="+lockDir, JobEnvVar+"="+job)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
+// Status asks the kernel whether the gate lock is held, not the holder line (#208): a line left by a
+// killed holder, or one naming a live pid, on a free lock shows a free lock; a held lock shows its line,
+// whatever pid it names.
+func TestGateLockViewAsksTheKernel(t *testing.T) {
+	m := newManager(t)
+	lock := GateLockPath() // the tests' own (TestMain)
+	if err := os.WriteFile(lock, []byte(fmt.Sprintf("pid %d job x since y: left behind\n", os.Getpid())), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); _ = cmd.Wait() })
-	lock := filepath.Join(lockDir, GateLockName)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if b, err := os.ReadFile(lock); err == nil {
-			if pid, _ := parseGateHolder(string(b)); pid == cmd.Process.Pid {
-				return pid
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the job's gate did not take the lock")
-		}
-		time.Sleep(20 * time.Millisecond)
+	if v := m.gateLockView(nil); v.Holder != "" {
+		t.Fatalf("a free lock with a holder line naming a live pid shows held: %q", v.Holder)
+	}
+	held := holdGateT(t, lock)
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Fatal(err)
+	}
+	writeGateHolderLine(lock, fmt.Sprintf("pid %d job x since y: token=sk-ant-abcdefghijklmnopqrstuvwxyz0123", dead.Process.Pid))
+	v := m.gateLockView(nil)
+	if !strings.HasPrefix(v.Holder, fmt.Sprintf("pid %d job x", dead.Process.Pid)) || strings.Contains(v.Holder, "abcdefghijklmnop") {
+		t.Fatalf("a held lock shows %q; want its holder line, redacted", v.Holder)
+	}
+	held.release()
+	if v := m.gateLockView(nil); v.Holder != "" {
+		t.Fatalf("a released lock shows held: %q", v.Holder)
 	}
 }

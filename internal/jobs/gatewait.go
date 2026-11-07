@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"errors"
 	"os"
 	"syscall"
 	"time"
@@ -9,7 +10,8 @@ import (
 )
 
 // GateWaitView is a running job's wait for the box-wide gate lock (#208), for job_list and status: a job
-// whose gate or acceptance step waits shows "waiting for gate lock held by <holder>".
+// whose gate or acceptance step waits shows "waiting for gate lock, untrusted holder line: <holder>" (the
+// holder line is in a file every user can write: shown, never trusted).
 type GateWaitView struct {
 	Waiting bool       `json:"waiting"`
 	Holder  string     `json:"holder,omitempty"`
@@ -38,7 +40,7 @@ func (m *Manager) GateWaitOf(j *store.Job) *GateWaitView {
 		}
 	}
 	if v.Waiting {
-		v.Note = "waiting for gate lock held by " + v.Holder
+		v.Note = "waiting for gate lock, untrusted holder line: " + v.Holder
 	}
 	if !v.Waiting && v.WaitedSec == 0 {
 		return nil
@@ -71,7 +73,8 @@ func (m *Manager) creditGateWait(j *store.Job, now time.Time) {
 // GateLockView is the box-wide gate lock as status and system_doctor show it (#208).
 type GateLockView struct {
 	Path string `json:"path"`
-	// Holder is the holder's line ("pid N job J since T at HEAD in DIR: CMD"); "" when the lock is free.
+	// Holder is the holder's line ("pid N job J since T at HEAD in DIR: CMD"), untrusted text (anyone can
+	// write the lock file), bounded, printable and redacted; "" when the lock is free.
 	Holder string `json:"holder,omitempty"`
 	// Waiting are this agent's running jobs whose gate or acceptance step waits for the lock.
 	Waiting []GateLockWaiter `json:"waiting,omitempty"`
@@ -83,16 +86,18 @@ type GateLockWaiter struct {
 	GateWaitView
 }
 
-// gateLockView reads the lock's holder line (without taking the lock) and the waits of the running jobs.
+// gateLockView reads the lock's holder line and the waits of the running jobs. Whether the lock is held
+// is the kernel's answer, not the line's: a holder that was killed leaves its line behind, and anyone can
+// write one. A shared flock tried without blocking (and dropped at once) fails only while a gate holds
+// the exclusive one; the line is shown then.
 func (m *Manager) gateLockView(running []*store.Job) GateLockView {
 	v := GateLockView{Path: GateLockPath()}
 	if f, err := os.OpenFile(v.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0); err == nil {
 		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
-			// A holder that was killed leaves its line behind: only a live holder counts.
-			if line := gateHolder(f); line != "unknown" {
-				if pid, _ := parseGateHolder(line); pid > 0 && alive(pid) {
-					v.Holder = RedactPrintable(line, 300)
-				}
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err == nil {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			} else if errors.Is(err, syscall.EWOULDBLOCK) {
+				v.Holder = RedactPrintable(gateHolder(f), 300)
 			}
 		}
 		f.Close()

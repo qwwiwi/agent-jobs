@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -160,11 +159,12 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		g.LockPath = GateLockPath()
 	}
 
-	// Inside a job (#208) the holder line names the job, so another gate of the same job never waits for
-	// it, and the wait is recorded in the job's folder for job_list, status and the job's timeout.
+	// Inside a job (#208) the holder line names the job (diagnostic only: the lock is not reentrant, a gate
+	// of the same job waits like any other), and the wait is recorded in the job's folder for job_list,
+	// status and the job's timeout.
 	job := envValue(g.Env, JobEnvVar)
 	lease, err := acquireGateLock(ctx, gateLockReq{path: g.LockPath, wait: g.LockWait, job: job,
-		detail: gateHolderDetail(g, ""), env: g.Env, notes: g.Stderr, waits: newGateWaitRecorder(gateJobDir(g.Env, job))})
+		detail: gateHolderDetail(g, ""), notes: g.Stderr, waits: newGateWaitRecorder(gateJobDir(g.Env, job))})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintf(g.Stderr, "gate: stopped while waiting for the gate lock %s\n", g.LockPath)
@@ -182,18 +182,12 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if code := assertGateHead(g, want, "before the run"); code != 0 {
 		return code
 	}
-	if !lease.reentrant {
-		writeGateHolderLine(g.LockPath, gateHolderLine(job, gateHolderDetail(g, want)))
-	}
+	writeGateHolderLine(g.LockPath, gateHolderLine(job, gateHolderDetail(g, want)))
 	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
 
 	start := time.Now()
 	if direct {
 		out.unknownEnd()
-	}
-	if !lease.reentrant {
-		// A gate inside this one finds its holder through this marker where /proc cannot tell ancestry.
-		g.Env = withEnv(g.Env, GateHolderEnv, strconv.Itoa(os.Getpid()))
 	}
 	code = runGateCmd(ctx, g, stderr)
 	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, time.Since(start).Round(time.Millisecond))
@@ -369,17 +363,12 @@ func (s *gateStdout) marker(code int) {
 	fmt.Fprintf(s.w, "%sexit=%d\n", nl, code)
 }
 
-// gateHolder is what the lock's holder wrote into it (writeGateHolder), one line.
+// gateHolder is what the lock's holder wrote into it (writeGateHolderLine): untrusted text (the lock file
+// is writable by every user), so it is only ever shown, bounded, printable and redacted, never trusted.
 func gateHolder(f *os.File) string {
 	b := make([]byte, gateHolderBytes)
 	n, _ := f.ReadAt(b, 0)
-	s := strings.TrimSpace(strings.ToValidUTF8(string(b[:n]), "?"))
-	s = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, s)
+	s := RedactPrintable(strings.ToValidUTF8(string(b[:n]), "?"), gateHolderBytes)
 	if s == "" {
 		return "unknown"
 	}

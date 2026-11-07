@@ -158,7 +158,7 @@ type JobView struct {
 	// Waiting explains queued job dependencies, a parent stack, or milestone dependencies/slots.
 	Waiting string `json:"waiting,omitempty"`
 	// GateWait (running jobs, #208): the job's gates or acceptance step wait for the box-wide gate lock
-	// ("waiting for gate lock held by <holder>"), and how long this attempt waited so far; its deadline
+	// ("waiting for gate lock, untrusted holder line: <holder>"), and how long this attempt waited so far; its deadline
 	// moves by that wait.
 	GateWait *jobs.GateWaitView `json:"gate_wait,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
@@ -650,7 +650,7 @@ func addJobList(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_list",
 		Description: "Recent jobs of this agent, newest first, optionally only one status. A running job whose heavy step waits for the box-wide " +
-			"gate lock shows gate_wait (\"waiting for gate lock held by <holder>\", waited_sec: its deadline moves by the wait).",
+			"gate lock shows gate_wait (\"waiting for gate lock, untrusted holder line: <holder>\", waited_sec: its deadline moves by the wait).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobListInput) (*sdk.CallToolResult, JobListOutput, error) {
 		limit := in.Limit
 		if limit == 0 {

@@ -34,7 +34,7 @@ func TestGateWaitShownInJobListAndDoctor(t *testing.T) {
 	if len(list.Jobs) != 1 || list.Jobs[0].GateWait == nil {
 		t.Fatalf("job_list: %+v", list.Jobs)
 	}
-	if g := list.Jobs[0].GateWait; !g.Waiting || g.Note != "waiting for gate lock held by pid 1 job other since x: npm run build" ||
+	if g := list.Jobs[0].GateWait; !g.Waiting || g.Note != "waiting for gate lock, untrusted holder line: pid 1 job other since x: npm run build" ||
 		g.WaitedSec < 19 {
 		t.Fatalf("job_list gate_wait: %+v", g)
 	}
