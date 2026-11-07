@@ -96,6 +96,13 @@ func checkGatePrefixes(c *simpleCmd, v cmdView, cfg Config, sawCD bool) string {
 		return refuse("xargs in front of the gate supplies words the guard cannot see")
 	}
 	dyn := func(i int) bool { return i < len(c.dyn) && (c.dyn[i] || c.bare[i] || c.glob[i]) }
+	// An unquoted expansion or glob anywhere in the prefix may split into words the guard never sees
+	// (an injected `--`, a --repo, a whole command): only a quoted expansion stays one word.
+	for i := g.at; i < g.end && i < len(c.bare); i++ {
+		if c.bare[i] || c.glob[i] {
+			return refuse("`" + c.words[i] + "` in the gate prefix is unquoted: the shell may split it into other words; quote it")
+		}
+	}
 	if dyn(g.at) || dyn(g.at+1) || dyn(g.at+2) || dyn(g.end-1) {
 		return refuse("the gate runner's name or subcommand comes from a variable or glob")
 	}
