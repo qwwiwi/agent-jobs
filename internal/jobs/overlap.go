@@ -44,10 +44,31 @@ func validateOverlapRequest(r *StartRequest) error {
 	return nil
 }
 
+// overlapOf lists the declared paths of a and b that intersect.
+func overlapOf(a, b *store.Job) (store.JobOverlap, bool) {
+	o := store.JobOverlap{ID: b.ID}
+	if len(a.Paths) == 0 || len(b.Paths) == 0 {
+		return o, false
+	}
+	for _, p := range a.Paths {
+		for _, q := range b.Paths {
+			if pathscope.Intersect(p, q) {
+				if !slices.Contains(o.Paths, p) {
+					o.Paths = append(o.Paths, p)
+				}
+				if !slices.Contains(o.OtherPaths, q) {
+					o.OtherPaths = append(o.OtherPaths, q)
+				}
+			}
+		}
+	}
+	return o, len(o.Paths) > 0
+}
+
 // overlapAdmission runs inside the insert's BEGIN IMMEDIATE transaction, like milestone dependency
 // checks at claim time. Simultaneous starts cannot both miss each other, including under budget caps.
 func (m *Manager) overlapAdmission(j *store.Job) store.JobAdmission {
-	return func(others []*store.Job, parent *store.Job, milestones map[int64]store.AdmissionMilestone) error {
+	return func(others []*store.Job, parent *store.Job, graph store.AdmissionGraph) error {
 		j.Overlap, j.WaitFor = nil, nil // an id collision may retry the admission
 		if j.Parent != "" {
 			if parent == nil || parent.Agent != j.Agent || parent.RepoPath != j.RepoPath || !coderJob(parent.Kind) {
@@ -67,23 +88,11 @@ func (m *Manager) overlapAdmission(j *store.Job) store.JobAdmission {
 			}
 		}
 		for _, other := range others {
-			if other.ID == j.ID || len(j.Paths) == 0 || len(other.Paths) == 0 {
+			if other.ID == j.ID {
 				continue
 			}
-			overlap := store.JobOverlap{ID: other.ID}
-			for _, a := range j.Paths {
-				for _, b := range other.Paths {
-					if pathscope.Intersect(a, b) {
-						if !slices.Contains(overlap.Paths, a) {
-							overlap.Paths = append(overlap.Paths, a)
-						}
-						if !slices.Contains(overlap.OtherPaths, b) {
-							overlap.OtherPaths = append(overlap.OtherPaths, b)
-						}
-					}
-				}
-			}
-			if len(overlap.Paths) == 0 {
+			overlap, ok := overlapOf(j, other)
+			if !ok {
 				continue
 			}
 			j.Overlap = append(j.Overlap, overlap)
@@ -99,109 +108,11 @@ func (m *Manager) overlapAdmission(j *store.Job) store.JobAdmission {
 				j.WaitFor = append(j.WaitFor, other.ID)
 			}
 		}
-		if cycle := dependencyCycle(j, others, parent, milestones); cycle != "" {
+		if cycle := newDepGraph(graph, j, parent).cycleThrough(j); cycle != "" {
 			return fmt.Errorf("dependency cycle: %s; neither job could ever start (use on_overlap warn, drop the parent, or start after the job it waits for has finished)", cycle)
 		}
 		return nil
 	}
-}
-
-// dependencyEdge is one "waits for" arc between jobs: a serialized wait, a stack parent, or a milestone
-// task dependency (a job waits for the active jobs of the tasks it depends on).
-type dependencyEdge struct {
-	to, why string
-}
-
-// dependencyCycle looks for a cycle through the new job j across all three edge kinds, as the queue
-// will judge them once j is stored: j's own serialized waits and parent, and the milestone edges that
-// j's task adds to queued jobs of tasks depending on it (j makes its task running again). The graph
-// before j is acyclic (every earlier admission was checked the same way), so any cycle contains j.
-// It returns "j waits for X (why), X waits for j (why)" or "".
-func dependencyCycle(j *store.Job, others []*store.Job, parent *store.Job, milestones map[int64]store.AdmissionMilestone) string {
-	byID := map[string]*store.Job{}
-	for _, o := range others {
-		byID[o.ID] = o
-	}
-	if parent != nil {
-		byID[parent.ID] = parent
-	}
-	taskStatus := map[int64]map[string]string{}
-	msJobs := map[int64][]*store.Job{}
-	for id, ms := range milestones {
-		jobs := slices.Clone(ms.Jobs)
-		if j.MilestoneID == id && !slices.ContainsFunc(jobs, func(o *store.Job) bool { return o.ID == j.ID }) {
-			jobs = append(jobs, j)
-		}
-		msJobs[id] = jobs
-		taskStatus[id] = TaskStatuses(ms.Tasks, jobs)
-		for _, o := range jobs {
-			if byID[o.ID] == nil {
-				byID[o.ID] = o
-			}
-		}
-	}
-	byID[j.ID] = j
-	active := func(o *store.Job) bool {
-		return o.Status == store.StatusQueued || o.Status == store.StatusRunning || o.Status == store.StatusStopped
-	}
-	edges := func(x *store.Job) []dependencyEdge {
-		if x.Status != store.StatusQueued {
-			return nil // only a queued job waits
-		}
-		var out []dependencyEdge
-		if x.Parent != "" {
-			if p := byID[x.Parent]; p != nil && active(p) {
-				out = append(out, dependencyEdge{p.ID, "parent"})
-			}
-		}
-		for _, id := range x.WaitFor {
-			if w := byID[id]; w != nil && active(w) {
-				out = append(out, dependencyEdge{w.ID, "serialized"})
-			}
-		}
-		if ms, ok := milestones[x.MilestoneID]; ok && x.MilestoneID != 0 {
-			if i := slices.IndexFunc(ms.Tasks, func(t store.MilestoneTask) bool { return t.Key == x.TaskKey }); i >= 0 {
-				for _, d := range ms.Tasks[i].DependsOn {
-					if s := taskStatus[x.MilestoneID][d]; s == TaskDone || s == TaskDropped || s == "" {
-						continue
-					}
-					for _, o := range msJobs[x.MilestoneID] {
-						if o.TaskKey == d && active(o) {
-							out = append(out, dependencyEdge{o.ID, "milestone task " + d})
-						}
-					}
-				}
-			}
-		}
-		return out
-	}
-	// Depth-first from j along "waits for" edges; an edge back to j closes the cycle.
-	visited := map[string]bool{}
-	var path []string
-	var walk func(x *store.Job) bool
-	walk = func(x *store.Job) bool {
-		for _, e := range edges(x) {
-			step := x.ID + " waits for " + e.to + " (" + e.why + ")"
-			if e.to == j.ID {
-				path = append(path, step)
-				return true
-			}
-			if visited[e.to] || byID[e.to] == nil {
-				continue
-			}
-			visited[e.to] = true
-			path = append(path, step)
-			if walk(byID[e.to]) {
-				return true
-			}
-			path = path[:len(path)-1]
-		}
-		return false
-	}
-	if walk(j) {
-		return strings.Join(path, ", ")
-	}
-	return ""
 }
 
 func (m *Manager) parentResult(parent *store.Job) (string, error) {

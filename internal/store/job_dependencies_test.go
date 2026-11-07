@@ -55,7 +55,7 @@ func TestJobAdmissionIncludesCapsAndRollsBack(t *testing.T) {
 				j.MaxBudgetUSD = 1
 			}
 			rejected := errors.New("overlap refused")
-			check := func(others []*Job, parent *Job, _ map[int64]AdmissionMilestone) error { return rejected }
+			check := func(others []*Job, parent *Job, _ AdmissionGraph) error { return rejected }
 			insert := func(c JobAdmission) (bool, error) {
 				switch mode {
 				case "codex":
@@ -73,7 +73,7 @@ func TestJobAdmissionIncludesCapsAndRollsBack(t *testing.T) {
 			if _, err := s.Get(j.ID); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("rejected insert persisted: %v", err)
 			}
-			if ok, err := insert(func(others []*Job, parent *Job, _ map[int64]AdmissionMilestone) error {
+			if ok, err := insert(func(others []*Job, parent *Job, _ AdmissionGraph) error {
 				j.Paths = []string{"a,b.go"}
 				j.WaitFor = []string{"older"}
 				return nil

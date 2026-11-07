@@ -1256,14 +1256,40 @@ type ResumeLimits struct {
 // the brief (a job stopped before it ever ran gets the update appended to its brief instead).
 // It keeps created_at, so the job keeps its original queue position. A recorded outcome (job_outcome)
 // was about the previous attempt's result and is cleared.
-func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
+//
+// The admissions, when given, run in the same BEGIN IMMEDIATE transaction as the requeue: they see
+// the job as it was stopped and the complete dependency graph, and the wait_for and overlap they
+// return are stored with the requeue, so no claim can slip between the check and the status change.
+func (s *Store) Requeue(id string, l ResumeLimits, context, brief string, admit ...ResumeAdmission) error {
+	return s.immediate(func(q querier) error { return requeueTx(q, id, l, context, brief, admit) })
+}
+
+func requeueTx(q querier, id string, l ResumeLimits, context, brief string, admit []ResumeAdmission) error {
+	ctx := bgContext()
 	const resumable = `status IN ('stopped','timeout','failed')`
-	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
+	var waitFor, overlap *string
+	if len(admit) > 0 {
+		j, err := scanJob(q.QueryRowContext(ctx, `SELECT `+cols+` FROM jobs WHERE id=? AND `+resumable, id))
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrImmutable
+		}
+		if err != nil {
+			return err
+		}
+		g, err := loadAdmissionGraph(ctx, q, j.MilestoneID)
+		if err != nil {
+			return err
+		}
+		for _, a := range admit {
+			w, o, err := a(j, g)
+			if err != nil {
+				return err
+			}
+			ws, os := sourceFilesJSON(w), overlapJSON(o)
+			waitFor, overlap = &ws, &os
+		}
+	}
+	if _, err := q.ExecContext(ctx, `INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
 		timeout_minutes, turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at,
 		finished_at, wrapper_result)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
@@ -1271,21 +1297,22 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
-	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
+	query := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
 		merge_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, cost_estimate_usd=NULL, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
 		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`
 	args := []any{l.MaxTurns, l.MaxBudgetUSD, l.TimeoutMinutes, context}
 	if brief != "" {
-		q += `, brief=?`
+		query += `, brief=?`
 		args = append(args, brief)
 	}
-	args = append(args, id)
-	if err := affected(tx.Exec(q+` WHERE id=? AND `+resumable, args...)); err != nil {
-		return err
+	if waitFor != nil {
+		query += `, wait_for=?, overlap=?`
+		args = append(args, *waitFor, *overlap)
 	}
-	return tx.Commit()
+	args = append(args, id)
+	return affected(q.ExecContext(ctx, query+` WHERE id=? AND `+resumable, args...))
 }
 
 // Attempts returns the archived attempts of a job, oldest first (the current one is the job row).

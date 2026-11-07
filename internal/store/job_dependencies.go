@@ -15,10 +15,23 @@ type AdmissionMilestone struct {
 	Jobs  []*Job
 }
 
-// JobAdmission sees the same-repository active jobs, the requested parent and the milestones of the
-// new job and of those active jobs under the insert's write lock. It may fill the new job's
-// dependencies. It must not call back into Store.
-type JobAdmission func(others []*Job, parent *Job, milestones map[int64]AdmissionMilestone) error
+// AdmissionGraph is everything a "waits for" edge can come from, read under one write lock: every
+// queued, running or stopped job of any repository, and every milestone one of them (or the job being
+// admitted or edited) belongs to. A repository-unbound milestone chains jobs of several repositories,
+// so a cycle can only be ruled out on the whole reachable graph, not on one repository's part of it.
+type AdmissionGraph struct {
+	Active     []*Job
+	Milestones map[int64]AdmissionMilestone
+}
+
+// JobAdmission sees the same-repository active jobs, the requested parent and the complete dependency
+// graph under the insert's write lock. It may fill the new job's dependencies. It must not call back
+// into Store.
+type JobAdmission func(others []*Job, parent *Job, graph AdmissionGraph) error
+
+// ResumeAdmission renews the overlap admission of a job that is requeued: it sees the job as stored
+// and the complete dependency graph, and returns the wait_for and overlap to store with the requeue.
+type ResumeAdmission func(j *Job, graph AdmissionGraph) (waitFor []string, overlap []JobOverlap, err error)
 
 func overlapJSON(items []JobOverlap) string {
 	if len(items) == 0 {
@@ -46,12 +59,12 @@ func (s *Store) insertAdmitted(j *Job, checks []JobAdmission, insert func(querie
 					return err
 				}
 			}
-			milestones, err := admissionMilestones(q, j, others)
+			graph, err := loadAdmissionGraph(context.Background(), q, j.MilestoneID)
 			if err != nil {
 				return err
 			}
 			for _, check := range checks {
-				if err := check(others, parent, milestones); err != nil {
+				if err := check(others, parent, graph); err != nil {
 					return err
 				}
 			}
@@ -76,45 +89,52 @@ func (s *Store) insertAdmitted(j *Job, checks []JobAdmission, insert func(querie
 	return inserted, err
 }
 
-// admissionMilestones reads the tasks and jobs of every milestone the new job or an active job belongs to.
-func admissionMilestones(q querier, j *Job, others []*Job) (map[int64]AdmissionMilestone, error) {
-	ids := map[int64]bool{}
-	if j.MilestoneID != 0 {
-		ids[j.MilestoneID] = true
+// bgContext is context.Background for functions whose "context" parameter shadows the package.
+func bgContext() context.Context { return context.Background() }
+
+// loadAdmissionGraph reads the active jobs of every repository and the milestones they belong to, plus
+// the extra milestones (the one of the job being admitted or edited).
+func loadAdmissionGraph(ctx context.Context, q querier, extra ...int64) (AdmissionGraph, error) {
+	rows, err := q.QueryContext(ctx, `SELECT `+cols+` FROM jobs WHERE status IN ('queued','running','stopped') ORDER BY created_at,rowid`)
+	if err != nil {
+		return AdmissionGraph{}, fmt.Errorf("active jobs: %w", err)
 	}
-	for _, o := range others {
-		if o.MilestoneID != 0 {
-			ids[o.MilestoneID] = true
+	var g AdmissionGraph
+	ids := map[int64]bool{}
+	for _, id := range extra {
+		if id != 0 {
+			ids[id] = true
 		}
 	}
-	out := make(map[int64]AdmissionMilestone, len(ids))
-	ctx := context.Background()
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			rows.Close()
+			return AdmissionGraph{}, fmt.Errorf("scan job: %w", err)
+		}
+		g.Active = append(g.Active, j)
+		if j.MilestoneID != 0 {
+			ids[j.MilestoneID] = true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return AdmissionGraph{}, err
+	}
+	g.Milestones = make(map[int64]AdmissionMilestone, len(ids))
 	for id := range ids {
 		tasks, err := milestoneTasks(ctx, q, id)
 		if err != nil {
-			return nil, err
+			return AdmissionGraph{}, err
 		}
-		rows, err := q.QueryContext(ctx, `SELECT `+cols+` FROM jobs WHERE milestone_id=? ORDER BY created_at,rowid`, id)
+		jobs, err := milestoneJobs(ctx, q, id)
 		if err != nil {
-			return nil, fmt.Errorf("milestone jobs: %w", err)
+			return AdmissionGraph{}, err
 		}
-		var jobs []*Job
-		for rows.Next() {
-			mj, err := scanJob(rows)
-			if err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("scan job: %w", err)
-			}
-			jobs = append(jobs, mj)
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return nil, err
-		}
-		out[id] = AdmissionMilestone{Tasks: tasks, Jobs: jobs}
+		g.Milestones[id] = AdmissionMilestone{Tasks: tasks, Jobs: jobs}
 	}
-	return out, nil
+	return g, nil
 }
 
 func activeRepoJobs(q queryer, repo string) ([]*Job, error) {

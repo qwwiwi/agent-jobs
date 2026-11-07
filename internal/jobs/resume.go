@@ -800,9 +800,10 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	return m.Store.Get(id)
 }
 
-// requeue puts a resumed job back in the queue.
+// requeue puts a resumed job back in the queue, renewing its overlap admission in the same transaction
+// (renewOverlapAdmission): jobs admitted while it was failed never recorded it.
 func (m *Manager) requeue(id string, l store.ResumeLimits, context, newBrief string) error {
-	return m.Store.Requeue(id, l, context, newBrief)
+	return m.Store.Requeue(id, l, context, newBrief, renewOverlapAdmission)
 }
 
 // refuseOpenRouterResume refuses every requeue of an openrouter job (Resume, also of a job stopped
