@@ -85,10 +85,9 @@ func TestAcceptanceRunsUnderGateLock(t *testing.T) {
 // it does not run, and the job fails as an acceptance that did not run, naming the holder.
 func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
 	m := acceptanceManager(t, "")
-	lock := GateLockPath()
-	holdGateT(t, lock)
 	j := enqueue(t, m, "do it", withAcceptance(`echo should-not-run > ../acc-ran.txt`))
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job %s since x: a gate the job left", startMarkedSleeper(t, j.ID), j.ID))
+	// A gate of the job itself holds the lock (its marker set, holding the flock).
+	gate := startJobGateT(t, filepath.Dir(GateLockPath()), j.ID)
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusFailed || !IsAcceptanceFailure(j.Error) {
 		t.Fatalf("got %s err=%q, want an acceptance that did not run", j.Status, j.Error)
@@ -97,7 +96,7 @@ func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "acc-ran.txt")); err == nil {
 		t.Fatal("the acceptance command ran while its own job's gate held the lock")
 	}
-	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, "a gate the job left") {
+	if log := readFile(t, filepath.Join(dir, "stderr.log")); !strings.Contains(log, fmt.Sprintf("pid %d job %s", gate, j.ID)) {
 		t.Fatalf("stderr.log does not name the holder:\n%s", log)
 	}
 }

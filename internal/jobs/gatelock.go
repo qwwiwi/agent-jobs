@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The box-wide gate lock (#134, #208): one heavy step (a full test suite, a type check, a build,
@@ -126,7 +128,7 @@ func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 				fmt.Fprintf(r.notes, "gate: the gate lock is held by this gate's own parent (%s): running inside it\n", holder)
 				return &gateLease{release: func() {}, reentrant: true, holder: holder}, nil
 			}
-			if r.job != "" && job == r.job && gateHolderOfJob(pid, r.job) {
+			if r.job != "" && job == r.job && gateHolderOfJob(pid, r.job, f) {
 				stopWaiting()
 				f.Close()
 				return nil, fmt.Errorf("%w (%s): a job never waits for itself; let that gate end first", ErrGateOwnJob, holder)
@@ -241,10 +243,14 @@ func gateAncestor(pid int, env []string) bool {
 // is: the line is in a file anyone can write, so a forged one must not fail another job's gates at once
 // (ErrGateOwnJob). It is when the pid carries job's marker (/proc/<pid>/environ, a gate inside the job)
 // or is an ancestor of this process (the job's wrapper during its acceptance step: this caller descends
-// from it, so it is of the caller's own job). Without /proc the line decides (macOS).
-func gateHolderOfJob(pid int, job string) bool {
+// from it, so it is of the caller's own job), and it really holds the flock on lock (/proc/locks): any
+// process of the same user can find a pid of another job to name. Without /proc the line decides (macOS).
+func gateHolderOfJob(pid int, job string, lock *os.File) bool {
 	if _, err := procParent(os.Getpid()); err != nil {
 		return true
+	}
+	if !procHoldsFlock(pid, lock) {
+		return false
 	}
 	if procMarker(pid) == job {
 		return true
@@ -259,6 +265,36 @@ func gateHolderOfJob(pid int, job string) bool {
 			return true
 		}
 		cur = parent
+	}
+	return false
+}
+
+// procHoldsFlock reports whether /proc/locks lists a granted FLOCK of pid on f's file (device and inode).
+// An unreadable /proc/locks or f is false: the holder is then not confirmed.
+func procHoldsFlock(pid int, f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	dev := uint64(st.Dev) // int32 on darwin
+	want := fmt.Sprintf("%02x:%02x:%d", unix.Major(dev), unix.Minor(dev), st.Ino)
+	b, err := os.ReadFile(filepath.Join(procRoot, "locks"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		// "N: FLOCK  ADVISORY  WRITE PID MAJ:MIN:INODE START END"; a blocked waiter's line has "->".
+		fs := strings.Fields(line)
+		if len(fs) < 6 || fs[1] != "FLOCK" || fs[3] != "WRITE" {
+			continue
+		}
+		if p, err := strconv.Atoi(fs[4]); err == nil && p == pid && fs[5] == want {
+			return true
+		}
 	}
 	return false
 }
