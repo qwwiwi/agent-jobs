@@ -503,7 +503,8 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
 		return err
 	}
 	// Own pipes rather than StdinPipe/StdoutPipe: the reaper's Wait (startGit) never closes them under a
-	// read.
+	// read. Held (#114): git, also once it has exited, stays unreaped until the reading is over or its
+	// group is killed, so that the kill at the deadline also ends a descendant still holding stdout.
 	inR, in, err := os.Pipe()
 	if err != nil {
 		return err
@@ -513,7 +514,7 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
 		_, _ = inR.Close(), in.Close()
 		return err
 	}
-	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
+	p, err := startGitHeld("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdin, c.Stdout = inR, outW },
 		"-C", repo, noReplace, "cat-file", "--batch")
 	_, _ = inR.Close(), outW.Close()
 	if err != nil {
@@ -542,6 +543,8 @@ func materializeTree(repo, sha, dst string, skip []string) (err error) {
 			p.kill()
 		}
 		_ = in.Close()
+		// No more reading: git may be reaped once it has exited.
+		p.releaseStreams()
 		werr := p.wait(ctx)
 		if errors.Is(werr, errGitTimeout) || timedOut && (err != nil || werr != nil) {
 			err = fmt.Errorf("git cat-file: %w after %s", errGitTimeout, gitLongTimeout)

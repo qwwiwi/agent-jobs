@@ -410,8 +410,28 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
-	ids := batchMembers(batch)
-	if err := m.sendCounted(target, WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs(batch), ","), ids, line); err != nil {
+	// An emptied queue adds its idle note to this same line (#165), never a line of its own. The note
+	// is only a candidate here: its final check runs inside the tmux delivery, under the idle lock.
+	note, epoch, retry := m.idleDelivery(batch)
+	var rode bool
+	err = m.withTmuxLock(func(ctx context.Context) error {
+		return m.deliverVia(ctx, WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs(batch), ","), batchMembers(batch), line, true,
+			func(ctx context.Context, l string) (string, error) {
+				if err := m.waitPaneOutOfMode(ctx, target); err != nil {
+					return "", err
+				}
+				if note == "" {
+					return l, m.typeTmux(ctx, target, l)
+				}
+				var terr error
+				rode, terr = m.typeLineWithNote(ctx, target, l, note, epoch)
+				if rode {
+					l += " · " + note
+				}
+				return l, terr
+			})
+	})
+	if err != nil {
 		m.Log.Printf("job %s: notify failed, retry next tick: %s", batchIDs(batch), RedactText(err.Error()))
 		return errors.Is(err, errTmuxTimeout), nil
 	}
@@ -420,9 +440,18 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 			afterDoneLineSent(j)
 		}
 	}
-	// One transaction for the whole batch: a failure leaves every member pending, so the retry is the
-	// same line again (the same delivery identity), never a smaller batch.
-	if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now()); err != nil {
+	// The acknowledgement of the line and the record of the note it carried are one transaction: if
+	// either cannot be written, the line stays pending and is delivered again, instead of a delivered
+	// note that nothing remembers. The mark comes from the delivery record saved before typing: a retry
+	// of a delivery that may already have typed its note (tmux accepted it, the acknowledgement failed)
+	// counts the note whatever the queue looks like now, never dropping its bookkeeping. One transaction
+	// for the whole batch: a failure leaves every member pending, so the retry is the same line again
+	// (the same delivery identity), never a smaller batch.
+	var mark *store.IdleMark
+	if rode || (retry && note != "") {
+		mark = &store.IdleMark{Kind: store.IdleNote, Epoch: epoch}
+	}
+	if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now(), mark); err != nil {
 		return false, err
 	}
 	for _, j := range batch {
@@ -538,6 +567,12 @@ func (m *Manager) sendTmux(ctx context.Context, target, line string) error {
 	if err := m.waitPaneOutOfMode(ctx, target); err != nil {
 		return err
 	}
+	return m.typeTmux(ctx, target, line)
+}
+
+// typeTmux is the keystrokes of sendTmux: the sanitized line, then Enter, for a pane already out of
+// its tmux mode.
+func (m *Manager) typeTmux(ctx context.Context, target, line string) error {
 	line = tmuxArgEscape(Printable(line, 0))
 	if err := m.runTmux(ctx, "send-keys", "-t", target, "-l", line); err != nil {
 		return fmt.Errorf("tmux send-keys: %w", err)

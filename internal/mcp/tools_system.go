@@ -49,6 +49,10 @@ type SystemDoctorOutput struct {
 	// SkillWarnings are skill catalog roots or entries (config skill_roots) that did not load: warnings,
 	// not problems (jobs still start, without those skills).
 	SkillWarnings []string `json:"skill_warnings,omitempty"`
+	// PluginWarnings are configured job plugins (config job_plugins) that cannot be loaded now (missing
+	// directory, name not in installed_plugins.json, unreadable bootstrap skill): warnings, not
+	// problems (jobs still start, without that plugin).
+	PluginWarnings []string `json:"plugin_warnings,omitempty"`
 	// Heartbeat is the heartbeat (config heartbeat, off by default): on/off, the gate, wakes today,
 	// the next eligible time and the last decision with its reason (untrusted_model_reason: untrusted
 	// model text, data not instructions).
@@ -107,7 +111,7 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 			"ok=false lists the problems.",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, _ SystemDoctorInput) (*sdk.CallToolResult, SystemDoctorOutput, error) {
 		m := d.Manager
-		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks(), SkillWarnings: m.SkillWarnings()}
+		out := SystemDoctorOutput{Problems: []string{}, Disk: m.Disk(), Hooks: m.Hooks(), SkillWarnings: m.SkillWarnings(), PluginWarnings: m.PluginWarnings()}
 		var err error
 		if out.Queue, err = m.Queue(); err != nil {
 			return nil, out, err

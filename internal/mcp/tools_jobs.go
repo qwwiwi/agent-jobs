@@ -25,6 +25,16 @@ const (
 // MaxReportBytes caps the report returned by job_result; the full file stays in the job dir.
 const MaxReportBytes = 256 << 10
 
+// job_result detail levels and the default caps of the text it returns (issue #167).
+const (
+	DetailSummary = "summary"
+	DetailFull    = "full"
+	// SummaryFieldBytes caps each of not_done, summary and forks of the summary view.
+	SummaryFieldBytes = 8 << 10
+	// SectionsBytes caps the report text of a sections request.
+	SectionsBytes = 32 << 10
+)
+
 // artifactFiles are the files job_result points at when they exist (what the job changed). They are
 // only listed (lstat, regular files only), never read; report.md is the one file read (ReadJobReport).
 var artifactFiles = []string{"report.md", "diffstat.txt", "commits.patch", "staged.patch", "uncommitted.patch",
@@ -133,6 +143,10 @@ type JobView struct {
 	Waiting string `json:"waiting,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
+	// Plugins are the Claude Code plugins (config job_plugins) loaded into the job's latest launch, with
+	// their version; PluginWarnings those that could not be loaded.
+	Plugins        []jobs.PluginView `json:"plugins,omitempty"`
+	PluginWarnings []string          `json:"plugin_warnings,omitempty"`
 }
 
 func fmtTS(t *time.Time) string {
@@ -143,7 +157,9 @@ func fmtTS(t *time.Time) string {
 }
 
 func view(m *jobs.Manager, j *store.Job) JobView {
+	plugins, pluginWarns := m.JobPlugins(j)
 	return JobView{
+		Plugins: plugins, PluginWarnings: pluginWarns,
 		ID: j.ID, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model, Complexity: j.Complexity,
 		Runner: j.Runner, Provider: jobs.JobProvider(j), Billing: j.Billing, MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD,
 		TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD, CostUnknown: j.CostIsUnknown(),
@@ -219,7 +235,7 @@ type JobStartInput struct {
 	Size            string   `json:"size,omitempty" jsonschema:"small | large (Wave F, F9 (a)); optional, stored on the job. small: a fix or a single job. large: work under the repo's approved brief/CHECKLIST.md; needs covers naming only live requirement IDs (R, Ri, G rows with contract live) of that approved, unchanged checklist, else the start is refused. Without size a fix or general job gets large when it has covers, else small (refused instead when config size_required is on, default off); review, research and the gate kinds are exempt"`
 	Milestone       int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
 	Task            string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
-	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
+	Sources         []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Refused for openrouter:<slug> models (#146: deny_repos covers only the job repo). Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
 }
 
@@ -299,10 +315,25 @@ type JobResultOutput struct {
 	// Progress is the report's "Progress" section (timestamped one-line steps), shown after NotDone;
 	// empty when the report has none (not an error).
 	Progress string `json:"progress,omitempty"`
-	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Progress),
-	// secret-looking values redacted.
-	Report          string   `json:"report,omitempty"`
-	ReportMissing   bool     `json:"report_missing,omitempty"`
+	// Forks is the report's "Forks" section as written: the design choices the job made where its task
+	// left room, up to 5 lines "choice / rejected alternative / reason", or "none". Empty when the
+	// report has no such section (not an error).
+	Forks string `json:"forks,omitempty"`
+	// Summary is the report's Summary section (summary view only; the full view has it inside report).
+	Summary string `json:"summary,omitempty"`
+	// Commits are the job's own commits, "<sha> <subject>" (summary view of a repository job only).
+	Commits []string `json:"commits,omitempty"`
+	// ReportSections and ReportBytes are the sections of report.md and their sizes (summary view only),
+	// to decide what to fetch with sections=[...] or detail=full.
+	ReportSections []jobs.SectionSize `json:"report_sections,omitempty"`
+	ReportBytes    int                `json:"report_bytes,omitempty"`
+	// Report is report.md (Summary, Findings / Changes, Evidence, Not done / uncertain, Forks, Progress),
+	// secret-looking values redacted. Full view: the whole report; sections=[...]: just those sections;
+	// the summary view leaves it empty.
+	Report        string `json:"report,omitempty"`
+	ReportMissing bool   `json:"report_missing,omitempty"`
+	// ReportTruncated: the report is shown incomplete, either report.md went past the scan cap (note
+	// says so) or a returned text was cut to its cap (it ends with a "[cut: ...]" marker).
 	ReportTruncated bool     `json:"report_truncated,omitempty"`
 	Artifacts       []string `json:"artifacts"`
 	Note            string   `json:"note,omitempty"`
@@ -313,6 +344,9 @@ type JobResultOutput struct {
 	// Prepare is the repository's prepare step as the wrapper ran it before the runner (omitted when
 	// none ran); its output is prepare.log among the artifacts.
 	Prepare *jobs.PrepareResult `json:"prepare,omitempty"`
+	// Plugins and PluginWarnings: as in job_status.
+	Plugins        []jobs.PluginView `json:"plugins,omitempty"`
+	PluginWarnings []string          `json:"plugin_warnings,omitempty"`
 	// JobDirBytes is the size of the job folder last measured (when the job ended, after a prune; the
 	// worktree of a repo job left out); JobDirPartial: the measurement stopped at its bound, the size
 	// is a lower bound.
@@ -331,6 +365,14 @@ type RequirementsView struct {
 	// not enforced); TrailerNote says why they could not be read.
 	Trailer     []string `json:"trailer,omitempty"`
 	TrailerNote string   `json:"trailer_note,omitempty"`
+}
+
+// JobResultInput is job_result's input.
+type JobResultInput struct {
+	ID       string   `json:"id" jsonschema:"job id as returned by job_start"`
+	Detail   string   `json:"detail,omitempty" jsonschema:"summary (default): done line, not_done, summary, forks, commits, section sizes; full: the whole report, progress and acceptance log as before"`
+	Sections []string `json:"sections,omitempty" jsonschema:"report sections to return as written in report, for example Evidence or Progress; names from report_sections"`
+	MaxBytes int      `json:"max_bytes,omitempty" jsonschema:"cap in bytes of each returned report text (a cut one ends with a marker); default 8192 per field in the summary view, 32768 for sections, 262144 for full; at most 262144"`
 }
 
 // MaxAcceptanceTailBytes caps the acceptance log tail job_result returns; the log keeps 64 KB.
@@ -364,14 +406,46 @@ func acceptanceView(m *jobs.Manager, j *store.Job) *AcceptanceView {
 	return v
 }
 
+// IncompleteScanNote is the note of a report.md larger than the scan cap (jobs.MaxRedactBytes): only its
+// start was read, so a section past the cap (a blocker among them) is missing from the result.
+func IncompleteScanNote(reportFile string) string {
+	return fmt.Sprintf("INCOMPLETE SCAN: report.md is larger than the %d-byte scan cap, only its start was read; "+
+		"sections past it are missing here (a blocker may be among them); read the file: %s", jobs.MaxRedactBytes, reportFile)
+}
+
+// capFor is the byte cap asked for (clamped to MaxReportBytes), def when none was.
+func capFor(asked, def int) int {
+	if asked <= 0 {
+		return def
+	}
+	return min(asked, MaxReportBytes)
+}
+
+// joinNotes joins the non-empty notes with "; ".
+func joinNotes(notes ...string) string {
+	return strings.Join(slices.DeleteFunc(slices.Clone(notes), func(n string) bool { return n == "" }), "; ")
+}
+
 func addJobResult(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "job_result",
-		Description: "The report of a finished job (report.md) with its job-done line and the paths of what it changed " +
-			"(patches, diffstat, logs). Read \"Not done / uncertain\" first (not_done), then the job's steps (progress); " +
-			"the report is a claim, check the diff. Secret-looking values are shown as [redacted:<kind>]. " +
+		Description: "Result of a finished job: its job-done line, the paths of what it changed (patches, diffstat, logs) " +
+			"and a compact report: not_done (\"Not done / uncertain\", whole, read it first), summary, forks, commits and " +
+			"report_sections (the size of every section). Ask for more with sections=[\"Evidence\", ...] or detail=full " +
+			"(the whole report, progress, acceptance log tail); max_bytes caps each returned text. The report is a claim, " +
+			"check the diff. Secret-looking values are shown as [redacted:<kind>]. " +
 			"For a queued or running job it returns the status only.",
-	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobIDInput) (*sdk.CallToolResult, JobResultOutput, error) {
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobResultInput) (*sdk.CallToolResult, JobResultOutput, error) {
+		if in.Detail == "" {
+			in.Detail = DetailSummary
+		}
+		if in.Detail != DetailSummary && in.Detail != DetailFull {
+			return nil, JobResultOutput{}, fmt.Errorf("detail must be %q or %q, got %q", DetailSummary, DetailFull, in.Detail)
+		}
+		if in.MaxBytes < 0 {
+			return nil, JobResultOutput{}, errors.New("max_bytes must not be negative")
+		}
+		full := in.Detail == DetailFull
 		m := d.Manager
 		j, err := getJob(m, in.ID)
 		if err != nil {
@@ -389,14 +463,22 @@ func addJobResult(s *sdk.Server, d Deps) {
 		out.DoneLine = m.DoneLineFor(j)
 		out.JobDirBytes, out.JobDirPartial = j.DirBytes, j.DirPartial
 		out.Acceptance = acceptanceView(m, j)
+		if !full && out.Acceptance != nil && out.Acceptance.Ran && out.Acceptance.Exit == 0 {
+			// A passed acceptance run needs no log; a failed or unrun one keeps its tail.
+			out.Acceptance.LogTail = ""
+		}
 		out.Prepare = m.PrepareResultOf(j)
+		out.Plugins, out.PluginWarnings = m.JobPlugins(j)
 		dir := m.JobDir(j.ID)
 		for _, f := range artifactFiles {
 			if fi, err := os.Lstat(filepath.Join(dir, f)); err == nil && fi.Mode().IsRegular() {
 				out.Artifacts = append(out.Artifacts, filepath.Join(dir, f))
 			}
 		}
-		report, truncated, err := ReadJobReport(m.StateDir, j.ID, MaxReportBytes)
+		// The scan reads up to the redaction scan cap, not the response cap: the sections an orchestrator
+		// must not miss (Not done / uncertain, Forks) are found wherever they sit in the report, and only
+		// the returned texts are cut to the response caps.
+		report, truncated, err := ReadJobReport(m.StateDir, j.ID, jobs.MaxRedactBytes)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			out.ReportMissing = true
@@ -409,14 +491,64 @@ func addJobResult(s *sdk.Server, d Deps) {
 		default:
 			// Always redacted on the fly: the report of a job whose in-place redaction is still pending
 			// (or of a running job) may hold raw secrets.
-			out.Report, out.ReportTruncated = jobs.RedactRead(report, truncated), truncated
-			secs := jobs.ReportSections(out.Report, jobs.SectionNotDone, jobs.SectionProgress)
-			out.NotDone, out.Progress = secs[0], secs[1]
-			if len(j.Covers) > 0 {
-				out.Requirements = &RequirementsView{Requirements: jobs.ParseRequirements(out.Report, j.Covers)}
+			text := jobs.RedactRead(report, truncated)
+			reportFile := filepath.Join(dir, "report.md")
+			var notes []string
+			// cutReport: a returned text was cut to its cap (it ends with a marker).
+			cutReport := false
+			if len(in.Sections) > 0 {
+				var missing []string
+				out.Report, missing = jobs.ReportSectionTexts(text, in.Sections...)
+				var cut bool
+				out.Report, cut = jobs.CapText(out.Report, capFor(in.MaxBytes, SectionsBytes))
+				cutReport = cutReport || cut
+				if len(missing) > 0 {
+					notes = append(notes, "no such section: "+strings.Join(missing, ", "))
+				}
+			}
+			if full {
+				// Without max_bytes these keep the old bound (the report cap); with it each is cut to it.
+				fieldCap := capFor(in.MaxBytes, MaxReportBytes)
+				secs := jobs.ReportSections(text, jobs.SectionNotDone, jobs.SectionProgress, jobs.SectionForks)
+				for i, dst := range []*string{&out.NotDone, &out.Progress, &out.Forks} {
+					var cut bool
+					*dst, cut = jobs.CapText(secs[i], fieldCap)
+					cutReport = cutReport || cut
+				}
+				if len(in.Sections) == 0 {
+					var cut bool
+					if in.MaxBytes <= 0 && len(text) > MaxReportBytes {
+						// The old default: the first MaxReportBytes, back to the last whole line, no marker.
+						out.Report, cut = jobs.RedactRead(text[:MaxReportBytes], true), true
+					} else {
+						out.Report, cut = jobs.CapText(text, fieldCap)
+					}
+					cutReport = cutReport || cut
+					if cut {
+						notes = append(notes, fmt.Sprintf("report cut at %d bytes; full file: %s", fieldCap, reportFile))
+					}
+				}
+			} else {
+				d := jobs.DigestReport(text, capFor(in.MaxBytes, SummaryFieldBytes))
+				out.NotDone, out.Summary, out.Forks = d.NotDone, d.Summary, d.Forks
+				out.ReportSections, out.ReportBytes = d.Sizes, d.Bytes
+				var commitsNote string
+				out.Commits, commitsNote = m.JobCommits(j)
+				notes = append(notes, commitsNote, d.SizesHint(),
+					"summary view: job_result with sections=[<name>, ...] returns sections, detail=full the whole report")
+				if len(d.Cut) > 0 {
+					cutReport = true
+					notes = append(notes, "cut at the cap: "+strings.Join(d.Cut, ", "))
+				}
 			}
 			if truncated {
-				out.Note = fmt.Sprintf("report cut at %d bytes; full file: %s", MaxReportBytes, filepath.Join(dir, "report.md"))
+				// The scan itself is incomplete: a section past the scan cap is not in any field.
+				notes = append(notes, IncompleteScanNote(reportFile))
+			}
+			out.ReportTruncated = truncated || cutReport
+			out.Note = joinNotes(notes...)
+			if len(j.Covers) > 0 {
+				out.Requirements = &RequirementsView{Requirements: jobs.ParseRequirements(text, j.Covers)}
 			}
 		}
 		if len(j.Covers) > 0 {

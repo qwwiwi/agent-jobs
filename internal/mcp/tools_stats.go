@@ -92,3 +92,41 @@ func addJobOutcome(s *sdk.Server, d Deps) {
 		return nil, JobOutcomeOutput{ID: j.ID, Outcome: j.Outcome, OutcomeNote: j.OutcomeNote}, nil
 	})
 }
+
+// JobOutcomeManyInput is job_outcome_many's input.
+type JobOutcomeManyInput struct {
+	Items []jobs.OutcomeItem `json:"items" jsonschema:"one {id, outcome, note?} per job; outcome is accepted | extended | reworked | rerun | discarded; note at most 300 characters; at most 500 items"`
+}
+
+// JobOutcomeManyOutput is job_outcome_many's output: one result per item, in the request's order.
+type JobOutcomeManyOutput struct {
+	Recorded int                  `json:"recorded"`
+	Failed   int                  `json:"failed"`
+	Results  []jobs.OutcomeResult `json:"results"`
+}
+
+func addJobOutcomeMany(s *sdk.Server, d Deps) {
+	addManagerTool(s, d, &sdk.Tool{
+		Name: "job_outcome_many",
+		Description: "Record outcomes for many finished jobs in one call: items [{id, outcome, note?}], each exactly like " +
+			"job_outcome (accepted, extended, reworked, rerun or discarded; note at most 300 characters; calling it " +
+			"again overwrites). Every item is validated and answered on its own in results (ok, or error): an unknown " +
+			"id, another agent's job, a queued, running or stopped job or a bad outcome fails only that item and the " +
+			"rest are recorded. At most 500 items. An outcome is only what an item names: it is never inferred from a " +
+			"job's status, so list only the jobs whose result you actually acted on.",
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobOutcomeManyInput) (*sdk.CallToolResult, JobOutcomeManyOutput, error) {
+		res, err := d.Manager.SetOutcomes(in.Items)
+		if err != nil {
+			return nil, JobOutcomeManyOutput{}, fmt.Errorf("job_outcome_many rejected: %w", err)
+		}
+		out := JobOutcomeManyOutput{Results: res}
+		for _, r := range res {
+			if r.OK {
+				out.Recorded++
+			} else {
+				out.Failed++
+			}
+		}
+		return nil, out, nil
+	})
+}

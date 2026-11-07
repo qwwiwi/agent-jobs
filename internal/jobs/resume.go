@@ -786,7 +786,9 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
 		// again from its own finding when this attempt ends.
 		m.clearNoCommits(id)
-		if err := m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context)); err != nil {
+		if err := m.underIdleLock(func() error {
+			return m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context))
+		}); err != nil {
 			return nil, err
 		}
 		return m.Store.Get(id)
@@ -856,7 +858,7 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
 	// again from its own finding when this attempt ends.
 	m.clearNoCommits(id)
-	return m.Store.Requeue(id, lim, update, "")
+	return m.underIdleLock(func() error { return m.Store.Requeue(id, lim, update, "") })
 }
 
 // neverRan reports whether an attempt ended without claude ever running: its launch was refused or
@@ -994,6 +996,10 @@ func archiveAttempt(dir string, n int) error {
 // refreshJobFiles rewrites the files claude and git read at launch from the agent's config: the job
 // dir is writable by the job, so what the previous attempt may have changed there is not reused.
 func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) error {
+	// A plugin update since the first attempt is picked up; the settings below carry its deny rules.
+	if err := m.preparePlugins(j, dir); err != nil {
+		return err
+	}
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.JobSettings(j, gitDirs...)); err != nil {
 		return err
 	}
@@ -1087,6 +1093,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if section := m.priorResults(j, prior); section != "" {
 		resumed += "\nThe prior results, read again for this attempt (prior/ was rewritten from the same read):\n\n" + section
 	}
+	// The fallback prompt gets the bootstrap through buildPrompt; the resumed session gets it here, read
+	// again with the plugins for this attempt (a plugin update may have changed it).
+	if section := m.pluginsPromptSection(j); section != "" {
+		resumed += "\nThe skills bootstrap, read again for this attempt:\n\n" + section
+	}
 	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
 	}
@@ -1128,7 +1139,7 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 // resumeMessage is the new user message of a resumed attempt.
 func (m *Manager) resumeMessage(j *store.Job) string {
 	return fmt.Sprintf("%s\nContinue the task with this update; keep the report contract: your final message is the "+
-		"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Progress.\n"+
+		"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Forks and Progress.\n"+
 		"Limits of this continuation (attempt %d): %d turns, $%g, %d minutes.\n",
 		updateBlock(j.PendingContext), j.Attempt, j.MaxTurns, j.MaxBudgetUSD, j.TimeoutMinutes)
 }

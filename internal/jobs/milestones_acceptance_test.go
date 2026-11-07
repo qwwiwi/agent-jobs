@@ -51,7 +51,8 @@ func TestMilestoneLatency(t *testing.T) {
 		for i := 1; i <= 20; i++ {
 			task := MilestoneTaskInput{Key: fmt.Sprintf("T%d", i), Title: fmt.Sprintf("task %d", i)}
 			if i > 10 {
-				task.DependsOn = deps(fmt.Sprintf("T%d", i-10))
+				dep := fmt.Sprintf("T%d", i-10)
+				task.DependsOn, task.DependsWhy = deps(dep), why(dep)
 			}
 			tasks = append(tasks, task)
 		}

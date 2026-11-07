@@ -181,6 +181,15 @@ func (m *Manager) deliverPlain(ctx context.Context, target, category, ref string
 }
 
 func (m *Manager) deliver(ctx context.Context, target, category, ref string, members []string, line string, withNote bool) error {
+	return m.deliverVia(ctx, category, ref, members, line, withNote, func(ctx context.Context, l string) (string, error) {
+		return l, m.sendTmux(ctx, target, l)
+	})
+}
+
+// deliverVia is deliver with the typing left to send, which returns the line it actually typed (a
+// job-done line may gain an idle note inside the tmux delivery, #165), so the recorded bytes are the
+// bytes the session received.
+func (m *Manager) deliverVia(ctx context.Context, category, ref string, members []string, line string, withNote bool, send func(ctx context.Context, line string) (string, error)) error {
 	var ids []int64
 	if withNote {
 		var note string
@@ -189,9 +198,11 @@ func (m *Manager) deliver(ctx context.Context, target, category, ref string, mem
 			line += " · " + note
 		}
 	}
-	if err := m.sendTmux(ctx, target, line); err != nil {
+	typed, err := send(ctx, line)
+	if err != nil {
 		return err
 	}
+	line = typed
 	if err := m.Store.MarkSLOBreachesNoted(ids, m.Now()); err != nil {
 		// The line is out: the next note leaves these breaches out and the mark is retried then.
 		m.Log.Printf("slo breach note: %v", err)

@@ -2,12 +2,15 @@
 // No browser starts here: the pure helpers are tested directly, and the in-page probe runs against a
 // small fake DOM in a vm context, through the same expression the script hands to page.evaluate.
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
 import {
   CLS_LIMIT, DEVICES, UsageError, clsFromShifts, countLines, failuresOf, hyphenationExempt, lineFragments, parseArgs,
-  probeExpression, scrollExpression, slug, sticksOut, wordSegments,
+  probeExpression, resolvePlaywright, scrollExpression, slug, sticksOut, wordSegments,
 } from './ui-check.mjs';
 
 test('device matrix is the required minimum', () => {
@@ -26,6 +29,13 @@ test('parseArgs', () => {
   assert.equal(o.dwell, 3000);
   assert.equal(parseArgs(['http://x', '/', '--dwell', '0']).dwell, 0);
   assert.equal(parseArgs(['--help']).help, true);
+  assert.equal(o.trusted, false);
+  assert.equal(o.playwright, '');
+  const t = parseArgs(['http://x', '/', '--trusted', '--playwright', '/opt/pw']);
+  assert.equal(t.trusted, true);
+  assert.equal(t.playwright, '/opt/pw');
+  assert.throws(() => parseArgs(['http://x', '/', '--trusted=1']), UsageError);
+  assert.throws(() => parseArgs(['http://x', '/', '--playwright', '']), UsageError);
   for (const bad of [[], ['http://x'], ['not a url', '/'], ['ftp://x', '/'], ['http://x', '/', '--schemes', 'blue'],
     ['http://x', '/', '--out'], ['http://x', '/', '--bogus', '1'], ['http://x', '/', '--timeout', '-5'], ['http://x', '/', '--dwell', '-1'], ['http://x', '/', '--limit', '0']]) {
     assert.throws(() => parseArgs(bad), UsageError, JSON.stringify(bad));
@@ -427,4 +437,42 @@ test('probeExpression is a self-contained expression', () => {
   // It must parse and must not reach module scope: an empty context with no DOM fails on document only.
   assert.doesNotThrow(() => new vm.Script(probeExpression(3)));
   assert.throws(() => vm.runInContext(probeExpression(3), vm.createContext({})), /document is not defined/);
+});
+
+// A fake package dir/node_modules/playwright; returns its entry file.
+function fakePlaywright(dir) {
+  const pkg = path.join(dir, 'node_modules', 'playwright');
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(path.join(pkg, 'package.json'), '{"name":"playwright","main":"index.js"}\n');
+  writeFileSync(path.join(pkg, 'index.js'), 'module.exports = {};\n');
+  return realpathSync(path.join(pkg, 'index.js'));
+}
+
+// #135: a trusted caller (agent-jobs ui-check, the orchestrator) never resolves Playwright from the
+// current directory, a job worktree it may stand in, nor from a relative NODE_PATH entry.
+test('resolvePlaywright: trusted mode skips the current directory', (t) => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'ui-check-resolve-'));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const worktree = path.join(tmp, 'worktree');
+  const planted = fakePlaywright(worktree);
+  const trustedRoot = path.join(tmp, 'global');
+  const good = fakePlaywright(trustedRoot);
+  const noGlobal = () => '';
+
+  // A job (untrusted) still finds its own node_modules.
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal), planted);
+  // Trusted: neither the cwd's node_modules nor a relative NODE_PATH entry.
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal, { trusted: true }), null);
+  assert.equal(resolvePlaywright(worktree, { NODE_PATH: 'node_modules' }, noGlobal, { trusted: true }), null);
+  // Trusted: the global root and absolute NODE_PATH entries count.
+  const root = path.join(trustedRoot, 'node_modules');
+  assert.equal(resolvePlaywright(worktree, {}, () => root, { trusted: true }), good);
+  assert.equal(resolvePlaywright(worktree, { NODE_PATH: root }, noGlobal, { trusted: true }), good);
+  // An explicit --playwright path wins over everything, and only it is used.
+  const explicit = path.join(root, 'playwright');
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal, { trusted: true, playwright: explicit }), good);
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal, { playwright: explicit }), good);
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal, { trusted: true, playwright: path.join(tmp, 'missing') }), null);
+  // A relative --playwright is refused in trusted mode (it would name a path inside the worktree).
+  assert.equal(resolvePlaywright(worktree, {}, noGlobal, { trusted: true, playwright: 'node_modules/playwright' }), null);
 });

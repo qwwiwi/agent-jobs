@@ -41,7 +41,7 @@ func TestJobResultRedactsAndShowsProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 		var res JobResultOutput
-		call(t, cs, "job_result", map[string]any{"id": j.ID}, &res)
+		call(t, cs, "job_result", map[string]any{"id": j.ID, "detail": "full"}, &res)
 		if strings.Contains(res.Report, tok) || strings.Contains(res.Error, strings.Repeat("z", 24)) ||
 			res.NotDone != "nothing" || res.Progress != c.progress || res.ReportMissing {
 			t.Fatalf("case %d: %+v", i, res)
@@ -96,5 +96,39 @@ func TestJobStartSameRepoAdvisory(t *testing.T) {
 	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["repo"] = repo }), &second)
 	if second.Status != "queued" || !strings.Contains(second.SameRepoJobs, first.ID+" queued") {
 		t.Fatalf("second: %+v", second)
+	}
+}
+
+// job_result: the report's "Forks" section comes as the field `forks` (kept as written, "none"
+// included); a report without it, or with Forks only inside a fence, leaves the field empty.
+func TestJobResultShowsForks(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	now := time.Now()
+	for i, c := range []struct{ report, forks string }{
+		{"## Summary\nok\n\n## Not done / uncertain\nnothing\n\n## Forks\n- a / b / c\n- d / e / f\n\n## Progress\n- 10:00 UTC x\n",
+			"- a / b / c\n- d / e / f"},
+		{"## Summary\nok\n\n## Not done / uncertain\nnothing\n\n## Forks\nnone\n", "none"},
+		{"## Summary\nok\n\n## Not done / uncertain\nnothing\n", ""},
+		{"## Summary\nok\n\n## Evidence\n```\n## Forks\n- x / y / z\n```\n\n## Not done / uncertain\nnothing\n", ""},
+	} {
+		j := &store.Job{ID: fmt.Sprintf("261106-13000%d-abcd", i), Agent: "test", Title: "t", Kind: "general", Brief: "b",
+			Status: store.StatusSucceeded, Model: "opus", MaxTurns: 1, MaxBudgetUSD: 1, TimeoutMinutes: 1,
+			CreatedAt: now, StartedAt: &now, FinishedAt: &now}
+		if err := m.Store.Insert(j); err != nil {
+			t.Fatal(err)
+		}
+		dir := m.JobDir(j.ID)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "report.md"), []byte(c.report), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var res JobResultOutput
+		call(t, cs, "job_result", map[string]any{"id": j.ID}, &res)
+		if res.Forks != c.forks || res.NotDone != "nothing" {
+			t.Fatalf("case %d: forks %q, not_done %q", i, res.Forks, res.NotDone)
+		}
 	}
 }

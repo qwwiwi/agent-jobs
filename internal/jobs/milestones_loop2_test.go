@@ -34,7 +34,7 @@ func TestMilestoneClaimRechecksEligibility(t *testing.T) {
 	j3 := enqueue(t, m, "do T3", onTask(v.ID, "T3"))
 	j4 := enqueue(t, m, "do other T1", onTask(other.ID, "T1"))
 	edits := map[string]MilestoneSet{
-		j2.ID: {ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1")}}},
+		j2.ID: {ID: v.ID, Tasks: []MilestoneTaskInput{{Key: "T2", DependsOn: deps("T1"), DependsWhy: why("T1")}}},
 		j3.ID: {ID: v.ID, Drop: []string{"T3"}},
 		j4.ID: {ID: other.ID, Status: store.MilestoneDropped},
 	}
@@ -131,7 +131,7 @@ func TestMilestoneWaitingReason(t *testing.T) {
 	m := newManager(t)
 	ctx := context.Background()
 	v, err := m.CreateMilestone(ctx, MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+		{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestMilestonePriorNamesOutcome(t *testing.T) {
 	} {
 		m := newManager(t)
 		v, err := m.CreateMilestone(context.Background(), MilestoneCreate{Title: "m", Tasks: []MilestoneTaskInput{
-			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1")}}})
+			{Key: "T1", Title: "base"}, {Key: "T2", Title: "next", DependsOn: deps("T1"), DependsWhy: why("T1")}}})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -126,31 +126,19 @@ func (s *Store) BeginOwnerPending(id, state string, now time.Time) error {
 // notify_off row stays as it is; an attempt without a row (nothing began it) gets a delivered one.
 // One transaction, so a delivered line of such a job never goes without its row.
 func (s *Store) MarkNotified(id string, now time.Time) error {
-	return s.MarkNotifiedBatch([]string{id}, now)
+	return s.MarkNotifiedBatch([]string{id}, now, nil)
 }
 
-// MarkNotifiedBatch marks all of ids notified in one transaction: a delivery that carried several jobs
-// is acknowledged as a whole or not at all, so a failure never leaves part of a batch pending (the
-// retry would be a different, smaller line).
-func (s *Store) MarkNotifiedBatch(ids []string, now time.Time) error {
-	tx, err := s.db.Begin()
-	if err != nil {
+// markNotifiedTx is MarkNotified inside the caller's transaction.
+func markNotifiedTx(tx *sql.Tx, id string, now time.Time) error {
+	if _, err := tx.Exec(`UPDATE jobs SET notified_at=? WHERE id=?`, now.Unix(), id); err != nil {
 		return fmt.Errorf("mark notified: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-	for _, id := range ids {
-		if _, err := tx.Exec(`UPDATE jobs SET notified_at=? WHERE id=?`, now.Unix(), id); err != nil {
-			return fmt.Errorf("mark notified: %w", err)
-		}
-		if _, err := tx.Exec(`INSERT INTO owner_pending (job_id, attempt, state, created_at)
+	if _, err := tx.Exec(`INSERT INTO owner_pending (job_id, attempt, state, created_at)
 		SELECT id, attempt, ?, ? FROM jobs WHERE id = ? AND owner_waits = 1
 		ON CONFLICT(job_id, attempt) DO UPDATE SET state = excluded.state, created_at = excluded.created_at
 		WHERE owner_pending.state = ?`, OwnerDelivered, now.Unix(), id, OwnerDelivering); err != nil {
-			return fmt.Errorf("mark notified: owner pending: %w", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("mark notified: %w", err)
+		return fmt.Errorf("mark notified: owner pending: %w", err)
 	}
 	return nil
 }

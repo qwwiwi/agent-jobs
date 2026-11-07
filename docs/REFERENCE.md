@@ -25,6 +25,8 @@ claude -p --output-format stream-json --verbose --model M \
 
 `--max-budget-usd` is omitted for `runner: openrouter` jobs (#148): their OpenRouter proxy enforces `max_budget_usd`.
 
+Config `job_plugins` adds one `--plugin-dir <dir>` per configured Claude Code plugin to claude jobs of the matching kinds (skill packs such as `superpowers`, which `--setting-sources project` would otherwise keep out). Their hooks and servers are cut from the job's view of the plugin unless `allow_hooks` is set; `deny_skills` become `Skill(<plugin>:<skill>)` deny rules, and `bootstrap_skill` puts one plugin skill's text into the prompt as «Skills bootstrap», standing in for the plugin's SessionStart hook. Codex jobs get none. See GUIDE «Plugins for jobs».
+
 The process is started detached, in its own process group, and writes its exit code to a file itself. So a daemon restart neither kills nor loses the job: the new daemon finds the exit-code file on the next tick.
 
 The kind of work sets a short checklist in the brief:
@@ -108,6 +110,8 @@ What we learned from mistakes:
 - The schedule row itself never expires. We edit it in place (`schedule edit`), re-read it from the database after the edit, and delete it only by the owner's decision.
 
 Separate from cron there is a «heartbeat»: the daemon itself decides whether there is a reason to wake the agent for its own goals. First a cheap check in Go (has enough time passed, is the daily limit not used up, is it not night), then a small model decides whether the big one is worth waking.
+
+With `idle_pick.enabled` there is a cheaper way to keep the agent busy than an hourly wake: when the last job of the queue has ended, the job-done line it arrives on ends with what is ready (`· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`): milestone tasks whose dependencies are accepted and that have no job yet, and the agent's open intentions. Nothing ready, nothing added; it is never a separate wake, and the daemon never starts the work itself. A note that was missed (idle pick was off, the cooldown or the daily cap held it back) is not made up later: the note rides only a genuine pending job-done line, and a delivered line is never sent again.
 
 ## MCP tools
 
