@@ -161,6 +161,50 @@ func TestIdleDeliveryRecord(t *testing.T) {
 	}
 }
 
+// #193: only the exact batch that owns a saved delivery may clear it; batch order is irrelevant.
+func TestMarkNotifiedBatchClearsOnlyMatchingIdleDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ids   []string
+		idle  *IdleMark
+		clear bool
+	}{
+		{name: "unrelated acknowledgement", ids: []string{"c"}},
+		{name: "unrelated idle note", ids: []string{"c"}, idle: &IdleMark{Kind: IdleNote, Epoch: 4}},
+		{name: "partial batch", ids: []string{"a"}},
+		{name: "larger batch", ids: []string{"a", "b", "c"}},
+		{name: "empty batch"},
+		{name: "matching batch", ids: []string{"a", "b"}, idle: &IdleMark{Kind: IdleNote, Epoch: 3}, clear: true},
+		{name: "matching reversed batch without note", ids: []string{"b", "a"}, clear: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openIdleStore(t)
+			now := time.Unix(1_800_000_000, 0)
+			for _, id := range []string{"a", "b", "c"} {
+				insertJob(t, s, id, false, now)
+			}
+			want := IdleDelivery{Batch: "a,b", Epoch: 3, Note: "idle: ready work"}
+			if err := s.SaveIdleDelivery(want); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.MarkNotifiedBatch(tc.ids, now, tc.idle); err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.IdleDeliveryFor(want.Batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.clear {
+				if got != nil {
+					t.Fatalf("matching delivery record kept: %+v", got)
+				}
+			} else if got == nil || *got != want {
+				t.Fatalf("unrelated acknowledgement changed saved delivery: got %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 // #165 F3: opening a database that predates the epoch counter treats the finished jobs as covered (no
 // note for history), except a completion whose job-done line is still pending: that one keeps its epoch
 // open and gets its note on its own line.

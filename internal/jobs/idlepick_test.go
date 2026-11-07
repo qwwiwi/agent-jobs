@@ -595,6 +595,64 @@ func TestIdlePickRetryAcknowledgesStoredNote(t *testing.T) {
 	}
 }
 
+// #193: an owner-waits acknowledgement delivered before an overdue retry must preserve the
+// retry's saved idle note, even after a restart and while another job keeps the queue busy.
+func TestIdlePickUnrelatedAcknowledgementKeepsStoredNote(t *testing.T) {
+	f := newIdleFixture(t)
+	f.m.Cfg.NotifyCoalesceSeconds = 10
+	a := f.finish(t, 0)
+	failIdleWrites(t, f.m, true)
+	*f.now = f.t0.Add(10 * time.Second)
+	if err := f.m.notifyPending(); err == nil || !strings.Contains(err.Error(), "idle pick event") {
+		t.Fatalf("expected idle event write failure: %v", err)
+	}
+	if got := tmuxLines(t, f.logf); len(got) != 1 || !strings.Contains(got[0], " · idle: ") {
+		t.Fatalf("first delivery did not carry an idle note: %q", got)
+	}
+	if get(t, f.m, a.ID).NotifiedAt != nil {
+		t.Fatal("A acknowledged despite the event write failure")
+	}
+	saved, err := f.m.Store.IdleDeliveryFor(a.ID)
+	if err != nil || saved == nil || saved.Note == "" {
+		t.Fatalf("A's delivery record missing: %+v %v", saved, err)
+	}
+
+	m := reopenForIdle(t, f.m, f.now)
+	failIdleWrites(t, m, false)
+	b := finishAt(t, m, f.now, f.t0.Add(11*time.Second), func(r *StartRequest) { r.OwnerWaits = true })
+	c := enqueue(t, m, "active C", nil)
+	// Coalescing sends B first, then retries overdue A in the same tick.
+	notifyAt(t, m, f.now, f.t0.Add(12*time.Second))
+	got := tmuxLines(t, f.logf)
+	if len(got) != 3 || !strings.Contains(got[1], b.ID) || !strings.HasSuffix(got[1], OwnerWaitsMarker) ||
+		!strings.Contains(got[2], a.ID) || strings.Contains(got[2], "idle:") {
+		t.Fatalf("expected B's line before A's retry on a busy queue: %q", got)
+	}
+	for _, id := range []string{a.ID, b.ID} {
+		if get(t, m, id).NotifiedAt == nil {
+			t.Fatalf("%s not acknowledged after writes recovered", id)
+		}
+	}
+	if epoch, err := m.Store.LastIdlePickEpoch(store.IdleNote); err != nil || epoch != saved.Epoch {
+		t.Fatalf("A's delivered note was lost after B's acknowledgement: epoch %d, want %d (%v)", epoch, saved.Epoch, err)
+	}
+	if rec, err := m.Store.IdleDeliveryFor(a.ID); err != nil || rec != nil {
+		t.Fatalf("A's record kept after its acknowledgement: %+v %v", rec, err)
+	}
+	if n, err := m.Store.CountIdlePickEvents(f.t0, store.IdleNote); err != nil || n != 1 {
+		t.Fatalf("expected one recorded idle note: %d %v", n, err)
+	}
+
+	if err := m.Cancel(c.ID); err != nil {
+		t.Fatal(err)
+	}
+	notifyAt(t, m, f.now, f.t0.Add(22*time.Second))
+	got = tmuxLines(t, f.logf)
+	if len(got) != 4 || !strings.Contains(got[3], c.ID) || strings.Contains(got[3], "idle:") {
+		t.Fatalf("C's completion must respect A's idle cooldown: %q", got)
+	}
+}
+
 // #165: config values are checked at load; absent means off with the documented defaults.
 func TestIdlePickConfig(t *testing.T) {
 	for _, body := range []string{
