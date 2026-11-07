@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -272,38 +272,51 @@ func advisorMember(id string, r advisorRun) func(int) bool {
 }
 
 // advisorMembers lists the live processes of call r's process group and session: those proven the
-// call's (advisorMember) and the others that may still be the call's (unproven: no marker, say, after
-// env -u AGENT_JOBS_JOB). reused reports that the ids are proven another's now: r's pid is a process with
-// another start time, so the call's group and session were gone before it was reused (a pid is not
-// reused while its process group or session has a member). A process that started before the call's
-// leader cannot be in its session either, so it is no member at all.
+// call's (they carry job id's marker) and the others that may still be the call's (unproven: no marker,
+// say, after env -u AGENT_JOBS_JOB). reused reports that the ids are proven another's now: r's pid is a
+// process with another start time, so the call's group and session were gone before it was reused (a
+// pid is not reused while its process group or session has a member). A process that started before
+// the call's leader cannot be in its session either, so it is no member at all. Each process's stat is
+// read once: only its disappearance (procGone) drops it; any other read failure (descriptors exhausted,
+// say) fails the enumeration, so the registration is kept (durable ownership, issue #190).
 func advisorMembers(id string, r advisorRun) (proven, unproven []int, reused bool, err error) {
 	if r.Start != 0 {
 		if p, err := procStatFull(r.PID); err == nil && p.start != r.Start {
 			return nil, nil, true, nil
 		}
 	}
-	group, err := groupMembers(r.PID)
+	ents, err := os.ReadDir(procRoot)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	session, err := sessionMembers(r.PID)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	pids := slices.Compact(slices.Sorted(slices.Values(append(group, session...))))
-	isMember := advisorMember(id, r)
-	for _, pid := range pids {
+	skip := selfAndAncestors()
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || skip[pid] {
+			continue
+		}
 		switch p, err := procStatFull(pid); {
-		case err != nil || p.state == "Z" || (p.pgid != r.PID && p.sid != r.PID):
-			// gone, or no longer a member
-		case isMember(pid):
+		case err != nil && procGone(err):
+			// gone
+		case err != nil:
+			return nil, nil, false, fmt.Errorf("process %d not inspected: %w", pid, err)
+		case p.state == "Z" || (p.pgid != r.PID && p.sid != r.PID):
+			// no member
+		case r.Start != 0 && p.start < r.Start:
+			// started before the call's leader: not of its session
+		case procMarker(pid) == id:
 			proven = append(proven, pid)
-		case r.Start == 0 || p.start >= r.Start:
+		default:
 			unproven = append(unproven, pid)
 		}
 	}
 	return proven, unproven, false, nil
+}
+
+// procGone reports whether err, from reading a process's /proc entry, means the process is gone
+// (ENOENT, ESRCH); any other failure says nothing about the process.
+func procGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH)
 }
 
 // advisorGroupRounds bounds endAdvisorGroup's wait (50 ms each) for the members it killed to go.
