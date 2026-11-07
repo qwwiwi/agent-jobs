@@ -109,3 +109,21 @@ func TestKindPromptsUIChangesRule(t *testing.T) {
 		}
 	}
 }
+
+// Owner decision 2026-11-07 (msg 74917, #208): a fix or general job runs its heavy steps through the
+// box-wide gate lock, in the one form the guard lets a job run (`agent-jobs gate run ... -- CMD`).
+func TestWriteKindPromptsGateRule(t *testing.T) {
+	for _, name := range []string{"prompts/kind-fix.md", "prompts/kind-general.md"} {
+		b, err := Templates.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(b)
+		for _, want := range []string{"`agent-jobs gate run --head HEAD --repo . -- <command>`", "scripts/check.sh",
+			"box-wide gate lock", "exit=N", "Never run a gate inside another gate", "exits 125"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+	}
+}
