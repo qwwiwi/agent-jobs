@@ -305,3 +305,58 @@ func readFileT(t *testing.T, path string) string {
 	}
 	return strings.TrimSpace(string(b))
 }
+
+// The queue file is shared and writable by every user: a planted entry (a heartbeat in the future, pid 1)
+// does not stop the queue, and a process that holds the queue file's own flock does not hang a gate
+// past its lock wait (it falls back to polling the lock).
+func TestGateLockQueueCannotBeJammed(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	now := time.Now()
+	planted := fmt.Sprintf("0 1 %d\n1 %d %d\n", now.Add(time.Hour).UnixMilli(), os.Getppid(), now.Add(100*365*24*time.Hour).UnixMilli())
+	if err := os.WriteFile(lock+gateQueueSuffix, []byte(planted), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("planted queue entries held up a free lock: %v", err)
+	}
+	l.release()
+
+	q, err := os.OpenFile(lock+gateQueueSuffix, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := syscall.Flock(int(q.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	l, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 3 * time.Second})
+	if err != nil || time.Since(start) > 3*time.Second {
+		t.Fatalf("with the queue file locked by someone: %v after %s", err, time.Since(start))
+	}
+	l.release()
+	holdGateT(t, lock)
+	start = time.Now()
+	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 500 * time.Millisecond})
+	if err == nil || time.Since(start) > 3*time.Second {
+		t.Fatalf("a held lock with the queue file locked: %v after %s; want a bounded wait", err, time.Since(start))
+	}
+}
+
+// Waits that overlap in time count once: the credit is the union of the attempt's wait intervals.
+func TestGateWaitCreditUnion(t *testing.T) {
+	start := time.Unix(1770000000, 0)
+	s := GateWaitState{
+		Done: []GateWaitDone{
+			{Since: start.Add(time.Minute), Sec: 600},     // 1..11 min
+			{Since: start.Add(2 * time.Minute), Sec: 600}, // 2..12 min, overlaps
+			{Since: start.Add(-time.Hour), Sec: 3600},     // an earlier attempt, ends at start
+			{Since: start.Add(20 * time.Minute), Sec: 60}, // 20..21 min
+		},
+		Waits: []GateWaitEntry{{PID: 1, Since: start.Add(20*time.Minute + 30*time.Second)}}, // 20.5..25 min
+	}
+	if got := s.Credit(start, start.Add(25*time.Minute)); got != 16*time.Minute {
+		t.Fatalf("credit %s, want 16m (1..12 and 20..25 min)", got)
+	}
+}

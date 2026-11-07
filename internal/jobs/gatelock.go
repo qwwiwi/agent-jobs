@@ -44,11 +44,14 @@ const (
 	// GateWaitFile is a job's gate lock waits (gateWaitRecorder), in its job dir.
 	GateWaitFile = "gate-wait.json"
 
-	gateQueueSuffix    = ".queue"
-	gateQueueStale     = 5 * time.Second
-	gateQueueMaxBytes  = 64 << 10
-	gateWaitFileMax    = 64 << 10
-	gateWaitMaxEntries = 32
+	gateQueueSuffix     = ".queue"
+	gateQueueStale      = 5 * time.Second
+	gateQueueMaxBytes   = 64 << 10
+	gateQueueMaxEntries = 256
+	gateQueueLockTries  = 10
+	gateQueueLockRetry  = 10 * time.Millisecond
+	gateWaitFileMax     = 64 << 10
+	gateWaitMaxEntries  = 32
 )
 
 // ErrGateOwnJob: the gate lock is held by another gate of the caller's own job, which is no ancestor
@@ -290,7 +293,17 @@ func (q *gateQueue) update(fn func([]gateEntry) []gateEntry) []gateEntry {
 		return nil
 	}
 	fd := int(q.f.Fd())
-	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+	// Every user can open the queue file, so anyone can hold its flock: never block on it. A queue that
+	// stays locked (gateQueueLockTries) is skipped this poll; the caller then just polls the gate lock.
+	locked := false
+	for range gateQueueLockTries {
+		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			locked = true
+			break
+		}
+		time.Sleep(gateQueueLockRetry)
+	}
+	if !locked {
 		return nil
 	}
 	defer func() { _ = syscall.Flock(fd, syscall.LOCK_UN) }()
@@ -306,10 +319,15 @@ func (q *gateQueue) update(fn func([]gateEntry) []gateEntry) []gateEntry {
 		seq, e1 := strconv.ParseInt(f[0], 10, 64)
 		pid, e2 := strconv.Atoi(f[1])
 		hb, e3 := strconv.ParseInt(f[2], 10, 64)
-		if e1 != nil || e2 != nil || e3 != nil || now-hb > gateQueueStale.Milliseconds() || !alive(pid) {
+		// A heartbeat from the future or pid 1 (planted lines) never goes stale on its own: dropped.
+		if e1 != nil || e2 != nil || e3 != nil || pid <= 1 || now-hb > gateQueueStale.Milliseconds() ||
+			hb-now > gateQueueStale.Milliseconds() || !alive(pid) {
 			continue
 		}
 		entries = append(entries, gateEntry{seq, pid, hb})
+	}
+	if len(entries) > gateQueueMaxEntries {
+		entries = entries[:gateQueueMaxEntries]
 	}
 	slices.SortFunc(entries, func(a, b gateEntry) int { return int(min(max(a.seq-b.seq, -1), 1)) })
 	entries = fn(entries)
@@ -383,26 +401,45 @@ type GateWaitDone struct {
 }
 
 // Credit is how long the job waited for the gate lock since start (its current attempt) until now: the
-// finished waits that started since then, plus the longest current one (waits that overlap count once
-// as far as they are current). It is what the job's deadline moves by (capped by the caller).
+// union of its wait intervals since start, finished ones and current ones (up to now), each cut at
+// start, so waits that overlap (two gates of the job waiting at once) count once. It is what the job's
+// deadline moves by (capped by the caller).
 func (s GateWaitState) Credit(start, now time.Time) time.Duration {
-	var d time.Duration
-	for _, w := range s.Done {
-		if !w.Since.Before(start) && w.Sec > 0 {
-			d += time.Duration(w.Sec) * time.Second
-		}
-	}
-	var cur time.Duration
-	for _, w := range s.Waits {
-		from := w.Since
+	type span struct{ from, to time.Time }
+	var spans []span
+	add := func(from, to time.Time) {
 		if from.Before(start) {
 			from = start
 		}
-		if c := now.Sub(from); c > cur {
-			cur = c
+		if to.After(now) {
+			to = now
+		}
+		if to.After(from) {
+			spans = append(spans, span{from, to})
 		}
 	}
-	return d + cur
+	for _, w := range s.Done {
+		if w.Sec > 0 {
+			add(w.Since, w.Since.Add(time.Duration(w.Sec)*time.Second))
+		}
+	}
+	for _, w := range s.Waits {
+		add(w.Since, now)
+	}
+	slices.SortFunc(spans, func(a, b span) int { return a.from.Compare(b.from) })
+	var d time.Duration
+	var end time.Time
+	for _, sp := range spans {
+		switch {
+		case !sp.from.Before(end):
+			d += sp.to.Sub(sp.from)
+			end = sp.to
+		case sp.to.After(end):
+			d += sp.to.Sub(end)
+			end = sp.to
+		}
+	}
+	return d
 }
 
 // GateWaitEntry is one gate of the job waiting for the lock.
