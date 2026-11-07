@@ -787,7 +787,7 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 		// again from its own finding when this attempt ends.
 		m.clearNoCommits(id)
 		if err := m.underIdleLock(func() error {
-			return m.Store.Requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context))
+			return m.requeue(id, lim, "", strings.TrimRight(j.Brief, "\n")+"\n\n"+updateBlock(context))
 		}); err != nil {
 			return nil, err
 		}
@@ -798,6 +798,11 @@ func (m *Manager) Resume(id, context string, l Limits) (*store.Job, error) {
 	}
 	m.Log.Printf("job %s: resume queued (attempt %d)", id, j.Attempt+1)
 	return m.Store.Get(id)
+}
+
+// requeue puts a resumed job back in the queue.
+func (m *Manager) requeue(id string, l store.ResumeLimits, context, newBrief string) error {
+	return m.Store.Requeue(id, l, context, newBrief)
 }
 
 // refuseOpenRouterResume refuses every requeue of an openrouter job (Resume, also of a job stopped
@@ -858,7 +863,7 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
 	// again from its own finding when this attempt ends.
 	m.clearNoCommits(id)
-	return m.underIdleLock(func() error { return m.Store.Requeue(id, lim, update, "") })
+	return m.underIdleLock(func() error { return m.requeue(id, lim, update, "") })
 }
 
 // neverRan reports whether an attempt ended without claude ever running: its launch was refused or
