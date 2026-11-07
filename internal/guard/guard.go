@@ -1536,7 +1536,7 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
 		// Double nesting (`find -exec parallel ssh ::: host \;`): the tool follows a runner that is
 		// itself an argument, or any stdin runner (its remote argument comes from the runner's input).
 		case scopeTool(b) && k > 0 && execRunners[progName(args[k-1])]:
-		case scopeTool(b) && !strings.HasPrefix(a, "-") && behindStdinRunner(name, args, k):
+		case scopeTool(b) && !strings.HasPrefix(a, "-") && behindStdinRunner(name, args, k, false):
 		case scopeTool(b) && copiers[name] && filepath.IsAbs(v):
 		case strings.ContainsAny(a, " \t\n'\"(){};`") && reScopeMention.MatchString(a):
 		default:
@@ -1586,10 +1586,12 @@ func remoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) str
 	}
 	for _, l := range ch.legacy {
 		if l.at == 0 {
-			return legacyRemoteCopyArg(name, args, dyn, bare, stdin)
+			return legacyRemoteCopyArg(name, args, dyn, bare, stdin, false)
 		}
+		// Reached through a modeled runner: the program keeps that runner's exec context, so every
+		// positional rsync word behind it may be the command (`setsid setpriv -- rsync …`).
 		if t := legacyRemoteCopyArg(progName(argv[l.at]), argv[l.at+1:l.end], d[l.at+1:l.end],
-			b[l.at+1:l.end], l.stdin); t != "" {
+			b[l.at+1:l.end], l.stdin, true); t != "" {
 			return t
 		}
 	}
@@ -1633,7 +1635,11 @@ func chainData(name string, args []string, dyn, bare []bool) map[int]bool {
 // legacyRemoteCopyArg is the position heuristic for a program the runner walk does not model
 // (ionice, chroot, fd -x, go test -exec, …): any rsync word at a command position. stdin marks an
 // argv extended from an outer xargs: an rsync there is refused without an argv to inspect.
-func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) string {
+// nested marks a program reached through a modeled runner (`setsid setpriv -- rsync …`): it runs in
+// that runner's exec context, so it is read as an exec runner whatever its name, as main read the
+// whole argv behind setsid or flock (fail closed: a positional rsync word may be the command).
+func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin, nested bool) string {
+	runner := nested || execRunners[name]
 	data := runnerDataValues(name, args)
 	for k, a := range args {
 		if data[k] || dyn[k] {
@@ -1645,8 +1651,8 @@ func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin boo
 		opt, _, _ := strings.Cut(a, "=")
 		switch {
 		case optValue(a) != a && execOpts[opt], k > 0 && (execOpts[args[k-1]] || execRunners[progName(args[k-1])]):
-		case execRunners[name] && !strings.HasPrefix(a, "-"):
-		case behindStdinRunner(name, args, k):
+		case runner && !strings.HasPrefix(a, "-"):
+		case behindStdinRunner(name, args, k, nested):
 		default:
 			continue
 		}
@@ -1654,7 +1660,7 @@ func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin boo
 		if name == "find" {
 			end = findExecEnd(args, k)
 		}
-		if stdin || stdinRunners[name] || behindStdinRunner(name, args, k) ||
+		if stdin || stdinRunners[name] || behindStdinRunner(name, args, k, nested) ||
 			rsyncRemote(args[k+1:end], dyn[k+1:end], bareFrom(bare, k+1, end)) {
 			return a
 		}
@@ -1675,9 +1681,11 @@ func bareFrom(bare []bool, from, to int) []bool {
 // read. The chain is the positionals of an exec runner name (`setsid parallel -j2 rsync …`) or, for
 // find, the words of the -exec/-execdir/-ok action that holds args[k] (`find . -exec parallel rsync …`).
 // A find predicate value (`-name parallel`) or any argument of another program is data, not a runner.
-func behindStdinRunner(name string, args []string, k int) bool {
+// nested reads name as an exec runner (legacyRemoteCopyArg): the chain is all of args.
+func behindStdinRunner(name string, args []string, k int, nested bool) bool {
 	start := 0
 	switch {
+	case nested:
 	case name == "find":
 		if start = findExecStart(args, k); start < 0 {
 			return false
