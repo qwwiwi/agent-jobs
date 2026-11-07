@@ -1,13 +1,12 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -47,17 +46,24 @@ type RestackResult struct {
 	Commits int      `json:"commits"`           // the child's commits carried over
 	Carried []string `json:"carried,omitempty"` // their original IDs, oldest first
 	Skipped []string `json:"skipped,omitempty"` // original IDs that became empty on onto (already there)
+	// Warnings are problems that did not stop the restack (the temporary directory could not be removed).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // restackTimeout bounds one Restack; a variable so that tests can shorten it.
 var restackTimeout = 10 * time.Minute
 
-// restackPatchIDScan is how many commits of base..onto are compared by patch-id.
-const restackPatchIDScan = 2000
+// restackPickConfig, when set, returns extra "key=value" git config for the cherry-pick of one commit
+// (passed as -c). A test seam: it lets a test make a single pick fail after the index was updated.
+var restackPickConfig func(commit string) []string
+
+// restackCleanupTimeout bounds the removal of the temporary directory; a variable for tests.
+var restackCleanupTimeout = time.Minute
 
 // Restack creates newName (default <child>-restacked) from onto (default main) in repo and
-// cherry-picks the commits of parent..child on it. See the package comment above.
-func Restack(repo, child, parent, onto, newName string) (RestackResult, error) {
+// cherry-picks the commits of parent..child on it. See the package comment above. A failure to remove
+// the temporary directory is appended to the error, or listed in RestackResult.Warnings on success.
+func Restack(repo, child, parent, onto, newName string) (res RestackResult, err error) {
 	if repo == "" || child == "" || parent == "" {
 		return RestackResult{}, errors.New("restack needs a repository, a child and a parent")
 	}
@@ -125,31 +131,37 @@ func Restack(repo, child, parent, onto, newName string) (RestackResult, error) {
 		return RestackResult{}, err
 	}
 
-	// Cherry-pick in a throw-away worktree on a detached HEAD: no ref exists until the very end.
+	// Cherry-pick in a throw-away repository of its own (see newReplay) on a detached HEAD: no ref
+	// exists in the real repository until the very end.
 	tmp, err := os.MkdirTemp("", "agent-jobs-restack-")
 	if err != nil {
 		return RestackResult{}, err
 	}
-	work := filepath.Join(tmp, "work")
 	defer func() {
-		// Not bound by ctx: the cleanup must also run after a timeout.
-		cleanup := &restackGit{ctx: context.Background(), env: r.env}
-		_, _ = cleanup.in(repo, "worktree", "remove", "--force", work)
-		_ = os.RemoveAll(tmp)
-		_, _ = cleanup.in(repo, "worktree", "prune")
+		// Bounded on its own clock, not by ctx: it must also run after a timeout, but not forever.
+		if rmErr := removeAllWithin(tmp, restackCleanupTimeout); rmErr != nil {
+			if err != nil {
+				err = fmt.Errorf("%w (cleanup: %v)", err, rmErr)
+			} else {
+				res.Warnings = append(res.Warnings, rmErr.Error())
+			}
+		}
 	}()
-	if _, err := r.in(repo, "worktree", "add", "--quiet", "--detach", work, ontoSHA); err != nil {
-		return RestackResult{}, fmt.Errorf("create temporary worktree: %w", err)
-	}
-	// Cherry-picking commits needs a committer; do not fail on a machine without one configured.
-	if _, err := r.in(work, "var", "GIT_COMMITTER_IDENT"); err != nil {
-		r.env = append(r.env, "GIT_COMMITTER_NAME=agent-jobs", "GIT_COMMITTER_EMAIL=agent-jobs@localhost")
+	replay, work, err := r.newReplay(repo, tmp, ontoSHA)
+	if err != nil {
+		return RestackResult{}, err
 	}
 
-	res := RestackResult{Branch: newName, Onto: ontoSHA}
+	res = RestackResult{Branch: newName, Onto: ontoSHA}
 	for _, c := range commits {
-		if _, err := r.in(work, "cherry-pick", "--allow-empty", "--no-edit", c); err != nil {
-			if err := r.settleCherryPick(work, c, err); err != nil {
+		pick := []string{}
+		if restackPickConfig != nil {
+			for _, kv := range restackPickConfig(c) {
+				pick = append(pick, "-c", kv)
+			}
+		}
+		if _, err := replay.in(work, append(pick, "cherry-pick", "--allow-empty", "--no-edit", c)...); err != nil {
+			if err := replay.settleCherryPick(work, c, err); err != nil {
 				return RestackResult{}, err
 			}
 			res.Skipped = append(res.Skipped, c)
@@ -161,19 +173,84 @@ func Restack(repo, child, parent, onto, newName string) (RestackResult, error) {
 	if res.Commits == 0 {
 		return RestackResult{}, fmt.Errorf("every commit of %s is already in %s: nothing to restack", child, onto)
 	}
-	head, err := r.in(work, "rev-parse", "--verify", "HEAD^{commit}")
+	head, err := replay.in(work, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return RestackResult{}, err
 	}
 	// Create-only and atomic: a branch that appeared meanwhile is errBranchExists, never overwritten.
-	if _, err := publishBranchRef(run, newName, head); err != nil {
-		if errors.Is(err, errBranchExists) {
-			err = fmt.Errorf("%w: %s (restack never moves an existing branch; pass --name)", errBranchExists, newName)
+	// created == false means the name already holds exactly this head (a concurrent identical restack):
+	// that is still a taken name, not a result of this call.
+	created, pubErr := publishBranchRef(run, newName, head)
+	if pubErr == nil && !created {
+		pubErr = errBranchExists
+	}
+	if pubErr != nil {
+		if errors.Is(pubErr, errBranchExists) {
+			pubErr = fmt.Errorf("%w: %s (restack never moves an existing branch; pass --name)", errBranchExists, newName)
 		}
-		return RestackResult{}, err
+		return RestackResult{}, pubErr
 	}
 	res.Head = head
 	return res, nil
+}
+
+// removeAllWithin removes dir (os.RemoveAll) and gives up reporting an error after limit. The removal
+// goroutine may outlive a timeout; it only deletes a private temporary directory.
+func removeAllWithin(dir string, limit time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- os.RemoveAll(dir) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("remove temporary directory %s: %w", dir, err)
+		}
+		return nil
+	case <-time.After(limit):
+		return fmt.Errorf("remove temporary directory %s: not finished after %s", dir, limit)
+	}
+}
+
+// newReplay prepares the throw-away repository the cherry-picks run in and returns a git runner for it
+// and its work tree, checked out detached at ontoSHA.
+//
+// It is NOT a worktree of repo: a worktree reads the repository's config and .git/info/attributes, so a
+// configured merge.<driver>.driver, filter.<name>.clean/smudge or diff textconv would execute during the
+// pick, and those cannot be switched off by an override (the names are not enumerable). Instead it is a
+// fresh repository with an empty config (no system or global config, an empty HOME, no template, so
+// no hooks), whose object database is repo's own (GIT_OBJECT_DIRECTORY): the commits are readable and
+// the picked commits are written where publishing needs them. A .gitattributes in the tree that names
+// a driver or filter finds none defined and falls back to the built-in text merge and no conversion.
+// Only the committer identity is carried over from repo (read, never executed).
+func (r *restackGit) newReplay(repo, tmp, ontoSHA string) (*restackGit, string, error) {
+	common, err := r.in(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return nil, "", err
+	}
+	format, err := r.in(repo, "rev-parse", "--show-object-format")
+	if err != nil {
+		return nil, "", err
+	}
+	home, work := filepath.Join(tmp, "home"), filepath.Join(tmp, "work")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		return nil, "", err
+	}
+	env := append(slices.Clone(r.env), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"HOME="+home, "XDG_CONFIG_HOME="+home, "GIT_ATTR_NOSYSTEM=1")
+	name, _ := r.in(repo, "config", "--get", "user.name")
+	email, _ := r.in(repo, "config", "--get", "user.email")
+	if name == "" || email == "" {
+		name, email = "agent-jobs", "agent-jobs@localhost"
+	}
+	replay := &restackGit{ctx: r.ctx, env: env}
+	if _, err := replay.in(tmp, "init", "-q", "--template=", "--object-format="+format, work); err != nil {
+		return nil, "", fmt.Errorf("create temporary repository: %w", err)
+	}
+	replay.env = append(replay.env, "GIT_OBJECT_DIRECTORY="+filepath.Join(common, "objects"),
+		"GIT_COMMITTER_NAME="+name, "GIT_COMMITTER_EMAIL="+email)
+	if _, err := replay.in(work, "checkout", "-q", "--detach", ontoSHA); err != nil {
+		return nil, "", fmt.Errorf("check out %s in the temporary repository: %w", shortSHA(ontoSHA), err)
+	}
+	return replay, work, nil
 }
 
 // restackGit runs git in one context with one environment.
@@ -194,28 +271,53 @@ func (r *restackGit) in(dir string, args ...string) (string, error) {
 // settleCherryPick handles a failed cherry-pick of commit c in work. A pick that stopped because the
 // commit became empty on onto (its change is already there) is skipped and returns nil; a conflict is
 // aborted and returned as *RestackConflictError; anything else is returned as it is.
+//
+// "Empty" is proven, not assumed: CHERRY_PICK_HEAD is also left behind when the commit step fails after
+// the changes were staged (a signing failure, a full disk), and skipping that would silently drop the
+// commit. So the pick is skipped only when no path is unmerged and the index equals HEAD.
 func (r *restackGit) settleCherryPick(work, c string, pickErr error) error {
-	files, _ := r.in(work, "diff", "--name-only", "--diff-filter=U")
-	if files != "" {
+	unmerged, _ := r.in(work, "ls-files", "-u", "-z")
+	if files := unmergedPaths(unmerged); len(files) > 0 {
 		_, _ = r.in(work, "cherry-pick", "--abort")
 		subject, _ := r.in(work, "log", "-1", "--format=%s", c)
-		return &RestackConflictError{Commit: shortSHA(c) + " " + Printable(subject, 80), Files: strings.Split(files, "\n")}
+		return &RestackConflictError{Commit: shortSHA(c) + " " + Printable(subject, 80), Files: files}
 	}
-	if _, err := r.in(work, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"); err == nil {
-		// Stopped without conflicts: the result is empty. Drop it and go on.
-		if _, err := r.in(work, "cherry-pick", "--skip"); err != nil {
-			return fmt.Errorf("skip an empty cherry-pick of %s: %w", shortSHA(c), err)
+	failed := fmt.Errorf("cherry-pick of %s: %w", shortSHA(c), pickErr)
+	if _, err := r.in(work, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"); err != nil {
+		return failed
+	}
+	// Any error here (staged changes, or git itself failing) is "not provably empty".
+	if _, err := r.in(work, "diff", "--cached", "--quiet", "--no-ext-diff"); err != nil {
+		return failed
+	}
+	if _, err := r.in(work, "cherry-pick", "--skip"); err != nil {
+		return fmt.Errorf("skip an empty cherry-pick of %s: %w", shortSHA(c), err)
+	}
+	return nil
+}
+
+// unmergedPaths is the sorted, de-duplicated paths of `git ls-files -u -z` output
+// ("<mode> <object> <stage>\t<path>" records separated by NUL).
+func unmergedPaths(out string) []string {
+	var paths []string
+	for _, rec := range strings.Split(out, "\x00") {
+		if _, path, ok := strings.Cut(rec, "\t"); ok && path != "" {
+			paths = append(paths, path)
 		}
-		return nil
 	}
-	return fmt.Errorf("cherry-pick of %s: %w", shortSHA(c), pickErr)
+	slices.Sort(paths)
+	return slices.Compact(paths)
 }
 
 // parentInOnto proves that the change of parent (its merge base with onto .. parent) is already in
-// onto, or returns an error wrapping ErrRestackNotMerged. Two independent proofs, either suffices:
-//  1. a merge of onto and parent yields exactly onto's tree (P adds nothing onto lacks);
-//  2. one commit of base..onto has the same stable patch-id as the cumulative diff base..parent (the
-//     squash itself), which also holds after main changed the squashed lines.
+// onto, or returns an error wrapping ErrRestackNotMerged. The proof is exact and against the CURRENT
+// onto: either parent is an ancestor of onto, or merging parent into onto (merge-tree, isolated from
+// repository config) is clean and yields exactly onto's tree, so parent adds nothing onto lacks.
+//
+// No hash of a patch is accepted as evidence: a stable patch-id ignores whitespace (also inside
+// string literals), so a parent value "a b" and an onto value "ab" would match. The price is a false
+// refusal when onto changed the squashed lines after the squash (the merge conflicts); a false
+// acceptance would silently drop the parent's change.
 func (r *restackGit) parentInOnto(repo, parent, parentSHA, onto, ontoSHA string) error {
 	notMerged := func(why string) error {
 		return fmt.Errorf("%w: %s is not contained in %s (%s); merge %s into %s first, or pass the right --onto",
@@ -239,51 +341,5 @@ func (r *restackGit) parentInOnto(repo, parent, parentSHA, onto, ontoSHA string)
 	if code == 0 && strings.TrimSpace(strings.SplitN(out, "\n", 2)[0]) == ontoTree {
 		return nil
 	}
-	want, err := r.patchIDs(repo, "diff", "--no-ext-diff", "--no-textconv", base, parentSHA)
-	if err != nil {
-		return err
-	}
-	if len(want) == 0 {
-		return nil // an empty change is contained anywhere.
-	}
-	have, err := r.patchIDs(repo, "log", "-p", "--no-merges", "--no-ext-diff", "--no-textconv",
-		fmt.Sprintf("--max-count=%d", restackPatchIDScan), base+".."+ontoSHA)
-	if err != nil {
-		return err
-	}
-	for id := range have {
-		if want[id] {
-			return nil
-		}
-	}
-	return notMerged("no clean merge and no commit with the same patch-id")
-}
-
-// patchIDs is the set of stable patch-ids that `git patch-id --stable` prints for the output of
-// the git command args run in repo.
-func (r *restackGit) patchIDs(repo string, args ...string) (map[string]bool, error) {
-	patch, code, stderr, err := gitEnvCtx(r.ctx, r.env, repo, append([]string{noReplace}, args...)...)
-	if err == nil && code != 0 {
-		err = fmt.Errorf("git %s exited %d: %s", args[0], code, RedactPrintable(stderr, 240))
-	}
-	if err != nil {
-		return nil, err
-	}
-	var out, errOut bytes.Buffer
-	p, err := startGit("", r.env, func(c *exec.Cmd) {
-		c.Stdin, c.Stdout, c.Stderr = strings.NewReader(patch), &out, &errOut
-	}, "-C", repo, "patch-id", "--stable")
-	if err != nil {
-		return nil, err
-	}
-	if err := p.wait(r.ctx); err != nil {
-		return nil, fmt.Errorf("git patch-id: %w: %s", err, RedactPrintable(errOut.String(), 240))
-	}
-	ids := map[string]bool{}
-	for _, line := range strings.Split(out.String(), "\n") {
-		if f := strings.Fields(line); len(f) > 0 {
-			ids[f[0]] = true
-		}
-	}
-	return ids, nil
+	return notMerged("merging it into the target changes the target or conflicts")
 }

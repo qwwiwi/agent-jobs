@@ -131,25 +131,26 @@ func TestRestackAfterSquash(t *testing.T) {
 	restackNoLeftovers(t, g, tmp)
 }
 
-// The squash is recognised by its patch-id when main changed the squashed lines afterwards and a
-// three-way merge of main and P therefore conflicts.
-func TestRestackRecognisesSquashByPatchID(t *testing.T) {
+// Main edited the squashed lines after the squash, so merging P into main conflicts and containment cannot
+// be proven against the current main. A patch-id match with the squash commit is NOT accepted instead
+// (it ignores whitespace); the refusal is a deliberate false negative and creates nothing.
+func TestRestackRefusesWhenSquashedLinesWereEditedAfterwards(t *testing.T) {
 	repo, g := restackRepo(t)
 	squashP(t, g)
 	if err := os.WriteFile(filepath.Join(repo, "p.txt"), []byte("p1\nEDITED\np3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	g("commit", "-q", "-am", "main edits p.txt")
-	// Precondition: the tree-equality proof cannot hold here, only the patch-id one.
+	// Precondition: the merge of main and P conflicts, so the tree-equality proof cannot hold.
 	if err := exec.Command("git", "-C", repo, "merge-tree", "--write-tree", "main", "P").Run(); err == nil {
-		t.Fatal("test setup: merge of main and P is clean, the patch-id path is not exercised")
+		t.Fatal("test setup: merge of main and P is clean")
 	}
-	res, err := Restack(repo, "C", "P", "main", "")
-	if err != nil {
-		t.Fatal(err)
+	before := g("for-each-ref")
+	if _, err := Restack(repo, "C", "P", "main", ""); !errors.Is(err, ErrRestackNotMerged) {
+		t.Fatalf("want ErrRestackNotMerged, got %v", err)
 	}
-	if got := restackSubjects(g, "main..C-restacked"); res.Commits != 2 || !slices.Equal(got, []string{"c1", "c2"}) {
-		t.Fatalf("%+v %v", res, got)
+	if g("for-each-ref") != before {
+		t.Fatal("a ref appeared")
 	}
 }
 

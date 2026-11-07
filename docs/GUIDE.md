@@ -331,15 +331,18 @@ Branch `C` is stacked on branch `P`. When `P` is squash-merged into `main` as on
 carries `P`'s original commits, so merging `C` conflicts on code that is identical in substance.
 `branch_restack` (MCP, orchestrator only) or `agent-jobs restack --child C --parent P [--onto main]
 [--name N] [--repo PATH] [--json]` builds a new branch from the tip of `onto` in a temporary
-worktree and cherry-picks only the child's own commits (`P..C`) on it. The default name is
+repository of its own (an empty config: no merge driver, filter or hook of the project runs) and
+cherry-picks only the child's own commits (`P..C`) on it. The default name is
 `<child>-restacked`; the result is the new branch, its head SHA and the commits carried (commits
 whose change is already in `onto` become empty and are listed as skipped).
 
 It checks first, and refuses with the reason instead of guessing: `P`'s change must already be in
-`onto` (a clean merge of `onto` and `P` gives `onto`'s tree, or one commit of `onto` has the same
-`git patch-id --stable` as the cumulative `P` diff); `P` must be an ancestor of `C`; `P..C` must be
-linear (no merge commit). A cherry-pick conflict aborts, names the files and the commit, and leaves
-no ref and no worktree behind. It is create-only like the result branches: it never moves or deletes
+`onto`, proven against the current `onto` (`P` is an ancestor of `onto`, or a clean merge of `onto`
+and `P` gives exactly `onto`'s tree; a patch-id match is not accepted because it ignores whitespace,
+so a squash whose lines `onto` edited afterwards is refused); `P` must be an ancestor of `C`; `P..C`
+must be linear (no merge commit). A cherry-pick conflict aborts, names the files and the commit, and
+leaves no ref and no temporary files behind; a pick that fails after staging (not an empty result) is
+refused, never skipped. It is create-only like the result branches: it never moves or deletes
 an existing ref (a taken name is refused), never touches `C`, `P` or your checkout, and never
 pushes; push the new branch and open the PR yourself. A daemon-side automatic restack is not part of
 this.

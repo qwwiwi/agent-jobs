@@ -26,11 +26,11 @@ func addBranchRestack(s *sdk.Server, _ Deps) {
 		Description: "Restack a branch after its parent was squash-merged. Branch child was built on branch parent; parent landed " +
 			"on onto (default main) as one squash commit, so child still carries parent's original commits and merging it " +
 			"conflicts on code that is identical in substance. This creates a NEW branch (name, default <child>-restacked) from " +
-			"onto's tip in a temporary worktree and cherry-picks only the child's own commits (parent..child) on it. " +
+			"onto's tip in a temporary repository with an empty config (no merge driver, filter or hook runs) and cherry-picks only the child's own commits (parent..child) on it. " +
 			"Returns the new branch, its head SHA, the commits carried (and any that were already in onto and skipped). " +
 			"Create-only: it never moves or deletes an existing ref, never touches child, parent or the checkout, never pushes. " +
-			"It refuses, with the reason and no ref left behind, when parent's change is not provably in onto (patch-id or " +
-			"clean merge), when parent is not an ancestor of child, when the child has a merge commit, when the name exists, " +
+			"It refuses, with the reason and no ref left behind, when parent's change is not provably in onto (a clean " +
+			"merge of parent into onto must give exactly onto's tree; no patch-id match is accepted), when parent is not an ancestor of child, when the child has a merge commit, when the name exists, " +
 			"or on a cherry-pick conflict (the error names the files).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in BranchRestackInput) (*sdk.CallToolResult, jobs.RestackResult, error) {
 		if in.Repo == "" {
