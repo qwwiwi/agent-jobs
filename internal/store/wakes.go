@@ -80,6 +80,19 @@ CREATE TABLE IF NOT EXISTS wake_member_refs (
 	ref      TEXT NOT NULL,
 	PRIMARY KEY (kind, category, ref)
 );
+-- Seed identities from deliveries recorded before member deduplication existed. Retrying a
+-- smaller batch after upgrade must not count any of its already delivered members again.
+WITH RECURSIVE members(ref, rest) AS (
+	SELECT '', substr(ref, length('job-done:') + 1) || ','
+	FROM orchestrator_wakes
+	WHERE kind = 'delivery' AND category = 'job-done'
+		AND substr(ref, 1, length('job-done:')) = 'job-done:'
+	UNION ALL
+	SELECT substr(rest, 1, instr(rest, ',') - 1), substr(rest, instr(rest, ',') + 1)
+	FROM members WHERE rest <> ''
+)
+INSERT OR IGNORE INTO wake_member_refs (kind, category, ref)
+	SELECT 'delivery', 'job-done', ref FROM members WHERE ref <> '';
 CREATE TABLE IF NOT EXISTS slo_samples (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT,
 	name    TEXT NOT NULL,
