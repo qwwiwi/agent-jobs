@@ -46,7 +46,11 @@ const (
 	gateKillGrace       = 5 * time.Second
 	gateLockPoll        = 100 * time.Millisecond
 	gateHolderBytes     = 512
+	gateNotesBytes      = 64 << 10
+	gateNotesWait       = 100 * time.Millisecond
 )
+
+const gateNotesTruncated = "\ngate: runner notes truncated\n"
 
 // gateEnvDropPrefixes are the variable name prefixes a gate's command never inherits.
 var gateEnvDropPrefixes = []string{"TELEGRAM_"}
@@ -61,7 +65,7 @@ type GateRun struct {
 	LockWait time.Duration // how long to wait for the lock; 0 = DefaultGateLockWait
 	Env      []string      // the base environment; nil = os.Environ()
 	Stdout   io.Writer     // the command's stdout and the exit= line; nil = os.Stdout
-	Stderr   io.Writer     // the command's stderr and the runner's notes; nil = os.Stderr
+	Stderr   io.Writer     // command stderr; bounded runner notes follow after unlock; nil = os.Stderr
 }
 
 // gateLockDirs are the candidate directories of the box-wide gate lock, the first that exists wins:
@@ -112,6 +116,13 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	}
 	out := &gateStdout{w: g.Stdout}
 	defer func() { out.marker(code) }()
+	// Like the stdout exit marker, runner notes must not write to the caller while holding the lock.
+	// Keep the command's stderr file direct: wrapping it would make cmd.Wait depend on a copy goroutine
+	// that can block on an unread pipe. Only the runner's own notes use the bounded buffer.
+	stderr := g.Stderr
+	notes := &gateNotes{}
+	g.Stderr = notes
+	defer notes.flush(stderr)
 	// A file (the CLI's stdout) goes to the command as is: os/exec then copies nothing, so a reader that
 	// stops reading blocks only the command, which the timeout ends, never cmd.Wait and with it the lock.
 	// What the command wrote last is unknown then, so the marker always gets a separator newline.
@@ -173,12 +184,53 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if direct {
 		out.unknownEnd()
 	}
-	code = runGateCmd(ctx, g)
+	code = runGateCmd(ctx, g, stderr)
 	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, time.Since(start).Round(time.Millisecond))
 	if moved := assertGateHead(g, want, "after the run"); moved != 0 && code == 0 {
 		code = moved
 	}
 	return code
+}
+
+// gateNotes bounds the diagnostics retained while a gate holds or waits for the box lock.
+type gateNotes struct {
+	buf       []byte
+	truncated bool
+}
+
+func (n *gateNotes) Write(p []byte) (int, error) {
+	size := len(p)
+	remaining := gateNotesBytes - len(gateNotesTruncated) - len(n.buf)
+	if len(p) > remaining {
+		p = p[:remaining]
+		n.truncated = true
+	}
+	n.buf = append(n.buf, p...)
+	return size, nil
+}
+
+// flush runs after unlock and waits only a bounded time for best-effort delivery. A caller-provided
+// writer can block forever; at most one delivery goroutine and gateNotesBytes bytes remain per run
+// until that writer returns. No note writer can delay the timeout kill, cmd.Wait, or unlocking.
+func (n *gateNotes) flush(w io.Writer) {
+	p := n.buf
+	if n.truncated {
+		p = append(p, gateNotesTruncated...)
+	}
+	if len(p) == 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = w.Write(p)
+	}()
+	timer := time.NewTimer(gateNotesWait)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 // gateCommit resolves rev in dir to a full commit id.
@@ -367,11 +419,11 @@ func writeGateHolder(g GateRun, head string) {
 
 // runGateCmd runs g.Argv in g.Dir as the leader of a process group of its own, stdin /dev/null, with
 // GateEnv(g.Env), and returns its exit code (see RunGate).
-func runGateCmd(ctx context.Context, g GateRun) int {
+func runGateCmd(ctx context.Context, g GateRun, stderr io.Writer) int {
 	cmd := exec.Command(g.Argv[0], g.Argv[1:]...)
 	cmd.Dir = g.Dir
 	cmd.Env = GateEnv(g.Env)
-	cmd.Stdout, cmd.Stderr = g.Stdout, g.Stderr
+	cmd.Stdout, cmd.Stderr = g.Stdout, stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// A process that left the group (setsid) and still holds a pipe must not hold Wait forever.
 	cmd.WaitDelay = gateKillGrace
