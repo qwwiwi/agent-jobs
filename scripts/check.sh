@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local checks (no CI): English commit messages, formatting, vet, tests. Wired to .githooks/pre-push.
+# Local checks (no CI): commit/PR titles, changelog fragments, formatting, vet, tests.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,6 +13,14 @@ GO_TEST_TIMEOUT="${GO_TEST_TIMEOUT:-45m}"
 
 echo "== commit messages"
 scripts/check-commit-messages.sh
+
+if [ "${PR_TITLE+x}" = x ]; then
+  echo "== PR title"
+  bash scripts/check-pr-title.sh "$PR_TITLE"
+fi
+
+echo "== changelog fragments"
+go run ./cmd/changelog --validate
 
 echo "== gofmt"
 unformatted="$(gofmt -l .)"

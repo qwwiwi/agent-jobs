@@ -32,6 +32,17 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 
    > Джоба коммитит локально, пушит и выкатывает оркестратор после того, как прочитал отчёт и дифф.
 
+   For agent-jobs itself, PR titles and squash subjects must be English. Translate
+   non-English issue titles. Run `bash scripts/check-pr-title.sh "$title"` before
+   creating or editing a PR, and use that same value for `--title`. Before merging,
+   read the current PR title (`gh pr view --json title --jq .title`) and validate
+   it again, including any explicit squash subject. The reusable check rejects
+   Cyrillic, empty/multiline titles, literal `$(` and backticks; never evaluate
+   title text. `PR_TITLE="$title" scripts/check.sh` includes this local check.
+   Feature jobs add `changelog.d/<issue>.<section>.md`, never edit Unreleased
+   directly. The release orchestrator assembles fragments using
+   [Releasing](../docs/RELEASING.md) and the existing release checklist.
+
 ## UI work: checked in a real browser (owner requirement 2026-11-03)
 
 Not in the reference. A static blog once went live after checks of only its first screen at two widths; tables further down broke words letter by letter on 360-393 px phones.
