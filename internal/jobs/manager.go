@@ -216,6 +216,11 @@ type StartRequest struct {
 	// OnOverlap is warn (default), serialize or refuse. Parent explicitly stacks on another job.
 	OnOverlap string
 	Parent    string
+	// Review is the id of a finished review job of this agent a fix job is started from (#197 item 6):
+	// its report becomes a source and its blocking findings the fix prompt. ControlReview (nil = true when
+	// Review is set) chains a control review when the fix succeeds (item 7).
+	Review        string
+	ControlReview *bool
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -508,6 +513,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
+	reviewFindings, controlReview, err := m.resolveReview(&r)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkFileSourceOrigins(r.Sources); err != nil {
 		if r.plannedSources {
 			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
@@ -652,6 +661,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
 		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent,
+		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview,
 	}
 	return j, nil
 }

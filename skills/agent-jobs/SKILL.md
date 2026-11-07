@@ -132,6 +132,8 @@ UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-
 
 After a review, and when a job failed:
 
+- Start the fix from the review, not from a hand-made brief: `job_start(kind: "fix", repo, review: "<review job id>")`. The daemon attaches the full report, puts every Blocking finding (ID and whole text, no Non-blocking items) into the fix prompt and makes the fix report answer each ID. Ask the reviewer for IDs (H1, H2, ...) in its brief; a review without them, or with nothing blocking, is refused.
+- With `review` set, a successful fix queues its control review itself (same model, runner and effort as the original review, base = the fix's result branch); the job-done line names it. `control_review: false` turns it off. A failed or cancelled fix queues nothing.
 - A fix job gets the review's Blocking findings as written and nothing more: copy them unchanged, without the Non-blocking items, your own rewording or extra ideas. Non-blocking items go to a separate ticket.
 - The review of that fix is a fix review: say «fix review» in its brief and give it only the fix diff and the Blocking findings as the conditions to close. It marks each one `closed` or `open`.
 - Rerun a failed job only after something in the approach changed (the brief, the inputs, the model, the limits or how the work is split), and say in the new brief what changed. The same brief on the same model again is not a rerun.

@@ -148,6 +148,11 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 	} else if j.BranchNote != "" {
 		line += " · " + j.BranchNote
 	}
+	if j.ControlJob != "" {
+		line += " · control review " + Printable(j.ControlJob, 64) + " queued"
+	} else if j.ControlNote != "" {
+		line += " · " + Printable(j.ControlNote, 320)
+	}
 	if suspicious != "" {
 		line += " · " + suspicious
 	}
@@ -321,6 +326,11 @@ func (m *Manager) notifyPending() error {
 	// It is independent of notification: a stopped job is never notified but keeps its commits.
 	if err := m.recoverResultBranches(); err != nil {
 		return err
+	}
+	// A fix started from a review queues its control review now that its result branch is recorded,
+	// and before its line is delivered, which names the review (#197 item 7).
+	if err := m.chainControlReviews(); err != nil {
+		m.Log.Printf("control reviews: %v", err)
 	}
 	jobs, err := m.Store.PendingNotify()
 	if err != nil || len(jobs) == 0 {

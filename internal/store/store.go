@@ -208,6 +208,21 @@ type Job struct {
 	// Parent is an explicit stack edge; ParentBase freezes the parent's successful result at launch.
 	Parent     string
 	ParentBase string
+	// Review is the id of the finished review job a fix job was started from (#197 item 6):
+	// ReviewBlocking are the blocking findings parsed from its report at start, each with its body.
+	Review         string
+	ReviewBlocking []BlockingFinding
+	// ControlReview asks for a control review to be queued when this fix job succeeds (#197 item 7).
+	// ControlJob is the job queued, ControlNote why none was (a cap refused it, no result branch).
+	ControlReview bool
+	ControlJob    string
+	ControlNote   string
+}
+
+// BlockingFinding is one blocking finding of a review report: its ID (H1, F2, …) and its whole text.
+type BlockingFinding struct {
+	ID   string `json:"id"`
+	Body string `json:"body"`
 }
 
 // JobOverlap records the other job and both declarations of each intersecting scope.
@@ -683,6 +698,11 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN wait_for TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE jobs ADD COLUMN parent TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN parent_base TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN review TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN review_blocking TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE jobs ADD COLUMN control_review INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN control_job TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN control_note TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -816,7 +836,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
-	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base`
+	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
+	review, review_blocking, control_review, control_job, control_note`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -901,7 +922,20 @@ func insertArgs(j *Job) []any {
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
 		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
 		j.RequestedBranch, j.Branch, j.BranchNote,
-		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase}
+		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
+		j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote}
+}
+
+// blockingJSON is the review_blocking column: "[]" for none.
+func blockingJSON(f []BlockingFinding) string {
+	if len(f) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(f)
+	if err != nil {
+		return "[]" // a struct of strings always marshals
+	}
+	return string(b)
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -922,7 +956,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor, reviewBlocking string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -936,7 +970,8 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
 		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
-		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase)
+		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase,
+		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote)
 	if err != nil {
 		return nil, err
 	}
@@ -951,6 +986,9 @@ func scanJob(r scanner) (*Job, error) {
 	}
 	if err := json.Unmarshal([]byte(waitFor), &j.WaitFor); err != nil {
 		return nil, fmt.Errorf("job %s: wait_for: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(reviewBlocking), &j.ReviewBlocking); err != nil {
+		return nil, fmt.Errorf("job %s: review_blocking: %w", j.ID, err)
 	}
 	if coverContract != "" {
 		j.CoverContract = &CoverContract{}

@@ -1,0 +1,2 @@
+- Review findings: the «Blocking findings to close» section above lists every blocking finding of the review with its ID and its full text. Close every one of them; do not stop after the first.
+- Answer every ID: add a `### Blocking findings` block to Findings / Changes with one line per ID, `<ID> · closed|not closed · evidence`. Each line says closed / not closed and gives the evidence (file:line, the test that failed before and passes after, or why it stays open). An ID with no line counts as not closed; never drop one.

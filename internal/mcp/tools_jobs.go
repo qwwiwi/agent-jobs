@@ -97,6 +97,13 @@ type JobView struct {
 	WaitFor      []string           `json:"wait_for,omitempty"`
 	Parent       string             `json:"parent,omitempty"`
 	ParentBase   string             `json:"parent_base,omitempty"`
+	// Review is the review job a fix job was started from; ReviewBlocking its blocking finding IDs;
+	// ControlReview whether a control review is chained, ControlJob the one queued, ControlNote why none.
+	Review         string   `json:"review,omitempty"`
+	ReviewBlocking []string `json:"review_blocking,omitempty"`
+	ControlReview  bool     `json:"control_review,omitempty"`
+	ControlJob     string   `json:"control_job,omitempty"`
+	ControlNote    string   `json:"control_note,omitempty"`
 	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
 	BaseBranch      string `json:"base_branch,omitempty"`
 	RequestedBranch string `json:"requested_branch,omitempty"`
@@ -183,6 +190,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		RequestedBranch: j.RequestedBranch, Branch: j.Branch, BranchNote: j.BranchNote,
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
 		Paths: j.Paths, OnOverlap: j.OnOverlap, Overlap: j.Overlap, WaitFor: j.WaitFor, Parent: j.Parent, ParentBase: j.ParentBase,
+		Review: j.Review, ReviewBlocking: findingIDs(j.ReviewBlocking), ControlReview: j.ControlReview, ControlJob: j.ControlJob, ControlNote: j.ControlNote,
 		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
 }
@@ -251,6 +259,8 @@ type JobStartInput struct {
 	Paths           []string `json:"paths,omitempty" jsonschema:"fix/general with repo: expected repository-relative paths or globs (at most 64, 256 bytes each). Go path.Match syntax plus ** as a whole component; a trailing slash includes descendants. Compared with other queued/running fix/general jobs without expanding against the filesystem. Missing paths on either side keep only the same_repo_jobs advisory"`
 	OnOverlap       string   `json:"on_overlap,omitempty" jsonschema:"warn (default): queue and return overlapping jobs and declarations in overlap; serialize: wait queued for those jobs to finish; refuse: reject on overlap. An explicit parent stack handles overlap with that parent. Other overlaps still follow this policy"`
 	Parent          string   `json:"parent,omitempty" jsonschema:"explicit stack: id of a fix/general job of this agent on the same repository. Waits queued for that parent's success and starts from its result commit (including after cleanup); refused if it failed, cancelled, or timed out. Mutually exclusive with base. Recorded in job_status/job_result"`
+	Review          string   `json:"review,omitempty" jsonschema:"fix job only, with repo: id of a finished (succeeded) review job of this agent. The daemon attaches its full report.md as a source (job:<id>), parses its ### Blocking section and puts every blocking finding ID with its whole text into the prompt under Blocking findings to close; the fix report must answer each ID (closed / not closed + evidence). Refused when the review is unknown, not this agent's, not kind review, not succeeded, has no ### Blocking section, has an empty one (SHIP: nothing to fix), or a Blocking item without a finding ID (F1, H2, C1: first on the item or right after its file:line)"`
+	ControlReview   *bool    `json:"control_review,omitempty" jsonschema:"only with review; default true. When the fix job succeeds the daemon queues a control review: kind review, the same model, runner and reasoning effort as the original review, the fix job's published result branch as base, sources = the original review report + the fix report. The queued job id is in the fix job-done line (control review <id> queued, or why not: a cap refused it, no result branch). Failed or cancelled fixes queue nothing. false turns it off"`
 	Skills          []string `json:"skills,omitempty" jsonschema:"edits to the job's default skills from the skill catalog (core skills of the kind plus the repository's project skills): name or +name adds, -name removes; unknown or deprecated names, or more than the per-job count or size budget, refuse the start; a draft only by name. A whole brief line skills: none disables catalog skills and conflicts with nonempty edits; an empty edits array keeps defaults. On a milestone task, omit skills to get the task's planned skills (given skills, [] too, replace the plan). See skill_list"`
 }
 
@@ -273,7 +283,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
 			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
-			Paths: in.Paths, OnOverlap: in.OnOverlap, Parent: in.Parent,
+			Paths: in.Paths, OnOverlap: in.OnOverlap, Parent: in.Parent, Review: in.Review, ControlReview: in.ControlReview,
 		})
 		if err != nil {
 			return nil, JobView{}, fmt.Errorf("job_start rejected: %w", err)
@@ -321,6 +331,8 @@ func addJobStatus(s *sdk.Server, d Deps) {
 type JobResultOutput struct {
 	Parent          string   `json:"parent,omitempty"`
 	ParentBase      string   `json:"parent_base,omitempty"`
+	ControlJob      string   `json:"control_job,omitempty"`
+	ControlNote     string   `json:"control_note,omitempty"`
 	WaitFor         []string `json:"wait_for,omitempty"`
 	ID              string   `json:"id"`
 	Status          string   `json:"status"`
@@ -476,7 +488,8 @@ func addJobResult(s *sdk.Server, d Deps) {
 		}
 		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: jobs.RedactText(j.Error),
 			RequestedBranch: j.RequestedBranch, Branch: j.Branch, BranchNote: j.BranchNote,
-			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}, Parent: j.Parent, ParentBase: j.ParentBase, WaitFor: j.WaitFor}
+			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}, Parent: j.Parent, ParentBase: j.ParentBase, WaitFor: j.WaitFor,
+			ControlJob: j.ControlJob, ControlNote: j.ControlNote}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err
 		}
@@ -667,4 +680,13 @@ func addJobCancel(s *sdk.Server, d Deps) {
 		}
 		return nil, JobCancelOutput{ID: cur.ID, Status: cur.Status}, nil
 	})
+}
+
+// findingIDs lists the IDs of blocking findings.
+func findingIDs(f []store.BlockingFinding) []string {
+	var ids []string
+	for _, x := range f {
+		ids = append(ids, x.ID)
+	}
+	return ids
 }
