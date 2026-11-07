@@ -56,6 +56,11 @@ func fakeCheckTree(t *testing.T, withChecklist bool) (root string, env []string)
 		writeFile(t, filepath.Join(root, f), string(b), 0o755)
 	}
 	writeFile(t, filepath.Join(root, "scripts/check-commit-messages.sh"), "#!/bin/sh\nexit 0\n", 0o755)
+	b, err := os.ReadFile("scripts/check-pr-title.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(root, "scripts/check-pr-title.sh"), string(b), 0o755)
 	writeFile(t, filepath.Join(root, "scripts/manifest-check.sh"), `#!/bin/sh
 echo "manifest-check $1" >> "$FAKE_LOG"
 cp "$1" "$FAKE_LOG.manifest-input"

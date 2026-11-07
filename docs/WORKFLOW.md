@@ -53,6 +53,16 @@ A typical change goes through these steps. Each step says who does it.
 
 A job commits locally and never pushes, by design: in a job's Bash calls the deny rules and the guard block `git push` and `git tag`, `gh release`, `gh api` and every `gh` write (PR or issue create, comment, edit, merge, review, close/reopen; only read-only `gh` subcommands pass). This covers the direct spellings, not scripts a job writes and runs (see «Known limits»). Step 8 is always the orchestrator's. To take a job's work, use its worktree while it exists, or after cleanup the ref `refs/agent-jobs/jobs/<id>` and the saved patches (see the README, «Cleanup and patches»).
 
+For this repository, step 8 also validates the English PR title with
+`bash scripts/check-pr-title.sh "$title"` before creation or editing, and passes
+that same value to `gh pr create --title` / `gh pr edit --title`. Translate issue
+titles when needed. Before squash merging, read the current title with
+`gh pr view --json title --jq .title` and validate it again, along with any explicit
+squash subject. `PR_TITLE="$title" scripts/check.sh` runs the check as part of the
+local gate. Literal `$(` and backticks are forbidden; never evaluate title text.
+Normal jobs add [changelog fragments](../changelog.d/README.md), while the release
+orchestrator follows [Releasing](RELEASING.md) to assemble them.
+
 ## Review policy
 
 - Review is never skipped.

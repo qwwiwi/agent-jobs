@@ -71,9 +71,11 @@ func TestTimedOutJobEstimatedCost(t *testing.T) {
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "usage in the stream", 10*time.Second, func() bool {
-		b, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
-		return strings.Contains(string(b), `"m2"`)
+	// The diagnostic stream is written before the trusted snapshot used to price a timeout.
+	// Wait for this launch's full token usage to be persisted before triggering the timeout.
+	launched := get(t, m, j.ID)
+	waitFor(t, "persisted token usage", 10*time.Second, func() bool {
+		return m.endedResult(launched).Tokens == (TokenUsage{Input: 1000, Output: 100000, CacheRead: 1e6})
 	})
 	real := time.Now
 	m.Now = func() time.Time { return real().Add(2 * time.Minute) }
@@ -118,9 +120,10 @@ func TestAutoContinuedJobMergeCheckAndEstimate(t *testing.T) {
 		r.RepoPath, r.Kind, r.TimeoutMinutes = repo, "fix", 10
 	})
 	tick(t, m)
-	waitFor(t, "usage in the stream", 10*time.Second, func() bool {
-		b, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
-		return strings.Contains(string(b), `"m2"`)
+	// The continuation must also wait for the timed-out attempt's trusted usage snapshot.
+	launched := get(t, m, j.ID)
+	waitFor(t, "persisted token usage", 10*time.Second, func() bool {
+		return m.endedResult(launched).Tokens == (TokenUsage{Input: 1000, Output: 100000, CacheRead: 1e6})
 	})
 	later := time.Now().Add(11 * time.Minute)
 	m.Now = func() time.Time { return later }

@@ -217,7 +217,11 @@ Everything below the fold lives in [docs/GUIDE.md](docs/GUIDE.md), unabridged:
 - [docs/BENCHMARK.md](docs/BENCHMARK.md): subagent vs background subagent vs job benchmark and real-usage numbers
 - [CHANGELOG.md](CHANGELOG.md)
 
-Contributing: run `scripts/check.sh` (gofmt, go vet, go test) before a push; commit messages are English-only.
+Contributing: add a [changelog fragment](changelog.d/README.md) instead of editing
+Unreleased, and run `scripts/check.sh` before a push (fragment validation, gofmt,
+go vet, go test). Commit messages and PR titles are English-only; set `PR_TITLE`
+to include the title check. See [Releasing](docs/RELEASING.md) for assembly and
+PR/squash-title validation.
 
 ## Credits
 
