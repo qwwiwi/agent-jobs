@@ -48,6 +48,9 @@ func TestOpenMigratesStage1Database(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(j.Paths) != 0 || len(j.Overlap) != 0 || len(j.WaitFor) != 0 || j.Parent != "" || j.ParentBase != "" {
+			t.Fatalf("dependency migration defaults: %+v", j)
+		}
 		if j.Title != "old job" || j.LaunchToken != "" || j.Complexity != "" || j.Runner != RunnerClaude ||
 			j.OwnerWaits || j.ResumedFrom != "" || j.ScheduleID != "" || j.Billing != BillingSubscription {
 			t.Fatalf("migrated row: %+v", j)
@@ -258,6 +261,9 @@ func TestRequeueArchivesAttemptAndAmend(t *testing.T) {
 	if err := st.MarkNotified("j", now); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.db.Exec(`UPDATE jobs SET requested_branch='feature', branch='feature', branch_note='fast-forwarded' WHERE id='j'`); err != nil {
+		t.Fatal(err)
+	}
 	if err := st.Requeue("j", ResumeLimits{MaxTurns: 50, MaxBudgetUSD: 7.5, TimeoutMinutes: 30}, "update", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +274,9 @@ func TestRequeueArchivesAttemptAndAmend(t *testing.T) {
 	if j.Status != StatusQueued || j.Brief != "b more" || j.Attempt != 1 || j.MaxTurns != 50 || j.Turns != 0 ||
 		j.NotifiedAt != nil || j.FinishedAt != nil || j.StartedAt != nil || j.Error != "" || j.PendingContext != "update" || j.SessionID != "sid-1" {
 		t.Fatalf("requeued: %+v", j)
+	}
+	if j.RequestedBranch != "feature" || j.Branch != "" || j.BranchNote != "" {
+		t.Fatalf("requeued branch outcome was not reset: %+v", j)
 	}
 	atts, err := st.Attempts("j")
 	if err != nil || len(atts) != 1 {

@@ -10,6 +10,26 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 
 > Главное правило: главная сессия только разговаривает, решает и проверяет. Всё, что дольше нескольких шагов, уходит в джобу.
 
+## Before parallel coder jobs start
+
+Declare `paths` on `job_start` for `fix` / `general` jobs sharing a repository.
+Use repository-relative filenames or globs (`*`, `?`, character classes, whole
+`**` components); a trailing slash covers a directory's descendants. Compare the
+returned `overlap` job IDs, `paths` and `other_paths`. Prefer
+`on_overlap: "serialize"` for conflicting edits, or an explicit `parent` job ID
+when the next job must build on that job's result. Use `on_overlap: "refuse"`
+when a conflict should stop admission. Default `warn` starts with a warning.
+Without declarations on either side, `same_repo_jobs` is only advisory.
+
+Serialization uses queue dependencies and keeps the original base. A `parent`
+stack waits for success and uses the parent's result commit, including its saved
+result ref after cleanup; failed parents refuse the stack or cancel a queued
+child. Do not combine `parent` and `base`. The parent handles its own overlap;
+other conflicts still follow `on_overlap`. Read `job_status.waiting` for a wait,
+and `parent` / `parent_base` in `job_status` or `job_result` for the recorded stack.
+The job-done line retains the serialized wait. CLI: repeat `--paths`, with
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`.
+
 ## When a job is done
 
 > Когда джоба закончилась, главная сессия получает одну строку: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. Сам отчёт в сессию не вливается, агент забирает его тулом `job_result`, когда готов его прочитать.
@@ -26,18 +46,30 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 
    > Отчёт джобы — заявление, а не результат.
 
-   Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`).
+   Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the result `branch` recorded by `job_result`).
+   Repository jobs with commits normally publish `job/<id>` on attempt 1 and `job/<id>-<attempt>` on a resumed attempt; `job_start` can request another target with `branch` (except `job`, `job/...`, `main`, `master` and `release*`). Result branches are create-only: the daemon never moves an existing ref. If the requested name already exists it is left untouched, the result goes to the generated attempt name, and the job-done line and `branch_note` say `requested branch <name> exists; not moved`; fast-forward it yourself with `git merge --ff-only` only when you want it there. Read the branch actually published from `job_result` or the job-done line, and use it for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch.
 
 3. Only then publish.
 
    > Джоба коммитит локально, пушит и выкатывает оркестратор после того, как прочитал отчёт и дифф.
+
+   For agent-jobs itself, PR titles and squash subjects must be English. Translate
+   non-English issue titles. Run `bash scripts/check-pr-title.sh "$title"` before
+   creating or editing a PR, and use that same value for `--title`. Before merging,
+   read the current PR title (`gh pr view --json title --jq .title`) and validate
+   it again, including any explicit squash subject. The reusable check rejects
+   Cyrillic, empty/multiline titles, literal `$(` and backticks; never evaluate
+   title text. `PR_TITLE="$title" scripts/check.sh` includes this local check.
+   Feature jobs add `changelog.d/<issue>.<section>.md`, never edit Unreleased
+   directly. The release orchestrator assembles fragments using
+   [Releasing](../docs/RELEASING.md) and the existing release checklist.
 
 ## UI work: checked in a real browser (owner requirement 2026-11-03)
 
 Not in the reference. A static blog once went live after checks of only its first screen at two widths; tables further down broke words letter by letter on 360-393 px phones.
 
 - A UI job is one whose diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-site renderers or design tokens. Its report must carry browser evidence: every changed page at 360x740, 390x844, 768x1024, 1366x768 and 1920x1080 (light and dark when the site has both), the full page length, pass/fail per device x page, screenshots in the job dir.
-- You never accept or deploy a UI job whose report lacks that evidence or says `BROWSER CHECK NOT RUN`. Run the check yourself (`node scripts/ui-check.mjs <base-url> <path>...` from an agent-jobs checkout, or the copy every job gets at `<job dir>/tools/ui-check.mjs`), or start a job that can run a browser (a claude job, not the Codex sandbox), before merge or deploy.
+- You never accept or deploy a UI job whose report lacks that evidence or says `BROWSER CHECK NOT RUN`. Run the check yourself with `agent-jobs ui-check <base-url> <path>... [--playwright <abs path>]` (the ui-check.mjs embedded in the binary, run from a private temp dir; it never loads Playwright from the current directory), never a script from a job dir or worktree, or start a job that can run a browser (a claude job, not the Codex sandbox), before merge or deploy.
 - Run it again on the live URL after a frontend deploy, for the changed pages; a failure there is a rollback or a fix, not a note.
 
 
@@ -45,7 +77,7 @@ Not in the reference. A static blog once went live after checks of only its firs
 
 > Через 30 минут после уведомления демон удаляет worktree, самую тяжёлую часть. Перед этим сохраняет diffstat, коммиты джобы через `git format-patch` и незакоммиченные правки через `git diff --binary`, а в исходном репозитории ставит ref `refs/reference/jobs/<id>` на последний коммит. Так работу можно взять и после удаления папки.
 
-The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: apply the saved patches or check out the ref.
+The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: check out the recorded result branch or apply the saved patches. Cleanup also retains the legacy `refs/agent-jobs/jobs/<id>` ref.
 
 ## Beyond the reference (owner decisions 2026-10-17, `docs/DECISIONS.md`)
 

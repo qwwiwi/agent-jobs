@@ -25,6 +25,8 @@ claude -p --output-format stream-json --verbose --model M \
 
 `--max-budget-usd` is omitted for `runner: openrouter` jobs (#148): their OpenRouter proxy enforces `max_budget_usd`.
 
+Config `job_plugins` adds one `--plugin-dir <dir>` per configured Claude Code plugin to claude jobs of the matching kinds (skill packs such as `superpowers`, which `--setting-sources project` would otherwise keep out). Their hooks and servers are cut from the job's view of the plugin unless `allow_hooks` is set; `deny_skills` become `Skill(<plugin>:<skill>)` deny rules, and `bootstrap_skill` puts one plugin skill's text into the prompt as «Skills bootstrap», standing in for the plugin's SessionStart hook. Codex jobs get none. See GUIDE «Plugins for jobs».
+
 The process is started detached, in its own process group, and writes its exit code to a file itself. So a daemon restart neither kills nor loses the job: the new daemon finds the exit-code file on the next tick.
 
 The kind of work sets a short checklist in the brief:
@@ -45,7 +47,9 @@ Default limits and ceilings. A request above a ceiling is rejected, not silently
 | timeout_minutes | 45 | 180 |
 | concurrent per agent | 2 | |
 
-When a job has finished, the main session gets one line: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. The report itself is not poured into the session; the agent fetches it with the `job_result` tool when it is ready to read it.
+When a job has finished, the main session gets one line: `[jobs:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. With `notify_coalesce_seconds` set, jobs that finish close together arrive as one line, `[jobs:job-done] 3 jobs: <id> …; <id> …; <id> …`, so the session wakes once instead of once per job; a job the owner waits on is never held. The report itself is not poured into the session; the agent fetches it with the `job_result` tool when it is ready to read it.
+
+Every such line, and every hook injection, is counted by category with its bytes (`agent-jobs stats wakes`, MCP `wake_stats`). A duration recorded with `agent-jobs slo record <name> <seconds>` that is over its `slo.targets` norm adds ` · slo breach: <name> <seconds>s > <norm>s` to the end of the next line of the categories whose text is not fixed (not the heartbeat wake line), once, at most 400 bytes of note per line.
 
 ## Where everything is kept
 
@@ -106,6 +110,8 @@ What we learned from mistakes:
 - The schedule row itself never expires. We edit it in place (`schedule edit`), re-read it from the database after the edit, and delete it only by the owner's decision.
 
 Separate from cron there is a «heartbeat»: the daemon itself decides whether there is a reason to wake the agent for its own goals. First a cheap check in Go (has enough time passed, is the daily limit not used up, is it not night), then a small model decides whether the big one is worth waking.
+
+With `idle_pick.enabled` there is a cheaper way to keep the agent busy than an hourly wake: when the last job of the queue has ended, the job-done line it arrives on ends with what is ready (`· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`): milestone tasks whose dependencies are accepted and that have no job yet, and the agent's open intentions. Nothing ready, nothing added; it is never a separate wake, and the daemon never starts the work itself. A note that was missed (idle pick was off, the cooldown or the daily cap held it back) is not made up later: the note rides only a genuine pending job-done line, and a delivered line is never sent again.
 
 ## MCP tools
 

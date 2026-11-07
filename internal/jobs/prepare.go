@@ -183,7 +183,8 @@ func (m *Manager) ProtectedPaths() []string {
 func (m *Manager) jobOwnProtected(id string) []string {
 	dir := m.JobDir(id)
 	return []string{filepath.Join(dir, gitConfigFile), filepath.Join(dir, noHooksDir),
-		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json"), filepath.Join(dir, PriorDir)}
+		filepath.Join(dir, "settings.json"), filepath.Join(dir, "mcp.json"), filepath.Join(dir, PriorDir),
+		filepath.Join(dir, jobPluginsFile)}
 }
 
 // SubagentLogPath is <state>/subagents/<id>.log: one line per subagent the guard allowed. It lies
@@ -253,6 +254,7 @@ func (m *Manager) Settings(kind string, gitDirs ...string) map[string]any {
 func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
 	protected = append(protected, m.ChecklistLockDir())
+	protected = append(protected, m.pluginProtected(j)...)
 	if len(j.SourceFiles) > 0 {
 		protected = append(protected, filepath.Join(m.JobDir(j.ID), SourcesDir))
 	}
@@ -261,7 +263,7 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 		readOnly = filepath.Join(m.JobDir(j.ID), "work")
 	}
 	guardCmd := m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), m.gateReadAllow(j), gitDirs...)
-	deny := skillDenyRules(protected)
+	deny := append(skillDenyRules(protected), m.pluginDenyRules(j)...)
 	if len(j.Sources) == 0 {
 		return m.settings(j.Kind, guardCmd, deny...)
 	}
@@ -500,8 +502,8 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 			"%s The diff is measured from that base.", j.BaseCommit, commit)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n\n%s%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, cfg.codexSandboxSection(j), codexReadDirsSection(j, cfg.CodexReadDirs),
-		skillsLine(j), sub, ownerRules)
+	fmt.Fprintf(&b, "%s\n\n%s%s%s%s%s\n\n## Owner rules\n\n%s\n\n", pre, cfg.codexSandboxSection(j), codexReadDirsSection(j, cfg.CodexReadDirs),
+		skillsLine(j), m.pluginsPromptSection(j), sub, ownerRules)
 	if IsGateKind(j.Kind) {
 		// A gate job's input is the daemon's (Wave F): never the brief column, cards or memory notes.
 		if j.Gate == nil {
@@ -615,6 +617,10 @@ func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Confi
 	// prompt says where each clone is, or why it is not.
 	sources, err := m.clonedSources(j)
 	if err != nil {
+		return err
+	}
+	// The plugins are resolved before the prompt: its bootstrap section comes from them.
+	if err := m.preparePlugins(j, dir); err != nil {
 		return err
 	}
 	// One read of the dependencies feeds both the prompt's prior results and the prior/ folder.

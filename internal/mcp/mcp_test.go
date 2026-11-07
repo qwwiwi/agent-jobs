@@ -325,7 +325,7 @@ func TestJobToolsLifecycle(t *testing.T) {
 		}
 	}
 	var res JobResultOutput
-	call(t, cs, "job_result", map[string]any{"id": done.ID}, &res)
+	call(t, cs, "job_result", map[string]any{"id": done.ID, "detail": "full"}, &res)
 	if res.CostUnknown {
 		t.Fatalf("job_result: cost of a claude job is known: %+v", res)
 	}

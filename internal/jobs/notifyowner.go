@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -115,7 +116,7 @@ func (m *Manager) NotifyOwner(jobID, text, urgency string) (*store.Notification,
 	if target := m.Config().NotifyTmuxTarget; target == "" {
 		derr = errors.New("notify off: notify_tmux_target is not configured")
 	} else {
-		derr = m.sendTmuxLocked(target, NotifyLine(n))
+		derr = m.sendCounted(target, WakeNotifyOwner, fmt.Sprintf("%s:%d", WakeNotifyOwner, n.ID), []string{strconv.FormatInt(n.ID, 10)}, NotifyLine(n))
 	}
 	if derr != nil {
 		n.Error = derr.Error()

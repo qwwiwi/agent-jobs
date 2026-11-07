@@ -98,6 +98,49 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 Менять статус могут только строки `queued` и `running`; `succeeded` и `cancelled` окончательны. Джобу в статусе `stopped`, `timeout` или `failed` можно продолжить (ниже); `stopped` можно и отменить.
 
+### Overlap-aware starts
+
+For parallel `fix` / `general` jobs on one repository, give `job_start` a `paths`
+array of expected repository-relative paths or globs. Matching uses Go `path.Match`
+syntax (`*`, `?`, character classes), plus a whole `**` component for zero or more
+path components. Use `src/` or `src/**` for a directory and its descendants;
+`src/file.go` names one file. Paths are compared without filesystem expansion,
+so declarations cover new files too. At most 64 declarations, 256 bytes each;
+absolute paths, `.` / `..` components, control characters and backslashes are refused.
+
+- `on_overlap: "warn"` (default) queues the job and returns `overlap`, containing
+  each other queued/running coder job's `id`, matching `paths` of the new job and
+  `other_paths` of that job.
+- `on_overlap: "serialize"` keeps it queued until those overlapping jobs finish,
+  using persisted `wait_for` dependencies. A failed or cancelled blocker releases
+  the wait; a stopped blocker still waits because it may resume. Unrelated queued
+  jobs can start in free slots. The job-done line mentions the serialized wait.
+- `on_overlap: "refuse"` rejects the start with the conflicting job and declarations.
+
+Missing paths on either side keep the existing `same_repo_jobs` advisory only.
+Admission is atomic with insertion and the existing daily caps, so simultaneous
+starts see each other. Scope checks are declarations, not enforcement of actual edits.
+
+For an explicit stack, set `parent: "<job id>"`. It must be a coder job of this
+agent on the same repository. The child waits for its parent's success and uses
+that result commit as `base_commit`, read from the verified parent worktree or
+its saved `refs/agent-jobs/jobs/<id>` ref after cleanup. A failed, timed-out or
+cancelled parent refuses a new stack; an already queued child is cancelled.
+A missing result also refuses the stack. Do not combine `parent` with `base`.
+The parent edge handles overlap with that parent; other overlaps still follow
+`on_overlap`. `job_status` and `job_result` show `parent` and the resolved
+`parent_base`; `job_status.waiting` explains pending dependencies. A serialized
+job without `parent` keeps its original base; it does not inherit another job's changes.
+
+CLI equivalents: repeat `--paths` once per declaration, quote globs, and use
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`:
+
+```sh
+agent-jobs start --agent A --kind fix --title "Update parser" --brief-file brief.md \
+  --repo /path/to/repo --model sonnet --paths 'internal/parser/**' \
+  --paths 'docs/parser.md' --on-overlap serialize
+```
+
 ### Сменить курс: дополнить, остановить, продолжить
 
 Каждая джоба работает в сессии claude, id которой назначается до запуска (`claude -p --session-id <uuid>`), и сессия сохраняется на диске, поэтому джобу можно поправить, не теряя того, что она уже знает и сделала:
@@ -165,23 +208,51 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 ## Контракт отчёта
 
-Финальное сообщение джобы — её отчёт, он сохраняется как `report.md`. Ровно четыре раздела в таком порядке, затем раздел Progress:
+Финальное сообщение джобы — её отчёт, он сохраняется как `report.md`. Ровно четыре раздела в таком порядке, затем раздел Forks и раздел Progress:
 
 ```
 ## Summary
 ## Findings / Changes
 ## Evidence
 ## Not done / uncertain
+## Forks
 ## Progress
 ```
 
-«Not done / uncertain» обязателен и читается первым: он заставляет джобу назвать то, чего она не сделала. Progress перечисляет шаги джобы, по строке с временем на шаг (`- HH:MM UTC …`); `job_result` отдаёт оба раздела как `not_done` и `progress`, а `agent-jobs result` печатает их раньше остального. Отчёт без Progress — не ошибка. Джоба, закончившаяся без отчёта, помечается `failed`.
+«Not done / uncertain» обязателен и читается первым: он заставляет джобу назвать то, чего она не сделала. Forks (#168) перечисляет проектные решения, которые джоба приняла там, где задача оставляла выбор: не больше 5 строк `выбор / отвергнутая альтернатива / причина`, либо `none`; молчаливый выбор «наугад» в диффе не виден, а ревью-джоба сверяет каждый Fork с кодом. Progress перечисляет шаги джобы, по строке с временем на шаг (`- HH:MM UTC …`); `job_result` отдаёт разделы как `not_done`, `forks` и `progress`, а `agent-jobs result` печатает Not done и Progress раньше остального. Отчёт без Forks или без Progress — не ошибка. Джоба, закончившаяся без отчёта, помечается `failed`.
 
 **Отчёты вне контракта.** Джоба claude, чей итоговый отчёт без раздела `## Summary`, больше не `succeeded` (#126): она падает с `report has no Summary section: likely stopped mid-task` (скорее всего, модель закончила ход посреди задачи: её последнее сообщение говорит, что она сделала бы дальше, или что ждёт сабагентов, которые умирают вместе с её сессией) при любом `report_contract` и один раз продолжается автоматически, как после лимита ходов; `job_resume` её принимает. Gate-джобы (slicing, judge, briefing), у которых результат — сохранённый блок, остаются под правилом warn / fail ниже. Успешная джоба с отчётом без `## Not done / uncertain` сохраняет статус, но её ошибка говорит `report has no Not done / uncertain section`. Пометка есть в строке job-done и в `job_status` и `job_result` (`error`), а `job_stats` / `agent-jobs stats` считают такие джобы как `report_off_contract` (столбец `OFF-CONTRACT`) по группам. С `report_contract: fail` в config.json такая джоба вместо этого падает с этой пометкой (по умолчанию `warn`). Джоба, запущенная с `covers` (волна F), должна ещё иметь блок `### Requirements` в Findings / Changes хотя бы со строкой для одного покрытого ID; без блока пометка — `report has no ### Requirements block in Findings / Changes (the job has covers)`, с блоком без такой строки (пустым, текстом, таблицей) — `report's ### Requirements block has no line for any covered ID …`, и обе считаются так же. Если run-wrapper не может прочитать строку джобы, он не знает её covers и закрывается отказом: `job row unreadable: the report's ### Requirements block was not checked (fail closed)`. Джобы без `covers` оцениваются как раньше.
 
 **Скрытие секретов.** Когда джоба закончилась, похожие на секреты значения в её `report.md` заменяются на месте на `[redacted:<kind>]`: токены Anthropic, OpenAI, GitHub, Slack, AWS, Google и ботов Telegram, JWT, блоки приватных ключей PEM, `Bearer <token>`, а также `key=value` / `"key": "value"`, где ключ содержит `token`, `secret`, `password`, `passwd` или `api_key`, а значение — 16+ символов. Оригинал не сохраняется, если только `keep_raw_reports: true` не оставляет его как `report.raw.md` (0600). Значения заменяются целиком, какой бы длины они ни были. Читаются и проверяются только первые 4 МиБ отчёта, остальное заменяется пометкой «unscanned». Если перезапись не удалась (или демон упал до неё), джоба остаётся `redaction_pending`, и каждый тик пробует снова; `job_result`, `agent-jobs result` и HTTP API всё равно скрывают секреты в отчёте при чтении. Строка job-done, лог демона, строка статистики и выдержки прошлой попытки в брифе продолжения скрываются так же. SHA коммитов, UUID и короткий base64 не трогаются. Это страховка, а не гарантия: `stream.jsonl` и `stderr.log` хранятся как есть (и так же уходят в архив), поэтому папка джобы и архив должны оставаться закрытыми.
 
 **Размер брифа.** `job_start` отклоняет бриф больше `max_brief_bytes` (по умолчанию 32 КБ) и возвращает `size_warning`, если бриф называет больше `brief_warn_files` файлов (по умолчанию 40) или в нём больше `brief_warn_headings` заголовков `## ` (по умолчанию 8): возможно, это не одна джоба.
+
+## Ветки результатов джоб
+
+Когда джоба репозитория заканчивается с коммитами поверх `base_commit`, демон
+обычно публикует в этом репозитории `job/<job-id>` для первой попытки или
+`job/<job-id>-<attempt>` для продолженной попытки. Это относится к Claude и Codex
+(после коммита обёртки из `progress/COMMIT_MSG`). Джобы без коммитов, review,
+research и gate-джобы не создают ветку результата.
+
+Параметр `branch` в `job_start` или `start --branch feature/result` в CLI задаёт
+желаемую ветку; `base` по-прежнему выбирает начальный коммит. Ветки результата
+только создаются: демон никогда не перемещает существующий ref. Ветка создаётся
+атомарно, только если её ещё нет (`git update-ref <ref> <head> ""`), поэтому из
+двух джоб с одним новым именем его получит ровно одна. Если запрошенное имя уже
+занято или его нельзя создать, результат публикуется под сгенерированным именем
+попытки с объяснением; при необходимости обновите существующую ветку сами командой
+`git merge --ff-only <published-branch>`. На попытку записывается один ref.
+Push не выполняется.
+
+Недопустимые имена Git (начинающиеся с `-`, `refs/`, содержащие `@{`, `..`),
+`main`, `master`, `release*`, `job` и `job/...` отклоняются при запросе. Так как
+существующая ветка никогда не перемещается, определять ветку по умолчанию не нужно.
+`job_result`, `job_list`, `job_status`, CLI status/list и HTTP показывают `branch`,
+`requested_branch` и `branch_note` (CLI list показывает ветку результата). Строка
+job-done сообщает фактически опубликованную ветку и объясняет, если запрошенное имя
+занято. Используйте эту ветку для проверки, последующих джоб и PR; оркестратор не
+должен перемещать refs вручную через `git branch -f` или `git update-ref`.
 
 ## Чистка и патчи
 
@@ -250,6 +321,25 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
   Копируются только помеченные разделы; больше 8 КБ — отказ, ничего не записывается. Написанный вручную файл правил продолжает работать и заменяется только с `--force`.
 - **Карточки проектов.** Короткие заметки по репозиторию, которые вклеиваются в бриф каждой джобы в нём: стек, как запускать проверки, чего не трогать, известные ловушки. Лежат в `~/.agent-jobs/<agent>/cards/<name>.md` (≤ 4 КБ каждая) и подбираются по `repo:` (путь верхнего уровня репозитория) или `remote:` (URL remote или `host/owner/name`; формы `https://`, `git@host:` и `ssh://` считаются одинаковыми, регистр хоста не важен, регистр пути важен; локальный или относительный remote совпадает только с локальным путём). Карточка, которую нельзя прочитать или разобрать, не пропускается молча, а не даёт стартовать джобам с репозиторием. Пример: [cards/example-agent-jobs.md](../cards/example-agent-jobs.md).
 
+- **Плагины для джоб.** `--setting-sources project` не пускает в джобу и пользовательские плагины Claude Code оркестратора. Конфиг `job_plugins` подключает выбранные плагины (пакеты скиллов вроде `superpowers`) к claude-джобам через `--plugin-dir`; их скиллы грузятся лениво (только описания), поэтому в `skills_max_kb` не входят; джоба получает свежую копию плагина при каждом запуске и возобновлении, так что обновление плагина доходит до следующей джобы.
+
+  ```json
+  { "job_plugins": [
+    { "name": "superpowers@claude-plugins-official", "kinds": ["fix", "general", "review"],
+      "deny_skills": ["brainstorming", "finishing-a-development-branch", "using-git-worktrees"],
+      "bootstrap_skill": "using-superpowers" },
+    { "path": "/home/me/plugins/my-pack" }
+  ] }
+  ```
+
+  Плагин задаётся `path` (абсолютная папка) или `name` (`<плагин>@<маркетплейс>`; при каждом запуске находится через `installed_plugins.json` в папке настроек Claude агента (`$CLAUDE_CONFIG_DIR` или `~/.claude/plugins/`) и даёт текущий `installPath`; побеждает установка со `scope` `user`). `kinds` ограничивает виды: `fix`, `general`, `research`, `review` (пусто = все четыре). Плагины получают только claude-джобы: codex-джоба и gate-виды (slicing, judge, briefing) их не получают. `deny_skills` добавляет `Skill(<плагин>:<скилл>)` в список запретов джобы — для скиллов, которые противоречат контракту джобы (интерактивный brainstorming, завершение ветки с push или merge, лишние worktree). Папка плагина защищена от записи (deny-правила и `--protect` у guard), как скилл каталога.
+
+  **Хуки выключены.** Хуки, MCP- и LSP-серверы плагина работали бы вне guard, поэтому джоба получает представление плагина (`<jobdir>/plugins/<n>/`, защищено от записи джобой): копию обычных файлов и папок плагина, которую демон делает при запуске и при каждом resume; на верхнем уровне в ней только `.claude-plugin/`, `skills/`, `commands/`, `agents/`, `output-styles/`, лицензия и папки из путей компонентов манифеста (так что `hooks/`, `.mcp.json`, `.lsp.json`, `monitors/`, `bin/`, `workflows/`, `settings.json` и прочие места кода по умолчанию не попадают, предупреждение перечисляет пропущенное), с `.claude-plugin/plugin.json`, где оставлены только известные ключи (name, version, description, author, homepage, repository, license, keywords и пути компонентов `commands`, `agents`, `skills`, `outputStyles`; путь, ведущий из плагина, убирается, путь внутрь `.claude-plugin/`, `hooks/`, `monitors/`, `bin/`, `workflows/`, `.mcp.json`, `.lsp.json` или `settings.json` — отказ от плагина); `--plugin-dir` указывает на представление. Копия не идёт по симлинкам внутри плагина (симлинк пропускается с предупреждением), так что ни ссылка на файл снаружи, ни изменение плагина после копии до джобы не доходят. Каждый `.md` копии (`SKILL.md` скилла, команда, агент, в том числе под `.claude-plugin/`) проверяется по allowlist: front matter может задавать только корневые ключи из `name`, `description`, `license`, `allowed-tools`, `version`, `metadata`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `model`, `tools`, `color`, `about`, `title`, `labels`, `assignees`, каждый один раз, простым или однострочным кавычечным значением, блочным скаляром или вложенным значением с отступом; всё прочее (`hooks`, `mcpServers`, любой другой ключ, корневые ключи с отступом или в кавычках, flow-коллекции, явные ключи, якоря, алиасы, теги, merge, табы, CR, BOM или пустая строка перед `---`, нет закрывающей `---`) убирает файл из копии с предупреждением; так же убирается файл, тело которого запускает shell при загрузке (`` !`cmd` `` или блок ```` ```! ````). `"allow_hooks": true` даёт копию без фильтра (симлинков в ней тоже нет).
+
+  **Bootstrap.** В интерактивной сессии SessionStart-хук плагина вкладывает bootstrap, из-за которого модель проверяет скиллы перед работой; при выключенных хуках джоба его бы не получила. `bootstrap_skill` называет скилл плагина (например `using-superpowers`), чей `SKILL.md` демон читает при запуске (не больше 32 КБ, без перехода по симлинкам, похожие на секреты значения скрываются) в промпт джобы разделом «Skills bootstrap», а за ним одна фиксированная строка с запрещёнными скиллами, чтобы модель их не пробовала. Отсутствующий, слишком большой, симлинк или нечитаемый файл — предупреждение: джоба стартует без раздела.
+
+  Плагин, который не найден (нет папки, имени нет в `installed_plugins.json`), — предупреждение, а не отказ джобы: `agent-jobs status` и `system_doctor` (`plugin_warnings`) перечисляют такие среди настроенных, а предупреждения самой джобы лежат в `job_status` / `job_result` (`plugin_warnings`) рядом с `plugins` (имя, версия, источник, разрешены ли хуки). `job_plugins` применяется только после перезапуска (`allow_hooks` — право на исполнение). Возобновлённая джоба находит плагины заново и подхватывает их обновление.
+
 - **Скиллы для джоб.** Джоба запускается с `--setting-sources project` и видит только `.claude/skills` своего репозитория. Чтобы джобы получали скиллы из вашего каталога, укажите его в `skill_roots`: подойдёт любая папка с `index.json` в корне (локальная папка, checkout общего репозитория скиллов); своего каталога agent-jobs не поставляет.
 
   ```json
@@ -257,6 +347,27 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
   ```
 
   `index.json` — это `{"version": 1, "skills": [{"name": "golang", "path": "skills/golang", "status": "core", "kinds": ["code"], "projects": [], "last_verified": "2026-10-18", "risk": []}]}` (допустимы и другие поля: `owner`, `origin`, `place`, `sha256`, `size_kb`, `has_scripts`, список `plugins`; agent-jobs читает только `name`, `path`, `status`, `kinds`, `projects`, `risk` и `last_verified`, информационные поля произвольной формы: `origin` может быть строкой или объектом, значение неожиданного типа игнорируется, неизвестное поле тоже; запись, у которой нужное поле неверного типа, пропускается с предупреждением с именем записи, остальной каталог загружается); каждый `path` — папка с именем скилла внутри корня, в ней `SKILL.md`; симлинк внутри скилла может указывать только на обычный файл в папке того же скилла (без ссылок на папки и ничего снаружи, учитывается в размере), иначе запись пропускается с предупреждением. Статусы: `core` (по умолчанию для своих видов), `active`, `draft` (только если назван явно), `deprecated` (никогда). Джоба получает `core`-скиллы своего вида (`fix` и `general` — это `code` и `general`, `review` — `review`, `research` — `research`) плюс скиллы, в `projects` которых есть имя папки репозитория; `job_start` `skills: ["+name", "-name"]` (CLI `--skills a,+b,-c`, также в расписаниях) добавляет или убирает; неизвестное или deprecated имя либо выход за бюджет отказывают в старте. На время запуска каждый скилл подключается в worktree ссылкой `.claude/skills/<name>` -> его папка в каталоге (скрыта от git через `info/exclude` репозитория, защищена от записи джобой, удаляется, когда попытка заканчивается, до любого diff); скилл, который уже есть в репозитории, остаётся репозиторным; codex-джобы скиллов не получают. Бриф называет скиллы одной строкой. `skill_list` / `agent-jobs skills list|search QUERY` — просмотр и поиск по каталогу; `agent-jobs stats --by skill` показывает использования рядом с доставками, `--by skill --by-repo` — рейтинг по репозиториям.
+
+### Пример: superpowers в джобах
+
+Плагин `superpowers` с лицензией MIT содержит 15 скиллов в v7.0.2. Он задаёт подход к написанию кода, тестированию, отладке и ревью в claude-джобах. Доступны 12 скиллов: `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `writing-plans`, `executing-plans`, `receiving-code-review`, `requesting-code-review`, `subagent-driven-development`, `dispatching-parallel-agents`, `writing-skills`, `diagnosing-superpowers` и `using-superpowers`.
+
+Запретите `brainstorming`: он задаёт вопросы человеку и ждёт ответа, а в джобе человека нет. Запретите `finishing-a-development-branch`: он предлагает merge, push или открытие PR, а джобы только коммитят локально. Запретите `using-git-worktrees`: джоба уже работает в собственном detached worktree.
+
+Добавьте в конфиг:
+
+```json
+"job_plugins": [
+  {
+    "name": "superpowers@superpowers-marketplace",
+    "kinds": ["fix", "general", "review"],
+    "deny_skills": ["brainstorming", "finishing-a-development-branch", "using-git-worktrees"],
+    "bootstrap_skill": "using-superpowers"
+  }
+]
+```
+
+`bootstrap_skill` передаёт bootstrap вместо SessionStart-хука, который удаляется из представления плагина по умолчанию. `job_plugins` применяется только после перезапуска демона. В `job_status` новой джобы проверьте, что `plugins` перечисляет имя и версию, а `plugin_warnings` нет. Для другого плагина используйте запись той же формы и сначала изучите его содержимое; оставьте `allow_hooks` выключенным, если не доверяете его хукам: они работают вне guard.
 
 ---
 
@@ -270,7 +381,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 |---|---|
 | `job_start` | поставить джобу: заголовок, вид, бриф, репозиторий, модель или сложность (одно обязательно), лимиты, `acceptance_cmd` (нужен ключ конфига `acceptance_allowed`), `owner_waits` (просьба владельца, см. «Владелец ждёт»), `skills` (правки скиллов по умолчанию: `+name`, `-name`), `covers` (ID требований чеклиста, над которыми работает джоба, см. «Чеклист брифа»: нужен `repo`, каждый ID должен быть строкой его `brief/CHECKLIST.md`, который должен быть последним одобренным чеклистом репозитория, а покрытые строки попадают в промпт джобы целиком), `size` (`small` \| `large`, см. «Размер джобы»); возвращает строку в очереди |
 | `job_status` | статус, ходы, стоимость, время |
-| `job_result` | строка job-done, отчёт (до 256 КБ, только обычные файлы), пути к артефактам и итог приёмки; для джобы с `covers` ещё `requirements` (её блок `### Requirements`, лишь заявленные (`claimed`) строки done, недостающие строки, трейлер `Requirements:` её коммитов) |
+| `job_result` | строка job-done, по умолчанию компактный отчёт (#167: `not_done` целиком, `summary`, `forks`, `commits`, `report_sections` с размером каждого раздела; вход `detail: summary\|full`, `sections: [...]`, `max_bytes`), пути к артефактам и итог приёмки (хвост лога только при провале в компактном виде). `detail: full` отдаёт весь отчёт (до 256 КБ, только обычные файлы), `progress` и хвост лога как раньше; `sections: ["Evidence"]` — только эти разделы; для джобы с `covers` ещё `requirements` (её блок `### Requirements`, лишь заявленные (`claimed`) строки done, недостающие строки, трейлер `Requirements:` её коммитов) |
 | `job_list` | последние джобы с фильтром по статусу |
 | `job_cancel` | отменить: из очереди сразу, идущую — SIGTERM, затем SIGKILL; от остановленной — отказаться |
 | `job_stop` | остановить ожидающую или идущую джобу, сохранив worktree и сессию: статус `stopped` (можно продолжить) |
@@ -278,6 +389,7 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 | `job_amend` | дописать контекст в бриф ожидающей джобы; место в очереди сохраняется |
 | `skill_list` | каталог скиллов (`skill_roots`): имя, статус, описание в одну строку, виды, размер, риски, дата проверки, использования и доля успешных, флаг `stale`; `query` — локальный поиск по содержимому (лучшие 10, с оценкой); фильтры `kind`, `repo`, `status`. Только для оркестратора |
 | `job_stats` | сводка по закончившимся джобам из таблицы статистики (строка на джобу): количество, доля успехов, медиана и p90 стоимости и времени, частые правила отказов гварда, вызовы инструментов, скиллы по использованиям и доле успехов, `requirements_claimed` / `claimed_jobs` (строки `done` покрытых джоб без `ran:` или REDPROOF, волна F); `since`, `by` = kind \| model \| skill (то же, что `agent-jobs stats --json`) |
+| `wake_stats` | что дошло до этой сессии, измерено: строки, напечатанные демоном, по категориям (`job-done`, `notify-owner`, `schedule`, `check-missed`, `heartbeat`) и инъекции хуков (`hook:brief-reminder`, `hook:pending-outcome`, `hook:stop`, `hook:merge-gate`, `hook:skills-picker`: текст, добавленный в контекст, а не причина блокировки), по категориям и локальным дням, с размером пачки и байтами на доставку (сумма, p50, p95, максимум). Инъекция, которую хук не смог сохранить, показывается отдельно (`injections_unrecorded`): тогда числа по инъекциям — нижняя оценка. Записи хранятся без очистки. Пока не измеряется категория `idle` (idle-доставки ещё нет). Только оркестратор. Тот же вывод, что у `agent-jobs stats wakes --json`. |
 
 **Тулы памяти, задач и команды** сохраняют имена из эталона и работают поверх общего мозга команды (gbrain), а не своего хранилища ([отличия #2, #3](DEVIATIONS.md)). Без блока `brain` в `config.json` каждый отвечает «brain not configured», остальное не меняется.
 
@@ -525,7 +637,11 @@ agent-jobs card list --agent my-agent --repo ~/src/project                  # к
 ```
 
 - `notify_tmux_target`: цель tmux для строки job-done. Пусто (по умолчанию) — уведомления выключены; строка уходит в журнал демона, чистка всё равно идёт.
+- `notify_coalesce_seconds`: придерживать строки job-done, чтобы джобы, закончившиеся рядом по времени, будили сессию один раз. `0` (по умолчанию) — одна строка на джобу, сразу. Со значением строка закончившейся джобы ждёт, пока с конца последней придержанной джобы не пройдёт столько секунд, и все придержанные джобы приходят одной строкой: `[jobs:job-done] 3 jobs: <id> <title> <status> · …; <id> …; <id> …` (у каждой джобы те же поля, что в её собственной строке; не больше 10 джоб в строке). Одна придержанная джоба приходит обычной строкой `[jobs:job-done] job <id> …`. Джобы «владелец ждёт» никогда не придерживаются, строки `notify_owner` тоже. `notify_coalesce_max_seconds` (по умолчанию 300) ограничивает ожидание от первой придержанной джобы, сколько бы их ни заканчивалось. Придержанные строки — это только недоставленные записи, поэтому перезапуск демона ничего не теряет: они уходят на первом тике после окна. Строки уходят на минутном тике, так что реальное ожидание округляется вверх до минуты.
+- `idle_pick`: сообщать о готовой работе, когда очередь опустела, вместо почасового пробуждения (#165, по умолчанию выключено). `{"idle_pick": {"enabled": true}}` с умолчаниями: `cooldown_seconds` 600 (минимальный промежуток между двумя заметками), `max_wakes_per_day` 8 (не больше 48, за любые 24 часа). Когда последняя queued, running или stopped джоба агента закончилась и её строка job-done доставлена (одна строка, обычная или объединённая), демон смотрит открытые вехи и открытые намерения агента; если есть готовая работа, эта же строка заканчивается на `· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`. Готовые задачи — те, чьи зависимости выполнены и у которых ещё нет джобы (заблокированная, выполняющаяся, упавшая или ждущая проверки задача не попадает в список); называются не больше 5 каждого вида, счёт полный. Нет готового, за это время поставлена джоба, кулдаун или дневной лимит: ничего не добавляется, а сама заметка никогда не идёт отдельной строкой. Демон только сообщает и сам работу не начинает. Один раз за «эпоху» очереди (счётчик завершённых джоб, поэтому две джобы, закончившиеся в одну секунду, — две эпохи), в том числе через перезапуск: оценки хранятся в базе, а заметка записывается вместе с подтверждением своей строки (если запись не удалась, строка доставляется снова с той же заметкой, сохранённой до печати строки, и заметка всё равно учитывается). Пропущенная заметка (idle pick был выключен, проверка упала, кулдаун или лимит задержали её) не восполняется: заметка едет только на настоящей ожидающей строке job-done, а доставленная строка никогда не отправляется повторно. База, созданная до idle pick, начинает с уже завершённых джоб как оценённых, так что историю заметка не касается; завершение, строка которого ещё ожидает на момент обновления, получает свою заметку.
+- `slo`: нормы и необязательное расследование (#170). `slo.targets` сопоставляет имя SLO с нормой в секундах (`{"deploy": 600, "first_reply": 60}`; имя: строчные буквы, цифры, `_`, `.`, `-`). `agent-jobs slo record <имя> <секунды>` сохраняет длительность; выше нормы это нарушение, и следующая строка, которую демон печатает в сессию (job-done, notify-owner, schedule, check-missed), заканчивается ` · slo breach: deploy 742s > 600s` (нарушения одного имени с прошлой доставки сворачиваются в `deploy 3x, worst 900s > 600s`). Нарушение упоминается один раз и сам по себе сессию не будит; доставка, которую tmux отклонил, оставляет его на следующую. Заметка не длиннее 400 байт: имена, которые не поместились, ждут следующей доставки. Строка пробуждения heartbeat фиксирована и заметку не несёт. Пока не подключено: `land` не записывает свою длительность (пересборка `land` сама вызовет `slo record landing-time`; до тех пор записывайте вручную), и idle-доставки нет. `slo.investigate` (по умолчанию выключено): `{"enabled": true, "cooldown_minutes": 60, "daily_max": 3, "complexity": "light"}` запускает по одной research-джобе (только чтение) на нарушение, не раньше кулдауна после последней запущенной (как бы давно она ни была, поэтому кулдаун больше суток соблюдается) и не сверх суточного лимита; нарушение резервируется до постановки джобы в очередь, поэтому сбой между этими шагами оставляет резерв, который считается, и второй джобы не запускает; пропущенное по этим причинам нарушение закрывается с причиной и не пересматривается. Подхватывается без перезапуска.
 - `orchestrator_dir`: абсолютная директория, в которой работает сессия оркестратора. `hook bind` («владелец ждёт») привязывает только сессию, чей `cwd` внутри неё и которая запущена в панели `notify_tmux_target`; пусто (по умолчанию) = привязка отклоняется, Stop-хук «владелец ждёт» никогда не блокирует. `owner_waits_max_hours`: сколько держит запись «ответ владельцу ожидается» (по умолчанию 6).
+- `hooks`: сколько хуки оркестратора кладут в его контекст (#166). `repeat_after_seconds` (по умолчанию 1800, не больше 604800): блок `[jobs:pending-outcome]` вставляется, когда изменился набор необработанных джоб или их статусы (возраст не считается), в первом промпте после SessionStart (`hook bind` срабатывает снова после компакции, `/clear` и resume: новая эпоха контекста, один свежий снимок), а иначе не чаще одного раза за этот интервал, поэтому три промпта подряд вставляют его один раз. `max_bytes` (по умолчанию 1500, 512..65536): ни один вставляемый блок не длиннее, а список, который не влез, заканчивается `+N more, see job_list`; сообщение Stop-хука «владелец ждёт» подчиняется тому же лимиту. Состояние (эпоха и по каждому хуку хеш последнего состояния и время) лежит в файле `<state>/hook-emit.json` (режим 600); хук промпта по-прежнему открывает хранилище только на чтение и не ждёт его. Состояние, которое не удалось записать, даёт лишь ещё одну вставку.
 - `job_dir_note_mb`: размер папки джобы (МБ, без worktree у джобы с репозиторием), начиная с которого строка job-done заканчивается на `· job dir <размер>` (по умолчанию 100, `0` никогда). `job_result` (`job_dir_bytes`) и строка статистики всегда содержат размер; `system_doctor` показывает пять самых больших папок джоб (`disk.largest_job_dirs`).
 - `idle_after_result_seconds`: пауза правила idle-after-result (по умолчанию 180). Если claude выдал финальный `result` и затем молчит столько секунд, а живых дочерних процессов, кроме MCP-сервера джобы, нет, джоба завершается и оценивается по этому результату, а не ждёт таймаута (Linux). `-1` выключает правило.
 - `owner_names`: имена, которые никогда не должны попасть в коммит джобы.
@@ -537,6 +653,7 @@ agent-jobs card list --agent my-agent --repo ~/src/project                  # к
 - `max_brief_bytes`: самый большой бриф, который принимает `job_start` (по умолчанию 32768); `brief_warn_files` (по умолчанию 40) и `brief_warn_headings` (по умолчанию 8): выше этого джоба в очереди получает `size_warning`.
 - `brain`: общий мозг для тулов памяти, задач и команды и для заметок памяти в брифе (см. «Общий мозг» ниже). Нет блока — не настроен.
 - `cgroup_scope`: `auto` (по умолчанию: свой временный пользовательский scope systemd на каждую джобу, когда работает `systemd-run --user`, иначе более слабая изоляция по сессии), `required` (джобы, которым не досталось scope, не запускаются), `off`.
+- `job_plugins`: плагины Claude Code для claude-джоб через `--plugin-dir`, список `{"path" | "name", "kinds", "deny_skills", "bootstrap_skill", "allow_hooks"}` (см. «Плагины для джоб»); применяется после перезапуска. Не найденный плагин — предупреждение в `status` и `system_doctor`, не ошибка.
 - `skill_roots`: абсолютные папки каталогов скиллов для джоб, в корне каждой `index.json` (см. «Скиллы для джоб» ниже); при одинаковом имени побеждает более ранний корень; отсутствующий или битый корень — предупреждение в `status` и `system_doctor`, не ошибка. `skills_max_per_job` (по умолчанию 6, максимум 8) и `skills_max_kb` (по умолчанию 400) ограничивают скиллы одной джобы.
 - `http_api`: HTTP API только на чтение, по умолчанию `{"enabled": false}`, слушает unix-сокет `<state>/http-api.sock` (см. «HTTP API только на чтение» ниже).
 - `heartbeat`: демон будит сессию оркестратора ради собственных целей агента (волна D, по умолчанию выключено). `{"heartbeat": {"enabled": true}}` с умолчаниями: `interval_minutes` 60 (минимальный промежуток между пробуждениями и между решениями), `night_start_hour` 0 / `night_end_hour` 8 (локальное ночное окно без пробуждений, может переходить через полночь, равные значения = окна нет), `daily_max_wakes` 6 (не больше 48), `goals_file` (абсолютный путь; по умолчанию `<state>/goals.md`, markdown-список постоянных целей, который ведёт агент; нет файла или он пуст = простой), `model` `"sonnet"` (только claude), `max_budget_usd` 0.2 (не больше 2) и `timeout_seconds` 60 (не больше 600) для вызова решения. Проверка на Go идёт каждый тик; вызов `claude -p` без инструментов отвечает `{"wake": bool, "reason": "..."}`; пробуждение — фиксированная строка `[jobs:heartbeat] wake <id>` в `notify_tmux_target` (причину модели в сессию никогда не печатаем: она сохраняется, и `heartbeat_get` / `agent-jobs heartbeat show <id>` отдают её как `untrusted_model_reason` — недоверенные данные, не инструкции). Прямо перед печатью, под `tmux.lock`, ночное окно и ожидающие доставки проверяются снова; пробуждение, которое уже нельзя доставить, сохраняется как `suppressed`: оно засчитывается в интервал (модель вызывалась), но не в `daily_max_wakes`. `agent-jobs heartbeat run-now --agent A [--dry-run]` запускает одно решение сейчас (интервал пропускается; `--dry-run` печатает результат проверки и промпт, модель не вызывается). Видно в `status`, `system_doctor` и `/v1/health`; см. docs/ARCHITECTURE.md «Heartbeat».
@@ -632,6 +749,9 @@ agent-jobs resume --agent my-agent <id> --context-file update.md [--timeout-minu
 agent-jobs prune  --agent my-agent [--dry-run]       # чистка папок джоб старше 48 ч
 agent-jobs archive --agent my-agent --dry-run        # что prune перенесёт в архив логов
 agent-jobs stats  --agent my-agent --since 30d --by skill   # сводка статистики джоб (--json, --backfill)
+agent-jobs stats wakes --agent my-agent --since 7d   # доставки и инъекции хуков по категориям и дням, байты p50/p95 (--json)
+agent-jobs slo record deploy 742 --agent my-agent   # сохранить длительность; выше нормы из slo.targets это нарушение
+agent-jobs slo show --agent my-agent [--since 30d]    # по имени: число, p50, p95, последнее, норма (--json)
 agent-jobs doctor procs --agent my-agent [--kill]    # призрачные процессы; без --kill только отчёт
 agent-jobs intentions --agent my-agent --status open  # собственные цели агента (--json)
 agent-jobs gate slicing --agent my-agent --repo ~/src/shop  # проверка нарезки чеклиста репозитория (JSON)

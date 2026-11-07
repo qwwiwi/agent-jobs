@@ -1168,6 +1168,9 @@ var (
 		`(systemd-run|systemctl|busctl|dbus-send|gdbus|qdbus|dbus-run-session|crontab|tmux|pm2|docker|podman|` +
 		`machinectl|loginctl|unshare|nsenter)($|[^a-z0-9_]))`)
 	reGitDashCmd = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])git-[a-z]`)
+	// reRsyncMention finds rsync as a word inside code (`python3 -c '…os.system("rsync …")'`): the
+	// rsync argv in there cannot be read, so rsyncRemote cannot decide whether it reaches a host.
+	reRsyncMention = regexp.MustCompile(`(?i)(^|[^a-z0-9_.-])rsync($|[^a-z0-9_-])`)
 )
 
 // checkUnverifiable fails closed on every form whose effect on git/gh cannot be resolved statically.
@@ -1330,8 +1333,36 @@ func unverifiable(sc *script, c *simpleCmd) string {
 	if t := scopeToolArg(name, argv[1:], dyn[1:]); t != "" {
 		return cannot(name + " running " + t + " (a tool that starts processes outside the job's scope) indirectly")
 	}
-	if t := remoteCopyArg(name, argv[1:], dyn[1:]); t != "" {
+	if t := remoteCopyArg(name, argv[1:], dyn[1:], c.bare[v.start+1:], slices.Contains(v.wrappers, "xargs")); t != "" {
 		return cannot(name + " running " + t + " (an rsync that reaches a remote host) indirectly")
+	}
+	if t := rsyncInCode(name, argv[1:], dyn[1:], c.bare[v.start+1:], ops); t != "" {
+		return cannot(name + " running rsync from code (" + t + "): its arguments cannot be verified")
+	}
+	return ""
+}
+
+// rsyncInCode returns the argument of name that holds rsync inside inline code — a word with
+// spaces, quotes or parentheses (`python3 -c '…os.system("rsync …")'`, `node -e`, `perl -e`,
+// `awk`, `watch 'rsync …'`) or a substitution — or "". The code's rsync argv is not an argv the
+// guard can read, so it cannot rule out a remote host (rsyncRemote); the mention is refused. A shell
+// -c string is parsed as a nested script instead, where rsync is checked like any other command.
+func rsyncInCode(name string, args []string, dyn, bare, ops []bool) string {
+	if shells[name] || name == "eval" {
+		return ""
+	}
+	// The value of an rsync option (`--exclude 'rsync cache'`, `-f'- rsync (x)'`, `--exclude "rsync $P"`)
+	// is a pattern, path or format, not code, once the whole argv of that rsync is verified (no remote
+	// operand, no unquoted expansion), also for an rsync a runner runs (`setsid rsync --exclude …`).
+	// A runner's own option values and operands (flock's lock file) are data too (walkChain).
+	data := chainData(name, args, dyn, bare)
+	for k, a := range args {
+		if (k < len(ops) && ops[k]) || data[k] {
+			continue
+		}
+		if reRsyncMention.MatchString(a) && (dyn[k] || strings.ContainsAny(a, " \t\n'\"(){};`")) {
+			return a
+		}
 	}
 	return ""
 }
@@ -1341,49 +1372,105 @@ func scopeTool(b string) bool { return outOfScopeTools[b] || b == "systemctl" }
 
 // rsyncRemote reports whether rsync args can reach a remote host: any -e/--rsh option (whatever
 // command it names — the default remote shell is ssh), a -M/--remote-option word (its value goes to
-// the remote side), or a path argument in rsync's remote spelling (host:/x, host::module,
-// user@host:/x, rsync://h/m; a ':' before any '/'). Options that take a value are consumed first
-// (rsyncValueOpts, and the short -f/-T/-B that take the rest of their cluster), so a value is
-// never read as an operand (`--exclude cache:old`) or as an option letter (`-f'- *.cache'`).
-// Purely local copies (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay
-// allowed: a job uses rsync inside its worktree.
-func rsyncRemote(args []string) bool {
+// the remote side), a path argument in rsync's remote spelling (host:/x, host::module,
+// user@host:/x, rsync://h/m; a ':' before any '/'), or a word the guard cannot read (dyn: built
+// from a variable or substitution) in an operand or option-name position, unless its static prefix
+// already holds a '/' before any ':' (`./out/$D` is local whatever $D holds). Options that take a
+// value are consumed first (rsyncValueOpts, and the short -f/-T/-B that take the rest of their
+// cluster), so a value is never read as an operand (`--exclude cache:old`) or as an option letter
+// (`-f'- *.cache'`); such a value may be dynamic, it is data. Purely local copies
+// (`rsync -a src/ dst/`, `rsync -a ./a:b/ dst/` — the ':' after a '/') stay allowed: a job uses
+// rsync inside its worktree. dyn may be shorter than args (missing = static).
+func rsyncRemote(args []string, dyn, bare []bool) bool {
+	remote, _, _ := rsyncScan(args, dyn, bare)
+	return remote
+}
+
+// rsyncPatternWords returns the indexes of args that carry a filter pattern: the word of
+// `--exclude=P`, `--include=P`, `--filter=R`, `-fR` (also inside a cluster) and the value word after
+// a separate `--exclude`/`--include`/`--filter`/`-f`. Such a word is data for rsync's matcher, not a
+// path to write, so a `*` in it is no glob hazard.
+func rsyncPatternWords(args []string) map[int]bool {
+	_, pat, _ := rsyncScan(args, nil, nil)
+	return pat
+}
+
+// rsyncScan walks rsync args once: remote as in rsyncRemote, pattern as in rsyncPatternWords, data
+// as the indexes of every word that is an option value or a short cluster carrying one (never code
+// or an operand; meaningful only when remote is false). bare[i] marks a word with an expansion
+// outside double quotes: the shell may split it into several words, so it can inject operands or
+// options whatever its static text says. Any such word makes the argv unverifiable (remote).
+func rsyncScan(args []string, dyn, bare []bool) (remote bool, pattern, data map[int]bool) {
+	pattern, data = map[int]bool{}, map[int]bool{}
+	isDyn := func(i int) bool { return i < len(dyn) && dyn[i] }
+	for i := range args {
+		if i < len(bare) && bare[i] {
+			return true, pattern, data
+		}
+	}
 	endOpts := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case endOpts || a == "-" || !strings.HasPrefix(a, "-"):
-			if remoteColon(a) {
-				return true
+			if remoteColon(a) || (isDyn(i) && !dynLocalPrefix(a)) {
+				return true, pattern, data
 			}
 		case a == "--":
 			endOpts = true
 		case strings.HasPrefix(a, "--"):
 			opt, _, hasVal := strings.Cut(a, "=")
 			switch {
-			case opt == "--rsh" || opt == "--remote-option":
-				return true
+			case opt == "--rsh" || opt == "--remote-option" || (isDyn(i) && strings.ContainsAny(opt, "$`")):
+				return true, pattern, data
+			case rsyncPatternOpts[opt] && hasVal:
+				pattern[i], data[i] = true, true
+			case rsyncValueOpts[opt] && hasVal:
+				data[i] = true
 			case rsyncValueOpts[opt] && !hasVal && i+1 < len(args):
 				i++ // the option's value is the next word
+				data[i] = true
+				if rsyncPatternOpts[opt] {
+					pattern[i] = true
+				}
 			}
 		default: // a short-option cluster
 			val := a[1:]
 			for k := 0; k < len(val); k++ {
 				c := val[k]
-				if c == 'e' || c == 'M' { // --rsh, --remote-option: remote whatever the value
-					return true
+				if c == 'e' || c == 'M' || c == '$' || c == '`' { // --rsh, --remote-option: remote
+					// whatever the value; an expansion may spell any option
+					return true, pattern, data
 				}
 				if c == 'f' || c == 'T' || c == 'B' { // --filter, --temp-dir, --block-size: the
 					// rest of the cluster (or the next word) is the value, not options
-					if k == len(val)-1 && i+1 < len(args) {
+					switch {
+					case k < len(val)-1:
+						data[i] = true
+						pattern[i] = pattern[i] || c == 'f'
+					case i+1 < len(args):
 						i++
+						data[i] = true
+						pattern[i] = pattern[i] || c == 'f'
 					}
 					break
 				}
 			}
 		}
 	}
-	return false
+	return false, pattern, data
+}
+
+// dynLocalPrefix reports a word built from a variable or substitution whose static part up to the
+// first expansion already holds a '/' with no ':' before it (`./out/$D`, `/tmp/$X`): rsync reads
+// the host part before the first '/', so the word is a local path whatever the expansion holds.
+func dynLocalPrefix(w string) bool {
+	i := strings.IndexAny(w, "$`")
+	if i < 0 {
+		return false
+	}
+	p := w[:i]
+	return strings.Contains(p, "/") && !remoteColon(p)
 }
 
 // rsyncValueOpts are rsync's long options whose value is data: a pattern, a path or a format. The
@@ -1397,8 +1484,11 @@ var rsyncValueOpts = map[string]bool{
 	"--suffix": true, "--chmod": true, "--chown": true, "--log-file": true, "--temp-dir": true,
 	"--partial-dir": true, "--password-file": true, "--out-format": true, "--iconv": true,
 	"--usermap": true, "--groupmap": true, "--block-size": true, "--max-size": true, "--min-size": true,
-	"--info": false, "--debug": false,
+	"--log-file-format": true, "--info": false, "--debug": false,
 }
+
+// rsyncPatternOpts are the rsync options whose value is a filter pattern (rsyncPatternWords).
+var rsyncPatternOpts = map[string]bool{"--exclude": true, "--include": true, "--filter": true}
 
 // remoteColon reports a word with a ':' before any '/', rsync's own remote spelling (`host:/x`,
 // `host::module`, `user@host:/x`, `rsync://h/m`): the host part precedes the first path separator,
@@ -1443,6 +1533,10 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
 		case scopeTool(b) && v != a && execOpts[opt]:
 		case scopeTool(b) && k > 0 && execOpts[args[k-1]]:
 		case scopeTool(b) && execRunners[name] && !strings.HasPrefix(a, "-"):
+		// Double nesting (`find -exec parallel ssh ::: host \;`): the tool follows a runner that is
+		// itself an argument, or any stdin runner (its remote argument comes from the runner's input).
+		case scopeTool(b) && k > 0 && execRunners[progName(args[k-1])]:
+		case scopeTool(b) && !strings.HasPrefix(a, "-") && behindStdinRunner(name, args, k, false):
 		case scopeTool(b) && copiers[name] && filepath.IsAbs(v):
 		case strings.ContainsAny(a, " \t\n'\"(){};`") && reScopeMention.MatchString(a):
 		default:
@@ -1453,16 +1547,99 @@ func scopeToolArg(name string, args []string, dyn []bool) string {
 	return ""
 }
 
-// remoteCopyArg returns the argument showing that name runs, at a position the guard already
-// treats as a command — the value or the word after an exec option (find -exec/-execdir/-ok) or a
-// positional of an exec runner (setsid, ionice, chroot, …, also one reached through another
-// exec option or runner) — an rsync that reaches a remote host (rsyncRemote of the words after
-// the command word). Under parallel or entr the command's extra arguments come from stdin and
-// cannot be seen, so rsync is refused without an argv to inspect; xargs is refused in
-// unverifiable (a wrapper split strips it). For an exec option the executed command's argv ends
-// at find's `;`/`+` terminator (execArgv): what follows is find's again, e.g. another action's
-// -printf format.
-func remoteCopyArg(name string, args []string, dyn []bool) string {
+// stdinRunners run a command whose extra arguments come from their own input (stdin, the input
+// files, `:::` lists), so the argv of a command behind them cannot be read.
+var stdinRunners = map[string]bool{"parallel": true, "entr": true, "xargs": true}
+
+// remoteCopyArg returns the argument showing that name runs an rsync that reaches a remote host,
+// or "". The runner chain is read per runner syntax first (walkChain, issue #179): flock's lock
+// file, a runner's option values, find's expression and rsync's own option values are never a
+// program, so `flock parallel rsync a b` runs a local rsync and `flock rsync parallel rsync a` runs
+// parallel. An rsync the chain reaches is checked with rsyncRemote on its own argv (for find's
+// exec option up to find's terminator, findExecEnd; elsewhere nothing ends it: an escaped `\;` is a
+// plain argument of rsync there). Behind a stdinRunner (parallel, entr, xargs) or an outer xargs
+// (stdin) the command's extra arguments come from input and cannot be seen, so an rsync word there
+// is refused without an argv to inspect; so is one after a runner word the walk cannot read (an
+// unknown option, an unquoted expansion). A program the walk does not model (ionice, chroot,
+// fd -x, …) keeps the position heuristic of legacyRemoteCopyArg. A plain rsync under xargs is
+// refused in unverifiable (a wrapper split strips xargs).
+func remoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) string {
+	argv, d, b := chainArgv(name, args, dyn, bare)
+	ch := walkChain(argv, d, b, stdin)
+	if len(ch.blind) > 0 { // the program is a variable or comes from xargs input: it may be rsync
+		return argv[ch.blind[0]]
+	}
+	for _, r := range ch.rsyncs {
+		if r.at == 0 { // the program itself: checkUserManager checks a plain rsync
+			continue
+		}
+		if r.stdin || rsyncRemote(argv[r.at+1:r.end], d[r.at+1:r.end], b[r.at+1:r.end]) {
+			return argv[r.at]
+		}
+	}
+	for _, t := range ch.tails {
+		for k := max(t.at, 1); k < t.end; k++ {
+			if !d[k] && progName(optValue(argv[k])) == "rsync" {
+				return argv[k]
+			}
+		}
+	}
+	for _, l := range ch.legacy {
+		if l.at == 0 {
+			return legacyRemoteCopyArg(name, args, dyn, bare, stdin, false)
+		}
+		// Reached through a modeled runner: the program keeps that runner's exec context, so every
+		// positional rsync word behind it may be the command (`setsid setpriv -- rsync …`).
+		if t := legacyRemoteCopyArg(progName(argv[l.at]), argv[l.at+1:l.end], d[l.at+1:l.end],
+			b[l.at+1:l.end], l.stdin, true); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// chainArgv rebuilds the argv of name for walkChain, with dyn and bare padded to its length.
+func chainArgv(name string, args []string, dyn, bare []bool) (argv []string, d, b []bool) {
+	argv = append([]string{name}, args...)
+	d, b = make([]bool, len(argv)), make([]bool, len(argv))
+	copy(d[1:], dyn)
+	copy(b[1:], bare)
+	return argv, d, b
+}
+
+// chainData returns the indexes of args that are data, never a program or code: the option values
+// and operands of the runners in front of a command (walkChain), and the option values of every
+// rsync the chain runs whose argv is verified (rsyncScan: no remote operand, no unquoted expansion).
+func chainData(name string, args []string, dyn, bare []bool) map[int]bool {
+	argv, d, b := chainArgv(name, args, dyn, bare)
+	ch := walkChain(argv, d, b, false)
+	data := map[int]bool{}
+	if ch.ambiguous {
+		return data
+	}
+	for k := range ch.data {
+		data[k-1] = true
+	}
+	for _, r := range ch.rsyncs {
+		remote, _, vals := rsyncScan(argv[r.at+1:r.end], d[r.at+1:r.end], b[r.at+1:r.end])
+		if remote {
+			continue
+		}
+		for k := range vals {
+			data[r.at+k] = true // argv index r.at+1+k is args index r.at+k
+		}
+	}
+	return data
+}
+
+// legacyRemoteCopyArg is the position heuristic for a program the runner walk does not model
+// (ionice, chroot, fd -x, go test -exec, …): any rsync word at a command position. stdin marks an
+// argv extended from an outer xargs: an rsync there is refused without an argv to inspect.
+// nested marks a program reached through a modeled runner (`setsid setpriv -- rsync …`): it runs in
+// that runner's exec context, so it is read as an exec runner whatever its name, as main read the
+// whole argv behind setsid or flock (fail closed: a positional rsync word may be the command).
+func legacyRemoteCopyArg(name string, args []string, dyn, bare []bool, stdin, nested bool) string {
+	runner := nested || execRunners[name]
 	data := runnerDataValues(name, args)
 	for k, a := range args {
 		if data[k] || dyn[k] {
@@ -1472,30 +1649,102 @@ func remoteCopyArg(name string, args []string, dyn []bool) string {
 			continue
 		}
 		opt, _, _ := strings.Cut(a, "=")
-		argv := args[k+1:]
 		switch {
 		case optValue(a) != a && execOpts[opt], k > 0 && (execOpts[args[k-1]] || execRunners[progName(args[k-1])]):
-			argv = execArgv(argv)
-		case execRunners[name] && !strings.HasPrefix(a, "-"):
+		case runner && !strings.HasPrefix(a, "-"):
+		case behindStdinRunner(name, args, k, nested):
 		default:
 			continue
 		}
-		if name == "parallel" || name == "entr" || rsyncRemote(argv) {
+		end := len(args)
+		if name == "find" {
+			end = findExecEnd(args, k)
+		}
+		if stdin || stdinRunners[name] || behindStdinRunner(name, args, k, nested) ||
+			rsyncRemote(args[k+1:end], dyn[k+1:end], bareFrom(bare, k+1, end)) {
 			return a
 		}
 	}
 	return ""
 }
 
-// execArgv cuts the argv of a command run by an exec option (find -exec/-execdir/-ok) at find's
-// `;`/`+` terminator, so the words of a following action are not read as the command's.
-func execArgv(argv []string) []string {
-	for k, a := range argv {
-		if a == ";" || a == "+" {
-			return argv[:k]
+// bareFrom returns bare[from:to], or nil when bare is shorter (missing = no expansion).
+func bareFrom(bare []bool, from, to int) []bool {
+	if to > len(bare) {
+		return nil
+	}
+	return bare[from:to]
+}
+
+// behindStdinRunner reports that the command word args[k] of name runs behind a stdinRunner (parallel,
+// entr, xargs) in its own command chain, so the arguments added from the runner's input cannot be
+// read. The chain is the positionals of an exec runner name (`setsid parallel -j2 rsync …`) or, for
+// find, the words of the -exec/-execdir/-ok action that holds args[k] (`find . -exec parallel rsync …`).
+// A find predicate value (`-name parallel`) or any argument of another program is data, not a runner.
+// nested reads name as an exec runner (legacyRemoteCopyArg): the chain is all of args.
+func behindStdinRunner(name string, args []string, k int, nested bool) bool {
+	start := 0
+	switch {
+	case nested:
+	case name == "find":
+		if start = findExecStart(args, k); start < 0 {
+			return false
+		}
+	case !execRunners[name]:
+		return false
+	}
+	return slices.ContainsFunc(args[start:k], func(w string) bool { return stdinRunners[progName(w)] })
+}
+
+// findExecStart returns the index of the first word of the -exec/-execdir/-ok/-okdir action that
+// holds args[k] (the word after the exec option), or -1 when args[k] lies outside every action.
+func findExecStart(args []string, k int) int {
+	kind, start := "", -1
+	for i := 0; i < k; i++ {
+		switch {
+		case findExec[args[i]]:
+			kind, start = args[i], i+1
+		case kind != "" && findTerminator(args, i, kind):
+			kind, start = "", -1
 		}
 	}
-	return argv
+	return start
+}
+
+// findExecEnd returns where the command that find runs ends, for the command word at args[k]: the
+// index of the first real terminator after k when k lies inside a -exec/-execdir/-ok/-okdir action
+// (`;`, or `+` right after a `{}` and only for -exec/-execdir, as find reads them: a `+` anywhere
+// else is a plain argument of the command), else len(args).
+func findExecEnd(args []string, k int) int {
+	kind := ""
+	for i := 0; i < k; i++ {
+		switch {
+		case findExec[args[i]]:
+			kind = args[i]
+		case kind != "" && findTerminator(args, i, kind):
+			kind = ""
+		}
+	}
+	if kind == "" {
+		return len(args)
+	}
+	for i := k + 1; i < len(args); i++ {
+		if findTerminator(args, i, kind) {
+			return i
+		}
+	}
+	return len(args)
+}
+
+// findTerminator reports args[i] as the word that ends a find action of the given kind.
+func findTerminator(args []string, i int, kind string) bool {
+	switch args[i] {
+	case ";":
+		return true
+	case "+":
+		return i > 0 && args[i-1] == "{}" && (kind == "-exec" || kind == "-execdir")
+	}
+	return false
 }
 
 // packageRunners fetch and run a package by name (npx, pnpm dlx, …): what runs is decided by a
@@ -1998,7 +2247,7 @@ func dynLinkCmds(scripts []*script) map[*simpleCmd]bool {
 // `--user=…`) is rejected (the system manager, without --user, cannot start units for the job). Then the
 // cgroup file system (checkCgroupWrites). Not a sandbox: a script the job writes is not inspected.
 func checkUserManager(scripts []*script, cmd string, cfg Config) string {
-	if r := eachCmd(scripts, func(_ *simpleCmd, argv []string) string {
+	if r := eachCmd(scripts, func(c *simpleCmd, argv []string) string {
 		if len(argv) == 0 {
 			return ""
 		}
@@ -2007,9 +2256,10 @@ func checkUserManager(scripts []*script, cmd string, cfg Config) string {
 			return "blocked by guard: `" + name + "` copies files to or from a remote host over ssh (with the " +
 				"operator's keys); a job never reaches remote hosts."
 		}
-		if name == "rsync" && rsyncRemote(argv[1:]) {
+		if name == "rsync" && rsyncRemote(argv[1:], c.dyn[len(c.words)-len(argv)+1:], c.bare[len(c.words)-len(argv)+1:]) {
 			return "blocked by guard: `rsync` is given a remote host (an -e/--rsh command or a host:path " +
-				"argument); a job never reaches remote hosts."
+				"argument) or an operand the guard cannot read (a variable or substitution); a job never " +
+				"reaches remote hosts. Write the paths out."
 		}
 		if outOfScopeTools[name] {
 			sandbox := ""
@@ -2505,11 +2755,18 @@ func checkGitFiles(scripts []*script, _ string, cfg Config) string {
 					return findExec[a] || a == "-delete" || strings.HasPrefix(a, "-fprint") || a == "-fls"
 				})
 				off := len(c.words) - len(argv)
+				// An rsync filter pattern (-f/--filter/--exclude/--include value) is matcher data, not a
+				// path: a quoted `*` in it is no glob hazard (an unquoted one still is).
+				var filterData map[int]bool
+				if name == "rsync" {
+					filterData = rsyncPatternWords(argv[1:])
+				}
 				for k, a := range argv[1:] {
 					if gitFile(a) || (gitDirTargets[name] && gitDir(a)) {
 						return blocked(a)
 					}
-					if !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter {
+					if !hasGlob(reBraceVar.ReplaceAllString(a, "")) || findFilter ||
+						(filterData[k] && !c.glob[off+k+1]) {
 						continue
 					}
 					// Inline code (`python3 -c`, `perl -e`, `node -e`, the awk program) is one quoted word

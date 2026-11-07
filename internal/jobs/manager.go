@@ -49,11 +49,17 @@ type Manager struct {
 	Log       *log.Logger
 	// Brain is the shared brain from config (brain.Disabled when not configured).
 	Brain brain.Brain
+	// afterOutcome, when set (tests), runs in SetOutcomes right after an item's outcome was committed.
+	afterOutcome func(id string)
 	// MemoryTimeout bounds the memory notes lookup while a job is prepared.
 	MemoryTimeout time.Duration
 
 	memMu        sync.Mutex
 	memDownUntil time.Time // memory lookups are skipped until then (MemoryBreaker)
+
+	// forceHookSnapshot is set when a new context epoch could not be recorded: the next hook block is
+	// injected whatever the stale emission state says.
+	forceHookSnapshot atomic.Bool
 
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
@@ -64,6 +70,12 @@ type Manager struct {
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
+
+	noteMu       sync.Mutex     // guards noteUnmarked
+	noteUnmarked map[int64]bool // SLO breaches a delivery carried whose noted mark failed (wakes.go)
+
+	idleMu   sync.Mutex
+	idleSent string // the ready list of the last idle-slot line (idleslots.go)
 
 	mergeMu     sync.Mutex
 	mergeChecks map[string]mergeCheck // job ID -> its last merge-tree result (MergeNote)
@@ -163,6 +175,7 @@ type StartRequest struct {
 	Brief          string
 	RepoPath       string
 	Base           string // ref in RepoPath; default HEAD
+	Branch         string // optional result branch; default job/<id>, published only with commits
 	Model          string // explicit model; else picked by kind × complexity
 	Complexity     string // light|normal|hard; model or complexity is required (no default, no classifier)
 	MaxTurns       int    // 0 = default
@@ -203,6 +216,11 @@ type StartRequest struct {
 	// Crew makes a crew job (issue #169): an advisor model the job may consult with advisor_ask, its caps,
 	// and an optional paired_with job to compare with in job_stats. Zero = a plain job.
 	Crew CrewRequest
+	// Paths are repository-relative paths/globs for overlap admission (fix/general only).
+	Paths []string
+	// OnOverlap is warn (default), serialize or refuse. Parent explicitly stacks on another job.
+	OnOverlap string
+	Parent    string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -383,7 +401,13 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			return nil, cerr
 		}
 		cleanup = c
-		ok, ierr := m.insertQueued(j)
+		// The insert is serialized with the final check of an idle note (#165): a note being typed
+		// never lands after the job that should have cancelled it.
+		var ok bool
+		ierr := m.underIdleLock(func() (err error) {
+			ok, err = m.insertQueued(j)
+			return err
+		})
 		if errors.Is(ierr, store.ErrJobIDExists) && try < idRedraws {
 			cleanup() // the folder of this attempt only; the next candidate owns the cleanup from here
 			cleanup = func() {}
@@ -411,10 +435,14 @@ const idRedraws = 64
 // cap, the codex daily cap, else plain. It reports whether the row was inserted; a cap that
 // refuses returns its error, so a false ok always comes with one.
 func (m *Manager) insertQueued(j *store.Job) (bool, error) {
+	var checks []store.JobAdmission
+	if j.RepoPath != "" && coderJob(j.Kind) && (len(j.Paths) > 0 || j.Parent != "") {
+		checks = append(checks, m.overlapAdmission(j))
+	}
 	if IsOpenRouterJob(j) {
 		capUSD := m.Config().Providers.OpenRouter.DailyCap()
 		since := j.CreatedAt.Add(-OpenRouterCapWindow)
-		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD)
+		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD, checks...)
 		if err != nil {
 			return false, err
 		}
@@ -428,7 +456,7 @@ func (m *Manager) insertQueued(j *store.Job) (bool, error) {
 		return true, nil
 	}
 	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
-		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
+		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit, checks...)
 		if err != nil {
 			return false, err
 		}
@@ -439,7 +467,7 @@ func (m *Manager) insertQueued(j *store.Job) (bool, error) {
 		}
 		return true, nil
 	}
-	if err := m.Store.Insert(j); err != nil {
+	if err := m.Store.Insert(j, checks...); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -479,6 +507,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := checkGateRequest(r); err != nil {
 		return nil, err
 	}
+	if err := validateOverlapRequest(&r); err != nil {
+		return nil, err
+	}
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
@@ -509,6 +540,13 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if openRouter {
 		if err := m.Config().checkOpenRouterJob(orSlug, r.Kind, runner, ""); err != nil {
 			return nil, err
+		}
+		if len(r.Sources) > 0 { // before any snapshot is taken or budget reserved (#146)
+			if r.plannedSources {
+				return nil, fmt.Errorf("%w; task %s of milestone %d has sources planned (give job_start sources: [] to run it without them)",
+					errOpenRouterSources, r.Task, r.Milestone)
+			}
+			return nil, errOpenRouterSources
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
@@ -562,6 +600,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	if r.Branch != "" {
+		if repo == "" {
+			return nil, errors.New("branch given without repo")
+		}
+		if err := validateResultBranch(func(args ...string) (string, error) { return gitHistory(repo, args...) }, r.Branch); err != nil {
+			return nil, err
+		}
+	}
 	if openRouter && repo != "" {
 		// Checked against both the path given and the main worktree it belongs to.
 		for _, p := range []string{top, repo} {
@@ -612,8 +658,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources), Crew: crew,
+		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
+		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
 	}
 	return j, nil
 }
@@ -684,8 +731,14 @@ func (m *Manager) tickLocked() error {
 	if err := m.notifyPending(); err != nil {
 		errs = append(errs, fmt.Errorf("notify: %w", err))
 	}
+	if err := m.nudgeIdleSlots(); err != nil {
+		errs = append(errs, fmt.Errorf("idle slots: %w", err))
+	}
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
+	}
+	if err := m.sloInvestigate(); err != nil {
+		errs = append(errs, fmt.Errorf("slo investigate: %w", err))
 	}
 	return errors.Join(errs...)
 }
@@ -745,6 +798,15 @@ func (m *Manager) launchQueued() error {
 		}
 		if running >= limit {
 			return nil
+		}
+		if wait, cancel, err := m.jobDependencies(j, true); err != nil {
+			m.Log.Printf("job %s: dependency check: %v", j.ID, err)
+			continue
+		} else if cancel != "" {
+			m.cancelQueued(j, "cancelled before start: "+cancel)
+			continue
+		} else if wait != "" {
+			continue
 		}
 		if j.MilestoneID != 0 {
 			// A job on a task is checked again: its milestone may have changed since job_start. It waits for
@@ -891,6 +953,8 @@ func claudeBaseArgs(j *store.Job, jobDir string) []string {
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
 	)
+	// The plugins the daemon resolved for this job (plugins.go); none for a gate job or a job with no match.
+	args = append(args, claudePluginArgs(jobDir)...)
 	// The flag outranks an effortLevel in the worktree's project settings; a row from before the effort
 	// was recorded has none and runs at the CLI default.
 	if j.ReasoningEffort != "" {

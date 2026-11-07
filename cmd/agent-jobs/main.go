@@ -33,7 +33,7 @@ const usage = `usage: agent-jobs <command> [flags]
   init       --agent A                     create state dir, copy owner-rules template,
                                            write orchestrator.md (main-session duties)
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
-             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
+             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF] [--branch NAME]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
              [--runner claude|codex] [--reasoning-effort low|medium|high|xhigh|max] [--owner-waits]
              [--skills a,+b,-c] [--size small|large]
@@ -51,7 +51,7 @@ const usage = `usage: agent-jobs <command> [flags]
                                            undelivered owner notifications, owner replies pending
   list       --agent A [--limit N] [--status S] [--json]
                                            newest jobs first; --json: the HTTP API's /v1/jobs view
-  result     --agent A <id>                print report.md
+  result     --agent A [--full] <id>       print the compact report (Not done, Summary, Forks, commits, section sizes); --full: all of report.md
   cancel     --agent A <id>                cancel a queued/running job, or give up a stopped one
   stop       --agent A <id> [--reason R]   stop a queued/running job, keep work dir and session (resumable)
   resume     --agent A <id> (--context TEXT | --context-file F | stdin)
@@ -74,6 +74,12 @@ const usage = `usage: agent-jobs <command> [flags]
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
+  outcome    --agent A <id> <outcome> [--note N] [--json]
+  outcome    --agent A --input F|- [--json]
+                                           record what you did with finished jobs' results (job_outcome,
+                                           job_outcome_many): one job, or a JSON array of {id, outcome,
+                                           note?} from a file or stdin; each item is answered on its own
+                                           and the exit status is 1 when any failed
   stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
@@ -83,6 +89,14 @@ const usage = `usage: agent-jobs <command> [flags]
                                            the skills rating: delivered, used, success rate, last
                                            used, median cost, stale flag and a per-repository
                                            breakdown (same as GET /v1/skills)
+  stats wakes --agent A [--since D] [--json]
+                                           what reached the orchestrator session: deliveries and hook
+                                           injections per category per day, batch sizes, bytes (p50, p95)
+  slo        record NAME SECONDS --agent A [--json]
+                                           store one duration; over its slo.targets norm it is a breach,
+                                           noted once on the next delivery to the session
+  slo        show --agent A [--since D] [--json]
+                                           per name: count, p50, p95, last and the configured norm
   skills list   --agent A [--kind K] [--repo R] [--status S] [--json]
   skills search --agent A QUERY [--kind K] [--repo R] [--status S] [--json]
                                            the skill catalog (config skill_roots, same as the
@@ -103,6 +117,13 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
+  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
+                                           a heavy local gate (check.sh, a pg suite, a build):
+                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
+                                           /tmp/ where /run/lock is missing), HEAD of DIR
+                                           must be REV before and after, own process group killed
+                                           on timeout (exit 124) and after the command, TELEGRAM_*
+                                           dropped; the last stdout line is always exit=N
   intentions --agent A [--status open|done|dropped] [--json]
                                            the agent's own goals (intention_* MCP tools), oldest first
   milestones --agent A [--status S] [--repo R] [--checklist-id ID] [--updated-since T] [--tree] [--json]
@@ -164,6 +185,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            cost (MISMATCH over 10%), totals per day, per model, 30 days,
                                            headed by the key's usage/limit; --reconcile fills OpenRouter's
                                            record of runs that lack it
+  ui-check   <base-url> <path>... [--out dir] [--schemes S] [--playwright path] [--timeout ms] [--dwell ms] [--limit n]
+                                           the orchestrator's browser check: runs the copy of
+                                           scripts/ui-check.mjs embedded in this binary from a private
+                                           temp dir, never a job dir copy, never Playwright from the
+                                           current directory; exit 0 pass, 1 fail, 2 not run
   version                                  print the version (also --version)
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
@@ -232,7 +258,14 @@ func main() {
 		err = cmdSkills(args)
 	case "stats":
 		err = cmdStats(args)
+	case "slo":
+		err = cmdSLO(args)
+	case "outcome":
+		err = cmdOutcome(args, os.Stdin)
 	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
+		}
 		err = cmdGate(args)
 	case "intentions":
 		err = cmdIntentions(args)
@@ -258,6 +291,8 @@ func main() {
 		err = cmdHeartbeat(args)
 	case "openrouter":
 		err = cmdOpenRouter(args, os.Stdout)
+	case "ui-check":
+		os.Exit(runUICheck(args, os.Stdout, os.Stderr))
 	case "version", "--version":
 		fmt.Printf("agent-jobs %s\n", version)
 		return
@@ -518,6 +553,7 @@ func cmdStart(args []string) error {
 	briefFile := fs.String("brief-file", "", "read brief from file")
 	fs.StringVar(&r.RepoPath, "repo", "", "git repository for the worktree (optional)")
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
+	fs.StringVar(&r.Branch, "branch", "", "result branch (default job/<id>); created only, an existing branch is never moved (job/<id> is used instead)")
 	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
 	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d for fix and general, %d for other kinds; ceiling %d",
@@ -538,12 +574,17 @@ func cmdStart(args []string) error {
 	fs.Float64Var(&r.Crew.AdvisorMaxBudgetUSD, "advisor-max-budget-usd", 0, fmt.Sprintf("crew job: the advisor calls' spend cap in USD, on top of --max-budget-usd; default %g, ceiling %g",
 		jobs.DefaultAdvisorBudgetUSD, jobs.MaxAdvisorBudgetUSD))
 	fs.StringVar(&r.Crew.PairedWith, "paired-with", "", "id of another job on the same brief to compare with in stats (crew vs plain)")
+	var paths multi
+	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
+	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
+	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
+	r.Paths = paths
 	if len(sources) > 0 {
 		r.Sources = sources
 	}
@@ -575,6 +616,13 @@ func cmdStart(args []string) error {
 	fmt.Println(j.ID)
 	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
 		fmt.Fprintln(os.Stderr, "size_warning:", w)
+	}
+	for _, overlap := range j.Overlap {
+		fmt.Fprintf(os.Stderr, "overlap: %s paths %s intersect %s (%s)\n", overlap.ID,
+			strings.Join(overlap.Paths, ", "), strings.Join(overlap.OtherPaths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Fprintln(os.Stderr, n)
 	}
 	if n := m.SameRepoNote(j); n != "" {
 		fmt.Fprintln(os.Stderr, "note:", n)
@@ -632,6 +680,9 @@ func cmdStatus(args []string) error {
 		for _, w := range m.SkillWarnings() {
 			fmt.Println("skills warning:", shown(w))
 		}
+		for _, w := range m.PluginWarnings() {
+			fmt.Println("plugins warning:", shown(w))
+		}
 		if err := printMergeGates(m); err != nil {
 			return err
 		}
@@ -651,6 +702,24 @@ func cmdStatus(args []string) error {
 	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
 	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
+	if j.RequestedBranch != "" {
+		fmt.Printf("requested branch: %s\n", j.RequestedBranch)
+	}
+	if j.Branch != "" {
+		fmt.Printf("branch:    %s\n", j.Branch)
+	}
+	if j.BranchNote != "" {
+		fmt.Printf("branch note: %s\n", j.BranchNote)
+	}
+	if j.Parent != "" {
+		fmt.Printf("parent:    %s (result %s)\n", j.Parent, j.ParentBase)
+	}
+	if len(j.Paths) > 0 {
+		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Printf("waiting:   %s\n", n)
+	}
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
 	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
@@ -662,6 +731,17 @@ func cmdStatus(args []string) error {
 		if j.SkillsNote != "" {
 			fmt.Printf("           %s\n", j.SkillsNote)
 		}
+	}
+	plugins, pluginWarns := m.JobPlugins(j)
+	for _, p := range plugins {
+		hooks := "off"
+		if p.Hooks {
+			hooks = "allowed"
+		}
+		fmt.Printf("plugin:    %s %s (hooks %s)\n", shown(p.Name), shown(p.Version), hooks)
+	}
+	for _, w := range pluginWarns {
+		fmt.Printf("plugin warning: %s\n", shown(w))
 	}
 	if len(j.Sources) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.Sources, ", "))
@@ -888,11 +968,11 @@ func cmdList(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
+	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tBRANCH\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
 			jobs.CostText(j.CostUSD, j.CostIsUnknown()),
-			fmtTime(&j.CreatedAt), containShort(j), j.Title)
+			fmtTime(&j.CreatedAt), containShort(j), j.Branch, j.Title)
 	}
 	return w.Flush()
 }
@@ -947,6 +1027,7 @@ func containShort(j *store.Job) string {
 func cmdResult(args []string) error {
 	fs := flag.NewFlagSet("result", flag.ContinueOnError)
 	agent := agentFlag(fs)
+	full := fs.Bool("full", false, "print the whole report.md (default: Not done / uncertain, Summary, Forks, commits and section sizes)")
 	id, err := oneID(fs, args)
 	if err != nil {
 		return err
@@ -990,11 +1071,36 @@ func cmdResult(args []string) error {
 	}
 	// Redacted on the fly (the in-place redaction may be pending), "Not done / uncertain" first and
 	// "Progress" after it, like job_result.
-	fmt.Print("\n" + jobs.ReadFirst(jobs.RedactRead(text, truncated)))
+	text = jobs.RedactRead(text, truncated)
+	if *full {
+		fmt.Print("\n" + jobs.ReadFirst(text))
+	} else {
+		printResultSummary(m, j, text)
+	}
 	if truncated {
-		fmt.Printf("\n[report cut at %d bytes; full file: %s]\n", jobs.MaxRedactBytes, filepath.Join(m.JobDir(id), "report.md"))
+		fmt.Printf("\n[%s]\n", mcp.IncompleteScanNote(filepath.Join(m.JobDir(id), "report.md")))
 	}
 	return nil
+}
+
+// printResultSummary prints the compact view of a redacted report (what job_result returns by default):
+// "Not done / uncertain" whole (capped with a marker), Summary, Forks, the job's commits and the size of
+// every section.
+func printResultSummary(m *jobs.Manager, j *store.Job, report string) {
+	d := jobs.DigestReport(report, mcp.SummaryFieldBytes)
+	for _, s := range []struct{ name, body string }{{jobs.SectionNotDone, d.NotDone}, {jobs.SectionSummary, d.Summary}, {jobs.SectionForks, d.Forks}} {
+		if s.body != "" {
+			fmt.Printf("\n## %s\n%s\n", s.name, s.body)
+		}
+	}
+	commits, note := m.JobCommits(j)
+	if len(commits) > 0 {
+		fmt.Printf("\n## Commits\n%s\n", strings.Join(commits, "\n"))
+	}
+	if note != "" {
+		fmt.Printf("\n[%s]\n", note)
+	}
+	fmt.Printf("\n[%s; --full prints all of it]\n", d.SizesHint())
 }
 
 func cmdCancel(args []string) error {
@@ -1515,7 +1621,7 @@ func cmdGate(args []string) error {
 	}
 	if len(args) == 0 || (args[0] != "slicing" && args[0] != "briefing" && args[0] != "verdict") {
 		return errors.New("usage: agent-jobs gate slicing|briefing|verdict --agent A --repo PATH [--sha S] [--checklist-id ID] | " +
-			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO")
+			"gate release-check --agent A --repo PATH --sha S | gate retire --agent A REPO | " + gateRunUsage[len("usage: agent-jobs "):])
 	}
 	fs := flag.NewFlagSet("gate "+args[0], flag.ContinueOnError)
 	agent := agentFlag(fs)
@@ -1844,6 +1950,9 @@ func cmdNotifyOwner(args []string) error {
 }
 
 func cmdStats(args []string) error {
+	if len(args) > 0 && args[0] == "wakes" {
+		return cmdStatsWakes(args[1:])
+	}
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	since := fs.String("since", "", "only jobs finished since: <n>d, a duration (36h) or a date YYYY-MM-DD")
@@ -2145,19 +2254,24 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if sub == "brief-reminder" {
 		type answer struct {
 			line string
-			warn string
-			err  error
+			// emission is the pending-outcome block inside line; it holds the dedupe state lock until this
+			// goroutine commits it after line reached stdout, or releases it.
+			emission *jobs.HookEmission
+			warn     string
+			err      error
 		}
 		done := make(chan answer, 1)
 		go func() {
-			line, warn, err := briefReminder(args[1:], stdin, openReadOnly)
-			done <- answer{line, warn, err}
+			line, em, warn, err := briefReminder(args[1:], stdin, briefReminderOpener)
+			done <- answer{line, em, warn, err}
 		}()
 		var a answer
 		select {
 		case a = <-done:
 		case <-time.After(briefReminderTimeout):
 			a.err = fmt.Errorf("no answer within %s", briefReminderTimeout)
+			// A worker that answers late is never delivered: its emission is dropped unrecorded.
+			go func() { (<-done).emission.Release() }()
 		}
 		if a.warn != "" {
 			fmt.Fprintln(stderr, a.warn)
@@ -2166,11 +2280,18 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 		case errors.Is(a.err, jobs.ErrInJobSession):
 			// A job session: silent, like the job-role refusal in main.
 		case a.err != nil:
+			a.emission.Release()
 			fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", a.err, "(no reminder)")
 		case a.line != "":
 			if _, err := fmt.Fprintln(stdout, a.line); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				a.emission.Release()
 				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err)
+			} else if err := a.emission.Commit(); err != nil {
+				fmt.Fprintln(stderr, "agent-jobs hook brief-reminder:", err, "(emission not recorded)")
 			}
+		default:
+			a.emission.Release()
 		}
 		return 0
 	}
@@ -2210,10 +2331,21 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 			return fail(err)
 		}
 		// SessionStart stdout becomes context, including after a restart or compaction.
-		if line, err := m.PendingOutcomeReminder(in.SessionID); err != nil {
+		em, err := m.PendingOutcomeReminder(in.SessionID)
+		switch {
+		case err != nil:
 			fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(no pending-outcome reminder)")
-		} else if line != "" {
-			fmt.Fprintln(stdout, line)
+		case em != nil:
+			if _, err := fmt.Fprintln(stdout, em.Text); err != nil {
+				// Not delivered: nothing is recorded, so the next run injects the block again.
+				em.Release()
+				fmt.Fprintln(stderr, "agent-jobs hook bind:", err)
+			} else {
+				m.RecordInjection(jobs.InjectPendingOutcome, em.Text)
+				if err := em.Commit(); err != nil {
+					fmt.Fprintln(stderr, "agent-jobs hook bind:", err, "(emission not recorded)")
+				}
+			}
 		}
 		return 0
 	}
@@ -2239,13 +2371,14 @@ func runHook(args []string, stdin io.Reader, stdout, stderr io.Writer, opener fu
 	if err != nil {
 		return fail(err)
 	}
-	out := jobs.StopHookDecision(in, pending)
+	out := jobs.StopHookDecisionCapped(in, pending, m.Config().Hooks.Max())
 	if out == nil {
 		return 0
 	}
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
 		return fail(err)
 	}
+	m.RecordInjection(jobs.InjectStop, out.Reason)
 	return 0
 }
 
@@ -2318,6 +2451,8 @@ func mergeGateHook(args []string, stdin io.Reader, stdout, stderr io.Writer, ope
 		// hook JSON on stdout (mergeGateWarningJSON).
 		if err := json.NewEncoder(stdout).Encode(mergeGateWarningJSON(a.warning)); err != nil {
 			fmt.Fprintln(stderr, a.warning) // the transcript still has it; the warning never blocks
+		} else if err := recordInjection(*agent, jobs.InjectMergeGate, a.warning); err != nil {
+			fmt.Fprintln(stderr, "agent-jobs hook merge-gate:", err)
 		}
 	}
 	return 0
@@ -2348,61 +2483,90 @@ func mergeGateWarningJSON(warning string) preToolUseOutput {
 
 // briefReminderTimeout bounds the whole brief reminder (store reads, git, checklist files): past it the
 // prompt goes on without a reminder.
-const briefReminderTimeout = 2 * time.Second
+var briefReminderTimeout = 2 * time.Second
+
+// briefReminderOpener opens the store for the brief reminder (replaced in tests).
+var briefReminderOpener = openReadOnly
 
 // briefReminder is `hook brief-reminder`: reminder lines (UserPromptSubmit stdout becomes context),
 // "" for a session other than the bound one.
-func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, string, error) {
+//
+// The returned emission (nil when there is no pending-outcome block) is part of line and holds the dedupe
+// state lock: the caller commits it once line reached stdout, or releases it.
+func briefReminder(args []string, stdin io.Reader, opener func(string) (*jobs.Manager, error)) (string, *jobs.HookEmission, string, error) {
 	fs := flag.NewFlagSet("hook brief-reminder", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	if len(pos) > 0 {
-		return "", "", errors.New("no positional arguments")
+		return "", nil, "", errors.New("no positional arguments")
 	}
 	in, err := jobs.ParseUserPromptInput(stdin)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	m, err := opener(*agent)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
 	defer m.Close()
 	line, err := m.BriefReminder(in)
 	if err != nil {
-		return "", "", err
+		return "", nil, "", err
 	}
-	pending, err := m.PendingOutcomeReminder(in.SessionID)
+	em, err := m.PendingOutcomeReminder(in.SessionID)
 	if err != nil {
-		return line, fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err), nil
+		warn := fmt.Sprintf("agent-jobs hook brief-reminder: %v (no pending-outcome reminder)", err)
+		if rerr := recordInjection(*agent, jobs.InjectBriefReminder, line); rerr != nil {
+			warn += "; " + rerr.Error()
+		}
+		return line, nil, warn, nil
+	}
+	// The hook holds a read-only store: what it injects is recorded (#170) by a short separate write
+	// that is skipped, never waited for, when the store is busy.
+	warn := ""
+	if rerr := errors.Join(recordInjection(*agent, jobs.InjectBriefReminder, line),
+		recordInjection(*agent, jobs.InjectPendingOutcome, em.Line())); rerr != nil {
+		warn = "agent-jobs hook brief-reminder: " + rerr.Error()
 	}
 	if line == "" {
-		return pending, "", nil
+		return em.Line(), em, warn, nil
 	}
-	if pending != "" {
-		line += "\n" + pending
+	if em != nil {
+		line += "\n" + em.Text
 	}
-	return line, "", nil
+	return line, em, warn, nil
+}
+
+// recordInjection counts text a hook added to the session's context. The write is best effort (a busy
+// or older store is not worth a hook failure or a wait), but a miss is never silent: the error comes
+// back for the hook's stderr and the injection is counted in the dropped-injections file, which
+// `stats wakes` reports as unrecorded.
+func recordInjection(agent, category, text string) error {
+	if err := jobs.RecordHookInjection(agent, category, text, time.Now()); err != nil {
+		return fmt.Errorf("%s injection of %d bytes not recorded: %v", category, len(text), jobs.Printable(err.Error(), 200))
+	}
+	return nil
 }
 
 // skillsPickerHook is `hook skills-picker` (G01): the picker's context as PreToolUse additionalContext,
-// nothing when it has none. It reads only its input (no state; --agent is accepted and not needed) and
+// nothing when it has none. It reads only its input (--agent only attributes the added context for #170) and
 // always exits 0: an error goes to stderr and the call goes on.
 func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hook skills-picker", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	agentFlag(fs)
+	agent := agentFlag(fs)
 	pos, err := parse(fs, args)
 	if err == nil && len(pos) > 0 {
 		err = errors.New("no positional arguments")
 	}
 	var msg string
 	if err == nil {
-		msg, err = jobs.SkillsPicker(stdin)
+		// The picker reads no state, only the configured byte cap of the agent (the default when unknown).
+		msg, err = jobs.SkillsPickerCapped(stdin, jobs.HookMaxBytesOf(*agent))
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", jobs.Printable(err.Error(), 300), "(no reminder)")
@@ -2423,6 +2587,13 @@ func skillsPickerHook(args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+	} else if *agent == "" {
+		// Counted (#170) only with an agent to attribute it to (the registration passes --agent).
+		fmt.Fprintln(stderr, "agent-jobs hook skills-picker: no --agent or AGENT_JOBS_AGENT: this injection is not counted")
+	} else {
+		if err := recordInjection(*agent, jobs.InjectSkillsPicker, msg); err != nil {
+			fmt.Fprintln(stderr, "agent-jobs hook skills-picker:", err)
+		}
 	}
 	return 0
 }

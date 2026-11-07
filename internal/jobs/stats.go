@@ -616,37 +616,44 @@ const MaxOutcomeNoteRunes = 300
 // (job_outcome); a later call overwrites it. Unknown ids, other agents' jobs and jobs that are still
 // queued, running or stopped are refused.
 func (m *Manager) SetOutcome(id, outcome, note string) error {
+	_, _, err := m.setOutcome(id, outcome, note)
+	return err
+}
+
+// setOutcome is SetOutcome that also returns the outcome and note it committed (trimmed), so a caller
+// can acknowledge them without a second, racy read of the row.
+func (m *Manager) setOutcome(id, outcome, note string) (string, string, error) {
 	id, outcome, note = strings.TrimSpace(id), strings.TrimSpace(outcome), strings.TrimSpace(note)
 	if id == "" {
-		return errors.New("id is required")
+		return "", "", errors.New("id is required")
 	}
 	if !slices.Contains(Outcomes, outcome) {
-		return fmt.Errorf("outcome %q must be one of %s", outcome, strings.Join(Outcomes, "|"))
+		return "", "", fmt.Errorf("outcome %q must be one of %s", outcome, strings.Join(Outcomes, "|"))
 	}
 	if n := len([]rune(note)); n > MaxOutcomeNoteRunes {
-		return fmt.Errorf("note is %d characters, at most %d", n, MaxOutcomeNoteRunes)
+		return "", "", fmt.Errorf("note is %d characters, at most %d", n, MaxOutcomeNoteRunes)
 	}
 	j, err := m.Store.Get(id)
 	if errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("job %q not found", id)
+		return "", "", fmt.Errorf("job %q not found", id)
 	}
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	if j.Agent != m.Agent {
-		return fmt.Errorf("job %s belongs to agent %s, not %s", id, j.Agent, m.Agent)
+		return "", "", fmt.Errorf("job %s belongs to agent %s, not %s", id, j.Agent, m.Agent)
 	}
 	switch j.Status {
 	case store.StatusQueued, store.StatusRunning, store.StatusStopped:
-		return fmt.Errorf("job %s is %s: an outcome is recorded once the job has finished", id, j.Status)
+		return "", "", fmt.Errorf("job %s is %s: an outcome is recorded once the job has finished", id, j.Status)
 	}
 	if err := m.Store.SetOutcome(id, m.Agent, outcome, note, m.Now()); err != nil {
 		if errors.Is(err, store.ErrImmutable) {
-			return fmt.Errorf("job %s changed meanwhile and is not finished: %w", id, err)
+			return "", "", fmt.Errorf("job %s changed meanwhile and is not finished: %w", id, err)
 		}
-		return err
+		return "", "", err
 	}
-	return nil
+	return outcome, note, nil
 }
 
 // StatsSummary aggregates a set of finished jobs. Percentiles are nearest-rank.

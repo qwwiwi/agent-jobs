@@ -1,11 +1,16 @@
 package jobs
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
 
 // Report section names of the report contract (prompts/report-contract.md).
 const (
 	SectionNotDone  = "Not done / uncertain"
 	SectionProgress = "Progress"
+	SectionForks    = "Forks"
 )
 
 // reportSection is one "## " section of a report: its heading line and its body.
@@ -133,4 +138,102 @@ func OffContractNote(errMsg string) string {
 		}
 	}
 	return ""
+}
+
+// SectionSummary is the report's Summary section name.
+const SectionSummary = "Summary"
+
+// SectionSize is one report section and its size in bytes (heading line included).
+type SectionSize struct {
+	Name  string `json:"name"`
+	Bytes int    `json:"bytes"`
+}
+
+// ReportSectionSizes lists the "## " sections of a report in order with their sizes.
+func ReportSectionSizes(report string) []SectionSize {
+	_, secs := splitReport(report)
+	out := make([]SectionSize, 0, len(secs))
+	for _, s := range secs {
+		out = append(out, SectionSize{Name: s.name, Bytes: len(s.text)})
+	}
+	return out
+}
+
+// ReportSectionTexts returns the named sections as written (heading line included, report order,
+// names matched case-insensitively, the last section of a name wins) and the names that are not in the report.
+func ReportSectionTexts(report string, names ...string) (string, []string) {
+	_, secs := splitReport(report)
+	var b strings.Builder
+	var missing []string
+	for _, n := range names {
+		n = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(n), "## "))
+		found := -1
+		for i := len(secs) - 1; i >= 0; i-- {
+			if strings.EqualFold(secs[i].name, n) {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			missing = append(missing, n)
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(strings.TrimRight(secs[found].text, "\n") + "\n")
+	}
+	return b.String(), missing
+}
+
+// CapText cuts s to at most max bytes at a rune boundary and appends a marker saying how much was
+// left out; s is returned as is when it fits. The marker is not counted in max.
+func CapText(s string, max int) (string, bool) {
+	if max < 0 || len(s) <= max {
+		return s, false
+	}
+	cut := max
+	for cut > 0 && cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s\n[cut: %d of %d bytes shown]", s[:cut], cut, len(s)), true
+}
+
+// ReportDigest is the compact view of a report: the sections an orchestrator reads first, each
+// capped, and the size of every section so it can ask for the rest.
+type ReportDigest struct {
+	NotDone, Summary, Forks string
+	Sizes                   []SectionSize
+	Bytes                   int
+	// Cut lists the digest fields that were cut at the cap.
+	Cut []string
+}
+
+// DigestReport builds the digest of a report; each of the three text fields is capped at maxField bytes
+// (a cut one ends with a marker). "Not done / uncertain" is never left out, only capped.
+func DigestReport(report string, maxField int) ReportDigest {
+	secs := ReportSections(report, SectionNotDone, SectionSummary, SectionForks)
+	d := ReportDigest{Sizes: ReportSectionSizes(report), Bytes: len(report)}
+	fields := []struct {
+		name string
+		src  string
+		dst  *string
+	}{{SectionNotDone, secs[0], &d.NotDone}, {SectionSummary, secs[1], &d.Summary}, {SectionForks, secs[2], &d.Forks}}
+	for _, f := range fields {
+		var cut bool
+		*f.dst, cut = CapText(f.src, maxField)
+		if cut {
+			d.Cut = append(d.Cut, f.name)
+		}
+	}
+	return d
+}
+
+// SizesHint is one line naming every section with its size, for the compact view.
+func (d ReportDigest) SizesHint() string {
+	parts := make([]string, len(d.Sizes))
+	for i, s := range d.Sizes {
+		parts[i] = fmt.Sprintf("%s %d B", s.Name, s.Bytes)
+	}
+	return fmt.Sprintf("report %d B: %s", d.Bytes, strings.Join(parts, ", "))
 }
