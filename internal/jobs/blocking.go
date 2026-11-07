@@ -14,8 +14,9 @@ import (
 // of Findings / Changes, one finding per line, "none" when empty. It does not fix an ID scheme, so a
 // fix brief is built only from a review whose Blocking items carry one (F1, H2, C1, M3: one or two
 // capital letters and a number). An item may declare several IDs («- H1: a; H2: b»); each ID stands
-// first on the item or right after its file:line (and a severity word), or after "; " / "," or at the
-// start of a wrapped line or sub-bullet. An item whose IDs cannot be told from mentions, or that has
+// first on the item or right after its file:line (and a severity word), or after "; " / "|" or at the
+// start of a wrapped line or sub-bullet, in each place with the same syntax (whitespace or a delimiter
+// after it); after "," it needs a delimiter. An item whose IDs cannot be told from mentions, or that has
 // none, is refused loudly with the line named instead of being accepted as a subset: a dropped finding
 // is the very failure this parser exists to prevent.
 //
@@ -53,18 +54,24 @@ var (
 	// The first ID of an item: nothing but the location before it, a delimiter (or the end) after it.
 	declFirstPrefix = regexp.MustCompile("^(?:" + declLocation + ")?[\\s*_`\\[(]*$")
 	declFirstSuffix = regexp.MustCompile("^(?:[\\]):.*_`\\s—–-]|$)")
-	// A further ID: right after "; " / ", " / "|" or at the start of a wrapped line or sub-bullet, and
-	// followed by punctuation.
-	declLaterPrefix = regexp.MustCompile("(?:[;,|]|\\n[ \\t]*(?:(?:[-*+]|[0-9]{1,3}[.)])[ \\t]+)?)[ \\t]*(?:" + declLocation + ")?[\\s*_`\\[(]*$")
-	declLaterSuffix = regexp.MustCompile("^[*_`\\])]*(?:\\s*[:—–]|\\.(?:\\s|$)|\\s+-\\s)")
+	// A further ID at the start of a wrapped line or sub-bullet, or right after "; " / "|", takes the
+	// first ID's syntax: its location before it, a delimiter or whitespace after it.
+	declLaterPrefix = regexp.MustCompile("(?:[;|]|\\n[ \\t]*(?:(?:[-*+]|[0-9]{1,3}[.)])[ \\t]+)?)[ \\t]*(?:" + declLocation + ")?[\\s*_`\\[(]*$")
+	// After ", " an ID is a declaration only when punctuation follows it: «M1, M2 and L3» lists mentions
+	// as much as declarations, so a comma ID followed by whitespace alone makes the item ambiguous.
+	declCommaPrefix = regexp.MustCompile(",[ \\t]*(?:" + declLocation + ")?[\\s*_`\\[(]*$")
+	declCommaSuffix = regexp.MustCompile("^[*_`\\])]*(?:\\s*[:—–]|\\.(?:\\s|$)|\\s+-\\s)")
 	// An ID followed like a declaration but standing elsewhere makes the item ambiguous.
 	declLooksLike = regexp.MustCompile("^[*_`\\])]*\\s*[:—–]")
 
-	// The start of a detailed entry: a heading or a bold paragraph opening with the ID, or a plain
-	// «H1: …» / «H1 — …» paragraph. Bullets never start one (a Delivered bullet that names an ID is a
-	// status, not the finding).
-	entryStartMarked = regexp.MustCompile(`^(?:#{1,6}\s+(?:\*\*|__)?|\*\*|__)\[?(` + blockingIDPattern + `)\b`)
-	entryStartPlain  = regexp.MustCompile("^[`\\[(]*(" + blockingIDPattern + ")[*_`\\])]*\\s*[:—–]")
+	// The start of a detailed entry: a heading or a bold paragraph opening with the ID, or with a
+	// severity word and then the ID («**High — H1: …**», «### Medium: M1 …»), or a plain «H1: …» /
+	// «H1 — …» paragraph. Bullets never start one (a Delivered bullet that names an ID is a status, not
+	// the finding).
+	entryStartMarked = regexp.MustCompile(`^(?:#{1,6}\s+(?:\*\*|__)?|\*\*|__)` +
+		`(?:(?i:critical|high|medium|low|major|minor|severe|p[0-3]|sev[0-3])(?:\*\*|__)?\s*[:—–-]+\s*(?:\*\*|__)?)?` +
+		`\[?(` + blockingIDPattern + `)\b`)
+	entryStartPlain = regexp.MustCompile("^[`\\[(]*(" + blockingIDPattern + ")[*_`\\])]*\\s*[:—–]")
 )
 
 // ParseBlocking extracts every finding of the «### Blocking» section of a review report, each with
@@ -158,9 +165,11 @@ func declaredIDs(lines []string) ([]string, error) {
 		case slices.Contains(ids, id):
 			// Repeated inside the item: the same finding.
 		case declFirstPrefix.MatchString(before) && declFirstSuffix.MatchString(after),
-			declLaterPrefix.MatchString(before) && declLaterSuffix.MatchString(after):
+			declLaterPrefix.MatchString(before) && declFirstSuffix.MatchString(after),
+			declCommaPrefix.MatchString(before) && declCommaSuffix.MatchString(after):
 			ids = append(ids, id)
-		case declLooksLike.MatchString(after):
+		case declLooksLike.MatchString(after),
+			declCommaPrefix.MatchString(before) && declFirstSuffix.MatchString(after):
 			line := lines[min(strings.Count(before, "\n"), len(lines)-1)]
 			return nil, fmt.Errorf("a Blocking item declares %s in a place that cannot be told from a mention "+
 				"(put each ID first on its own item, or right after its file:line): %q", id, Printable(strings.TrimSpace(line), 160))

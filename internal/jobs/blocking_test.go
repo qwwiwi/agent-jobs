@@ -2,7 +2,10 @@ package jobs
 
 import (
 	"errors"
+	"maps"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -243,5 +246,148 @@ func TestParseBlockingWithoutDetailedEntry(t *testing.T) {
 	}
 	if strings.Contains(got[0].Body, "H2") || strings.Contains(got[1].Body, "Reproduced with") {
 		t.Errorf("bodies crossed:\n%s\n---\n%s", got[0].Body, got[1].Body)
+	}
+}
+
+// H1 (#197 fix loop 2): a further ID takes the same declaration syntax as the first one, so a
+// whitespace-delimited ID on a sub-bullet or wrapped line is tracked, not left as body text.
+func TestParseBlockingNestedAndWrappedIDs(t *testing.T) {
+	cases := map[string]struct{ section, want string }{
+		"nested sub-bullet, no punctuation":   {"- H1: first\n  - H2 second\n", "H1,H2"},
+		"wrapped location, no punctuation":    {"- a.go:1 — H1: first\n  b.go:2 — H2 second\n", "H1,H2"},
+		"wrapped bare id, no punctuation":     {"- H1: first\n  H2 second\n", "H1,H2"},
+		"after a semicolon, no punctuation":   {"- H1: first; H2 second\n", "H1,H2"},
+		"numbered sub-bullet, no punctuation": {"- H1: first\n  1. H2 second\n", "H1,H2"},
+	}
+	for name, c := range cases {
+		got, err := idsOf(t, c.section)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: got %q, want %q", name, got, c.want)
+		}
+	}
+	// The nested ID gets the item as its body: its own text is there.
+	got, err := ParseBlocking("## Findings / Changes\n\n### Blocking\n- H1: first\n  - H2 second\n\n### Non-blocking\nnone\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !strings.Contains(got[1].Body, "H2 second") {
+		t.Errorf("H2 body: %+v", got)
+	}
+}
+
+// An ID after a comma with nothing but a space after it reads as a mention as much as a declaration
+// («same cause as M1, M2 and L3»): the item is refused with the line named, never accepted as a subset.
+func TestParseBlockingCommaIDWithoutPunctuationIsRefused(t *testing.T) {
+	_, err := idsOf(t, "- H1: same cause as the overflow, M2 and L3 too\n")
+	if err == nil || !strings.Contains(err.Error(), "M2") {
+		t.Errorf("want an error naming M2, got %v", err)
+	}
+}
+
+// H4 (#197 fix loop 2): a detailed entry may put its severity before the ID («**High — H1: …**»).
+// Fixture: docs/benchmarks/2026-11-06/reports/L-119-sonnet-medium-review.md, copied unchanged.
+func TestParseBlockingResolvesSeverityFirstEntriesL119(t *testing.T) {
+	got, err := ParseBlocking(readFixtureFile(t, "review-l119.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "H1" || got[1].ID != "M1" {
+		t.Fatalf("findings: %+v", got)
+	}
+	want := map[int][]string{
+		0: {"H1: deliver the idle-slot nudge", "**High — H1: nudge never reaches the orchestrator.**",
+			"only calls `m.Log.Printf`", "**Fix:** deliver through the existing notification channel"},
+		1: {"M1: exclude blocked queued jobs", "**Medium — M1: blocked queue entries incorrectly consume slots.**",
+			"computes zero free slots despite four available", "**Fix:** count occupied running slots"},
+	}
+	for i, parts := range want {
+		for _, p := range parts {
+			if !strings.Contains(got[i].Body, p) {
+				t.Errorf("%s body lacks %q:\n%s", got[i].ID, p, got[i].Body)
+			}
+		}
+	}
+	for i, not := range map[int][]string{
+		0: {"blocked queue entries", "L1:", "### Blocking", "Evidence"},
+		1: {"nudge never reaches", "new HTTP field bypasses", "capField", "Evidence"},
+	} {
+		for _, n := range not {
+			if strings.Contains(got[i].Body, n) {
+				t.Errorf("%s body took unrelated text %q:\n%s", got[i].ID, n, got[i].Body)
+			}
+		}
+	}
+}
+
+// Every review report of the benchmarks either parses with every ID of its Blocking section tracked
+// and every detailed entry of a tracked ID attached, or is refused with an error: never a silent
+// subset. The oracle is independent of the parser's patterns: any ID token in the Blocking section,
+// and any heading or bold paragraph outside it that names the ID before its first colon.
+func TestParseBlockingBenchmarkReportsDropNothing(t *testing.T) {
+	files, err := filepath.Glob("../../docs/benchmarks/*/reports/*-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no benchmark review reports found")
+	}
+	parsed := 0
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report := string(b)
+		name := filepath.Base(f)
+		all := strings.Split(strings.ReplaceAll(report, "\r\n", "\n"), "\n")
+		head, end, found := blockingSection(all)
+		got, perr := ParseBlocking(report)
+		switch {
+		case errors.Is(perr, ErrNoBlockingSection):
+			if found {
+				t.Errorf("%s: ErrNoBlockingSection, but the section exists", name)
+			}
+			continue
+		case errors.Is(perr, ErrNothingToFix):
+			if ids := idToken.FindAllString(strings.Join(all[head+1:end], "\n"), -1); len(ids) > 0 {
+				t.Errorf("%s: nothing to fix, but the Blocking section names %v", name, ids)
+			}
+			continue
+		case perr != nil:
+			// Refused loudly: nothing is accepted, so nothing is dropped silently.
+			if !strings.Contains(perr.Error(), "Blocking item") {
+				t.Errorf("%s: unexpected error %v", name, perr)
+			}
+			continue
+		}
+		parsed++
+		bodies := map[string]string{}
+		for _, g := range got {
+			bodies[g.ID] = g.Body
+		}
+		for _, id := range idToken.FindAllString(strings.Join(all[head+1:end], "\n"), -1) {
+			if _, ok := bodies[id]; !ok {
+				t.Errorf("%s: %s is in the Blocking section but was not tracked (got %v)", name, id, slices.Collect(maps.Keys(bodies)))
+			}
+		}
+		fenced := fencedLines(all)
+		for i, line := range all {
+			if (i >= head && i < end) || fenced[i] || !(strings.HasPrefix(line, "#") || strings.HasPrefix(line, "**") || strings.HasPrefix(line, "__")) {
+				continue
+			}
+			lead, _, _ := strings.Cut(line, ":")
+			for _, id := range idToken.FindAllString(lead, -1) {
+				if body, ok := bodies[id]; ok && !strings.Contains(body, strings.TrimRight(line, " \t")) {
+					t.Errorf("%s:%d: the detailed entry of %s is not in its body: %q", name, i+1, id, line)
+				}
+			}
+		}
+	}
+	if parsed == 0 {
+		t.Error("no benchmark report parsed: the check covers nothing")
 	}
 }
