@@ -719,6 +719,9 @@ func (m *Manager) tickLocked() error {
 	if err := m.retryScopeStops(); err != nil {
 		errs = append(errs, fmt.Errorf("scope stop: %w", err))
 	}
+	if err := m.retryAdvisorEnds(); err != nil {
+		errs = append(errs, fmt.Errorf("advisor calls: %w", err))
+	}
 	if err := m.retryRedactions(); err != nil {
 		errs = append(errs, fmt.Errorf("redaction: %w", err))
 	}
@@ -1981,14 +1984,17 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		}
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
+	// Admission is closed for the transition: the running advisor calls end first, and one that cannot be
+	// ended (kept registered, retried every tick) keeps the attempt from counting as a clean finish.
 	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(j.ID); note != "" {
+			status, msg = advisorsNotEnded(status, msg, note)
+		}
 		return m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now)
 	}); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
-	// The row has left running: no advisor call is admitted any more, and the ones running end now.
-	m.noteSweep(j.ID, m.endAdvisors(j.ID))
 	// A crew job's advisor calls run in sessions of their own, outside the wrapper's session sweep: what
 	// they left outside their group is swept after any finish, a successful one too (issue #190).
 	if status == store.StatusTimeout || status == store.StatusFailed || j.Crew.HasAdvisor() {
@@ -2225,13 +2231,15 @@ func (m *Manager) Cancel(id string) error {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
+	// Admission is closed for the transition; the running advisor calls end first (finish).
 	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(id); note != "" {
+			_, msg = advisorsNotEnded(store.StatusCancelled, msg, note)
+		}
 		return m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now)
 	}); err != nil {
 		return err
 	}
-	// The row has left running: no advisor call is admitted any more, and the ones running end now.
-	m.noteSweep(id, m.endAdvisors(id))
 	m.noteSweep(id, m.sweepEscaped(id))
 	m.settled(id)
 	return nil

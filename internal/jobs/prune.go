@@ -175,6 +175,11 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 
 func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 	pj := PruneJob{ID: j.ID, Status: j.Status, Removed: []PruneEntry{}, Archived: []PruneEntry{}, Kept: []string{}}
+	if m.advisorPending(j) {
+		// Its registrations are the only record of what to end: kept with the folder until the tick ended them.
+		pj.Skipped = "advisor calls of the job are not ended yet (retried every tick), not touched"
+		return pj
+	}
 	dir := m.JobDir(j.ID)
 	fi, err := os.Lstat(dir)
 	switch {

@@ -21,7 +21,9 @@ import (
 // timeout claim and the row leaving running in finish, Cancel and Stop) run under the same lock
 // (closingAdmission, issue #190), and each of those paths then ends the registered calls under it. So
 // either a call registered first (and is ended with the job), or the transition came first (and the
-// call's admission refuses to start its process); none can fall between the check and the start. The advisor dir is the daemon's, outside the
+// call's admission refuses to start its process); none can fall between the check and the start. The
+// wrapper's completion record (also read by the check) is not taken under this lock: a call admitted
+// just before it is ended by the finish that collects the attempt. The advisor dir is the daemon's, outside the
 // job's folder: the job cannot forge a registration. whileJobRuns' polling stays as a fallback.
 
 // advisorRun is the registration of one running advisor call (<AdvisorDir>/run.<n>.json).
@@ -191,6 +193,17 @@ func (m *Manager) endAdvisors(id string) string {
 		return "advisor calls not checked: " + err.Error()
 	}
 	defer unlock()
+	return m.endAdvisorsHeld(id)
+}
+
+// endAdvisorsHeld is endAdvisors for a caller that holds the advisor lock (closingAdmission's fn). A
+// call that could not be ended keeps its registration (durable ownership, issue #190): the tick retries
+// it (retryAdvisorEnds), and the job is neither resumed nor pruned while it is there (advisorPending).
+func (m *Manager) endAdvisorsHeld(id string) string {
+	dir := m.AdvisorDir(id)
+	if _, err := os.Stat(dir); err != nil {
+		return ""
+	}
 	paths, err := filepath.Glob(filepath.Join(dir, "run.*.json"))
 	if err != nil {
 		return "advisor calls not checked: " + err.Error()
@@ -243,34 +256,59 @@ func (m *Manager) endAdvisorRun(id string, r advisorRun) string {
 }
 
 // advisorMember reports whether pid is a live (non-zombie) member of registered advisor call r's
-// process group that is proven the call's whether or not its leader is still there: it carries job
-// id's marker and started no earlier than the call's leader.
+// process group or session that is proven the call's whether or not its leader is still there: it
+// carries job id's marker and started no earlier than the call's leader.
 func advisorMember(id string, r advisorRun) func(int) bool {
 	return func(pid int) bool {
 		p, err := procStatFull(pid)
-		return err == nil && p.state != "Z" && p.pgid == r.PID && procMarker(pid) == id && (r.Start == 0 || p.start >= r.Start)
+		return err == nil && p.state != "Z" && (p.pgid == r.PID || p.sid == r.PID) && procMarker(pid) == id &&
+			(r.Start == 0 || p.start >= r.Start)
 	}
+}
+
+// advisorMembers lists the processes of call r's process group and session proven the call's.
+func advisorMembers(id string, r advisorRun) ([]int, error) {
+	group, err := groupMembers(r.PID)
+	if err != nil {
+		return nil, err
+	}
+	session, err := sessionMembers(r.PID)
+	if err != nil {
+		return nil, err
+	}
+	pids := slices.Compact(slices.Sorted(slices.Values(append(group, session...))))
+	isMember := advisorMember(id, r)
+	return slices.DeleteFunc(pids, func(pid int) bool { return !isMember(pid) }), nil
 }
 
 // advisorGroupRounds bounds endAdvisorGroup's wait (50 ms each) for the members it killed to go.
 const advisorGroupRounds = 60
 
-// endAdvisorGroup ends the members of registered call r's process group proven the call's
+// endAdvisorGroup ends the members of registered call r's process group and session proven the call's
 // (advisorMember), also when the leader has exited or been reaped, each through a pidfd (signalMember),
-// and waits until none is left. A member that is not proven the call's is never signalled. It returns
-// a note when members survived or the group could not be checked ("" when none is left).
+// and waits until none is left. A member that is not proven the call's is never signalled. Without
+// /proc nothing can be proven: a group that keeps processes keeps the registration (fail closed). It
+// returns a note when members survived or could not be checked ("" when none is left).
 func (m *Manager) endAdvisorGroup(id string, r advisorRun) string {
-	if plausibleGroup(r.PID) != nil || !groupAlive(r.PID) {
+	if plausibleGroup(r.PID) != nil {
 		return ""
+	}
+	if !procAvailable() {
+		for round := 0; round < advisorGroupRounds; round++ {
+			if !groupAlive(r.PID) {
+				return ""
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return fmt.Sprintf("advisor call %d: process group %d still has processes, not checked (needs Linux /proc)", r.N, r.PID)
 	}
 	isMember := advisorMember(id, r)
 	var signalErr error
 	for round := 0; round < advisorGroupRounds; round++ {
-		pids, err := groupMembers(r.PID)
+		pids, err := advisorMembers(id, r)
 		if err != nil {
 			return fmt.Sprintf("advisor call %d: process group %d not checked: %v", r.N, r.PID, err)
 		}
-		pids = slices.DeleteFunc(pids, func(pid int) bool { return !isMember(pid) })
 		if len(pids) == 0 {
 			return ""
 		}
@@ -289,4 +327,64 @@ func (m *Manager) endAdvisorGroup(id string, r advisorRun) string {
 		note += ": " + signalErr.Error()
 	}
 	return note
+}
+
+// advisorPending reports whether job j still owns advisor calls that could not be ended (a kept
+// registration, issue #190): resume, cleanup and prune wait until the tick has ended them.
+func (m *Manager) advisorPending(j *store.Job) bool {
+	if !j.Crew.HasAdvisor() {
+		return false
+	}
+	runs, err := filepath.Glob(filepath.Join(m.AdvisorDir(j.ID), "run.*.json"))
+	return err != nil || len(runs) > 0
+}
+
+// errAdvisorPending is the refusal of a resume while advisor calls of the job are not ended.
+func errAdvisorPending(id string) error {
+	return fmt.Errorf("job %s: advisor calls of its last attempt are not ended yet (retried every tick); resume once they are", id)
+}
+
+// advisorsNotEnded is the status and message of an attempt whose advisor calls could not be ended
+// (note): like a failed scope stop, a timeout stays a timeout and a clean finish fails.
+func advisorsNotEnded(status, msg, note string) (string, string) {
+	note = ReasonSurvivors + " (advisor calls not ended, retried every tick: " + note + ")"
+	if msg != "" {
+		note = msg + "; " + note
+	}
+	if status == store.StatusTimeout || status == store.StatusFailed {
+		return status, RedactPrintable(note, 300)
+	}
+	return store.StatusFailed, RedactPrintable(note, 300)
+}
+
+// retryAdvisorEnds retries, every tick, the advisor calls that a job which left running could not end
+// (their registrations were kept): a registration is dropped only once nothing of its call is left.
+// A running job's registrations belong to its live calls and its own lifecycle.
+func (m *Manager) retryAdvisorEnds() error {
+	runs, err := filepath.Glob(filepath.Join(m.StateDir, "advisor", "*", "run.*.json"))
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, p := range runs {
+		id := filepath.Base(filepath.Dir(p))
+		if seen[id] || m.AdvisorDir(id) != filepath.Dir(p) {
+			continue
+		}
+		seen[id] = true
+		j, err := m.Store.Get(id)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			m.Log.Printf("job %s: advisor calls not retried: %v", id, err)
+			continue
+		}
+		if err == nil && j.Status == store.StatusRunning {
+			continue
+		}
+		if note := m.endAdvisors(id); note != "" {
+			m.Log.Printf("job %s: advisor calls still not ended (retry next tick): %s", id, note)
+			continue
+		}
+		m.Log.Printf("job %s: advisor calls ended on retry", id)
+	}
+	return nil
 }

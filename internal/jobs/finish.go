@@ -689,7 +689,7 @@ func (m *Manager) cleanupDue() error {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
 		}
-		if j.ScopePending {
+		if j.ScopePending || m.advisorPending(j) {
 			continue // processes of the job may still use the worktree; retried after the scope stop
 		}
 		f := m.cleanupFails[j.ID]

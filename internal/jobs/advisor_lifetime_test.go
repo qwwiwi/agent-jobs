@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -253,8 +254,18 @@ func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
 			noAdvisorPolling(t)
 			noAutoContinue(e.m)
 			j := e.crewJob(t, 2, 1.0)
+			// The timeout case's tick signals when it reaches its claim: the check below waits for that,
+			// so a slow tick cannot make the case pass without the lock.
+			claiming := make(chan struct{})
 			if how == "timeout" {
 				parentGroup(t, e.m, j)
+				real := e.m.Now // shifted before any goroutine reads it
+				e.m.Now = func() time.Time { return real().Add(3 * time.Hour) }
+				var once sync.Once
+				beforeTimeoutClaim = func(string) { once.Do(func() { close(claiming) }) }
+				t.Cleanup(func() { beforeTimeoutClaim = func(string) {} })
+			} else {
+				close(claiming)
 			}
 			if err := os.WriteFile(filepath.Join(e.dir, "slow"), nil, 0o600); err != nil {
 				t.Fatal(err)
@@ -280,8 +291,6 @@ func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
 					_, err := e.m.Stop(j.ID, "")
 					transition <- err
 				case "timeout":
-					real := e.m.Now
-					e.m.Now = func() time.Time { return real().Add(3 * time.Hour) }
 					transition <- e.m.Tick()
 				default:
 					_, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now())
@@ -292,6 +301,12 @@ func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
 					transition <- nil
 				}
 			}()
+			select {
+			case <-claiming:
+			case <-time.After(15 * time.Second):
+				close(release)
+				t.Fatal("the tick never reached its timeout claim")
+			}
 			crossed := false
 			select {
 			case <-transition:
@@ -345,8 +360,12 @@ func TestAdvisorAdmissionSerializedWithTransition(t *testing.T) {
 // left. "returned": the call came back before its job finished successfully; "draining": the job
 // finished successfully while the call still waited for its inherited pipes, its leader already reaped;
 // "escaped": the child left the call's group (a group of its own in the call's session) and the call
-// came back, so only the escaped-process sweep of the successful finish can end it.
+// came back: the call's session is enumerated too (and a crew job's successful finish sweeps what
+// escaped its groups).
 func TestAdvisorLeaderlessGroupEnded(t *testing.T) {
+	if !procAvailable() {
+		t.Skip("proving group members needs Linux /proc")
+	}
 	for _, when := range []string{"returned", "draining", "escaped"} {
 		t.Run(when, func(t *testing.T) {
 			e := newAdvisor(t)
@@ -408,5 +427,105 @@ func TestAdvisorLeaderlessGroupEnded(t *testing.T) {
 				t.Fatalf("advisor registrations left: %v", runs)
 			}
 		})
+	}
+}
+
+// breakScopeEnd makes every scope stop fail until the returned func restores it: systemctl fails and
+// the direct cgroup sweep finds no cgroup (cgroupRoot is an empty temp dir, without the parent slice).
+func breakScopeEnd(t *testing.T) (restore func()) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "systemctl")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\necho 'Failed to connect to bus' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldBin, oldRoot := systemctlBin, cgroupRoot
+	systemctlBin, cgroupRoot = bin, t.TempDir()
+	restore = func() { systemctlBin, cgroupRoot = oldBin, oldRoot }
+	t.Cleanup(restore)
+	return restore
+}
+
+// An advisor call contained in a scope keeps its durable registration until its scope is proven empty
+// (issue #190, F2 scope): a descendant that left the call's group and session (setsid) survives a
+// failed scope stop and cgroup sweep; the registration persists, the job's successful finish is not
+// recorded as a clean one, resume and prune are refused, and the daemon's tick retries the stop until
+// it succeeds, which ends the descendant and only then drops the registration.
+func TestAdvisorScopeSurvivorKeepsOwnership(t *testing.T) {
+	requireUserScope(t)
+	requireSetsid(t)
+	e := newAdvisor(t)
+	t.Setenv("AGENT_JOBS_CGROUP_SCOPE", ScopeRequired)
+	noAdvisorPolling(t)
+	noAutoContinue(e.m)
+	j := e.crewJob(t, 2, 1.0)
+	scopeID := fmt.Sprintf("advisor-%s-%d", j.ID, 1)
+	t.Cleanup(func() { _ = e.m.stopScope(scopeID) })
+	for _, f := range []string{"desc", "slow"} {
+		if err := os.WriteFile(filepath.Join(e.dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := askInBackground(e, j)
+	leader := e.advisorPID(t, 1)
+	t.Cleanup(func() { _ = syscall.Kill(-leader, syscall.SIGKILL) })
+	var desc int
+	waitFor(t, "the advisor's setsid descendant", 15*time.Second, func() bool {
+		b, err := os.ReadFile(filepath.Join(e.dir, "desc.1"))
+		if err != nil {
+			return false
+		}
+		desc, err = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && desc > 1
+	})
+	t.Cleanup(func() { _ = syscall.Kill(desc, syscall.SIGKILL) })
+	waitFor(t, "the descendant's own session", 5*time.Second, func() bool {
+		sid, err := getsid(desc)
+		return err == nil && sid == desc
+	})
+	restore := breakScopeEnd(t)
+	if _, _, ok := e.m.finish(j, store.StatusSucceeded, StreamResult{Runner: j.Runner, Completed: true}, false, 1, "", e.m.Now()); !ok {
+		t.Fatal("finish did not record the row")
+	}
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the advisor call did not return after its job finished")
+	}
+	runs := func() []string {
+		r, _ := filepath.Glob(filepath.Join(e.m.AdvisorDir(j.ID), "run.*.json"))
+		return r
+	}
+	if gone(desc) {
+		t.Skip("the descendant ended without the scope stop: nothing to retry")
+	}
+	if len(runs()) != 1 {
+		t.Fatalf("the registration of an advisor call with a live descendant was dropped: %v", runs())
+	}
+	got := get(t, e.m, j.ID)
+	if got.Status == store.StatusSucceeded || !strings.Contains(got.Error, ReasonSurvivors) {
+		t.Fatalf("a finish with an advisor survivor counted as clean: %s %q", got.Status, got.Error)
+	}
+	if err := os.WriteFile(filepath.Join(e.m.JobDir(j.ID), "prompt.md"), []byte("brief\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.m.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
+		t.Fatalf("resume with an advisor survivor: %v", err)
+	}
+	if pj, ok, err := e.m.pruneOne(j.ID, e.m.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+		t.Fatalf("prune with an advisor survivor: %+v %v %v", pj, ok, err)
+	}
+	if err := e.m.Tick(); err != nil {
+		t.Logf("tick: %v", err)
+	}
+	if len(runs()) != 1 || gone(desc) {
+		t.Fatalf("a tick whose scope stop failed dropped the registration (%v) or the descendant ended", runs())
+	}
+	restore()
+	if err := e.m.Tick(); err != nil {
+		t.Logf("tick: %v", err)
+	}
+	waitFor(t, "the descendant to end with the retried scope stop", 10*time.Second, func() bool { return gone(desc) })
+	if r := runs(); len(r) != 0 {
+		t.Fatalf("the registration was kept after its scope stopped: %v", r)
 	}
 }
