@@ -173,3 +173,29 @@ func TestResultBranchRejectsNonDescendantHead(t *testing.T) {
 		})
 	}
 }
+
+// A custom default with no remote HEAD and no declared default, while the main worktree sits on
+// another branch, must not be requestable: nothing identifies it as the default (#197).
+func TestResultBranchStartRefusesUnidentifiedDefault(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	gitT(t, repo, "branch", "-m", "main", "develop")
+	gitT(t, repo, "checkout", "-q", "-b", "feature")
+	gitT(t, repo, "config", "init.defaultBranch", "") // empty overrides any host-level value
+	start := func(name string) error {
+		_, err := m.Enqueue(StartRequest{Title: "test", Kind: "fix", Brief: "test", Model: "sonnet", RepoPath: repo, Branch: name})
+		return err
+	}
+	for _, name := range []string{"develop", "other"} {
+		if err := start(name); err == nil {
+			t.Errorf("accepted %q with the default branch unidentified", name)
+		}
+	}
+	gitT(t, repo, "config", "init.defaultBranch", "develop")
+	if err := start("develop"); err == nil {
+		t.Error("accepted the declared default branch")
+	}
+	if err := start("other"); err != nil {
+		t.Errorf("refused a name with the default declared: %v", err)
+	}
+}

@@ -32,6 +32,8 @@ func branchRepo(t *testing.T) (branchGit, string, string) {
 	branchMust(t, run, "init", "-q", "-b", "main")
 	branchMust(t, run, "config", "user.name", "Test")
 	branchMust(t, run, "config", "user.email", "test@example.com")
+	// Requested names need an identified default branch; tests of the unidentified case unset this.
+	branchMust(t, run, "config", "init.defaultBranch", "main")
 	branchMust(t, run, "commit", "-q", "--allow-empty", "-m", "base")
 	base := branchMust(t, run, "rev-parse", "HEAD")
 	branchMust(t, run, "checkout", "-q", "--detach")
@@ -50,11 +52,11 @@ func branchMust(t *testing.T, run branchGit, args ...string) string {
 
 func TestPublishBranchRefCreateAndFastForward(t *testing.T) {
 	run, base, head := branchRepo(t)
-	if ff, err := publishBranchRef(run, "job/123", head); err != nil || ff {
+	if ff, err := publishBranchRef(run, "job/123", head, true); err != nil || ff {
 		t.Fatalf("create: ff=%v err=%v", ff, err)
 	}
 	branchMust(t, run, "branch", "feature", base)
-	if ff, err := publishBranchRef(run, "feature", head); err != nil || !ff {
+	if ff, err := publishBranchRef(run, "feature", head, false); err != nil || !ff {
 		t.Fatalf("fast-forward: ff=%v err=%v", ff, err)
 	}
 	for _, name := range []string{"job/123", "feature"} {
@@ -70,7 +72,7 @@ func TestPublishBranchRefRejectsNonFastForward(t *testing.T) {
 	branchMust(t, run, "commit", "-q", "--allow-empty", "-m", "other")
 	other := branchMust(t, run, "rev-parse", "HEAD")
 	branchMust(t, run, "branch", "feature", other)
-	if _, err := publishBranchRef(run, "feature", head); err == nil || !strings.Contains(err.Error(), "not a fast-forward") {
+	if _, err := publishBranchRef(run, "feature", head, false); err == nil || !strings.Contains(err.Error(), "not a fast-forward") {
 		t.Fatalf("expected non-ff refusal, got %v", err)
 	}
 	if got := branchMust(t, run, "rev-parse", "feature"); got != other {
@@ -102,7 +104,7 @@ func TestPublishBranchRefRejectsEmptyHeadAndSymbolicRef(t *testing.T) {
 	run, base, head := branchRepo(t)
 	branchMust(t, run, "symbolic-ref", "refs/heads/alias", "refs/heads/main")
 	for _, tc := range []struct{ name, head string }{{"job/empty", ""}, {"alias", head}, {"job/bad", "HEAD"}} {
-		if _, err := publishBranchRef(run, tc.name, tc.head); err == nil {
+		if _, err := publishBranchRef(run, tc.name, tc.head, false); err == nil {
 			t.Fatalf("accepted %+v", tc)
 		}
 	}
@@ -122,7 +124,7 @@ func TestPublishBranchRefCAS(t *testing.T) {
 		}
 		return run(args...)
 	})
-	if _, err := publishBranchRef(racing, "feature", head); err == nil {
+	if _, err := publishBranchRef(racing, "feature", head, false); err == nil {
 		t.Fatal("concurrent ref move was overwritten")
 	}
 	if got := branchMust(t, run, "rev-parse", "feature"); got != other {
@@ -135,13 +137,14 @@ func TestPublishBranchRefCheckedOut(t *testing.T) {
 	branchMust(t, run, "branch", "feature", base)
 	work := filepath.Join(t.TempDir(), "linked")
 	branchMust(t, run, "worktree", "add", "-q", work, "feature")
-	if _, err := publishBranchRef(run, "feature", head); err == nil || !strings.Contains(err.Error(), "checked out") {
+	if _, err := publishBranchRef(run, "feature", head, false); err == nil || !strings.Contains(err.Error(), "checked out") {
 		t.Fatalf("expected checked-out refusal, got %v", err)
 	}
 }
 
 func TestValidateResultBranchLocalDefault(t *testing.T) {
 	run, _, _ := branchRepo(t)
+	branchMust(t, run, "config", "--unset", "init.defaultBranch")
 	if err := validateResultBranch(run, "feature"); err == nil {
 		t.Fatal("accepted explicit target without enough metadata to protect the default")
 	}
@@ -149,8 +152,13 @@ func TestValidateResultBranchLocalDefault(t *testing.T) {
 	if err := validateResultBranch(run, "trunk"); err == nil {
 		t.Fatal("accepted possible local default without remote metadata")
 	}
-	if err := validateResultBranch(run, "feature"); err != nil {
-		t.Fatalf("refused feature with a known current branch: %v", err)
+	if err := validateResultBranch(run, "feature"); err == nil {
+		t.Fatal("accepted a name with the default still unidentified")
+	}
+	// The main worktree's current branch stays protected once a default is declared.
+	branchMust(t, run, "config", "init.defaultBranch", "main")
+	if err := validateResultBranch(run, "trunk"); err == nil {
+		t.Fatal("accepted the main worktree's current branch")
 	}
 }
 
@@ -158,8 +166,63 @@ func TestPublishBranchRefRetry(t *testing.T) {
 	run, base, head := branchRepo(t)
 	branchMust(t, run, "branch", "feature", base)
 	for range 2 {
-		if ff, err := publishBranchRef(run, "feature", head); err != nil || !ff {
+		if ff, err := publishBranchRef(run, "feature", head, false); err != nil || !ff {
 			t.Fatalf("idempotent fast-forward: ff=%v err=%v", ff, err)
 		}
+	}
+}
+
+// The default branch cannot be told from local metadata alone: with no remote HEAD and no
+// init.defaultBranch, a requested name is refused even when the main worktree sits elsewhere.
+func TestValidateResultBranchUnidentifiedDefault(t *testing.T) {
+	run, base, head := branchRepo(t)
+	branchMust(t, run, "config", "--unset", "init.defaultBranch")
+	branchMust(t, run, "branch", "-m", "main", "develop") // the real default, unknown to metadata
+	branchMust(t, run, "checkout", "-q", "-b", "feature", base)
+	for _, name := range []string{"develop", "feature/result", "job/manual"} {
+		if err := validateResultBranch(run, name); err == nil {
+			t.Fatalf("accepted %q although the default branch is unidentified", name)
+		}
+	}
+	// Publication re-validates requested names; only the generated fallback skips the default check.
+	if _, err := publishBranchRef(run, "develop", head, false); err == nil {
+		t.Fatal("published to an unidentified default branch")
+	}
+	if _, err := publishBranchRef(run, "job/abc", head, true); err != nil {
+		t.Fatalf("generated fallback refused: %v", err)
+	}
+	// An explicit declaration identifies the default and protects it.
+	branchMust(t, run, "config", "init.defaultBranch", "develop")
+	if err := validateResultBranch(run, "develop"); err == nil {
+		t.Fatal("accepted the declared default")
+	}
+	if err := validateResultBranch(run, "feature/result"); err != nil {
+		t.Fatalf("refused a name once the default is declared: %v", err)
+	}
+}
+
+// A worktree may switch to the target (without moving its tip) between the worktree check and the
+// ref update. The update would then move a checked-out branch under an unchanged index and files;
+// publication must notice and put the ref back.
+func TestPublishBranchRefCheckoutRacingTheUpdate(t *testing.T) {
+	run, base, head := branchRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	branchMust(t, run, "worktree", "add", "-q", "--detach", linked, base)
+	branchMust(t, run, "branch", "feature", base)
+	switched := false
+	racing := branchGit(func(args ...string) (string, error) {
+		if !switched && len(args) > 1 && args[0] == "update-ref" {
+			switched = true
+			if out, err := exec.Command("git", "-C", linked, "checkout", "-q", "feature").CombinedOutput(); err != nil {
+				t.Fatalf("racing checkout: %v: %s", err, out)
+			}
+		}
+		return run(args...)
+	})
+	if _, err := publishBranchRef(racing, "feature", head, false); err == nil || !strings.Contains(err.Error(), "checked out") {
+		t.Fatalf("expected checked-out refusal, got %v", err)
+	}
+	if got := branchMust(t, run, "rev-parse", "feature"); got != base {
+		t.Fatalf("checked-out branch left at %s, want %s", got, base)
 	}
 }

@@ -1051,6 +1051,9 @@ func newRepo(t *testing.T) string {
 	gitT(t, repo, "init", "-q", "-b", "main")
 	gitT(t, repo, "config", "user.name", "T")
 	gitT(t, repo, "config", "user.email", "t@example.com")
+	// Declared explicitly, not read from the host's global settings: requested result branches are
+	// refused while the default branch is unidentified.
+	gitT(t, repo, "config", "init.defaultBranch", "main")
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("v1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

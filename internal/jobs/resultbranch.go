@@ -73,12 +73,12 @@ func (m *Manager) publishResultBranch(j *store.Job) error {
 	}
 	run := branchGit(func(args ...string) (string, error) { return runAt(j.RepoPath, args...) })
 	branch := "job/" + j.ID
-	if _, err := publishBranchRef(run, branch, head); err != nil {
+	if _, err := publishBranchRef(run, branch, head, true); err != nil {
 		return fail(err)
 	}
 	note := ""
 	if j.RequestedBranch != "" && j.RequestedBranch != branch {
-		ff, err := publishBranchRef(run, j.RequestedBranch, head)
+		ff, err := publishBranchRef(run, j.RequestedBranch, head, false)
 		if err != nil {
 			note = "requested branch " + j.RequestedBranch + " not moved: " + RedactPrintable(err.Error(), 240)
 		} else {
