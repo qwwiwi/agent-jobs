@@ -132,7 +132,7 @@ func TestGateLockOwnTree(t *testing.T) {
 		t.Fatalf("a copied marker passed through: %v", err)
 	}
 
-	sibling := startSleeper(t)
+	sibling := startMarkedSleeper(t, "j1") // a gate inside job j1 carries its marker
 	writeGateHolderLine(lock, fmt.Sprintf("pid %d job j1 since x: background gate", sibling))
 	start = time.Now()
 	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: time.Minute, job: "j1"})
@@ -446,5 +446,44 @@ func TestGateWaitRecorderLockedDuringAcquisition(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		unlock()
 		t.Fatal("a locked gate-wait.json kept the gate from returning with the box lock held")
+	}
+}
+
+// startMarkedSleeper is startSleeper with the job marker of job in its environment.
+func startMarkedSleeper(t *testing.T, job string) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	cmd.Env = append(os.Environ(), JobEnvVar+"="+job)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	return cmd.Process.Pid
+}
+
+// The holder line is in a file anyone can write (#208 review): a line naming a live pid and a victim
+// job id fails the victim's gates at once only when that pid really is of the victim job (its job
+// marker in /proc/<pid>/environ). A forged one is a held lock like any other: the gate waits, bounded.
+func TestGateLockForgedOwnJobHolder(t *testing.T) {
+	if _, err := procParent(os.Getpid()); err != nil {
+		t.Skip("no /proc: the holder line decides")
+	}
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	holdGateT(t, lock)
+	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: forged", startSleeper(t)))
+	_, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 300 * time.Millisecond, job: "victim"})
+	if err == nil || errors.Is(err, ErrGateOwnJob) {
+		t.Fatalf("forged holder line: %v; want the bounded wait's timeout, not ErrGateOwnJob", err)
+	}
+	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: a gate the job left", startMarkedSleeper(t, "victim")))
+	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 10 * time.Second, job: "victim"})
+	if !errors.Is(err, ErrGateOwnJob) {
+		t.Fatalf("a real gate of the job: %v; want ErrGateOwnJob", err)
+	}
+	// An ancestor without the marker (the job's wrapper during its acceptance step) is of the caller's job.
+	writeGateHolderLine(lock, fmt.Sprintf("pid %d job victim since x: acceptance", os.Getppid()))
+	_, err = acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 10 * time.Second, job: "victim"})
+	if !errors.Is(err, ErrGateOwnJob) {
+		t.Fatalf("held by an ancestor named as the job: %v; want ErrGateOwnJob", err)
 	}
 }

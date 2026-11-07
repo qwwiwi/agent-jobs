@@ -88,7 +88,7 @@ func TestAcceptanceRefusesOwnJobGate(t *testing.T) {
 	lock := GateLockPath()
 	holdGateT(t, lock)
 	j := enqueue(t, m, "do it", withAcceptance(`echo should-not-run > ../acc-ran.txt`))
-	writeGateHolderLine(lock, fmt.Sprintf("pid %d job %s since x: a gate the job left", startSleeper(t), j.ID))
+	writeGateHolderLine(lock, fmt.Sprintf("pid %d job %s since x: a gate the job left", startMarkedSleeper(t, j.ID), j.ID))
 	j = runToEnd(t, m, j.ID)
 	if j.Status != store.StatusFailed || !IsAcceptanceFailure(j.Error) {
 		t.Fatalf("got %s err=%q, want an acceptance that did not run", j.Status, j.Error)

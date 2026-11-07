@@ -126,7 +126,7 @@ func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 				fmt.Fprintf(r.notes, "gate: the gate lock is held by this gate's own parent (%s): running inside it\n", holder)
 				return &gateLease{release: func() {}, reentrant: true, holder: holder}, nil
 			}
-			if r.job != "" && job == r.job {
+			if r.job != "" && job == r.job && gateHolderOfJob(pid, r.job) {
 				stopWaiting()
 				f.Close()
 				return nil, fmt.Errorf("%w (%s): a job never waits for itself; let that gate end first", ErrGateOwnJob, holder)
@@ -231,6 +231,32 @@ func gateAncestor(pid int, env []string) bool {
 		}
 		if parent <= 1 {
 			return false
+		}
+		cur = parent
+	}
+	return false
+}
+
+// gateHolderOfJob reports whether the lock's holder pid, which its holder line names as of job, really
+// is: the line is in a file anyone can write, so a forged one must not fail another job's gates at once
+// (ErrGateOwnJob). It is when the pid carries job's marker (/proc/<pid>/environ, a gate inside the job)
+// or is an ancestor of this process (the job's wrapper during its acceptance step: this caller descends
+// from it, so it is of the caller's own job). Without /proc the line decides (macOS).
+func gateHolderOfJob(pid int, job string) bool {
+	if _, err := procParent(os.Getpid()); err != nil {
+		return true
+	}
+	if procMarker(pid) == job {
+		return true
+	}
+	cur := os.Getpid()
+	for range 256 {
+		parent, err := procParent(cur)
+		if err != nil || parent <= 1 {
+			return false
+		}
+		if parent == pid {
+			return true
 		}
 		cur = parent
 	}
