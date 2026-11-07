@@ -46,9 +46,19 @@ var ErrImmutable = errors.New("job status is final and cannot change")
 // on jobs.id): the caller can redraw the id's random part and retry (#129).
 var ErrJobIDExists = errors.New("job id already exists")
 
+// ErrIdemKeyExists is returned when a new job's idempotency key is already used by another job.
+var ErrIdemKeyExists = errors.New("job idempotency key already exists")
+
+// idemKeyTaken reports whether an insert error is the jobs.idem_key UNIQUE constraint.
+func idemKeyTaken(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.idem_key") ||
+		strings.Contains(err.Error(), "UNIQUE constraint failed: index 'jobs_idem_key'")
+}
+
 // jobIDTaken reports whether an insert error is the jobs.id UNIQUE constraint: the id is taken.
 func jobIDTaken(err error) bool {
-	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id")
+	// "jobs.idem_key" also starts with "jobs.id": that constraint is the key's, not the id's.
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id") && !idemKeyTaken(err)
 }
 
 // Job is one row of the jobs table.
@@ -217,6 +227,9 @@ type Job struct {
 	ControlReview bool
 	ControlJob    string
 	ControlNote   string
+	// IdemKey is a deterministic creation key, unique among the jobs that have one ("" = none): a retry
+	// of the same creation finds the job it already made (GetByIdemKey, ErrIdemKeyExists).
+	IdemKey string
 }
 
 // BlockingFinding is one blocking finding of a review report: its ID (H1, F2, …) and its whole text.
@@ -408,6 +421,10 @@ func Open(path string) (*Store, error) {
 	if err := migrateKindCheck(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
+	}
+	if _, err := db.Exec(idemKeyIndex); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: idem key: %w", err)
 	}
 	if _, err := db.Exec(intentionsSchema); err != nil {
 		_ = db.Close()
@@ -703,7 +720,13 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN control_review INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN control_job TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN control_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''`,
 }
+
+// idemKeyIndex makes idem_key unique among the jobs that have one: a retried creation (the control review
+// of a fix, #197 item 7) finds its job by key instead of queueing a second. It is created after the table
+// rebuilds (rebuildCheck drops every index but jobs_status) and is idempotent.
+const idemKeyIndex = `CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem_key ON jobs(idem_key) WHERE idem_key != ''`
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
 
@@ -837,7 +860,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
 	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
-	review, review_blocking, control_review, control_job, control_note`
+	review, review_blocking, control_review, control_job, control_note, idem_key`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -923,7 +946,7 @@ func insertArgs(j *Job) []any {
 		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
 		j.RequestedBranch, j.Branch, j.BranchNote,
 		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
-		j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote}
+		j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote, j.IdemKey}
 }
 
 // blockingJSON is the review_blocking column: "[]" for none.
@@ -971,7 +994,7 @@ func scanJob(r scanner) (*Job, error) {
 		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
 		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase,
-		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote)
+		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote, &j.IdemKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1043,6 +1066,21 @@ func (s *Store) GetContext(ctx context.Context, id string) (*Job, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get job: %w", err)
+	}
+	return j, nil
+}
+
+// GetByIdemKey returns the job created with the idempotency key, ErrNotFound if there is none.
+func (s *Store) GetByIdemKey(key string) (*Job, error) {
+	if key == "" {
+		return nil, ErrNotFound
+	}
+	j, err := scanJob(s.db.QueryRow(`SELECT `+cols+` FROM jobs WHERE idem_key = ?`, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get job by key: %w", err)
 	}
 	return j, nil
 }

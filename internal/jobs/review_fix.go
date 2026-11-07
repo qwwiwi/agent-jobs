@@ -96,18 +96,30 @@ func renderReviewBlocking(j *store.Job) string {
 	return b.String()
 }
 
+// controlReviewKey is the idempotency key of the control review of fix job j: one per fix and attempt,
+// so a retry after a crash finds the child that was already queued instead of queueing a second.
+func (m *Manager) controlReviewKey(j *store.Job) string {
+	return fmt.Sprintf("control-review:%s:%s:%d", m.Agent, j.ID, j.Attempt)
+}
+
 // chainControlReviews queues the control review of every succeeded fix job that asked for one. It runs
-// before the job-done lines are delivered, so a line names the review it queued (or why none was).
-func (m *Manager) chainControlReviews() error {
+// before the job-done lines are delivered, so a line names the review it queued (or why none was). It
+// returns the fix jobs whose outcome could not be recorded: their line must wait for the next tick,
+// which finds the same child by its key and links it (a line delivered now would lose the id for good).
+func (m *Manager) chainControlReviews() (unrecorded map[string]bool, err error) {
 	jobs, err := m.Store.PendingControlReview()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var errs []error
 	for _, j := range jobs {
 		queued, note := m.controlReviewFor(j)
 		if err := m.Store.SetControlReview(j.ID, queued, note); err != nil {
 			errs = append(errs, fmt.Errorf("job %s: record control review: %w", j.ID, err))
+			if unrecorded == nil {
+				unrecorded = map[string]bool{}
+			}
+			unrecorded[j.ID] = true
 			continue
 		}
 		j.ControlJob, j.ControlNote = queued, note
@@ -117,7 +129,7 @@ func (m *Manager) chainControlReviews() error {
 			m.Log.Printf("job %s: %s", j.ID, note)
 		}
 	}
-	return errors.Join(errs...)
+	return unrecorded, errors.Join(errs...)
 }
 
 // controlReviewFor queues the control review of the succeeded fix job j. It returns the queued job's
@@ -142,6 +154,7 @@ func (m *Manager) controlReviewFor(j *store.Job) (queued, note string) {
 		Title: "Control review: " + j.Title, Kind: "review", Brief: controlReviewBrief(j, rev),
 		RepoPath: j.RepoPath, Base: "refs/heads/" + j.Branch, Model: rev.Model, Runner: rev.Runner, ReasoningEffort: rev.ReasoningEffort,
 		TimeoutMinutes: rev.TimeoutMinutes, Sources: []string{"job:" + rev.ID, "job:" + j.ID},
+		IdemKey: m.controlReviewKey(j),
 	}
 	if rev.Runner != store.RunnerCodex {
 		req.MaxTurns, req.MaxBudgetUSD = rev.MaxTurns, rev.MaxBudgetUSD

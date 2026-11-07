@@ -329,12 +329,23 @@ func (m *Manager) notifyPending() error {
 	}
 	// A fix started from a review queues its control review now that its result branch is recorded,
 	// and before its line is delivered, which names the review (#197 item 7).
-	if err := m.chainControlReviews(); err != nil {
+	unrecorded, err := m.chainControlReviews()
+	if err != nil {
 		m.Log.Printf("control reviews: %v", err)
 	}
-	jobs, err := m.Store.PendingNotify()
-	if err != nil || len(jobs) == 0 {
+	if unrecorded == nil && err != nil {
+		// The pending list itself could not be read: a line delivered now could miss its review.
 		return err
+	}
+	jobs, err := m.Store.PendingNotify()
+	if err != nil {
+		return err
+	}
+	// A fix whose control review could not be linked waits: the next tick links the same child by its
+	// key, and only then does its line (which names the child) go out.
+	jobs = slices.DeleteFunc(jobs, func(j *store.Job) bool { return unrecorded[j.ID] })
+	if len(jobs) == 0 {
+		return nil
 	}
 	t := m.Config().NotifyTmuxTarget
 	if t == "" {

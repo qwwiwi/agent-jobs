@@ -360,3 +360,136 @@ func TestControlReviewBaseIgnoresSameNamedTag(t *testing.T) {
 		t.Fatalf("control review base branch %q", ctl.BaseBranch)
 	}
 }
+
+// succeededFixAwaitingChain is a fix job started from a review, ended by hand as succeeded with a
+// published result branch, before any tick: the daemon state in which the control review is due.
+func succeededFixAwaitingChain(t *testing.T, m *Manager, repo string) (fix, review *store.Job) {
+	t.Helper()
+	review = finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	f, err := m.Enqueue(fixFromReview(repo, review.ID, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(f.ID, "fix-token", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(m.JobDir(f.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.JobDir(f.ID), "report.md"), []byte("## Summary\nfixed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(f.ID, "fix-token", store.StatusSucceeded, 1, 0, 1, "", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	gitT(t, repo, "branch", "fix-result")
+	if err := m.Store.SetResultBranch(f.ID, "fix-result", ""); err != nil {
+		t.Fatal(err)
+	}
+	return get(t, m, f.ID), review
+}
+
+func controlReviewChildren(t *testing.T, m *Manager, original string) []*store.Job {
+	t.Helper()
+	all, err := m.Store.List(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []*store.Job
+	for _, j := range all {
+		if j.Kind == "review" && j.ID != original {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// H2 (#197 fix loop 1): a crash after the control review was queued but before it was linked to the fix
+// must not queue a second child on the next tick; the existing child is found by its key and linked.
+func TestControlReviewCrashBeforeLinkQueuesNoSecondChild(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	logf := notifyTo(t, m)
+	fix, review := succeededFixAwaitingChain(t, m, repo)
+	// The daemon queued the child and died before SetControlReview.
+	queued, note := m.controlReviewFor(fix)
+	if queued == "" {
+		t.Fatalf("setup: control review not queued: %s", note)
+	}
+	if got := get(t, m, fix.ID); got.ControlJob != "" {
+		t.Fatalf("setup: the crash left a link: %+v", got)
+	}
+	for i := 0; i < 2; i++ { // the restarted daemon, and one more tick
+		if err := m.notifyPending(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fix = get(t, m, fix.ID)
+	if fix.ControlJob != queued {
+		t.Fatalf("fix links control review %q, want the one already queued %q", fix.ControlJob, queued)
+	}
+	if kids := controlReviewChildren(t, m, review.ID); len(kids) != 1 {
+		t.Fatalf("%d control reviews exist, want 1", len(kids))
+	}
+	if b, _ := os.ReadFile(logf); !strings.Contains(string(b), "control review "+queued+" queued") {
+		t.Fatalf("delivered line lacks the control review: %s", b)
+	}
+}
+
+// H2, second half: when linking the child to the fix fails, the done line is not delivered without the
+// child's id. The fix stays pending, the next tick links the same child, and the line names it.
+func TestControlReviewRecordErrorKeepsTheIDInTheDoneLine(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	logf := notifyTo(t, m)
+	fix, review := succeededFixAwaitingChain(t, m, repo)
+	db := rawDB(t, m)
+	mustExec(t, db, `CREATE TRIGGER fail_link BEFORE UPDATE OF control_job ON jobs BEGIN SELECT RAISE(ABORT, 'link boom'); END`)
+	if err := m.notifyPending(); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, m, fix.ID); got.NotifiedAt != nil {
+		t.Fatalf("the done line went out without the control review's id: %+v", got)
+	}
+	if b, _ := os.ReadFile(logf); strings.Contains(string(b), fix.ID) {
+		t.Fatalf("a line for the fix was delivered: %s", b)
+	}
+	mustExec(t, db, `DROP TRIGGER fail_link`)
+	if err := m.notifyPending(); err != nil {
+		t.Fatal(err)
+	}
+	kids := controlReviewChildren(t, m, review.ID)
+	if len(kids) != 1 {
+		t.Fatalf("%d control reviews exist, want 1", len(kids))
+	}
+	fix = get(t, m, fix.ID)
+	if fix.ControlJob != kids[0].ID || fix.NotifiedAt == nil {
+		t.Fatalf("fix not linked and notified after the retry: %+v", fix)
+	}
+	if b, _ := os.ReadFile(logf); !strings.Contains(string(b), "control review "+kids[0].ID+" queued") {
+		t.Fatalf("delivered line lacks the control review: %s", b)
+	}
+}
+
+// A start that carries a key an existing job already has is a retry: it returns that job, queues nothing.
+func TestEnqueueWithTheSameKeyReturnsTheExistingJob(t *testing.T) {
+	m := newManager(t)
+	req := StartRequest{Title: "keyed", Kind: "general", Brief: "b", Model: "sonnet", IdemKey: "test-key:1"}
+	first, err := m.Enqueue(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := m.Enqueue(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != first.ID {
+		t.Fatalf("a retry queued %s, want the existing %s", again.ID, first.ID)
+	}
+	if all, _ := m.Store.List(10); len(all) != 1 {
+		t.Fatalf("%d jobs, want 1", len(all))
+	}
+	// Even when the retry's own request would no longer validate, the existing job is the answer.
+	req.Model = "no-such-model"
+	if got, err := m.Enqueue(req); err != nil || got.ID != first.ID {
+		t.Fatalf("retry with a changed request: %v, %v", got, err)
+	}
+}

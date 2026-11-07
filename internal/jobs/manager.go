@@ -221,6 +221,9 @@ type StartRequest struct {
 	// Review is set) chains a control review when the fix succeeds (item 7).
 	Review        string
 	ControlReview *bool
+	// IdemKey (internal, never set from a request) makes the creation idempotent: a start with a key an
+	// existing job already has returns that job instead of queueing another (the control review chain).
+	IdemKey string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -372,6 +375,14 @@ func gitBytes(timeout time.Duration, dir string, env []string, args ...string) (
 // Enqueue validates the request and inserts a queued job. It returns immediately. A codex job past the
 // codex daily cap (codex_jobs_per_day) is refused.
 func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
+	// A request with a key a job already carries is a retry: that job is the answer.
+	if r.IdemKey != "" {
+		if have, err := m.Store.GetByIdemKey(r.IdemKey); err == nil {
+			return have, nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+	}
 	j, err := m.newJob(r)
 	if err != nil {
 		return nil, err
@@ -413,6 +424,12 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			cleanup = func() {}
 			j.ID = newID(j.CreatedAt)
 			continue
+		}
+		if errors.Is(ierr, store.ErrIdemKeyExists) {
+			// A concurrent start with the same key won the insert: this attempt's folder goes, its job is the answer.
+			cleanup()
+			cleanup = func() {}
+			return m.Store.GetByIdemKey(j.IdemKey)
 		}
 		if ierr != nil {
 			return nil, ierr
@@ -661,7 +678,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
 		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent,
-		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview,
+		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview, IdemKey: r.IdemKey,
 	}
 	return j, nil
 }
