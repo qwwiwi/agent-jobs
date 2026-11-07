@@ -184,6 +184,32 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 **Размер брифа.** `job_start` отклоняет бриф больше `max_brief_bytes` (по умолчанию 32 КБ) и возвращает `size_warning`, если бриф называет больше `brief_warn_files` файлов (по умолчанию 40) или в нём больше `brief_warn_headings` заголовков `## ` (по умолчанию 8): возможно, это не одна джоба.
 
+## Job result branches
+
+When a repository job ends with commits beyond `base_commit`, the daemon publishes
+`job/<job-id>` in that repository, for both Claude and Codex (after the wrapper
+commits changes from `progress/COMMIT_MSG`). Jobs without commits, reviews,
+research jobs and gate jobs create no result branch.
+
+Use `job_start` parameter `branch`, or CLI `start --branch feature/result`, to
+request a target; `base` still selects the starting commit. A missing target is
+created. An existing target advances only by fast-forward, comparing its observed
+tip atomically. A divergent, symbolic, checked-out or concurrently changed target
+stays unchanged; the result remains on `job/<job-id>`. That fallback is retained
+even when the requested target succeeds. Nothing is pushed.
+
+Invalid Git names, `main`, `master`, the default branch and `release*` are refused
+at start. Default protection uses local remote-HEAD metadata and
+`init.defaultBranch`, without fetching. Without remote-HEAD metadata, the main
+worktree's current branch is conservatively protected; if its HEAD is detached,
+an explicit target is refused. Automatic `job/<id>` publication still works.
+`job_result`, `job_list`, `job_status`, CLI
+status/list and HTTP job views show `branch`, `requested_branch` and `branch_note`
+(CLI list shows the result branch). The job-done line says `branch job/<id>` or
+`branch feature/result (fast-forwarded)`; a fallback names the requested target and
+the refusal reason. Use the recorded branch for review, follow-up jobs and PRs;
+the orchestrator must not move refs by hand with `git branch -f` or `git update-ref`.
+
 ## Чистка и патчи
 
 Через 30 минут после доставки строки job-done демон удаляет worktree джобы, самую тяжёлую часть. Сначала он проверяет, что worktree действительно принадлежит этой джобе, затем сохраняет всё, что джоба изменила, не трогая индекс и файлы:

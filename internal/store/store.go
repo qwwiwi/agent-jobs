@@ -171,6 +171,11 @@ type Job struct {
 	// refs/remotes/<r>/<b>) the job was given, or the branch checked out in the repository when it was
 	// queued; "" when the base was a tag, a commit or a detached HEAD.
 	BaseBranch string
+	// RequestedBranch is the optional result target supplied at start. Branch is the actual
+	// published result (empty before publication or without commits), BranchNote its outcome.
+	RequestedBranch string
+	Branch          string
+	BranchNote      string
 	// MergeNote is the merge check of the job's commits onto BaseBranch, made when its job-done line
 	// was sent ("" = none: no repository or no commits of its own).
 	MergeNote string
@@ -648,6 +653,9 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE job_stats ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN skills_manifest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN requested_branch TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN branch_note TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -781,7 +789,7 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
-	cost_estimate_usd, provider, source_files`
+	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -885,7 +893,8 @@ func insertArgs(j *Job) []any {
 		j.AcceptanceCmd, ts(j.AcceptanceStartedAt), j.AcceptanceExit, j.AcceptanceDurationSec, ts(j.AcceptanceDeadline),
 		j.AcceptancePGID, ts(j.TimedOutAt), j.PGIDSpawned, j.DirBytes, j.DirTmpBytes, j.DirPartial,
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
-		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles)}
+		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
+		j.RequestedBranch, j.Branch, j.BranchNote}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -918,7 +927,8 @@ func scanJob(r scanner) (*Job, error) {
 		&j.AcceptanceCmd, &accStarted, &accExit, &j.AcceptanceDurationSec, &accDeadline, &j.AcceptancePGID, &timedOut,
 		&j.PGIDSpawned, &j.DirBytes, &j.DirTmpBytes, &j.DirPartial,
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
-		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles)
+		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
+		&j.RequestedBranch, &j.Branch, &j.BranchNote)
 	if err != nil {
 		return nil, err
 	}
@@ -1262,7 +1272,7 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
-		merge_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, cost_estimate_usd=NULL, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
+		merge_note='', branch='', branch_note='', cleaned_at=NULL, cleanup_skipped_at=NULL, turns=0, cost_usd=0, cost_unknown=0, cost_estimate_usd=NULL, duration_sec=0, dir_bytes=0, dir_tmp_bytes=0, dir_partial=0, error='',
 		acceptance_started_at=NULL,
 		acceptance_exit=NULL, acceptance_duration_sec=0, acceptance_deadline=NULL, acceptance_pgid=0, timed_out_at=NULL, max_turns=?, max_budget_usd=?,
 		timeout_minutes=?, pending_context=?, outcome='', outcome_note='', outcome_at=NULL`

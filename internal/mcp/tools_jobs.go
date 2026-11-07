@@ -92,7 +92,10 @@ type JobView struct {
 	// advisory (the job is queued anyway).
 	SameRepoJobs string `json:"same_repo_jobs,omitempty"`
 	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
-	BaseBranch string `json:"base_branch,omitempty"`
+	BaseBranch      string `json:"base_branch,omitempty"`
+	RequestedBranch string `json:"requested_branch,omitempty"`
+	Branch          string `json:"branch,omitempty"`
+	BranchNote      string `json:"branch_note,omitempty"`
 	// MergeNote is that check, made when the job-done line was sent.
 	MergeNote string `json:"merge_note,omitempty"`
 	// Warnings (job_start only): this MCP server runs an older binary than the one installed, a changed
@@ -171,6 +174,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		SessionID: j.SessionID, Attempt: j.Attempt, RunMode: j.RunMode, ReasoningEffort: j.ReasoningEffort,
 		AcceptanceCmd: j.AcceptanceCmd, Skills: j.Skills, SkillsDelivered: j.SkillsDelivered, SkillsNote: j.SkillsNote,
 		Outcome: j.Outcome, OutcomeNote: j.OutcomeNote, BaseBranch: j.BaseBranch, MergeNote: j.MergeNote,
+		RequestedBranch: j.RequestedBranch, Branch: j.Branch, BranchNote: j.BranchNote,
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
 		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.MilestoneWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
@@ -227,6 +231,7 @@ type JobStartInput struct {
 	MaxBudgetUSD    float64  `json:"max_budget_usd,omitempty" jsonschema:"spend cap in USD; default 10, ceiling 50"`
 	Repo            string   `json:"repo,omitempty" jsonschema:"absolute path of a git repository; the job works in a detached worktree of it. Omit for an empty work dir"`
 	Base            string   `json:"base,omitempty" jsonschema:"ref in repo to start from; default HEAD"`
+	Branch          string   `json:"branch,omitempty" jsonschema:"optional result branch; default job/<id>. Published only with commits, never for review or research. An existing branch advances only by fast-forward; otherwise job/<id> is kept and branch_note explains why. Invalid names, main, master, the repository default and release* are refused"`
 	Runner          string   `json:"runner,omitempty" jsonschema:"claude | codex; default: codex for a gpt-* model, else claude. Codex jobs: kind review or research only (read-only sandbox) unless the config allows writes; no turn or budget caps (the timeout is the limit), cost unknown, no resume, no guard hook"`
 	ReasoningEffort string   `json:"reasoning_effort,omitempty" jsonschema:"reasoning effort, recorded on the job. Claude: low | medium | high | xhigh | max, passed as --effort (a repository's effortLevel cannot change it); default from config effort_by_kind, else high (general: medium). Codex: low | medium | high; default from config codex_reasoning_effort, else high"`
 	AcceptanceCmd   string   `json:"acceptance_cmd,omitempty" jsonschema:"fix and general jobs only, refused unless config acceptance_allowed is true: one-line shell command (max 1 KB) run in the job worktree after claude exits 0, outside the guard; non-zero or timeout (acceptance_timeout_minutes, default 15) fails the job with acceptance failed"`
@@ -252,7 +257,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			"base_branch; its job-done line says whether its commits still merge onto that branch (git merge-tree).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobStartInput) (*sdk.CallToolResult, JobView, error) {
 		j, err := d.Manager.Enqueue(jobs.StartRequest{
-			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Model: in.Model,
+			Title: in.Title, Kind: in.Kind, Brief: in.Brief, RepoPath: in.Repo, Base: in.Base, Branch: in.Branch, Model: in.Model,
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
@@ -302,9 +307,12 @@ func addJobStatus(s *sdk.Server, d Deps) {
 
 // JobResultOutput is job_result's output.
 type JobResultOutput struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Finished bool   `json:"finished"`
+	ID              string `json:"id"`
+	Status          string `json:"status"`
+	Finished        bool   `json:"finished"`
+	RequestedBranch string `json:"requested_branch,omitempty"`
+	Branch          string `json:"branch,omitempty"`
+	BranchNote      string `json:"branch_note,omitempty"`
 	// DoneLine is the same line the session got when the job ended.
 	DoneLine string `json:"done_line,omitempty"`
 	// CostUnknown: the job's cost was never reported (a codex job, a killed attempt).
@@ -452,6 +460,7 @@ func addJobResult(s *sdk.Server, d Deps) {
 			return nil, JobResultOutput{}, err
 		}
 		out := JobResultOutput{ID: j.ID, Status: j.Status, Finished: finished(j.Status), Error: jobs.RedactText(j.Error),
+			RequestedBranch: j.RequestedBranch, Branch: j.Branch, BranchNote: j.BranchNote,
 			CostUnknown: j.CostIsUnknown(), Artifacts: []string{}}
 		if out.Attempts, err = attemptViews(m, j); err != nil {
 			return nil, JobResultOutput{}, err

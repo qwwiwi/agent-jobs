@@ -26,7 +26,8 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 
    > Отчёт джобы — заявление, а не результат.
 
-   Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the ref `refs/agent-jobs/jobs/<id>`).
+   Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the result `branch` recorded by `job_result`).
+   Repository jobs with commits automatically publish `job/<id>`; `job_start` can request another target with `branch`. An existing target advances only by fast-forward. If it diverged or could not be updated, the job-done line and `branch_note` explain why it stayed unchanged and name the fallback. Use the recorded branch for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch.
 
 3. Only then publish.
 
@@ -56,7 +57,7 @@ Not in the reference. A static blog once went live after checks of only its firs
 
 > Через 30 минут после уведомления демон удаляет worktree, самую тяжёлую часть. Перед этим сохраняет diffstat, коммиты джобы через `git format-patch` и незакоммиченные правки через `git diff --binary`, а в исходном репозитории ставит ref `refs/reference/jobs/<id>` на последний коммит. Так работу можно взять и после удаления папки.
 
-The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: apply the saved patches or check out the ref.
+The daemon removes the worktree 30 minutes after the job-done line. Read the report within that window; if you read later, the work is not lost: check out the recorded result branch or apply the saved patches. Cleanup also retains the legacy `refs/agent-jobs/jobs/<id>` ref.
 
 ## Beyond the reference (owner decisions 2026-10-17, `docs/DECISIONS.md`)
 

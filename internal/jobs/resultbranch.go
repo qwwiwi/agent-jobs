@@ -1,0 +1,86 @@
+package jobs
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/store"
+)
+
+// publishResultBranch runs after either runner has ended (including the Codex wrapper's commit).
+// Keep job/<id> as a durable fallback before attempting the caller's optional target. A recorded
+// outcome is never replayed at notification retries; resuming clears it for the next attempt.
+func (m *Manager) publishResultBranch(j *store.Job) error {
+	if j.RepoPath == "" || j.BaseCommit == "" || j.Kind == "review" || j.Kind == "research" || IsGateKind(j.Kind) ||
+		j.Status == store.StatusQueued || j.Status == store.StatusRunning || j.Branch != "" || j.BranchNote != "" {
+		return nil
+	}
+	work := filepath.Join(m.JobDir(j.ID), "work")
+	if _, err := os.Stat(work); os.IsNotExist(err) {
+		return nil // never prepared, or a legacy job whose worktree was already cleaned up.
+	}
+	record := func(branch, note string) error {
+		if err := m.Store.SetResultBranch(j.ID, branch, note); err != nil {
+			return err
+		}
+		j.Branch, j.BranchNote = branch, note
+		return nil
+	}
+	fail := func(err error) error {
+		note := "result branch not published: " + RedactPrintable(err.Error(), 240)
+		m.Log.Printf("job %s: %s", j.ID, note)
+		return record("", note)
+	}
+	if err := m.verifyWorktree(j, work); err != nil {
+		return fail(fmt.Errorf("job worktree not verified: %w", err))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	env := append(daemonGitEnv(), "GIT_GRAFT_FILE="+os.DevNull)
+	runAt := func(dir string, args ...string) (string, error) {
+		out, code, stderr, err := gitEnvCtx(ctx, env, dir, append([]string{noReplace}, args...)...)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if err == nil && code != 0 {
+			err = fmt.Errorf("git %s exited %d: %s", args[0], code, stderr)
+		}
+		return strings.TrimSpace(out), err
+	}
+	head, err := runAt(work, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}")
+	if err != nil {
+		return fail(err)
+	}
+	if head == j.BaseCommit {
+		return nil
+	}
+	ahead, err := runAt(work, "rev-list", "--count", j.BaseCommit+".."+head)
+	if err != nil {
+		return fail(err)
+	}
+	if ahead == "0" {
+		return nil
+	}
+	run := branchGit(func(args ...string) (string, error) { return runAt(j.RepoPath, args...) })
+	branch := "job/" + j.ID
+	if _, err := publishBranchRef(run, branch, head); err != nil {
+		return fail(err)
+	}
+	note := ""
+	if j.RequestedBranch != "" && j.RequestedBranch != branch {
+		ff, err := publishBranchRef(run, j.RequestedBranch, head)
+		if err != nil {
+			note = "requested branch " + j.RequestedBranch + " not moved: " + RedactPrintable(err.Error(), 240)
+		} else {
+			branch = j.RequestedBranch
+			if ff {
+				note = "fast-forwarded"
+			}
+		}
+	}
+	return record(branch, note)
+}

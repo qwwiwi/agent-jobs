@@ -245,6 +245,37 @@ Owner requirement (2026-11-03): frontend work is checked for real, in a browser.
   For each device x scheme x page it scrolls the window and every vertical scroll container whose content exceeds its box by more than a viewport (an app shell's `overflow-y: auto` area; `body` too when `html` has a non-visible overflow so `body` scrolls on its own), largest first, to the end (lazy content loads; a scroll that stops early, a scroller cut off or left out by the shared budget of 400 steps fails), observes layout shifts for at least `--dwell` ms (default 3000), and fails on: a 4xx/5xx or failed response, horizontal page scroll (`documentElement.scrollWidth > clientWidth`), a visible element sticking out of the viewport outside a scroll container (one in its containing-block chain whose own box stays inside the viewport), a broken image, CLS ≥ 0.1, a word split inside a word (the client rects of a word, between line-break opportunities, fall on more than one line; a word is skipped only when `hyphens: auto` provably hyphenated it: its breaks move with hyphenation off, no `word-break: break-all`, no fragment under 2 letters, 3 under `overflow-wrap: anywhere`; scripts written without spaces are skipped). The 3-letter minimum under `overflow-wrap: anywhere` is deliberate policy: a 2-letter fragment fails even where the dictionary hyphenated correctly, because short word fragments are not allowed on phones. `--schemes auto` (default) adds the dark run when the page declares a dark scheme or its colours change under `prefers-color-scheme: dark`; `--schemes light,dark` forces both (a site whose dark mode is only a toggle button needs its own run). It prints one `PASS` / `FAIL` line per run, writes full-page screenshots and `results.json` to `--out`, and exits 0 (all pass), 1 (a failure) or 2 (could not run: the last line starts `BROWSER CHECK NOT RUN:`).
 - **Playwright** is not a dependency of agent-jobs: the script resolves it from the caller's environment (node_modules above the current directory, `NODE_PATH`, `npm root -g`; with `--playwright <path>` only that path; with `--trusted` never the current directory) and uses Chromium (`npx playwright install chromium`). `scripts/check.sh` runs only static tests of it (`scripts/ui-check.test.mjs` under `node --test`: the pure helpers and the in-page probe against a fake DOM), no browser.
 
+## Job result branches
+
+When a repository job ends with commits beyond `base_commit`, the daemon publishes
+`job/<job-id>` in that repository. This happens for both runners, after the Codex
+wrapper commits changes from `progress/COMMIT_MSG`. A job without commits, a review,
+a research job or a gate job creates no result branch.
+
+Set `branch` in `job_start`, or use `agent-jobs start --branch feature/result`, to
+request another result branch. `base` / `--base` still selects the starting commit;
+`branch` selects where the result goes. A missing target is created; an existing
+target advances only when its current tip is an ancestor of the job's head. The
+write compares the observed tip atomically, so a concurrent move is never
+overwritten. A divergent, symbolic or checked-out target stays unchanged and the
+result remains on `job/<job-id>`. The job branch is retained even when the requested
+target succeeds. Nothing is pushed.
+
+Invalid Git branch names, `main`, `master`, the repository's default branch and
+`release*` are refused at start. Default branch protection uses local remote-HEAD
+metadata and `init.defaultBranch`. Without remote-HEAD metadata, it conservatively
+protects the main worktree's current branch; if that HEAD is detached too, an
+explicit target is refused because the default cannot be identified locally.
+Automatic `job/<id>` publication still works. It does not fetch from the network.
+
+`job_result`, `job_list` and `job_status` expose `branch`, `requested_branch` and
+`branch_note`; CLI status/list and HTTP job views expose the result too. `branch`
+is empty until commits have been published. The job-done line says
+`branch job/<id>` or `branch feature/result (fast-forwarded)`; if the requested
+target could not be moved, it names the fallback and the reason. Use that recorded
+branch for review, follow-up jobs and PRs. The orchestrator must not move refs by
+hand with `git branch -f` or `git update-ref`.
+
 ## Cleanup and patches
 
 30 minutes after the job-done line is delivered, the daemon removes the job's worktree, the heaviest part. It first checks that the worktree really belongs to this job, then saves everything the job changed, without touching the index or files:

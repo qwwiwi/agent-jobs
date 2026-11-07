@@ -134,6 +134,14 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 	if j.MergeNote != "" {
 		line += " · " + j.MergeNote
 	}
+	if j.Branch != "" {
+		line += " · branch " + j.Branch
+		if j.BranchNote != "" {
+			line += " (" + j.BranchNote + ")"
+		}
+	} else if j.BranchNote != "" {
+		line += " · " + j.BranchNote
+	}
 	if suspicious != "" {
 		line += " · " + suspicious
 	}
@@ -290,6 +298,13 @@ func (m *Manager) notifyPending() error {
 	jobs, err := m.Store.PendingNotify()
 	if err != nil || len(jobs) == 0 {
 		return err
+	}
+	// Recover a daemon crash between finishing a row and publishing its branch. This runs before
+	// delivery (and cleanup), so both the notification and job_result carry the recorded outcome.
+	for _, j := range jobs {
+		if err := m.publishResultBranch(j); err != nil {
+			return err
+		}
 	}
 	t := m.Config().NotifyTmuxTarget
 	if t == "" {
