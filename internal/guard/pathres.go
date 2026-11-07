@@ -126,6 +126,7 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 			s.makesLinks = true
 		}
 	}
+	s.wrapperCd(c)
 	argv := argvOf(c.words)
 	if len(argv) == 0 {
 		return
@@ -148,6 +149,23 @@ func (s *pathScope) step(c *simpleCmd, cdpathEnv bool) {
 func (s *pathScope) unknown(why string) {
 	if s.dynamic == "" {
 		s.dynamic = why
+	}
+}
+
+// wrapperCd treats a directory a wrapper moves the command into (`env -C D`, `sudo -D D`: cmdView.chdirs)
+// as a `cd -- D` (#211); chdir(2) ignores CDPATH. A directory from an expansion or a glob, and `sudo -i`
+// (the target user's home), leave the directory unknown.
+func (s *pathScope) wrapperCd(c *simpleCmd) {
+	v := split(c.words)
+	if v.login != "" {
+		s.unknown(v.login)
+	}
+	for _, d := range v.chdirs {
+		if c.dyn[d.idx] || hasGlob(d.dir) {
+			s.unknown(d.dir)
+			continue
+		}
+		s.cd([]string{"cd", "--", d.dir}, []bool{false, false, false}, false)
 	}
 }
 
