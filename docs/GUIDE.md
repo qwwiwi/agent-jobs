@@ -317,7 +317,7 @@ Full rule list: [docs/ARCHITECTURE.md](ARCHITECTURE.md#rules-enforcement).
   Only the marked sections are copied; over 8 KB is refused and nothing is written. A hand-written owner-rules file still works and is replaced only with `--force`.
 - **Project cards.** Short notes per repository, attached to the brief of every job in that repository: stack, check runner, what not to touch, known traps. They live in `~/.agent-jobs/<agent>/cards/<name>.md` (≤ 4 KB each) and match by `repo:` (the repository's top-level path) or `remote:` (a remote URL or `host/owner/name`; `https://`, `git@host:` and `ssh://` forms compare equal, the host's case is ignored, the path's case is not; a local or relative remote only matches a local path). A card that cannot be read or parsed refuses the start of repository jobs instead of being skipped. Example: [cards/example-agent-jobs.md](../cards/example-agent-jobs.md).
 
-- **Plugins for jobs.** `--setting-sources project` also keeps the orchestrator's user-level Claude Code plugins out of a job. Config `job_plugins` loads chosen plugins (skill packs such as `superpowers`) into claude jobs with `--plugin-dir`; their skills load lazily (descriptions only), so they do not count against `skills_max_kb`, and nothing is copied, so a plugin update reaches the next job.
+- **Plugins for jobs.** `--setting-sources project` also keeps the orchestrator's user-level Claude Code plugins out of a job. Config `job_plugins` loads chosen plugins (skill packs such as `superpowers`) into claude jobs with `--plugin-dir`; their skills load lazily (descriptions only), so they do not count against `skills_max_kb`; the job gets a fresh copy of the plugin at every launch and resume, so a plugin update reaches the next job.
 
   ```json
   { "job_plugins": [
@@ -343,6 +343,27 @@ Full rule list: [docs/ARCHITECTURE.md](ARCHITECTURE.md#rules-enforcement).
   ```
 
   `index.json` is `{"version": 1, "skills": [{"name": "golang", "path": "skills/golang", "status": "core", "kinds": ["code"], "projects": [], "last_verified": "2026-10-18", "risk": []}]}` (other fields such as `owner`, `origin`, `place`, `sha256`, `size_kb`, `has_scripts` and a `plugins` list are allowed; agent-jobs reads only `name`, `path`, `status`, `kinds`, `projects`, `risk` and `last_verified`, the informational fields are free-form: `origin` may be a string or an object, a value of an unexpected type is ignored, and an unknown field is ignored; an entry whose needed field has the wrong type is skipped with a warning naming the entry, the rest of the catalog still loads); each `path` is a directory named like the skill, inside the root, holding `SKILL.md`; a symlink inside a skill may only point to a regular file in that same skill directory (no directory links, nothing outside it, counted in the size), otherwise the entry is skipped with a warning. Status: `core` (a default for its kinds), `active`, `draft` (only when named), `deprecated` (never). A job gets the `core` skills of its kind (`fix` and `general` match `code` and `general`, `review` matches `review`, `research` matches `research`) plus the skills whose `projects` name the repository's folder; `job_start` `skills: ["+name", "-name"]` (CLI `--skills a,+b,-c`, also on schedules; on a milestone task the task's planned `skills` when none are given, see [Milestones](#milestones)) adds or removes; an unknown or deprecated name, or more than the budget, refuses the start. An explicit whole line `skills: none` in the brief (case-insensitive, surrounding whitespace allowed) opts out of catalog skills, matching the signal accepted by external orchestrator PreToolUse hooks. It cannot be combined with nonempty `skills` edits. Omitting `skills` or passing `skills: []` keeps the defaults; use `-name` edits to remove individual defaults. Repository-owned skills still belong to the repository. For the run, each skill is linked into the worktree as `.claude/skills/<name>` -> its catalog directory (hidden from git by the repository's `info/exclude`, write-protected for the job, removed when the attempt ends, before any diff); a skill the repository already has stays the repository's; codex jobs get none. The brief names the skills in one line. `skill_list` / `agent-jobs skills list|search QUERY` browse and search the catalog; `agent-jobs stats --by skill` shows uses next to deliveries, `--by skill --by-repo` the rating per repository.
+
+### Example: superpowers in jobs
+
+The MIT-licensed `superpowers` plugin has 15 skills in v7.0.2. It shapes how a Claude job writes, tests, debugs and reviews code. The 12 available skills are `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `writing-plans`, `executing-plans`, `receiving-code-review`, `requesting-code-review`, `subagent-driven-development`, `dispatching-parallel-agents`, `writing-skills`, `diagnosing-superpowers` and `using-superpowers`.
+
+Deny `brainstorming` because it asks a human questions and waits; a job has no human in the loop. Deny `finishing-a-development-branch` because it offers to merge, push or open a PR; jobs only commit locally. Deny `using-git-worktrees` because a job already runs in its own detached worktree.
+
+Add this entry to the config:
+
+```json
+"job_plugins": [
+  {
+    "name": "superpowers@superpowers-marketplace",
+    "kinds": ["fix", "general", "review"],
+    "deny_skills": ["brainstorming", "finishing-a-development-branch", "using-git-worktrees"],
+    "bootstrap_skill": "using-superpowers"
+  }
+]
+```
+
+`bootstrap_skill` supplies the bootstrap in place of the SessionStart hook, which is stripped from the default plugin view. `job_plugins` is restart-only, so restart the daemon after editing it. In `job_status` for a new job, check that `plugins` lists the name and version and that there are no `plugin_warnings`. To enable another plugin, use the same entry shape and inspect what it ships first; keep `allow_hooks` false unless you trust its hooks, which run outside the guard.
 
 ---
 

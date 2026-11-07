@@ -154,6 +154,7 @@ Details: [docs/GUIDE.md, Limits](docs/GUIDE.md#limits) (codex runner, commits an
 | [Report contract](docs/GUIDE.md#report-contract) | Summary, Findings / Changes, Evidence, Not done / uncertain, Progress; secrets redacted from reports | every result reads the same way, gaps first |
 | [Cleanup and patches](docs/GUIDE.md#cleanup-and-patches) | worktrees removed 30 minutes after the job-done line, work kept as patches and a git ref; prune, log archive, per-job stats | disks stay clean and no work is lost |
 | [Skills and job context](docs/GUIDE.md#skill-subagents-and-job-context) | the `agent-jobs` skill for the session; owner rules, project cards and catalog skills for jobs | the session routes work well, and jobs start with the right context |
+| [Plugins in jobs](docs/GUIDE.md#example-superpowers-in-jobs) | Claude Code plugins such as superpowers for Claude jobs | jobs can use a plugin's skills |
 | [Schedules](docs/GUIDE.md#mcp-tools) | cron in local time: type a prompt into the session or start a job | recurring work without a human |
 | [Checks (dead-man's switch)](docs/GUIDE.md#mcp-tools) | work that is silent while healthy leaves a mark; a missed mark alerts the session | silent failures get noticed |
 | [notify_owner](docs/GUIDE.md#mcp-tools) | a job or the session asks for the owner's attention through the session's own channel | jobs can raise a hand, with rate limits |

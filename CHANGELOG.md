@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-07
+
+This release reduces orchestrator turns and context bytes with coalesced job-done lines, idle pick, deduplicated and capped hook injections, and a compact `job_result`.
+Jobs gain Claude Code plugins such as superpowers, a `## Forks` report section, and injection metrics.
+Safety improvements include a serialized gate runner, the ui-check trust boundary, and an OpenRouter runner with key sandboxing.
+
 ### Added
 - Idle pick (#165): config `idle_pick` (`enabled` default `false`, `cooldown_seconds` default 600, `max_wakes_per_day` default 8 at most 48) makes the job-done line of the last job of an emptied queue say what is ready, instead of an hourly polling wake: `· idle: 2 ready tasks: 4:T2 "title", 4:T3 "title" / 1 open intention: #7 "text"`. Ready tasks are tasks of open milestones whose dependencies are done and that have no job yet (blocked, running, failed and in-review tasks are never listed), plus the agent's open intentions. The note rides the same delivery (single or coalesced), once per queue epoch (an explicit counter of the jobs that ended, kept by the database, and the new table `idle_pick_events`, so neither a restart nor two jobs ending in the same second repeat or merge an epoch), is dropped when a job is enqueued before the line is typed (the final queue check and the keystrokes run under an `idle.lock` that Enqueue and Resume also take around the insert), is recorded in the same transaction as the line's acknowledgement (a write that fails leaves the line pending and retried with the note saved in `idle_pick_delivery` before typing, so the retry acknowledges that stored note instead of composing another), and is never a line of its own; nothing ready delivers nothing. The daemon only reports and never starts work. A missed note is not made up later: nothing re-sends a delivered line, the note rides only a genuine pending job-done line. A database that predates idle pick starts with its finished jobs counted as evaluated (no note for history); a completion pending across the upgrade still gets its note. Docs: GUIDE, ARCHITECTURE, REFERENCE (+ .ru).
 - `## Forks` section in the job report (#168): the report contract asks for up to 5 lines `choice / rejected alternative / reason` (or `none`) between «Not done / uncertain» and Progress, so a reviewer sees which design choices were deliberate and what was rejected. `job_result` returns it as the field `forks` (the section as written; empty when the report has none, never an error, not part of the off-contract check); the review checklist asks the reviewer to check every Fork against the code. Docs: GUIDE (en, ru), ARCHITECTURE, DEVIATIONS #20.
@@ -305,7 +311,8 @@ No 0.2.0 was ever tagged: everything that was described as 0.2.0 is released her
 - File tools (Write/Edit/MultiEdit/NotebookEdit) cannot write inside `.git` or the job's own git dirs (symlinks resolved, `..` rejected).
 - Wrapper starts claude with a scrubbed git environment (job-only global config with the job identity, no system config, hooks/fsmonitor/ssh/credential helper/pager/editor overridden); the daemon's own git calls use the same overrides, and cleanup makes no patch when the repository config names a filter, diff command or textconv.
 
-[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/qwwiwi/agent-jobs/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/qwwiwi/agent-jobs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/qwwiwi/agent-jobs/compare/v0.4.0...v0.5.0
