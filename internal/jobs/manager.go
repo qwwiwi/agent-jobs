@@ -94,6 +94,14 @@ type Manager struct {
 	sourcesRetryAt sync.Map
 	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
 	beforeClaim func(*store.Job)
+	// beforeAdvisorLaunch (tests only) runs between an advisor call's reservation and its launch.
+	beforeAdvisorLaunch func(*store.Job)
+	// afterAdvisorAdmit (tests only) runs between an advisor call's final liveness check and the start
+	// of its process, under the advisor lock.
+	afterAdvisorAdmit func(*store.Job)
+	// closingLock (tests only) replaces admitLock for the transitions that close advisor admission
+	// (closingAdmission): a test injects a lock failure there.
+	closingLock func(dir string) (func(), error)
 
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
@@ -211,6 +219,9 @@ type StartRequest struct {
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
+	// Crew makes a crew job (issue #169): an advisor model the job may consult with advisor_ask, its caps,
+	// and an optional paired_with job to compare with in job_stats. Zero = a plain job.
+	Crew CrewRequest
 	// Paths are repository-relative paths/globs for overlap admission (fix/general only).
 	Paths []string
 	// OnOverlap is warn (default), serialize or refuse. Parent explicitly stacks on another job.
@@ -545,6 +556,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
+	crew, err := m.validateCrew(r, runner)
+	if err != nil {
+		return nil, err
+	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
 		return nil, err
@@ -651,7 +666,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
-		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent,
+		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
 	}
 	return j, nil
 }
@@ -706,6 +721,9 @@ func (m *Manager) tickLocked() error {
 	}
 	if err := m.retryScopeStops(); err != nil {
 		errs = append(errs, fmt.Errorf("scope stop: %w", err))
+	}
+	if err := m.retryAdvisorEnds(); err != nil {
+		errs = append(errs, fmt.Errorf("advisor calls: %w", err))
 	}
 	if err := m.retryRedactions(); err != nil {
 		errs = append(errs, fmt.Errorf("redaction: %w", err))
@@ -1816,7 +1834,11 @@ func (m *Manager) collect() error {
 			// since. The decision is a conditional update against the row as it is now; it also closes
 			// the start of an acceptance command from here on.
 			beforeTimeoutClaim(j.ID)
-			claimed, err := m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+			var claimed bool
+			err := m.closingAdmission(j, func() (err error) {
+				claimed, err = m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+				return err
+			})
 			if err != nil {
 				m.Log.Printf("job %s: claim timeout: %v", j.ID, err)
 				continue
@@ -1965,11 +1987,20 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		}
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
-	if err := m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now); err != nil {
+	// Admission is closed for the transition: the running advisor calls end first, and one that cannot be
+	// ended (kept registered, retried every tick) keeps the attempt from counting as a clean finish.
+	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(j.ID); note != "" {
+			status, msg = advisorsNotEnded(status, msg, note)
+		}
+		return m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now)
+	}); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
-	if status == store.StatusTimeout || status == store.StatusFailed {
+	// A crew job's advisor calls run in sessions of their own, outside the wrapper's session sweep: what
+	// they left outside their group is swept after any finish, a successful one too (issue #190).
+	if status == store.StatusTimeout || status == store.StatusFailed || j.Crew.HasAdvisor() {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
 	m.noteReviewChanges(j)
@@ -2203,7 +2234,13 @@ func (m *Manager) Cancel(id string) error {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
-	if err := m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now); err != nil {
+	// Admission is closed for the transition; the running advisor calls end first (finish).
+	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(id); note != "" {
+			_, msg = advisorsNotEnded(store.StatusCancelled, msg, note)
+		}
+		return m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now)
+	}); err != nil {
 		return err
 	}
 	m.noteSweep(id, m.sweepEscaped(id))

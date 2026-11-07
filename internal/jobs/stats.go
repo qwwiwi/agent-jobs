@@ -724,6 +724,12 @@ type StatsReport struct {
 	GuardRules []NameCount  `json:"guard_rules"`
 	Skills     []SkillUse   `json:"skills"`
 	Tools      []NameCount  `json:"tools"`
+	// CrewPairs are the jobs started with paired_with (issue #169) finished in the window, each next to
+	// the job it names: status, outcome, turns, cost main / advisor.
+	CrewPairs []CrewPair `json:"crew_pairs,omitempty"`
+	// AdvisorCostUSD is what the advisor calls of the crew jobs in the window spent or may still spend
+	// (a call without a known cost at its budget), on top of the totals, which sum the jobs' own cost.
+	AdvisorCostUSD float64 `json:"advisor_cost_usd,omitempty"`
 }
 
 // TopN bounds the guard-rule and tool lists of a stats report.
@@ -765,6 +771,12 @@ func (m *Manager) StatsContext(ctx context.Context, since time.Time, by string) 
 	rep, err := Summarize(rows, by)
 	if !since.IsZero() {
 		rep.Since = since.UTC().Format(time.RFC3339)
+	}
+	if err == nil {
+		rep.CrewPairs, err = m.crewPairs(ctx, rows)
+	}
+	if err == nil {
+		rep.AdvisorCostUSD, err = m.crewAdvisorCost(ctx, rows)
 	}
 	return rep, err
 }

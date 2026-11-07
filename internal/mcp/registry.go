@@ -110,13 +110,19 @@ var OrchestratorOnly = []string{
 // JobAllowed are tools a job may call (the orchestrator gets them too): reading and writing the
 // team's shared memory, notify_owner, which reaches the owner only through the agent's own
 // session (rate limited), and check_mark, a completion mark for an existing check; nothing that
-// reaches another agent.
+// reaches another agent. advisor_ask (issue #169) is registered only in a crew job's server.
 var JobAllowed = []string{
 	"memory_search",
 	"memory_write",
 	"notify_owner",
 	"check_mark",
+	"advisor_ask",
 }
+
+// JobConditional are job tools a server registers only when their dependency is in its Deps:
+// advisor_ask needs a crew job's proxy client (Deps.JobAdvisor), so a plain job and the orchestrator
+// never list it.
+var JobConditional = []string{"advisor_ask"}
 
 // Allowed reports whether role may see and call the tool.
 func Allowed(role Role, name string) bool {

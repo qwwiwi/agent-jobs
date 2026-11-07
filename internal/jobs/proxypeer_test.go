@@ -33,6 +33,9 @@ type peerCall struct {
 	Text    string           `json:"text,omitempty"`
 	Urgency string           `json:"urgency,omitempty"`
 	Check   string           `json:"check,omitempty"`
+	// Question and Context are advisor_ask's input.
+	Question string `json:"question,omitempty"`
+	Context  string `json:"context,omitempty"`
 }
 
 // peerAnswer is the child's answer to a peerCall.
@@ -67,6 +70,8 @@ func runProxyClient() int {
 			a.Result, err = cl.NotifyOwner(ctx, c.Text, c.Urgency)
 		case brain.SocketOpCheckMark:
 			a.Result, err = cl.CheckMark(ctx, c.Check, c.Text)
+		case brain.SocketOpAdvisor:
+			a.Result, err = cl.AdvisorAsk(ctx, c.Question, c.Context)
 		default:
 			err = errors.New("unknown op " + c.Op)
 		}
@@ -186,5 +191,10 @@ func (c *peerClient) NotifyOwner(_ context.Context, text, urgency string) (brain
 
 func (c *peerClient) CheckMark(_ context.Context, name, note string) (brain.Object, error) {
 	a := c.call(peerCall{Op: brain.SocketOpCheckMark, Check: name, Text: note})
+	return a.Result, answerErr(a)
+}
+
+func (c *peerClient) AdvisorAsk(_ context.Context, question, background string) (brain.Object, error) {
+	a := c.call(peerCall{Op: brain.SocketOpAdvisor, Question: question, Context: background})
 	return a.Result, answerErr(a)
 }

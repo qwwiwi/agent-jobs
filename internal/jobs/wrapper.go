@@ -1067,25 +1067,10 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 		return 127, false, StreamResult{}
 	}
 	defer stdout.Close()
-	env, err := GitEnv(jobDir, os.Environ())
+	env, err := RunnerEnv(jobDir, os.Environ(), runner)
 	if err != nil {
-		fmt.Fprintln(stderrLog, "run-wrapper: git environment:", err)
+		fmt.Fprintln(stderrLog, "run-wrapper:", err)
 		return 127, false, StreamResult{}
-	}
-	env, err = JobEnv(jobDir, env)
-	if err != nil {
-		fmt.Fprintln(stderrLog, "run-wrapper: job marker:", err)
-		return 127, false, StreamResult{}
-	}
-	// Created by prepare; again here for an attempt prepared by an older build.
-	tmp, err := ensureJobTmp(jobDir)
-	if err != nil {
-		fmt.Fprintln(stderrLog, "run-wrapper: job temp dir:", err)
-		return 127, false, StreamResult{}
-	}
-	env = TempEnv(env, tmp)
-	if runner != store.RunnerCodex {
-		env = ForkSubagentEnv(env)
 	}
 	if runEnv != nil {
 		env = runEnv(env)
@@ -1122,6 +1107,29 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 		return 127, closed, res
 	}
 	return 0, closed, res
+}
+
+// RunnerEnv is the environment a job's runner starts with, built from env: the job's git environment
+// (GitEnv), the job marker without the user bus (JobEnv), the job's temp dir (TempEnv) and, for a
+// claude runner, no fork subagents (ForkSubagentEnv). An advisor call of a crew job gets it too.
+func RunnerEnv(jobDir string, env []string, runner string) ([]string, error) {
+	env, err := GitEnv(jobDir, env)
+	if err != nil {
+		return nil, fmt.Errorf("git environment: %w", err)
+	}
+	if env, err = JobEnv(jobDir, env); err != nil {
+		return nil, fmt.Errorf("job marker: %w", err)
+	}
+	// Created by prepare; again here for an attempt prepared by an older build.
+	tmp, err := ensureJobTmp(jobDir)
+	if err != nil {
+		return nil, fmt.Errorf("job temp dir: %w", err)
+	}
+	env = TempEnv(env, tmp)
+	if runner != store.RunnerCodex {
+		env = ForkSubagentEnv(env)
+	}
+	return env, nil
 }
 
 // JobTmpDir is the job's own temp dir inside its folder (<jobDir>/tmp): what the job's tools leave in

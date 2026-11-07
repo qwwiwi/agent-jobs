@@ -199,7 +199,8 @@ const usage = `usage: agent-jobs <command> [flags]
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
-                                           job: only the tools allow-listed for jobs)
+                                           job: only the tools allow-listed for jobs; --advisor:
+                                           a crew job's server, also advisor_ask)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
              [--subagent-db DB --subagent-job ID] [--protect PATH]...
                                            (PreToolUse hook, JSON on stdin)
@@ -341,6 +342,7 @@ func mcpRole(args []string) string {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	_ = fs.String("agent", "", "")
+	_ = fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "")
 	role := fs.String("role", "", "")
 	if _, err := parse(fs, args); err != nil {
 		return ""
@@ -574,6 +576,11 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	fs.StringVar(&r.Crew.AdvisorModel, "advisor-model", "", "crew job (claude only): a stronger claude model the job may consult with advisor_ask at a design fork (read-only, capped)")
+	fs.IntVar(&r.Crew.AdvisorMaxCalls, "advisor-max-calls", 0, fmt.Sprintf("crew job: advisor calls per job; default %d, ceiling %d", jobs.DefaultAdvisorMaxCalls, jobs.MaxAdvisorCalls))
+	fs.Float64Var(&r.Crew.AdvisorMaxBudgetUSD, "advisor-max-budget-usd", 0, fmt.Sprintf("crew job: the advisor calls' spend cap in USD, on top of --max-budget-usd; default %g, ceiling %g",
+		jobs.DefaultAdvisorBudgetUSD, jobs.MaxAdvisorBudgetUSD))
+	fs.StringVar(&r.Crew.PairedWith, "paired-with", "", "id of another job on the same brief to compare with in stats (crew vs plain)")
 	var paths multi
 	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
 	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
@@ -758,6 +765,18 @@ func cmdStatus(args []string) error {
 	}
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
+	}
+	return printCrew(m, j)
+}
+
+// printCrew prints a crew job's advisor setup and calls (nothing for a plain job).
+func printCrew(m *jobs.Manager, j *store.Job) error {
+	v, err := m.Crew(j)
+	if err != nil {
+		return fmt.Errorf("crew: %w", err)
+	}
+	for _, line := range jobs.CrewTimeline(v) {
+		fmt.Println(shown(line))
 	}
 	return nil
 }
@@ -1044,6 +1063,9 @@ func cmdResult(args []string) error {
 	}
 	if len(atts) > 0 {
 		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
+	}
+	if err := printCrew(m, j); err != nil {
+		return err
 	}
 	// The bounded reader of job_result: never through a link, never a FIFO or another non-regular
 	// file, at most the scan cap.
@@ -1469,6 +1491,7 @@ func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	roleFlag := fs.String("role", "", "orchestrator|job")
+	advisor := fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "job role: offer advisor_ask (a crew job)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -1479,10 +1502,13 @@ func cmdMCP(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *advisor && role != mcp.RoleJob {
+		return errors.New("--advisor is for the job role only")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// stdout carries the protocol: nothing else may print there.
-	return mcp.Serve(ctx, role, *agent)
+	return mcp.Serve(ctx, role, *agent, *advisor)
 }
 
 func cmdPrune(args []string) error {
@@ -2030,6 +2056,26 @@ func cmdStats(args []string) error {
 		fmt.Println("\nskills (uses, jobs, success rate, delivered, delivered unused):")
 		for _, s := range rep.Skills {
 			fmt.Printf("  %-22s %d  %d  %.0f%%  %d  %d\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100, s.Delivered, s.DeliveredUnused)
+		}
+	}
+	if rep.AdvisorCostUSD > 0 {
+		fmt.Printf("\nadvisor calls of crew jobs: $%.2f (not in the totals above)\n", rep.AdvisorCostUSD)
+	}
+	if len(rep.CrewPairs) > 0 {
+		fmt.Println("\ncrew pairs (job vs paired: model, advisor calls, status, outcome, cost main + advisor):")
+		side := func(s jobs.CrewPairSide) string {
+			model := s.Model
+			if s.AdvisorModel != "" {
+				model += "+" + s.AdvisorModel
+			}
+			outcome := s.Outcome
+			if outcome == "" {
+				outcome = "-"
+			}
+			return fmt.Sprintf("%s %s %d %s %s $%.2f+$%.2f", s.ID, shown(model), s.AdvisorCalls, s.Status, outcome, s.CostMainUSD, s.CostAdvisorUSD)
+		}
+		for _, p := range rep.CrewPairs {
+			fmt.Printf("  %s  vs  %s\n", side(p.Job), side(p.Paired))
 		}
 	}
 	return nil

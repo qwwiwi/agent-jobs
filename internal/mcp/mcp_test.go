@@ -195,8 +195,8 @@ func TestJobRoleRefusesHiddenToolsServerSide(t *testing.T) {
 	}
 	for name, s := range map[string]*sdk.Server{"plain": plain, "all registered": loaded} {
 		cs := connect(t, s)
-		if got := toolNames(t, cs); len(got) != len(JobAllowed) {
-			t.Fatalf("%s: job role lists %v, want %v", name, got, JobAllowed)
+		if got := toolNames(t, cs); len(got) != len(JobAllowed)-len(JobConditional) {
+			t.Fatalf("%s: job role lists %v, want %v without %v", name, got, JobAllowed, JobConditional)
 		}
 		for _, tool := range OrchestratorOnly {
 			msg := callErr(t, cs, tool, map[string]any{"id": "x"})
@@ -213,6 +213,7 @@ func TestOrchestratorRoleListsJobTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := slices.Sorted(slices.Values(append(slices.Clone(OrchestratorOnly), JobAllowed...)))
+	want = slices.DeleteFunc(want, func(n string) bool { return slices.Contains(JobConditional, n) })
 	if got := toolNames(t, connect(t, s)); !slices.Equal(got, want) {
 		t.Fatalf("orchestrator tools %v, want %v", got, want)
 	}
@@ -396,14 +397,14 @@ func TestStdioSubcommand(t *testing.T) {
 		return cs
 	}
 	job := run("job")
-	if got := toolNames(t, job); len(got) != len(JobAllowed) {
+	if got := toolNames(t, job); len(got) != len(JobAllowed)-len(JobConditional) {
 		t.Fatalf("job role over stdio lists %v", got)
 	}
 	if msg := callErr(t, job, "job_start", startArgs(nil)); !strings.Contains(msg, "not available to the job role") {
 		t.Fatalf("job role job_start: %q", msg)
 	}
 	orch := run("orchestrator")
-	if got := toolNames(t, orch); len(got) != len(OrchestratorOnly)+len(JobAllowed) {
+	if got := toolNames(t, orch); len(got) != len(OrchestratorOnly)+len(JobAllowed)-len(JobConditional) {
 		t.Fatalf("orchestrator over stdio lists %v", got)
 	}
 	var started JobView
@@ -476,7 +477,7 @@ func TestBinaryRefusesInsideJob(t *testing.T) {
 	}
 	// Serve refuses the orchestrator role under the marker even when called directly.
 	t.Setenv(jobs.JobEnvVar, "x")
-	if err := Serve(context.Background(), RoleOrchestrator, "test"); err == nil || !strings.Contains(err.Error(), "refused") {
+	if err := Serve(context.Background(), RoleOrchestrator, "test", false); err == nil || !strings.Contains(err.Error(), "refused") {
 		t.Fatalf("Serve orchestrator under the marker: %v", err)
 	}
 }
@@ -642,13 +643,13 @@ func TestJobRoleToolWithoutManagerFailsCleanly(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := connect(t, s)
-	if got := toolNames(t, cs); !slices.Contains(got, "dummy_count") || len(got) != len(JobAllowed) {
+	if got := toolNames(t, cs); !slices.Contains(got, "dummy_count") || len(got) != len(JobAllowed)-len(JobConditional) {
 		t.Fatalf("job tools %v", got)
 	}
 	if msg := callErr(t, cs, "dummy_count", map[string]any{}); !strings.Contains(msg, "needs the job database") {
 		t.Fatalf("dummy tool without a manager: %q", msg)
 	}
-	if got := toolNames(t, cs); len(got) != len(JobAllowed) { // the server survived the call
+	if got := toolNames(t, cs); len(got) != len(JobAllowed)-len(JobConditional) { // the server survived the call
 		t.Fatalf("after the call: %v", got)
 	}
 }

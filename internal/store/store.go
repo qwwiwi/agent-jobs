@@ -208,6 +208,8 @@ type Job struct {
 	// Parent is an explicit stack edge; ParentBase freezes the parent's successful result at launch.
 	Parent     string
 	ParentBase string
+	// Crew is the advisor setup of a crew job (issue #169); nil for a plain job.
+	Crew *Crew
 }
 
 // JobOverlap records the other job and both declarations of each intersecting scope.
@@ -518,6 +520,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: sources: %w", err)
 	}
+	if err := migrateCrew(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: crew: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -816,7 +822,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
-	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base`
+	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
+	crew`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -901,7 +908,8 @@ func insertArgs(j *Job) []any {
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
 		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
 		j.RequestedBranch, j.Branch, j.BranchNote,
-		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase}
+		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
+		crewJSON(j.Crew)}
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -922,7 +930,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor, crew string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -936,12 +944,15 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
 		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
-		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase)
+		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase, &crew)
 	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(sourceFiles), &j.SourceFiles); err != nil {
 		return nil, fmt.Errorf("job %s: source_files: %w", j.ID, err)
+	}
+	if j.Crew, err = parseCrew(crew); err != nil {
+		return nil, fmt.Errorf("job %s: crew: %w", j.ID, err)
 	}
 	if err := json.Unmarshal([]byte(paths), &j.Paths); err != nil {
 		return nil, fmt.Errorf("job %s: paths: %w", j.ID, err)
