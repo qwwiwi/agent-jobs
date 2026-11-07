@@ -182,6 +182,9 @@ type QueueStatus struct {
 	// opened the manager. The daemon enforces its own copy, read at its start; after a config change
 	// the two can differ until both restart. /v1/health shows the daemon's value.
 	ConfiguredMaxRunning int `json:"configured_max_running"`
+	// GateLock is the box-wide gate lock (#208): who holds it now and which of this agent's running jobs
+	// wait for it (their gates or acceptance steps).
+	GateLock GateLockView `json:"gate_lock"`
 }
 
 // Queue reports the queue.
@@ -201,6 +204,9 @@ func (m *Manager) Queue() (QueueStatus, error) {
 			return q, err
 		}
 		*c.n = len(l)
+		if c.n == &q.Running {
+			q.GateLock = m.gateLockView(l)
+		}
 	}
 	return q, nil
 }

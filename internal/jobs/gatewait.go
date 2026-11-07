@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"os"
+	"syscall"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -64,4 +66,41 @@ func (m *Manager) creditGateWait(j *store.Job, now time.Time) {
 		return
 	}
 	j.GateWaitSec = sec
+}
+
+// GateLockView is the box-wide gate lock as status and system_doctor show it (#208).
+type GateLockView struct {
+	Path string `json:"path"`
+	// Holder is the holder's line ("pid N job J since T at HEAD in DIR: CMD"); "" when the lock is free.
+	Holder string `json:"holder,omitempty"`
+	// Waiting are this agent's running jobs whose gate or acceptance step waits for the lock.
+	Waiting []GateLockWaiter `json:"waiting,omitempty"`
+}
+
+// GateLockWaiter is one running job waiting for the gate lock.
+type GateLockWaiter struct {
+	ID string `json:"id"`
+	GateWaitView
+}
+
+// gateLockView reads the lock's holder line (without taking the lock) and the waits of the running jobs.
+func (m *Manager) gateLockView(running []*store.Job) GateLockView {
+	v := GateLockView{Path: GateLockPath()}
+	if f, err := os.OpenFile(v.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0); err == nil {
+		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+			// A holder that was killed leaves its line behind: only a live holder counts.
+			if line := gateHolder(f); line != "unknown" {
+				if pid, _ := parseGateHolder(line); pid > 0 && alive(pid) {
+					v.Holder = RedactPrintable(line, 300)
+				}
+			}
+		}
+		f.Close()
+	}
+	for _, j := range running {
+		if w := m.GateWaitOf(j); w != nil && w.Waiting {
+			v.Waiting = append(v.Waiting, GateLockWaiter{ID: j.ID, GateWaitView: *w})
+		}
+	}
+	return v
 }

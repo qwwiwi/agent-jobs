@@ -157,6 +157,10 @@ type JobView struct {
 	Task      string `json:"task,omitempty"`
 	// Waiting explains queued job dependencies, a parent stack, or milestone dependencies/slots.
 	Waiting string `json:"waiting,omitempty"`
+	// GateWait (running jobs, #208): the job's gates or acceptance step wait for the box-wide gate lock
+	// ("waiting for gate lock held by <holder>"), and how long this attempt waited so far; its deadline
+	// moves by that wait.
+	GateWait *jobs.GateWaitView `json:"gate_wait,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
 	// Crew (crew jobs only, issue #169): the advisor setup, its calls as a timeline and the cost split
@@ -198,6 +202,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
 	v.Crew, v.CrewError = crewView(m, j)
+	v.GateWait = m.GateWaitOf(j)
 	return v
 }
 
@@ -643,8 +648,9 @@ var statuses = []string{store.StatusQueued, store.StatusRunning, store.StatusSuc
 
 func addJobList(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
-		Name:        "job_list",
-		Description: "Recent jobs of this agent, newest first, optionally only one status.",
+		Name: "job_list",
+		Description: "Recent jobs of this agent, newest first, optionally only one status. A running job whose heavy step waits for the box-wide " +
+			"gate lock shows gate_wait (\"waiting for gate lock held by <holder>\", waited_sec: its deadline moves by the wait).",
 	}, func(_ context.Context, _ *sdk.CallToolRequest, in JobListInput) (*sdk.CallToolResult, JobListOutput, error) {
 		limit := in.Limit
 		if limit == 0 {

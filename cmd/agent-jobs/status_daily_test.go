@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +104,38 @@ func TestStatusShowsUndeliveredNotifications(t *testing.T) {
 	for _, want := range []string{"1 owner notifications not delivered", "job job-7 (high): need a decision", "notify_tmux_target"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// status shows the box-wide gate lock and a running job waiting for it (#208).
+func TestStatusShowsGateLockWait(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	m, err := jobs.Open("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	j, err := m.Enqueue(jobs.StartRequest{Title: "t", Kind: "general", Brief: "do it", Model: "sonnet"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(j.ID, "tok", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(m.JobDir(j.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st := jobs.GateWaitState{Waits: []jobs.GateWaitEntry{{PID: os.Getpid(), Since: time.Now().Add(-30 * time.Second).UTC(),
+		Holder: "pid 1 job other since x: scripts/check.sh"}}}
+	b, _ := json.Marshal(st)
+	if err := os.WriteFile(filepath.Join(m.JobDir(j.ID), jobs.GateWaitFile), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() error { return printQueue(m) })
+	for _, want := range []string{"gate lock: ", "gate wait: " + j.ID + " waiting for gate lock held by pid 1 job other since x: scripts/check.sh (waited 3"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
 		}
 	}
 }

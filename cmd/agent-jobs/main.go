@@ -821,6 +821,15 @@ func printQueue(m *jobs.Manager) error {
 		return err
 	}
 	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
+	// The box-wide gate lock that serializes heavy steps (#208).
+	if g := q.GateLock; g.Holder != "" {
+		fmt.Printf("gate lock: held by %s\n", shown(g.Holder))
+	} else {
+		fmt.Println("gate lock: free")
+	}
+	for _, w := range q.GateLock.Waiting {
+		fmt.Printf("gate wait: %s %s (waited %ds)\n", w.ID, shown(w.Note), w.WaitedSec)
+	}
 	return nil
 }
 
