@@ -10,16 +10,16 @@ import (
 // Keeping the ref operations independent of the store also permits offline Git tests.
 type branchGit func(args ...string) (string, error)
 
-// validateResultBranch checks a caller-supplied result target at start time.
-func validateResultBranch(run branchGit, name string) error {
-	return validateBranchTarget(run, name, false)
-}
+// errBranchExists reports that the branch to create is already taken by another ref (or by this
+// job's own earlier publication of a different commit). Result branches are create-only: the daemon
+// never moves an existing ref, so it can never disturb a branch somebody else has checked out,
+// advanced or relies on, and no default-branch knowledge is needed.
+var errBranchExists = errors.New("branch already exists")
 
-// validateBranchTarget refuses invalid and protected names. generated marks the job/<id> fallback
-// the daemon creates itself: it needs no knowledge of the default branch, so it also works in a
-// detached repository without metadata. Any other name is refused unless the default branch is
-// identified, because a requested name could be that branch.
-func validateBranchTarget(run branchGit, name string, generated bool) error {
+// validateResultBranch checks a caller-supplied result name statically: a valid branch name written
+// literally, and not one of the protected names (main, master, release*). Whether the name is free
+// is decided when the ref is created.
+func validateResultBranch(run branchGit, name string) error {
 	// check-ref-format expands @{-N}; accept only the literal name the caller supplied.
 	checked, err := run("check-ref-format", "--branch", name)
 	if err != nil || checked != name || strings.HasPrefix(name, "refs/") {
@@ -30,50 +30,16 @@ func validateBranchTarget(run branchGit, name string, generated bool) error {
 	if lower == "main" || lower == "master" || strings.HasPrefix(lower, "release") {
 		return fmt.Errorf("protected result branch %q", name)
 	}
-	// Remote HEADs and init.defaultBranch are local metadata: never fetch just to validate a name.
-	defaults, err := run("for-each-ref", "--format=%(symref)", "refs/remotes/")
-	if err != nil {
-		return fmt.Errorf("check default branch: %w", err)
-	}
-	knownDefault := false
-	for _, ref := range strings.Fields(defaults) {
-		if rest, ok := strings.CutPrefix(ref, "refs/remotes/"); ok {
-			if _, branch, ok := strings.Cut(rest, "/"); ok {
-				knownDefault = true
-				if strings.EqualFold(branch, name) {
-					return fmt.Errorf("protected default branch %q", name)
-				}
-			}
-		}
-	}
-	declared := false
-	if configured, err := run("config", "--get", "init.defaultBranch"); err == nil && configured != "" {
-		declared = true
-		if strings.EqualFold(name, configured) {
-			return fmt.Errorf("protected default branch %q", name)
-		}
-	}
-	// The main worktree's current branch is always protected too, but it is no proof of the
-	// default: a repository on a feature branch, with the default elsewhere and no remote HEAD,
-	// would otherwise let a request move the real default. Fail closed for requested names until
-	// a remote HEAD or an explicit init.defaultBranch identifies the default.
-	if current, err := run("symbolic-ref", "-q", "HEAD"); err == nil && strings.EqualFold(current, "refs/heads/"+name) {
-		return fmt.Errorf("protected current branch %q", name)
-	}
-	if !generated && !knownDefault && !declared {
-		return errors.New("result branch refused: the default branch cannot be identified (no remote HEAD metadata and no init.defaultBranch); run git remote set-head or set init.defaultBranch")
-	}
 	return nil
 }
 
-// publishBranchRef creates a branch or advances it only from an ancestor of head.
-// The expected old OID makes the write atomic against other jobs and owner actions.
-// It never follows a symbolic ref or changes a checked-out worktree's branch.
-//
-// generated marks the daemon's own job/<id> fallback, which needs no default-branch knowledge;
-// every other name is validated again, since the repository may have changed since start.
-func publishBranchRef(run branchGit, name, head string, generated bool) (fastForwarded bool, err error) {
-	if err := validateBranchTarget(run, name, generated); err != nil {
+// publishBranchRef creates refs/heads/<name> at head and nothing else. The expected old value is
+// empty (update-ref: the ref must not exist), so the write is atomic against every other writer: of
+// concurrent creators exactly one wins, the others get errBranchExists. An existing ref is never
+// moved, followed or rolled back. A retry that finds the ref already at head (a crash between the
+// write and the job row update) succeeds without writing; created is false then.
+func publishBranchRef(run branchGit, name, head string) (created bool, err error) {
+	if err := validateResultBranch(run, name); err != nil {
 		return false, err
 	}
 	if !branchOID(head) {
@@ -84,43 +50,66 @@ func publishBranchRef(run branchGit, name, head string, generated bool) (fastFor
 		return false, errors.New("job head is not an available commit")
 	}
 	ref := "refs/heads/" + name
+	if exists, atHead := existingRef(run, ref, head); exists {
+		if atHead {
+			return false, nil
+		}
+		return false, errBranchExists
+	}
+	// An unborn branch that a worktree has checked out has no ref to collide with; do not make one
+	// appear under that worktree.
+	if err := refNotCheckedOut(run, ref); err != nil {
+		return false, err
+	}
+	_, writeErr := run("update-ref", "--no-deref", ref, head, "")
+	if writeErr == nil {
+		return true, nil
+	}
+	// The write failed: either another writer created the ref meanwhile (a legitimate outcome) or
+	// something else is wrong (a directory/file name conflict, a lock, a read-only repository).
+	if exists, atHead := existingRef(run, ref, head); exists {
+		if atHead {
+			return false, nil
+		}
+		return false, errBranchExists
+	}
+	return false, fmt.Errorf("create branch: %w", writeErr)
+}
+
+// existingRef reports whether ref exists (a symbolic ref counts, dangling or not, and is never
+// "at head": it must not be adopted) and whether it points at head.
+func existingRef(run branchGit, ref, head string) (exists, atHead bool) {
 	if _, err := run("symbolic-ref", "-q", ref); err == nil {
-		return false, errors.New("branch is a symbolic ref")
+		return true, false
 	}
-	tip, lookupErr := run("rev-parse", "--verify", "--end-of-options", ref)
-	if lookupErr != nil {
-		tip = "" // update-ref's empty expected OID requires the ref not to exist.
-	} else {
-		if !branchOID(tip) {
-			return false, errors.New("branch tip is not a full commit ID")
+	tip, err := run("rev-parse", "--verify", "-q", "--end-of-options", ref)
+	if err != nil {
+		return false, false
+	}
+	return true, tip == head
+}
+
+// publishResultRefs publishes the job head under the requested name when it is free, and under
+// job/<id> otherwise (or when no name was requested). It returns the branch that holds the result
+// and a note when the request was not honoured. It writes one ref only.
+func publishResultRefs(run branchGit, id, requested, head string) (branch, note string, err error) {
+	generated := "job/" + id
+	if requested != "" && requested != generated {
+		_, err := publishBranchRef(run, requested, head)
+		if err == nil {
+			return requested, "", nil
 		}
-		if tip == head {
-			return true, nil // an existing branch already at head: idempotent crash recovery.
-		}
-		if _, err := run("merge-base", "--is-ancestor", tip, head); err != nil {
-			return false, errors.New("not a fast-forward (current tip is not an ancestor of job head)")
+		if errors.Is(err, errBranchExists) {
+			note = fmt.Sprintf("requested branch %s exists; not moved - published %s; fast-forward it yourself with git merge --ff-only",
+				requested, generated)
+		} else {
+			note = fmt.Sprintf("requested branch %s not created: %s - published %s", requested, RedactPrintable(err.Error(), 240), generated)
 		}
 	}
-	if err := refNotCheckedOut(run, ref); err != nil {
-		return false, err
+	if _, err := publishBranchRef(run, generated, head); err != nil {
+		return "", "", err
 	}
-	if _, err := run("update-ref", "--no-deref", ref, head, tip); err != nil {
-		return false, fmt.Errorf("atomic branch update refused: %w", err)
-	}
-	// update-ref knows nothing about worktrees, and a checkout of the unchanged tip does not fail
-	// the expected-old-OID check. Look again now that the ref has moved: a worktree that switched to
-	// it in between would sit on a new tip with its old index and files, so put the ref back.
-	if err := refNotCheckedOut(run, ref); err != nil {
-		rollback := []string{"update-ref", "--no-deref", ref, tip, head}
-		if tip == "" {
-			rollback = []string{"update-ref", "--no-deref", "-d", ref, head}
-		}
-		if _, rbErr := run(rollback...); rbErr != nil {
-			return false, fmt.Errorf("%w; restoring the branch failed: %v", err, rbErr)
-		}
-		return false, err
-	}
-	return tip != "", nil
+	return generated, note, nil
 }
 
 // refNotCheckedOut fails when any worktree (the main one included) has ref checked out.

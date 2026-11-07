@@ -21,20 +21,19 @@ func TestResultBranchDefault(t *testing.T) {
 	}
 }
 
-func TestResultBranchRequestedNewAndAncestorTarget(t *testing.T) {
-	for _, exists := range []bool{false, true} {
-		t.Run(map[bool]string{false: "new", true: "ancestor-of-base"}[exists], func(t *testing.T) {
-			m := newManager(t)
-			repo := newRepo(t)
-			if exists {
-				gitT(t, repo, "branch", "feature")
-				gitT(t, repo, "commit", "-q", "--allow-empty", "-m", "advance base")
-			}
-			j := runToEnd(t, m, enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" }).ID)
-			if j.Branch != "feature" || (exists && j.BranchNote != "fast-forwarded") || (!exists && j.BranchNote != "") {
-				t.Fatalf("target: %+v", j)
-			}
-		})
+func TestResultBranchRequestedNew(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" }).ID)
+	head := gitT(t, m.JobDir(j.ID)+"/work", "rev-parse", "HEAD")
+	if j.Branch != "feature" || j.BranchNote != "" {
+		t.Fatalf("target: %+v", j)
+	}
+	if got := gitT(t, repo, "rev-parse", "refs/heads/feature"); got != head {
+		t.Fatalf("feature at %s, want %s", got, head)
+	}
+	if refs := gitT(t, repo, "for-each-ref", "--format=%(refname)", "refs/heads/job/"); refs != "" {
+		t.Fatalf("a second ref was created: %s", refs)
 	}
 }
 
@@ -64,48 +63,65 @@ func TestResultBranchNotifyRecovery(t *testing.T) {
 	}
 }
 
-func TestResultBranchRequested(t *testing.T) {
-	for _, diverged := range []bool{false, true} {
-		t.Run(map[bool]string{false: "fast-forward", true: "non-fast-forward"}[diverged], func(t *testing.T) {
+// An existing requested branch is never touched, whether it is an ancestor of the job head (a
+// fast-forward would have been possible), diverged, or checked out in a linked worktree: the daemon
+// publishes job/<id> and tells the owner to fast-forward it themselves.
+func TestResultBranchRequestedExistingIsNotMoved(t *testing.T) {
+	for _, shape := range []string{"ancestor", "diverged", "checked-out"} {
+		t.Run(shape, func(t *testing.T) {
 			m := newManager(t)
 			repo := newRepo(t)
 			gitT(t, repo, "branch", "feature")
 			j := enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" })
-			if diverged {
+			switch shape {
+			case "diverged":
 				gitT(t, repo, "checkout", "-q", "feature")
 				gitT(t, repo, "commit", "-q", "--allow-empty", "-m", "concurrent work")
 				gitT(t, repo, "checkout", "-q", "main")
+			case "checked-out":
+				gitT(t, repo, "worktree", "add", "-q", t.TempDir()+"/linked", "feature")
 			}
 			tip := gitT(t, repo, "rev-parse", "feature")
 			j = runToEnd(t, m, j.ID)
 			head := gitT(t, m.JobDir(j.ID)+"/work", "rev-parse", "HEAD")
-			if diverged {
-				if j.Branch != "job/"+j.ID || !strings.Contains(j.BranchNote, "requested branch feature not moved: not a fast-forward") {
-					t.Fatalf("fallback: %+v", j)
-				}
-				if got := gitT(t, repo, "rev-parse", "feature"); got != tip {
-					t.Fatal("requested branch moved")
-				}
-			} else if j.Branch != "feature" || j.BranchNote != "fast-forwarded" {
-				t.Fatalf("fast-forward: %+v", j)
+			want := "requested branch feature exists; not moved - published job/" + j.ID +
+				"; fast-forward it yourself with git merge --ff-only"
+			if j.Branch != "job/"+j.ID || j.BranchNote != want {
+				t.Fatalf("fallback: branch=%q note=%q", j.Branch, j.BranchNote)
 			}
-			if got := gitT(t, repo, "rev-parse", "refs/heads/"+j.Branch); got != head {
-				t.Fatal("branch does not hold job head")
+			if got := gitT(t, repo, "rev-parse", "feature"); got != tip {
+				t.Fatal("requested branch moved")
 			}
-			if line := m.DoneLineFor(j); !strings.Contains(line, "branch "+j.Branch+" (") || !strings.Contains(line, j.BranchNote) {
+			if got := gitT(t, repo, "rev-parse", "refs/heads/job/"+j.ID); got != head {
+				t.Fatal("job branch does not hold the job head")
+			}
+			if line := m.DoneLineFor(j); !strings.Contains(line, "branch job/"+j.ID+" (") || !strings.Contains(line, want) {
 				t.Fatalf("done line: %s", line)
 			}
 		})
 	}
 }
 
+// Two jobs asking for the same new name: the first creates it, the second finds it existing and
+// falls back, leaving the winner's branch alone.
+func TestResultBranchSameNameTwoJobs(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	first := runToEnd(t, m, enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" }).ID)
+	tip := gitT(t, repo, "rev-parse", "feature")
+	second := runToEnd(t, m, enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "feature" }).ID)
+	if first.Branch != "feature" || second.Branch != "job/"+second.ID || !strings.Contains(second.BranchNote, "exists; not moved") {
+		t.Fatalf("first=%q second=%q note=%q", first.Branch, second.Branch, second.BranchNote)
+	}
+	if got := gitT(t, repo, "rev-parse", "feature"); got != tip {
+		t.Fatal("the winner's branch moved")
+	}
+}
+
 func TestResultBranchStartRejectsInvalidAndProtected(t *testing.T) {
 	m := newManager(t)
 	repo := newRepo(t)
-	base := gitT(t, repo, "rev-parse", "HEAD")
-	gitT(t, repo, "update-ref", "refs/remotes/origin/trunk", base)
-	gitT(t, repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
-	for _, name := range []string{"main", "master", "trunk", "release-1", "bad name", "@{-1}"} {
+	for _, name := range []string{"main", "Master", "release-1", "bad name", "@{-1}", "-flag", "a..b", "refs/heads/x"} {
 		if _, err := m.Enqueue(StartRequest{Title: "test", Kind: "fix", Brief: "test", Model: "sonnet", RepoPath: repo, Branch: name}); err == nil {
 			t.Errorf("accepted %q", name)
 		}
@@ -174,29 +190,34 @@ func TestResultBranchRejectsNonDescendantHead(t *testing.T) {
 	}
 }
 
-// A custom default with no remote HEAD and no declared default, while the main worktree sits on
-// another branch, must not be requestable: nothing identifies it as the default (#197).
-func TestResultBranchStartRefusesUnidentifiedDefault(t *testing.T) {
+// Result branches are create-only, so an existing default branch can never be moved: no knowledge
+// of the repository's default is needed, and a custom default is an ordinary name at start (it
+// exists, so the job falls back to job/<id> at publication).
+func TestResultBranchStartDoesNotNeedDefaultBranch(t *testing.T) {
 	m := newManager(t)
 	repo := newRepo(t)
 	gitT(t, repo, "branch", "-m", "main", "develop")
 	gitT(t, repo, "checkout", "-q", "-b", "feature")
 	gitT(t, repo, "config", "init.defaultBranch", "") // empty overrides any host-level value
-	start := func(name string) error {
-		_, err := m.Enqueue(StartRequest{Title: "test", Kind: "fix", Brief: "test", Model: "sonnet", RepoPath: repo, Branch: name})
-		return err
-	}
 	for _, name := range []string{"develop", "other"} {
-		if err := start(name); err == nil {
-			t.Errorf("accepted %q with the default branch unidentified", name)
+		if _, err := m.Enqueue(StartRequest{Title: "test", Kind: "fix", Brief: "test", Model: "sonnet", RepoPath: repo, Branch: name}); err != nil {
+			t.Errorf("refused %q: %v", name, err)
 		}
 	}
-	gitT(t, repo, "config", "init.defaultBranch", "develop")
-	if err := start("develop"); err == nil {
-		t.Error("accepted the declared default branch")
+}
+
+func TestResultBranchExistingCustomDefaultIsNotMoved(t *testing.T) {
+	m := newManager(t)
+	repo := newRepo(t)
+	gitT(t, repo, "branch", "-m", "main", "develop")
+	gitT(t, repo, "checkout", "-q", "-b", "feature")
+	tip := gitT(t, repo, "rev-parse", "develop")
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_EDIT_TRACKED", func(r *StartRequest) { r.RepoPath, r.Branch = repo, "develop" }).ID)
+	if j.Branch != "job/"+j.ID || !strings.Contains(j.BranchNote, "requested branch develop exists; not moved") {
+		t.Fatalf("fallback: branch=%q note=%q", j.Branch, j.BranchNote)
 	}
-	if err := start("other"); err != nil {
-		t.Errorf("refused a name with the default declared: %v", err)
+	if got := gitT(t, repo, "rev-parse", "develop"); got != tip {
+		t.Fatal("default branch moved")
 	}
 }
 
