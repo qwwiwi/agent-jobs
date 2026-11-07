@@ -137,9 +137,10 @@ func (m *Manager) controlReviewFor(j *store.Job) (queued, note string) {
 		}
 		return notQueued(why)
 	}
+	// The base is the fully qualified branch: a short name could select a same-named tag (git prefers tags).
 	req := StartRequest{
 		Title: "Control review: " + j.Title, Kind: "review", Brief: controlReviewBrief(j, rev),
-		RepoPath: j.RepoPath, Base: j.Branch, Model: rev.Model, Runner: rev.Runner, ReasoningEffort: rev.ReasoningEffort,
+		RepoPath: j.RepoPath, Base: "refs/heads/" + j.Branch, Model: rev.Model, Runner: rev.Runner, ReasoningEffort: rev.ReasoningEffort,
 		TimeoutMinutes: rev.TimeoutMinutes, Sources: []string{"job:" + rev.ID, "job:" + j.ID},
 	}
 	if rev.Runner != store.RunnerCodex {

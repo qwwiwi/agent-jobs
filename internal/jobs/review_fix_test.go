@@ -329,3 +329,34 @@ func TestControlReviewNeedsAResultBranch(t *testing.T) {
 		t.Fatalf("done line: %s", line)
 	}
 }
+
+// H3 (#197 fix loop 1): a tag that shares its name with the fix's result branch must not become the
+// control review's base. The base is the recorded branch, fully qualified.
+func TestControlReviewBaseIgnoresSameNamedTag(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	review := finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	oldCommit := gitT(t, repo, "rev-parse", "HEAD")
+	gitT(t, repo, "tag", "fix197", oldCommit) // an older tag with the name of the branch the fix asks for
+	fix, err := m.Enqueue(fixFromReview(repo, review.ID, func(r *StartRequest) { r.Branch = "fix197" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fix = runToEnd(t, m, fix.ID)
+	if fix.Status != store.StatusSucceeded || fix.Branch != "fix197" {
+		t.Fatalf("fix did not publish fix197: %+v", fix)
+	}
+	branchHead := gitT(t, repo, "rev-parse", "refs/heads/fix197")
+	if branchHead == oldCommit {
+		t.Fatal("test setup: the branch did not move past the tag")
+	}
+	if fix.ControlJob == "" {
+		t.Fatalf("no control review: %q", fix.ControlNote)
+	}
+	ctl := get(t, m, fix.ControlJob)
+	if ctl.BaseCommit != branchHead {
+		t.Fatalf("control review base is %s (the tag?), want the branch commit %s", ctl.BaseCommit, branchHead)
+	}
+	if ctl.BaseBranch != "refs/heads/fix197" {
+		t.Fatalf("control review base branch %q", ctl.BaseBranch)
+	}
+}
