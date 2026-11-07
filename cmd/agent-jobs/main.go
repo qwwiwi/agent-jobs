@@ -80,6 +80,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            job_outcome_many): one job, or a JSON array of {id, outcome,
                                            note?} from a file or stdin; each item is answered on its own
                                            and the exit status is 1 when any failed
+  restack    --child C --parent P [--onto main] [--name N] [--repo PATH] [--json]
+                                           after P was squash-merged into main: a NEW branch (default
+                                           C-restacked) from main with only C's own commits cherry-picked
+                                           on it (branch_restack); create-only, refuses when P is not in
+                                           main, on a conflict (names the files) or when the name exists
   stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
@@ -261,6 +266,8 @@ func main() {
 		err = cmdSLO(args)
 	case "outcome":
 		err = cmdOutcome(args, os.Stdin)
+	case "restack":
+		err = cmdRestack(args)
 	case "gate":
 		if len(args) > 0 && args[0] == "run" {
 			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))

@@ -62,6 +62,7 @@ var toolDefs = []toolDef{
 	{"wake_stats", addWakeStats},
 	{"job_outcome", addJobOutcome},
 	{"job_outcome_many", addJobOutcomeMany},
+	{"branch_restack", addBranchRestack},
 	{"skill_list", addSkillList},
 	{"memory_search", addMemorySearch},
 	{"memory_write", addMemoryWrite},
@@ -129,6 +130,7 @@ State an explicit model or a complexity (light|normal|hard, mapped to a model by
 When a job ends this session receives one line "[jobs:job-done] job <id> ..." (with notify_coalesce_seconds set, jobs ending close together arrive as one line "[jobs:job-done] N jobs: <id> ...; <id> ..."; with idle_pick enabled, the line of the last job of an emptied queue may end with "· idle: N ready tasks: ..." naming work that is ready, which the daemon never starts itself); the report is not pushed into the session.
 Read it with job_result when ready, section "Not done / uncertain" first, and check the diff before anything leaves the machine.
 Once you have acted on a result, record what you did with it: job_outcome(id, accepted|extended|reworked|rerun|discarded, note?), or job_outcome_many for several jobs at once (items [{id, outcome, note?}], each answered on its own); job_stats reports the outcome shares and the cost per usable result.
+When a branch C was built on a branch P and P was squash-merged into main, branch_restack(repo, child C, parent P, onto?, name?) makes a new branch from main with only C's own commits on top, instead of a merge job that resolves the same code by hand; it refuses when P is not in main or on a conflict, and never moves an existing branch.
 wake_stats reports what reached this session (lines by category per day, batch sizes, bytes p50/p95, hook injections); a line may end with " · slo breach: <name> <seconds>s > <norm>s" (a duration recorded by agent-jobs slo record went over its norm).
 Route: minutes of work, do it yourself; the session needs the result now, a subagent; long, background, overnight or must survive a restart, a job.
 A job may use at most 3 subagents inside its own limits and can never start jobs itself.

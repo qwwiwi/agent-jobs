@@ -47,6 +47,8 @@ var OrchestratorOnly = []string{
 	// What the orchestrator did with a job's result (feeds job_stats): the session's judgement, not a job's.
 	"job_outcome",
 	"job_outcome_many",
+	// Git helper for stacked branches: creates a branch in the owner's repository, so only the session.
+	"branch_restack",
 	// The skill catalog (E7): the session chooses a job's skills; a job gets them delivered, it does
 	// not browse the catalog.
 	"skill_list",

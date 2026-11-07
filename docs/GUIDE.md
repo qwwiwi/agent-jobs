@@ -325,6 +325,25 @@ attempt's branch is never moved, so its result stays reachable; `branch` shows t
 newest attempt's branch and each archived attempt keeps its own. The names `job` and
 `job/*` are reserved: `job_start` refuses them as a requested `branch`.
 
+### Restack after a squash merge
+
+Branch `C` is stacked on branch `P`. When `P` is squash-merged into `main` as one commit, `C` still
+carries `P`'s original commits, so merging `C` conflicts on code that is identical in substance.
+`branch_restack` (MCP, orchestrator only) or `agent-jobs restack --child C --parent P [--onto main]
+[--name N] [--repo PATH] [--json]` builds a new branch from the tip of `onto` in a temporary
+worktree and cherry-picks only the child's own commits (`P..C`) on it. The default name is
+`<child>-restacked`; the result is the new branch, its head SHA and the commits carried (commits
+whose change is already in `onto` become empty and are listed as skipped).
+
+It checks first, and refuses with the reason instead of guessing: `P`'s change must already be in
+`onto` (a clean merge of `onto` and `P` gives `onto`'s tree, or one commit of `onto` has the same
+`git patch-id --stable` as the cumulative `P` diff); `P` must be an ancestor of `C`; `P..C` must be
+linear (no merge commit). A cherry-pick conflict aborts, names the files and the commit, and leaves
+no ref and no worktree behind. It is create-only like the result branches: it never moves or deletes
+an existing ref (a taken name is refused), never touches `C`, `P` or your checkout, and never
+pushes; push the new branch and open the PR yourself. A daemon-side automatic restack is not part of
+this.
+
 ## Cleanup and patches
 
 30 minutes after the job-done line is delivered, the daemon removes the job's worktree, the heaviest part. It first checks that the worktree really belongs to this job, then saves everything the job changed, without touching the index or files:
@@ -463,6 +482,7 @@ The agent drives jobs through one MCP server (stdio) in two roles: `agent-jobs m
 | `job_stop` | stop a queued or running job, keep its worktree and session: status `stopped` (resumable) |
 | `job_resume` | continue a stopped, timeout or failed job in the same session with an «Orchestrator update»; limits default to what is left |
 | `job_amend` | append context to a queued job's brief; it keeps its place in the queue |
+| `branch_restack` | after a stacked branch's parent was squash-merged: `repo`, `child`, `parent`, `onto?` (default `main`), `name?` (default `<child>-restacked`). Creates a new branch from `onto` with only the child's own commits cherry-picked on it and returns `branch`, `head`, `commits` (and `skipped`); refuses with the reason when the parent's change is not in `onto`, on a conflict (names the files) or when the name exists; never moves an existing ref (see "Restack after a squash merge"). Orchestrator only |
 | `skill_list` | the skill catalog (`skill_roots`): name, status, one-line description, kinds, size, risk, last verified, uses and success rate, a `stale` flag; `query` = local content search (best 10, with a score); `kind`, `repo`, `status` filters. Orchestrator only |
 | `job_stats` | summary of finished jobs from the per-job stats table: counts, success rate, median / p90 cost and duration, top guard refusal rules, tool calls, skills by uses and success rate, outcome shares (`unrecorded` = finished with a report and no outcome) and `cost_per_usable_result_usd` = total cost / (accepted + extended), `requirements_claimed` / `claimed_jobs` (0 since 2026-10-25: a `done` line counts without `ran:` or REDPROOF); `since`, `by` = kind \| model \| skill \| effort \| repo (same as `agent-jobs stats --json`) |
 | `wake_stats` | what reached this session, measured: the lines the daemon typed in, by category (`job-done`, `notify-owner`, `schedule`, `check-missed`, `heartbeat`), and the hook injections (`hook:brief-reminder`, `hook:pending-outcome`, `hook:stop`, `hook:merge-gate`, `hook:skills-picker`: the text added as context, not a blocked call's reason), per category per local day, with the batch size and the bytes per delivery (total, p50, p95, max). An injection a hook could not store is reported apart (`injections_unrecorded`; `injections_uncounted` is true when more were lost after the dropped-injections file filled up at 1 MiB, marker file `injections-dropped.saturated`): the injection numbers are then a lower bound. Records are kept without pruning. Not yet measured: the `idle` category (no idle delivery exists yet). Orchestrator-only. Same output as `agent-jobs stats wakes --json`. |
@@ -952,6 +972,7 @@ agent-jobs prune  --agent my-agent [--dry-run]       # clean folders of jobs fin
 agent-jobs archive --agent my-agent --dry-run        # what prune would move into the log archive
 agent-jobs stats  --agent my-agent --since 30d --by skill   # per-job stats summary (--json, --backfill)
 agent-jobs outcome --agent my-agent <id> accepted --note "shipped"   # job_outcome for one job
+agent-jobs restack --repo ~/code/app --child feature-c --parent feature-p   # branch_restack: feature-c-restacked = main + feature-c's own commits, after feature-p was squash-merged (--onto, --name, --json)
 agent-jobs outcome --agent my-agent --input outcomes.json   # job_outcome_many: a JSON array of {id, outcome, note}; "-" = stdin; exit 1 if any item failed (--json)
 agent-jobs stats wakes --agent my-agent --since 7d   # deliveries and hook injections per category per day, bytes p50/p95 (--json)
 agent-jobs slo record deploy 742 --agent my-agent   # store a duration; over its slo.targets norm it is a breach
