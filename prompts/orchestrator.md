@@ -10,6 +10,26 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
 
 > Главное правило: главная сессия только разговаривает, решает и проверяет. Всё, что дольше нескольких шагов, уходит в джобу.
 
+## Before parallel coder jobs start
+
+Declare `paths` on `job_start` for `fix` / `general` jobs sharing a repository.
+Use repository-relative filenames or globs (`*`, `?`, character classes, whole
+`**` components); a trailing slash covers a directory's descendants. Compare the
+returned `overlap` job IDs, `paths` and `other_paths`. Prefer
+`on_overlap: "serialize"` for conflicting edits, or an explicit `parent` job ID
+when the next job must build on that job's result. Use `on_overlap: "refuse"`
+when a conflict should stop admission. Default `warn` starts with a warning.
+Without declarations on either side, `same_repo_jobs` is only advisory.
+
+Serialization uses queue dependencies and keeps the original base. A `parent`
+stack waits for success and uses the parent's result commit, including its saved
+result ref after cleanup; failed parents refuse the stack or cancel a queued
+child. Do not combine `parent` and `base`. The parent handles its own overlap;
+other conflicts still follow `on_overlap`. Read `job_status.waiting` for a wait,
+and `parent` / `parent_base` in `job_status` or `job_result` for the recorded stack.
+The job-done line retains the serialized wait. CLI: repeat `--paths`, with
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`.
+
 ## When a job is done
 
 > Когда джоба закончилась, главная сессия получает одну строку: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. Сам отчёт в сессию не вливается, агент забирает его тулом `job_result`, когда готов его прочитать.

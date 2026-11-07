@@ -48,6 +48,9 @@ func TestOpenMigratesStage1Database(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(j.Paths) != 0 || len(j.Overlap) != 0 || len(j.WaitFor) != 0 || j.Parent != "" || j.ParentBase != "" {
+			t.Fatalf("dependency migration defaults: %+v", j)
+		}
 		if j.Title != "old job" || j.LaunchToken != "" || j.Complexity != "" || j.Runner != RunnerClaude ||
 			j.OwnerWaits || j.ResumedFrom != "" || j.ScheduleID != "" || j.Billing != BillingSubscription {
 			t.Fatalf("migrated row: %+v", j)

@@ -736,6 +736,11 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 	}
 	now := m.Now()
 	var droppedEdges []string
+	var checks []store.MilestoneGraphCheck
+	var resulting []store.MilestoneTask // the tasks the edit leaves, for the cycle check
+	if len(in.Tasks) > 0 || len(in.Drop) > 0 {
+		checks = append(checks, milestoneCycleCheck(in.ID, func() []store.MilestoneTask { return resulting }))
+	}
 	err = m.Store.UpdateMilestone(ctx, in.ID, now, func(ms *store.Milestone, tasks []store.MilestoneTask,
 		jobs []*store.Job) (*store.Milestone, []store.MilestoneTask, error) {
 		all, changed := tasks, []store.MilestoneTask(nil)
@@ -745,6 +750,7 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 				return nil, nil, err
 			}
 		}
+		resulting = all
 		next := *ms
 		if title != "" {
 			next.Title = title
@@ -791,7 +797,7 @@ func (m *Manager) SetMilestone(ctx context.Context, in MilestoneSet) (*Milestone
 			}
 		}
 		return &next, changed, nil
-	})
+	}, checks...)
 	if err != nil {
 		return nil, err
 	}

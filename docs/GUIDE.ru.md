@@ -98,6 +98,49 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 Менять статус могут только строки `queued` и `running`; `succeeded` и `cancelled` окончательны. Джобу в статусе `stopped`, `timeout` или `failed` можно продолжить (ниже); `stopped` можно и отменить.
 
+### Overlap-aware starts
+
+For parallel `fix` / `general` jobs on one repository, give `job_start` a `paths`
+array of expected repository-relative paths or globs. Matching uses Go `path.Match`
+syntax (`*`, `?`, character classes), plus a whole `**` component for zero or more
+path components. Use `src/` or `src/**` for a directory and its descendants;
+`src/file.go` names one file. Paths are compared without filesystem expansion,
+so declarations cover new files too. At most 64 declarations, 256 bytes each;
+absolute paths, `.` / `..` components, control characters and backslashes are refused.
+
+- `on_overlap: "warn"` (default) queues the job and returns `overlap`, containing
+  each other queued/running coder job's `id`, matching `paths` of the new job and
+  `other_paths` of that job.
+- `on_overlap: "serialize"` keeps it queued until those overlapping jobs finish,
+  using persisted `wait_for` dependencies. A failed or cancelled blocker releases
+  the wait; a stopped blocker still waits because it may resume. Unrelated queued
+  jobs can start in free slots. The job-done line mentions the serialized wait.
+- `on_overlap: "refuse"` rejects the start with the conflicting job and declarations.
+
+Missing paths on either side keep the existing `same_repo_jobs` advisory only.
+Admission is atomic with insertion and the existing daily caps, so simultaneous
+starts see each other. Scope checks are declarations, not enforcement of actual edits.
+
+For an explicit stack, set `parent: "<job id>"`. It must be a coder job of this
+agent on the same repository. The child waits for its parent's success and uses
+that result commit as `base_commit`, read from the verified parent worktree or
+its saved `refs/agent-jobs/jobs/<id>` ref after cleanup. A failed, timed-out or
+cancelled parent refuses a new stack; an already queued child is cancelled.
+A missing result also refuses the stack. Do not combine `parent` with `base`.
+The parent edge handles overlap with that parent; other overlaps still follow
+`on_overlap`. `job_status` and `job_result` show `parent` and the resolved
+`parent_base`; `job_status.waiting` explains pending dependencies. A serialized
+job without `parent` keeps its original base; it does not inherit another job's changes.
+
+CLI equivalents: repeat `--paths` once per declaration, quote globs, and use
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`:
+
+```sh
+agent-jobs start --agent A --kind fix --title "Update parser" --brief-file brief.md \
+  --repo /path/to/repo --model sonnet --paths 'internal/parser/**' \
+  --paths 'docs/parser.md' --on-overlap serialize
+```
+
 ### Сменить курс: дополнить, остановить, продолжить
 
 Каждая джоба работает в сессии claude, id которой назначается до запуска (`claude -p --session-id <uuid>`), и сессия сохраняется на диске, поэтому джобу можно поправить, не теряя того, что она уже знает и сделала:

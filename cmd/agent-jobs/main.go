@@ -567,12 +567,17 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	var paths multi
+	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
+	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
+	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
+	r.Paths = paths
 	if len(sources) > 0 {
 		r.Sources = sources
 	}
@@ -604,6 +609,13 @@ func cmdStart(args []string) error {
 	fmt.Println(j.ID)
 	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
 		fmt.Fprintln(os.Stderr, "size_warning:", w)
+	}
+	for _, overlap := range j.Overlap {
+		fmt.Fprintf(os.Stderr, "overlap: %s paths %s intersect %s (%s)\n", overlap.ID,
+			strings.Join(overlap.Paths, ", "), strings.Join(overlap.OtherPaths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Fprintln(os.Stderr, n)
 	}
 	if n := m.SameRepoNote(j); n != "" {
 		fmt.Fprintln(os.Stderr, "note:", n)
@@ -691,6 +703,15 @@ func cmdStatus(args []string) error {
 	}
 	if j.BranchNote != "" {
 		fmt.Printf("branch note: %s\n", j.BranchNote)
+	}
+	if j.Parent != "" {
+		fmt.Printf("parent:    %s (result %s)\n", j.Parent, j.ParentBase)
+	}
+	if len(j.Paths) > 0 {
+		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Printf("waiting:   %s\n", n)
 	}
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))

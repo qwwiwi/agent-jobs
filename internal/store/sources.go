@@ -36,8 +36,8 @@ func migrateSources(db *sql.DB) error {
 }
 
 // writeTaskSources stores the planned sources of task t (an upsert of the task wrote its other columns).
-func writeTaskSources(tx *sql.Tx, id int64, t MilestoneTask) error {
-	if _, err := tx.Exec(`UPDATE milestone_tasks SET sources = ? WHERE milestone_id = ? AND key = ?`,
+func writeTaskSources(tx execer, id int64, t MilestoneTask) error {
+	if _, err := tx.ExecContext(context.Background(), `UPDATE milestone_tasks SET sources = ? WHERE milestone_id = ? AND key = ?`,
 		JoinNames(t.Sources), id, t.Key); err != nil {
 		return fmt.Errorf("write task %s sources: %w", t.Key, err)
 	}
