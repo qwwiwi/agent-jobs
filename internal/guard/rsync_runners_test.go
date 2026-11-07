@@ -70,6 +70,16 @@ func TestRsyncRunnerChains(t *testing.T) {
 		{"quoted option hex value", `flock "$X" 0x10 L rsync host:/x /y`, true},
 		{"quoted option after flag", `flock -s "$X" 1e3 ./l rsync -a ./a host:/x`, true},
 		{"quoted option inf value", `flock "$X" inf L rsync host:/x /y`, true},
+		// After `--` the lock file is still one shell word: an unquoted or "$@" expansion may split
+		// into the lock file and the program (fix loop 1, H1).
+		{"lock after -- splits from variable", `L='rsync rsync'; flock -- $L -v rsync host:/dst/`, true},
+		{"lock after -- splits from all args", `set -- rsync rsync; flock -- "$@" -v rsync host:/dst/`, true},
+		{"lock after -- splits inside find exec", `find . -exec flock -- $L -v rsync ./a h:/x \;`, true},
+		{"lock after -- splits from braced variable", `flock -- ${L} -v rsync ./a h:/x`, true},
+		{"lock after -- splits from prefixed variable", `flock -- ./l$L -v rsync ./a h:/x`, true},
+		// Fail closed: an unquoted lock file may split even when the visible rsync is local.
+		{"unquoted lock after -- local", `flock -- $L rsync ./src/ ./dst/`, true},
+		{"quoted lock after -- local", `flock -- "$LOCK" rsync ./src/ ./dst/`, false},
 		// A runner operand is data, not a program.
 		{"lock file with space named rsync", `flock 'rsync lock' rsync ./src/ ./dst/`, false},
 		{"setsid flock options and excludes", `setsid -f flock -n -w 3 ./l rsync -a --exclude 'rsync x' ./src/ ./dst/`, false},

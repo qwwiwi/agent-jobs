@@ -256,6 +256,12 @@ func (ch *runnerChain) flockOperand(argv []string, s chainSpan, i int) {
 		}
 		return
 	}
+	if ch.isBare(i) {
+		// An unquoted or "$@" expansion (reachable after `--`) may split into the lock file and the
+		// program: `L='rsync rsync'; flock -- $L -v rsync h:/x` runs rsync. Its words cannot be read.
+		ch.tails = append(ch.tails, s)
+		return
+	}
 	ch.data[i] = true
 	i++
 	if i < s.end && (argv[i] == "-c" || argv[i] == "--command") {
