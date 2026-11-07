@@ -425,3 +425,81 @@ func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
 		t.Fatalf("first gate's output does not end with the marker line: ...%q", o[max(0, len(o)-40):])
 	}
 }
+
+// Neither startup notes nor the note before the timeout kill may block on unread stderr (#178).
+func TestRunGateUnreadStderrReleasesLock(t *testing.T) {
+	for _, prefill := range []bool{true, false} {
+		name := "timeout"
+		if prefill {
+			name = "startup"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo, _, head, lock := gateFixture(t)
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			defer r.Close() // Also releases a blocked note writer on regression failures.
+			if prefill {
+				if err := w.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Write(make([]byte, 1<<20)); !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("fill stderr pipe: %v, want deadline exceeded", err)
+				}
+				if err := w.SetWriteDeadline(time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pidf := filepath.Join(t.TempDir(), "leader.pid")
+			var out bytes.Buffer
+			done := make(chan int, 1)
+			returned := false
+			go func() {
+				done <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock,
+					Timeout: 500 * time.Millisecond, Stdout: &out, Stderr: w,
+					Argv: []string{"/bin/sh", "-c", "echo $$ > " + pidf + "; head -c 1048576 /dev/zero >&2; sleep 30"}})
+			}()
+			t.Cleanup(func() {
+				_ = r.Close()
+				if !returned {
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Error("runner did not finish after closing its stderr reader")
+					}
+				}
+			})
+			// Stderr stays open and completely unread through the timeout and lock handoff.
+			select {
+			case code := <-done:
+				returned = true
+				if code != GateExitTimeout || lastLine(out.String()) != "exit=124" {
+					t.Fatalf("code %d, stdout %q", code, out.String())
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("runner blocked on unread stderr past its timeout")
+			}
+			code, out2, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+				LockWait: 300 * time.Millisecond, Argv: []string{"true"}})
+			if code != 0 || lastLine(out2) != "exit=0" {
+				t.Fatalf("gate lock not released: code %d, stdout %q, stderr %q", code, out2, errs)
+			}
+			waitDead(t, readPID(t, pidf))
+		})
+	}
+}
+
+func TestRunGateNotesAreBounded(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+		Argv: []string{"/" + strings.Repeat("x", 128<<10)}})
+	if code != GateExitNotStarted || lastLine(out) != "exit=127" {
+		t.Fatalf("code %d, stdout %q", code, out)
+	}
+	if len(errs) > 64<<10 || !strings.HasSuffix(errs, "\ngate: runner notes truncated\n") {
+		t.Fatalf("runner notes: %d bytes, truncation marker present: %t", len(errs),
+			strings.HasSuffix(errs, "\ngate: runner notes truncated\n"))
+	}
+}
