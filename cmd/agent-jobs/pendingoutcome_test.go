@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -217,38 +215,6 @@ func (h *pendingOutcomeHarness) run(sub, input string) string {
 	return out.String()
 }
 
-// age moves the recorded last emission back by d: the prompt hook reads the store with the real clock, so
-// the tests age the state instead of moving a clock.
-func (h *pendingOutcomeHarness) age(d time.Duration) {
-	h.t.Helper()
-	dir, err := jobs.StateDir("test")
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	path := filepath.Join(dir, "hook-emit.json")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		h.t.Fatal(err)
-	}
-	var st struct {
-		SessionID string                    `json:"session_id"`
-		Epoch     int64                     `json:"epoch"`
-		Kinds     map[string]map[string]any `json:"kinds"`
-	}
-	if err := json.Unmarshal(b, &st); err != nil {
-		h.t.Fatal(err)
-	}
-	for _, rec := range st.Kinds {
-		rec["last_emitted"] = rec["last_emitted"].(float64) - d.Seconds()
-	}
-	if b, err = json.Marshal(st); err != nil {
-		h.t.Fatal(err)
-	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		h.t.Fatal(err)
-	}
-}
-
 func (h *pendingOutcomeHarness) prompt() string {
 	return h.run("brief-reminder", `{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hello"}`)
 }
@@ -298,15 +264,24 @@ func TestHookPendingOutcomeChangedStateEmitsAgain(t *testing.T) {
 
 func TestHookPendingOutcomeRepeatsAfterInterval(t *testing.T) {
 	h := newPendingOutcomeHarness(t)
+	// The prompt hook opens its store through briefReminderOpener: give it the harness clock too, so
+	// every step decides at an exact offset from the bind's emission.
+	opener := briefReminderOpener
+	briefReminderOpener = func(agent string) (*jobs.Manager, error) {
+		m, err := opener(agent)
+		if err == nil {
+			m.Now = func() time.Time { return h.now }
+		}
+		return m, err
+	}
+	t.Cleanup(func() { briefReminderOpener = opener })
 	h.finish("a1", "first")
 	h.bind()
-	// The windows leave room for slow subprocess runs: last_emitted has whole seconds, and every
-	// h.run is an exec of the binary, which takes over a second under the full suite's parallel load.
-	h.age(jobs.DefaultHookRepeatAfter - time.Minute)
+	h.now = h.now.Add(jobs.DefaultHookRepeatAfter - time.Second)
 	if out := h.prompt(); out != "" {
 		t.Errorf("just before the default repeat interval: %q", out)
 	}
-	h.age(time.Minute + time.Second)
+	h.now = h.now.Add(time.Second)
 	if out := h.prompt(); !strings.Contains(out, "a1 first") {
 		t.Errorf("at the default repeat interval: %q", out)
 	}
@@ -315,11 +290,11 @@ func TestHookPendingOutcomeRepeatsAfterInterval(t *testing.T) {
 	}
 	writeAgentConfig(t, "test", map[string]any{"notify_tmux_target": "orch-session", "orchestrator_dir": h.orch,
 		"hooks": map[string]any{"repeat_after_seconds": 60}})
-	h.age(30 * time.Second)
+	h.now = h.now.Add(59 * time.Second)
 	if out := h.prompt(); out != "" {
 		t.Errorf("before the configured interval: %q", out)
 	}
-	h.age(40 * time.Second)
+	h.now = h.now.Add(time.Second)
 	if out := h.prompt(); !strings.Contains(out, "a1 first") {
 		t.Errorf("at the configured interval: %q", out)
 	}

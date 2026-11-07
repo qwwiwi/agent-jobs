@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -338,14 +337,14 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 	}
 	wait, jobBound := acceptanceLockWait(a.started, a.jobTimeout, time.Now())
 	lease, err := acquireGateLock(ctx, gateLockReq{path: GateLockPath(), wait: wait, job: a.id,
-		detail: " in " + filepath.Join(abs, "work") + ": acceptance " + Printable(a.cmd, 200), env: os.Environ(), notes: log,
+		detail: " in " + filepath.Join(abs, "work") + ": acceptance " + Printable(a.cmd, 200), notes: log,
 		waits: newGateWaitRecorder(abs)})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintln(log, "run-wrapper: stopped by a signal while the acceptance command waited for the gate lock")
 			return 128 + int(syscall.SIGTERM)
 		}
-		if jobBound && !errors.Is(err, ErrGateOwnJob) {
+		if jobBound {
 			err = fmt.Errorf("%w; the wait was cut to %s by the job's time (timeout %s, credited lock wait at most as much)",
 				err, wait.Round(time.Second), a.jobTimeout)
 		}
@@ -353,13 +352,9 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 		fmt.Fprintln(log, "run-wrapper: acceptance: not run:", err)
 		return 0
 	}
+	// The lock is not reentrant: a gate inside the acceptance command (`agent-jobs gate run` in a check
+	// script) is unsupported, it waits for this lock within its bound and times out without running.
 	defer lease.release()
-	if !lease.reentrant {
-		// A gate inside the acceptance command (`agent-jobs gate run` in a check script) runs inside this
-		// lock instead of waiting for it (gateAncestor); acceptanceEnvAt passes the marker on.
-		_ = os.Setenv(GateHolderEnv, strconv.Itoa(os.Getpid()))
-		defer os.Unsetenv(GateHolderEnv)
-	}
 	if lease.waited > 0 {
 		fmt.Fprintf(log, "run-wrapper: acceptance: waited %s for the gate lock (not counted against the acceptance timeout)\n",
 			lease.waited.Round(time.Second))
@@ -521,7 +516,7 @@ func runShellGroup(parent context.Context, dir string, env []string, cmdline str
 // acceptanceEnvKeys are the variables an acceptance command inherits (plus LC_*); everything else of
 // the wrapper's environment (tokens, API keys, CLAUDE_*, XDG_*, the user bus, the real HOME and
 // TMPDIR) is dropped.
-var acceptanceEnvKeys = []string{"PATH", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TERM", GateHolderEnv}
+var acceptanceEnvKeys = []string{"PATH", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TERM"}
 
 // acceptanceEnv is the acceptance command's environment: the allow-listed variables of env, HOME a
 // fresh throwaway dir <jobDir>/acceptance-home (its tmp/ as the temp dir, TempEnv), so no tool finds the agent's

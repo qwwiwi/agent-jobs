@@ -381,7 +381,6 @@ func TestMain(m *testing.M) {
 	}
 	gateLockDirs = []string{gateDir}
 	_ = os.Setenv("AGENT_JOBS_TEST_GATE_LOCK_DIR", gateDir)
-	_ = os.Unsetenv(GateHolderEnv) // set when this suite runs as a gate's command
 	_ = os.Unsetenv(JobDirEnvVar)
 	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
 	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).

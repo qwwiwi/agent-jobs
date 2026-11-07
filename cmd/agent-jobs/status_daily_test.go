@@ -133,7 +133,7 @@ func TestStatusShowsGateLockWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := captureStdout(t, func() error { return printQueue(m) })
-	for _, want := range []string{"gate lock: ", "gate wait: " + j.ID + " waiting for gate lock held by pid 1 job other since x: scripts/check.sh (waited 3"} {
+	for _, want := range []string{"gate lock: ", "gate wait: " + j.ID + " waiting for gate lock, untrusted holder line: pid 1 job other since x: scripts/check.sh (waited 3"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)
 		}

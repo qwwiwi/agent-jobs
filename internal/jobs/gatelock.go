@@ -14,8 +14,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // The box-wide gate lock (#134, #208): one heavy step (a full test suite, a type check, a build,
@@ -25,12 +23,13 @@ import (
 //     heartbeat it refreshes every poll) and only the first live waiter tries the lock, so a gate that
 //     came later never overtakes; a waiter that died or stopped polling (no heartbeat for
 //     gateQueueStale) drops out of the queue. The holder is not queued;
-//   - bounded: a waiter gives up after its lock wait with an error naming the holder;
-//   - no self-deadlock: a gate whose own process tree holds the lock (the holder is an ancestor: a
-//     gate inside a gate, a gate inside the acceptance command) runs inside it without waiting
-//     (reentrant); one the kernel verifies as of the caller's own job (gateHolderOfJob: it holds the
-//     flock and is an ancestor or runs in the caller's job scope, e.g. a background gate of the job)
-//     fails at once (ErrGateOwnJob) instead of waiting for itself. An unverified holder is waited for;
+//   - bounded: a waiter gives up after its lock wait with an error showing the holder line;
+//   - not reentrant: a successful acquisition requires a successful exclusive flock on the shared
+//     lock file, and nothing else grants entry. The holder line is in a file anyone can write, so it is
+//     shown as untrusted text and never decides; a held lock is waited for, bounded, whoever holds it
+//     (a gate of the same job, the caller's own parent). Nested gates (a gate inside a gate or inside
+//     the acceptance command) are unsupported: they wait within their bound and time out without
+//     running their command;
 //   - released with its holder: flock belongs to the holder's open file, so a holder that is killed
 //     (with its job's process group or scope) releases it, and the queue forgets a killed waiter;
 //   - visible: a waiter inside a job records its wait in <jobdir>/gate-wait.json (gateWaitRecorder),
@@ -38,9 +37,6 @@ import (
 
 // Gate lock environment and files.
 const (
-	// GateHolderEnv is set in the environment of a gate's command: the pid of the gate holding the lock,
-	// for the reentrant check where /proc cannot tell ancestry (macOS).
-	GateHolderEnv = "AGENT_JOBS_GATE_HOLDER"
 	// JobDirEnvVar is the job's folder, set with the job marker (JobEnv): a gate inside the job records
 	// its lock wait there.
 	JobDirEnvVar = "AGENT_JOBS_JOB_DIR"
@@ -57,28 +53,21 @@ const (
 	gateWaitMaxEntries  = 32
 )
 
-// ErrGateOwnJob: the gate lock is held by a process the kernel verifies as of the caller's own job
-// (gateHolderOfJob). Waiting would wait for the job itself.
-var ErrGateOwnJob = errors.New("the gate lock is held by another gate of this job")
-
 // gateLockReq is one acquisition of the gate lock.
 type gateLockReq struct {
 	path   string
 	wait   time.Duration
 	job    string    // the caller's job id ("" = not in a job)
 	detail string    // the holder line after "pid N job J since T" (where, what)
-	env    []string  // the caller's environment (GateHolderEnv)
 	notes  io.Writer // waiting notes
 	// waits, when set, records the wait (a job's gate-wait.json).
 	waits *gateWaitRecorder
 }
 
-// gateLease is a held (or reentered) gate lock.
+// gateLease is a held gate lock.
 type gateLease struct {
-	release   func()
-	waited    time.Duration // time spent waiting for the lock (0 = it was free)
-	reentrant bool          // the caller's own process tree holds the lock: nothing was taken
-	holder    string        // reentrant: the holding gate's line
+	release func()
+	waited  time.Duration // time spent waiting for the lock (0 = it was free)
 }
 
 // acquireGateLock takes the box-wide gate lock for r (see the comment above), polling every
@@ -121,23 +110,10 @@ func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 				return nil, fmt.Errorf("flock gate lock: %w", err)
 			}
 		}
-		holder := gateHolder(f)
-		if pid, job := parseGateHolder(holder); pid > 0 && pid != os.Getpid() && alive(pid) {
-			if gateAncestor(pid, r.env) {
-				stopWaiting()
-				f.Close()
-				fmt.Fprintf(r.notes, "gate: the gate lock is held by this gate's own parent (%s): running inside it\n", holder)
-				return &gateLease{release: func() {}, reentrant: true, holder: holder}, nil
-			}
-			if r.job != "" && job == r.job && gateHolderOfJob(pid, r.job, f) {
-				stopWaiting()
-				f.Close()
-				return nil, fmt.Errorf("%w (%s): a job never waits for itself; let that gate end first", ErrGateOwnJob, holder)
-			}
-		}
 		if !waiting {
 			waiting = true
-			fmt.Fprintf(r.notes, "gate: waiting up to %s for the gate lock %s, held by: %s\n", r.wait, r.path, holder)
+			holder := gateHolder(f)
+			fmt.Fprintf(r.notes, "gate: waiting up to %s for the gate lock %s, untrusted holder line: %s\n", r.wait, r.path, holder)
 			if r.waits != nil {
 				r.waits.start(start, holder)
 			}
@@ -147,11 +123,11 @@ func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 			}
 		}
 		if time.Now().After(deadline) {
-			holder = gateHolder(f)
+			holder := gateHolder(f)
 			stopWaiting()
 			f.Close()
-			return nil, fmt.Errorf("the gate lock %s is still held after %s (by: %s): another gate runs on this box", r.path,
-				r.wait, holder)
+			return nil, fmt.Errorf("the gate lock %s is still held after %s (untrusted holder line: %s): another gate runs on this box",
+				r.path, r.wait, holder)
 		}
 		select {
 		case <-ctx.Done():
@@ -176,7 +152,7 @@ func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 }
 
 // gateHolderLine is what a holder writes into the lock: "pid N job J since T<detail>" (job "-" when not
-// in a job), read by the waiters (parseGateHolder) and shown to them.
+// in a job), shown to the waiters as untrusted text (gateHolder), never parsed.
 func gateHolderLine(job, detail string) string {
 	if job == "" {
 		job = "-"
@@ -198,138 +174,6 @@ func writeGateHolderLine(path, line string) {
 	_, _ = f.WriteString(line + "\n")
 }
 
-// parseGateHolder reads the pid and the job of a holder line ("pid N job J …"; 0 and "" when absent).
-func parseGateHolder(line string) (pid int, job string) {
-	f := strings.Fields(line)
-	if len(f) < 2 || f[0] != "pid" {
-		return 0, ""
-	}
-	pid, err := strconv.Atoi(f[1])
-	if err != nil || pid <= 0 {
-		return 0, ""
-	}
-	if len(f) >= 4 && f[2] == "job" && f[3] != "-" {
-		job = f[3]
-	}
-	return pid, job
-}
-
-// gateAncestor reports whether the gate lock's holder pid is this process's own parent gate: the holder
-// marker in this process's environment names it (GateHolderEnv: set only in the command of a gate or of
-// the acceptance step while it holds the lock), and, where /proc can be read, pid is an ancestor. The
-// marker alone keeps a process that merely descends from a holder (a daemon that ever held the lock, a
-// shell) from passing through without the lock.
-func gateAncestor(pid int, env []string) bool {
-	if envValue(env, GateHolderEnv) != strconv.Itoa(pid) {
-		return false
-	}
-	cur := os.Getpid()
-	for range 256 {
-		parent, err := procParent(cur)
-		if err != nil {
-			return cur == os.Getpid() // no /proc: the marker decides
-		}
-		if parent == pid {
-			return true
-		}
-		if parent <= 1 {
-			return false
-		}
-		cur = parent
-	}
-	return false
-}
-
-// gateHolderOfJob reports whether the kernel verifies that the lock's holder pid, which its holder line
-// names as of job, is of the caller's own job: only then does the caller fail at once (ErrGateOwnJob)
-// instead of waiting. The line is in a file anyone can write and the job marker in /proc/<pid>/environ
-// is set by whoever starts the process, so neither decides. Verified means the pid holds the granted
-// flock on lock (/proc/locks) and either is an ancestor of this process (the job's wrapper during its
-// acceptance step) or runs in this process's own job scope (procSameJobScope: a gate of the job left in
-// the background). Anything unverified or unknown (no /proc, an unreadable file, another pid namespace)
-// is false: the caller waits, bounded. Without /proc (macOS) a job's gate therefore always waits.
-func gateHolderOfJob(pid int, job string, lock *os.File) bool {
-	if !procHoldsFlock(pid, lock) {
-		return false
-	}
-	return procAncestorOfSelf(pid) || procSameJobScope(pid, job)
-}
-
-// procAncestorOfSelf reports whether pid is an ancestor of this process (/proc/<pid>/stat ppid walk; an
-// unreadable step is false).
-func procAncestorOfSelf(pid int) bool {
-	cur := os.Getpid()
-	for range maxAncestry {
-		parent, err := procParent(cur)
-		if err != nil || parent <= 1 {
-			return false
-		}
-		if parent == pid {
-			return true
-		}
-		cur = parent
-	}
-	return false
-}
-
-// procSameJobScope reports whether pid runs in this process's own job scope: this process's cgroup v2
-// path (/proc/<self>/cgroup) lies in a job scope of job (agent-jobs-<agent>-<job>.scope) and pid's
-// cgroup is that scope or below it. A cgroup is inherited by every descendant and cannot be left with
-// setsid or re-parenting; no scope (session containment), cgroup v1 or an unreadable file is false.
-func procSameJobScope(pid int, job string) bool {
-	self, err := procCgroup(os.Getpid())
-	if err != nil {
-		return false
-	}
-	scope := jobScopePath(self)
-	if scope == "" || !strings.HasSuffix(scope, "-"+job+".scope") {
-		return false
-	}
-	holder, err := procCgroup(pid)
-	return err == nil && inSubtree(holder, scope)
-}
-
-// jobScopePath is cgroup path p up to and including its first job scope component ("" = none).
-func jobScopePath(p string) string {
-	parts := strings.Split(p, "/")
-	for i, c := range parts {
-		if isJobScopeName(c) {
-			return strings.Join(parts[:i+1], "/")
-		}
-	}
-	return ""
-}
-
-// procHoldsFlock reports whether /proc/locks lists a granted FLOCK of pid on f's file (device and inode).
-// An unreadable /proc/locks or f is false: the holder is then not confirmed.
-func procHoldsFlock(pid int, f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	dev := uint64(st.Dev) // int32 on darwin
-	want := fmt.Sprintf("%02x:%02x:%d", unix.Major(dev), unix.Minor(dev), st.Ino)
-	b, err := os.ReadFile(filepath.Join(procRoot, "locks"))
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		// "N: FLOCK  ADVISORY  WRITE PID MAJ:MIN:INODE START END"; a blocked waiter's line has "->".
-		fs := strings.Fields(line)
-		if len(fs) < 6 || fs[1] != "FLOCK" || fs[3] != "WRITE" {
-			continue
-		}
-		if p, err := strconv.Atoi(fs[4]); err == nil && p == pid && fs[5] == want {
-			return true
-		}
-	}
-	return false
-}
-
 // envValue is the value of key in env ("" when absent).
 func envValue(env []string, key string) string {
 	for i := len(env) - 1; i >= 0; i-- {
@@ -338,17 +182,6 @@ func envValue(env []string, key string) string {
 		}
 	}
 	return ""
-}
-
-// withEnv is env with key set to value (any earlier value dropped).
-func withEnv(env []string, key, value string) []string {
-	out := make([]string, 0, len(env)+1)
-	for _, kv := range env {
-		if k, _, _ := strings.Cut(kv, "="); k != key {
-			out = append(out, kv)
-		}
-	}
-	return append(out, key+"="+value)
 }
 
 // gateEntry is one waiter of the gate queue: its ticket (nanoseconds at join, unique in the file), its
