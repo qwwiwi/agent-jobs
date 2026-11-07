@@ -617,8 +617,9 @@ var chdirLong = []string{"--chdir", "--cwd", "--prefix", "--dir", "--working-dir
 // chdirs returns the directories (as written, in order) a command runs in instead of the shell's
 // working directory: `env -C|--chdir D`, `sudo -D|--chdir D`, `git -C D` (global options),
 // `make|tar|go|ninja|… -C D` or `--directory D`, and `--chdir`, `--cwd`, `--prefix`, `--dir`, … of any
-// program, with the indices of the words that hold them. unmodeled names a form the guard does not
-// resolve: a directory from an expansion, chroot.
+// program, with the indices of the words that hold them. The wrapper part comes from split (cmdView.chdirs,
+// any getopt spelling). unmodeled names a form the guard does not resolve: a directory from an
+// expansion, `sudo -i|--login` (the target user's home), chroot.
 func chdirs(c *simpleCmd) (vals []string, idx []int, unmodeled string) {
 	words := c.words
 	add := func(i int, v string) {
@@ -643,46 +644,11 @@ func chdirs(c *simpleCmd) (vals []string, idx []int, unmodeled string) {
 		return i + 1
 	}
 	v := split(words)
-	for i := v.lead; i < v.start; {
-		name := progName(words[i])
-		vf := wrapperValueFlags[name]
-		target := map[string]byte{"env": 'C', "sudo": 'D'}[name]
-		for i++; i < v.start; i++ {
-			w := words[i]
-			if w == "--" || !strings.HasPrefix(w, "-") || len(w) < 2 {
-				if w == "--" {
-					i++
-				}
-				break
-			}
-			if strings.HasPrefix(w, "--") {
-				val, attached, isChdir := longOpt(w, len(w)+1, "--chdir") // exact: split refuses env abbreviations
-				switch {
-				case isChdir && target != 0:
-					i = value(i, val, attached)
-				case name == "env" && w == "--unset":
-					i++ // its value
-				}
-				continue
-			}
-			for k := 1; k < len(w); k++ {
-				if strings.IndexByte(vf, w[k]) < 0 {
-					continue
-				}
-				if w[k] == target {
-					i = value(i, w[k+1:], k+1 < len(w))
-				} else if k+1 == len(w) {
-					i++
-				}
-				break
-			}
-		}
-		for i < v.start && name == "env" && (reAssign.MatchString(words[i]) || words[i] == "-") {
-			i++
-		}
-		if name == "timeout" && i < v.start {
-			i++ // duration
-		}
+	if v.login != "" {
+		unmodeled = v.login
+	}
+	for _, d := range v.chdirs {
+		add(d.idx, d.dir)
 	}
 	argv := words[v.start:]
 	if len(argv) == 0 {

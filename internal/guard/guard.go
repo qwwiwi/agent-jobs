@@ -2045,7 +2045,20 @@ func newCdView(scripts []*script, cmd string, cfg Config) cdView {
 	for _, sc := range scripts {
 		for _, pl := range sc.pipelines {
 			for _, c := range pl.cmds {
-				st := split(c.words).start
+				sv := split(c.words)
+				// A wrapper that moves its command (`env -C D`, `sudo -D D`) is a cd to D (#211); it does
+				// not move the shell, so it sets no PWD and ignores CDPATH (sawCD stays as it is).
+				if sv.login != "" {
+					v.unknown = true
+				}
+				for _, d := range sv.chdirs {
+					if t, ok := v.tilde(d.dir); ok && !c.dyn[d.idx] && !hasGlob(d.dir) {
+						targets = append(targets, t)
+					} else {
+						v.unknown = true
+					}
+				}
+				st := sv.start
 				argv, dyn := c.words[st:], c.dyn[st:]
 				if len(argv) == 0 {
 					continue

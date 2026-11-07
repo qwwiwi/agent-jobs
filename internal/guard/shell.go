@@ -1433,6 +1433,29 @@ type cmdView struct {
 	wrapperUnknown string   // first unknown or ambiguous wrapper long option
 	envUnknown     string   // first env long option that is not a full known spelling (abbreviation, unknown)
 	lead           int      // number of leading keywords and shell assignments (before any program word)
+	// chdirs are the directories wrappers move the program into (`env -C|--chdir D`, `sudo -D|--chdir D`,
+	// any getopt spelling), in order: a cd for every rule (#211).
+	chdirs []wrapperChdir
+	// login names a wrapper option that runs the program in a directory the guard does not resolve
+	// (`sudo -i|--login`: the target user's home); "" = none.
+	login string
+}
+
+// wrapperChdir is a directory a wrapper option moves the program into: its value and the index of the
+// word that holds it (the option word itself when the value is attached).
+type wrapperChdir struct {
+	idx int
+	dir string
+}
+
+// noteChdir records the value of a directory option read from words[i] (next is the index after the
+// option): attached to words[i], or the following word.
+func (v *cmdView) noteChdir(i, next int, dir string) {
+	idx := i
+	if next == i+2 {
+		idx = i + 1
+	}
+	v.chdirs = append(v.chdirs, wrapperChdir{idx: idx, dir: dir})
 }
 
 // split strips keywords, assignments and wrapper programs: what remains is the real program and its args.
@@ -1476,15 +1499,25 @@ func split(words []string) cmdView {
 			}
 			if strings.HasPrefix(w, "-") && len(w) > 1 {
 				if name != "env" && strings.HasPrefix(w, "--") {
-					key, _, eq := strings.Cut(w, "=")
+					key, val, eq := strings.Cut(w, "=")
 					full, required := resolveWrapperLong(name, key)
 					if full == "" && v.wrapperUnknown == "" {
 						v.wrapperUnknown = name + " " + w
 					}
-					i++
-					if required && !eq && i < len(words) {
-						i++
+					next := i + 1
+					if required && !eq && next < len(words) {
+						val = words[next]
+						next++
 					}
+					if name == "sudo" {
+						switch full {
+						case "--chdir":
+							v.noteChdir(i, next, val)
+						case "--login":
+							v.login = "sudo " + w
+						}
+					}
+					i = next
 					continue
 				}
 				longs := wrapperLongValues[name]
@@ -1500,6 +1533,14 @@ func split(words []string) cmdView {
 					if name == "exec" && opt.name == "c" {
 						v.envClear = true
 					}
+					if name == "sudo" {
+						switch opt.name {
+						case "D":
+							v.noteChdir(i, next, opt.value)
+						case "i":
+							v.login = "sudo -i"
+						}
+					}
 					if name != "env" {
 						continue
 					}
@@ -1510,7 +1551,9 @@ func split(words []string) cmdView {
 						v.splitString = true
 					case "u", "--unset":
 						v.envUnset = append(v.envUnset, opt.value)
-					case "C", "--chdir", "v", "0", "--null", "--debug", "--help", "--version", "--list-signal-handling", "--block-signal", "--default-signal", "--ignore-signal":
+					case "C", "--chdir":
+						v.noteChdir(i, next, opt.value)
+					case "v", "0", "--null", "--debug", "--help", "--version", "--list-signal-handling", "--block-signal", "--default-signal", "--ignore-signal":
 					default:
 						if strings.HasPrefix(opt.name, "--") && v.envUnknown == "" {
 							v.envUnknown = w
