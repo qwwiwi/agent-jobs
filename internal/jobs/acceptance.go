@@ -47,6 +47,12 @@ const (
 	acceptanceDeadlineGrace = 2 * time.Minute // the wrapper's kill, sweep and bookkeeping after the timeout
 	acceptanceReasonPrefix  = "acceptance "
 	acceptanceHome          = "acceptance-home" // HOME (and TMPDIR under it) of the acceptance command
+	// AcceptanceGateLockWait bounds the acceptance step's wait for the box-wide gate lock (#208); past it
+	// the command does not run and the job fails as an acceptance that did not run, naming the holder.
+	AcceptanceGateLockWait = DefaultGateLockWait
+	// acceptanceLockMargin is kept free before the daemon would time the job out while its acceptance
+	// step waits for the gate lock (acceptanceLockWait): the step gives up first, naming the holder.
+	acceptanceLockMargin = time.Minute
 	// acceptanceSignalled is runAcceptanceCmd's result when the wrapper was told to stop (SIGTERM,
 	// SIGINT, SIGHUP) while the command ran: the group is killed and nothing is recorded.
 	acceptanceSignalled = -2
@@ -105,9 +111,10 @@ func (c Config) validateAcceptance() error {
 // jobDeadline is when the daemon times a running job out: its timeout from the start, or, once its
 // acceptance command started, the later acceptance deadline the wrapper recorded with the start (from
 // the acceptance timeout the wrapper applies, so a config changed while the daemon runs cannot cut it
-// short). It only preselects: the decision is store.ClaimTimeout, made against the row as it is then.
+// short). The attempt's wait for the box-wide gate lock (GateWaitSec, #208) moves it too. It only
+// preselects: the decision is store.ClaimTimeout, made against the row as it is then.
 func jobDeadline(j *store.Job) time.Time {
-	d := j.StartedAt.Add(time.Duration(j.TimeoutMinutes) * time.Minute)
+	d := j.StartedAt.Add(time.Duration(j.TimeoutMinutes)*time.Minute + time.Duration(j.GateWaitSec)*time.Second)
 	if j.AcceptanceDeadline != nil && j.AcceptanceDeadline.After(d) {
 		d = *j.AcceptanceDeadline
 	}
@@ -232,6 +239,26 @@ type wrapperAcceptance struct {
 	timeout time.Duration
 	st      *store.Store
 	id      string
+	// started and jobTimeout are the attempt's start and the job's timeout: they bound the step's wait
+	// for the gate lock (acceptanceLockWait).
+	started    time.Time
+	jobTimeout time.Duration
+}
+
+// acceptanceLockWait bounds the acceptance step's wait for the box-wide gate lock by what the job has
+// left: the daemon times it out at its timeout from the start plus its gate-wait credit, and the credit
+// grows with the wait up to the timeout, so a wait cannot outlast start + 2 x timeout. The step gives up
+// acceptanceLockMargin before that (at most AcceptanceGateLockWait); 0 means one try. jobBound is true
+// when the bound comes from the job's time rather than AcceptanceGateLockWait.
+func acceptanceLockWait(started time.Time, jobTimeout time.Duration, now time.Time) (wait time.Duration, jobBound bool) {
+	if started.IsZero() || jobTimeout <= 0 {
+		return AcceptanceGateLockWait, false
+	}
+	left := started.Add(2*jobTimeout - acceptanceLockMargin).Sub(now)
+	if left >= AcceptanceGateLockWait {
+		return AcceptanceGateLockWait, false
+	}
+	return max(left, 0), true
 }
 
 // openAcceptance reads the job's acceptance command from <state>/jobs.db (jobDir = <state>/jobs/<id>)
@@ -252,7 +279,10 @@ func openAcceptance(jobDir, token string) (*wrapperAcceptance, error) {
 		_ = st.Close()
 		return nil, err
 	}
-	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID}
+	a := &wrapperAcceptance{cmd: j.AcceptanceCmd, st: st, id: j.ID, jobTimeout: time.Duration(j.TimeoutMinutes) * time.Minute}
+	if j.StartedAt != nil {
+		a.started = *j.StartedAt
+	}
 	if a.cmd == "" {
 		return a, nil
 	}
@@ -296,6 +326,39 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 	// From here on a stop signal must not kill the wrapper before the command's group is gone.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
+	// The acceptance command is a heavy step: it runs under the box-wide gate lock (#208), with the other
+	// jobs' gates and acceptance steps and the main session's gates. The lock is taken before the start is
+	// recorded, so its wait counts neither against the acceptance timeout nor (gate-wait.json, credited by
+	// the daemon) against the job's own.
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		fmt.Fprintln(log, "run-wrapper: acceptance: not run:", err)
+		return 0
+	}
+	wait, jobBound := acceptanceLockWait(a.started, a.jobTimeout, time.Now())
+	lease, err := acquireGateLock(ctx, gateLockReq{path: GateLockPath(), wait: wait, job: a.id,
+		detail: " in " + filepath.Join(abs, "work") + ": acceptance " + Printable(a.cmd, 200), notes: log,
+		waits: newGateWaitRecorder(abs)})
+	if err != nil {
+		if ctx.Err() != nil {
+			fmt.Fprintln(log, "run-wrapper: stopped by a signal while the acceptance command waited for the gate lock")
+			return 128 + int(syscall.SIGTERM)
+		}
+		if jobBound {
+			err = fmt.Errorf("%w; the wait was cut to %s by the job's time (timeout %s, credited lock wait at most as much)",
+				err, wait.Round(time.Second), a.jobTimeout)
+		}
+		// No result recorded: the daemon fails the job as an acceptance that did not run.
+		fmt.Fprintln(log, "run-wrapper: acceptance: not run:", err)
+		return 0
+	}
+	// The lock is not reentrant: a gate inside the acceptance command (`agent-jobs gate run` in a check
+	// script) is unsupported, it waits for this lock within its bound and times out without running.
+	defer lease.release()
+	if lease.waited > 0 {
+		fmt.Fprintf(log, "run-wrapper: acceptance: waited %s for the gate lock (not counted against the acceptance timeout)\n",
+			lease.waited.Round(time.Second))
+	}
 	now := time.Now()
 	if err := a.st.SetAcceptanceStarted(a.id, token, now, acceptanceDeadline(now, a.timeout)); err != nil {
 		// ErrImmutable: the daemon already decided to time the job out (or it no longer runs).

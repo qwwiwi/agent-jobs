@@ -94,6 +94,14 @@ type Manager struct {
 	sourcesRetryAt sync.Map
 	// beforeClaim (tests only) runs between a queued job's launch check and its claim.
 	beforeClaim func(*store.Job)
+	// beforeAdvisorLaunch (tests only) runs between an advisor call's reservation and its launch.
+	beforeAdvisorLaunch func(*store.Job)
+	// afterAdvisorAdmit (tests only) runs between an advisor call's final liveness check and the start
+	// of its process, under the advisor lock.
+	afterAdvisorAdmit func(*store.Job)
+	// closingLock (tests only) replaces admitLock for the transitions that close advisor admission
+	// (closingAdmission): a test injects a lock failure there.
+	closingLock func(dir string) (func(), error)
 
 	codexProbeMu  sync.Mutex
 	codexProbe    *CodexSandboxProbe // the cached native sandbox probe (codexSandboxProbe)
@@ -211,11 +219,22 @@ type StartRequest struct {
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
+	// Crew makes a crew job (issue #169): an advisor model the job may consult with advisor_ask, its caps,
+	// and an optional paired_with job to compare with in job_stats. Zero = a plain job.
+	Crew CrewRequest
 	// Paths are repository-relative paths/globs for overlap admission (fix/general only).
 	Paths []string
 	// OnOverlap is warn (default), serialize or refuse. Parent explicitly stacks on another job.
 	OnOverlap string
 	Parent    string
+	// Review is the id of a finished review job of this agent a fix job is started from (#197 item 6):
+	// its report becomes a source and its blocking findings the fix prompt. ControlReview (nil = true when
+	// Review is set) chains a control review when the fix succeeds (item 7).
+	Review        string
+	ControlReview *bool
+	// IdemKey (internal, never set from a request) makes the creation idempotent: a start with a key an
+	// existing job already has returns that job instead of queueing another (the control review chain).
+	IdemKey string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -367,6 +386,14 @@ func gitBytes(timeout time.Duration, dir string, env []string, args ...string) (
 // Enqueue validates the request and inserts a queued job. It returns immediately. A codex job past the
 // codex daily cap (codex_jobs_per_day) is refused.
 func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
+	// A request with a key a job already carries is a retry: that job is the answer.
+	if r.IdemKey != "" {
+		if have, err := m.Store.GetByIdemKey(r.IdemKey); err == nil {
+			return have, nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+	}
 	j, err := m.newJob(r)
 	if err != nil {
 		return nil, err
@@ -408,6 +435,12 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 			cleanup = func() {}
 			j.ID = newID(j.CreatedAt)
 			continue
+		}
+		if errors.Is(ierr, store.ErrIdemKeyExists) {
+			// A concurrent start with the same key won the insert: this attempt's folder goes, its job is the answer.
+			cleanup()
+			cleanup = func() {}
+			return m.Store.GetByIdemKey(j.IdemKey)
 		}
 		if ierr != nil {
 			return nil, ierr
@@ -508,6 +541,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err := m.milestoneStart(&r); err != nil {
 		return nil, err
 	}
+	reviewFindings, controlReview, err := m.resolveReview(&r)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkFileSourceOrigins(r.Sources); err != nil {
 		if r.plannedSources {
 			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
@@ -544,6 +581,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 			return nil, errOpenRouterSources
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
+	}
+	crew, err := m.validateCrew(r, runner)
+	if err != nil {
+		return nil, err
 	}
 	acceptance, err := ValidateAcceptanceCmd(r.Kind, r.AcceptanceCmd, m.Config().AcceptanceAllowed)
 	if err != nil {
@@ -651,7 +692,8 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
-		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent,
+		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
+		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview, IdemKey: r.IdemKey,
 	}
 	return j, nil
 }
@@ -706,6 +748,9 @@ func (m *Manager) tickLocked() error {
 	}
 	if err := m.retryScopeStops(); err != nil {
 		errs = append(errs, fmt.Errorf("scope stop: %w", err))
+	}
+	if err := m.retryAdvisorEnds(); err != nil {
+		errs = append(errs, fmt.Errorf("advisor calls: %w", err))
 	}
 	if err := m.retryRedactions(); err != nil {
 		errs = append(errs, fmt.Errorf("redaction: %w", err))
@@ -1812,11 +1857,19 @@ func (m *Manager) collect() error {
 			continue
 		}
 		if j.StartedAt != nil && now.After(jobDeadline(j)) {
+			// Time the job spent waiting for the gate lock is not its own (#208): credit it first.
+			m.creditGateWait(j, now)
+		}
+		if j.StartedAt != nil && now.After(jobDeadline(j)) {
 			// j was read at the start of the tick: the wrapper may have started the acceptance command
 			// since. The decision is a conditional update against the row as it is now; it also closes
 			// the start of an acceptance command from here on.
 			beforeTimeoutClaim(j.ID)
-			claimed, err := m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+			var claimed bool
+			err := m.closingAdmission(j, func() (err error) {
+				claimed, err = m.Store.ClaimTimeout(j.ID, j.LaunchToken, now)
+				return err
+			})
 			if err != nil {
 				m.Log.Printf("job %s: claim timeout: %v", j.ID, err)
 				continue
@@ -1824,6 +1877,8 @@ func (m *Manager) collect() error {
 			if !claimed {
 				continue // the acceptance command started meanwhile: its deadline counts from the next tick
 			}
+			// Read before the kill: the waits of dead processes drop out (#208).
+			gateWait := m.GateWaitOf(j)
 			survivors := m.killJob(j, j.PID, j.PGID)
 			res, killed := m.killedResult(j)
 			if !killed {
@@ -1838,6 +1893,10 @@ func (m *Manager) collect() error {
 				m.writeStopReport(j, dir, stopTimeout, res.Turns)
 			}
 			msg := fmt.Sprintf("timeout after %d minutes", j.TimeoutMinutes)
+			if gateWait != nil && gateWait.Waiting {
+				msg += fmt.Sprintf("; %s (this attempt waited %ds for the gate lock, deadline moved by %ds)",
+					gateWait.Note, gateWait.WaitedSec, j.GateWaitSec)
+			}
 			if survivors != "" {
 				msg += "; " + survivors
 			}
@@ -1965,11 +2024,20 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 		}
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
-	if err := m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now); err != nil {
+	// Admission is closed for the transition: the running advisor calls end first, and one that cannot be
+	// ended (kept registered, retried every tick) keeps the attempt from counting as a clean finish.
+	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(j.ID); note != "" {
+			status, msg = advisorsNotEnded(status, msg, note)
+		}
+		return m.Store.FinishAttempt(j.ID, j.LaunchToken, status, res.Turns, res.CostUSD, unknown, estimate, dur, msg, now)
+	}); err != nil {
 		m.Log.Printf("job %s: finish %s: %v", j.ID, status, err)
 		return status, msg, false
 	}
-	if status == store.StatusTimeout || status == store.StatusFailed {
+	// A crew job's advisor calls run in sessions of their own, outside the wrapper's session sweep: what
+	// they left outside their group is swept after any finish, a successful one too (issue #190).
+	if status == store.StatusTimeout || status == store.StatusFailed || j.Crew.HasAdvisor() {
 		m.noteSweep(j.ID, m.sweepEscaped(j.ID))
 	}
 	m.noteReviewChanges(j)
@@ -2203,7 +2271,13 @@ func (m *Manager) Cancel(id string) error {
 		m.Log.Printf("job %s: %s", id, RedactText(err.Error()))
 		msg = RedactPrintable(msg+"; "+ReasonSurvivors+" (scope not stopped, retried every tick: "+err.Error()+")", 300)
 	}
-	if err := m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now); err != nil {
+	// Admission is closed for the transition; the running advisor calls end first (finish).
+	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(id); note != "" {
+			_, msg = advisorsNotEnded(store.StatusCancelled, msg, note)
+		}
+		return m.Store.FinishAttempt(id, "", store.StatusCancelled, res.Turns, res.CostUSD, killed, nil, dur, msg, now)
+	}); err != nil {
 		return err
 	}
 	m.noteSweep(id, m.sweepEscaped(id))

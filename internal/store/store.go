@@ -46,9 +46,19 @@ var ErrImmutable = errors.New("job status is final and cannot change")
 // on jobs.id): the caller can redraw the id's random part and retry (#129).
 var ErrJobIDExists = errors.New("job id already exists")
 
+// ErrIdemKeyExists is returned when a new job's idempotency key is already used by another job.
+var ErrIdemKeyExists = errors.New("job idempotency key already exists")
+
+// idemKeyTaken reports whether an insert error is the jobs.idem_key UNIQUE constraint.
+func idemKeyTaken(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.idem_key") ||
+		strings.Contains(err.Error(), "UNIQUE constraint failed: index 'jobs_idem_key'")
+}
+
 // jobIDTaken reports whether an insert error is the jobs.id UNIQUE constraint: the id is taken.
 func jobIDTaken(err error) bool {
-	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id")
+	// "jobs.idem_key" also starts with "jobs.id": that constraint is the key's, not the id's.
+	return strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id") && !idemKeyTaken(err)
 }
 
 // Job is one row of the jobs table.
@@ -152,6 +162,10 @@ type Job struct {
 	DirBytes    int64
 	DirTmpBytes int64
 	DirPartial  bool
+	// GateWaitSec is how long the current attempt waited for the box-wide gate lock (#208): its gates and
+	// its acceptance step, as the daemon read the job's gate-wait.json (capped at the job's timeout). The
+	// job's deadline moves by it, so a lock wait does not eat the job's wall clock. Reset at each launch.
+	GateWaitSec int64
 	// Skills are the catalog skills selected for the job at job_start (E7), sorted by name.
 	Skills []string
 	// SkillsDelivered are the skills linked into the job's work dir for the current attempt (removed
@@ -208,6 +222,26 @@ type Job struct {
 	// Parent is an explicit stack edge; ParentBase freezes the parent's successful result at launch.
 	Parent     string
 	ParentBase string
+	// Crew is the advisor setup of a crew job (issue #169); nil for a plain job.
+	Crew *Crew
+	// Review is the id of the finished review job a fix job was started from (#197 item 6):
+	// ReviewBlocking are the blocking findings parsed from its report at start, each with its body.
+	Review         string
+	ReviewBlocking []BlockingFinding
+	// ControlReview asks for a control review to be queued when this fix job succeeds (#197 item 7).
+	// ControlJob is the job queued, ControlNote why none was (a cap refused it, no result branch).
+	ControlReview bool
+	ControlJob    string
+	ControlNote   string
+	// IdemKey is a deterministic creation key, unique among the jobs that have one ("" = none): a retry
+	// of the same creation finds the job it already made (GetByIdemKey, ErrIdemKeyExists).
+	IdemKey string
+}
+
+// BlockingFinding is one blocking finding of a review report: its ID (H1, F2, …) and its whole text.
+type BlockingFinding struct {
+	ID   string `json:"id"`
+	Body string `json:"body"`
 }
 
 // JobOverlap records the other job and both declarations of each intersecting scope.
@@ -394,6 +428,10 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: %w", err)
 	}
+	if _, err := db.Exec(idemKeyIndex); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: idem key: %w", err)
+	}
 	if _, err := db.Exec(intentionsSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: intentions: %w", err)
@@ -517,6 +555,10 @@ func Open(path string) (*Store, error) {
 	if err := migrateSources(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate db: sources: %w", err)
+	}
+	if err := migrateCrew(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate db: crew: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -683,7 +725,19 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN wait_for TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE jobs ADD COLUMN parent TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN parent_base TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN review TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN review_blocking TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE jobs ADD COLUMN control_review INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN control_job TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN control_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN gate_wait_sec INTEGER NOT NULL DEFAULT 0`,
 }
+
+// idemKeyIndex makes idem_key unique among the jobs that have one: a retried creation (the control review
+// of a fix, #197 item 7) finds its job by key instead of queueing a second. It is created after the table
+// rebuilds (rebuildCheck drops every index but jobs_status) and is idempotent.
+const idemKeyIndex = `CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem_key ON jobs(idem_key) WHERE idem_key != ''`
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
 
@@ -816,7 +870,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_cmd, acceptance_started_at, acceptance_exit, acceptance_duration_sec, acceptance_deadline,
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
-	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base`
+	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
+	crew, review, review_blocking, control_review, control_job, control_note, idem_key, gate_wait_sec`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -901,7 +956,21 @@ func insertArgs(j *Job) []any {
 		j.Outcome, j.OutcomeNote, ts(j.OutcomeAt), j.BaseBranch, j.MergeNote, JoinNames(j.Covers), coverContractJSON(j.CoverContract), gateInputJSON(j.Gate), j.Size,
 		nullID(j.MilestoneID), j.TaskKey, JoinNames(j.Sources), j.CostEstimateUSD, j.Provider, sourceFilesJSON(j.SourceFiles),
 		j.RequestedBranch, j.Branch, j.BranchNote,
-		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase}
+		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
+		crewJSON(j.Crew), j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote, j.IdemKey,
+		j.GateWaitSec}
+}
+
+// blockingJSON is the review_blocking column: "[]" for none.
+func blockingJSON(f []BlockingFinding) string {
+	if len(f) == 0 {
+		return "[]"
+	}
+	b, err := json.Marshal(f)
+	if err != nil {
+		return "[]" // a struct of strings always marshals
+	}
+	return string(b)
 }
 
 // coverContractJSON is the cover_contract column: "" for none.
@@ -922,7 +991,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor, crew, reviewBlocking string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -936,12 +1005,17 @@ func scanJob(r scanner) (*Job, error) {
 		&j.Outcome, &j.OutcomeNote, &outcomeAt, &j.BaseBranch, &j.MergeNote, &covers, &coverContract, &gate, &j.Size,
 		&milestone, &j.TaskKey, &sources, &estimate, &j.Provider, &sourceFiles,
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
-		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase)
+		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase, &crew,
+		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote, &j.IdemKey,
+		&j.GateWaitSec)
 	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(sourceFiles), &j.SourceFiles); err != nil {
 		return nil, fmt.Errorf("job %s: source_files: %w", j.ID, err)
+	}
+	if j.Crew, err = parseCrew(crew); err != nil {
+		return nil, fmt.Errorf("job %s: crew: %w", j.ID, err)
 	}
 	if err := json.Unmarshal([]byte(paths), &j.Paths); err != nil {
 		return nil, fmt.Errorf("job %s: paths: %w", j.ID, err)
@@ -951,6 +1025,9 @@ func scanJob(r scanner) (*Job, error) {
 	}
 	if err := json.Unmarshal([]byte(waitFor), &j.WaitFor); err != nil {
 		return nil, fmt.Errorf("job %s: wait_for: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(reviewBlocking), &j.ReviewBlocking); err != nil {
+		return nil, fmt.Errorf("job %s: review_blocking: %w", j.ID, err)
 	}
 	if coverContract != "" {
 		j.CoverContract = &CoverContract{}
@@ -1005,6 +1082,21 @@ func (s *Store) GetContext(ctx context.Context, id string) (*Job, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get job: %w", err)
+	}
+	return j, nil
+}
+
+// GetByIdemKey returns the job created with the idempotency key, ErrNotFound if there is none.
+func (s *Store) GetByIdemKey(key string) (*Job, error) {
+	if key == "" {
+		return nil, ErrNotFound
+	}
+	j, err := scanJob(s.db.QueryRow(`SELECT `+cols+` FROM jobs WHERE idem_key = ?`, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get job by key: %w", err)
 	}
 	return j, nil
 }
@@ -1128,7 +1220,7 @@ func (s *Store) Claim(id, token string, now time.Time) error {
 
 // claimSQL moves a queued job to running (Claim, ClaimOnMilestone): launch token, started_at, id.
 const claimSQL = `UPDATE jobs SET status='running', pid=0, pgid=0, pgid_spawned=0, launch_token=?, started_at=?,
-	attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'` + jobDependenciesSQL
+	gate_wait_sec=0, attempt=attempt+1, redaction_pending=1, fallback_session='', wrapper_result='', wrapper_token='' WHERE id=? AND status='queued'` + jobDependenciesSQL
 
 // RedactionPending returns the ids of the jobs that are no longer queued or running and whose
 // report.md has not been redacted yet (the rewrite failed, or the daemon died before it), oldest first.
@@ -1187,6 +1279,13 @@ func (s *Store) FallbackSession(id, token string) (string, error) {
 func (s *Store) SetWrapperResult(id, token, result string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET wrapper_result=?, wrapper_token=? WHERE id=? AND status='running'
 		AND launch_token=? AND launch_token!=''`, result, token, id, token))
+}
+
+// RaiseGateWait records how long the running launch with token waited for the box-wide gate lock
+// (#208), keeping the larger value; the job's deadline moves by it (ClaimTimeout).
+func (s *Store) RaiseGateWait(id, token string, sec int64) error {
+	return affected(s.db.Exec(`UPDATE jobs SET gate_wait_sec=MAX(gate_wait_sec, ?) WHERE id=? AND status='running'
+		AND launch_token=? AND launch_token!=''`, sec, id, token))
 }
 
 // WrapperResult returns the result the wrapper of the launch with token recorded; ok is false when
@@ -1401,7 +1500,7 @@ func (s *Store) SetAcceptanceResult(id, token string, exit, durationSec int) err
 // token. A claim already made stays (true again): the daemon may have died before finishing the row.
 func (s *Store) ClaimTimeout(id, token string, now time.Time) (bool, error) {
 	res, err := s.db.Exec(`UPDATE jobs SET timed_out_at=COALESCE(timed_out_at, ?) WHERE id=? AND status='running'
-		AND launch_token=? AND (timed_out_at IS NOT NULL OR (started_at IS NOT NULL AND ? > started_at + timeout_minutes*60
+		AND launch_token=? AND (timed_out_at IS NOT NULL OR (started_at IS NOT NULL AND ? > started_at + timeout_minutes*60 + gate_wait_sec
 		AND (acceptance_deadline IS NULL OR ? > acceptance_deadline)))`, now.Unix(), id, token, now.Unix(), now.Unix())
 	if err != nil {
 		return false, err

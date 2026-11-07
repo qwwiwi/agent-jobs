@@ -372,6 +372,16 @@ func TestMain(m *testing.M) {
 	// The tests' OpenRouter key files live in their temp dirs, a placement the key sandbox refuses
 	// (keysandbox_testhooks.go); Landlock itself still applies to the jobs' processes.
 	_ = os.Setenv("AGENT_JOBS_TEST_KEY_PLACEMENT_ANY", "1")
+	// The tests' box-wide gate lock (acceptance steps take it, #208) is one of their own, in process and
+	// in the binary under test (gaterun_testhooks.go): never the box's, which a real gate may hold (this
+	// suite itself may run under `agent-jobs gate run`).
+	gateDir, err := os.MkdirTemp("", "agent-jobs-gate-test-")
+	if err != nil {
+		log.Fatal(err)
+	}
+	gateLockDirs = []string{gateDir}
+	_ = os.Setenv("AGENT_JOBS_TEST_GATE_LOCK_DIR", gateDir)
+	_ = os.Unsetenv(JobDirEnvVar)
 	// The wrapper (session, scope) of that job is not counted either: in process here, and in the binary
 	// under test through the test-only hook of the agentjobs_testhooks build (outer_testhooks.go).
 	ignoreOuterJob()
@@ -404,6 +414,7 @@ func TestMain(m *testing.M) {
 	}
 	code := m.Run()
 	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(gateDir)
 	os.Exit(code)
 }
 

@@ -88,7 +88,8 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "system_doctor",
 		Description: "Health of this agent's job system: disk (free space, what prune would free), the queue " +
-			"(configured_max_running is the value of config.json as this MCP server last loaded it, reloaded when the file changes; the daemon's active cap is max_running in /v1/health), " +
+			"(configured_max_running is the value of config.json as this MCP server last loaded it, reloaded when the file changes; the daemon's active cap is max_running in /v1/health; " +
+			"queue.gate_lock is the box-wide gate lock that serializes heavy steps (gates, acceptance steps): its holder and this agent's running jobs waiting for it), " +
 			"processes that outlived their job or session and running rows with a dead pid, and jobs whose sandbox " +
 			"containers are not removed yet (pending_containers, each a problem) (doctor procs, report only: " +
 			"nothing is killed here), and the hooks every job depends on (the guard blocks git push and allows ls, " +

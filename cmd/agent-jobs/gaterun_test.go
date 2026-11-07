@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
 
 // `agent-jobs gate run` passes the command's own flags through, takes the box lock (here the test's own,
@@ -56,6 +58,30 @@ func TestGateRunCLI(t *testing.T) {
 	} {
 		if code, o, _ := run(args...); code != 125 || !strings.HasSuffix(o, "exit=125\n") {
 			t.Fatalf("%v: code %d, out %q", args, code, o)
+		}
+	}
+}
+
+// Inside a job `gate run` is the one control command that runs (#208): its heavy steps take the box-wide
+// gate lock. Every other gate subcommand and every other command that manages jobs stays refused.
+func TestGateRunAllowedInsideJob(t *testing.T) {
+	t.Setenv(jobs.JobEnvVar, "261107-000000-gate")
+	if reason := refuseInsideJob("gate", []string{"run", "--head", "HEAD", "--", "go", "test", "./..."}); reason != "" {
+		t.Fatalf("gate run refused inside a job: %s", reason)
+	}
+	for _, c := range []struct {
+		cmd  string
+		args []string
+	}{
+		{"gate", []string{"retire", "--pr", "1"}},
+		{"gate", nil},
+		{"gate", []string{"--head", "HEAD", "run"}},
+		{"start", []string{"--title", "t"}},
+		{"daemon", nil},
+		{"tick", nil},
+	} {
+		if reason := refuseInsideJob(c.cmd, c.args); reason == "" {
+			t.Errorf("%s %v allowed inside a job", c.cmd, c.args)
 		}
 	}
 }

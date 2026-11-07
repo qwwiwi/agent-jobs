@@ -472,6 +472,13 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	if j.Runner == store.RunnerCodex && cfg.codexPromptSettings(j.Kind).sandbox == CodexSandboxWrite {
 		check = strings.Replace(check, "and create a local commit.", "and leave files for the wrapper to commit.", 1)
 	}
+	if j.Review != "" {
+		extra, err := fixReviewChecklist()
+		if err != nil {
+			return "", err
+		}
+		check = strings.TrimRight(check, "\n") + "\n" + extra
+	}
 	contract, err := template("prompts/report-contract.md")
 	if err != nil {
 		return "", err
@@ -523,7 +530,7 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s%s\n\n%s\n",
 		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSourceFiles(j.SourceFiles)+renderSources(m.JobDir(j.ID), sources),
-		m.priorResults(j, prior), cover, check, contract)
+		m.priorResults(j, prior), cover+renderReviewBlocking(j), check, contract)
 	return b.String(), nil
 }
 
@@ -544,6 +551,10 @@ func writeFileReplace(path string, data []byte) error {
 	})
 }
 
+// JobMCPAdvisorFlag is the job-role server's switch (in a crew job's mcp.json args) that makes it offer
+// advisor_ask. The daemon checks the job's crew on every call anyway.
+const JobMCPAdvisorFlag = "--advisor"
+
 // JobMCPServerName is the job-role server's key in the job's mcp.json.
 const JobMCPServerName = "agent-jobs"
 
@@ -562,6 +573,22 @@ func (m *Manager) JobMCPConfig(kind string) map[string]any {
 			"args":    []string{"mcp", "--role", "job", "--agent", m.Agent},
 		},
 	}}
+}
+
+// jobMCPConfigFor is JobMCPConfig for job j: a crew job with an advisor (issue #169) gets
+// JobMCPAdvisorFlag on its server's command line, so its server offers advisor_ask (an argument, not
+// an env block: the server sees it whatever the client does with env).
+func (m *Manager) jobMCPConfigFor(j *store.Job) map[string]any {
+	c := m.JobMCPConfig(j.Kind)
+	if !j.Crew.HasAdvisor() || j.Runner == store.RunnerCodex {
+		return c
+	}
+	if srv, ok := c["mcpServers"].(map[string]any)[JobMCPServerName].(map[string]any); ok {
+		if args, ok := srv["args"].([]string); ok {
+			srv["args"] = append(slices.Clone(args), JobMCPAdvisorFlag)
+		}
+	}
+	return c
 }
 
 // prepare creates the job directory: prompt.md, settings.json, mcp.json, work/, base_commit.
@@ -626,7 +653,7 @@ func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Confi
 	}
 	// The job's only MCP server is agent-jobs itself in the job role (allow-listed tools only), none for a
 	// gate job; --strict-mcp-config makes this the complete list.
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig(j.Kind)); err != nil {
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.jobMCPConfigFor(j)); err != nil {
 		return err
 	}
 	work := filepath.Join(dir, "work")

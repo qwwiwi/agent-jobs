@@ -80,6 +80,11 @@ const usage = `usage: agent-jobs <command> [flags]
                                            job_outcome_many): one job, or a JSON array of {id, outcome,
                                            note?} from a file or stdin; each item is answered on its own
                                            and the exit status is 1 when any failed
+  restack    --child C --parent P [--onto main] [--name N] [--repo PATH] [--json]
+                                           after P was squash-merged into main: a NEW branch (default
+                                           C-restacked) from main with only C's own commits cherry-picked
+                                           on it (branch_restack); create-only, refuses when P is not in
+                                           main, on a conflict (names the files) or when the name exists
   stats      --agent A [--since D] [--by kind|model|skill|effort|repo|provider] [--json] [--backfill [--all]]
                                            per-job summary: counts, success rate, cost and duration
                                            (median, p90), guard refusal rules, skills (uses and
@@ -194,7 +199,8 @@ const usage = `usage: agent-jobs <command> [flags]
   run-wrapper <jobdir> --token T [--prompt F] [--fallback-prompt F --fallback-session ID] [--runner R] [--checklist-lock-dir D] [--manifest-check] [--prepare] -- <claude|codex> <args...>
                                            (internal, started by the daemon)
   mcp        --agent A --role orchestrator|job   MCP server on stdio (orchestrator: job_* tools;
-                                           job: only the tools allow-listed for jobs)
+                                           job: only the tools allow-listed for jobs; --advisor:
+                                           a crew job's server, also advisor_ask)
   guard      [--owner-name N]... [--git-name N] [--git-email E] [--git-dir D]... [--subagent-log F]
              [--subagent-db DB --subagent-job ID] [--protect PATH]...
                                            (PreToolUse hook, JSON on stdin)
@@ -261,6 +267,8 @@ func main() {
 		err = cmdSLO(args)
 	case "outcome":
 		err = cmdOutcome(args, os.Stdin)
+	case "restack":
+		err = cmdRestack(args)
 	case "gate":
 		if len(args) > 0 && args[0] == "run" {
 			os.Exit(cmdGateRun(args[1:], os.Stdout, os.Stderr))
@@ -312,12 +320,17 @@ func main() {
 
 // refuseInsideJob: no nested jobs. Inside a job – the env marker AGENT_JOBS_JOB is set (the wrapper
 // sets it on every job) or an ancestor process is the job wrapper (Linux /proc) – only the job's own
-// MCP server (`mcp --role job`), the guard hook, run-wrapper and help run; every command that reads or
-// changes the agent's jobs is refused. open() adds the session check once the agent is known.
+// MCP server (`mcp --role job`), the gate runner (`gate run`: it reads no jobs, only takes the box-wide
+// gate lock for a heavy step, #208), the guard hook, run-wrapper and help run; every command that reads
+// or changes the agent's jobs is refused. open() adds the session check once the agent is known.
 func refuseInsideJob(cmd string, args []string) string {
 	switch cmd {
 	case "run-wrapper", "guard", "-h", "--help", "help", "version", "--version":
 		return ""
+	case "gate":
+		if len(args) > 0 && args[0] == "run" {
+			return ""
+		}
 	case "mcp":
 		if mcpRole(args) == string(mcp.RoleJob) {
 			return ""
@@ -334,6 +347,7 @@ func mcpRole(args []string) string {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	_ = fs.String("agent", "", "")
+	_ = fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "")
 	role := fs.String("role", "", "")
 	if _, err := parse(fs, args); err != nil {
 		return ""
@@ -567,9 +581,16 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	fs.StringVar(&r.Crew.AdvisorModel, "advisor-model", "", "crew job (claude only): a stronger claude model the job may consult with advisor_ask at a design fork (read-only, capped)")
+	fs.IntVar(&r.Crew.AdvisorMaxCalls, "advisor-max-calls", 0, fmt.Sprintf("crew job: advisor calls per job; default %d, ceiling %d", jobs.DefaultAdvisorMaxCalls, jobs.MaxAdvisorCalls))
+	fs.Float64Var(&r.Crew.AdvisorMaxBudgetUSD, "advisor-max-budget-usd", 0, fmt.Sprintf("crew job: the advisor calls' spend cap in USD, on top of --max-budget-usd; default %g, ceiling %g",
+		jobs.DefaultAdvisorBudgetUSD, jobs.MaxAdvisorBudgetUSD))
+	fs.StringVar(&r.Crew.PairedWith, "paired-with", "", "id of another job on the same brief to compare with in stats (crew vs plain)")
 	var paths multi
 	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
 	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
+	fs.StringVar(&r.Review, "review", "", "fix job: id of a succeeded review job of this agent; its report is attached and every ### Blocking finding ID goes into the prompt")
+	controlReview := fs.Bool("control-review", true, "with --review: queue a control review (same model as the review, base = the fix result branch) when the fix succeeds; --control-review=false turns it off")
 	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
@@ -578,6 +599,16 @@ func cmdStart(args []string) error {
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
 	r.Paths = paths
+	// The flag defaults to true; it is passed on only when given or when --review makes it apply, so
+	// the default alone never trips the "control_review needs review" refusal.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "control-review" {
+			r.ControlReview = controlReview
+		}
+	})
+	if r.Review != "" && r.ControlReview == nil {
+		r.ControlReview = controlReview
+	}
 	if len(sources) > 0 {
 		r.Sources = sources
 	}
@@ -707,6 +738,21 @@ func cmdStatus(args []string) error {
 	if j.Parent != "" {
 		fmt.Printf("parent:    %s (result %s)\n", j.Parent, j.ParentBase)
 	}
+	if j.Review != "" {
+		ids := make([]string, 0, len(j.ReviewBlocking))
+		for _, f := range j.ReviewBlocking {
+			ids = append(ids, f.ID)
+		}
+		fmt.Printf("review:    %s (blocking %s)\n", j.Review, strings.Join(ids, ", "))
+		switch {
+		case j.ControlJob != "":
+			fmt.Printf("control:   review %s queued\n", j.ControlJob)
+		case j.ControlNote != "":
+			fmt.Printf("control:   %s\n", j.ControlNote)
+		case j.ControlReview:
+			fmt.Printf("control:   review on success\n")
+		}
+	}
 	if len(j.Paths) > 0 {
 		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
 	}
@@ -752,6 +798,18 @@ func cmdStatus(args []string) error {
 	if j.Error != "" {
 		fmt.Printf("error:     %s\n", j.Error)
 	}
+	return printCrew(m, j)
+}
+
+// printCrew prints a crew job's advisor setup and calls (nothing for a plain job).
+func printCrew(m *jobs.Manager, j *store.Job) error {
+	v, err := m.Crew(j)
+	if err != nil {
+		return fmt.Errorf("crew: %w", err)
+	}
+	for _, line := range jobs.CrewTimeline(v) {
+		fmt.Println(shown(line))
+	}
 	return nil
 }
 
@@ -763,6 +821,15 @@ func printQueue(m *jobs.Manager) error {
 		return err
 	}
 	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
+	// The box-wide gate lock that serializes heavy steps (#208).
+	if g := q.GateLock; g.Holder != "" {
+		fmt.Printf("gate lock: held, untrusted holder line: %s\n", shown(g.Holder))
+	} else {
+		fmt.Println("gate lock: free")
+	}
+	for _, w := range q.GateLock.Waiting {
+		fmt.Printf("gate wait: %s %s (waited %ds)\n", w.ID, shown(w.Note), w.WaitedSec)
+	}
 	return nil
 }
 
@@ -1037,6 +1104,9 @@ func cmdResult(args []string) error {
 	}
 	if len(atts) > 0 {
 		fmt.Printf("attempt %d: %s %s (current)\n", j.Attempt, j.RunMode, j.Status)
+	}
+	if err := printCrew(m, j); err != nil {
+		return err
 	}
 	// The bounded reader of job_result: never through a link, never a FIFO or another non-regular
 	// file, at most the scan cap.
@@ -1462,6 +1532,7 @@ func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	roleFlag := fs.String("role", "", "orchestrator|job")
+	advisor := fs.Bool(strings.TrimPrefix(jobs.JobMCPAdvisorFlag, "--"), false, "job role: offer advisor_ask (a crew job)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -1472,10 +1543,13 @@ func cmdMCP(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *advisor && role != mcp.RoleJob {
+		return errors.New("--advisor is for the job role only")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	// stdout carries the protocol: nothing else may print there.
-	return mcp.Serve(ctx, role, *agent)
+	return mcp.Serve(ctx, role, *agent, *advisor)
 }
 
 func cmdPrune(args []string) error {
@@ -2023,6 +2097,26 @@ func cmdStats(args []string) error {
 		fmt.Println("\nskills (uses, jobs, success rate, delivered, delivered unused):")
 		for _, s := range rep.Skills {
 			fmt.Printf("  %-22s %d  %d  %.0f%%  %d  %d\n", shown(s.Name), s.Uses, s.Jobs, s.SuccessRate*100, s.Delivered, s.DeliveredUnused)
+		}
+	}
+	if rep.AdvisorCostUSD > 0 {
+		fmt.Printf("\nadvisor calls of crew jobs: $%.2f (not in the totals above)\n", rep.AdvisorCostUSD)
+	}
+	if len(rep.CrewPairs) > 0 {
+		fmt.Println("\ncrew pairs (job vs paired: model, advisor calls, status, outcome, cost main + advisor):")
+		side := func(s jobs.CrewPairSide) string {
+			model := s.Model
+			if s.AdvisorModel != "" {
+				model += "+" + s.AdvisorModel
+			}
+			outcome := s.Outcome
+			if outcome == "" {
+				outcome = "-"
+			}
+			return fmt.Sprintf("%s %s %d %s %s $%.2f+$%.2f", s.ID, shown(model), s.AdvisorCalls, s.Status, outcome, s.CostMainUSD, s.CostAdvisorUSD)
+		}
+		for _, p := range rep.CrewPairs {
+			fmt.Printf("  %s  vs  %s\n", side(p.Job), side(p.Paired))
 		}
 	}
 	return nil

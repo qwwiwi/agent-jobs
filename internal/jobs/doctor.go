@@ -105,9 +105,13 @@ type procInfo struct {
 	marker         string
 }
 
+// procStatRead reads a /proc/<pid>/stat file for procStatFull (os.ReadFile); a variable so tests can
+// inject read failures (descriptors exhausted, say) that are not the process's disappearance.
+var procStatRead = os.ReadFile
+
 // procStatFull parses /proc/<pid>/stat: state, ppid, process group, session and starttime.
 func procStatFull(pid int) (procInfo, error) {
-	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
+	b, err := procStatRead(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
 	if err != nil {
 		return procInfo{}, err
 	}

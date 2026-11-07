@@ -522,8 +522,15 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		msg += "; " + ReasonSurvivors + " (scope not stopped, retried every tick: " + err.Error() + ")"
 	}
 	unknown, estimate := m.attemptCost(j, res, killed)
-	if err := m.Store.FinishAttempt(id, "", store.StatusStopped, res.Turns, res.CostUSD, unknown, estimate, dur,
-		RedactPrintable(msg, 800), now); err != nil {
+	// Admission is closed for the transition; the running advisor calls end first (finish). One that
+	// cannot be ended stays registered, and the job cannot be resumed until the tick has ended it.
+	if err := m.closingAdmission(j, func() error {
+		if note := m.endAdvisorsHeld(id); note != "" {
+			msg += "; " + ReasonSurvivors + " (advisor calls not ended, retried every tick: " + note + ")"
+		}
+		return m.Store.FinishAttempt(id, "", store.StatusStopped, res.Turns, res.CostUSD, unknown, estimate, dur,
+			RedactPrintable(msg, 800), now)
+	}); err != nil {
 		return nil, err
 	}
 	// Only now (the row is no longer running) does a process left in the job's session count as a
@@ -841,6 +848,9 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	if j.ScopePending {
 		return fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
 	}
+	if m.advisorPending(j) {
+		return errAdvisorPending(id)
+	}
 	if err := m.checkEscaped(id); err != nil {
 		return err
 	}
@@ -1009,7 +1019,7 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.JobSettings(j, gitDirs...)); err != nil {
 		return err
 	}
-	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.JobMCPConfig(j.Kind)); err != nil {
+	if err := writeJSON(filepath.Join(dir, "mcp.json"), m.jobMCPConfigFor(j)); err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(dir, gitConfigFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1030,6 +1040,9 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) {
 	if j.ScopePending {
 		return launchPlan{}, errors.New("the cgroup scope of the previous attempt is not stopped yet")
+	}
+	if m.advisorPending(j) {
+		return launchPlan{}, errors.New("advisor calls of the previous attempt are not ended yet")
 	}
 	if err := m.errArchived(j); err != nil {
 		return launchPlan{}, err

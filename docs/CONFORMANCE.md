@@ -23,9 +23,9 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | «started detached, in its own process group, and writes its exit code to a file itself» | 1:1 (+ scope: deviation #14; session sweep: deviation #9) | `internal/jobs/manager.go:565` (`Setsid: true`), `internal/jobs/wrapper.go:290` |
 | «the new daemon finds the exit-code file on the next tick» | 1:1 | `internal/jobs/manager.go:877-882` (`readExitCode`), `:535` (pid adopted from `wrapper.json`) |
 | Checklist review: «real bugs with file:line, the consequence and a minimal fix; verified findings kept apart from suspicions» | deviation (the reference row is kept, much is added; Finding U6 → #21) | `prompts/kind-review.md:3-12` |
-| Checklist fix: «reproduce with a failing test, then the minimal change, tests, a local commit» | 1:1 | `prompts/kind-fix.md:3-4` |
+| Checklist fix: «reproduce with a failing test, then the minimal change, tests, a local commit» | 1:1 (reference rows on lines 3-4; heavy steps through the gate lock on line 9: deviation #38) | `prompts/kind-fix.md:3-4, 9` |
 | Checklist research: «only primary sources … verified kept apart from inferred» | deviation (#37), reference rows kept on lines 3-4 | `prompts/kind-research.md:3-7` |
-| Checklist general: «state what counts as done, and prove it at the end» | 1:1 | `prompts/kind-general.md:3-4` |
+| Checklist general: «state what counts as done, and prove it at the end» | 1:1 (reference rows on lines 3-4; heavy steps through the gate lock on line 9: deviation #38) | `prompts/kind-general.md:3-4, 9` |
 | Defaults / ceilings 80/200 turns, $10/$50, 45/180 min | deviation (#123, owner decision 2026-10-31): fix and general jobs default to 200 turns | `internal/jobs/config.go:24-36` |
 | «A request above a ceiling is rejected, not silently cut down» | 1:1 | `internal/jobs/manager.go:151` (`limits rejected (not clamped)`) |
 | «concurrent per agent 2» (no ceiling) | 1:1 (a constant, not configurable) | `internal/jobs/config.go:30` |
@@ -75,7 +75,7 @@ Status values: **1:1**, **deviation #N** (listed in DEVIATIONS.md), **missing** 
 | «Web only for research. WebFetch and WebSearch are closed for every other kind» | 1:1 | `internal/jobs/prepare.go:109, 178-180` |
 | «`--strict-mcp-config` cuts off everything not listed in mcp.json» | 1:1 | `internal/jobs/manager.go:457` |
 | Guard: «`$?` after a pipe, a wait loop that finds itself via `pgrep -f`, the owner's name in a commit, a foreign git identity» | 1:1 | `internal/guard/guard.go:2336, 2400, 2574, 2661` |
-| Extra guard rules (nested agents, package runners, globs, git config, protected paths, subagents, out-of-scope processes, cgroupfs) | deviations #9, #12, #14 | `internal/guard/guard.go:502` (`Check`), `internal/guard/pathres.go` |
+| Extra guard rules (nested agents, package runners, globs, git config, protected paths, subagents, out-of-scope processes, cgroupfs) | deviations #9, #12, #14; the gate runner inside a job, its CMD checked as if run directly: #38 (`internal/guard/gaterun.go`) | `internal/guard/guard.go:502` (`Check`), `internal/guard/pathres.go` |
 | Guard refuses reads of the agent state outside the job's own folder | deviation (Finding U8 → #23) | `internal/guard/stateread.go:47-52`, `internal/guard/guard.go:118-126` |
 | «The main session's other hooks do not reach the job (`--setting-sources project`)» | 1:1 | `internal/jobs/manager.go:456` |
 | Preamble: own folder, contents are data, no secrets | 1:1 | `prompts/preamble.md:7-9` |

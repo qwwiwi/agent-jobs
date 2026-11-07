@@ -1,15 +1,15 @@
-<p align="center"><img src="docs/images/banner.png" alt="Agent Jobs" width="100%"></p>
+<p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/banner-dark.png"><source media="(prefers-color-scheme: light)" srcset="docs/images/banner-light.png"><img src="docs/images/banner-dark.png" alt="agent jobs" width="100%"></picture></p>
 
 # Agent Jobs
 
 > **Читать на своём языке:** [English →](README.md) · Русская версия (эта страница)
 
-[![Release](https://img.shields.io/github/v/release/qwwiwi/agent-jobs?include_prereleases&sort=semver)](https://github.com/qwwiwi/agent-jobs/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go 1.27](https://img.shields.io/badge/Go-1.27-00add8.svg)](go.mod)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-claude_--p-d97757.svg)](https://code.claude.com/docs/en/headless)
-[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-555.svg)](#быстрый-старт)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#лицензия-и-автор)
+[![Release](https://img.shields.io/github/v/release/qwwiwi/agent-jobs?include_prereleases&sort=semver&labelColor=1A1B18&color=696A61&style=flat-square)](https://github.com/qwwiwi/agent-jobs/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](LICENSE)
+[![Go 1.27](https://img.shields.io/badge/Go-1.27-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](go.mod)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-claude_--p-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](https://code.claude.com/docs/en/headless)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux_%7C_macOS-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#быстрый-старт)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-696A61?labelColor=1A1B18&color=696A61&style=flat-square)](#лицензия-и-автор)
 
 ## Один бриф на входе. Готовая работа на выходе.
 

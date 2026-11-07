@@ -77,6 +77,7 @@ Inside a job:
 | `job_resume` | continue a stopped, timeout or failed job in the same session with your update |
 | `job_outcome` | after reading a result and acting on it: record `accepted`, `extended`, `reworked`, `rerun` or `discarded` (optional note); `job_stats` then shows the cost per usable result |
 | `job_outcome_many` | the same for many jobs at once: `items` `[{id, outcome, note?}]`; each item is answered on its own (a bad id or another agent's job fails only that item); list only jobs whose result you acted on, nothing is inferred from a job's success. CLI: `agent-jobs outcome --agent A <id> <outcome> [--note]` or `--input F` (`-` = stdin) |
+| `branch_restack` | after a stacked branch's parent was squash-merged into main: `repo`, `child`, `parent`, `onto?`, `name?`; creates a new branch (`<child>-restacked`) from `onto` with only the child's own commits and returns branch, head, commits; refuses (no ref left) when the parent is not in `onto`, on a conflict or when the name exists. CLI: `agent-jobs restack --child C --parent P [--onto main] [--name N] [--repo PATH]` |
 | `skill_list` | the skill catalog: list by `kind`, `repo`, `status`, or search with `query` (best 10); shows uses, success rate and a `stale` flag |
 | `milestone_create` | a stage of work in one call: `title` and `tasks` (`[{key, title, depends_on?, depends_why?, covers?, skills?}]`; each `depends_on` edge needs a one-line reason in `depends_why` or it is dropped), optional `goal`, `repo`, `branch`, `checklist_id`, `order`, `max_parallel`; a task's `skills` are the `job_start` skills edits its jobs get |
 | `milestone_set` | edit fields, upsert tasks by key, `drop` keys, `status` open / done / dropped (done only when every task is done or dropped; any edit of a done milestone while a task is not done or dropped reopens it) |
@@ -132,11 +133,17 @@ UI job (the diff touches css/scss, html, jsx/tsx, vue/svelte, templates, static-
 
 After a review, and when a job failed:
 
+- Start the fix from the review, not from a hand-made brief: `job_start(kind: "fix", repo, review: "<review job id>")`. The daemon attaches the full report, puts every Blocking finding (ID and whole text, no Non-blocking items) into the fix prompt and makes the fix report answer each ID. Ask the reviewer for IDs (H1, H2, ...) in its brief; a review without them, or with nothing blocking, is refused.
+- With `review` set, a successful fix queues its control review itself (same model, runner and effort as the original review, base = the fix's result branch); the job-done line names it. `control_review: false` turns it off. A failed or cancelled fix queues nothing.
 - A fix job gets the review's Blocking findings as written and nothing more: copy them unchanged, without the Non-blocking items, your own rewording or extra ideas. Non-blocking items go to a separate ticket.
 - The review of that fix is a fix review: say «fix review» in its brief and give it only the fix diff and the Blocking findings as the conditions to close. It marks each one `closed` or `open`.
 - Rerun a failed job only after something in the approach changed (the brief, the inputs, the model, the limits or how the work is split), and say in the new brief what changed. The same brief on the same model again is not a rerun.
 
 The daemon removes the worktree 30 minutes after the job-done line. Read within that window; later the work is still in the patches and the ref.
+
+## Crew jobs: a cheap coder with an advisor
+
+For medium tasks with one or two design forks, start a crew job instead of running the whole job on the strong model: `job_start` with a cheap `model` (e.g. `sonnet`) and `advisor_model` (e.g. `opus`); `advisor_max_calls` defaults to 2, `advisor_max_budget_usd` to $2 (on top of `max_budget_usd`). The job gets `advisor_ask(question, context)`: a short read-only consult in its work tree, capped and recorded. Claude runner only (refused for codex). `job_status` / `job_result` show `crew`: the calls as a timeline and the cost split main / advisor. To compare, start a plain job on the same brief and give the crew job `paired_with: <plain job id>`; `job_stats` lists the pair under `crew_pairs` (record `job_outcome` for both).
 
 ## A job asks for the owner: `[jobs:notify-owner]`
 

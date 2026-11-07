@@ -30,6 +30,14 @@ and `parent` / `parent_base` in `job_status` or `job_result` for the recorded st
 The job-done line retains the serialized wait. CLI: repeat `--paths`, with
 `--on-overlap warn|serialize|refuse` and optional `--parent <job id>`.
 
+## Starting a fix loop from a review (#197 items 6 and 7)
+
+Never retype a review into a fix brief by hand: a copied section range once lost two High findings. Start the fix with `job_start(kind: "fix", repo, review: "<review job id>", ...)` (CLI `--review <id>`). The daemon attaches the review's full `report.md` as a source, puts **every** blocking finding with its ID and whole text into the prompt, and the fix report must answer each ID (closed / not closed + evidence). Your brief then says only what the findings do not: boundaries, tests to run, what not to touch.
+
+- Ask for IDs in the review brief ("number the blocking findings H1, H2, ..."), first on the item or right after its `file:line`. A review whose Blocking items have no IDs, has no `### Blocking` section, is empty (SHIP: nothing to fix), or is not a succeeded `review` job of this agent is refused; fix the review, do not work around the refusal.
+- `control_review` defaults to true: when the fix succeeds the daemon queues a control review on the same model, runner and effort as the original review, based on the fix's result branch, with the original report and the fix report as sources. Its id is in the fix's job-done line (`control review <id> queued`); a refusal by a cap or a missing result branch is in the line too (`control review not queued: ...`). A failed or cancelled fix queues nothing. Pass `control_review: false` to run the control review yourself.
+- Read the control review's verdict as any report: `BLOCK` or an `open` ID starts the next fix with `review: <control review id>`. The fix-loop cap is yours; the daemon does not count rounds.
+
 ## When a job is done
 
 > Когда джоба закончилась, главная сессия получает одну строку: `[reference:job-done] job <id> … succeeded · 39 turns · $1.76 · 28m`. Сам отчёт в сессию не вливается, агент забирает его тулом `job_result`, когда готов его прочитать.
@@ -47,7 +55,7 @@ The job-done line retains the serialized wait. CLI: repeat `--paths`, with
    > Отчёт джобы — заявление, а не результат.
 
    Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the result `branch` recorded by `job_result`).
-   Repository jobs with commits normally publish `job/<id>` on attempt 1 and `job/<id>-<attempt>` on a resumed attempt; `job_start` can request another target with `branch` (except `job`, `job/...`, `main`, `master` and `release*`). Result branches are create-only: the daemon never moves an existing ref. If the requested name already exists it is left untouched, the result goes to the generated attempt name, and the job-done line and `branch_note` say `requested branch <name> exists; not moved`; fast-forward it yourself with `git merge --ff-only` only when you want it there. Read the branch actually published from `job_result` or the job-done line, and use it for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch.
+   Repository jobs with commits normally publish `job/<id>` on attempt 1 and `job/<id>-<attempt>` on a resumed attempt; `job_start` can request another target with `branch` (except `job`, `job/...`, `main`, `master` and `release*`). Result branches are create-only: the daemon never moves an existing ref. If the requested name already exists it is left untouched, the result goes to the generated attempt name, and the job-done line and `branch_note` say `requested branch <name> exists; not moved`; fast-forward it yourself with `git merge --ff-only` only when you want it there. Read the branch actually published from `job_result` or the job-done line, and use it for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch. When a stacked branch's parent was squash-merged into main, run `branch_restack` (child, parent, onto) to get a new branch with only the child's own commits instead of starting a merge job to resolve the same code by hand.
 
 3. Only then publish.
 

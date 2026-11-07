@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-07
+
+This release adds crew jobs with a capped advisor, create-only result branches, overlap-aware coder jobs, restack after a squash merge and fix loops started from a review job.
+Heavy steps of jobs now share the box-wide gate lock, which is not reentrant and bounds every wait by the job's time.
+The guard treats `env -C` and `sudo -D` as a `cd`, and the README gets a new identity.
+
+### Added
+- Crew jobs (#169): a cheap main model with a capped advisor at design forks. `job_start` `advisor_model` (a claude model; refused for codex jobs, `gpt-*` / `openrouter:` advisors and gate kinds), `advisor_max_calls` (default 2, ceiling 5), `advisor_max_budget_usd` (default $2, ceiling $10, on top of `max_budget_usd`) and `paired_with` (CLI `--advisor-model`, `--advisor-max-calls`, `--advisor-max-budget-usd`, `--paired-with`). A crew job's MCP server offers `advisor_ask(question, context)`: through the daemon's proxy, a short read-only `claude -p` on the advisor model in the job's work tree (Read, Glob, Grep only; the daemon's own settings with write tools denied and the guard read-only on the work dir; no project settings or MCP servers; the job runner's environment; 12 turns, 5 minutes, an equal share of the crew budget left over the calls left; never started once the job has left `running` or is timing out, and ended by its cancel, stop, timeout or finish, its process group's members too when its leader is gone; a call that cannot be ended (#190) fails a clean finish with "processes survived the job", is retried every tick, and holds up resume, cleanup and prune until it is gone). One call at a time; the caps are claimed in one transaction before the model runs; each call is recorded (turn, question, outcome, turns, cost; a call without a reported cost, or with a missing, null or negative one, counts at its whole budget; claude's budget is checked between turns, so a call may overshoot by one advisor turn). `job_status` / `job_result` show `crew` with the calls as a timeline and the cost split main / advisor (main over all attempts, `cost_main_unknown` when one reported no cost); `job_stats` lists `crew_pairs` (a job next to the job it names in `paired_with`: model, advisor calls, status, outcome, cost) and `advisor_cost_usd` (advisor spend outside the totals). The crew job's MCP server gets `--advisor` on its command line. Prune removes `<state>/advisor/<id>`.
+- Add issue-scoped changelog fragments, a release assembler with preview and validation modes, and local fragment checks (#197).
+- Validate English PR titles before publication and reject literal shell substitution syntax in titles (#197).
+- Publish repository job commits on create-only result branches: the daemon never moves an existing ref, and a taken requested name falls back to `job/<id>` with a note (#197).
+- Detect declared path/glob overlaps between coder jobs with warn, serialize or refuse policies, and record explicit parent stacks based on successful job results (#197).
+- Add `agent-jobs restack` and the `branch_restack` MCP tool: after a stacked branch's parent was squash-merged, create a new branch from main with only the child's own commits, create-only, refusing when the parent is not in main or on a conflict (#197).
+- Start a fix loop from a review job: `review` on `job_start` attaches its full report, puts every blocking finding ID with its body into the fix prompt, and a successful fix queues a control review on the same model (`control_review: false` turns it off) (#197).
+- Heavy steps of jobs share the box-wide gate lock: inside a job `agent-jobs gate run --head REV [--repo .] -- CMD` is allowed (the guard checks CMD as if it ran directly and refuses nested gates, job-built runners and a `--repo` elsewhere), the fix and general checklists tell jobs to run full test suites, type checks, builds and `scripts/check.sh` that way, and the acceptance step runs under the same lock; waiters are served first come, first served, the lock is not reentrant (a gate of the same job waits like any other, nested gates, also inside acceptance scripts, time out without running their command), the wait counts neither against the acceptance timeout nor (credited, at most the job's timeout) against the job's, and `job_list`, `system_doctor` and `status` show a job "waiting for gate lock, untrusted holder line: <holder>" (#208).
+
+### Fixed
+- Bound gate runner notes and deliver them after unlocking so unread stderr cannot block timeout kills or hold the box-wide gate lock. (#178)
+- Read the runner chain in front of rsync per runner syntax (flock lock file, setsid/find/wrapper options, rsync option values as data), so local copies such as `flock parallel rsync ./src/ ./dst/` pass, while an rsync behind parallel, entr or an outer xargs stays refused (#179)
+- Fix flaky timeout cost tests by waiting for persisted token usage before triggering a timeout. (#185)
+- A hook emission planned in a previous context can no longer recreate the dedup suppression after a lock-less epoch reset invalidated it (#188)
+- Preserve a pending idle note's delivery record when an unrelated notification batch is acknowledged. (#193)
+- Backfill existing job-done delivery identities and preserve the latest injection-loss timestamp with an atomic, serialized marker update. (#195)
+- Publish each resumed attempt on its own result branch (`job/<id>-<attempt>`, the first attempt keeps `job/<id>`) and record the branch per attempt, and refuse the reserved requested names `job` and `job/*` at job_start (#205).
+- A resumed job now waits for overlapping peers that asked for `serialize` whatever `on_overlap` policy the resumed job itself used, so a failed-then-resumed `warn`, `refuse` or default blocker no longer runs next to a serialized successor (#206)
+- The guard now treats a wrapper that moves its command into another directory as a `cd` for every rule: `env -C|--chdir D` and `sudo -D|--chdir D` (every getopt spelling, combined short options, after other options) resolve the command's paths against `D` too, `..` the way the kernel does, so `env -C brief cp a BRIEF.md` and `env -C .. rm -f gitconfig` are refused like their `cd` forms; `sudo -i|--login` (the target user's home) leaves the directory unknown, as `cd $X` does (#211)
+
+### Docs
+- New README identity: theme-aware banners, flat badges and redrawn architecture and brief-flow images in the pixel style.
+
 ## [0.7.0] - 2026-11-07
 
 This release reduces orchestrator turns and context bytes with coalesced job-done lines, idle pick, deduplicated and capped hook injections, and a compact `job_result`.

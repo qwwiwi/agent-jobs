@@ -74,6 +74,9 @@ func (s *Store) insertAdmitted(j *Job, checks []JobAdmission, insert func(querie
 			if jobIDTaken(err) {
 				return ErrJobIDExists
 			}
+			if idemKeyTaken(err) {
+				return ErrIdemKeyExists
+			}
 			return fmt.Errorf("insert job: %w", err)
 		}
 		n, err := res.RowsAffected()
