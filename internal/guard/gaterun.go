@@ -18,7 +18,8 @@ import (
 //     built itself (`./agent-jobs`, <jobdir>/work/...) is not the installed runner;
 //   - only the values of --head, --timeout and --lock-wait may come from a variable or substitution
 //     (data); --repo is literal and is where CMD runs, so it must be where the shell is: omitted, `.`,
-//     or the call's own directory written out when the call has no cd. Relative words of CMD then
+//     or the call's own directory written out when the call has no cd, never with a `..` segment (the
+//     kernel resolves `link/..` after the link, filepath.Clean does not). Relative words of CMD then
 //     resolve where the guard resolves them;
 //   - one gate per command: a gate inside a gate would wait for the lock its own parent holds.
 
@@ -146,8 +147,13 @@ func gateProgram(argv0 string, cfg Config) string {
 }
 
 // gateRepo allows a --repo that is where the shell is: `.`, or the call's directory written out when the
-// call changes no directory (cdView would otherwise make another directory current).
+// call changes no directory (cdView would otherwise make another directory current). A `..` segment is
+// refused as written, relative or absolute: filepath.Clean drops `link/..` lexically, but RunGate hands
+// the raw value to the kernel, which resolves it to the parent of the link's target (#208 review).
 func gateRepo(repo string, cfg Config, sawCD bool) string {
+	if hasDotDot(repo) {
+		return "--repo `" + repo + "` has a `..` segment: the kernel resolves it after a symlink, so CMD could run elsewhere; run the gate there with --repo ."
+	}
 	if filepath.Clean(repo) == "." {
 		return ""
 	}

@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ func TestGateRunInsideJob(t *testing.T) {
 	cfg.GitName, cfg.GitEmail = "Job Bot", "bot@example.com"
 	cfg.Protected = append(cfg.Protected, filepath.Join(own, "gitconfig"))
 	work := cfg.Dir
+	gateLinkSetup(t, &cfg)
 	cases := []struct {
 		name  string
 		cmd   string
@@ -86,6 +88,15 @@ func TestGateRunInsideJob(t *testing.T) {
 		{"repo parent then protected", `agent-jobs gate run --head HEAD --repo .. -- cp x gitconfig`, true},
 		{"repo variable", `agent-jobs gate run --head HEAD --repo "$D" -- rm -f x`, true},
 		{"repo = state", `agent-jobs gate run --head HEAD --repo=` + state + ` -- cat config.json`, true},
+		// A `..` in --repo is refused as written: filepath.Clean makes `link/..` the current directory,
+		// while the kernel resolves it to the parent of the link's target (here the protected brief/).
+		{"repo link/..", `agent-jobs gate run --head HEAD --repo b/.. -- cp a BRIEF.md`, true},
+		{"repo ./link/..", `agent-jobs gate run --head HEAD --repo ./b/.. -- cp a BRIEF.md`, true},
+		{"repo = link/..", `agent-jobs gate run --head HEAD --repo=b/.. -- go test ./...`, true},
+		{"repo absolute link/..", `agent-jobs gate run --head HEAD --repo ` + work + `/b/.. -- cp a BRIEF.md`, true},
+		{"repo absolute dir/..", `agent-jobs gate run --head HEAD --repo ` + work + `/sub/.. -- go test ./...`, true},
+		{"repo ./", `agent-jobs gate run --head HEAD --repo ./ -- go test ./...`, false},
+		{"repo worktree slash", `agent-jobs gate run --head HEAD --repo ` + work + `/ -- go test ./...`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -97,11 +108,51 @@ func TestGateRunInsideJob(t *testing.T) {
 	}
 }
 
+// gateLinkSetup adds a protected brief/BRIEF.md to the work tree, a directory brief/d and a link
+// work/b -> brief/d (both allowed to create), and a plain directory work/sub: `b/..` is brief/ for the
+// kernel and the work tree for filepath.Clean.
+func gateLinkSetup(t *testing.T, cfg *Config) {
+	t.Helper()
+	brief := filepath.Join(cfg.Dir, "brief")
+	for _, d := range []string{filepath.Join(brief, "d"), filepath.Join(cfg.Dir, "sub")} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(brief, "BRIEF.md"), []byte("brief\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(brief, "d"), filepath.Join(cfg.Dir, "b")); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Protected = append(cfg.Protected, filepath.Join(brief, "BRIEF.md"))
+}
+
 // A gate never changes the verdict: `agent-jobs gate run --head HEAD -- CMD` is refused exactly when CMD
 // alone is.
 func TestGateRunSameVerdictAsDirect(t *testing.T) {
 	state, own, cfg := stateReadSetup(t)
 	cfg.GitName, cfg.GitEmail = "Job Bot", "bot@example.com"
+	gateLinkSetup(t, &cfg)
+	work := cfg.Dir
+	// The --repo axis: a spelling of the current directory gives the direct verdict; any other spelling
+	// (a `..` the kernel resolves through a link) may only be stricter than `cd REPO && CMD`.
+	sameDir := []string{".", "./", work, work + "/"}
+	otherDir := []string{"b/..", "./b/..", work + "/b/..", "sub/..", ".."}
+	for _, cmd := range []string{`cp a BRIEF.md`, `rm -f BRIEF.md`, `cp a brief/BRIEF.md`, `go test ./...`, `git push`} {
+		direct := Check(cmd, cfg) != ""
+		for _, r := range sameDir {
+			if gated := Check(`agent-jobs gate run --head HEAD --repo `+r+` -- `+cmd, cfg) != ""; gated != direct {
+				t.Errorf("--repo %s %q: direct blocked=%v, through the gate blocked=%v", r, cmd, direct, gated)
+			}
+		}
+		for _, r := range otherDir {
+			viaCD := Check(`cd `+r+` && `+cmd, cfg) != ""
+			if gated := Check(`agent-jobs gate run --head HEAD --repo `+r+` -- `+cmd, cfg) != ""; viaCD && !gated {
+				t.Errorf("--repo %s %q: allowed through the gate, but `cd %s && %s` is blocked", r, cmd, r, cmd)
+			}
+		}
+	}
 	for _, cmd := range []string{
 		`go test ./...`, `scripts/check.sh`, `npx tsc --noEmit`, `npm run build`, `make -j4 check`,
 		`git push`, `git -C . push`, `gh pr merge 1`, `claude -p x`, `gemini-cli x`, `aider-chat`,
