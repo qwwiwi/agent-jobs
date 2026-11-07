@@ -113,16 +113,30 @@ func TestOverlapRefusesCrossRepositoryCycle(t *testing.T) {
 }
 
 // B waits for A; A fails and B starts; C (serialized, overlapping) is admitted while A is failed and
-// records only B. A resumed must not run next to C once B is done.
+// records only B. A resumed must not run next to C once B is done, whatever on_overlap policy A itself
+// used (C asked for serialization) and whichever of A and C is tried first.
 func TestSerializeResumeRenewsOverlapAdmission(t *testing.T) {
+	for _, policy := range []string{"", "warn", "refuse", "serialize"} {
+		for _, order := range []string{"A tried first", "C claimed first"} {
+			t.Run("policy="+policy+"/"+order, func(t *testing.T) {
+				serializeResumeScenario(t, policy, order == "A tried first")
+			})
+		}
+	}
+}
+
+func serializeResumeScenario(t *testing.T, policy string, aTriedFirst bool) {
 	m, repo := newManager(t), newRepo(t)
-	a, err := m.Enqueue(overlapRequest(repo, []string{"src/**"}, "serialize"))
+	a, err := m.Enqueue(overlapRequest(repo, []string{"src/**"}, policy))
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, err := m.Enqueue(overlapRequest(repo, []string{"src/b.go"}, "serialize"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := get(t, m, b.ID); len(got.WaitFor) != 1 || got.WaitFor[0] != a.ID {
+		t.Fatalf("fixture: B should record A: %v", got.WaitFor)
 	}
 	if err := m.Store.Claim(a.ID, "a1", m.Now()); err != nil {
 		t.Fatal(err)
@@ -150,8 +164,10 @@ func TestSerializeResumeRenewsOverlapAdmission(t *testing.T) {
 	if err := m.Store.Finish(b.ID, "b1", store.StatusSucceeded, 0, 0, 0, "", m.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.claim(a, "a2"); !errors.Is(err, store.ErrImmutable) {
-		t.Fatalf("resumed A claimed while C is queued: %v", err)
+	if aTriedFirst {
+		if err := m.claim(a, "a2"); !errors.Is(err, store.ErrImmutable) {
+			t.Fatalf("resumed A claimed while C is queued: %v", err)
+		}
 	}
 	if err := m.claim(c, "c1"); err != nil {
 		t.Fatalf("C did not start after B: %v", err)
