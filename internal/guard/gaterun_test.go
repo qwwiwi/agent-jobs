@@ -146,10 +146,11 @@ func TestGateRunSameVerdictAsDirect(t *testing.T) {
 				t.Errorf("--repo %s %q: direct blocked=%v, through the gate blocked=%v", r, cmd, direct, gated)
 			}
 		}
+		// Every other spelling has a `..` segment: refused for it, whatever the direct verdict.
 		for _, r := range otherDir {
-			viaCD := Check(`cd `+r+` && `+cmd, cfg) != ""
-			if gated := Check(`agent-jobs gate run --head HEAD --repo `+r+` -- `+cmd, cfg) != ""; viaCD && !gated {
-				t.Errorf("--repo %s %q: allowed through the gate, but `cd %s && %s` is blocked", r, cmd, r, cmd)
+			want := "--repo `" + r + "` has a `..` segment"
+			if got := Check(`agent-jobs gate run --head HEAD --repo `+r+` -- `+cmd, cfg); !strings.Contains(got, want) {
+				t.Errorf("--repo %s %q through the gate: %q, want the refusal %q", r, cmd, got, want)
 			}
 		}
 	}
