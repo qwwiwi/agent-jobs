@@ -63,13 +63,13 @@ Measured per task (benchmark below, 2026-10-19): on small tasks a job is **not**
 
 ### The swarm
 
-<p align="center"><img src="images/swarm.png" alt="The main session hands work to many jobs and gets a check mark back from each" width="100%"></p>
+<p align="center"><img src="images/swarm-v2.png" alt="The main session hands work to many jobs and gets a check mark back from each" width="100%"></p>
 
 One main session, many workers. The session writes a brief for a stranger (a job has no conversation context), starts a job and goes back to talking. Each job works alone in its own folder and comes back with a report. The picture is illustrative: jobs wait in a queue, and at most `max_running` (default two) run at a time per agent.
 
 ### Components
 
-<p align="center"><img src="images/architecture.png" alt="Main session, daemon, job, job folder, owner and schedules" width="100%"></p>
+<p align="center"><img src="images/architecture-v2.png" alt="Main session, daemon, job, job folder, owner and schedules" width="100%"></p>
 
 - **Main session** talks to the owner, starts jobs, reads reports, reviews and pushes. It is the only part allowed to go outside.
 - **Daemon** (`agent-jobs daemon`) ticks once a minute: collect finished jobs, launch queued ones, deliver job-done lines, clean up. It keeps no state in memory: kill it, even with SIGKILL, and running jobs carry on; the next daemon finds their exit codes and collects them.
@@ -81,7 +81,7 @@ One main session, many workers. The session writes a brief for a stranger (a job
 
 ### Lifecycle
 
-<p align="center"><img src="images/lifecycle.png" alt="job_start, queued, running, report, job-done line, job_result, review and push, cleanup" width="100%"></p>
+<p align="center"><img src="images/lifecycle-v2.png" alt="job_start, queued, running, report, job-done line, job_result, review and push, cleanup" width="100%"></p>
 
 1. **Start.** The session starts a job with a title, kind, brief, repo, model and limits. The call validates everything, inserts a `queued` row and returns the id. Nothing runs yet.
 2. **Queued.** On the next tick, if fewer than `max_running` (default two) jobs are running for this agent, the daemon claims it.
