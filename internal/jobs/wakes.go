@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -113,16 +114,16 @@ const DroppedInjectionsFile = "injections-dropped"
 // saturation marker (SaturatedInjectionsFile) records that injections are still being lost.
 const maxDroppedFileBytes = 1 << 20
 
-// SaturatedInjectionsFile holds the unix time of the latest injection lost after the dropped file was
-// full. It outlives the entries that age out of a report's window, so a report knows it is incomplete.
+// SaturatedInjectionsFile holds the greatest unix time observed for an injection lost after the dropped
+// file was full. It outlives entries that age out of a report's window, so the report stays incomplete.
 const SaturatedInjectionsFile = "injections-dropped.saturated"
 
 // noteDroppedInjection appends one line to the dropped-injections file. Best effort by design: the
-// hook this serves must never fail or wait for it.
+// hook this serves must never fail because its metrics could not be recorded.
 func noteDroppedInjection(dir, category string, bytes int, at time.Time) {
 	path := filepath.Join(dir, DroppedInjectionsFile)
 	if fi, err := os.Stat(path); err == nil && fi.Size() > maxDroppedFileBytes {
-		_ = os.WriteFile(filepath.Join(dir, SaturatedInjectionsFile), []byte(strconv.FormatInt(at.Unix(), 10)+"\n"), 0o600)
+		noteSaturatedInjection(dir, at)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -131,6 +132,33 @@ func noteDroppedInjection(dir, category string, bytes int, at time.Time) {
 	}
 	defer f.Close()
 	_, _ = fmt.Fprintf(f, "%d %s %d\n", at.Unix(), category, bytes)
+}
+
+// noteSaturatedInjection publishes the maximum loss timestamp. The separate lock serializes the
+// read/compare/replace across hook processes; atomic replacement keeps readers on a full snapshot.
+func noteSaturatedInjection(dir string, at time.Time) {
+	path := filepath.Join(dir, SaturatedInjectionsFile)
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	for {
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX)
+		if err != syscall.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		return
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	if b, err := os.ReadFile(path); err == nil {
+		if previous, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && previous >= at.Unix() {
+			return
+		}
+	}
+	_ = writeAtomic(path, []byte(strconv.FormatInt(at.Unix(), 10)+"\n"))
 }
 
 // droppedSaturated reports whether an injection was lost, uncounted, at or after since because the
