@@ -88,9 +88,20 @@ func TestWalkChainStdinAndBare(t *testing.T) {
 	if len(ch.rsyncs) != 1 || ch.rsyncs[0].at != 2 || !ch.data[1] {
 		t.Errorf("quoted lock file: rsyncs = %+v data = %v, want rsync at 2, data 1", ch.rsyncs, ch.data)
 	}
+	// `"$L"` is walked as the lock file (rsync runs) and as an option (rsync is the lock file, `a`
+	// runs); no word counts as data then.
 	ch = walkChain(strings.Fields("flock $L rsync a b"), dyn, nil, false)
-	if len(ch.rsyncs) != 0 || len(ch.tails) != 1 {
-		t.Errorf("quoted bare-name lock file: rsyncs = %+v tails = %+v, want one tail", ch.rsyncs, ch.tails)
+	if len(ch.rsyncs) != 1 || ch.rsyncs[0].at != 2 || len(ch.legacy) != 1 || ch.legacy[0].at != 3 || !ch.ambiguous {
+		t.Errorf("quoted bare-name lock file: rsyncs = %+v legacy = %+v ambiguous = %v, want rsync at 2, legacy at 3",
+			ch.rsyncs, ch.legacy, ch.ambiguous)
+	}
+	ch = walkChain(strings.Fields("flock ./l $P a"), []bool{false, false, true, false}, nil, false)
+	if len(ch.blind) != 1 {
+		t.Errorf("quoted program: blind = %v, want one", ch.blind)
+	}
+	ch = walkChain(strings.Fields("setsid -f"), nil, nil, true)
+	if len(ch.blind) != 1 {
+		t.Errorf("xargs setsid without program: blind = %v, want one", ch.blind)
 	}
 	ch = walkChain(strings.Fields("find . -exec rsync a b ;"), nil, nil, true)
 	if len(ch.rsyncs) != 0 || len(ch.tails) != 1 {

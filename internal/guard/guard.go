@@ -1566,6 +1566,9 @@ var stdinRunners = map[string]bool{"parallel": true, "entr": true, "xargs": true
 func remoteCopyArg(name string, args []string, dyn, bare []bool, stdin bool) string {
 	argv, d, b := chainArgv(name, args, dyn, bare)
 	ch := walkChain(argv, d, b, stdin)
+	if len(ch.blind) > 0 { // the program is a variable or comes from xargs input: it may be rsync
+		return argv[ch.blind[0]]
+	}
 	for _, r := range ch.rsyncs {
 		if r.at == 0 { // the program itself: checkUserManager checks a plain rsync
 			continue
@@ -1609,6 +1612,9 @@ func chainData(name string, args []string, dyn, bare []bool) map[int]bool {
 	argv, d, b := chainArgv(name, args, dyn, bare)
 	ch := walkChain(argv, d, b, false)
 	data := map[int]bool{}
+	if ch.ambiguous {
+		return data
+	}
 	for k := range ch.data {
 		data[k-1] = true
 	}

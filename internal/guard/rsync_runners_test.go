@@ -52,6 +52,18 @@ func TestRsyncRunnerChains(t *testing.T) {
 		{"setsid ionice remote", `setsid ionice -c 3 rsync ./src/ h:/x`, true},
 		{"setsid ionice local", `setsid ionice -c 3 rsync ./src/ ./dst/`, false},
 		{"setsid fd -x remote", `setsid fd -x rsync ./src/ h:/x`, true},
+		// The program behind a runner comes from xargs input or a variable: it may be rsync.
+		{"xargs setsid program from input", `echo rsync ./a h:/x | xargs setsid`, true},
+		{"xargs flock program from input", `echo rsync ./a h:/x | xargs flock ./l`, true},
+		{"setsid quoted variable program", `setsid "rs$Y" ./a h:/x`, true},
+		{"flock quoted variable program", `flock ./l "rs$Y" ./a h:/x`, true},
+		{"find exec quoted variable program", `find . -exec "rs$Y" ./a h:/x \;`, true},
+		// A quoted lock file variable: the lock file, or an option that makes rsync the lock file.
+		{"quoted lock file variable", `flock "$LOCK" rsync -a ./a/ ./b/`, false},
+		{"quoted lock file under home", `flock -n "$HOME/.cache/x.lock" rsync -a ./a/ ./b/`, false},
+		{"quoted timeout value", `flock -w "$T" ./l rsync ./a ./b`, false},
+		{"quoted lock variable as option", `L=-n; printf '%s\n' h:/x | flock "$L" rsync parallel rsync ./src/`, true},
+		{"quoted lock variable remote", `flock "$LOCK" rsync ./a h:/x`, true},
 		// A runner operand is data, not a program.
 		{"lock file with space named rsync", `flock 'rsync lock' rsync ./src/ ./dst/`, false},
 		{"setsid flock options and excludes", `setsid -f flock -n -w 3 ./l rsync -a --exclude 'rsync x' ./src/ ./dst/`, false},

@@ -21,9 +21,13 @@ type runnerChain struct {
 	rsyncs []chainSpan  // the rsync commands the chain runs; stdin = argv not fully visible
 	tails  []chainSpan  // spans the walk cannot read: any rsync word in them is refused
 	legacy []chainSpan  // programs not modeled here, checked by legacyRemoteCopyArg
+	blind  []int        // a runner whose program the guard cannot see (a variable, xargs input)
 	data   map[int]bool // runner option words, their values and operands (a lock file): never a program
-	dyn    []bool
-	bare   []bool
+	// ambiguous: a word was walked in several readings (flockFrom); data then holds the words of
+	// every reading, so no word may be skipped as data (chainData).
+	ambiguous bool
+	dyn       []bool
+	bare      []bool
 }
 
 func (ch *runnerChain) isDyn(i int) bool  { return i < len(ch.dyn) && ch.dyn[i] }
@@ -40,10 +44,13 @@ func walkChain(argv []string, dyn, bare []bool, stdin bool) *runnerChain {
 // command classifies the program at s.at and walks into it when it is a modeled runner.
 func (ch *runnerChain) command(argv []string, s chainSpan) {
 	if s.at >= s.end {
+		if s.stdin && s.at > 0 { // `xargs setsid`: the program itself comes from input
+			ch.blind = append(ch.blind, s.at-1)
+		}
 		return
 	}
-	if s.at > 0 && (ch.isDyn(s.at) || ch.isBare(s.at)) { // a program from a variable
-		ch.tails = append(ch.tails, s)
+	if s.at > 0 && (ch.isDyn(s.at) || ch.isBare(s.at)) { // a program from a variable: any program
+		ch.blind = append(ch.blind, s.at)
 		return
 	}
 	name := progName(argv[s.at])
@@ -73,49 +80,62 @@ func isWrapper(name string) bool { _, ok := wrapperValueFlags[name]; return ok }
 // at the first operand or `--`). shortFlags take no value, shortValues take the rest of the word or
 // the next word, longs maps every long option to whether it takes a value.
 func (ch *runnerChain) options(argv []string, s chainSpan, shortFlags, shortValues string, longs map[string]bool) {
-	i, ok := ch.runnerOptions(argv, s, shortFlags, shortValues, longs)
-	if !ok {
+	i, st := ch.runnerOptions(argv, s, s.at+1, shortFlags, shortValues, longs)
+	if st != optsDone {
 		ch.tails = append(ch.tails, s)
 		return
 	}
 	ch.command(argv, chainSpan{i, s.end, s.stdin})
 }
 
-// runnerOptions consumes the options of the runner at s.at and returns the index of its first
-// operand. ok is false for an unknown or ambiguous option or a word the guard cannot read.
-func (ch *runnerChain) runnerOptions(argv []string, s chainSpan, shortFlags, shortValues string,
-	longs map[string]bool) (int, bool) {
-	i := s.at + 1
+// optsState is how runnerOptions ended.
+type optsState int
+
+const (
+	optsDone      optsState = iota // at the first operand (or the end)
+	optsUnknown                    // an unknown or ambiguous option, or an unquoted expansion
+	optsAmbiguous                  // a quoted expansion that may be an option or the first operand
+)
+
+// runnerOptions consumes the options of the runner at s.at, from index from, and returns the index
+// of its first operand. A separate option value may be a quoted expansion (`-w "$T"`): it is one
+// word, data whatever it holds.
+func (ch *runnerChain) runnerOptions(argv []string, s chainSpan, from int, shortFlags, shortValues string,
+	longs map[string]bool) (int, optsState) {
+	i := from
 	for i < s.end {
 		w := argv[i]
 		if ch.isBare(i) { // an unquoted expansion may split into options and operands
-			return i, false
+			return i, optsUnknown
 		}
 		if ch.isDyn(i) {
 			// A quoted expansion is one word: an operand when its static text already shows it
-			// (`"./locks/$L"`), else it may spell any option.
-			return i, w != "" && !strings.ContainsAny(w[:1], "-$`")
+			// (`"./locks/$L"`), else it may spell an option too (`"$LOCK"`).
+			if w != "" && !strings.ContainsAny(w[:1], "-$`") {
+				return i, optsDone
+			}
+			return i, optsAmbiguous
 		}
 		if w == "--" {
 			ch.data[i] = true
-			return i + 1, true
+			return i + 1, optsDone
 		}
 		if !strings.HasPrefix(w, "-") || w == "-" {
-			return i, true
+			return i, optsDone
 		}
 		next, ok := runnerOption(argv, i, s.end, shortFlags, shortValues, longs)
 		if !ok || next > s.end {
-			return i, false
+			return i, optsUnknown
 		}
 		for j := i; j < next; j++ {
-			if ch.isDyn(j) || ch.isBare(j) {
-				return i, false
+			if ch.isBare(j) {
+				return i, optsUnknown
 			}
 			ch.data[j] = true
 		}
 		i = next
 	}
-	return i, true
+	return i, optsDone
 }
 
 // runnerOption reads the option word argv[i] and returns the index after it and its value.
@@ -166,17 +186,59 @@ func runnerOption(argv []string, i, end int, shortFlags, shortValues string, lon
 // flock: `flock [options] file|dir command [args]`, `flock [options] file|dir -c command`,
 // `flock [options] fd` (util-linux, getopt "+sexnoFuw:E:hV?"). The first operand is the lock
 // file, never a program.
-func (ch *runnerChain) flock(argv []string, s chainSpan) {
-	i, ok := ch.runnerOptions(argv, s, "sexnoFuhV?", "wE", map[string]bool{
-		"--shared": false, "--exclusive": false, "--unlock": false, "--nonblock": false, "--nb": false,
-		"--timeout": true, "--wait": true, "--conflict-exit-code": true, "--close": false,
-		"--no-fork": false, "--verbose": false, "--help": false, "--version": false,
-	})
-	if !ok {
+func (ch *runnerChain) flock(argv []string, s chainSpan) { ch.flockFrom(argv, s, s.at+1, 0) }
+
+// flockOpts are flock's options: short flags, short options with a value, long options.
+var flockOpts = struct {
+	flags, values string
+	longs         map[string]bool
+}{"sexnoFuhV?", "wE", map[string]bool{
+	"--shared": false, "--exclusive": false, "--unlock": false, "--nonblock": false, "--nb": false,
+	"--timeout": true, "--wait": true, "--conflict-exit-code": true, "--close": false,
+	"--no-fork": false, "--verbose": false, "--help": false, "--version": false,
+}}
+
+// flockFrom walks flock's options from index from. A quoted expansion where an option or the lock
+// file may stand (`flock "$LOCK" rsync …`) is walked as each: the lock file, a one-word option,
+// or -w/-E with the next word as its (numeric) value; every reading's rsyncs, tails and legacy
+// programs count (ambiguous: no word is taken as data, see chainData). Past maxFlockForks such
+// words the argv is unreadable.
+func (ch *runnerChain) flockFrom(argv []string, s chainSpan, from, forks int) {
+	i, st := ch.runnerOptions(argv, s, from, flockOpts.flags, flockOpts.values, flockOpts.longs)
+	switch st {
+	case optsUnknown:
 		ch.tails = append(ch.tails, s)
 		return
+	case optsAmbiguous:
+		if forks >= maxFlockForks {
+			ch.tails = append(ch.tails, s)
+			return
+		}
+		ch.ambiguous = true
+		ch.flockOperand(argv, s, i)
+		ch.flockFrom(argv, s, i+1, forks+1)
+		if i+1 < s.end && numeric(argv[i+1]) && !ch.isDyn(i+1) {
+			ch.flockFrom(argv, s, i+2, forks+1)
+		}
+		return
 	}
+	ch.flockOperand(argv, s, i)
+}
+
+// maxFlockForks bounds the readings flockFrom walks (3^n).
+const maxFlockForks = 3
+
+// numeric reports a word that flock -w/-E could take as its value (seconds or an exit code).
+func numeric(w string) bool {
+	return w != "" && strings.Trim(w, "0123456789.") == ""
+}
+
+// flockOperand walks flock from its lock file at index i: then the command or `-c` string.
+func (ch *runnerChain) flockOperand(argv []string, s chainSpan, i int) {
 	if i >= s.end {
+		if s.stdin { // `xargs flock`: the lock file and the program come from input
+			ch.blind = append(ch.blind, s.at)
+		}
 		return
 	}
 	ch.data[i] = true
