@@ -152,6 +152,53 @@ func TestRestackRefusesPickThatFailsToCommit(t *testing.T) {
 	restackNoLeftovers(t, g, tmp)
 }
 
+// A .gitmodules "ignore = all" hides a staged gitlink change from `git diff --cached`. A child commit
+// that only moves the gitlink and then fails to commit must still be refused, not skipped as empty.
+func TestRestackRefusesGitlinkPickThatFailsToCommit(t *testing.T) {
+	repo, g := restackRepo(t)
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const oldLink, newLink = "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"
+	g("checkout", "-q", "C")
+	write(".gitmodules", "[submodule \"lib\"]\n\tpath = lib\n\turl = ./lib\n\tignore = all\n")
+	g("add", ".gitmodules")
+	g("update-index", "--add", "--cacheinfo", "160000,"+oldLink+",lib")
+	g("commit", "-q", "-m", "c3: add lib submodule, ignored")
+	g("update-index", "--cacheinfo", "160000,"+newLink+",lib")
+	g("commit", "-q", "-m", "c4: only move the lib gitlink")
+	gitlinkCommit := g("rev-parse", "HEAD")
+	g("checkout", "-q", "main")
+	squashP(t, g)
+
+	restackPickConfig = func(c string) []string {
+		if c == gitlinkCommit {
+			return []string{"commit.gpgsign=true", "gpg.program=/nonexistent/agent-jobs-gpg"}
+		}
+		return nil
+	}
+	t.Cleanup(func() { restackPickConfig = nil })
+	before := g("for-each-ref")
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	res, err := Restack(repo, "C", "P", "main", "")
+	if err == nil {
+		t.Fatalf("a gitlink-only commit that failed to commit was skipped: %+v", res)
+	}
+	var conflict *RestackConflictError
+	if errors.As(err, &conflict) {
+		t.Fatalf("not a conflict: %v", err)
+	}
+	if g("for-each-ref") != before {
+		t.Fatalf("a ref was left behind:\n%s", g("for-each-ref"))
+	}
+	restackNoLeftovers(t, g, tmp)
+}
+
 func TestRemoveAllWithinReportsFailure(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions")

@@ -286,8 +286,14 @@ func (r *restackGit) settleCherryPick(work, c string, pickErr error) error {
 	if _, err := r.in(work, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"); err != nil {
 		return failed
 	}
-	// Any error here (staged changes, or git itself failing) is "not provably empty".
-	if _, err := r.in(work, "diff", "--cached", "--quiet", "--no-ext-diff"); err != nil {
+	// Exact comparison of trees, not a diff: `git diff` honours .gitmodules "ignore = all" and would
+	// hide a staged gitlink change. Any error here is "not provably empty".
+	index, err := r.in(work, "write-tree")
+	if err != nil {
+		return failed
+	}
+	head, err := r.in(work, "rev-parse", "--verify", "HEAD^{tree}")
+	if err != nil || index != head {
 		return failed
 	}
 	if _, err := r.in(work, "cherry-pick", "--skip"); err != nil {

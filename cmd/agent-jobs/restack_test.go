@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -58,5 +59,18 @@ func TestRestackCLI(t *testing.T) {
 	})
 	if !strings.Contains(text, "C-restacked") || !strings.Contains(text, "1 commit") {
 		t.Fatalf("text output: %q", text)
+	}
+}
+
+// Cleanup warnings go to stderr in the text output; stdout keeps only the summary line.
+func TestPrintRestackWarnings(t *testing.T) {
+	res := jobs.RestackResult{Branch: "C-restacked", Head: "abc123", Commits: 2, Warnings: []string{"remove temporary directory: boom"}}
+	var out, errb bytes.Buffer
+	printRestack(&out, &errb, res, "C", "main")
+	if got := out.String(); got != "C-restacked abc123: 2 commit(s) of C on top of main\n" {
+		t.Fatalf("stdout: %q", got)
+	}
+	if got := errb.String(); got != "warning: remove temporary directory: boom\n" {
+		t.Fatalf("stderr: %q", got)
 	}
 }

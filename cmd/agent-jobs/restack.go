@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/qwwiwi/agent-jobs/internal/jobs"
 )
@@ -49,10 +51,19 @@ func cmdRestack(args []string) error {
 		fmt.Println(string(b))
 		return nil
 	}
+	printRestack(os.Stdout, os.Stderr, res, *child, *onto)
+	return nil
+}
+
+// printRestack writes the one-line summary to stdout and every cleanup warning to stderr: a warning
+// does not fail the restack, but it must not disappear from the text output.
+func printRestack(stdout, stderr io.Writer, res jobs.RestackResult, child, onto string) {
 	skipped := ""
 	if len(res.Skipped) > 0 {
-		skipped = fmt.Sprintf(", %d already in %s skipped", len(res.Skipped), *onto)
+		skipped = fmt.Sprintf(", %d already in %s skipped", len(res.Skipped), onto)
 	}
-	fmt.Printf("%s %s: %d commit(s) of %s on top of %s%s\n", res.Branch, res.Head, res.Commits, *child, *onto, skipped)
-	return nil
+	fmt.Fprintf(stdout, "%s %s: %d commit(s) of %s on top of %s%s\n", res.Branch, res.Head, res.Commits, child, onto, skipped)
+	for _, w := range res.Warnings {
+		fmt.Fprintln(stderr, "warning:", w)
+	}
 }
