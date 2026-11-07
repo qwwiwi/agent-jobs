@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -737,7 +738,8 @@ func (m *Manager) decideHeartbeat(ctx context.Context, h *store.Heartbeat) error
 		case target == "":
 			return errors.New("notify off: notify_tmux_target is not configured")
 		}
-		return m.sendTmux(ctx, target, HeartbeatLine(h.ID))
+		id := strconv.FormatInt(h.ID, 10)
+		return m.deliverPlain(ctx, target, WakeHeartbeat, WakeHeartbeat+":"+id, []string{id}, HeartbeatLine(h.ID))
 	}
 	var derr error
 	if target == "" {

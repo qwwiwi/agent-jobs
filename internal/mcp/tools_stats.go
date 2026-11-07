@@ -37,6 +37,29 @@ func addJobStats(s *sdk.Server, d Deps) {
 	})
 }
 
+// WakeStatsInput is wake_stats' input.
+type WakeStatsInput struct {
+	Since string `json:"since,omitempty" jsonschema:"only records since: <n>d (7d), a duration (36h) or a date YYYY-MM-DD; default all"`
+}
+
+func addWakeStats(s *sdk.Server, d Deps) {
+	addManagerTool(s, d, &sdk.Tool{
+		Name: "wake_stats",
+		Description: "What reached this orchestrator session, measured (not estimated): every line the daemon typed into it " +
+			"by category (job-done, notify-owner, schedule, check-missed, heartbeat) and every hook injection " +
+			"(hook:brief-reminder, hook:pending-outcome, hook:stop, hook:merge-gate, hook:skills-picker), counted per category per local day, with the batch size " +
+			"(jobs of a coalesced job-done line, alerts of a check-missed line) and the bytes per delivery or injection " +
+			"(total, p50, p95, max). A retried delivery counts once; injections_unrecorded counts the ones a hook could not store (the injection numbers are then a lower bound; injections_uncounted: true means more were lost after the dropped file filled up). Same output as `agent-jobs stats wakes --json`.",
+	}, func(_ context.Context, _ *sdk.CallToolRequest, in WakeStatsInput) (*sdk.CallToolResult, jobs.WakeStatsReport, error) {
+		since, err := jobs.ParseSince(in.Since, d.Manager.Now())
+		if err != nil {
+			return nil, jobs.WakeStatsReport{}, err
+		}
+		rep, err := d.Manager.WakeStats(since)
+		return nil, rep, err
+	})
+}
+
 // JobOutcomeInput is job_outcome's input.
 type JobOutcomeInput struct {
 	ID      string `json:"id" jsonschema:"job id as returned by job_start"`

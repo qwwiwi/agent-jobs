@@ -71,6 +71,9 @@ type Manager struct {
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
 
+	noteMu       sync.Mutex     // guards noteUnmarked
+	noteUnmarked map[int64]bool // SLO breaches a delivery carried whose noted mark failed (wakes.go)
+
 	idleMu   sync.Mutex
 	idleSent string // the ready list of the last idle-slot line (idleslots.go)
 
@@ -702,6 +705,9 @@ func (m *Manager) tickLocked() error {
 	}
 	if err := m.cleanupDue(); err != nil {
 		errs = append(errs, fmt.Errorf("cleanup: %w", err))
+	}
+	if err := m.sloInvestigate(); err != nil {
+		errs = append(errs, fmt.Errorf("slo investigate: %w", err))
 	}
 	return errors.Join(errs...)
 }

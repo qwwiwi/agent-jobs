@@ -84,6 +84,38 @@ func TestJobOutcomeTool(t *testing.T) {
 	}
 }
 
+// wake_stats is orchestrator-only and returns the same report as `agent-jobs stats wakes --json`.
+func TestWakeStatsTool(t *testing.T) {
+	if !slices.Contains(OrchestratorOnly, "wake_stats") || slices.Contains(JobAllowed, "wake_stats") || Allowed(RoleJob, "wake_stats") {
+		t.Fatal("wake_stats must be orchestrator-only")
+	}
+	m := newManager(t)
+	now := time.Now()
+	m.Now = func() time.Time { return now }
+	for _, w := range []store.Wake{
+		{At: now.Add(-time.Hour), Kind: store.WakeDelivery, Category: jobs.WakeJobDone, Bytes: 100, BatchSize: 3},
+		{At: now.Add(-10 * 24 * time.Hour), Kind: store.WakeDelivery, Category: jobs.WakeSchedule, Bytes: 50},
+		{At: now.Add(-time.Hour), Kind: store.WakeInjection, Category: jobs.InjectStop, Bytes: 9},
+	} {
+		if _, err := m.Store.AddWake(w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs := connect(t, mustServer(t, m))
+	var out jobs.WakeStatsReport
+	call(t, cs, "wake_stats", map[string]any{}, &out)
+	if out.Wakes != 2 || out.WakeBytes != 150 || out.InjectionBytes != 9 || len(out.Categories) != 3 {
+		t.Fatalf("all: %+v", out)
+	}
+	call(t, cs, "wake_stats", map[string]any{"since": "7d"}, &out)
+	if out.Wakes != 1 || out.Categories[0].Category != jobs.WakeJobDone || out.Categories[0].Members != 3 {
+		t.Fatalf("since 7d: %+v", out)
+	}
+	if msg := callErr(t, cs, "wake_stats", map[string]any{"since": "soon"}); !strings.Contains(msg, "since") {
+		t.Fatalf("bad since: %q", msg)
+	}
+}
+
 // job_outcome_many is orchestrator-only, answers per item (one failing item does not abort the rest),
 // overwrites idempotently and refuses other agents' jobs item by item.
 func TestJobOutcomeManyTool(t *testing.T) {

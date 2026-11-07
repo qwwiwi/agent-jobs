@@ -211,6 +211,8 @@ type Config struct {
 	// Heartbeat lets the daemon wake the orchestrator session for the agent's own standing goals:
 	// a cheap Go gate, then a small model decides (DEVIATIONS #1). Off by default.
 	Heartbeat HeartbeatConfig `json:"heartbeat"`
+	// SLO holds the norms `slo record` compares a duration with, and slo.investigate (#170).
+	SLO SLOConfig `json:"slo"`
 	// IdlePick makes the job-done line of the last job of an emptied queue say what is ready to do next
 	// (#165), so no hourly wake is needed to look for it. Off by default.
 	IdlePick IdlePickConfig `json:"idle_pick"`
@@ -627,6 +629,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.Heartbeat.validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
+	}
+	if err := c.SLO.validate(); err != nil {
 		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if err := c.IdlePick.validate(); err != nil {

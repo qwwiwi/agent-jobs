@@ -42,6 +42,8 @@ var OrchestratorOnly = []string{
 	"job_resume",
 	"job_amend",
 	"job_stats",
+	// What reached the orchestrator session (#170): the session reads its own load.
+	"wake_stats",
 	// What the orchestrator did with a job's result (feeds job_stats): the session's judgement, not a job's.
 	"job_outcome",
 	"job_outcome_many",
