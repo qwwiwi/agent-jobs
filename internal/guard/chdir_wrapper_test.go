@@ -145,11 +145,28 @@ func TestChdirWrapperSudoLogin(t *testing.T) {
 	)
 }
 
-// Through the gate the verdict is the direct one (refused).
+// Through the gate the verdict is the direct one: the gate prefix is stripped (#208) and CMD is refused
+// for the protected path its wrapper directory reaches, not by checkSelf as a nested agent-jobs call.
 func TestChdirWrapperGateRun(t *testing.T) {
 	cfg := chdirSetup(t)
-	refused(t, cfg,
-		"agent-jobs gate run --head HEAD -- env -C brief cp a BRIEF.md",
-		"agent-jobs gate run --head HEAD -- env -C .. rm -f gitconfig",
-	)
+	for _, c := range []struct{ cmd, path string }{
+		{"env -C brief cp a BRIEF.md", filepath.Join(cfg.Dir, "brief", "BRIEF.md")},
+		{"env -C .. rm -f gitconfig", filepath.Join(filepath.Dir(cfg.Dir), "gitconfig")},
+		{"sudo -D up/.. cp a BRIEF.md", filepath.Join(cfg.Dir, "brief", "BRIEF.md")},
+	} {
+		direct := Check(c.cmd, cfg)
+		want := "`" + c.path + "` is agent-jobs state"
+		if !strings.Contains(direct, want) {
+			t.Fatalf("direct %q: %q, want the protected-path refusal %q", c.cmd, direct, want)
+		}
+		for _, prefix := range []string{"agent-jobs gate run --head HEAD -- ", "agent-jobs gate run --head HEAD --repo . -- "} {
+			gated := Check(prefix+c.cmd, cfg)
+			if !strings.Contains(gated, want) || strings.Contains(gated, "no nested jobs") {
+				t.Errorf("%q: %q, want the protected-path refusal %q", prefix+c.cmd, gated, want)
+			}
+			if gated != direct {
+				t.Errorf("%q: through the gate %q, direct %q", prefix+c.cmd, gated, direct)
+			}
+		}
+	}
 }

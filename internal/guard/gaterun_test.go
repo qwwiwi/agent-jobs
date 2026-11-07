@@ -169,6 +169,23 @@ func TestGateRunSameVerdictAsDirect(t *testing.T) {
 			t.Errorf("%q: direct blocked=%v, through the gate blocked=%v", cmd, direct, gated)
 		}
 	}
+	// A wrapper directory after the gate (`env -C D`, `sudo -D D`, #211) is a cd for CMD: refused through
+	// the gate with the very refusal of the direct command, `..` resolved as the kernel does (b/.. is brief/).
+	for _, cmd := range []string{
+		`env -C .. cat ../k/report.md`, `env --chdir=.. cat ../k/report.md`, `env -C .. rm -f ../../jobs.db`,
+		`env -C ../.. cat k/prompt.md`, `env -C b/.. cp a BRIEF.md`, `env -C brief cp a BRIEF.md`,
+		`sudo -D .. cat ../k/report.md`, `sudo --chdir=b/.. rm -f BRIEF.md`, `env -C sub/.. cp a brief/BRIEF.md`,
+	} {
+		direct := Check(cmd, cfg)
+		if direct == "" {
+			t.Fatalf("direct %q allowed: the case shows nothing", cmd)
+		}
+		for _, prefix := range []string{`agent-jobs gate run --head HEAD -- `, `agent-jobs gate run --head HEAD --repo . -- `} {
+			if gated := Check(prefix+cmd, cfg); gated != direct {
+				t.Errorf("%q: through the gate %q, direct %q", prefix+cmd, gated, direct)
+			}
+		}
+	}
 }
 
 // The refusal of another agent-jobs form names the allowed gate form, so the job can correct itself.
