@@ -238,7 +238,10 @@ func numeric(w string) bool {
 	if w == "" {
 		return false
 	}
-	if c := w[0]; c == '.' || c >= '0' && c <= '9' {
+	if w[0] == '.' && len(w) > 1 {
+		w = w[1:] // strtod reads `.5`, not `./l`
+	}
+	if c := w[0]; c >= '0' && c <= '9' {
 		return true
 	}
 	l := strings.ToLower(w)
