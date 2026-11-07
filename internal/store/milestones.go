@@ -233,15 +233,21 @@ func (s *Store) CreateMilestone(ms *Milestone, tasks []MilestoneTask, now time.T
 	return id, nil
 }
 
-func upsertTask(tx *sql.Tx, id int64, t MilestoneTask, now time.Time) error {
-	if _, err := tx.Exec(`INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at)
+// execer is the write side shared by a transaction and a single connection in BEGIN IMMEDIATE.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func upsertTask(tx execer, id int64, t MilestoneTask, now time.Time) error {
+	ctx := context.Background()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO milestone_tasks (milestone_id, key, title, depends_on, covers, skills, dropped, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(milestone_id, key) DO UPDATE SET title=excluded.title,
 		depends_on=excluded.depends_on, covers=excluded.covers, skills=excluded.skills, dropped=excluded.dropped,
 		updated_at=excluded.updated_at`,
 		id, t.Key, t.Title, JoinNames(t.DependsOn), JoinNames(t.Covers), JoinNames(t.Skills), t.Dropped, now.Unix(), now.Unix()); err != nil {
 		return fmt.Errorf("write task %s: %w", t.Key, err)
 	}
-	if _, err := tx.Exec(`UPDATE milestone_tasks SET depends_why = ? WHERE milestone_id = ? AND key = ?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE milestone_tasks SET depends_why = ? WHERE milestone_id = ? AND key = ?`,
 		dependsWhyJSON(t.DependsWhy), id, t.Key); err != nil {
 		return fmt.Errorf("write task %s depends_why: %w", t.Key, err)
 	}
@@ -459,40 +465,54 @@ func milestoneJobs(ctx context.Context, q queryer, id int64) ([]*Job, error) {
 // key), or an error that leaves everything unchanged.
 type MilestoneEdit func(ms *Milestone, tasks []MilestoneTask, jobs []*Job) (*Milestone, []MilestoneTask, error)
 
-// UpdateMilestone applies edit to milestone id in one transaction: the row's editable fields (title,
+// MilestoneGraphCheck judges an edit against the complete dependency graph. It runs inside the
+// edit's write transaction, after the edit computed the new tasks and before anything is written.
+type MilestoneGraphCheck func(g AdmissionGraph) error
+
+// UpdateMilestone applies edit to milestone id in one BEGIN IMMEDIATE transaction (so it cannot slip
+// between the reads and the writes of a concurrent job admission): the row's editable fields (title,
 // goal, branch, order, status, max_parallel, closed_at, close_note) and the tasks edit returns are
-// written, and updated_at moves (milestoneStamp: now is not used for it).
-func (s *Store) UpdateMilestone(ctx context.Context, id int64, now time.Time, edit MilestoneEdit) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	cur, err := getMilestone(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	tasks, err := milestoneTasks(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	jobs, err := milestoneJobs(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	next, upserts, err := edit(cur, tasks, jobs)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE milestones SET title=?, goal=?, branch=?, ord=?, status=?, max_parallel=?, closed_at=?,
-		close_note=?, updated_at=`+milestoneStamp+` WHERE id=?`, next.Title, next.Goal, next.Branch, next.Order, next.Status,
-		nullInt(next.MaxParallel), ts(next.ClosedAt), next.CloseNote, id); err != nil {
-		return fmt.Errorf("set milestone: %w", err)
-	}
-	for _, t := range upserts {
-		if err := upsertTask(tx, id, t, now); err != nil {
+// written, and updated_at moves (milestoneStamp: now is not used for it). The checks see the graph of
+// all active jobs and their milestones, the edited milestone with its tasks as stored before the edit.
+func (s *Store) UpdateMilestone(ctx context.Context, id int64, now time.Time, edit MilestoneEdit, checks ...MilestoneGraphCheck) error {
+	return s.immediate(func(q querier) error {
+		cur, err := getMilestone(ctx, q, id)
+		if err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		tasks, err := milestoneTasks(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		jobs, err := milestoneJobs(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		next, upserts, err := edit(cur, tasks, jobs)
+		if err != nil {
+			return err
+		}
+		if len(checks) > 0 {
+			g, err := loadAdmissionGraph(ctx, q, id)
+			if err != nil {
+				return err
+			}
+			for _, check := range checks {
+				if err := check(g); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE milestones SET title=?, goal=?, branch=?, ord=?, status=?, max_parallel=?, closed_at=?,
+		close_note=?, updated_at=`+milestoneStamp+` WHERE id=?`, next.Title, next.Goal, next.Branch, next.Order, next.Status,
+			nullInt(next.MaxParallel), ts(next.ClosedAt), next.CloseNote, id); err != nil {
+			return fmt.Errorf("set milestone: %w", err)
+		}
+		for _, t := range upserts {
+			if err := upsertTask(q, id, t, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

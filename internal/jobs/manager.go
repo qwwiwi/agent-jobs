@@ -173,6 +173,7 @@ type StartRequest struct {
 	Brief          string
 	RepoPath       string
 	Base           string // ref in RepoPath; default HEAD
+	Branch         string // optional result branch; default job/<id>, published only with commits
 	Model          string // explicit model; else picked by kind × complexity
 	Complexity     string // light|normal|hard; model or complexity is required (no default, no classifier)
 	MaxTurns       int    // 0 = default
@@ -210,6 +211,11 @@ type StartRequest struct {
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
+	// Paths are repository-relative paths/globs for overlap admission (fix/general only).
+	Paths []string
+	// OnOverlap is warn (default), serialize or refuse. Parent explicitly stacks on another job.
+	OnOverlap string
+	Parent    string
 	// plannedSkills is set when Skills are the task's planned ones (milestoneStart): a refusal names them.
 	plannedSkills bool
 	// plannedSources is set when Sources are the task's planned ones (milestoneStart).
@@ -424,10 +430,14 @@ const idRedraws = 64
 // cap, the codex daily cap, else plain. It reports whether the row was inserted; a cap that
 // refuses returns its error, so a false ok always comes with one.
 func (m *Manager) insertQueued(j *store.Job) (bool, error) {
+	var checks []store.JobAdmission
+	if j.RepoPath != "" && coderJob(j.Kind) && (len(j.Paths) > 0 || j.Parent != "") {
+		checks = append(checks, m.overlapAdmission(j))
+	}
 	if IsOpenRouterJob(j) {
 		capUSD := m.Config().Providers.OpenRouter.DailyCap()
 		since := j.CreatedAt.Add(-OpenRouterCapWindow)
-		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD)
+		ok, err := m.Store.InsertBudgetCapped(j, since, capUSD, checks...)
 		if err != nil {
 			return false, err
 		}
@@ -441,7 +451,7 @@ func (m *Manager) insertQueued(j *store.Job) (bool, error) {
 		return true, nil
 	}
 	if limit := m.Config().CodexDailyCap(); j.Runner == store.RunnerCodex && limit > 0 {
-		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit)
+		ok, err := m.Store.InsertCapped(j, j.CreatedAt.Add(-CodexCapWindow), limit, checks...)
 		if err != nil {
 			return false, err
 		}
@@ -452,7 +462,7 @@ func (m *Manager) insertQueued(j *store.Job) (bool, error) {
 		}
 		return true, nil
 	}
-	if err := m.Store.Insert(j); err != nil {
+	if err := m.Store.Insert(j, checks...); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -490,6 +500,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		return nil, fmt.Errorf("kind %q must be one of %s", r.Kind, strings.Join(Kinds, "|"))
 	}
 	if err := checkGateRequest(r); err != nil {
+		return nil, err
+	}
+	if err := validateOverlapRequest(&r); err != nil {
 		return nil, err
 	}
 	if err := m.milestoneStart(&r); err != nil {
@@ -578,6 +591,14 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	} else if r.Base != "" {
 		return nil, errors.New("base given without repo")
 	}
+	if r.Branch != "" {
+		if repo == "" {
+			return nil, errors.New("branch given without repo")
+		}
+		if err := validateResultBranch(func(args ...string) (string, error) { return gitHistory(repo, args...) }, r.Branch); err != nil {
+			return nil, err
+		}
+	}
 	if openRouter && repo != "" {
 		// Checked against both the path given and the main worktree it belongs to.
 		for _, p := range []string{top, repo} {
@@ -628,8 +649,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MaxTurns: turns, MaxBudgetUSD: budget, TimeoutMinutes: timeout, CreatedAt: now,
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
-		BaseBranch: branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
+		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
+		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent,
 	}
 	return j, nil
 }
@@ -767,6 +789,15 @@ func (m *Manager) launchQueued() error {
 		}
 		if running >= limit {
 			return nil
+		}
+		if wait, cancel, err := m.jobDependencies(j, true); err != nil {
+			m.Log.Printf("job %s: dependency check: %v", j.ID, err)
+			continue
+		} else if cancel != "" {
+			m.cancelQueued(j, "cancelled before start: "+cancel)
+			continue
+		} else if wait != "" {
+			continue
 		}
 		if j.MilestoneID != 0 {
 			// A job on a task is checked again: its milestone may have changed since job_start. It waits for

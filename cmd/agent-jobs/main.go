@@ -33,7 +33,7 @@ const usage = `usage: agent-jobs <command> [flags]
   init       --agent A                     create state dir, copy owner-rules template,
                                            write orchestrator.md (main-session duties)
   start      --agent A --title T --kind K [--brief TEXT | --brief-file F | stdin]
-             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF]]
+             (--model M | --complexity light|normal|hard) [--repo PATH [--base REF] [--branch NAME]]
              [--max-turns N] [--max-budget-usd B] [--timeout-minutes M]
              [--runner claude|codex] [--reasoning-effort low|medium|high|xhigh|max] [--owner-waits]
              [--skills a,+b,-c] [--size small|large]
@@ -551,6 +551,7 @@ func cmdStart(args []string) error {
 	briefFile := fs.String("brief-file", "", "read brief from file")
 	fs.StringVar(&r.RepoPath, "repo", "", "git repository for the worktree (optional)")
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
+	fs.StringVar(&r.Branch, "branch", "", "result branch (default job/<id>); created only, an existing branch is never moved (job/<id> is used instead)")
 	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
 	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d for fix and general, %d for other kinds; ceiling %d",
@@ -566,12 +567,17 @@ func cmdStart(args []string) error {
 		"large needs covers, which only job_start takes")
 	r.SizeRule = true
 	skillEdits := fs.String("skills", "", "edits to the default skills, comma separated: name or +name adds, -name removes (e.g. a,+b,-c)")
+	var paths multi
+	fs.Var(&paths, "paths", "fix/general: expected repo-relative path or glob (repeatable; quote globs; trailing / includes descendants)")
+	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
+	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
 	r.Skills = skills.ParseEdits(*skillEdits)
+	r.Paths = paths
 	if len(sources) > 0 {
 		r.Sources = sources
 	}
@@ -603,6 +609,13 @@ func cmdStart(args []string) error {
 	fmt.Println(j.ID)
 	if w := m.Cfg.BriefSizeWarning(r.Brief); w != "" {
 		fmt.Fprintln(os.Stderr, "size_warning:", w)
+	}
+	for _, overlap := range j.Overlap {
+		fmt.Fprintf(os.Stderr, "overlap: %s paths %s intersect %s (%s)\n", overlap.ID,
+			strings.Join(overlap.Paths, ", "), strings.Join(overlap.OtherPaths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Fprintln(os.Stderr, n)
 	}
 	if n := m.SameRepoNote(j); n != "" {
 		fmt.Fprintln(os.Stderr, "note:", n)
@@ -682,6 +695,24 @@ func cmdStatus(args []string) error {
 	fmt.Printf("limits:    %s\n", jobs.LimitsText(j))
 	fmt.Printf("usage:     %d turns · %s · %ds\n", j.Turns, costWord(j.CostUSD, j.CostIsUnknown()), j.DurationSec)
 	fmt.Printf("repo:      %s\nbase:      %s\npid/pgid:  %d/%d\n", j.RepoPath, j.BaseCommit, j.PID, j.PGID)
+	if j.RequestedBranch != "" {
+		fmt.Printf("requested branch: %s\n", j.RequestedBranch)
+	}
+	if j.Branch != "" {
+		fmt.Printf("branch:    %s\n", j.Branch)
+	}
+	if j.BranchNote != "" {
+		fmt.Printf("branch note: %s\n", j.BranchNote)
+	}
+	if j.Parent != "" {
+		fmt.Printf("parent:    %s (result %s)\n", j.Parent, j.ParentBase)
+	}
+	if len(j.Paths) > 0 {
+		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
+	}
+	if n := m.JobWaiting(context.Background(), j); n != "" {
+		fmt.Printf("waiting:   %s\n", n)
+	}
 	fmt.Printf("created:   %s\nstarted:   %s\nfinished:  %s\nnotified:  %s\ncleaned:   %s\n",
 		fmtTime(&j.CreatedAt), fmtTime(j.StartedAt), fmtTime(j.FinishedAt), fmtTime(j.NotifiedAt), fmtTime(j.CleanedAt))
 	fmt.Printf("session:   %s (attempt %d, %s)\n", j.SessionID, j.Attempt, j.RunMode)
@@ -918,11 +949,11 @@ func cmdList(args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tTITLE")
+	fmt.Fprintln(w, "ID\tSTATUS\tKIND\tMODEL\tTURNS\tCOST\tCREATED\tCONTAIN\tBRANCH\tTITLE")
 	for _, j := range list {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Status, j.Kind, j.Model, j.Turns,
 			jobs.CostText(j.CostUSD, j.CostIsUnknown()),
-			fmtTime(&j.CreatedAt), containShort(j), j.Title)
+			fmtTime(&j.CreatedAt), containShort(j), j.Branch, j.Title)
 	}
 	return w.Flush()
 }

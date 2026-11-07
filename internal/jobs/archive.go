@@ -561,37 +561,41 @@ func (m *Manager) expireArchive(dryRun bool) (out []PruneEntry, off string, err 
 
 // jobMeta is meta.json of an archived job: the job row (without the launch token).
 type jobMeta struct {
-	ID             string     `json:"id"`
-	Agent          string     `json:"agent"`
-	Title          string     `json:"title"`
-	Kind           string     `json:"kind"`
-	Status         string     `json:"status"`
-	Model          string     `json:"model"`
-	Complexity     string     `json:"complexity,omitempty"`
-	Runner         string     `json:"runner"`
-	Billing        string     `json:"billing"`
-	RepoPath       string     `json:"repo_path,omitempty"`
-	BaseCommit     string     `json:"base_commit,omitempty"`
-	MaxTurns       int        `json:"max_turns"`
-	MaxBudgetUSD   float64    `json:"max_budget_usd"`
-	TimeoutMinutes int        `json:"timeout_minutes"`
-	Turns          int        `json:"turns"`
-	CostUSD        float64    `json:"cost_usd"`
-	DurationSec    int        `json:"duration_sec"`
-	CreatedAt      time.Time  `json:"created_at"`
-	StartedAt      *time.Time `json:"started_at,omitempty"`
-	FinishedAt     *time.Time `json:"finished_at,omitempty"`
-	CleanedAt      *time.Time `json:"cleaned_at,omitempty"`
-	ResumedFrom    string     `json:"resumed_from,omitempty"`
-	ScheduleID     string     `json:"schedule_id,omitempty"`
-	Error          string     `json:"error,omitempty"`
-	Attempt        int        `json:"attempt"`
+	ID              string     `json:"id"`
+	Agent           string     `json:"agent"`
+	Title           string     `json:"title"`
+	Kind            string     `json:"kind"`
+	Status          string     `json:"status"`
+	Model           string     `json:"model"`
+	Complexity      string     `json:"complexity,omitempty"`
+	Runner          string     `json:"runner"`
+	Billing         string     `json:"billing"`
+	RepoPath        string     `json:"repo_path,omitempty"`
+	BaseCommit      string     `json:"base_commit,omitempty"`
+	RequestedBranch string     `json:"requested_branch,omitempty"`
+	Branch          string     `json:"branch,omitempty"`
+	BranchNote      string     `json:"branch_note,omitempty"`
+	MaxTurns        int        `json:"max_turns"`
+	MaxBudgetUSD    float64    `json:"max_budget_usd"`
+	TimeoutMinutes  int        `json:"timeout_minutes"`
+	Turns           int        `json:"turns"`
+	CostUSD         float64    `json:"cost_usd"`
+	DurationSec     int        `json:"duration_sec"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	CleanedAt       *time.Time `json:"cleaned_at,omitempty"`
+	ResumedFrom     string     `json:"resumed_from,omitempty"`
+	ScheduleID      string     `json:"schedule_id,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	Attempt         int        `json:"attempt"`
 }
 
 func metaOf(j *store.Job) jobMeta {
 	return jobMeta{
 		ID: j.ID, Agent: j.Agent, Title: j.Title, Kind: j.Kind, Status: j.Status, Model: j.Model,
 		Complexity: j.Complexity, Runner: j.Runner, Billing: j.Billing, RepoPath: j.RepoPath, BaseCommit: j.BaseCommit,
+		RequestedBranch: j.RequestedBranch, Branch: j.Branch, BranchNote: j.BranchNote,
 		MaxTurns: j.MaxTurns, MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns,
 		CostUSD: j.CostUSD, DurationSec: j.DurationSec, CreatedAt: j.CreatedAt, StartedAt: j.StartedAt,
 		FinishedAt: j.FinishedAt, CleanedAt: j.CleanedAt, ResumedFrom: j.ResumedFrom, ScheduleID: j.ScheduleID,

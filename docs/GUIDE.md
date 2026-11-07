@@ -92,13 +92,56 @@ One main session, many workers. The session writes a brief for a stranger (a job
    [jobs:job-done] job 261015-124136-70d3 review auth module succeeded · 3 turns · $0.25 · 0m · model sonnet · effort high
    ```
    The line is printable-only (control characters dropped, title capped), so a job title cannot type keystrokes into the session. An undelivered line stays pending and is retried every tick.
-   **Merge check.** A repository job records `base_branch` when it is queued: the ref it was given when that names a local or remote-tracking branch, else (default `HEAD`) the branch checked out in the repository, else nothing (a tag, a commit, a detached HEAD). When a repository job with commits beyond `base_commit` is notified, the daemon runs `git merge-tree --write-tree --name-only --no-messages <branch tip> <job head>` in the repository (objects only, no ref moves; 10 s cap) and appends one of `merges cleanly onto <branch> at <sha>`, `WARNING: conflicts with <branch> at <sha> in <files>` (at most five files, plus the branch's commits since `base_commit`, at most five) or `merge onto <branch> not checked: <reason>` (no branch, branch gone, git older than 2.38, timeout). The check is stored with the job (`merge_note`, also in `job_result`). `job_start` names the other queued or running jobs on the same repository in `same_repo_jobs` (`agent-jobs start` prints it as a `note:` on stderr); it never refuses the job.
+   **Merge check.** A repository job records `base_branch` when it is queued: the ref it was given when that names a local or remote-tracking branch, else (default `HEAD`) the branch checked out in the repository, else nothing (a tag, a commit, a detached HEAD). When a repository job with commits beyond `base_commit` is notified, the daemon runs `git merge-tree --write-tree --name-only --no-messages <branch tip> <job head>` in the repository (objects only, no ref moves; 10 s cap) and appends one of `merges cleanly onto <branch> at <sha>`, `WARNING: conflicts with <branch> at <sha> in <files>` (at most five files, plus the branch's commits since `base_commit`, at most five) or `merge onto <branch> not checked: <reason>` (no branch, branch gone, git older than 2.38, timeout). The check is stored with the job (`merge_note`, also in `job_result`). `job_start` names the other queued or running jobs on the same repository in `same_repo_jobs` (`agent-jobs start` prints it as a `note:` on stderr); without declared paths this remains advisory.
    **Fast empty coder jobs.** A coder job (kind `fix` or `general`) that ends `succeeded` or `cancelled` within three minutes with a repository and no commit over its `base_commit` ends its job-done line with `· suspicious: no commits in <N>m` (#132): a run that fast with zero commits almost always hit a brief or sandbox mismatch, not finished work. The zero-commits finding is the merge check's own, so it is never added on a guess (no worktree, no finding) and never for review or research jobs or jobs without a repository.
 6. **Result.** The session reads the report when it is ready: «Not done / uncertain» first.
 7. **Review and push.** The session checks the diff against `base_commit` itself. A report is a claim, not a result. Only then does it push or publish.
 8. **Cleanup.** 30 minutes after the line was delivered, the worktree is removed and the work is kept as patches (below).
 
 Only `queued` and `running` rows can change status; `succeeded` and `cancelled` are final. A `stopped`, `timeout` or `failed` job can be resumed (below); a `stopped` job can also be cancelled.
+
+### Overlap-aware starts
+
+For parallel `fix` / `general` jobs on one repository, give `job_start` a `paths`
+array of expected repository-relative paths or globs. Matching uses Go `path.Match`
+syntax (`*`, `?`, character classes), plus a whole `**` component for zero or more
+path components. Use `src/` or `src/**` for a directory and its descendants;
+`src/file.go` names one file. Paths are compared without filesystem expansion,
+so declarations cover new files too. At most 64 declarations, 256 bytes each;
+absolute paths, `.` / `..` components, control characters and backslashes are refused.
+
+- `on_overlap: "warn"` (default) queues the job and returns `overlap`, containing
+  each other queued/running coder job's `id`, matching `paths` of the new job and
+  `other_paths` of that job.
+- `on_overlap: "serialize"` keeps it queued until those overlapping jobs finish,
+  using persisted `wait_for` dependencies. A failed or cancelled blocker releases
+  the wait; a stopped blocker still waits because it may resume. Unrelated queued
+  jobs can start in free slots. The job-done line mentions the serialized wait.
+- `on_overlap: "refuse"` rejects the start with the conflicting job and declarations.
+
+Missing paths on either side keep the existing `same_repo_jobs` advisory only.
+Admission is atomic with insertion and the existing daily caps, so simultaneous
+starts see each other. Scope checks are declarations, not enforcement of actual edits.
+
+For an explicit stack, set `parent: "<job id>"`. It must be a coder job of this
+agent on the same repository. The child waits for its parent's success and uses
+that result commit as `base_commit`, read from the verified parent worktree or
+its saved `refs/agent-jobs/jobs/<id>` ref after cleanup. A failed, timed-out or
+cancelled parent refuses a new stack; an already queued child is cancelled.
+A missing result also refuses the stack. Do not combine `parent` with `base`.
+The parent edge handles overlap with that parent; other overlaps still follow
+`on_overlap`. `job_status` and `job_result` show `parent` and the resolved
+`parent_base`; `job_status.waiting` explains pending dependencies. A serialized
+job without `parent` keeps its original base; it does not inherit another job's changes.
+
+CLI equivalents: repeat `--paths` once per declaration, quote globs, and use
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`:
+
+```sh
+agent-jobs start --agent A --kind fix --title "Update parser" --brief-file brief.md \
+  --repo /path/to/repo --model sonnet --paths 'internal/parser/**' \
+  --paths 'docs/parser.md' --on-overlap serialize
+```
 
 ### Change course: amend, stop and resume
 
@@ -244,6 +287,43 @@ Owner requirement (2026-11-03): frontend work is checked for real, in a browser.
 
   For each device x scheme x page it scrolls the window and every vertical scroll container whose content exceeds its box by more than a viewport (an app shell's `overflow-y: auto` area; `body` too when `html` has a non-visible overflow so `body` scrolls on its own), largest first, to the end (lazy content loads; a scroll that stops early, a scroller cut off or left out by the shared budget of 400 steps fails), observes layout shifts for at least `--dwell` ms (default 3000), and fails on: a 4xx/5xx or failed response, horizontal page scroll (`documentElement.scrollWidth > clientWidth`), a visible element sticking out of the viewport outside a scroll container (one in its containing-block chain whose own box stays inside the viewport), a broken image, CLS ≥ 0.1, a word split inside a word (the client rects of a word, between line-break opportunities, fall on more than one line; a word is skipped only when `hyphens: auto` provably hyphenated it: its breaks move with hyphenation off, no `word-break: break-all`, no fragment under 2 letters, 3 under `overflow-wrap: anywhere`; scripts written without spaces are skipped). The 3-letter minimum under `overflow-wrap: anywhere` is deliberate policy: a 2-letter fragment fails even where the dictionary hyphenated correctly, because short word fragments are not allowed on phones. `--schemes auto` (default) adds the dark run when the page declares a dark scheme or its colours change under `prefers-color-scheme: dark`; `--schemes light,dark` forces both (a site whose dark mode is only a toggle button needs its own run). It prints one `PASS` / `FAIL` line per run, writes full-page screenshots and `results.json` to `--out`, and exits 0 (all pass), 1 (a failure) or 2 (could not run: the last line starts `BROWSER CHECK NOT RUN:`).
 - **Playwright** is not a dependency of agent-jobs: the script resolves it from the caller's environment (node_modules above the current directory, `NODE_PATH`, `npm root -g`; with `--playwright <path>` only that path; with `--trusted` never the current directory) and uses Chromium (`npx playwright install chromium`). `scripts/check.sh` runs only static tests of it (`scripts/ui-check.test.mjs` under `node --test`: the pure helpers and the in-page probe against a fake DOM), no browser.
+
+## Job result branches
+
+When a repository job ends with commits beyond `base_commit`, the daemon normally publishes
+`job/<job-id>` for attempt 1 or `job/<job-id>-<attempt>` for a resumed
+attempt in that repository. This happens for both runners, after the Codex
+wrapper commits changes from `progress/COMMIT_MSG`. A job without commits, a review,
+a research job or a gate job creates no result branch.
+
+Set `branch` in `job_start`, or use `agent-jobs start --branch feature/result`, to
+request another result branch. `base` / `--base` still selects the starting commit;
+`branch` selects where the result goes. Result branches are create-only: the daemon
+never moves an existing ref. It publishes the job head with an atomic
+create-if-absent write (`git update-ref <ref> <head> ""`), so of two jobs asking for
+the same new name exactly one gets it. If the requested name already exists (or
+cannot be created), nothing is touched and the result goes to the generated attempt
+name with an explanation; fast-forward the existing branch yourself with `git merge --ff-only <published-branch>` if you want
+it there. One ref is written per attempt.
+Nothing is pushed.
+
+Invalid Git branch names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master`,
+`release*`, `job` and `job/...` are refused as requested names at start. Because an
+existing branch can never be moved, no knowledge of the repository's default branch is needed. Publication does not fetch
+from the network.
+
+`job_result`, `job_list` and `job_status` expose `branch`, `requested_branch` and
+`branch_note`; CLI status/list and HTTP job views expose the result too. `branch`
+is empty until commits have been published. The job-done line reports the branch
+actually published and explains when a requested name was taken. Use that recorded
+branch for review, follow-up jobs and PRs. The orchestrator must not move refs by
+hand with `git branch -f` or `git update-ref`.
+
+Each attempt has its own generated branch: `job/<id>` for the first attempt,
+`job/<id>-<attempt>` (for example `job/<id>-2`) for a resumed one. An earlier
+attempt's branch is never moved, so its result stays reachable; `branch` shows the
+newest attempt's branch and each archived attempt keeps its own. The names `job` and
+`job/*` are reserved: `job_start` refuses them as a requested `branch`.
 
 ## Cleanup and patches
 

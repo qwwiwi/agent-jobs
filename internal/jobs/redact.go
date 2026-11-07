@@ -546,10 +546,14 @@ func replaceFile(dir, name string, write func(io.Writer) error) (err error) {
 var renameFile = os.Rename
 
 // settled runs once a job reached a terminal or stopped status: its report is redacted in place and
-// its stats row written. A failed redaction stays pending (retryRedactions).
+// its result branch published and its stats row written. A failed redaction stays pending
+// (retryRedactions); publication is recovered before notification if recording it failed.
 func (m *Manager) settled(id string) {
 	m.redactAndClear(id)
 	if j, err := m.Store.Get(id); err == nil {
+		if err := m.publishResultBranch(j); err != nil {
+			m.Log.Printf("job %s: record result branch: %v", id, err)
+		}
 		m.spawnedGroupAlive(j) // a group that ended with the job is forgotten right away
 		m.acceptanceGroupAlive(j)
 		if len(j.Sources) > 0 {

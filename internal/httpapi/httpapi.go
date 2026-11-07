@@ -593,6 +593,9 @@ type JobView struct {
 	DurationSec     int     `json:"duration_sec"`
 	Repo            string  `json:"repo,omitempty"`
 	BaseCommit      string  `json:"base_commit,omitempty"`
+	RequestedBranch string  `json:"requested_branch,omitempty"`
+	Branch          string  `json:"branch,omitempty"`
+	BranchNote      string  `json:"branch_note,omitempty"`
 	CreatedAt       string  `json:"created_at"`
 	StartedAt       string  `json:"started_at,omitempty"`
 	FinishedAt      string  `json:"finished_at,omitempty"`
@@ -635,6 +638,7 @@ func ViewOf(j *store.Job) JobView {
 		MaxBudgetUSD: j.MaxBudgetUSD, TimeoutMinutes: j.TimeoutMinutes, Turns: j.Turns, CostUSD: j.CostUSD,
 		CostUnknown: j.CostIsUnknown(), DurationSec: j.DurationSec, Repo: repoName(j.RepoPath),
 		BaseCommit: capField(j.BaseCommit), CreatedAt: ts(&j.CreatedAt), StartedAt: ts(j.StartedAt),
+		RequestedBranch: capField(j.RequestedBranch), Branch: capField(j.Branch), BranchNote: capField(j.BranchNote),
 		FinishedAt: ts(j.FinishedAt), NotifiedAt: ts(j.NotifiedAt), CleanedAt: ts(j.CleanedAt),
 		OwnerWaits: j.OwnerWaits, ResumedFrom: capField(j.ResumedFrom), ScheduleID: capField(j.ScheduleID),
 		Attempt: j.Attempt, Containment: capField(jobs.Containment(j)),

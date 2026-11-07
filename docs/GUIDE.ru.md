@@ -98,6 +98,49 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 Менять статус могут только строки `queued` и `running`; `succeeded` и `cancelled` окончательны. Джобу в статусе `stopped`, `timeout` или `failed` можно продолжить (ниже); `stopped` можно и отменить.
 
+### Overlap-aware starts
+
+For parallel `fix` / `general` jobs on one repository, give `job_start` a `paths`
+array of expected repository-relative paths or globs. Matching uses Go `path.Match`
+syntax (`*`, `?`, character classes), plus a whole `**` component for zero or more
+path components. Use `src/` or `src/**` for a directory and its descendants;
+`src/file.go` names one file. Paths are compared without filesystem expansion,
+so declarations cover new files too. At most 64 declarations, 256 bytes each;
+absolute paths, `.` / `..` components, control characters and backslashes are refused.
+
+- `on_overlap: "warn"` (default) queues the job and returns `overlap`, containing
+  each other queued/running coder job's `id`, matching `paths` of the new job and
+  `other_paths` of that job.
+- `on_overlap: "serialize"` keeps it queued until those overlapping jobs finish,
+  using persisted `wait_for` dependencies. A failed or cancelled blocker releases
+  the wait; a stopped blocker still waits because it may resume. Unrelated queued
+  jobs can start in free slots. The job-done line mentions the serialized wait.
+- `on_overlap: "refuse"` rejects the start with the conflicting job and declarations.
+
+Missing paths on either side keep the existing `same_repo_jobs` advisory only.
+Admission is atomic with insertion and the existing daily caps, so simultaneous
+starts see each other. Scope checks are declarations, not enforcement of actual edits.
+
+For an explicit stack, set `parent: "<job id>"`. It must be a coder job of this
+agent on the same repository. The child waits for its parent's success and uses
+that result commit as `base_commit`, read from the verified parent worktree or
+its saved `refs/agent-jobs/jobs/<id>` ref after cleanup. A failed, timed-out or
+cancelled parent refuses a new stack; an already queued child is cancelled.
+A missing result also refuses the stack. Do not combine `parent` with `base`.
+The parent edge handles overlap with that parent; other overlaps still follow
+`on_overlap`. `job_status` and `job_result` show `parent` and the resolved
+`parent_base`; `job_status.waiting` explains pending dependencies. A serialized
+job without `parent` keeps its original base; it does not inherit another job's changes.
+
+CLI equivalents: repeat `--paths` once per declaration, quote globs, and use
+`--on-overlap warn|serialize|refuse` and optional `--parent <job id>`:
+
+```sh
+agent-jobs start --agent A --kind fix --title "Update parser" --brief-file brief.md \
+  --repo /path/to/repo --model sonnet --paths 'internal/parser/**' \
+  --paths 'docs/parser.md' --on-overlap serialize
+```
+
 ### Сменить курс: дополнить, остановить, продолжить
 
 Каждая джоба работает в сессии claude, id которой назначается до запуска (`claude -p --session-id <uuid>`), и сессия сохраняется на диске, поэтому джобу можно поправить, не теряя того, что она уже знает и сделала:
@@ -183,6 +226,33 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 **Скрытие секретов.** Когда джоба закончилась, похожие на секреты значения в её `report.md` заменяются на месте на `[redacted:<kind>]`: токены Anthropic, OpenAI, GitHub, Slack, AWS, Google и ботов Telegram, JWT, блоки приватных ключей PEM, `Bearer <token>`, а также `key=value` / `"key": "value"`, где ключ содержит `token`, `secret`, `password`, `passwd` или `api_key`, а значение — 16+ символов. Оригинал не сохраняется, если только `keep_raw_reports: true` не оставляет его как `report.raw.md` (0600). Значения заменяются целиком, какой бы длины они ни были. Читаются и проверяются только первые 4 МиБ отчёта, остальное заменяется пометкой «unscanned». Если перезапись не удалась (или демон упал до неё), джоба остаётся `redaction_pending`, и каждый тик пробует снова; `job_result`, `agent-jobs result` и HTTP API всё равно скрывают секреты в отчёте при чтении. Строка job-done, лог демона, строка статистики и выдержки прошлой попытки в брифе продолжения скрываются так же. SHA коммитов, UUID и короткий base64 не трогаются. Это страховка, а не гарантия: `stream.jsonl` и `stderr.log` хранятся как есть (и так же уходят в архив), поэтому папка джобы и архив должны оставаться закрытыми.
 
 **Размер брифа.** `job_start` отклоняет бриф больше `max_brief_bytes` (по умолчанию 32 КБ) и возвращает `size_warning`, если бриф называет больше `brief_warn_files` файлов (по умолчанию 40) или в нём больше `brief_warn_headings` заголовков `## ` (по умолчанию 8): возможно, это не одна джоба.
+
+## Ветки результатов джоб
+
+Когда джоба репозитория заканчивается с коммитами поверх `base_commit`, демон
+обычно публикует в этом репозитории `job/<job-id>` для первой попытки или
+`job/<job-id>-<attempt>` для продолженной попытки. Это относится к Claude и Codex
+(после коммита обёртки из `progress/COMMIT_MSG`). Джобы без коммитов, review,
+research и gate-джобы не создают ветку результата.
+
+Параметр `branch` в `job_start` или `start --branch feature/result` в CLI задаёт
+желаемую ветку; `base` по-прежнему выбирает начальный коммит. Ветки результата
+только создаются: демон никогда не перемещает существующий ref. Ветка создаётся
+атомарно, только если её ещё нет (`git update-ref <ref> <head> ""`), поэтому из
+двух джоб с одним новым именем его получит ровно одна. Если запрошенное имя уже
+занято или его нельзя создать, результат публикуется под сгенерированным именем
+попытки с объяснением; при необходимости обновите существующую ветку сами командой
+`git merge --ff-only <published-branch>`. На попытку записывается один ref.
+Push не выполняется.
+
+Недопустимые имена Git (начинающиеся с `-`, `refs/`, содержащие `@{`, `..`),
+`main`, `master`, `release*`, `job` и `job/...` отклоняются при запросе. Так как
+существующая ветка никогда не перемещается, определять ветку по умолчанию не нужно.
+`job_result`, `job_list`, `job_status`, CLI status/list и HTTP показывают `branch`,
+`requested_branch` и `branch_note` (CLI list показывает ветку результата). Строка
+job-done сообщает фактически опубликованную ветку и объясняет, если запрошенное имя
+занято. Используйте эту ветку для проверки, последующих джоб и PR; оркестратор не
+должен перемещать refs вручную через `git branch -f` или `git update-ref`.
 
 ## Чистка и патчи
 
