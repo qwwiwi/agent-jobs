@@ -124,7 +124,7 @@ func TestReportContractAsksForForks(t *testing.T) {
 	}
 }
 
-func TestCapText(t *testing.T) {
+func TestExportedCapText(t *testing.T) {
 	if got, cut := CapText("short", 10); got != "short" || cut {
 		t.Fatalf("fits: %q %v", got, cut)
 	}
