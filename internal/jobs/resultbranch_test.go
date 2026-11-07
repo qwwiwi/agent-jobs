@@ -121,7 +121,7 @@ func TestResultBranchSameNameTwoJobs(t *testing.T) {
 func TestResultBranchStartRejectsInvalidAndProtected(t *testing.T) {
 	m := newManager(t)
 	repo := newRepo(t)
-	for _, name := range []string{"main", "Master", "release-1", "bad name", "@{-1}", "-flag", "a..b", "refs/heads/x"} {
+	for _, name := range []string{"job", "Job", "job/x", "main", "Master", "release-1", "bad name", "@{-1}", "-flag", "a..b", "refs/heads/x"} {
 		if _, err := m.Enqueue(StartRequest{Title: "test", Kind: "fix", Brief: "test", Model: "sonnet", RepoPath: repo, Branch: name}); err == nil {
 			t.Errorf("accepted %q", name)
 		}

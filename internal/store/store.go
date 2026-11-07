@@ -248,6 +248,9 @@ type Attempt struct {
 	SessionID       string
 	StartedAt       *time.Time
 	FinishedAt      *time.Time
+	// Branch and BranchNote: the result branch this attempt published and the outcome note, as on Job.
+	Branch     string
+	BranchNote string
 }
 
 // Runners and billing modes.
@@ -656,6 +659,8 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN requested_branch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN branch_note TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN branch TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE attempts ADD COLUMN branch_note TEXT NOT NULL DEFAULT ''`,
 }
 
 const jobStatsEffortAlter = `ALTER TABLE job_stats ADD COLUMN effort TEXT NOT NULL DEFAULT ''`
@@ -1265,10 +1270,11 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 	const resumable = `status IN ('stopped','timeout','failed')`
 	if _, err := tx.Exec(`INSERT INTO attempts (job_id, n, mode, status, model, max_turns, max_budget_usd,
 		timeout_minutes, turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at,
-		finished_at, wrapper_result)
+		finished_at, wrapper_result, branch, branch_note)
 		SELECT id, attempt, CASE run_mode WHEN '' THEN 'new' ELSE run_mode END, status, model, max_turns,
 		max_budget_usd, timeout_minutes, turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, pending_context, session_id,
-		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
+		started_at, finished_at, CASE WHEN wrapper_token=launch_token AND launch_token!='' THEN wrapper_result ELSE '' END,
+		branch, branch_note FROM jobs WHERE id=? AND attempt > 0 AND started_at IS NOT NULL AND `+resumable, id); err != nil {
 		return fmt.Errorf("archive attempt: %w", err)
 	}
 	q := `UPDATE jobs SET status='queued', pid=0, pgid=0, pgid_spawned=0, launch_token='', started_at=NULL, finished_at=NULL, notified_at=NULL,
@@ -1291,8 +1297,8 @@ func (s *Store) Requeue(id string, l ResumeLimits, context, brief string) error 
 // Attempts returns the archived attempts of a job, oldest first (the current one is the job row).
 func (s *Store) Attempts(id string) ([]Attempt, error) {
 	rows, err := s.db.Query(`SELECT job_id, n, mode, status, model, max_turns, max_budget_usd, timeout_minutes,
-		turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at, finished_at
-		FROM attempts WHERE job_id=? ORDER BY n`, id)
+		turns, cost_usd, cost_unknown, cost_estimate_usd, duration_sec, error, context, session_id, started_at, finished_at,
+		branch, branch_note FROM attempts WHERE job_id=? ORDER BY n`, id)
 	if err != nil {
 		return nil, fmt.Errorf("query attempts: %w", err)
 	}
@@ -1304,7 +1310,7 @@ func (s *Store) Attempts(id string) ([]Attempt, error) {
 		var estimate sql.NullFloat64
 		if err := rows.Scan(&a.JobID, &a.N, &a.Mode, &a.Status, &a.Model, &a.MaxTurns, &a.MaxBudgetUSD,
 			&a.TimeoutMinutes, &a.Turns, &a.CostUSD, &a.CostUnknown, &estimate, &a.DurationSec, &a.Error, &a.Context, &a.SessionID,
-			&started, &finished); err != nil {
+			&started, &finished, &a.Branch, &a.BranchNote); err != nil {
 			return nil, fmt.Errorf("scan attempt: %w", err)
 		}
 		a.StartedAt, a.FinishedAt, a.CostEstimateUSD = convTS(started), convTS(finished), nullFloat(estimate)

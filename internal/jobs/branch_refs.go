@@ -17,9 +17,37 @@ type branchGit func(args ...string) (string, error)
 var errBranchExists = errors.New("branch already exists")
 
 // validateResultBranch checks a caller-supplied result name statically: a valid branch name written
-// literally, and not one of the protected names (main, master, release*). Whether the name is free
-// is decided when the ref is created.
+// literally, not one of the protected names (main, master, release*) and not inside the namespace
+// the daemon generates names in (job, job/*). A branch named job would also block every job/<id>:
+// refs/heads/job cannot be a file and a directory. Whether the name is free is decided when the ref
+// is created.
 func validateResultBranch(run branchGit, name string) error {
+	if reservedResultBranch(name) {
+		return fmt.Errorf("reserved result branch %q: job and job/* are generated names", name)
+	}
+	return checkBranchName(run, name)
+}
+
+// reservedResultBranch reports a name in the generated namespace; folded, as refs may live on a
+// case-insensitive filesystem.
+func reservedResultBranch(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "job" || strings.HasPrefix(lower, "job/")
+}
+
+// resultBranchName is the generated name of one attempt's result: job/<id> for the first attempt,
+// job/<id>-<attempt> for a resumed one. The name is stable (a crash-retry of the same attempt finds
+// its own ref) and cannot collide with another job (ids carry no such suffix) or with a requested
+// name (the namespace is reserved).
+func resultBranchName(id string, attempt int) string {
+	if attempt > 1 {
+		return fmt.Sprintf("job/%s-%d", id, attempt)
+	}
+	return "job/" + id
+}
+
+// checkBranchName is the name check shared by requested and generated names.
+func checkBranchName(run branchGit, name string) error {
 	// check-ref-format expands @{-N}; accept only the literal name the caller supplied.
 	checked, err := run("check-ref-format", "--branch", name)
 	if err != nil || checked != name || strings.HasPrefix(name, "refs/") {
@@ -39,7 +67,7 @@ func validateResultBranch(run branchGit, name string) error {
 // moved, followed or rolled back. A retry that finds the ref already at head (a crash between the
 // write and the job row update) succeeds without writing; created is false then.
 func publishBranchRef(run branchGit, name, head string) (created bool, err error) {
-	if err := validateResultBranch(run, name); err != nil {
+	if err := checkBranchName(run, name); err != nil {
 		return false, err
 	}
 	if !branchOID(head) {
@@ -89,13 +117,20 @@ func existingRef(run branchGit, ref, head string) (exists, atHead bool) {
 	return true, tip == head
 }
 
-// publishResultRefs publishes the job head under the requested name when it is free, and under
-// job/<id> otherwise (or when no name was requested). It returns the branch that holds the result
-// and a note when the request was not honoured. It writes one ref only.
-func publishResultRefs(run branchGit, id, requested, head string) (branch, note string, err error) {
-	generated := "job/" + id
-	if requested != "" && requested != generated {
-		_, err := publishBranchRef(run, requested, head)
+// publishResultRefs publishes the job head under the requested name when it is free, and under the
+// attempt's generated name (resultBranchName) otherwise or when no name was requested. It returns
+// the branch that holds the result and a note when the request was not honoured. It writes one ref
+// only. A requested name in the generated namespace is not honoured (jobs started before the
+// namespace was reserved may carry one).
+func publishResultRefs(run branchGit, id string, attempt int, requested, head string) (branch, note string, err error) {
+	generated := resultBranchName(id, attempt)
+	if requested != "" {
+		var err error
+		if reservedResultBranch(requested) {
+			err = validateResultBranch(run, requested)
+		} else {
+			_, err = publishBranchRef(run, requested, head)
+		}
 		if err == nil {
 			return requested, "", nil
 		}

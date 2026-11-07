@@ -277,6 +277,12 @@ job/<id>; fast-forward it yourself with git merge --ff-only)`. Use that recorded
 branch for review, follow-up jobs and PRs. The orchestrator must not move refs by
 hand with `git branch -f` or `git update-ref`.
 
+Each attempt has its own generated branch: `job/<id>` for the first attempt,
+`job/<id>-<attempt>` (for example `job/<id>-2`) for a resumed one. An earlier
+attempt's branch is never moved, so its result stays reachable; `branch` shows the
+newest attempt's branch and each archived attempt keeps its own. The names `job` and
+`job/*` are reserved: `job_start` refuses them as a requested `branch`.
+
 ## Cleanup and patches
 
 30 minutes after the job-done line is delivered, the daemon removes the job's worktree, the heaviest part. It first checks that the worktree really belongs to this job, then saves everything the job changed, without touching the index or files:

@@ -95,3 +95,49 @@ func TestPendingResultBranch(t *testing.T) {
 		t.Fatalf("pending result branches: %v", ids)
 	}
 }
+
+// Resume archives the published branch with the attempt that produced it and clears the job row for
+// the next attempt, so every attempt keeps its own result branch (#205).
+func TestRequeueArchivesResultBranchPerAttempt(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Unix(1760000000, 0)
+	if err := st.Insert(&Job{ID: "j", Agent: "a", Title: "t", Kind: "fix", Brief: "b", Status: StatusQueued, Model: "m",
+		MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	limits := ResumeLimits{MaxTurns: 10, MaxBudgetUSD: 1, TimeoutMinutes: 5}
+	for attempt, branch := range []string{"job/j", "job/j-2"} {
+		token := "tok" + branch
+		if err := st.Claim("j", token, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetSession("j", token, "sid", RunNew); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Finish("j", token, StatusFailed, 1, 0, 1, "failed", now); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetResultBranch("j", branch, "note "+branch); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Requeue("j", limits, "more", ""); err != nil {
+			t.Fatalf("requeue %d: %v", attempt+1, err)
+		}
+		if j, err := st.Get("j"); err != nil || j.Branch != "" || j.BranchNote != "" {
+			t.Fatalf("job row after requeue %d: %+v %v", attempt+1, j, err)
+		}
+	}
+	attempts, err := st.Attempts("j")
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("attempts: %+v %v", attempts, err)
+	}
+	for i, want := range []string{"job/j", "job/j-2"} {
+		if attempts[i].Branch != want || attempts[i].BranchNote != "note "+want {
+			t.Fatalf("attempt %d: branch=%q note=%q", i+1, attempts[i].Branch, attempts[i].BranchNote)
+		}
+	}
+}

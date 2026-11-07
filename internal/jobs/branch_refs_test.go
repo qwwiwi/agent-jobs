@@ -166,7 +166,7 @@ func TestPublishResultRefsLosesRaceFallsBack(t *testing.T) {
 		}
 		return run(args...)
 	})
-	branch, note, err := publishResultRefs(racing, "abc", "feature", head)
+	branch, note, err := publishResultRefs(racing, "abc", 1, "feature", head)
 	if err != nil || branch != "job/abc" || !strings.Contains(note, "requested branch feature exists; not moved") {
 		t.Fatalf("branch=%q note=%q err=%v", branch, note, err)
 	}
@@ -184,13 +184,15 @@ func TestPublishResultRefsOutcomes(t *testing.T) {
 	branchMust(t, run, "branch", "dir/x", base)
 	for _, tc := range []struct{ id, requested, branch, note string }{
 		{"a", "", "job/a", ""},
-		{"b", "job/b", "job/b", ""},
+		// The job/ namespace is generated: a requested job/b is not honoured (an old row may carry one).
+		{"b", "job/b", "job/b", "requested branch job/b not created: reserved"},
+		{"f", "job", "job/f", "requested branch job not created: reserved"},
 		{"c", "fresh", "fresh", ""},
 		{"d", "taken", "job/d", "requested branch taken exists; not moved - published job/d; fast-forward it yourself with git merge --ff-only"},
 		// A directory/file conflict is not "exists", but the result still lands on job/<id>.
 		{"e", "dir", "job/e", "requested branch dir not created"},
 	} {
-		branch, note, err := publishResultRefs(run, tc.id, tc.requested, head)
+		branch, note, err := publishResultRefs(run, tc.id, 1, tc.requested, head)
 		if err != nil || branch != tc.branch || !strings.HasPrefix(note, tc.note) {
 			t.Fatalf("%+v: branch=%q note=%q err=%v", tc, branch, note, err)
 		}
@@ -202,7 +204,7 @@ func TestPublishResultRefsOutcomes(t *testing.T) {
 		t.Fatal("existing branch moved")
 	}
 	// Re-running every outcome (crash recovery) is idempotent.
-	if branch, _, err := publishResultRefs(run, "c", "fresh", head); err != nil || branch != "fresh" {
+	if branch, _, err := publishResultRefs(run, "c", 1, "fresh", head); err != nil || branch != "fresh" {
 		t.Fatalf("retry: %q %v", branch, err)
 	}
 }
@@ -223,7 +225,7 @@ func TestValidateResultBranch(t *testing.T) {
 	run, base, _ := branchRepo(t)
 	branchMust(t, run, "update-ref", "refs/remotes/origin/trunk", base)
 	branchMust(t, run, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
-	for _, name := range []string{"main", "Main", "master", "release", "release/1", "Release/1", "release-next", "bad name", "-flag", "a..b", "a@{b", "@{-1}", "refs/heads/main"} {
+	for _, name := range []string{"job", "Job", "job/manual", "JOB/1", "job/123-2", "main", "Main", "master", "release", "release/1", "Release/1", "release-next", "bad name", "-flag", "a..b", "a@{b", "@{-1}", "refs/heads/main"} {
 		t.Run(name, func(t *testing.T) {
 			if err := validateResultBranch(run, name); err == nil {
 				t.Fatalf("accepted %q", name)
@@ -231,7 +233,7 @@ func TestValidateResultBranch(t *testing.T) {
 		})
 	}
 	// Existing branches cannot be moved, so the default branch needs no special knowledge.
-	for _, name := range []string{"feature/result", "trunk", "develop", "job/manual"} {
+	for _, name := range []string{"feature/result", "trunk", "develop", "jobs", "job-1", "myjob/x"} {
 		if err := validateResultBranch(run, name); err != nil {
 			t.Fatalf("refused %q: %v", name, err)
 		}

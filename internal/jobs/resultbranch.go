@@ -14,8 +14,9 @@ import (
 
 // publishResultBranch runs after either runner has ended (including the Codex wrapper's commit).
 // The result is published create-only (see publishResultRefs): the caller's optional target when it
-// is free, job/<id> otherwise. A recorded outcome is never replayed at notification retries;
-// resuming clears it for the next attempt.
+// is free, the attempt's generated name (job/<id>, job/<id>-<attempt> once resumed) otherwise. A
+// recorded outcome is never replayed at notification retries; resuming archives it with the attempt
+// and clears it for the next attempt.
 func (m *Manager) publishResultBranch(j *store.Job) error {
 	if j.RepoPath == "" || j.BaseCommit == "" || j.Kind == "review" || j.Kind == "research" || IsGateKind(j.Kind) ||
 		j.Status == store.StatusQueued || j.Status == store.StatusRunning || j.Branch != "" || j.BranchNote != "" {
@@ -73,7 +74,7 @@ func (m *Manager) publishResultBranch(j *store.Job) error {
 		return fail(errors.New("job head is not a descendant of the base commit"))
 	}
 	run := branchGit(func(args ...string) (string, error) { return runAt(j.RepoPath, args...) })
-	branch, note, err := publishResultRefs(run, j.ID, j.RequestedBranch, head)
+	branch, note, err := publishResultRefs(run, j.ID, j.Attempt, j.RequestedBranch, head)
 	if err != nil {
 		return fail(err)
 	}
