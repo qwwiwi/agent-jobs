@@ -247,8 +247,9 @@ Owner requirement (2026-11-03): frontend work is checked for real, in a browser.
 
 ## Job result branches
 
-When a repository job ends with commits beyond `base_commit`, the daemon publishes
-`job/<job-id>` in that repository. This happens for both runners, after the Codex
+When a repository job ends with commits beyond `base_commit`, the daemon normally publishes
+`job/<job-id>` for attempt 1 or `job/<job-id>-<attempt>` for a resumed
+attempt in that repository. This happens for both runners, after the Codex
 wrapper commits changes from `progress/COMMIT_MSG`. A job without commits, a review,
 a research job or a gate job creates no result branch.
 
@@ -258,22 +259,20 @@ request another result branch. `base` / `--base` still selects the starting comm
 never moves an existing ref. It publishes the job head with an atomic
 create-if-absent write (`git update-ref <ref> <head> ""`), so of two jobs asking for
 the same new name exactly one gets it. If the requested name already exists (or
-cannot be created), nothing is touched and the result goes to `job/<job-id>` with an
-explanation; fast-forward the existing branch yourself with
-`git merge --ff-only job/<job-id>` if you want it there. One ref is written per job.
+cannot be created), nothing is touched and the result goes to the generated attempt
+name with an explanation; fast-forward the existing branch yourself with `git merge --ff-only <published-branch>` if you want
+it there. One ref is written per attempt.
 Nothing is pushed.
 
-Invalid Git branch names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master` and
-`release*` are refused at start. Because an existing branch can never be moved, no
-knowledge of the repository's default branch is needed. Publication does not fetch
+Invalid Git branch names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master`,
+`release*`, `job` and `job/...` are refused as requested names at start. Because an
+existing branch can never be moved, no knowledge of the repository's default branch is needed. Publication does not fetch
 from the network.
 
 `job_result`, `job_list` and `job_status` expose `branch`, `requested_branch` and
 `branch_note`; CLI status/list and HTTP job views expose the result too. `branch`
-is empty until commits have been published. The job-done line says
-`branch job/<id>` or `branch feature/result`; if the requested name was taken it
-says `branch job/<id> (requested branch feature/result exists; not moved - published
-job/<id>; fast-forward it yourself with git merge --ff-only)`. Use that recorded
+is empty until commits have been published. The job-done line reports the branch
+actually published and explains when a requested name was taken. Use that recorded
 branch for review, follow-up jobs and PRs. The orchestrator must not move refs by
 hand with `git branch -f` or `git update-ref`.
 

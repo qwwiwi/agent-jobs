@@ -184,32 +184,32 @@ Agent Jobs позволяет долгоживущей сессии Claude Code 
 
 **Размер брифа.** `job_start` отклоняет бриф больше `max_brief_bytes` (по умолчанию 32 КБ) и возвращает `size_warning`, если бриф называет больше `brief_warn_files` файлов (по умолчанию 40) или в нём больше `brief_warn_headings` заголовков `## ` (по умолчанию 8): возможно, это не одна джоба.
 
-## Job result branches
+## Ветки результатов джоб
 
-When a repository job ends with commits beyond `base_commit`, the daemon publishes
-`job/<job-id>` in that repository, for both Claude and Codex (after the wrapper
-commits changes from `progress/COMMIT_MSG`). Jobs without commits, reviews,
-research jobs and gate jobs create no result branch.
+Когда джоба репозитория заканчивается с коммитами поверх `base_commit`, демон
+обычно публикует в этом репозитории `job/<job-id>` для первой попытки или
+`job/<job-id>-<attempt>` для продолженной попытки. Это относится к Claude и Codex
+(после коммита обёртки из `progress/COMMIT_MSG`). Джобы без коммитов, review,
+research и gate-джобы не создают ветку результата.
 
-Use `job_start` parameter `branch`, or CLI `start --branch feature/result`, to
-request a target; `base` still selects the starting commit. Result branches are
-create-only: the daemon never moves an existing ref. It creates the branch with an
-atomic create-if-absent write (`git update-ref <ref> <head> ""`), so of two jobs
-asking for the same new name exactly one gets it. If the requested name already
-exists (or cannot be created), nothing is touched and the result goes to
-`job/<job-id>` with an explanation; fast-forward the existing branch yourself with
-`git merge --ff-only`. One ref is written per job. Nothing is pushed.
+Параметр `branch` в `job_start` или `start --branch feature/result` в CLI задаёт
+желаемую ветку; `base` по-прежнему выбирает начальный коммит. Ветки результата
+только создаются: демон никогда не перемещает существующий ref. Ветка создаётся
+атомарно, только если её ещё нет (`git update-ref <ref> <head> ""`), поэтому из
+двух джоб с одним новым именем его получит ровно одна. Если запрошенное имя уже
+занято или его нельзя создать, результат публикуется под сгенерированным именем
+попытки с объяснением; при необходимости обновите существующую ветку сами командой
+`git merge --ff-only <published-branch>`. На попытку записывается один ref.
+Push не выполняется.
 
-Invalid Git names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master` and
-`release*` are refused at start. An existing branch can never be moved, so the
-default branch needs no special detection.
-`job_result`, `job_list`, `job_status`, CLI
-status/list and HTTP job views show `branch`, `requested_branch` and `branch_note`
-(CLI list shows the result branch). The job-done line says `branch job/<id>` or
-`branch feature/result`; a taken name is reported as `requested branch <name>
-exists; not moved - published job/<id>; fast-forward it yourself with git merge
---ff-only`. Use the recorded branch for review, follow-up jobs and PRs;
-the orchestrator must not move refs by hand with `git branch -f` or `git update-ref`.
+Недопустимые имена Git (начинающиеся с `-`, `refs/`, содержащие `@{`, `..`),
+`main`, `master`, `release*`, `job` и `job/...` отклоняются при запросе. Так как
+существующая ветка никогда не перемещается, определять ветку по умолчанию не нужно.
+`job_result`, `job_list`, `job_status`, CLI status/list и HTTP показывают `branch`,
+`requested_branch` и `branch_note` (CLI list показывает ветку результата). Строка
+job-done сообщает фактически опубликованную ветку и объясняет, если запрошенное имя
+занято. Используйте эту ветку для проверки, последующих джоб и PR; оркестратор не
+должен перемещать refs вручную через `git branch -f` или `git update-ref`.
 
 ## Чистка и патчи
 
