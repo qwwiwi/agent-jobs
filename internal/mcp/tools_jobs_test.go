@@ -41,7 +41,7 @@ func TestJobResultRedactsAndShowsProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 		var res JobResultOutput
-		call(t, cs, "job_result", map[string]any{"id": j.ID}, &res)
+		call(t, cs, "job_result", map[string]any{"id": j.ID, "detail": "full"}, &res)
 		if strings.Contains(res.Report, tok) || strings.Contains(res.Error, strings.Repeat("z", 24)) ||
 			res.NotDone != "nothing" || res.Progress != c.progress || res.ReportMissing {
 			t.Fatalf("case %d: %+v", i, res)

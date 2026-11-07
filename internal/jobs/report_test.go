@@ -123,3 +123,43 @@ func TestReportContractAsksForForks(t *testing.T) {
 		}
 	}
 }
+
+func TestExportedCapText(t *testing.T) {
+	if got, cut := CapText("short", 10); got != "short" || cut {
+		t.Fatalf("fits: %q %v", got, cut)
+	}
+	if got, cut := CapText("abcdefghij", 4); got != "abcd\n[cut: 4 of 10 bytes shown]" || !cut {
+		t.Fatalf("cut: %q %v", got, cut)
+	}
+	// 3 bytes into a 2-byte rune: the cut steps back to the rune start.
+	if got, _ := CapText("жжж", 3); got != "ж\n[cut: 2 of 6 bytes shown]" {
+		t.Fatalf("rune: %q", got)
+	}
+}
+
+func TestReportSectionTextsAndSizes(t *testing.T) {
+	report := "## Summary\nok\n\n## Evidence\n```\n## Forks\n```\nlog\n\n## Not done / uncertain\nnothing\n"
+	text, missing := ReportSectionTexts(report, "evidence", "## Not done / uncertain", "Forks")
+	if text != "## Evidence\n```\n## Forks\n```\nlog\n\n## Not done / uncertain\nnothing\n" || len(missing) != 1 || missing[0] != "Forks" {
+		t.Fatalf("texts %q missing %v", text, missing)
+	}
+	sizes := ReportSectionSizes(report)
+	if len(sizes) != 3 || sizes[0] != (SectionSize{Name: "Summary", Bytes: len("## Summary\nok\n\n")}) || sizes[2].Name != "Not done / uncertain" {
+		t.Fatalf("sizes %+v", sizes)
+	}
+	if got := ReportSectionSizes("no headings"); len(got) != 0 {
+		t.Fatalf("no sections: %+v", got)
+	}
+}
+
+func TestDigestReport(t *testing.T) {
+	report := "## Summary\nok\n\n## Not done / uncertain\n" + strings.Repeat("b", 100) + "\n"
+	d := DigestReport(report, 10)
+	if d.Summary != "ok" || d.Forks != "" || !strings.HasPrefix(d.NotDone, strings.Repeat("b", 10)+"\n[cut: 10 of 100") ||
+		len(d.Cut) != 1 || d.Cut[0] != SectionNotDone || d.Bytes != len(report) {
+		t.Fatalf("digest %+v", d)
+	}
+	if h := d.SizesHint(); !strings.Contains(h, "Summary 15 B") || !strings.Contains(h, "Not done / uncertain ") {
+		t.Fatalf("hint %q", h)
+	}
+}

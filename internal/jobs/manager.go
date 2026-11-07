@@ -907,6 +907,8 @@ func claudeBaseArgs(j *store.Job, jobDir string) []string {
 		"--mcp-config", filepath.Join(jobDir, "mcp.json"), "--strict-mcp-config",
 		"--add-dir", jobDir,
 	)
+	// The plugins the daemon resolved for this job (plugins.go); none for a gate job or a job with no match.
+	args = append(args, claudePluginArgs(jobDir)...)
 	// The flag outranks an effortLevel in the worktree's project settings; a row from before the effort
 	// was recorded has none and runs at the CLI default.
 	if j.ReasoningEffort != "" {

@@ -996,6 +996,10 @@ func archiveAttempt(dir string, n int) error {
 // refreshJobFiles rewrites the files claude and git read at launch from the agent's config: the job
 // dir is writable by the job, so what the previous attempt may have changed there is not reused.
 func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) error {
+	// A plugin update since the first attempt is picked up; the settings below carry its deny rules.
+	if err := m.preparePlugins(j, dir); err != nil {
+		return err
+	}
 	if err := writeJSON(filepath.Join(dir, "settings.json"), m.JobSettings(j, gitDirs...)); err != nil {
 		return err
 	}
@@ -1088,6 +1092,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	resumed := update
 	if section := m.priorResults(j, prior); section != "" {
 		resumed += "\nThe prior results, read again for this attempt (prior/ was rewritten from the same read):\n\n" + section
+	}
+	// The fallback prompt gets the bootstrap through buildPrompt; the resumed session gets it here, read
+	// again with the plugins for this attempt (a plugin update may have changed it).
+	if section := m.pluginsPromptSection(j); section != "" {
+		resumed += "\nThe skills bootstrap, read again for this attempt:\n\n" + section
 	}
 	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
