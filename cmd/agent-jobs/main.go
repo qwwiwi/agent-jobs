@@ -551,7 +551,7 @@ func cmdStart(args []string) error {
 	briefFile := fs.String("brief-file", "", "read brief from file")
 	fs.StringVar(&r.RepoPath, "repo", "", "git repository for the worktree (optional)")
 	fs.StringVar(&r.Base, "base", "", "base ref (default HEAD)")
-	fs.StringVar(&r.Branch, "branch", "", "result branch (default job/<id>); existing branches are fast-forwarded only")
+	fs.StringVar(&r.Branch, "branch", "", "result branch (default job/<id>); created only, an existing branch is never moved (job/<id> is used instead)")
 	fs.StringVar(&r.Model, "model", "", "model (or give --complexity; one of them is required)")
 	fs.StringVar(&r.Complexity, "complexity", "", "light|normal|hard: picks the model by kind when --model is not given")
 	fs.IntVar(&r.MaxTurns, "max-turns", 0, fmt.Sprintf("default %d for fix and general, %d for other kinds; ceiling %d",

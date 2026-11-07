@@ -34,7 +34,7 @@ func TestResultBranchMigrationAndRoundTrip(t *testing.T) {
 			if err := s.Insert(j); err != nil {
 				t.Fatal(err)
 			}
-			if err := s.SetResultBranch(j.ID, "job/branch-job", "requested branch feature not moved: not a fast-forward"); err != nil {
+			if err := s.SetResultBranch(j.ID, "job/branch-job", "requested branch feature exists; not moved - published job/branch-job"); err != nil {
 				t.Fatal(err)
 			}
 		}

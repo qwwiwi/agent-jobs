@@ -192,22 +192,23 @@ commits changes from `progress/COMMIT_MSG`). Jobs without commits, reviews,
 research jobs and gate jobs create no result branch.
 
 Use `job_start` parameter `branch`, or CLI `start --branch feature/result`, to
-request a target; `base` still selects the starting commit. A missing target is
-created. An existing target advances only by fast-forward, comparing its observed
-tip atomically. A divergent, symbolic, checked-out or concurrently changed target
-stays unchanged; the result remains on `job/<job-id>`. That fallback is retained
-even when the requested target succeeds. Nothing is pushed.
+request a target; `base` still selects the starting commit. Result branches are
+create-only: the daemon never moves an existing ref. It creates the branch with an
+atomic create-if-absent write (`git update-ref <ref> <head> ""`), so of two jobs
+asking for the same new name exactly one gets it. If the requested name already
+exists (or cannot be created), nothing is touched and the result goes to
+`job/<job-id>` with an explanation; fast-forward the existing branch yourself with
+`git merge --ff-only`. One ref is written per job. Nothing is pushed.
 
-Invalid Git names, `main`, `master`, the default branch and `release*` are refused
-at start. Default protection uses local remote-HEAD metadata and
-`init.defaultBranch`, without fetching. Without remote-HEAD metadata, the main
-worktree's current branch is conservatively protected; if its HEAD is detached,
-an explicit target is refused. Automatic `job/<id>` publication still works.
+Invalid Git names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master` and
+`release*` are refused at start. An existing branch can never be moved, so the
+default branch needs no special detection.
 `job_result`, `job_list`, `job_status`, CLI
 status/list and HTTP job views show `branch`, `requested_branch` and `branch_note`
 (CLI list shows the result branch). The job-done line says `branch job/<id>` or
-`branch feature/result (fast-forwarded)`; a fallback names the requested target and
-the refusal reason. Use the recorded branch for review, follow-up jobs and PRs;
+`branch feature/result`; a taken name is reported as `requested branch <name>
+exists; not moved - published job/<id>; fast-forward it yourself with git merge
+--ff-only`. Use the recorded branch for review, follow-up jobs and PRs;
 the orchestrator must not move refs by hand with `git branch -f` or `git update-ref`.
 
 ## Чистка и патчи

@@ -27,7 +27,7 @@ This file is for the agent's MAIN session (the orchestrator), not for jobs. Add 
    > Отчёт джобы — заявление, а не результат.
 
    Check the diff yourself against `base_commit` (in the worktree while it exists, afterwards `commits.patch`, `uncommitted.patch`, `diffstat.txt` and the result `branch` recorded by `job_result`).
-   Repository jobs with commits automatically publish `job/<id>`; `job_start` can request another target with `branch`. An existing target advances only by fast-forward. If it diverged or could not be updated, the job-done line and `branch_note` explain why it stayed unchanged and name the fallback. Use the recorded branch for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch.
+   Repository jobs with commits automatically publish `job/<id>`; `job_start` can request another target with `branch`. Result branches are create-only: the daemon never moves an existing ref. If the requested name already exists it is left untouched, the result goes to `job/<id>`, and the job-done line and `branch_note` say `requested branch <name> exists; not moved`; fast-forward it yourself with `git merge --ff-only` only when you want it there. Use the recorded branch for the next coder/fix job (`base`) and for PRs; never move refs by hand with `git branch -f` or `git update-ref`, and never derive a ref update from a possibly empty SHA. Jobs without commits and read-only jobs create no result branch.
 
 3. Only then publish.
 

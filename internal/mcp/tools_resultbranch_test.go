@@ -10,7 +10,7 @@ import (
 func TestResultBranchToolViews(t *testing.T) {
 	m := newManager(t)
 	cs := connect(t, mustServer(t, m))
-	const note = "requested branch feature not moved: not a fast-forward"
+	const note = "requested branch feature exists; not moved - published job/x"
 	id := insertReportJob(t, m, 90, "## Summary\nok\n\n## Not done / uncertain\nnothing\n", func(j *store.Job) {
 		j.RequestedBranch, j.Branch, j.BranchNote = "feature", "job/261106-150090-abcd", note
 	})

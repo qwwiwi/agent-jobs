@@ -254,25 +254,26 @@ a research job or a gate job creates no result branch.
 
 Set `branch` in `job_start`, or use `agent-jobs start --branch feature/result`, to
 request another result branch. `base` / `--base` still selects the starting commit;
-`branch` selects where the result goes. A missing target is created; an existing
-target advances only when its current tip is an ancestor of the job's head. The
-write compares the observed tip atomically, so a concurrent move is never
-overwritten. A divergent, symbolic or checked-out target stays unchanged and the
-result remains on `job/<job-id>`. The job branch is retained even when the requested
-target succeeds. Nothing is pushed.
+`branch` selects where the result goes. Result branches are create-only: the daemon
+never moves an existing ref. It publishes the job head with an atomic
+create-if-absent write (`git update-ref <ref> <head> ""`), so of two jobs asking for
+the same new name exactly one gets it. If the requested name already exists (or
+cannot be created), nothing is touched and the result goes to `job/<job-id>` with an
+explanation; fast-forward the existing branch yourself with
+`git merge --ff-only job/<job-id>` if you want it there. One ref is written per job.
+Nothing is pushed.
 
-Invalid Git branch names, `main`, `master`, the repository's default branch and
-`release*` are refused at start. Default branch protection uses local remote-HEAD
-metadata and `init.defaultBranch`. Without remote-HEAD metadata, it conservatively
-protects the main worktree's current branch; if that HEAD is detached too, an
-explicit target is refused because the default cannot be identified locally.
-Automatic `job/<id>` publication still works. It does not fetch from the network.
+Invalid Git branch names (a leading `-`, `refs/`, `@{`, `..`), `main`, `master` and
+`release*` are refused at start. Because an existing branch can never be moved, no
+knowledge of the repository's default branch is needed. Publication does not fetch
+from the network.
 
 `job_result`, `job_list` and `job_status` expose `branch`, `requested_branch` and
 `branch_note`; CLI status/list and HTTP job views expose the result too. `branch`
 is empty until commits have been published. The job-done line says
-`branch job/<id>` or `branch feature/result (fast-forwarded)`; if the requested
-target could not be moved, it names the fallback and the reason. Use that recorded
+`branch job/<id>` or `branch feature/result`; if the requested name was taken it
+says `branch job/<id> (requested branch feature/result exists; not moved - published
+job/<id>; fast-forward it yourself with git merge --ff-only)`. Use that recorded
 branch for review, follow-up jobs and PRs. The orchestrator must not move refs by
 hand with `git branch -f` or `git update-ref`.
 
