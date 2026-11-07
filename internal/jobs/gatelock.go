@@ -295,15 +295,7 @@ func (q *gateQueue) update(fn func([]gateEntry) []gateEntry) []gateEntry {
 	fd := int(q.f.Fd())
 	// Every user can open the queue file, so anyone can hold its flock: never block on it. A queue that
 	// stays locked (gateQueueLockTries) is skipped this poll; the caller then just polls the gate lock.
-	locked := false
-	for range gateQueueLockTries {
-		if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
-			locked = true
-			break
-		}
-		time.Sleep(gateQueueLockRetry)
-	}
-	if !locked {
+	if !tryFlock(fd, gateQueueLockTries, gateQueueLockRetry) {
 		return nil
 	}
 	defer func() { _ = syscall.Flock(fd, syscall.LOCK_UN) }()
@@ -340,6 +332,20 @@ func (q *gateQueue) update(fn func([]gateEntry) []gateEntry) []gateEntry {
 		_, _ = q.f.WriteAt(buf.Bytes(), 0)
 	}
 	return entries
+}
+
+// tryFlock takes an exclusive flock on fd without blocking: up to tries attempts, retry apart. false
+// when someone else kept it locked (or flock failed) all along.
+func tryFlock(fd, tries int, retry time.Duration) bool {
+	for i := range tries {
+		if syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+			return true
+		}
+		if i < tries-1 {
+			time.Sleep(retry)
+		}
+	}
+	return false
 }
 
 // join adds a waiter and returns its entry.
@@ -486,7 +492,8 @@ func (w *gateWaitRecorder) end(waited time.Duration) {
 	})
 }
 
-// edit changes the file under its own flock; a file that cannot be opened or read is left alone (the
+// edit changes the file under its own flock, taken without blocking (tryFlock); a file that cannot be
+// locked, opened or read is left alone (the
 // record is diagnostic and a timeout credit, never a condition of the gate).
 func (w *gateWaitRecorder) edit(fn func(*GateWaitState)) {
 	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
@@ -497,7 +504,9 @@ func (w *gateWaitRecorder) edit(fn func(*GateWaitState)) {
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
 		return
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	// The job can lock its own gate-wait.json; never wait on it (end runs while the box lock is held):
+	// a few tries, then the record is skipped.
+	if !tryFlock(int(f.Fd()), gateQueueLockTries, gateQueueLockRetry) {
 		return
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()

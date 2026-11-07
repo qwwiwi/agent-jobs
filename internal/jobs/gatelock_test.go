@@ -360,3 +360,91 @@ func TestGateWaitCreditUnion(t *testing.T) {
 		t.Fatalf("credit %s, want 16m (1..12 and 20..25 min)", got)
 	}
 }
+
+// lockFileT opens path (created when missing) and holds an exclusive flock on it, as a job process can
+// on its own gate-wait.json; unlock releases it (also on cleanup).
+func lockFileT(t *testing.T, path string) (unlock func()) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	unlock = func() { once.Do(func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }) }
+	t.Cleanup(unlock)
+	return unlock
+}
+
+// acquireWithinT runs acquireGateLock(r) and fails the test when it has not returned within limit.
+func acquireWithinT(t *testing.T, r gateLockReq, limit time.Duration) (*gateLease, error) {
+	t.Helper()
+	type res struct {
+		l   *gateLease
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		l, err := acquireGateLock(context.Background(), r)
+		done <- res{l, err}
+	}()
+	select {
+	case got := <-done:
+		return got.l, got.err
+	case <-time.After(limit):
+		t.Fatalf("acquireGateLock still blocked after %s", limit)
+		return nil, nil
+	}
+}
+
+// The job's gate-wait.json is a diagnostic the job itself can lock: a lock held on it before the wait
+// starts never stretches the wait past its bound (#208 review).
+func TestGateWaitRecorderLockedBeforeStart(t *testing.T) {
+	jobDir := t.TempDir()
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	holdGateT(t, lock)
+	lockFileT(t, filepath.Join(jobDir, GateWaitFile))
+	_, err := acquireWithinT(t, gateLockReq{path: lock, wait: 300 * time.Millisecond, waits: newGateWaitRecorder(jobDir)}, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "still held") {
+		t.Fatalf("err %v, want the bounded wait's timeout", err)
+	}
+}
+
+// A lock taken on gate-wait.json while the gate waits never keeps a gate that got the box lock from
+// returning (it would hold the box-wide lock with no lease to release it).
+func TestGateWaitRecorderLockedDuringAcquisition(t *testing.T) {
+	jobDir := t.TempDir()
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	holder := holdGateT(t, lock)
+	type res struct {
+		l   *gateLease
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: time.Minute, waits: newGateWaitRecorder(jobDir)})
+		done <- res{l, err}
+	}()
+	wait := filepath.Join(jobDir, GateWaitFile)
+	deadline := time.Now().Add(5 * time.Second)
+	for b, _ := os.ReadFile(wait); !bytes.Contains(b, []byte(`"pid"`)); b, _ = os.ReadFile(wait) {
+		if time.Now().After(deadline) {
+			t.Fatal("the wait was never recorded")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	unlock := lockFileT(t, wait)
+	holder.release()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("acquisition: %v", got.err)
+		}
+		got.l.release()
+	case <-time.After(5 * time.Second):
+		unlock()
+		t.Fatal("a locked gate-wait.json kept the gate from returning with the box lock held")
+	}
+}
