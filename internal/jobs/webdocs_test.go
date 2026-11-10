@@ -387,3 +387,23 @@ func TestPreambleWebRule(t *testing.T) {
 		}
 	}
 }
+
+// F1/F2: docs validation and the config refuse a non-ASCII host that lowercases to an allowlisted one and
+// a host whose last label is a hex or octal number.
+func TestDocsNonASCIIAndNumericHosts(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.WebAllowHosts = []string{"i.example", "127.0x1"}
+	for _, d := range []string{"https://İ.example/", "https://127.0x1/", "https://0x7f.0.0.01/"} {
+		if err := checkDocs([]string{d}, m.Cfg.WebAllowHosts); err == nil {
+			t.Errorf("checkDocs(%q) passed, want refused", d)
+		}
+		if _, err := m.Enqueue(StartRequest{Title: "t", Kind: "general", Brief: "b", Model: "sonnet", Docs: []string{d}}); err == nil {
+			t.Errorf("Enqueue with doc %q passed, want refused", d)
+		}
+	}
+	for _, body := range []string{`{"web_allow_hosts": ["127.0x1"]}`, `{"web_allow_hosts": ["İ.example"]}`, `{"web_allow_hosts": ["a.0X1f"]}`} {
+		if _, err := loadConfigBody(t, body); err == nil || !strings.Contains(err.Error(), "web_allow_hosts") {
+			t.Errorf("%s: %v; want a web_allow_hosts error", body, err)
+		}
+	}
+}

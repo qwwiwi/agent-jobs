@@ -170,7 +170,11 @@ func decideCall(r io.Reader, cfg Config) (string, error) {
 		return toolRefused(in.ToolName), nil
 	}
 	if len(cfg.WebAllow) > 0 && (in.ToolName == "WebFetch" || in.ToolName == "WebSearch") {
-		return checkWebTool(in.ToolName, in.ToolInput.URL, cfg.WebAllow), nil
+		u, why := exactURLKey(in.RawInput)
+		if why != "" {
+			return webRefused(in.ToolName, why), nil
+		}
+		return checkWebTool(in.ToolName, u, cfg.WebAllow), nil
 	}
 	if readTools[in.ToolName] {
 		p, pattern := in.ToolInput.Path, ""
