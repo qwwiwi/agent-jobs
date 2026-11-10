@@ -158,11 +158,13 @@ func TestCreditGateWait(t *testing.T) {
 	}
 }
 
-// Two jobs' heavy steps never overlap (#208, simulated): the acceptance steps of two jobs running at the
-// same time and a gate a third job runs itself all take the one box-wide gate lock. Each step fails if
-// another is inside (an atomic mkdir), and at least one of them had to wait.
+// Two jobs' heavy steps never overlap past the box cap (#208, simulated; v0.8.2 G01): the acceptance
+// steps of two jobs running at the same time and a gate a third job runs itself, each in a work tree of
+// its own, all take a box slot; with gate_max_parallel 1 (the acceptance steps read it from config, the
+// job's gate from its environment) they run one at a time. Each step fails if another is inside (an
+// atomic mkdir), and at least one of them had to wait.
 func TestJobsHeavyStepsNeverOverlap(t *testing.T) {
-	m := acceptanceManager(t, `, "max_running": 3`)
+	m := acceptanceManager(t, `, "max_running": 3, "gate_max_parallel": 1`)
 	busy := filepath.Join(t.TempDir(), "busy")
 	step := "mkdir " + busy + " || exit 9; sleep 1; rmdir " + busy
 	a := enqueue(t, m, "a", withAcceptance(step))
@@ -173,7 +175,7 @@ func TestJobsHeavyStepsNeverOverlap(t *testing.T) {
 		t.Fatal(err)
 	}
 	gate := exec.Command(selfBin, "gate", "run", "--repo", repo, "--head", head, "--", "/bin/sh", "-c", step)
-	gate.Env = append(os.Environ(), JobEnvVar+"=c-third", JobDirEnvVar+"="+third)
+	gate.Env = append(os.Environ(), JobEnvVar+"=c-third", JobDirEnvVar+"="+third, GateMaxParallelEnvVar+"=1")
 	var gateOut strings.Builder
 	gate.Stdout = &gateOut
 	if err := m.Tick(); err != nil {
