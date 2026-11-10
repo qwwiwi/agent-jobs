@@ -133,6 +133,23 @@ var denyRules = []string{
 // webTools are closed for every kind except research.
 var webTools = []string{"WebFetch", "WebSearch"}
 
+// MaxWebAllowHosts caps config web_allow_hosts.
+const MaxWebAllowHosts = 50
+
+// webFetchKind is a kind whose claude job may get WebFetch on the owner's allowlisted hosts (v0.8.2
+// G07): the code and review kinds. Research already has the web tools; the gate kinds get nothing but
+// their input.
+func webFetchKind(kind string) bool { return kind == "fix" || kind == "general" || kind == "review" }
+
+// webFetchHosts are the hosts WebFetch may reach in a job of this kind: config web_allow_hosts for a
+// kind that may use them, none otherwise (then WebFetch stays denied).
+func (m *Manager) webFetchHosts(kind string) []string {
+	if !webFetchKind(kind) {
+		return nil
+	}
+	return m.Config().WebAllowHosts
+}
+
 // reviewWriteRules are the first layer of a claude review job's read-only mode, as the codex sandbox
 // makes a codex one read-only: no edit tools, no git writes to the worktree's history or index, no
 // rm/mv. Reads, search and test runners stay allowed. Prefix rules do not catch every shell write
@@ -255,7 +272,7 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	protected := append(append(m.skillProtected(j), m.sessionProtected(j)...), m.briefProtected(j)...)
 	protected = append(protected, m.ChecklistLockDir())
 	protected = append(protected, m.pluginProtected(j)...)
-	if len(j.SourceFiles) > 0 {
+	if len(j.SourceFiles) > 0 || len(j.Docs) > 0 {
 		protected = append(protected, filepath.Join(m.JobDir(j.ID), SourcesDir))
 	}
 	readOnly := ""
@@ -264,14 +281,18 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 	}
 	guardCmd := m.guardCommand(j.ID, readOnly, protected, gateNoRead(j), m.gateReadAllow(j), gitDirs...)
 	deny := append(skillDenyRules(protected), m.pluginDenyRules(j)...)
+	web := m.webFetchHosts(j.Kind)
+	for _, h := range web {
+		guardCmd += " --web-allow " + shellQuote(h)
+	}
 	if len(j.Sources) == 0 {
-		return m.settings(j.Kind, guardCmd, deny...)
+		return m.settingsWeb(j.Kind, guardCmd, web, deny...)
 	}
 	// A job with sources (G02): file tools never write its clones, and the guard is told the clones (no
 	// write, no host execution) and the sandbox dir, whose copies are the only mounts of a `docker run`.
 	src, box := filepath.Join(m.JobDir(j.ID), SourcesDir), filepath.Join(m.JobDir(j.ID), SandboxDir)
 	guardCmd += " --sources " + shellQuote(src) + " --sandbox " + shellQuote(box)
-	s := m.settings(j.Kind, guardCmd, append(deny, skillDenyRules([]string{src})...)...)
+	s := m.settingsWeb(j.Kind, guardCmd, web, append(deny, skillDenyRules([]string{src})...)...)
 	// docker stays refused by the guard except the sandbox form, which the prefix rule would deny too.
 	perms := s["permissions"].(map[string]any)
 	perms["deny"] = slices.DeleteFunc(perms["deny"].([]string), func(r string) bool { return r == "Bash(docker:*)" })
@@ -284,8 +305,18 @@ func (m *Manager) JobSettings(j *store.Job, gitDirs ...string) map[string]any {
 const GuardHookTimeout = int(3 * guard.DecideBudget / time.Second)
 
 func (m *Manager) settings(kind, guardCmd string, extraDeny ...string) map[string]any {
+	return m.settingsWeb(kind, guardCmd, nil, extraDeny...)
+}
+
+// settingsWeb is settings for a job whose WebFetch may reach webHosts: given hosts, WebFetch is not
+// denied (the guard, started with --web-allow for them, checks every call) and WebSearch stays denied.
+func (m *Manager) settingsWeb(kind, guardCmd string, webHosts []string, extraDeny ...string) map[string]any {
 	deny := append(append([]string{}, denyRules...), extraDeny...)
-	if kind != "research" {
+	switch {
+	case kind == "research":
+	case len(webHosts) > 0:
+		deny = append(deny, "WebSearch")
+	default:
 		deny = append(deny, webTools...)
 	}
 	if readOnlyKind(kind) {
@@ -529,9 +560,22 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 	b.WriteString(RenderCards(cards))
 	b.WriteString(RenderMemoryNotes(notes))
 	fmt.Fprintf(&b, "## Task: %s\n\nJob id: %s · kind: %s\n\n%s\n\n%s\n\n%s%s%s%s\n\n%s\n",
-		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSourceFiles(j.SourceFiles)+renderSources(m.JobDir(j.ID), sources),
+		j.Title, j.ID, j.Kind, work, strings.TrimSpace(j.Brief), renderSourceFiles(j.SourceFiles)+m.renderJobDocs(j)+renderSources(m.JobDir(j.ID), sources),
 		m.priorResults(j, prior), cover+renderReviewBlocking(j), check, contract)
 	return b.String(), nil
+}
+
+// renderJobDocs is the docs section of j's prompt. A missing or unreadable docs.json never fails the
+// prompt: the section then says every doc is unavailable.
+func (m *Manager) renderJobDocs(j *store.Job) string {
+	res, err := m.docResults(j)
+	if err != nil {
+		m.Log.Printf("job %s: %v", j.ID, err)
+		for _, u := range j.Docs {
+			res = append(res, docResult{URL: u, Err: "not fetched: the daemon's fetch result is missing"})
+		}
+	}
+	return renderDocs(res)
 }
 
 func writeJSON(path string, v any) error {

@@ -216,6 +216,9 @@ type StartRequest struct {
 	// job gets the task's planned skills (G01).
 	Milestone int64
 	Task      string
+	// Docs are https URLs of provider documentation on config web_allow_hosts hosts, fetched by the daemon
+	// into the job's sources/ as text files before it starts (v0.8.2 G08).
+	Docs []string
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
@@ -562,6 +565,12 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if len(r.Sources) > 0 && r.Gate != nil {
 		return nil, errors.New("a gate job gets nothing but its input: no sources")
 	}
+	if err := checkDocs(r.Docs, m.Config().WebAllowHosts); err != nil {
+		return nil, err
+	}
+	if len(r.Docs) > 0 && r.Gate != nil {
+		return nil, errors.New("a gate job gets nothing but its input: no docs")
+	}
 	turns, budget, timeout, err := ValidateLimits(DefaultTurns(r.Kind, r.MaxTurns), r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
 		return nil, err
@@ -586,6 +595,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 					errOpenRouterSources, r.Task, r.Milestone)
 			}
 			return nil, errOpenRouterSources
+		}
+		if len(r.Docs) > 0 {
+			return nil, errOpenRouterDocs
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
@@ -698,7 +710,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
+		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources), Docs: slices.Clone(r.Docs),
 		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
 		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview, IdemKey: r.IdemKey,
 		LoopDesign: r.Design, LoopOverride: loopOverride(r.LoopOverride),
@@ -717,7 +729,7 @@ func (m *Manager) Tick() error {
 	if m.daemonLockHeld {
 		m.prefetchInBackground()
 	} else if d, derr := m.ReadDaemonInfo(); derr != nil || !alive(d.PID) {
-		m.prefetchSources()
+		m.prefetchQueued()
 	}
 	err := m.tickLocked()
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
@@ -871,6 +883,9 @@ func (m *Manager) launchQueued() error {
 		}
 		if needsClone(j) && !m.sourcesCloned(j) {
 			continue // its sources are cloned outside the lifecycle lock (prefetchSources); it starts once they are
+		}
+		if needsDocs(j) && !m.docsFetched(j) {
+			continue // its docs are fetched outside the lifecycle lock (prefetchDocs); it starts once they are
 		}
 		if m.beforeClaim != nil {
 			m.beforeClaim(j)

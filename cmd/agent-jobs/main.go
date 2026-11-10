@@ -428,6 +428,8 @@ func runGuard(args []string, stdin io.Reader) int {
 	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
 	var sources multi
 	fs.Var(&sources, "sources", "the job's cloned sources dir: read-only, its code never runs on the host (repeatable)")
+	var webAllow multi
+	fs.Var(&webAllow, "web-allow", "a host WebFetch may reach over https (config web_allow_hosts, repeatable); given, every other host and WebSearch are refused")
 	sandbox := fs.String("sandbox", "", "the job's sandbox dir: its copies run only in docker run --rm with one -v mount from it")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -450,7 +452,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
 		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
-		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob),
+		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob), WebAllow: webAllow,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -600,6 +602,8 @@ func cmdStart(args []string) error {
 	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
+	var docs multi
+	fs.Var(&docs, "doc", "provider docs: https URL on a config web_allow_hosts host; the daemon fetches it into sources/ as a text file before the job starts (repeatable, max 5)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -620,6 +624,9 @@ func cmdStart(args []string) error {
 	}
 	if len(sources) > 0 {
 		r.Sources = sources
+	}
+	if len(docs) > 0 {
+		r.Docs = docs
 	}
 	switch {
 	case *brief != "":
@@ -799,6 +806,9 @@ func cmdStatus(args []string) error {
 	}
 	if len(j.SourceFiles) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.SourceFiles, ", "))
+	}
+	if len(j.Docs) > 0 {
+		fmt.Printf("docs:      %s\n", strings.Join(j.Docs, ", "))
 	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if p := m.PrepareResultOf(j); p != nil {

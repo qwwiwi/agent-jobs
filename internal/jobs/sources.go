@@ -624,7 +624,7 @@ func (m *Manager) prefetchInBackground() {
 	go func() {
 		defer m.prefetchWG.Done()
 		defer m.prefetching.Store(false)
-		m.prefetchSources()
+		m.prefetchQueued()
 	}()
 }
 

@@ -101,6 +101,10 @@ type Config struct {
 	// JobID is the job's id (G02): a sandbox container is named aj-<JobID>-<suffix>, so the daemon removes
 	// it when the job ends. "" = docker refused.
 	JobID string
+	// WebAllow are the hosts a job's WebFetch may reach (config web_allow_hosts, v0.8.2 G07): given, a
+	// WebFetch call must name an https URL on one of them and WebSearch is refused (webfetch.go). Empty
+	// = the guard does not look at the web tools (the settings' deny rules close them).
+	WebAllow []string
 	// readAllowScope marks the read scope readScopes builds from ReadAllow (StateDir "/", the allowed
 	// paths its own folders).
 	readAllowScope bool
@@ -116,6 +120,7 @@ type HookInput struct {
 		NotebookPath string `json:"notebook_path"`
 		Path         string `json:"path"`    // Grep, Glob
 		Pattern      string `json:"pattern"` // Glob (Grep's pattern is a regexp, not a path)
+		URL          string `json:"url"`     // WebFetch
 	} `json:"tool_input"`
 	// RawInput is tool_input as sent (subagent calls are checked on fields of their own).
 	RawInput json.RawMessage `json:"-"`
@@ -163,6 +168,9 @@ func decideCall(r io.Reader, cfg Config) (string, error) {
 	}
 	if !ToolAllowed(in.ToolName) {
 		return toolRefused(in.ToolName), nil
+	}
+	if len(cfg.WebAllow) > 0 && (in.ToolName == "WebFetch" || in.ToolName == "WebSearch") {
+		return checkWebTool(in.ToolName, in.ToolInput.URL, cfg.WebAllow), nil
 	}
 	if readTools[in.ToolName] {
 		p, pattern := in.ToolInput.Path, ""

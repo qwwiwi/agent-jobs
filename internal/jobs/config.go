@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -206,6 +207,10 @@ type Config struct {
 	// ...; v0.8.2 G04): a further fix started with review= is refused unless it carries design or
 	// loop_override. 0 = DefaultReviewMaxFixLoops (2); at most CeilingReviewMaxFixLoops (10).
 	ReviewMaxFixLoops int `json:"review_max_fix_loops"`
+	// WebAllowHosts are the hosts a claude fix, general or review job's WebFetch may reach over https, and
+	// the only hosts the daemon fetches a job's `docs` from (v0.8.2 G07, G08): exact host names, no
+	// wildcard, port, scheme or IP. Empty = no job has WebFetch and `docs` is refused. WebSearch stays closed.
+	WebAllowHosts []string `json:"web_allow_hosts"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked
 	// either way. The owner turns it on.
@@ -624,6 +629,13 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if c.ReviewMaxFixLoops < 0 || c.ReviewMaxFixLoops > CeilingReviewMaxFixLoops {
 		return c, fmt.Errorf("config.json: review_max_fix_loops %d must be 0 (default %d) to %d", c.ReviewMaxFixLoops,
 			DefaultReviewMaxFixLoops, CeilingReviewMaxFixLoops)
+	}
+	if hosts, err := guard.NormalizeWebHosts(c.WebAllowHosts); err != nil {
+		return c, fmt.Errorf("config.json: web_allow_hosts: %w", err)
+	} else if len(hosts) > MaxWebAllowHosts {
+		return c, fmt.Errorf("config.json: web_allow_hosts lists %d hosts, at most %d", len(hosts), MaxWebAllowHosts)
+	} else {
+		c.WebAllowHosts = hosts
 	}
 	if c.SourcesMaxMB < 0 {
 		return c, errors.New("config.json: sources_max_mb must be 0 (default) or positive")

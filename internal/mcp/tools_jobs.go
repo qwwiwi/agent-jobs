@@ -166,6 +166,8 @@ type JobView struct {
 	GateWait *jobs.GateWaitView `json:"gate_wait,omitempty"`
 	// Sources are the origins of read-only file copies (or legacy repository clones).
 	Sources []string `json:"sources,omitempty"`
+	// Docs are the provider-documentation URLs the daemon fetches into sources/ (v0.8.2 G08).
+	Docs []string `json:"docs,omitempty"`
 	// Crew (crew jobs only, issue #169): the advisor setup, its calls as a timeline and the cost split
 	// main / advisor; CrewError says why it could not be read.
 	Crew      *jobs.CrewView `json:"crew,omitempty"`
@@ -203,7 +205,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		Paths: j.Paths, OnOverlap: j.OnOverlap, Overlap: j.Overlap, WaitFor: j.WaitFor, Parent: j.Parent, ParentBase: j.ParentBase,
 		Review: j.Review, ReviewBlocking: findingIDs(j.ReviewBlocking), ControlReview: j.ControlReview, ControlJob: j.ControlJob, ControlNote: j.ControlNote,
 		Design: j.LoopDesign, LoopOverride: j.LoopOverride,
-		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
+		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...), Docs: j.Docs,
 	}
 	v.Crew, v.CrewError = crewView(m, j)
 	v.GateWait = m.GateWaitOf(j)
@@ -280,6 +282,7 @@ type JobStartInput struct {
 	Milestone           int64    `json:"milestone,omitempty" jsonschema:"milestone id: attach the job to a task of that milestone (give task too). Refused when the task is blocked (a dependency not done) or dropped; the milestone's branch is the default base; a task with depends_on gets their accepted jobs' results in its prompt"`
 	Task                string   `json:"task,omitempty" jsonschema:"task key in the milestone (T1, T2, ...); goes with milestone"`
 	Sources             []string `json:"sources,omitempty" jsonschema:"optional read-only file copies: absolute file paths or job:<id> (report.md of a job belonging to this agent). At most 10 regular files, 2 MiB each; symlinks, missing files and unknown or foreign jobs are refused. Copied synchronously into the new job directory as sources/<unique basename> before enqueue; origins and paths appear in the prompt. Refused for openrouter:<slug> models (#146: deny_repos covers only the job repo). Repository cloning remains disabled until OS-level isolation lands (G02 deferred)."`
+	Docs                []string `json:"docs,omitempty" jsonschema:"optional provider documentation: https URLs (at most 5) whose host is listed in the daemon's config web_allow_hosts (exact host, https, default port, no userinfo, no IP). The daemon fetches each page before the job starts and saves it as a text file sources/doc-<host>-<path>.txt (HTML reduced to text, at most 2 MiB, text types only; a redirect off the allowlist is refused). A page that cannot be fetched is named in the prompt as not fetched and the job starts anyway. The prompt marks the files as data, not instructions. Refused when web_allow_hosts is empty, for openrouter models and for the gate kinds"`
 	Paths               []string `json:"paths,omitempty" jsonschema:"fix/general with repo: expected repository-relative paths or globs (at most 64, 256 bytes each). Go path.Match syntax plus ** as a whole component; a trailing slash includes descendants. Compared with other queued/running fix/general jobs without expanding against the filesystem. Missing paths on either side keep only the same_repo_jobs advisory"`
 	OnOverlap           string   `json:"on_overlap,omitempty" jsonschema:"warn (default): queue and return overlapping jobs and declarations in overlap; serialize: wait queued for those jobs to finish; refuse: reject on overlap. An explicit parent stack handles overlap with that parent. Other overlaps still follow this policy"`
 	Parent              string   `json:"parent,omitempty" jsonschema:"explicit stack: id of a fix/general job of this agent on the same repository. Waits queued for that parent's success and starts from its result commit (including after cleanup); refused if it failed, cancelled, or timed out. Mutually exclusive with base. Recorded in job_status/job_result"`
@@ -312,7 +315,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			Complexity: in.Complexity, MaxTurns: in.MaxTurns, MaxBudgetUSD: in.MaxBudgetUSD, TimeoutMinutes: in.TimeoutMinutes,
 			Runner: in.Runner, ReasoningEffort: in.ReasoningEffort, AcceptanceCmd: in.AcceptanceCmd,
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
-			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
+			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources, Docs: in.Docs,
 			Paths: in.Paths, OnOverlap: in.OnOverlap, Parent: in.Parent, Review: in.Review, ControlReview: in.ControlReview,
 			Design: in.Design, LoopOverride: in.LoopOverride,
 			Crew: jobs.CrewRequest{AdvisorModel: in.AdvisorModel, AdvisorMaxCalls: in.AdvisorMaxCalls,
