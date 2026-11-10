@@ -676,3 +676,76 @@ func TestRunGateMaxParallelFromEnv(t *testing.T) {
 		t.Fatalf("env max parallel 1: %d inside at once", most)
 	}
 }
+
+// G03: an old binary waiting for the single box lock (queued in its FIFO) is not starved by new gates:
+// a new gate that comes after it waits until it has run, though a slot is free.
+func TestRunGateYieldsToLegacyWaiter(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	repoA, repoB := newRepo(t), newRepo(t)
+	headA := strings.TrimSpace(gitT(t, repoA, "rev-parse", "HEAD"))
+	headB := strings.TrimSpace(gitT(t, repoB, "rev-parse", "HEAD"))
+	started := filepath.Join(t.TempDir(), "a-started")
+	doneA := make(chan int, 1)
+	go func() {
+		code, _, _ := runGateT(t, GateRun{Dir: repoA, Head: headA, LockPath: lock, MaxParallel: 2,
+			Argv: []string{"/bin/sh", "-c", "touch " + started + "; sleep 1"}})
+		doneA <- code
+	}()
+	waitFileT(t, started)
+	// The old binary: an exclusive flock on the single box lock, queued behind the running new gate.
+	var oldAt time.Time
+	doneOld := make(chan error, 1)
+	go func() {
+		l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 20 * time.Second, detail: ": old binary"})
+		if err == nil {
+			oldAt = time.Now()
+			time.Sleep(300 * time.Millisecond)
+			l.release()
+		}
+		doneOld <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(readFileOrEmpty(lock+gateQueueSuffix), " ") {
+		if time.Now().After(deadline) {
+			t.Fatal("the old binary never queued for the box lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A new gate of another repository arrives while the old binary waits.
+	var bAt time.Time
+	code, _, errs := runGateT(t, GateRun{Dir: repoB, Head: headB, LockPath: lock, MaxParallel: 2, LockWait: 20 * time.Second,
+		Argv: []string{"true"}})
+	bAt = time.Now()
+	if code != 0 {
+		t.Fatalf("new gate B: %d %s", code, errs)
+	}
+	if err := <-doneOld; err != nil {
+		t.Fatalf("old binary: %v", err)
+	}
+	if c := <-doneA; c != 0 {
+		t.Fatalf("new gate A: %d", c)
+	}
+	if oldAt.IsZero() || bAt.Before(oldAt) {
+		t.Fatalf("the new gate B (done %s) overtook the queued old binary (got the lock %s)", bAt.Format(time.StampMilli),
+			oldAt.Format(time.StampMilli))
+	}
+}
+
+func waitFileT(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never appeared", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func readFileOrEmpty(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
+}

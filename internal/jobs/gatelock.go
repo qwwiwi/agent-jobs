@@ -87,11 +87,14 @@ const (
 // gateLockStep is one lock of a gate's acquisition, taken in order (repository, slot, legacy), all
 // within the one wait of the request.
 type gateLockStep struct {
-	name   string   // for notes and errors
-	paths  []string // the candidates: taking any one is the step (the box slots); one for a plain lock
-	queue  string   // the FIFO of the step's waiters ("" = none: a shared lock never waits for its peers)
-	how    int      // syscall.LOCK_EX or syscall.LOCK_SH
-	holder bool     // the holder line goes into the taken file, cleared on release
+	name  string   // for notes and errors
+	paths []string // the candidates: taking any one is the step (the box slots); one for a plain lock
+	queue string   // the FIFO of the step's waiters ("" = none: a shared lock never waits for its peers)
+	// yield is a FIFO the step does not join but waits behind while it has a live waiter: the shared
+	// step yields to the pre-0.8.2 gates queued for the single box lock, so they are not starved.
+	yield  string
+	how    int  // syscall.LOCK_EX or syscall.LOCK_SH
+	holder bool // the holder line goes into the taken file, cleared on release
 }
 
 // gateLockSteps are the locks r takes, in this order (every gate the same order, so no two wait for
@@ -99,7 +102,8 @@ type gateLockStep struct {
 //   - its repository's lock, exclusive: two gates of one repository (any of its work trees) serialize;
 //   - one of the box slots, exclusive: at most that many gates run on the box at once;
 //   - the pre-0.8.2 single box lock, shared: new gates run beside each other, but neither beside a gate
-//     of an old binary (which takes it exclusively) nor it beside them, while a box upgrades.
+//     of an old binary (which takes it exclusively) nor it beside them, while a box upgrades. A new gate
+//     waits while an old binary waits in that lock's queue, so a stream of new gates cannot starve it.
 func gateLockSteps(r gateLockReq) []gateLockStep {
 	legacy := gateLockStep{name: r.path, paths: []string{r.path}, queue: r.path + gateQueueSuffix, how: syscall.LOCK_EX, holder: true}
 	if r.repo == "" {
@@ -115,7 +119,7 @@ func gateLockSteps(r gateLockReq) []gateLockStep {
 		{name: repo + " (the repository's gate lock)", paths: []string{repo}, queue: repo + gateQueueSuffix, how: syscall.LOCK_EX, holder: true},
 		{name: fmt.Sprintf("%s* (%d box slots)", filepath.Join(dir, gateSlotLockPrefix), len(slots)), paths: slots,
 			queue: filepath.Join(dir, gateSlotQueueName), how: syscall.LOCK_EX, holder: true},
-		{name: r.path, paths: []string{r.path}, how: syscall.LOCK_SH},
+		{name: r.path, paths: []string{r.path}, yield: r.path + gateQueueSuffix, how: syscall.LOCK_SH},
 	}
 }
 
@@ -135,8 +139,12 @@ func gateSlotPath(dir string, i int) string {
 // gateRepoKey is the identity of the repository with work tree dir: its git common dir (shared by all of
 // its work trees), absolute and without symlinks; dir itself when it is no git work tree.
 func gateRepoKey(dir string) string {
-	if out, err := git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir"); err == nil {
+	// Without --path-format (git 2.31+): a relative answer is relative to dir.
+	if out, err := git(dir, "rev-parse", "--git-common-dir"); err == nil {
 		if p := strings.TrimSpace(out); p != "" {
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
 			dir = p
 		}
 	}
@@ -233,6 +241,11 @@ func (a *gateAcquisition) take(ctx context.Context, step gateLockStep) (*gateHel
 		q = openGateQueue(step.queue)
 	}
 	defer q.close()
+	yield := &gateQueue{}
+	if step.yield != "" {
+		yield = openGateQueue(step.yield)
+	}
+	defer yield.close()
 	var me *gateEntry
 	defer func() {
 		if me != nil {
@@ -241,7 +254,7 @@ func (a *gateAcquisition) take(ctx context.Context, step gateLockStep) (*gateHel
 	}()
 	noted := false
 	for {
-		if !q.anyAhead(me) {
+		if !q.anyAhead(me) && !yield.anyAhead(nil) {
 			for i, f := range files {
 				err := syscall.Flock(int(f.Fd()), step.how|syscall.LOCK_NB)
 				if err == nil {

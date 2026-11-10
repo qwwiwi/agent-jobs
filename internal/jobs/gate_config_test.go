@@ -145,3 +145,23 @@ func TestGateLockViewShowsSlots(t *testing.T) {
 		t.Fatalf("no gate runs: %+v", v)
 	}
 }
+
+// G01: the repository key is the git common dir: the main checkout, a subdirectory of it and a linked
+// work tree share one lock; another repository and a plain directory get their own.
+func TestGateRepoKey(t *testing.T) {
+	repo := newRepo(t)
+	sub := filepath.Join(repo, "sub")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitT(t, repo, "worktree", "add", "-q", "--detach", wt, "HEAD")
+	k := gateRepoKey(repo)
+	if gateRepoKey(sub) != k || gateRepoKey(wt) != k || !filepath.IsAbs(k) {
+		t.Fatalf("one repository, keys %q %q %q", k, gateRepoKey(sub), gateRepoKey(wt))
+	}
+	plain := t.TempDir()
+	if other := gateRepoKey(newRepo(t)); other == k || gateRepoKey(plain) == k {
+		t.Fatalf("another repository or a plain dir shares key %q", k)
+	}
+}

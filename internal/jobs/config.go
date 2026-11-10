@@ -198,8 +198,9 @@ type Config struct {
 	GateTimeoutMinutes int `json:"gate_timeout_minutes"`
 	// GateMaxParallel is how many gates (of any repository) run on the box at once: the box slots this
 	// agent's gates and acceptance steps take (two gates of one repository never run at once). 0 =
-	// DefaultGateMaxParallel (2); at most CeilingGateMaxParallel (8). Gates of agents with different
-	// values share the slots: the largest value decides how many can run together.
+	// DefaultGateMaxParallel (2); at most CeilingGateMaxParallel (8). All gates of the box share the
+	// slots and one queue, and a gate outside a job uses $AGENT_JOBS_GATE_MAX_PARALLEL or the default:
+	// keep one value per box (a waiter with fewer slots at the head of the queue holds back the others).
 	GateMaxParallel int `json:"gate_max_parallel"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked
