@@ -20,7 +20,8 @@ const gateRunUsage = "usage: agent-jobs gate run --head REV [--repo DIR] [--time
 // the box can lock different files.
 var gateRunTestLock string
 
-// cmdGateRun is `agent-jobs gate run` (#134): one heavy local gate at a time per box, on the asserted
+// cmdGateRun is `agent-jobs gate run` (#134): one heavy local gate at a time per repository, at most
+// jobs.GateMaxParallelEnvVar (default 2) per box (v0.8.2), on the asserted
 // HEAD, in a process group of its own, without TELEGRAM_*, always ending with exit=N on stdout
 // (jobs.RunGate). It returns the exit code; a usage error is GateExitRunner and prints the marker too.
 func cmdGateRun(args []string, stdout, stderr io.Writer) int {
@@ -28,7 +29,10 @@ func cmdGateRun(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	repo := fs.String("repo", ".", "the git work tree the command runs in")
 	head := fs.String("head", "", "the commit HEAD must be at (required)")
-	timeout := fs.Duration("timeout", jobs.DefaultGateTimeout, "the command's time limit; then its process group is killed")
+	// 0 (not given): the job's gate timeout (jobs.GateTimeoutEnvVar, from its card or config), else
+	// jobs.DefaultGateTimeout. An explicit value wins.
+	timeout := fs.Duration("timeout", 0, "the command's time limit, then its process group is killed (default: $"+
+		jobs.GateTimeoutEnvVar+", else "+jobs.DefaultGateTimeout.String()+")")
 	lockWait := fs.Duration("lock-wait", jobs.DefaultGateLockWait, "how long to wait for another gate on this box")
 	// Flags stop at the command: what follows (its own flags too) is passed through untouched.
 	if err := fs.Parse(args); err != nil {

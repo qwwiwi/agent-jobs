@@ -85,3 +85,28 @@ func TestGateRunAllowedInsideJob(t *testing.T) {
 		}
 	}
 }
+
+// G02: without --timeout the gate takes the job's gate timeout from the environment; an explicit
+// --timeout still wins.
+func TestGateRunCLITimeout(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), "agent-jobs-gate.lock")
+	gateRunTestLock = lock
+	t.Cleanup(func() { gateRunTestLock = "" })
+	repo := t.TempDir()
+	for _, args := range [][]string{{"init", "-q"}, {"-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-q",
+		"--allow-empty", "-m", "init"}} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	t.Setenv(jobs.GateTimeoutEnvVar, "300ms")
+	var o, e bytes.Buffer
+	if code := cmdGateRun([]string{"--repo", repo, "--head", "HEAD", "--", "sleep", "3"}, &o, &e); code != jobs.GateExitTimeout {
+		t.Fatalf("env timeout: code %d, out %q, err %q", code, o.String(), e.String())
+	}
+	o.Reset()
+	e.Reset()
+	if code := cmdGateRun([]string{"--repo", repo, "--head", "HEAD", "--timeout", "1m", "--", "sleep", "0.6"}, &o, &e); code != 0 {
+		t.Fatalf("explicit --timeout: code %d, out %q, err %q", code, o.String(), e.String())
+	}
+}

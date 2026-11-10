@@ -144,8 +144,10 @@ func TestGateLockReleasedOnKill(t *testing.T) {
 	suite := readPID(t, marker)
 	t.Cleanup(func() { _ = syscall.Kill(-suite, syscall.SIGKILL) })
 	lock := filepath.Join(lockDir, GateLockName)
-	if !strings.HasPrefix(readFileT(t, lock), fmt.Sprintf("pid %d job ", cmd.Process.Pid)) {
-		t.Fatalf("holder line %q does not name the runner %d", readFileT(t, lock), cmd.Process.Pid)
+	// The holder line is in the repository's lock (the box lock is shared by the running gates).
+	repoLock := gateRepoLockIn(lockDir, gateRepoKey(repo))
+	if !strings.HasPrefix(readFileT(t, repoLock), fmt.Sprintf("pid %d job ", cmd.Process.Pid)) {
+		t.Fatalf("holder line %q does not name the runner %d", readFileT(t, repoLock), cmd.Process.Pid)
 	}
 	// The job is killed: its process group (the runner) and, as the job's scope or session sweep does,
 	// the suite's own group.

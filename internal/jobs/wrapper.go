@@ -1110,8 +1110,9 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 }
 
 // RunnerEnv is the environment a job's runner starts with, built from env: the job's git environment
-// (GitEnv), the job marker without the user bus (JobEnv), the job's temp dir (TempEnv) and, for a
-// claude runner, no fork subagents (ForkSubagentEnv). An advisor call of a crew job gets it too.
+// (GitEnv), the job marker without the user bus (JobEnv), the job's gate settings (gateSettingsEnv),
+// the job's temp dir (TempEnv) and, for a claude runner, no fork subagents (ForkSubagentEnv). An
+// advisor call of a crew job gets it too.
 func RunnerEnv(jobDir string, env []string, runner string) ([]string, error) {
 	env, err := GitEnv(jobDir, env)
 	if err != nil {
@@ -1119,6 +1120,9 @@ func RunnerEnv(jobDir string, env []string, runner string) ([]string, error) {
 	}
 	if env, err = JobEnv(jobDir, env); err != nil {
 		return nil, fmt.Errorf("job marker: %w", err)
+	}
+	if env, err = gateSettingsEnv(jobDir, env); err != nil {
+		return nil, fmt.Errorf("gate settings: %w", err)
 	}
 	// Created by prepare; again here for an attempt prepared by an older build.
 	tmp, err := ensureJobTmp(jobDir)
