@@ -448,6 +448,8 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		inserted = ok
 		if ok {
 			m.logSize(j)
+			// The daemon starts the job at once, not at its next minute tick (G12).
+			m.kickDaemon()
 		}
 		return j, nil
 	}

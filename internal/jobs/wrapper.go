@@ -859,7 +859,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		}
 		costJournal.end(openRouter, status, msg, openRouter.lookup(deadline))
 	}
-	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
+	err = writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code)))
+	// The completion is stored: the daemon can collect the job and refill its slot now (G12). Sent last,
+	// once the wrapper has nothing left to do: collecting the job stops its scope, which ends the wrapper.
+	kickDaemonOf(jobDir, stderrLog)
+	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)
 		return 2
 	}
@@ -929,7 +933,9 @@ func finishBeforeRunner(jobDir string, res StreamResult, record func(StreamResul
 		fmt.Fprintln(log, "run-wrapper: record completion:", err)
 		return 2
 	}
-	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n")); err != nil {
+	err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n"))
+	kickDaemonOf(jobDir, log) // the completion is stored (G12); sent last, as in RunWrapper
+	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: write exit_code:", err)
 		return 2
 	}

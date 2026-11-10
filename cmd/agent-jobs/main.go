@@ -1456,6 +1456,12 @@ func cmdTick(args []string) error {
 }
 
 func cmdDaemon(args []string) error {
+	// Kicks (G12) are caught before anything else: SIGUSR1 ends a process that does not handle it, and a
+	// wrapper or Enqueue may kick this pid as soon as daemon.json names it. The handler stays until the
+	// process exits (no signal.Stop): a kick during shutdown is dropped, it never ends the daemon. One
+	// buffered slot: kicks that arrive while one waits are folded into it.
+	kicks := make(chan os.Signal, 1)
+	signal.Notify(kicks, jobs.KickSignal)
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	if _, err := parse(fs, args); err != nil {
@@ -1504,9 +1510,14 @@ func cmdDaemon(args []string) error {
 	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
-	for {
+	// The minute tick as before, plus a debounced tick on every kick (G12, G13): a queued job starts
+	// seconds after a slot frees or it is enqueued, not at the next minute.
+	daemonLoop(ctx, wallClock{}, t.C, kicks, func(minute bool) {
 		if err := m.Tick(); err != nil {
 			m.Log.Printf("tick: %v", err)
+		}
+		if !minute {
+			return // the daily run and the heartbeat keep the minute's cadence
 		}
 		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
 		// the next ticks keep launching jobs while it runs.
@@ -1514,18 +1525,14 @@ func cmdDaemon(args []string) error {
 		// Heartbeat (off by default): the Go gate, then at most one small-model decision in the
 		// background, so a slow decision never delays the next tick.
 		m.StartHeartbeat(ctx)
-		select {
-		case <-ctx.Done():
-			// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
-			// in progress stops between jobs (ctx) and is waited for before the store closes.
-			m.Log.Printf("daemon stopping; running jobs keep running")
-			m.WaitDaily()
-			m.WaitHeartbeat()
-			<-httpDone
-			return nil
-		case <-t.C:
-		}
-	}
+	})
+	// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
+	// in progress stops between jobs (ctx) and is waited for before the store closes.
+	m.Log.Printf("daemon stopping; running jobs keep running")
+	m.WaitDaily()
+	m.WaitHeartbeat()
+	<-httpDone
+	return nil
 }
 
 func cmdMCP(args []string) error {
