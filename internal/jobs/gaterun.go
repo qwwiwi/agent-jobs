@@ -17,10 +17,12 @@ import (
 
 // Serialized gate runner (#134): `agent-jobs gate run` runs one heavy local gate (check.sh, a pg suite,
 // a vite build) for the orchestrator so that
-//   - one gate runs at a time per box: an exclusive flock on one fixed file, GateLockPath(), shared by
-//     every agent, user and state root of the box (never derived from AGENT_JOBS_HOME, HOME, TMPDIR or
-//     a flag, so no two callers can lock different files); a waiter gives up after its lock wait
-//     instead of hanging;
+//   - one gate runs at a time per repository, and at most gate_max_parallel (default 2) per box
+//     (v0.8.2): a gate takes its repository's lock, one of the box slots and a shared flock on the
+//     pre-0.8.2 single box lock (gateLockSteps), all fixed files next to GateLockPath(), shared by every
+//     agent, user and state root of the box (never derived from AGENT_JOBS_HOME, HOME, TMPDIR or a
+//     flag, so no two callers can lock different files); a waiter gives up after its lock wait instead
+//     of hanging;
 //   - it runs on the commit it claims to check: HEAD of the work tree must resolve to the asserted
 //     commit once the lock is held, and still after the command (a checkout meanwhile fails the gate);
 //   - it always ends with the line exit=N on stdout, whatever happened (a refusal, a missing command, a
@@ -40,7 +42,7 @@ const (
 	GateExitTimeout     = 124 // as timeout(1)
 	GateExitRunner      = 125 // as timeout(1): the runner itself failed
 	GateExitNotStarted  = 127
-	DefaultGateTimeout  = 30 * time.Minute
+	DefaultGateTimeout  = DefaultGateTimeoutMinutes * time.Minute
 	DefaultGateLockWait = 60 * time.Minute
 	GateLockName        = "agent-jobs-gate.lock"
 	gateKillGrace       = 5 * time.Second
@@ -60,12 +62,15 @@ type GateRun struct {
 	Dir      string        // the git work tree the command runs in
 	Head     string        // the commit HEAD must be at (any revision git resolves, compared as full ids); required
 	Argv     []string      // the command and its arguments (no shell)
-	Timeout  time.Duration // the command's limit; 0 = DefaultGateTimeout
+	Timeout  time.Duration // the command's limit; 0 = GateTimeoutEnvVar of Env, else DefaultGateTimeout
 	LockPath string        // tests only: another lock file; "" (every real caller, the CLI has no flag) = GateLockPath()
 	LockWait time.Duration // how long to wait for the lock; 0 = DefaultGateLockWait
-	Env      []string      // the base environment; nil = os.Environ()
-	Stdout   io.Writer     // the command's stdout and the exit= line; nil = os.Stdout
-	Stderr   io.Writer     // command stderr; bounded runner notes follow after unlock; nil = os.Stderr
+	// MaxParallel is the box slots (gates of any repository at once); 0 = GateMaxParallelEnvVar of Env,
+	// else DefaultGateMaxParallel.
+	MaxParallel int
+	Env         []string  // the base environment; nil = os.Environ()
+	Stdout      io.Writer // the command's stdout and the exit= line; nil = os.Stdout
+	Stderr      io.Writer // command stderr; bounded runner notes follow after unlock; nil = os.Stderr
 }
 
 // gateLockDirs are the candidate directories of the box-wide gate lock, the first that exists wins:
@@ -146,14 +151,23 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if g.Dir == "" {
 		g.Dir = "."
 	}
-	if g.Timeout <= 0 {
-		g.Timeout = DefaultGateTimeout
-	}
 	if g.LockWait <= 0 {
 		g.LockWait = DefaultGateLockWait
 	}
 	if g.Env == nil {
 		g.Env = os.Environ()
+	}
+	if g.Timeout <= 0 {
+		var note string
+		if g.Timeout, note = gateTimeoutFromEnv(g.Env); note != "" {
+			fmt.Fprintf(g.Stderr, "gate: %s\n", note)
+		}
+	}
+	if g.MaxParallel <= 0 {
+		var note string
+		if g.MaxParallel, note = gateMaxParallelFromEnv(g.Env); note != "" {
+			fmt.Fprintf(g.Stderr, "gate: %s\n", note)
+		}
 	}
 	if g.LockPath == "" {
 		g.LockPath = GateLockPath()
@@ -164,7 +178,8 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	// status and the job's timeout.
 	job := envValue(g.Env, JobEnvVar)
 	lease, err := acquireGateLock(ctx, gateLockReq{path: g.LockPath, wait: g.LockWait, job: job,
-		detail: gateHolderDetail(g, ""), notes: g.Stderr, waits: newGateWaitRecorder(gateJobDir(g.Env, job))})
+		detail: gateHolderDetail(g, ""), notes: g.Stderr, waits: newGateWaitRecorder(gateJobDir(g.Env, job)),
+		repo: gateRepoKey(g.Dir), slots: g.MaxParallel})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintf(g.Stderr, "gate: stopped while waiting for the gate lock %s\n", g.LockPath)
@@ -182,7 +197,7 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	if code := assertGateHead(g, want, "before the run"); code != 0 {
 		return code
 	}
-	writeGateHolderLine(g.LockPath, gateHolderLine(job, gateHolderDetail(g, want)))
+	lease.writeHolder(gateHolderLine(job, gateHolderDetail(g, want)))
 	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
 
 	start := time.Now()

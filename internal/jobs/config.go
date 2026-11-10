@@ -192,6 +192,16 @@ type Config struct {
 	// and the daemon and wrapper do not run it). Enabling requires a daemon restart; disabling on
 	// disk revokes it immediately. The command runs the job's code outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
+	// GateTimeoutMinutes is the time limit of a gate's command (`agent-jobs gate run` inside a job
+	// without --timeout; a matching card's gate_timeout: wins). 0 = DefaultGateTimeoutMinutes (60); at
+	// most CeilingGateTimeoutMinutes (180).
+	GateTimeoutMinutes int `json:"gate_timeout_minutes"`
+	// GateMaxParallel is how many gates (of any repository) run on the box at once: the box slots this
+	// agent's gates and acceptance steps take (two gates of one repository never run at once). 0 =
+	// DefaultGateMaxParallel (2); at most CeilingGateMaxParallel (8). All gates of the box share the
+	// slots and one queue, and a gate outside a job uses $AGENT_JOBS_GATE_MAX_PARALLEL or the default:
+	// keep one value per box (a waiter with fewer slots at the head of the queue holds back the others).
+	GateMaxParallel int `json:"gate_max_parallel"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked
 	// either way. The owner turns it on.
@@ -602,6 +612,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 			DefaultAutoContinueFraction)
 	}
 	if err := c.validateAcceptance(); err != nil {
+		return c, err
+	}
+	if err := c.validateGate(); err != nil {
 		return c, err
 	}
 	if c.SourcesMaxMB < 0 {

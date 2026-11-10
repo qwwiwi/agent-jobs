@@ -122,10 +122,14 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
-  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
+  gate run --head REV [--repo DIR] [--timeout 60m] [--lock-wait 60m] -- CMD [ARGS...]
                                            a heavy local gate (check.sh, a pg suite, a build):
-                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
-                                           /tmp/ where /run/lock is missing), HEAD of DIR
+                                           one at a time per repository, at most
+                                           $AGENT_JOBS_GATE_MAX_PARALLEL (gate_max_parallel, default
+                                           2) per box (locks in /run/lock, /tmp/ where /run/lock is
+                                           missing); --timeout defaults to $AGENT_JOBS_GATE_TIMEOUT
+                                           (a job's card gate_timeout: or gate_timeout_minutes),
+                                           else 60m; HEAD of DIR
                                            must be REV before and after, own process group killed
                                            on timeout (exit 124) and after the command, TELEGRAM_*
                                            dropped; the last stdout line is always exit=N
@@ -821,9 +825,11 @@ func printQueue(m *jobs.Manager) error {
 		return err
 	}
 	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
-	// The box-wide gate lock that serializes heavy steps (#208).
-	if g := q.GateLock; g.Holder != "" {
-		fmt.Printf("gate lock: held, untrusted holder line: %s\n", shown(g.Holder))
+	// The gate locks that serialize heavy steps (#208; per repository and box slot since v0.8.2).
+	if g := q.GateLock; len(g.Holders) > 0 {
+		for _, h := range g.Holders {
+			fmt.Printf("gate lock: held, untrusted holder line: %s\n", shown(h))
+		}
 	} else {
 		fmt.Println("gate lock: free")
 	}

@@ -3,6 +3,7 @@ package jobs
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -70,14 +71,39 @@ func (m *Manager) creditGateWait(j *store.Job, now time.Time) {
 	j.GateWaitSec = sec
 }
 
-// GateLockView is the box-wide gate lock as status and system_doctor show it (#208).
+// GateLockView is the gate lock as status and system_doctor show it (#208): the gates that run, one
+// per held box slot (v0.8.2), and a gate of a pre-0.8.2 binary holding the single box lock.
 type GateLockView struct {
 	Path string `json:"path"`
-	// Holder is the holder's line ("pid N job J since T at HEAD in DIR: CMD"), untrusted text (anyone can
-	// write the lock file), bounded, printable and redacted; "" when the lock is free.
+	// Holder is the first of Holders ("" when no gate runs), for readers of the single box lock.
 	Holder string `json:"holder,omitempty"`
+	// Holders are the holder lines ("pid N job J since T at HEAD in DIR: CMD") of the running gates,
+	// untrusted text (anyone can write the lock files), bounded, printable and redacted.
+	Holders []string `json:"holders,omitempty"`
 	// Waiting are this agent's running jobs whose gate or acceptance step waits for the lock.
 	Waiting []GateLockWaiter `json:"waiting,omitempty"`
+}
+
+// gateLockHeld reports whether someone holds the lock at path exclusively, and its holder line then. A
+// shared flock tried without blocking (and dropped at once) fails only while one does.
+func gateLockHeld(path string) (string, bool) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return "", false
+	}
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if err == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return "", false
+	}
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
+		return "", false
+	}
+	return RedactPrintable(gateHolder(f), 300), true
 }
 
 // GateLockWaiter is one running job waiting for the gate lock.
@@ -86,21 +112,24 @@ type GateLockWaiter struct {
 	GateWaitView
 }
 
-// gateLockView reads the lock's holder line and the waits of the running jobs. Whether the lock is held
-// is the kernel's answer, not the line's: a holder that was killed leaves its line behind, and anyone can
-// write one. A shared flock tried without blocking (and dropped at once) fails only while a gate holds
-// the exclusive one; the line is shown then.
+// gateLockView reads the holder lines of the held gate locks and the waits of the running jobs: the
+// single box lock (held exclusively only by a pre-0.8.2 gate; new gates hold it shared) and every box
+// slot. Whether a lock is held is the kernel's answer, not the line's: a holder that was killed leaves
+// its line behind, and anyone can write one.
 func (m *Manager) gateLockView(running []*store.Job) GateLockView {
 	v := GateLockView{Path: GateLockPath()}
-	if f, err := os.OpenFile(v.Path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0); err == nil {
-		if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
-			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err == nil {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-			} else if errors.Is(err, syscall.EWOULDBLOCK) {
-				v.Holder = RedactPrintable(gateHolder(f), 300)
-			}
+	dir := filepath.Dir(v.Path)
+	paths := []string{v.Path}
+	for i := range CeilingGateMaxParallel {
+		paths = append(paths, gateSlotPath(dir, i))
+	}
+	for _, p := range paths {
+		if h, held := gateLockHeld(p); held {
+			v.Holders = append(v.Holders, h)
 		}
-		f.Close()
+	}
+	if len(v.Holders) > 0 {
+		v.Holder = v.Holders[0]
 	}
 	for _, j := range running {
 		if w := m.GateWaitOf(j); w != nil && w.Waiting {

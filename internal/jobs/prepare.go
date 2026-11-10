@@ -642,6 +642,10 @@ func (m *Manager) prepare(j *store.Job, token, dir string, promptConfig ...Confi
 	if err := os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(prompt), 0o600); err != nil {
 		return err
 	}
+	// The job's gate timeout and box slots, for `agent-jobs gate run` inside it (RunnerEnv).
+	if err := writeGateSettings(dir, gateSettingsFor(m.Config(), cards)); err != nil {
+		return fmt.Errorf("write %s: %w", GateSettingsFile, err)
+	}
 	if err := m.writePriorReports(prior, dir); err != nil {
 		return err
 	}

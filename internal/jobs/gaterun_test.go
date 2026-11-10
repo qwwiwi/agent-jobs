@@ -389,10 +389,11 @@ func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
 		first <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: 500 * time.Millisecond,
 			Env: os.Environ(), Argv: []string{"/bin/sh", "-c", "head -c 1048576 /dev/zero; sleep 0.2"}, Stdout: w, Stderr: &firstErr})
 	}()
-	// Wait until the first gate holds the lock (it wrote the holder line).
+	// Wait until the first gate holds the lock (it wrote the holder line into its repository's lock).
+	repoLock := gateRepoLockIn(filepath.Dir(lock), gateRepoKey(repo))
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if b, _ := os.ReadFile(lock); len(b) > 0 {
+		if b, _ := os.ReadFile(repoLock); len(b) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -502,4 +503,249 @@ func TestRunGateNotesAreBounded(t *testing.T) {
 		t.Fatalf("runner notes: %d bytes, truncation marker present: %t", len(errs),
 			strings.HasSuffix(errs, "\ngate: runner notes truncated\n"))
 	}
+}
+
+// gateParallelT runs one gate per entry of dirs at once, all on the lock directory of lock, with
+// maxParallel slots; each command records how many gate commands were inside at its start (the log
+// file), stays inside for hold and exits 0. It returns the exit codes and the largest count seen.
+func gateParallelT(t *testing.T, lock string, maxParallel int, hold time.Duration, dirs ...string) ([]int, int) {
+	t.Helper()
+	inside := t.TempDir()
+	logf := filepath.Join(t.TempDir(), "counts")
+	codes := make([]int, len(dirs))
+	var wg sync.WaitGroup
+	for i, dir := range dirs {
+		head := strings.TrimSpace(gitT(t, dir, "rev-parse", "HEAD"))
+		me := filepath.Join(inside, strconv.Itoa(i))
+		script := "mkdir " + me + "; ls " + inside + " | wc -l >> " + logf +
+			"; sleep " + strconv.FormatFloat(hold.Seconds(), 'f', 2, 64) + "; rmdir " + me
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var o, e bytes.Buffer
+			codes[i] = RunGate(context.Background(), GateRun{Dir: dir, Head: head, LockPath: lock, Timeout: time.Minute,
+				LockWait: time.Minute, MaxParallel: maxParallel, Env: os.Environ(), Argv: []string{"/bin/sh", "-c", script},
+				Stdout: &o, Stderr: &e})
+			if codes[i] != 0 {
+				t.Logf("gate %d: exit %d, stderr %s", i, codes[i], e.String())
+			}
+		}()
+	}
+	wg.Wait()
+	most := 0
+	for _, f := range strings.Fields(readFileT(t, logf)) {
+		if n, err := strconv.Atoi(f); err == nil && n > most {
+			most = n
+		}
+	}
+	return codes, most
+}
+
+// G01: gates in two different repositories run at once (the gate lock is per repository); the box
+// semaphore still caps them.
+func TestRunGateTwoReposOverlap(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	codes, most := gateParallelT(t, lock, 2, time.Second, newRepo(t), newRepo(t))
+	if codes[0] != 0 || codes[1] != 0 || most != 2 {
+		t.Fatalf("two repos, two slots: codes %v, at most %d inside at once; want both inside together", codes, most)
+	}
+}
+
+// G01: two gates of one repository serialize, also from two work trees of it (a job's worktree and the
+// main checkout share the repository's databases, ports and caches).
+func TestRunGateSameRepoSerializes(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	repo := newRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitT(t, repo, "worktree", "add", "-q", "--detach", wt, "HEAD")
+	codes, most := gateParallelT(t, lock, 2, 300*time.Millisecond, repo, wt, repo)
+	if codes[0] != 0 || codes[1] != 0 || codes[2] != 0 || most != 1 {
+		t.Fatalf("one repository: codes %v, at most %d inside at once; want one at a time", codes, most)
+	}
+}
+
+// G01: with N slots a gate of a third repository waits while two run; one slot serializes every gate.
+func TestRunGateSemaphoreCap(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	codes, most := gateParallelT(t, lock, 2, 700*time.Millisecond, newRepo(t), newRepo(t), newRepo(t))
+	for i, c := range codes {
+		if c != 0 {
+			t.Fatalf("gate %d exited %d", i, c)
+		}
+	}
+	if most != 2 {
+		t.Fatalf("three repos, two slots: at most %d inside at once; want exactly 2", most)
+	}
+	lock = filepath.Join(t.TempDir(), GateLockName)
+	if _, most := gateParallelT(t, lock, 1, 300*time.Millisecond, newRepo(t), newRepo(t)); most != 1 {
+		t.Fatalf("two repos, one slot: %d inside at once", most)
+	}
+}
+
+// G03: an old binary holds the single box lock exclusively: a new gate (any repository) waits for it
+// and gives up within its bound without running its command; while new gates run, the old binary's
+// exclusive lock is refused, so the two never run gates together during an upgrade.
+func TestRunGateLegacyHolderBlocks(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	old := holdGateT(t, lock) // what a v0.8.0 gate takes: an exclusive flock on the one box lock
+	writeGateHolderLine(lock, gateHolderLine("", ": old binary check.sh"))
+	ran := filepath.Join(t.TempDir(), "ran")
+	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 300 * time.Millisecond,
+		Argv: []string{"touch", ran}})
+	if code != GateExitRunner || lastLine(out) != "exit=125" || !strings.Contains(errs, "still held after") ||
+		!strings.Contains(errs, "old binary check.sh") {
+		t.Fatalf("legacy holder: code %d, out %q, err %q", code, out, errs)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("the command ran while an old binary held the box lock")
+	}
+	old.release()
+
+	// A new gate runs: the legacy lock cannot be taken exclusively until it ends.
+	started := filepath.Join(t.TempDir(), "started")
+	done := make(chan int, 1)
+	go func() {
+		code, _, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
+			Argv: []string{"/bin/sh", "-c", "touch " + started + "; sleep 1"}})
+		done <- code
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the new gate did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	f, err := os.OpenFile(lock, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("an old binary's exclusive lock while a new gate runs: %v; want EWOULDBLOCK", err)
+	}
+	if code := <-done; code != 0 {
+		t.Fatalf("new gate exited %d", code)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("the legacy lock after the new gate ended: %v", err)
+	}
+}
+
+// G02: a gate without an explicit timeout takes the job's gate timeout from the environment
+// (AGENT_JOBS_GATE_TIMEOUT, set by the wrapper from the card or config); the default is 60 minutes.
+func TestRunGateTimeoutFromEnv(t *testing.T) {
+	if DefaultGateTimeout != 60*time.Minute {
+		t.Fatalf("DefaultGateTimeout = %s, want 60m", DefaultGateTimeout)
+	}
+	repo, _, head, lock := gateFixture(t)
+	var o, e bytes.Buffer
+	start := time.Now()
+	code := RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock,
+		Env: append(os.Environ(), GateTimeoutEnvVar+"=400ms"), Argv: []string{"sleep", "5"}, Stdout: &o, Stderr: &e})
+	if code != GateExitTimeout || time.Since(start) > 4*time.Second || !strings.Contains(e.String(), "timeout 400ms") {
+		t.Fatalf("env timeout: code %d after %s, err %q", code, time.Since(start), e.String())
+	}
+	// An explicit timeout wins over the environment.
+	o.Reset()
+	e.Reset()
+	code = RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: time.Minute,
+		Env: append(os.Environ(), GateTimeoutEnvVar+"=100ms"), Argv: []string{"sleep", "0.5"}, Stdout: &o, Stderr: &e})
+	if code != 0 {
+		t.Fatalf("explicit timeout: code %d, err %q", code, e.String())
+	}
+	// An unusable value falls back to the default with a note.
+	o.Reset()
+	e.Reset()
+	code = RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock,
+		Env: append(os.Environ(), GateTimeoutEnvVar+"=soon"), Argv: []string{"true"}, Stdout: &o, Stderr: &e})
+	if code != 0 || !strings.Contains(e.String(), "timeout 1h0m0s") || !strings.Contains(e.String(), GateTimeoutEnvVar) {
+		t.Fatalf("bad env timeout: code %d, err %q", code, e.String())
+	}
+}
+
+// G01: the box cap comes from the environment (AGENT_JOBS_GATE_MAX_PARALLEL, from gate_max_parallel)
+// when the caller sets none: 1 serializes two repositories.
+func TestRunGateMaxParallelFromEnv(t *testing.T) {
+	t.Setenv(GateMaxParallelEnvVar, "1")
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	if _, most := gateParallelT(t, lock, 0, 300*time.Millisecond, newRepo(t), newRepo(t)); most != 1 {
+		t.Fatalf("env max parallel 1: %d inside at once", most)
+	}
+}
+
+// G03: an old binary waiting for the single box lock (queued in its FIFO) is not starved by new gates:
+// a new gate that comes after it waits until it has run, though a slot is free.
+func TestRunGateYieldsToLegacyWaiter(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), GateLockName)
+	repoA, repoB := newRepo(t), newRepo(t)
+	headA := strings.TrimSpace(gitT(t, repoA, "rev-parse", "HEAD"))
+	headB := strings.TrimSpace(gitT(t, repoB, "rev-parse", "HEAD"))
+	started := filepath.Join(t.TempDir(), "a-started")
+	doneA := make(chan int, 1)
+	go func() {
+		code, _, _ := runGateT(t, GateRun{Dir: repoA, Head: headA, LockPath: lock, MaxParallel: 2,
+			Argv: []string{"/bin/sh", "-c", "touch " + started + "; sleep 1"}})
+		doneA <- code
+	}()
+	waitFileT(t, started)
+	// The old binary: an exclusive flock on the single box lock, queued behind the running new gate.
+	var oldAt time.Time
+	doneOld := make(chan error, 1)
+	go func() {
+		l, err := acquireGateLock(context.Background(), gateLockReq{path: lock, wait: 20 * time.Second, detail: ": old binary"})
+		if err == nil {
+			oldAt = time.Now()
+			time.Sleep(300 * time.Millisecond)
+			l.release()
+		}
+		doneOld <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(readFileOrEmpty(lock+gateQueueSuffix), " ") {
+		if time.Now().After(deadline) {
+			t.Fatal("the old binary never queued for the box lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A new gate of another repository arrives while the old binary waits.
+	var bAt time.Time
+	code, _, errs := runGateT(t, GateRun{Dir: repoB, Head: headB, LockPath: lock, MaxParallel: 2, LockWait: 20 * time.Second,
+		Argv: []string{"true"}})
+	bAt = time.Now()
+	if code != 0 {
+		t.Fatalf("new gate B: %d %s", code, errs)
+	}
+	if err := <-doneOld; err != nil {
+		t.Fatalf("old binary: %v", err)
+	}
+	if c := <-doneA; c != 0 {
+		t.Fatalf("new gate A: %d", c)
+	}
+	if oldAt.IsZero() || bAt.Before(oldAt) {
+		t.Fatalf("the new gate B (done %s) overtook the queued old binary (got the lock %s)", bAt.Format(time.StampMilli),
+			oldAt.Format(time.StampMilli))
+	}
+}
+
+func waitFileT(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never appeared", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func readFileOrEmpty(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
 }

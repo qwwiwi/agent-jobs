@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/sys/unix"
@@ -37,6 +38,9 @@ type Card struct {
 	Repos   []string // `repo:` keys: absolute repository paths (git top level)
 	Remotes []string // `remote:` keys as remote identities (RemoteIdentity: net:host/path or local:/path)
 	Body    string   // everything after the front matter, trimmed
+	// GateTimeout is the `gate_timeout:` key (once at most): the gate timeout of jobs in this
+	// repository, over config gate_timeout_minutes (0 = not set).
+	GateTimeout time.Duration
 }
 
 var reCardName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
@@ -45,7 +49,8 @@ var reCardName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 func (m *Manager) CardsDir() string { return m.Config().CardsDir }
 
 // ParseCard parses a card: a front matter block between `---` lines with `repo:` and/or `remote:`
-// keys (each repeatable, at least one), then a non-empty Markdown body.
+// keys (each repeatable, at least one) and an optional `gate_timeout:` (a duration, e.g. 90m), then a
+// non-empty Markdown body.
 func ParseCard(name string, b []byte) (Card, error) {
 	c := Card{Name: name}
 	s := strings.ReplaceAll(string(b), "\r\n", "\n")
@@ -86,8 +91,17 @@ func ParseCard(name string, b []byte) (Card, error) {
 				return c, fmt.Errorf("front matter line %d: %w", i+2, err)
 			}
 			c.Remotes = append(c.Remotes, id)
+		case "gate_timeout":
+			if c.GateTimeout != 0 {
+				return c, fmt.Errorf("front matter line %d: gate_timeout given twice", i+2)
+			}
+			d, err := parseCardGateTimeout(v)
+			if err != nil {
+				return c, fmt.Errorf("front matter line %d: %w", i+2, err)
+			}
+			c.GateTimeout = d
 		default:
-			return c, fmt.Errorf("front matter line %d: unknown key %q (want repo or remote)", i+2, k)
+			return c, fmt.Errorf("front matter line %d: unknown key %q (want repo, remote or gate_timeout)", i+2, k)
 		}
 	}
 	if len(c.Repos) == 0 && len(c.Remotes) == 0 {
