@@ -160,6 +160,7 @@ func TestWebFetchURLKeyExactCase(t *testing.T) {
 		{"allowed URL, evil url", `{"URL":"https://docs.example.com/","url":"https://evil.example.net/x"}`, false},
 		{"evil url, allowed Url", `{"url":"https://evil.example.net/x","Url":"https://docs.example.com/"}`, false},
 		{"only URL", `{"URL":"https://docs.example.com/"}`, false},
+		{"allowed url, evil URL", `{"url":"https://docs.example.com/","URL":"https://evil.example.net/x"}`, false},
 		{"url not a string", `{"url":["https://docs.example.com/"]}`, false},
 		{"tool_input not an object", `"https://docs.example.com/"`, false},
 	}
