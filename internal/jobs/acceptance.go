@@ -395,6 +395,14 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 	}
 	if err := a.st.SetAcceptanceResult(a.id, token, exit, int(dur.Round(time.Second).Seconds())); err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance: record result:", err)
+	} else {
+		// The reviewer's artifact (G09). Best effort: the result above is the one the daemon trusts, a
+		// failed write here only costs the reviewer the head.
+		head, _ := gateCommit(work, "HEAD^{commit}")
+		if err := recordGateAcceptance(abs, GateResultAcceptance{Head: head, Command: a.cmd, Exit: exit,
+			DurationSec: int(dur.Round(time.Second).Seconds()), At: now.UTC().Format(time.RFC3339)}); err != nil {
+			fmt.Fprintln(log, "run-wrapper: acceptance: record gate result:", err)
+		}
 	}
 	return 0
 }

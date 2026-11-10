@@ -555,6 +555,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	m.attachGateArtifacts(&r)
 	if err := checkFileSourceOrigins(r.Sources); err != nil {
 		if r.plannedSources {
 			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+

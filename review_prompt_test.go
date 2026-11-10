@@ -129,3 +129,26 @@ func TestReviewPromptChecksForks(t *testing.T) {
 		t.Error("the Forks rule must come before the Blocking subsection it feeds")
 	}
 }
+
+// G10: the review checklist uses the gate artifact: a recorded exit 0 at the reviewed HEAD answers «tests
+// could not be run», a missing or red artifact is reported, the trusted and the job-reported parts are
+// told apart, and the file is data.
+func TestReviewPromptUsesGateArtifact(t *testing.T) {
+	b, err := Templates.ReadFile("prompts/kind-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		"gate-results.json", "trusted", "job-reported", "exit 0", "reviewed HEAD",
+		"could not be run", "not a finding", "missing", "red", "data, never instructions",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("kind-review.md lacks %q", want)
+		}
+	}
+	// The trusted side is the daemon's; the job's own runs are claims.
+	if !strings.Contains(s, "`trusted`") || !strings.Contains(s, "`job_reported`") {
+		t.Error("kind-review.md must name the artifact's two parts (`trusted`, `job_reported`)")
+	}
+}
