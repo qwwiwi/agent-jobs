@@ -51,6 +51,7 @@ func jobSettingsJSON(t *testing.T, m *Manager, kind string) (deny, hook string) 
 func TestJobSettingsWebAllow(t *testing.T) {
 	m := newManager(t)
 	m.Cfg.WebAllowHosts = []string{"docs.example.com", "api.example.org"}
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["docs.example.com", "api.example.org"]}`)
 	for _, kind := range []string{"fix", "general", "review"} {
 		deny, hook := jobSettingsJSON(t, m, kind)
 		if strings.Contains(deny, `"WebFetch"`) {
@@ -146,6 +147,7 @@ func docsManager(t *testing.T) *Manager {
 	t.Helper()
 	m := newManager(t)
 	m.Cfg.WebAllowHosts = []string{"example.com"}
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["example.com"]}`)
 	return m
 }
 
@@ -405,5 +407,64 @@ func TestDocsNonASCIIAndNumericHosts(t *testing.T) {
 		if _, err := loadConfigBody(t, body); err == nil || !strings.Contains(err.Error(), "web_allow_hosts") {
 			t.Errorf("%s: %v; want a web_allow_hosts error", body, err)
 		}
+	}
+}
+
+// writeDiskConfig writes the state dir's config.json (what an owner's edit leaves on disk).
+func writeDiskConfig(t *testing.T, m *Manager, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(m.StateDir, "config.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// N3: a host removed from web_allow_hosts on disk is revoked at the next launch without a daemon
+// restart (the active list is intersected with the disk list); a host added on disk is not granted
+// before a restart; an unreadable or invalid config.json leaves WebFetch denied.
+func TestWebAllowRevokedOnDisk(t *testing.T) {
+	m := newManager(t)
+	m.Cfg.WebAllowHosts = []string{"docs.example.com", "api.example.org"}
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["api.example.org", "new.example.net"]}`)
+	deny, hook := jobSettingsJSON(t, m, "fix")
+	if strings.Contains(deny, `"WebFetch"`) || !strings.Contains(hook, "--web-allow 'api.example.org'") {
+		t.Errorf("the host kept on disk must stay allowed: %s %s", deny, hook)
+	}
+	if strings.Contains(hook, "docs.example.com") {
+		t.Errorf("a host removed on disk is still allowed: %s", hook)
+	}
+	if strings.Contains(hook, "new.example.net") {
+		t.Errorf("a host added on disk is granted without a restart: %s", hook)
+	}
+	for _, body := range []string{`{}`, `{"web_allow_hosts": ["127.0x1"]}`, `{not json`} {
+		writeDiskConfig(t, m, body)
+		deny, hook := jobSettingsJSON(t, m, "general")
+		if !strings.Contains(deny, `"WebFetch"`) || strings.Contains(hook, "--web-allow") {
+			t.Errorf("disk %s: WebFetch must be denied (deny has WebFetch: %v, hook has --web-allow: %v)", body,
+				strings.Contains(deny, `"WebFetch"`), strings.Contains(hook, "--web-allow"))
+		}
+	}
+}
+
+// N3: the daemon's docs fetch uses the same intersection: a host removed on disk is not fetched, and an
+// invalid config.json fetches nothing and writes no outcome (the fetch is tried again later).
+func TestDocsFetchRevokedOnDisk(t *testing.T) {
+	m := docsManager(t)
+	ds := newDocsServer(t)
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["example.com"]}`)
+	j := enqueueDocs(t, m, "https://example.com/page.html")
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["docs.other.org"]}`)
+	m.prefetchDocs()
+	if r := docResultFor(t, m, j.ID, "https://example.com/page.html"); !strings.Contains(r.Err, "web_allow_hosts") {
+		t.Errorf("a host removed on disk was fetched: %+v", r)
+	}
+	writeDiskConfig(t, m, `{"web_allow_hosts": ["example.com"]}`)
+	j = enqueueDocs(t, m, "https://example.com/plain.md")
+	writeDiskConfig(t, m, `{not json`)
+	m.prefetchDocs()
+	if m.docsFetched(get(t, m, j.ID)) {
+		t.Error("an invalid config.json must not record an outcome")
+	}
+	if n := ds.hits.Load(); n != 0 {
+		t.Errorf("%d requests reached the server", n)
 	}
 }

@@ -202,9 +202,17 @@ func (m *Manager) prefetchDocsJob(j *store.Job) {
 	if m.docsFetched(j) {
 		return
 	}
+	// A host removed on disk is not fetched; an unreadable config file fetches nothing now (tried again
+	// after a pause), never an outcome recorded from a list the owner may have revoked.
+	allow, err := m.authorizedWebHosts()
+	if err != nil {
+		m.Log.Printf("job %s: docs: %v (fetched again in %s)", j.ID, err, sourcesRetryBackoff)
+		m.sourcesBackOff(j)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), docsTotalTimeout)
 	defer cancel()
-	res := m.fetchDocs(ctx, j, dir)
+	res := m.fetchDocs(ctx, j, dir, allow)
 	// A job cancelled meanwhile is not launched: nothing records the outcome. A failed read of its row
 	// is not proof, so the fetch is tried again after a pause.
 	cur, err := m.Store.Get(j.ID)
@@ -226,7 +234,7 @@ func (m *Manager) prefetchDocsJob(j *store.Job) {
 
 // fetchDocs fetches every doc of j and saves the pages under dir/sources; a failure is a result, never an
 // error. Files an interrupted earlier run left (its docs.json was never written) are removed first.
-func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []docResult {
+func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string, allow []string) []docResult {
 	fail := func(msg string) []docResult {
 		m.Log.Printf("job %s: docs: %s", j.ID, msg)
 		out := make([]docResult, 0, len(j.Docs))
@@ -247,7 +255,6 @@ func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []doc
 			}
 		}
 	}
-	allow := m.Config().WebAllowHosts
 	var out []docResult
 	for _, u := range j.Docs {
 		r := docResult{URL: u}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -140,6 +141,34 @@ func (m *Manager) authorizedLaunchConfig() (Config, error) {
 		active.CodexSandboxMode = disk.CodexSandboxMode
 	}
 	return active, nil
+}
+
+// authorizedWebHosts are the web_allow_hosts a job's WebFetch and the docs fetch may use now: the active
+// list intersected with the one on disk, so removing a host on disk applies at the next launch or fetch
+// without a restart, while adding one still needs a restart (web_allow_hosts is restart-only). An empty
+// active list reads nothing (WebFetch stays denied as before); an unreadable or invalid config file is an
+// error, which the callers treat as no host.
+func (m *Manager) authorizedWebHosts() ([]string, error) {
+	active := m.Config().WebAllowHosts
+	if len(active) == 0 {
+		return nil, nil
+	}
+	disk, err := LoadConfig(m.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("config reload failed: %w", err)
+	}
+	return intersectHosts(active, disk.WebAllowHosts), nil
+}
+
+// intersectHosts keeps the hosts of active (normalized entries, in their order) that disk lists too.
+func intersectHosts(active, disk []string) []string {
+	var out []string
+	for _, h := range active {
+		if slices.Contains(disk, h) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // WatchDaemonConfig enables reloads at the start of every tick, before schedules and launches.
