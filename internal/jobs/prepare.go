@@ -510,6 +510,9 @@ func (m *Manager) buildPrompt(j *store.Job, ownerRules string, cards []Card, not
 		}
 		check = strings.TrimRight(check, "\n") + "\n" + extra
 	}
+	if extra := renderCardChecklist(cards); extra != "" && slices.Contains(CoderKinds, j.Kind) {
+		check = strings.TrimRight(check, "\n") + "\n" + extra
+	}
 	contract, err := template("prompts/report-contract.md")
 	if err != nil {
 		return "", err

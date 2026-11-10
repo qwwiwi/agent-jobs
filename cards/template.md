@@ -1,5 +1,8 @@
 ---
 {{FRONT}}
+# Optional keys (remove the # to use):
+# review_questions: race, retry, dependency, rollback, residual-risk
+# ui: true
 ---
 # Project: {{NAME}}
 

@@ -78,11 +78,12 @@ const doneLinePrefix = "[jobs:job-done] job "
 // says «resumed» with its attempt number (and «fresh session» when the session could not be resumed).
 // A coder job that ended fast with no commits over its base carries suspiciousNote (#132).
 // An owner-waits job ends the line with OwnerWaitsMarker.
-func DoneLine(j *store.Job, dirNote int64) string { return doneLine(j, dirNote, "", "") }
+func DoneLine(j *store.Job, dirNote int64) string { return doneLine(j, dirNote, "", "", "") }
 
-// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate) and
-// with suspicious, when it is not empty, marking a fast empty coder job.
-func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
+// doneLine is DoneLine with the cost text replaced by cost when it is not empty (an estimate), with
+// suspicious, when it is not empty, marking a fast empty coder job, and with uiNote, when it is not
+// empty, saying a ui: true job has a UI diff and no ui-check/ evidence.
+func doneLine(j *store.Job, dirNote int64, cost, suspicious, uiNote string) string {
 	if cost == "" {
 		cost = CostText(j.CostUSD, j.CostIsUnknown())
 		if j.CostIsUnknown() {
@@ -158,6 +159,9 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 	}
 	if suspicious != "" {
 		line += " · " + suspicious
+	}
+	if uiNote != "" {
+		line += " · " + uiNote
 	}
 	if j.OwnerWaits {
 		line += " · " + OwnerWaitsMarker
@@ -260,7 +264,7 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
 		}
 	}
-	return doneLine(j, m.Config().JobDirNoteBytes(), cost, m.suspiciousNote(j))
+	return doneLine(j, m.Config().JobDirNoteBytes(), cost, m.suspiciousNote(j), m.uiEvidenceNote(j))
 }
 
 // suspiciousFastEmpty is how fast a coder job may finish with no commits of its own before its
