@@ -176,3 +176,15 @@ func TestWebFetchURLKeyExactCase(t *testing.T) {
 		}
 	}
 }
+
+// N6: a percent-encoded host never matches: Go refuses an escaped ASCII byte in a host, and an escaped
+// non-ASCII one (%C4%B0 = U+0130) decodes to a name the non-ASCII rule refuses.
+func TestWebFetchPercentEncodedHost(t *testing.T) {
+	allow := []string{"docs.example.com", "i.example"}
+	for _, u := range []string{"https://docs%2eexample%2ecom/a", "https://%64ocs.example.com/a", "https://docs.example.com%2f@evil.example.net/a",
+		"https://docs.example.com%40evil.example.net/a", "https://%C4%B0.example/", "https://docs.example.com%00/a", "https://docs.example.com%2e/a"} {
+		if r := decideWeb(t, "WebFetch", u, allow); r == "" {
+			t.Errorf("%q passed, want refused", u)
+		}
+	}
+}

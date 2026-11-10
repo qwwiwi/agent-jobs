@@ -269,7 +269,7 @@ func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string, allow
 		}
 		if err != nil {
 			r.Err = "not fetched: " + RedactPrintable(err.Error(), 300)
-			m.Log.Printf("job %s: doc %s: %s", j.ID, Printable(u, 80), r.Err)
+			m.Log.Printf("job %s: doc %s: %s", j.ID, docLogURL(u), r.Err)
 		}
 		out = append(out, r)
 	}
@@ -337,7 +337,7 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 				return fmt.Errorf("more than %d redirects", maxDocRedirects)
 			}
 			if why := guard.CheckWebURL(req.URL.String(), allow); why != "" {
-				return fmt.Errorf("redirect to %s refused: %s", Printable(req.URL.String(), 80), why)
+				return fmt.Errorf("redirect to %s refused: %s", docLogURL(req.URL.String()), why)
 			}
 			return nil
 		},
@@ -375,14 +375,35 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 	if ctype == "" {
 		ctype, _, _ = mime.ParseMediaType(http.DetectContentType(body))
 	}
+	var text []byte
 	switch {
 	case ctype == "text/html" || ctype == "application/xhtml+xml":
-		return htmlToText(body), nil
+		text = htmlToText(body)
 	case strings.HasPrefix(ctype, "text/") || ctype == "application/json" || ctype == "application/xml" ||
 		strings.HasSuffix(ctype, "+json") || strings.HasSuffix(ctype, "+xml"):
-		return cleanText(body), nil
+		text = cleanText(body)
+	default:
+		return nil, fmt.Errorf("the page is %q, not a text type", ctype)
 	}
-	return nil, fmt.Errorf("the page is %q, not a text type", ctype)
+	// The UTF-8 repair turns each invalid byte into a 3-byte U+FFFD: the cap holds for what is saved.
+	if int64(len(text)) > MaxSourceFileBytes {
+		return nil, fmt.Errorf("the page text exceeds %d bytes (2 MiB) after its UTF-8 repair", MaxSourceFileBytes)
+	}
+	return text, nil
+}
+
+// docLogURL is a doc URL for a log line or an error: scheme, host and path only, since a query string or
+// fragment may carry a token.
+func docLogURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(an unparsable URL)"
+	}
+	s := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}).String()
+	if u.RawQuery != "" || u.ForceQuery {
+		s += "?…"
+	}
+	return RedactPrintable(s, 80)
 }
 
 var (

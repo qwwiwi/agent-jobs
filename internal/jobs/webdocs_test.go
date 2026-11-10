@@ -1,11 +1,13 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -110,6 +113,17 @@ func newDocsServer(t *testing.T) *docsServer {
 	mux.HandleFunc("/exact", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(strings.Repeat("b", int(MaxSourceFileBytes))))
+	})
+	mux.HandleFunc("/badutf8", func(w http.ResponseWriter, r *http.Request) {
+		// Within the cap as sent; each invalid byte becomes a 3-byte U+FFFD in the saved text.
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(strings.Repeat("\xffa", int(MaxSourceFileBytes)/2)))
+	})
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
 	})
 	mux.HandleFunc("/img", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
@@ -466,5 +480,96 @@ func TestDocsFetchRevokedOnDisk(t *testing.T) {
 	}
 	if n := ds.hits.Load(); n != 0 {
 		t.Errorf("%d requests reached the server", n)
+	}
+}
+
+// sol: the saved text is held to the 2 MiB cap after the UTF-8 repair, which can grow a body inside the
+// cap (each invalid byte becomes a 3-byte replacement character).
+func TestPrefetchDocsCapAfterUTF8Repair(t *testing.T) {
+	m := docsManager(t)
+	newDocsServer(t)
+	j := enqueueDocs(t, m, "https://example.com/badutf8")
+	m.prefetchDocs()
+	if r := docResultFor(t, m, j.ID, "https://example.com/badutf8"); r.Err == "" || !strings.Contains(r.Err, "2 MiB") || r.Name != "" {
+		t.Errorf("a body over the cap after the repair: %+v; want a 2 MiB error and no file", r)
+	}
+}
+
+// sol: a failed fetch's log line and recorded error carry no query string (it may hold a token).
+func TestPrefetchDocsLogRedactsQuery(t *testing.T) {
+	m := docsManager(t)
+	newDocsServer(t)
+	var logBuf bytes.Buffer
+	m.Log = log.New(&logBuf, "", 0)
+	j := enqueueDocs(t, m, "https://example.com/nothing?token=qsecret1", "https://example.com/redir-out?key=qsecret2")
+	m.prefetchDocs()
+	if !strings.Contains(logBuf.String(), "example.com/nothing") {
+		t.Fatalf("the failed fetch is not logged: %q", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), "qsecret") {
+		t.Errorf("the log holds a query string: %q", logBuf.String())
+	}
+	for _, u := range []string{"https://example.com/nothing?token=qsecret1", "https://example.com/redir-out?key=qsecret2"} {
+		if r := docResultFor(t, m, j.ID, u); r.Err == "" || strings.Contains(r.Err, "qsecret") {
+			t.Errorf("%s: %+v; want an error without the query", u, r)
+		}
+	}
+}
+
+// N6: a server that never answers ends at the page timeout as a "not fetched" result, never a hang.
+func TestPrefetchDocsPageTimeout(t *testing.T) {
+	m := docsManager(t)
+	newDocsServer(t)
+	old := docFetchTimeout
+	docFetchTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { docFetchTimeout = old })
+	j := enqueueDocs(t, m, "https://example.com/slow")
+	start := time.Now()
+	m.prefetchDocs()
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("the fetch took %s; the page timeout is %s", d, docFetchTimeout)
+	}
+	if r := docResultFor(t, m, j.ID, "https://example.com/slow"); r.Err == "" || r.Name != "" {
+		t.Errorf("a page past its timeout: %+v; want an error and no file", r)
+	}
+}
+
+// N6: one internal answer among public ones refuses the host, in either order, also as an IPv4-mapped
+// IPv6 address; nothing is dialed.
+func TestDialPublicMixedAnswers(t *testing.T) {
+	old := sourceLookup
+	t.Cleanup(func() { sourceLookup = old })
+	for _, answers := range [][]string{{"93.184.216.34", "10.0.0.5"}, {"127.0.0.1", "93.184.216.34"},
+		{"93.184.216.34", "::ffff:127.0.0.1"}, {"2606:2800:220:1::1", "::ffff:169.254.169.254"}, {"93.184.216.34", "100.100.1.1"}} {
+		var addrs []netip.Addr
+		for _, a := range answers {
+			addrs = append(addrs, netip.MustParseAddr(a))
+		}
+		sourceLookup = func(context.Context, string) ([]netip.Addr, error) { return addrs, nil }
+		conn, err := dialPublic(context.Background(), "tcp", "example.com:443")
+		if err == nil {
+			conn.Close()
+			t.Errorf("%v: dialed, want refused", answers)
+			continue
+		}
+		if !strings.Contains(err.Error(), "internal address") {
+			t.Errorf("%v: %v; want an internal address refusal", answers, err)
+		}
+	}
+}
+
+// N7: the IETF protocol assignments (192.0.0.0/24), Teredo (2001::/32), IPv4-compatible IPv6 (::/96)
+// and the deprecated site-local range (fec0::/10) are internal; ordinary public addresses are not.
+func TestPublicAddrReservedRanges(t *testing.T) {
+	for _, a := range []string{"192.0.0.8", "192.0.0.170", "2001::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "::7f00:1",
+		"::a00:5", "fec0::1", "feff::1", "::ffff:192.0.0.9"} {
+		if publicAddr(netip.MustParseAddr(a)) {
+			t.Errorf("publicAddr(%s) = true, want internal", a)
+		}
+	}
+	for _, a := range []string{"93.184.216.34", "8.8.8.8", "2606:2800:220:1::1", "2001:4860:4860::8888"} {
+		if !publicAddr(netip.MustParseAddr(a)) {
+			t.Errorf("publicAddr(%s) = false, want public", a)
+		}
 	}
 }
