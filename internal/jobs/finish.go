@@ -153,6 +153,9 @@ func doneLine(j *store.Job, dirNote int64, cost, suspicious string) string {
 	} else if j.ControlNote != "" {
 		line += " · " + Printable(j.ControlNote, 320)
 	}
+	if f := FixLoopBypass(j); f != "" {
+		line += " · " + f
+	}
 	if suspicious != "" {
 		line += " · " + suspicious
 	}

@@ -202,6 +202,10 @@ type Config struct {
 	// slots and one queue, and a gate outside a job uses $AGENT_JOBS_GATE_MAX_PARALLEL or the default:
 	// keep one value per box (a waiter with fewer slots at the head of the queue holds back the others).
 	GateMaxParallel int `json:"gate_max_parallel"`
+	// ReviewMaxFixLoops caps the fix jobs on one review chain (review -> fix -> control review -> fix
+	// ...; v0.8.2 G04): a further fix started with review= is refused unless it carries design or
+	// loop_override. 0 = DefaultReviewMaxFixLoops (2); at most CeilingReviewMaxFixLoops (10).
+	ReviewMaxFixLoops int `json:"review_max_fix_loops"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked
 	// either way. The owner turns it on.
@@ -616,6 +620,10 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if err := c.validateGate(); err != nil {
 		return c, err
+	}
+	if c.ReviewMaxFixLoops < 0 || c.ReviewMaxFixLoops > CeilingReviewMaxFixLoops {
+		return c, fmt.Errorf("config.json: review_max_fix_loops %d must be 0 (default %d) to %d", c.ReviewMaxFixLoops,
+			DefaultReviewMaxFixLoops, CeilingReviewMaxFixLoops)
 	}
 	if c.SourcesMaxMB < 0 {
 		return c, errors.New("config.json: sources_max_mb must be 0 (default) or positive")

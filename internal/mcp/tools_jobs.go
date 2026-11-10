@@ -104,6 +104,9 @@ type JobView struct {
 	ControlReview  bool     `json:"control_review,omitempty"`
 	ControlJob     string   `json:"control_job,omitempty"`
 	ControlNote    string   `json:"control_note,omitempty"`
+	// Design and LoopOverride are the fix-loop cap bypass the job was started with (v0.8.2 G05).
+	Design       string `json:"design,omitempty"`
+	LoopOverride string `json:"loop_override,omitempty"`
 	// BaseBranch is the branch the job's commits are checked against at notify (merge check).
 	BaseBranch      string `json:"base_branch,omitempty"`
 	RequestedBranch string `json:"requested_branch,omitempty"`
@@ -199,6 +202,7 @@ func view(m *jobs.Manager, j *store.Job) JobView {
 		Covers: j.Covers, Size: j.Size, CodexSandbox: launchCodexSandbox(m, j), Prepare: m.PrepareResultOf(j),
 		Paths: j.Paths, OnOverlap: j.OnOverlap, Overlap: j.Overlap, WaitFor: j.WaitFor, Parent: j.Parent, ParentBase: j.ParentBase,
 		Review: j.Review, ReviewBlocking: findingIDs(j.ReviewBlocking), ControlReview: j.ControlReview, ControlJob: j.ControlJob, ControlNote: j.ControlNote,
+		Design: j.LoopDesign, LoopOverride: j.LoopOverride,
 		Milestone: j.MilestoneID, Task: j.TaskKey, Waiting: m.JobWaiting(context.Background(), j), Sources: append(append([]string(nil), j.SourceFiles...), j.Sources...),
 	}
 	v.Crew, v.CrewError = crewView(m, j)
@@ -281,6 +285,8 @@ type JobStartInput struct {
 	Parent              string   `json:"parent,omitempty" jsonschema:"explicit stack: id of a fix/general job of this agent on the same repository. Waits queued for that parent's success and starts from its result commit (including after cleanup); refused if it failed, cancelled, or timed out. Mutually exclusive with base. Recorded in job_status/job_result"`
 	Review              string   `json:"review,omitempty" jsonschema:"fix job only, with repo: id of a finished (succeeded) review job of this agent. The daemon attaches its full report.md as a source (job:<id>), parses its ### Blocking section and puts every blocking finding ID with its whole text into the prompt under Blocking findings to close; the fix report must answer each ID (closed / not closed + evidence). Refused when the review is unknown, not this agent's, not kind review, not succeeded, has no ### Blocking section, has an empty one (SHIP: nothing to fix), or a Blocking item without a finding ID (F1, H2, C1: first on the item or right after its file:line)"`
 	ControlReview       *bool    `json:"control_review,omitempty" jsonschema:"only with review; default true. When the fix job succeeds the daemon queues a control review: kind review, the same model, runner and reasoning effort as the original review, the fix job's published result branch as base, sources = the original review report + the fix report. The queued job id is in the fix job-done line (control review <id> queued, or why not: a cap refused it, no result branch). Failed or cancelled fixes queue nothing. false turns it off"`
+	Design              string   `json:"design,omitempty" jsonschema:"only with review: bypass the fix-loop cap (config review_max_fix_loops, default 2: a fix started from a review whose chain review -> fix -> control review -> fix ... already holds that many fix jobs is refused, naming the chain). The id of a succeeded research or general job of this agent that designs the way out of the loop; stored on the job and shown in job_status and the job-done line"`
+	LoopOverride        *string  `json:"loop_override,omitempty" jsonschema:"only with review: bypass the fix-loop cap with a stated reason (non-empty; an empty one is refused); stored on the job and shown in job_status and the job-done line"`
 	AdvisorModel        string   `json:"advisor_model,omitempty" jsonschema:"crew job (claude runner only, refused for codex): a stronger claude model (opus, fable or a full id) the job may consult with the job-role tool advisor_ask at a design fork; each call is a short read-only claude -p in the job's work tree (Read, Glob, Grep only), recorded and shown in job_status / job_result with the cost split main / advisor"`
 	AdvisorMaxCalls     int      `json:"advisor_max_calls,omitempty" jsonschema:"crew job: at most this many advisor_ask calls; default 2, ceiling 5; needs advisor_model"`
 	AdvisorMaxBudgetUSD float64  `json:"advisor_max_budget_usd,omitempty" jsonschema:"crew job: the advisor calls' spend cap in USD, on top of max_budget_usd; default 2, ceiling 10; a call past it is refused; needs advisor_model"`
@@ -308,6 +314,7 @@ func addJobStart(s *sdk.Server, d Deps) {
 			OwnerWaits: in.OwnerWaits, Skills: in.Skills, Covers: in.Covers, Size: in.Size, SizeRule: true,
 			Milestone: in.Milestone, Task: in.Task, Sources: in.Sources,
 			Paths: in.Paths, OnOverlap: in.OnOverlap, Parent: in.Parent, Review: in.Review, ControlReview: in.ControlReview,
+			Design: in.Design, LoopOverride: in.LoopOverride,
 			Crew: jobs.CrewRequest{AdvisorModel: in.AdvisorModel, AdvisorMaxCalls: in.AdvisorMaxCalls,
 				AdvisorMaxBudgetUSD: in.AdvisorMaxBudgetUSD, PairedWith: in.PairedWith},
 		})

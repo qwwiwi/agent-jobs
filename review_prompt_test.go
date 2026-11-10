@@ -63,8 +63,9 @@ func TestReviewPromptKeepsContractOrder(t *testing.T) {
 }
 
 // F10: for each finding the reviewer asks whether the executor's brief let it see the problem (if not,
-// a brief gap), and a review of a fix looks only at the fix diff and the conditions it must close, a
-// condition still defeatable another way staying open, never a new finding.
+// a brief gap), and a review of a fix looks only at the fix diff and the conditions it must close, under
+// the stop rule (v0.8.2 G06): closed when the original scenario no longer reproduces, a deeper scenario
+// Non-blocking unless it shows reproducible money or data loss.
 func TestReviewPromptBriefGapAndFixReview(t *testing.T) {
 	b, err := Templates.ReadFile("prompts/kind-review.md")
 	if err != nil {
@@ -75,7 +76,9 @@ func TestReviewPromptBriefGapAndFixReview(t *testing.T) {
 		"Brief gap: for each finding", "executor's brief gave it a way to see the problem",
 		"`brief gap: <what the brief should have said>`",
 		"Fix review:", "look only at the fix diff and the conditions the fix has to close",
-		"`closed` or `open`", "can still be defeated another way stays `open`", "do not file that as a new finding",
+		"`closed` or `open`", "a finding is closed when its original scenario no longer reproduces",
+		"A deeper scenario found while checking it does not keep it `open`",
+		"Non-blocking unless it shows reproducible money or data loss, with steps",
 		"Each `open` condition is a Blocking line",
 	} {
 		if !strings.Contains(s, want) {

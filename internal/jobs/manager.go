@@ -232,6 +232,11 @@ type StartRequest struct {
 	// Review is set) chains a control review when the fix succeeds (item 7).
 	Review        string
 	ControlReview *bool
+	// Design and LoopOverride bypass the fix-loop cap (review_max_fix_loops, v0.8.2 G05), only with
+	// Review: Design is the id of a succeeded research or general job of this agent, LoopOverride a
+	// non-empty reason (nil = not given; given empty is refused). Either is stored on the job.
+	Design       string
+	LoopOverride *string
 	// IdemKey (internal, never set from a request) makes the creation idempotent: a start with a key an
 	// existing job already has returns that job instead of queueing another (the control review chain).
 	IdemKey string
@@ -696,6 +701,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
 		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
 		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview, IdemKey: r.IdemKey,
+		LoopDesign: r.Design, LoopOverride: loopOverride(r.LoopOverride),
 	}
 	return j, nil
 }
