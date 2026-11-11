@@ -30,7 +30,8 @@ func uiNoteLive(token string) (string, []any) {
 
 // ClearUINote removes the job's stored note before its ending attempt works out a new one. It only
 // touches an attempt that has not ended (token as in FinishAttempt): ErrImmutable otherwise, so a
-// finish repeated for an ended attempt leaves the stored note alone.
+// finish repeated for an ended attempt leaves the stored note alone. Its guard is the live status and
+// the launch token only: it does not compare the attempt number (SetUINote does).
 func (s *Store) ClearUINote(id, token string) error {
 	live, args := uiNoteLive(token)
 	return affected(s.db.Exec(`UPDATE jobs SET ui_note=NULL WHERE id=? AND `+live, append([]any{id}, args...)...))

@@ -198,7 +198,8 @@ var errUINoteOutput = errors.New("diff output over the cap")
 // holds no part of it: nothing the job can write is ever read back as the note. The order: the stored
 // note is cleared first, then the note is worked out (bounded by uiNoteTimeout), then it is stored with
 // the attempt number, all before the row turns terminal. Both writes only touch an attempt that has not
-// ended, so a finish repeated for an ended attempt changes nothing. It never fails the finish: a clear
+// ended (the live status and the launch token; only the store also checks the attempt number), so a
+// finish repeated for an ended attempt changes nothing. It never fails the finish: a clear
 // that fails, a timeout, any error or a store write that fails mean no note, and the note of another
 // attempt is never shown (uiEvidenceNote asks for the line's own attempt).
 func (m *Manager) recordUINote(j *store.Job, status string) {
@@ -264,12 +265,40 @@ func uiNoteField(s string, max int) string {
 // sanitizeUINote is a whole note under the hard cap (applied when it is built and again when it is read).
 func sanitizeUINote(s string) string { return uiNoteField(s, uiNoteMaxRunes) }
 
+// uiNoteNameRune reports whether r may stand in a file name of the note: an ASCII letter, a digit or one
+// of ". _ / -".
+func uiNoteNameRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+		r == '.' || r == '_' || r == '/' || r == '-'
+}
+
+// uiNoteName is a changed file's name as the note shows it. A file name is the job's own text, so it
+// passes an allowlist instead of an escape per separator: every rune that is not uiNoteNameRune (a
+// space, ";", "·", ":", a quote, a bracket, a control character, a non-ASCII letter, a broken byte)
+// becomes "_". What is left cannot spell a separator of the job-done formats: the fields' " · ", the
+// "; " between the jobs of a coalesced line, the ", " and " (+k more)" of the list. Redacted first (a
+// value changed by the allowlist no longer matches its format), then cut to max bytes, a cut name
+// ending in "...".
+func uiNoteName(name string, max int) string {
+	out := strings.Map(func(r rune) rune {
+		if uiNoteNameRune(r) {
+			return r
+		}
+		return '_'
+	}, strings.ToValidUTF8(RedactText(name), "_"))
+	if len(out) > max {
+		out = out[:max-3] + "..."
+	}
+	return out
+}
+
 // uiNoteNames is the bounded list of changed UI files as the note names them: at most maxUINoteFiles
-// names, each cut to uiNoteMaxName and made safe (uiNoteField), then "(+k more)".
+// names, each through the allowlist and cut to uiNoteMaxName (uiNoteName), then "(+k more)". This is the
+// one place where file names enter the note text.
 func uiNoteNames(files []string) string {
 	names := make([]string, 0, maxUINoteFiles)
 	for _, f := range files[:min(len(files), maxUINoteFiles)] {
-		names = append(names, uiNoteField(f, uiNoteMaxName))
+		names = append(names, uiNoteName(f, uiNoteMaxName))
 	}
 	return capList(append(names, files[len(names):]...), maxUINoteFiles)
 }
