@@ -79,11 +79,14 @@ var sourceLookup = func(ctx context.Context, host string) ([]netip.Addr, error) 
 
 // internalNets are address ranges, besides loopback, private, link-local, multicast and unspecified ones,
 // that a source host may not resolve to: shared address space (CGNAT, the tailnet), "this network",
-// benchmarking (198.18/15), reserved and broadcast (240/4), and the IPv6 forms that embed an IPv4 address
-// a gateway may route to (NAT64 64:ff9b::/96, 6to4 2002::/16).
+// benchmarking (198.18/15), IETF protocol assignments (192.0.0.0/24), reserved and broadcast (240/4), the
+// IPv6 forms that embed an IPv4 address a gateway may route to (NAT64 64:ff9b::/96, 6to4 2002::/16,
+// Teredo 2001::/32, IPv4-compatible ::/96) and the deprecated site-local fec0::/10.
 var internalNets = []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("2002::/16")}
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2001::/32"), netip.MustParsePrefix("::/96"), netip.MustParsePrefix("fec0::/10")}
 
 // publicAddr reports an address a clone may connect to: none of loopback, private (RFC 1918, fc00::/7),
 // link-local (169.254/16, fe80::/10), multicast, unspecified or internalNets, also IPv4-mapped.

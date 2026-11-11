@@ -210,6 +210,10 @@ type Config struct {
 	// WebAllowHosts are the hosts a claude fix, general or review job's WebFetch may reach over https, and
 	// the only hosts the daemon fetches a job's `docs` from (v0.8.2 G07, G08): exact host names, no
 	// wildcard, port, scheme or IP. Empty = no job has WebFetch and `docs` is refused. WebSearch stays closed.
+	// Every listed host is an outbound channel: a job chooses the path and query of each request, so it can
+	// carry data out to that host's logs (or its content, where users publish). List only vendor-owned
+	// documentation hosts without user content. Restart-only to add a host; a host removed on disk is
+	// revoked at the next launch or docs fetch (authorizedWebHosts).
 	WebAllowHosts []string `json:"web_allow_hosts"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked

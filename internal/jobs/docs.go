@@ -3,11 +3,13 @@ package jobs
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"mime"
 	"net"
 	"net/http"
@@ -65,6 +67,45 @@ var (
 	docTLS  *tls.Config
 )
 
+// docError is an error of the docs fetch whose text is ours alone: a fixed phrase with, at most, a host
+// or an address already vetted, or a URL cut by docLogURL. Only this text is logged or recorded; text
+// from the server, the resolver, the TLS stack or Go's HTTP client (which quotes a malformed Location
+// header, query included) never is: docFetchError maps it to a docError.
+type docError struct{ msg string }
+
+func (e *docError) Error() string { return e.msg }
+
+// docFetchError classifies an error of the HTTP client into a docError without query text: our own
+// docError as it is, else timeout, TLS failure, malformed redirect or other.
+func docFetchError(err error) error {
+	var de *docError
+	if errors.As(err, &de) {
+		return de
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+		if errors.As(err, &de) {
+			return de
+		}
+	}
+	var ne net.Error
+	var uae x509.UnknownAuthorityError
+	var he x509.HostnameError
+	var cie x509.CertificateInvalidError
+	var cve *tls.CertificateVerificationError
+	var rhe tls.RecordHeaderError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()):
+		return &docError{"the request timed out"}
+	case errors.As(err, &uae) || errors.As(err, &he) || errors.As(err, &cie) || errors.As(err, &cve) || errors.As(err, &rhe):
+		return &docError{"the TLS handshake failed (the certificate or the protocol was refused)"}
+	case strings.HasPrefix(err.Error(), "failed to parse Location header"):
+		return &docError{"the redirect target is malformed"}
+	}
+	return &docError{"the request failed"}
+}
+
 // dialPublic resolves addr's host and dials the first address that is public (publicAddr); one internal
 // answer refuses the host, as for a clone (sourcePin), so a name that resolves to the machine or the
 // tailnet is never connected to. It dials the vetted address, not the name: no second lookup can differ.
@@ -77,15 +118,15 @@ func dialPublic(ctx context.Context, network, addr string) (net.Conn, error) {
 	defer cancel()
 	addrs, err := sourceLookup(lctx, host)
 	if err != nil {
-		return nil, fmt.Errorf("cannot resolve %s: %v", host, err)
+		return nil, &docError{fmt.Sprintf("%s could not be resolved", host)}
 	}
 	if len(addrs) == 0 {
-		return nil, fmt.Errorf("%s resolves to no address", host)
+		return nil, &docError{fmt.Sprintf("%s resolves to no address", host)}
 	}
 	pick := netip.Addr{}
 	for _, a := range addrs {
 		if !publicAddr(a) {
-			return nil, fmt.Errorf("%s resolves to %s, an internal address (loopback, private, link-local, shared, multicast, reserved or unspecified)", host, a)
+			return nil, &docError{fmt.Sprintf("%s resolves to %s, an internal address (loopback, private, link-local, shared, multicast, reserved or unspecified)", host, a)}
 		}
 		if a = a.Unmap(); !pick.IsValid() || (a.Is4() && !pick.Is4()) {
 			pick = a
@@ -202,9 +243,17 @@ func (m *Manager) prefetchDocsJob(j *store.Job) {
 	if m.docsFetched(j) {
 		return
 	}
+	// A host removed on disk is not fetched; an unreadable config file fetches nothing now (tried again
+	// after a pause), never an outcome recorded from a list the owner may have revoked.
+	allow, err := m.authorizedWebHosts()
+	if err != nil {
+		m.Log.Printf("job %s: docs: %v (fetched again in %s)", j.ID, err, sourcesRetryBackoff)
+		m.sourcesBackOff(j)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), docsTotalTimeout)
 	defer cancel()
-	res := m.fetchDocs(ctx, j, dir)
+	res := m.fetchDocs(ctx, j, dir, allow)
 	// A job cancelled meanwhile is not launched: nothing records the outcome. A failed read of its row
 	// is not proof, so the fetch is tried again after a pause.
 	cur, err := m.Store.Get(j.ID)
@@ -226,7 +275,7 @@ func (m *Manager) prefetchDocsJob(j *store.Job) {
 
 // fetchDocs fetches every doc of j and saves the pages under dir/sources; a failure is a result, never an
 // error. Files an interrupted earlier run left (its docs.json was never written) are removed first.
-func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []docResult {
+func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string, allow []string) []docResult {
 	fail := func(msg string) []docResult {
 		m.Log.Printf("job %s: docs: %s", j.ID, msg)
 		out := make([]docResult, 0, len(j.Docs))
@@ -247,7 +296,6 @@ func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []doc
 			}
 		}
 	}
-	allow := m.Config().WebAllowHosts
 	var out []docResult
 	for _, u := range j.Docs {
 		r := docResult{URL: u}
@@ -262,7 +310,7 @@ func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []doc
 		}
 		if err != nil {
 			r.Err = "not fetched: " + RedactPrintable(err.Error(), 300)
-			m.Log.Printf("job %s: doc %s: %s", j.ID, Printable(u, 80), r.Err)
+			m.Log.Printf("job %s: doc %s: %s", j.ID, docLogURL(u), r.Err)
 		}
 		out = append(out, r)
 	}
@@ -273,7 +321,7 @@ func (m *Manager) fetchDocs(ctx context.Context, j *store.Job, dir string) []doc
 func writeDocFile(path string, text []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
 	if err != nil {
-		return fmt.Errorf("create the copy: %w", err)
+		return &docError{"create the copy: " + osErrText(err)}
 	}
 	_, err = f.Write(text)
 	if cerr := f.Close(); err == nil {
@@ -281,9 +329,19 @@ func writeDocFile(path string, text []byte) error {
 	}
 	if err != nil {
 		_ = os.Remove(path)
-		return fmt.Errorf("write the copy: %w", err)
+		return &docError{"write the copy: " + osErrText(err)}
 	}
 	return nil
+}
+
+// osErrText is the system's reason of a file error without the path it quotes: the file name is made of
+// the doc URL, query included.
+func osErrText(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err.Error()
+	}
+	return "failed"
 }
 
 var nonNameChars = regexp.MustCompile(`[^a-z0-9]+`)
@@ -314,7 +372,7 @@ func docFileName(rawURL string, taken []string) string {
 // other than 200, a type that is not text and a body over MaxSourceFileBytes.
 func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error) {
 	if why := guard.CheckWebURL(rawURL, allow); why != "" {
-		return nil, errors.New(why)
+		return nil, &docError{why}
 	}
 	client := &http.Client{
 		Timeout: docFetchTimeout,
@@ -327,10 +385,10 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) > maxDocRedirects {
-				return fmt.Errorf("more than %d redirects", maxDocRedirects)
+				return &docError{fmt.Sprintf("more than %d redirects", maxDocRedirects)}
 			}
 			if why := guard.CheckWebURL(req.URL.String(), allow); why != "" {
-				return fmt.Errorf("redirect to %s refused: %s", Printable(req.URL.String(), 80), why)
+				return &docError{fmt.Sprintf("redirect to %s refused: %s", docLogURL(req.URL.String()), why)}
 			}
 			return nil
 		},
@@ -338,17 +396,13 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, &docError{"the URL cannot be requested"} // the error quotes the URL, query included
 	}
 	req.Header.Set("User-Agent", "docs-fetch")
 	req.Header.Set("Accept", "text/html, text/markdown, text/plain, application/json;q=0.8")
 	resp, err := client.Do(req)
 	if err != nil {
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
-		}
-		return nil, err
+		return nil, docFetchError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -359,7 +413,7 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxSourceFileBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		return nil, &docError{"read: " + docFetchError(err).Error()}
 	}
 	if int64(len(body)) > MaxSourceFileBytes {
 		return nil, fmt.Errorf("the page exceeds %d bytes (2 MiB)", MaxSourceFileBytes)
@@ -368,14 +422,35 @@ func fetchDoc(ctx context.Context, rawURL string, allow []string) ([]byte, error
 	if ctype == "" {
 		ctype, _, _ = mime.ParseMediaType(http.DetectContentType(body))
 	}
+	var text []byte
 	switch {
 	case ctype == "text/html" || ctype == "application/xhtml+xml":
-		return htmlToText(body), nil
+		text = htmlToText(body)
 	case strings.HasPrefix(ctype, "text/") || ctype == "application/json" || ctype == "application/xml" ||
 		strings.HasSuffix(ctype, "+json") || strings.HasSuffix(ctype, "+xml"):
-		return cleanText(body), nil
+		text = cleanText(body)
+	default:
+		return nil, &docError{"the page is not a text type"} // the server's type string is not echoed
 	}
-	return nil, fmt.Errorf("the page is %q, not a text type", ctype)
+	// The UTF-8 repair turns each invalid byte into a 3-byte U+FFFD: the cap holds for what is saved.
+	if int64(len(text)) > MaxSourceFileBytes {
+		return nil, fmt.Errorf("the page text exceeds %d bytes (2 MiB) after its UTF-8 repair", MaxSourceFileBytes)
+	}
+	return text, nil
+}
+
+// docLogURL is a doc URL for a log line or an error: scheme, host and path only, since a query string or
+// fragment may carry a token.
+func docLogURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(an unparsable URL)"
+	}
+	s := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path, RawPath: u.RawPath}).String()
+	if u.RawQuery != "" || u.ForceQuery {
+		s += "?…"
+	}
+	return RedactPrintable(s, 80)
 }
 
 var (

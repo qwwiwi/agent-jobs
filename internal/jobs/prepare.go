@@ -141,13 +141,19 @@ const MaxWebAllowHosts = 50
 // their input.
 func webFetchKind(kind string) bool { return kind == "fix" || kind == "general" || kind == "review" }
 
-// webFetchHosts are the hosts WebFetch may reach in a job of this kind: config web_allow_hosts for a
-// kind that may use them, none otherwise (then WebFetch stays denied).
+// webFetchHosts are the hosts WebFetch may reach in a job of this kind: the authorized web_allow_hosts
+// (authorizedWebHosts: a host removed on disk is gone) for a kind that may use them, none otherwise or
+// when the config file cannot be read (then WebFetch stays denied).
 func (m *Manager) webFetchHosts(kind string) []string {
 	if !webFetchKind(kind) {
 		return nil
 	}
-	return m.Config().WebAllowHosts
+	hosts, err := m.authorizedWebHosts()
+	if err != nil {
+		m.Log.Printf("WebFetch stays denied: %v", err)
+		return nil
+	}
+	return hosts
 }
 
 // reviewWriteRules are the first layer of a claude review job's read-only mode, as the codex sandbox

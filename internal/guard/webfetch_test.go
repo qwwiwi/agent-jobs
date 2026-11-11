@@ -106,3 +106,85 @@ func TestNormalizeWebHost(t *testing.T) {
 		}
 	}
 }
+
+// F1: a non-ASCII host is refused before any case conversion, so a letter whose lower case is ASCII
+// (U+0130 İ -> i, U+212A Kelvin sign -> k) never matches an allowlisted ASCII host.
+func TestWebFetchNonASCIIFoldsToAllowlisted(t *testing.T) {
+	allow := []string{"i.example", "kit.example.com"}
+	for _, u := range []string{"https://İ.example/", "https://Kit.example.com/a", "https://KIT.EXAMPLE.COM/a"} {
+		if r := decideWeb(t, "WebFetch", u, allow); r == "" {
+			t.Errorf("%q passed the allowlist %v, want refused", u, allow)
+		}
+	}
+	for _, h := range []string{"İ.example", "Kit.example.com"} {
+		if got, err := NormalizeWebHost(h); err == nil {
+			t.Errorf("NormalizeWebHost(%q) = %q, want an error", h, got)
+		}
+	}
+	if r := decideWeb(t, "WebFetch", "https://I.EXAMPLE/", allow); r != "" {
+		t.Errorf("ASCII upper case must still match: %s", r)
+	}
+}
+
+// F2: a last label a URL parser reads as a number (decimal, 0x hex, octal) is an IP address in
+// disguise: refused as a config entry and in a URL.
+func TestWebHostNumericLastLabel(t *testing.T) {
+	for _, h := range []string{"127.0x1", "127.0X1", "0x7f.0x1", "127.0.0.0x1", "0x7f000001.0x", "a.0xff", "127.01",
+		"0177.0.0.01", "0x7f.0.0.017", "a.0X"} {
+		if got, err := NormalizeWebHost(h); err == nil {
+			t.Errorf("NormalizeWebHost(%q) = %q, want an error", h, got)
+		}
+		if r := decideWeb(t, "WebFetch", "https://"+h+"/", []string{h, "127.0x1"}); r == "" {
+			t.Errorf("https://%s/ passed, want refused", h)
+		}
+	}
+	// A last label that only starts like a number stays a name.
+	for _, h := range []string{"docs.0xg", "docs.x0x1", "a.b0x1"} {
+		if _, err := NormalizeWebHost(h); err != nil {
+			t.Errorf("NormalizeWebHost(%q): %v, want a name", h, err)
+		}
+	}
+}
+
+// N1: the guard takes exactly the key "url" of tool_input; another key equal to it ignoring case (which
+// Go's decoder would match) is refused, so an allowed "URL" cannot hide an evil "url".
+func TestWebFetchURLKeyExactCase(t *testing.T) {
+	allow := []string{"docs.example.com"}
+	cases := []struct {
+		name, input string
+		ok          bool
+	}{
+		{"exact key", `{"url":"https://docs.example.com/a"}`, true},
+		{"exact key and prompt", `{"url":"https://docs.example.com/a","prompt":"summarize"}`, true},
+		{"evil url, allowed URL", `{"url":"https://evil.example.net/x","URL":"https://docs.example.com/"}`, false},
+		{"allowed URL, evil url", `{"URL":"https://docs.example.com/","url":"https://evil.example.net/x"}`, false},
+		{"evil url, allowed Url", `{"url":"https://evil.example.net/x","Url":"https://docs.example.com/"}`, false},
+		{"only URL", `{"URL":"https://docs.example.com/"}`, false},
+		{"allowed url, evil URL", `{"url":"https://docs.example.com/","URL":"https://evil.example.net/x"}`, false},
+		{"url not a string", `{"url":["https://docs.example.com/"]}`, false},
+		{"tool_input not an object", `"https://docs.example.com/"`, false},
+	}
+	for _, c := range cases {
+		in := `{"tool_name":"WebFetch","cwd":"` + t.TempDir() + `","tool_input":` + c.input + `}`
+		r, err := Decide(strings.NewReader(in), Config{WebAllow: allow})
+		refused := err != nil || r != ""
+		if c.ok && refused {
+			t.Errorf("%s: refused: %q %v", c.name, r, err)
+		}
+		if !c.ok && !refused {
+			t.Errorf("%s: passed, want refused", c.name)
+		}
+	}
+}
+
+// N6: a percent-encoded host never matches: Go refuses an escaped ASCII byte in a host, and an escaped
+// non-ASCII one (%C4%B0 = U+0130) decodes to a name the non-ASCII rule refuses.
+func TestWebFetchPercentEncodedHost(t *testing.T) {
+	allow := []string{"docs.example.com", "i.example"}
+	for _, u := range []string{"https://docs%2eexample%2ecom/a", "https://%64ocs.example.com/a", "https://docs.example.com%2f@evil.example.net/a",
+		"https://docs.example.com%40evil.example.net/a", "https://%C4%B0.example/", "https://docs.example.com%00/a", "https://docs.example.com%2e/a"} {
+		if r := decideWeb(t, "WebFetch", u, allow); r == "" {
+			t.Errorf("%q passed, want refused", u)
+		}
+	}
+}
