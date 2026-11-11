@@ -177,6 +177,12 @@ if [[ $prompt == *FAKE_ONLY_COMMIT* ]]; then
   git add only-commit.txt
   git -c user.name=T -c user.email=t@example.com commit -qm "only commit"
 fi
+if [[ $prompt == *FAKE_UI_COMMIT* ]]; then
+  mkdir -p web
+  echo 'a{}' > web/app.css
+  git add web/app.css
+  git -c user.name=T -c user.email=t@example.com commit -qm "ui commit"
+fi
 if [[ $prompt == *FAKE_ONLY_STAGED* ]]; then printf 'staged\n' > tracked.txt; git add tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNSTAGED* ]]; then printf 'unstaged\n' >> tracked.txt; fi
 if [[ $prompt == *FAKE_ONLY_UNTRACKED* ]]; then echo u > only-untracked.txt; fi

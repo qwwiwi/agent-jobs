@@ -2,10 +2,13 @@ package jobs
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -202,9 +205,13 @@ func TestHasUICheckEvidence(t *testing.T) {
 	if hasUICheckEvidence(dir) {
 		t.Fatal("an empty ui-check/ counts as evidence")
 	}
-	if err := os.WriteFile(filepath.Join(ev, "notes.txt"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+	put := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(ev, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
+	put("notes.txt", "x")
 	if hasUICheckEvidence(dir) {
 		t.Fatal("a text file counts as evidence")
 	}
@@ -214,20 +221,41 @@ func TestHasUICheckEvidence(t *testing.T) {
 	if hasUICheckEvidence(dir) {
 		t.Fatal("a symlink counts as evidence")
 	}
-	if err := os.WriteFile(filepath.Join(ev, "results.json"), []byte("{}"), 0o600); err != nil {
-		t.Fatal(err)
+	for _, empty := range []string{"", "{}", " {} \n", "[]", "\n"} {
+		put("results.json", empty)
+		if hasUICheckEvidence(dir) {
+			t.Fatalf("results.json %q counts as evidence", empty)
+		}
 	}
+	put("shot2.png", "")
+	if hasUICheckEvidence(dir) {
+		t.Fatal("an empty screenshot counts as evidence")
+	}
+	put("results.json", `{"runs":[{"device":"360x740","ok":true}]}`)
 	if !hasUICheckEvidence(dir) {
-		t.Fatal("results.json is not evidence")
+		t.Fatal("a results.json with content is not evidence")
 	}
 	if err := os.Remove(filepath.Join(ev, "results.json")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ev, "360x740-light.png"), []byte("png"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	put("360x740-light.png", "png")
 	if !hasUICheckEvidence(dir) {
 		t.Fatal("a screenshot is not evidence")
+	}
+}
+
+// A ui-check/ that is itself a link does not count, whatever it points at.
+func TestHasUICheckEvidenceSymlinkedDir(t *testing.T) {
+	dir := t.TempDir()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "shot.png"), []byte("png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "ui-check")); err != nil {
+		t.Fatal(err)
+	}
+	if hasUICheckEvidence(dir) {
+		t.Fatal("a symlinked ui-check/ counts as evidence")
 	}
 }
 
@@ -274,17 +302,55 @@ func commitFile(t *testing.T, work, rel string) {
 
 const uiNoteText = "ui: true but no ui-check/ evidence"
 
+// uiNote is the note of the job-done line as the daemon gets it: computed once at the finish
+// (recordUINote) and read back from what the finish stored (uiEvidenceNote).
+func uiNote(t *testing.T, m *Manager, j *store.Job) string {
+	t.Helper()
+	m.recordUINote(j, j.Status)
+	return m.uiEvidenceNote(j)
+}
+
+// The real git, found once before any fake is on PATH (a second fakeGitDiff in one test must not call the first).
+var (
+	realGitOnce sync.Once
+	realGitPath string
+	realGitErr  error
+)
+
+// fakeGitDiff puts a git first on PATH that runs body (a sh snippet) for a `diff` call and the real git
+// for every other call.
+func fakeGitDiff(t *testing.T, body string) {
+	t.Helper()
+	realGitOnce.Do(func() { realGitPath, realGitErr = exec.LookPath("git") })
+	if realGitErr != nil {
+		t.Fatal(realGitErr)
+	}
+	real := realGitPath
+	if strings.ContainsRune(real, '\'') {
+		t.Fatalf("git path %q has a quote", real)
+	}
+	fakeGitOnPath(t, "for a in \"$@\"; do\n  if [ \"$a\" = diff ]; then\n"+body+"\n  fi\ndone\nexec '"+real+"' \"$@\"\n")
+}
+
+// shortUINoteTimeout sets the bound of the finish-time note to d for the test.
+func shortUINoteTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := uiNoteTimeout
+	uiNoteTimeout = d
+	t.Cleanup(func() { uiNoteTimeout = orig })
+}
+
 func TestUIEvidenceNote(t *testing.T) {
 	m, j, work := uiNoteFixture(t, "ui: true\n")
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); n != "" {
 		t.Fatalf("no diff: note %q", n)
 	}
 	commitFile(t, work, "docs/notes.txt")
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); n != "" {
 		t.Fatalf("a non-UI diff: note %q", n)
 	}
 	commitFile(t, work, "web/app.css")
-	n := m.uiEvidenceNote(j)
+	n := uiNote(t, m, j)
 	if !strings.Contains(n, uiNoteText) || !strings.Contains(n, "web/app.css") {
 		t.Fatalf("UI diff without evidence: note %q", n)
 	}
@@ -300,15 +366,28 @@ func TestUIEvidenceNote(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ev, "results.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); !strings.Contains(n, uiNoteText) {
+		t.Fatalf("an empty {} results.json silenced the note: %q", n)
+	}
+	if err := os.WriteFile(filepath.Join(ev, "results.json"), []byte(`{"runs":[{"ok":true}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if n := uiNote(t, m, j); n != "" {
 		t.Fatalf("with evidence: note %q", n)
+	}
+	// Evidence left by an earlier attempt counts: the folder is the job's, not the attempt's.
+	if err := os.MkdirAll(filepath.Join(m.JobDir(j.ID), "attempts", "1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if n := uiNote(t, m, j); n != "" {
+		t.Fatalf("evidence from an earlier attempt: note %q", n)
 	}
 	// Only a succeeded job gets it.
 	if err := os.RemoveAll(ev); err != nil {
 		t.Fatal(err)
 	}
 	j.Status = store.StatusFailed
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); n != "" {
 		t.Fatalf("failed job: note %q", n)
 	}
 }
@@ -317,7 +396,7 @@ func TestUIEvidenceNoteNeedsUICard(t *testing.T) {
 	for _, front := range []string{"", "ui: false\n", "review_questions: race\n"} {
 		m, j, work := uiNoteFixture(t, front)
 		commitFile(t, work, "web/app.css")
-		if n := m.uiEvidenceNote(j); n != "" {
+		if n := uiNote(t, m, j); n != "" {
 			t.Errorf("card front %q: note %q", front, n)
 		}
 	}
@@ -329,13 +408,13 @@ func TestUIEvidenceNoteNeverFails(t *testing.T) {
 	commitFile(t, work, "web/app.css")
 	bad := *j
 	bad.BaseCommit = "deadbeef"
-	if n := m.uiEvidenceNote(&bad); n != "" {
+	if n := uiNote(t, m, &bad); n != "" {
 		t.Errorf("unknown base: note %q", n)
 	}
 	if err := os.WriteFile(filepath.Join(m.CardsDir(), "p.md"), []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); n != "" {
 		t.Errorf("broken card: note %q", n)
 	}
 	if line := m.DoneLineFor(j); !strings.HasPrefix(line, doneLinePrefix) {
@@ -344,7 +423,7 @@ func TestUIEvidenceNoteNeverFails(t *testing.T) {
 	if err := os.RemoveAll(work); err != nil {
 		t.Fatal(err)
 	}
-	if n := m.uiEvidenceNote(j); n != "" {
+	if n := uiNote(t, m, j); n != "" {
 		t.Errorf("no work tree: note %q", n)
 	}
 }

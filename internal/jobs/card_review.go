@@ -1,11 +1,18 @@
 package jobs
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -87,6 +94,16 @@ func renderCardChecklist(cards []Card) string {
 	return b.String()
 }
 
+// cardChecklistFor is renderCardChecklist for the kinds that get it (fix and general, CoderKinds): "" for
+// every other kind. A first prompt, the fallback prompt and the resumed session's update all take it
+// from here.
+func cardChecklistFor(j *store.Job, cards []Card) string {
+	if !slices.Contains(CoderKinds, j.Kind) {
+		return ""
+	}
+	return renderCardChecklist(cards)
+}
+
 // uiExtensions are the file extensions that make a path a UI file: styles, markup and component or
 // template files. A path rule only (no content sniffing, no model call); static-site renderers and
 // design tokens written in other extensions are not recognised.
@@ -106,11 +123,17 @@ func isUIPath(p string) bool {
 	return slices.Contains(uiExtensions, strings.ToLower(filepath.Ext(p)))
 }
 
-// hasUICheckEvidence reports whether <jobDir>/ui-check/ holds the output of a browser check: a regular
-// file (never a link) results.json or a .png/.jpg/.jpeg/.webp screenshot. It does not judge the
-// result; it says that a check left something.
+// hasUICheckEvidence reports whether <jobDir>/ui-check/ holds the output of a browser check: ui-check/
+// is a real directory (a link to one does not count) with a non-empty regular file (never a link)
+// results.json or a .png/.jpg/.jpeg/.webp screenshot. A results.json that is blank or only an empty
+// `{}` / `[]` is no output. It does not judge the result; it says that a check left something. Whether
+// the evidence came from this attempt or an earlier one does not matter: the folder is the job's.
 func hasUICheckEvidence(jobDir string) bool {
-	entries, err := os.ReadDir(filepath.Join(jobDir, "ui-check"))
+	dir := filepath.Join(jobDir, "ui-check")
+	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
@@ -119,21 +142,132 @@ func hasUICheckEvidence(jobDir string) bool {
 			continue
 		}
 		name := strings.ToLower(e.Name())
-		if name == "results.json" || slices.Contains([]string{".png", ".jpg", ".jpeg", ".webp"}, filepath.Ext(name)) {
-			return true
+		isShot := slices.Contains([]string{".png", ".jpg", ".jpeg", ".webp"}, filepath.Ext(name))
+		if name != "results.json" && !isShot {
+			continue
 		}
+		fi, err := e.Info()
+		if err != nil || fi.Size() == 0 {
+			continue
+		}
+		if name == "results.json" && blankResults(filepath.Join(dir, e.Name())) {
+			continue
+		}
+		return true
 	}
 	return false
+}
+
+// blankResults reports whether the results file has nothing but white space, `{}` or `[]`: what a browser
+// check that did not run leaves. An unreadable file counts as blank.
+func blankResults(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, 64))
+	if err != nil {
+		return true
+	}
+	t := strings.TrimSpace(string(b))
+	return t == "" || t == "{}" || t == "[]"
 }
 
 // maxUINoteFiles caps the changed UI files the note names.
 const maxUINoteFiles = 3
 
-// uiEvidenceNote is the job-done note of a succeeded fix/general job in a repository whose card says
+// uiNoteFile is the job's stored note, in the job dir: written once at the finish (recordUINote) and
+// only read when the job-done line is built (uiEvidenceNote).
+const uiNoteFile = "ui-note.txt"
+
+// uiNoteMaxOutput caps the diff output read for the note, and uiNoteMaxRead the stored note read back.
+const (
+	uiNoteMaxOutput = 256 << 10
+	uiNoteMaxRead   = 1 << 10
+)
+
+// uiNoteTimeout bounds the whole work of the note at the finish (the card lookup and the diff). Past it
+// the note is dropped. A variable only so that tests shorten it.
+var uiNoteTimeout = 5 * time.Second
+
+// errUINoteOutput is a diff output past uiNoteMaxOutput.
+var errUINoteOutput = errors.New("diff output over the cap")
+
+// recordUINote works out the job-done note once, when the attempt finishes with status, and stores it
+// in the job dir: the note when a succeeded fix/general job on a ui: true card has a UI diff and no
+// ui-check/ evidence, else nothing (an older note is removed). It is bounded by uiNoteTimeout and never
+// fails the finish: a timeout or any error means no note. Building or re-delivering the done line only
+// reads the stored value.
+func (m *Manager) recordUINote(j *store.Job, status string) {
+	note := ""
+	if status == store.StatusSucceeded {
+		note = m.boundedUINote(j)
+	}
+	path := filepath.Join(m.JobDir(j.ID), uiNoteFile)
+	if note == "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			m.Log.Printf("job %s: ui note: remove: %v", j.ID, err)
+		}
+		return
+	}
+	// The job ended, but its dir is the job's: a planted link at the temp name is never written through.
+	if err := os.Remove(path + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.Log.Printf("job %s: ui note: %v", j.ID, err)
+		return
+	}
+	if err := writeAtomic(path, []byte(note+"\n")); err != nil {
+		m.Log.Printf("job %s: ui note: write: %v", j.ID, err)
+	}
+}
+
+// boundedUINote is uiNoteFor under uiNoteTimeout. The card lookup takes no deadline of its own, so the
+// work runs on its own goroutine that the finish stops waiting for at the bound; the diff is killed at
+// the same deadline, and the lookup's git calls end at their own bounds. A late result is dropped.
+func (m *Manager) boundedUINote(j *store.Job) string {
+	ctx, cancel := context.WithTimeout(context.Background(), uiNoteTimeout)
+	defer cancel()
+	jc := *j
+	jc.Status = store.StatusSucceeded
+	out := make(chan string, 1)
+	go func() { out <- m.uiNoteFor(ctx, &jc) }()
+	select {
+	case n := <-out:
+		return n
+	case <-ctx.Done():
+		m.Log.Printf("job %s: ui note: not ready within %s, no note", j.ID, uiNoteTimeout)
+		return ""
+	}
+}
+
+// uiEvidenceNote is the job-done note of a succeeded job: the value stored at its finish, "" when there
+// is none. It reads one small regular file and never runs git.
+func (m *Manager) uiEvidenceNote(j *store.Job) string {
+	if j.Status != store.StatusSucceeded {
+		return ""
+	}
+	path := filepath.Join(m.JobDir(j.ID), uiNoteFile)
+	if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, uiNoteMaxRead))
+	if err != nil {
+		return ""
+	}
+	return RedactPrintable(string(b), 300)
+}
+
+// uiNoteFor works out the note of a succeeded fix/general job in a repository whose card says
 // `ui: true`, whose diff against its base has a UI file (isUIPath) and whose folder has no ui-check/
 // evidence (hasUICheckEvidence). "" for everything else and for every error (a broken card, a missing
-// work tree, a bad base): the note is advice on a line, it never fails or holds back a job.
-func (m *Manager) uiEvidenceNote(j *store.Job) string {
+// work tree, a bad base, a diff past ctx or the output cap): the note is advice on a line, it never
+// fails or holds back a job.
+func (m *Manager) uiNoteFor(ctx context.Context, j *store.Job) string {
 	if !slices.Contains(CoderKinds, j.Kind) || j.Status != store.StatusSucceeded || j.RepoPath == "" || j.BaseCommit == "" {
 		return ""
 	}
@@ -153,8 +287,8 @@ func (m *Manager) uiEvidenceNote(j *store.Job) string {
 	if _, err := os.Stat(work); err != nil {
 		return ""
 	}
-	// The work tree against the base: the commits and any tracked change still uncommitted.
-	out, err := gitLong(work, "diff", "--name-only", "-z", j.BaseCommit)
+	// The work tree against the base: the commits and any tracked change still uncommitted. Names only.
+	out, err := cappedGit(ctx, work, uiNoteMaxOutput, "diff", "--name-only", "-z", j.BaseCommit)
 	if err != nil {
 		m.Log.Printf("job %s: ui note: diff: %v", j.ID, RedactText(err.Error()))
 		return ""
@@ -169,4 +303,55 @@ func (m *Manager) uiEvidenceNote(j *store.Job) string {
 		return ""
 	}
 	return "ui: true but no ui-check/ evidence for " + capList(files, maxUINoteFiles)
+}
+
+// cappedWriter keeps at most max bytes; the write that would pass it marks the output over and calls stop
+// (which ends git), and what follows is dropped.
+type cappedWriter struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	max  int
+	over bool
+	stop context.CancelFunc
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.over || w.buf.Len()+len(p) > w.max {
+		if !w.over {
+			w.over = true
+			w.stop()
+		}
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+// cappedGit runs git -C dir args with the daemon's git environment until ctx ends (git's process group
+// is then killed), reading at most max bytes of stdout while it streams: more is errUINoteOutput and git
+// is stopped at once. Stdout is returned untrimmed.
+func cappedGit(ctx context.Context, dir string, max int, args ...string) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := &cappedWriter{max: max, stop: cancel}
+	var errOut bytes.Buffer
+	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdout, c.Stderr = out, &errOut }, append([]string{"-C", dir}, args...)...)
+	if err != nil {
+		return "", err
+	}
+	err = p.wait(ctx)
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	if out.over {
+		return "", errUINoteOutput
+	}
+	if err != nil {
+		if errors.Is(err, errGitTimeout) {
+			return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		}
+		// errOut may still be written by an abandoned wait only after a timeout, handled above.
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
+	}
+	return out.buf.String(), nil
 }
