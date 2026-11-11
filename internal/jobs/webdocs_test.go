@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -140,6 +141,17 @@ func newDocsServer(t *testing.T) *docsServer {
 	})
 	mux.HandleFunc("/loop", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/loop", http.StatusFound)
+	})
+	mux.HandleFunc("/loopq", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/loopq?q=logprobe", http.StatusFound)
+	})
+	mux.HandleFunc("/redir-out-q", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://evil.example.net/x?q=logprobe", http.StatusFound)
+	})
+	mux.HandleFunc("/redir-bad", func(w http.ResponseWriter, r *http.Request) {
+		// Go's client reports this Location, query included, before CheckRedirect runs.
+		w.Header().Set("Location", "https://example.com/%zz?q=logprobe")
+		w.WriteHeader(http.StatusFound)
 	})
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ds.hits.Add(1)
@@ -513,6 +525,76 @@ func TestPrefetchDocsLogRedactsQuery(t *testing.T) {
 		if r := docResultFor(t, m, j.ID, u); r.Err == "" || strings.Contains(r.Err, "qsecret") {
 			t.Errorf("%s: %+v; want an error without the query", u, r)
 		}
+	}
+}
+
+// sol L1: no error of the docs fetch that is logged or recorded carries untrusted diagnostic text (Go's
+// client quotes a malformed Location header, a resolver quotes its own message): each failure is a
+// query-free class plus the sanitized URL. The marker sits in the request URL, in a redirect target or in
+// the diagnostic text itself; it must reach neither the log nor the recorded error.
+func TestPrefetchDocsErrorsCarryNoQueryText(t *testing.T) {
+	const marker = "logprobe"
+	oldTimeout, oldLookup := docFetchTimeout, sourceLookup
+	t.Cleanup(func() { docFetchTimeout, sourceLookup = oldTimeout, oldLookup })
+	cases := []struct {
+		name, path, want string
+		setup            func()
+	}{
+		{name: "malformed redirect", path: "/redir-bad?q=logprobe", want: "malformed"},
+		{name: "redirect off the allowlist", path: "/redir-out-q?q=logprobe", want: "redirect to https://evil.example.net/x?… refused"},
+		{name: "redirect chain", path: "/loopq?q=logprobe", want: "more than"},
+		{name: "status", path: "/nothing?q=logprobe", want: "the server answered 404"},
+		{name: "too large", path: "/big?q=logprobe", want: "exceeds"},
+		{name: "not text", path: "/img?q=logprobe", want: "not a text type"},
+		{name: "timeout", path: "/slow?q=logprobe", want: "timed out", setup: func() { docFetchTimeout = 300 * time.Millisecond }},
+		{name: "tls", path: "/page.html?q=logprobe", want: "TLS", setup: func() { docTLS = &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12} }},
+		{name: "dns", path: "/page.html?q=logprobe", want: "resolved", setup: func() {
+			docDial = dialPublic // newDocsServer's cleanup restores it
+			sourceLookup = func(context.Context, string) ([]netip.Addr, error) {
+				return nil, errors.New("resolver said q=logprobe")
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := docsManager(t)
+			newDocsServer(t)
+			docFetchTimeout, sourceLookup = oldTimeout, oldLookup
+			if c.setup != nil {
+				c.setup()
+			}
+			var logBuf bytes.Buffer
+			m.Log = log.New(&logBuf, "", 0)
+			u := "https://example.com" + c.path
+			j := enqueueDocs(t, m, u)
+			m.prefetchDocs()
+			r := docResultFor(t, m, j.ID, u)
+			if r.Err == "" || r.Name != "" {
+				t.Fatalf("%+v; want an error and no file", r)
+			}
+			if !strings.Contains(r.Err, c.want) {
+				t.Errorf("recorded error %q; want it to contain %q", r.Err, c.want)
+			}
+			if strings.Contains(r.Err, marker) {
+				t.Errorf("the recorded error carries query text: %q", r.Err)
+			}
+			if !strings.Contains(logBuf.String(), "example.com") || strings.Contains(logBuf.String(), marker) {
+				t.Errorf("the log must name the doc without query text: %q", logBuf.String())
+			}
+		})
+	}
+}
+
+// sol L1: the saved file's name is made of the URL (query included), so a failed save must not quote the
+// path in its error.
+func TestWriteDocFileErrorHasNoPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-dir", "doc-example.com-x-q-logprobe.txt")
+	err := writeDocFile(path, []byte("x"))
+	if err == nil {
+		t.Fatal("a save into a missing folder succeeded")
+	}
+	if strings.Contains(err.Error(), "logprobe") {
+		t.Errorf("the save error quotes the file name: %q", err)
 	}
 }
 
