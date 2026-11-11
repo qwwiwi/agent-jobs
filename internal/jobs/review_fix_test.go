@@ -182,7 +182,7 @@ func TestControlReviewQueuedAfterSuccessfulFix(t *testing.T) {
 	if ctl.BaseBranch != "refs/heads/"+fix.Branch || ctl.BaseCommit != head {
 		t.Fatalf("control review base %s@%s, want %s@%s", ctl.BaseBranch, ctl.BaseCommit, fix.Branch, head)
 	}
-	if want := []string{"job:" + review.ID, "job:" + fix.ID}; !slices.Equal(ctl.SourceFiles, want) {
+	if want := []string{"job:" + review.ID, "job:" + fix.ID, "gate:" + fix.ID}; !slices.Equal(ctl.SourceFiles, want) {
 		t.Fatalf("sources %v, want %v", ctl.SourceFiles, want)
 	}
 	if ctl.Review != "" || ctl.ControlReview {

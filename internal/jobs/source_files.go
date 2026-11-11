@@ -37,6 +37,11 @@ func checkFileSourceOrigins(origins []string) error {
 			if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\\x00\r\n") {
 				return fmt.Errorf("sources: invalid job id %q", id)
 			}
+		case strings.HasPrefix(origin, "gate:"):
+			id := strings.TrimPrefix(origin, "gate:")
+			if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\\x00\r\n") {
+				return fmt.Errorf("sources: invalid job id %q", id)
+			}
 		case filepath.IsAbs(origin):
 			// Existence and file type are checked while taking the snapshot.
 		case strings.Contains(origin, "://"):
@@ -56,6 +61,9 @@ func sourceFileNames(origins []string) []string {
 		base := filepath.Base(origin)
 		if strings.HasPrefix(origin, "job:") {
 			base = strings.TrimPrefix(origin, "job:") + "-report.md"
+		}
+		if strings.HasPrefix(origin, "gate:") {
+			base = strings.TrimPrefix(origin, "gate:") + "-" + GateResultsFile
 		}
 		name := base
 		for n := 2; used[casefold.Fold(name)]; n++ {
@@ -98,6 +106,22 @@ func openAbsoluteSource(path string) (*os.File, error) {
 func (m *Manager) readSourceFile(origin string) ([]byte, error) {
 	var f *os.File
 	var err error
+	if strings.HasPrefix(origin, "gate:") {
+		// The gate result artifact of a job (G09): rendered by the daemon, never a file of the job's.
+		id := strings.TrimPrefix(origin, "gate:")
+		j, getErr := m.Store.Get(id)
+		if getErr != nil {
+			return nil, fmt.Errorf("sources %q: unknown job or unavailable job record: %w", origin, getErr)
+		}
+		if j.Agent != m.Agent {
+			return nil, fmt.Errorf("sources %q: job must belong to the same agent (%s)", origin, m.Agent)
+		}
+		b, err := m.gateArtifact(j)
+		if err != nil {
+			return nil, fmt.Errorf("sources %q: %w", origin, err)
+		}
+		return b, nil
+	}
 	if strings.HasPrefix(origin, "job:") {
 		id := strings.TrimPrefix(origin, "job:")
 		j, getErr := m.Store.Get(id)
