@@ -236,6 +236,15 @@ type Job struct {
 	// IdemKey is a deterministic creation key, unique among the jobs that have one ("" = none): a retry
 	// of the same creation finds the job it already made (GetByIdemKey, ErrIdemKeyExists).
 	IdemKey string
+	// LoopDesign and LoopOverride are the bypass of the fix-loop cap (v0.8.2 G05) a fix job started from
+	// a review was given: the id of a succeeded research or general job of this agent, and the stated
+	// reason. Either lets a fix past review_max_fix_loops; "" = not given.
+	LoopDesign   string
+	LoopOverride string
+	// Docs are the https URLs of provider documentation (v0.8.2 G08) the daemon fetches into
+	// <jobdir>/sources as text files before the job starts; their hosts are checked against the config
+	// web_allow_hosts at enqueue and again at the fetch.
+	Docs []string
 }
 
 // BlockingFinding is one blocking finding of a review report: its ID (H1, F2, …) and its whole text.
@@ -732,6 +741,10 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN control_note TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN idem_key TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN gate_wait_sec INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN loop_design TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN loop_override TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE jobs ADD COLUMN docs TEXT NOT NULL DEFAULT '[]'`,
+	uiNoteAlter,
 }
 
 // idemKeyIndex makes idem_key unique among the jobs that have one: a retried creation (the control review
@@ -871,7 +884,8 @@ const cols = `id, agent, title, kind, brief, repo_path, base_commit, status, mod
 	acceptance_pgid, timed_out_at, pgid_spawned, dir_bytes, dir_tmp_bytes, dir_partial, outcome, outcome_note, outcome_at,
 	base_branch, merge_note, covers, cover_contract, gate_input, size, milestone_id, task_key, sources,
 	cost_estimate_usd, provider, source_files, requested_branch, branch, branch_note, paths, on_overlap, overlap, wait_for, parent, parent_base,
-	crew, review, review_blocking, control_review, control_job, control_note, idem_key, gate_wait_sec`
+	crew, review, review_blocking, control_review, control_job, control_note, idem_key, gate_wait_sec,
+	loop_design, loop_override, docs`
 
 func ts(t *time.Time) any {
 	if t == nil {
@@ -958,7 +972,7 @@ func insertArgs(j *Job) []any {
 		j.RequestedBranch, j.Branch, j.BranchNote,
 		sourceFilesJSON(j.Paths), j.OnOverlap, overlapJSON(j.Overlap), sourceFilesJSON(j.WaitFor), j.Parent, j.ParentBase,
 		crewJSON(j.Crew), j.Review, blockingJSON(j.ReviewBlocking), j.ControlReview, j.ControlJob, j.ControlNote, j.IdemKey,
-		j.GateWaitSec}
+		j.GateWaitSec, j.LoopDesign, j.LoopOverride, sourceFilesJSON(j.Docs)}
 }
 
 // blockingJSON is the review_blocking column: "[]" for none.
@@ -991,7 +1005,7 @@ func scanJob(r scanner) (*Job, error) {
 	var j Job
 	var created int64
 	var started, finished, notified, cleaned, accStarted, accExit, accDeadline, timedOut, outcomeAt sql.NullInt64
-	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor, crew, reviewBlocking string
+	var skills, delivered, covers, coverContract, gate, sources, sourceFiles, paths, overlaps, waitFor, crew, reviewBlocking, docs string
 	var milestone sql.NullInt64
 	var estimate sql.NullFloat64
 	err := r.Scan(&j.ID, &j.Agent, &j.Title, &j.Kind, &j.Brief, &j.RepoPath, &j.BaseCommit, &j.Status,
@@ -1007,12 +1021,15 @@ func scanJob(r scanner) (*Job, error) {
 		&j.RequestedBranch, &j.Branch, &j.BranchNote,
 		&paths, &j.OnOverlap, &overlaps, &waitFor, &j.Parent, &j.ParentBase, &crew,
 		&j.Review, &reviewBlocking, &j.ControlReview, &j.ControlJob, &j.ControlNote, &j.IdemKey,
-		&j.GateWaitSec)
+		&j.GateWaitSec, &j.LoopDesign, &j.LoopOverride, &docs)
 	if err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(sourceFiles), &j.SourceFiles); err != nil {
 		return nil, fmt.Errorf("job %s: source_files: %w", j.ID, err)
+	}
+	if err := json.Unmarshal([]byte(docs), &j.Docs); err != nil {
+		return nil, fmt.Errorf("job %s: docs: %w", j.ID, err)
 	}
 	if j.Crew, err = parseCrew(crew); err != nil {
 		return nil, fmt.Errorf("job %s: crew: %w", j.ID, err)

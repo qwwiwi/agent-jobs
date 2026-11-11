@@ -398,6 +398,10 @@ func (r RoutingPolicy) validate(where string) error {
 var errOpenRouterSources = errors.New("openrouter jobs take no sources (providers.openrouter.deny_repos covers only the job's repo; " +
 	"a source file or job report would reach the third-party provider): start it without sources, or on a claude or codex model")
 
+// errOpenRouterDocs refuses docs on an OpenRouter job: the daemon saves fetched pages as files in the job
+// folder, which an OpenRouter job's runner does not read.
+var errOpenRouterDocs = errors.New("openrouter jobs take no docs: start it without docs, or on a claude or codex model")
+
 // checkOpenRouterJob refuses an OpenRouter job the config does not allow (R2, R5): not configured, a
 // slug off the allow-list, a review job, a codex runner, or a denied repository (repo may be "").
 func (c Config) checkOpenRouterJob(slug, kind, runner, repo string) error {

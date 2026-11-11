@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/qwwiwi/agent-jobs/internal/brain"
+	"github.com/qwwiwi/agent-jobs/internal/guard"
 	"github.com/qwwiwi/agent-jobs/internal/skills"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -192,6 +193,28 @@ type Config struct {
 	// and the daemon and wrapper do not run it). Enabling requires a daemon restart; disabling on
 	// disk revokes it immediately. The command runs the job's code outside the guard.
 	AcceptanceAllowed bool `json:"acceptance_allowed"`
+	// GateTimeoutMinutes is the time limit of a gate's command (`agent-jobs gate run` inside a job
+	// without --timeout; a matching card's gate_timeout: wins). 0 = DefaultGateTimeoutMinutes (60); at
+	// most CeilingGateTimeoutMinutes (180).
+	GateTimeoutMinutes int `json:"gate_timeout_minutes"`
+	// GateMaxParallel is how many gates (of any repository) run on the box at once: the box slots this
+	// agent's gates and acceptance steps take (two gates of one repository never run at once). 0 =
+	// DefaultGateMaxParallel (2); at most CeilingGateMaxParallel (8). All gates of the box share the
+	// slots and one queue, and a gate outside a job uses $AGENT_JOBS_GATE_MAX_PARALLEL or the default:
+	// keep one value per box (a waiter with fewer slots at the head of the queue holds back the others).
+	GateMaxParallel int `json:"gate_max_parallel"`
+	// ReviewMaxFixLoops caps the fix jobs on one review chain (review -> fix -> control review -> fix
+	// ...; v0.8.2 G04): a further fix started with review= is refused unless it carries design or
+	// loop_override. 0 = DefaultReviewMaxFixLoops (2); at most CeilingReviewMaxFixLoops (10).
+	ReviewMaxFixLoops int `json:"review_max_fix_loops"`
+	// WebAllowHosts are the hosts a claude fix, general or review job's WebFetch may reach over https, and
+	// the only hosts the daemon fetches a job's `docs` from (v0.8.2 G07, G08): exact host names, no
+	// wildcard, port, scheme or IP. Empty = no job has WebFetch and `docs` is refused. WebSearch stays closed.
+	// Every listed host is an outbound channel: a job chooses the path and query of each request, so it can
+	// carry data out to that host's logs (or its content, where users publish). List only vendor-owned
+	// documentation hosts without user content. Restart-only to add a host; a host removed on disk is
+	// revoked at the next launch or docs fetch (authorizedWebHosts).
+	WebAllowHosts []string `json:"web_allow_hosts"`
 	// SizeRequired makes job_start refuse a fix or general job without size (Wave F, F9 (a)). Default
 	// false during the rollout: a missing size is then logged and allowed, while size large is checked
 	// either way. The owner turns it on.
@@ -603,6 +626,20 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if err := c.validateAcceptance(); err != nil {
 		return c, err
+	}
+	if err := c.validateGate(); err != nil {
+		return c, err
+	}
+	if c.ReviewMaxFixLoops < 0 || c.ReviewMaxFixLoops > CeilingReviewMaxFixLoops {
+		return c, fmt.Errorf("config.json: review_max_fix_loops %d must be 0 (default %d) to %d", c.ReviewMaxFixLoops,
+			DefaultReviewMaxFixLoops, CeilingReviewMaxFixLoops)
+	}
+	if hosts, err := guard.NormalizeWebHosts(c.WebAllowHosts); err != nil {
+		return c, fmt.Errorf("config.json: web_allow_hosts: %w", err)
+	} else if len(hosts) > MaxWebAllowHosts {
+		return c, fmt.Errorf("config.json: web_allow_hosts lists %d hosts, at most %d", len(hosts), MaxWebAllowHosts)
+	} else {
+		c.WebAllowHosts = hosts
 	}
 	if c.SourcesMaxMB < 0 {
 		return c, errors.New("config.json: sources_max_mb must be 0 (default) or positive")

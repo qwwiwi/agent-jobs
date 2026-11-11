@@ -859,7 +859,11 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		}
 		costJournal.end(openRouter, status, msg, openRouter.lookup(deadline))
 	}
-	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code))); err != nil {
+	err = writeAtomic(filepath.Join(jobDir, "exit_code"), []byte(fmt.Sprintf("%d\n", code)))
+	// The completion is stored: the daemon can collect the job and refill its slot now (G12). Sent last,
+	// once the wrapper has nothing left to do: collecting the job stops its scope, which ends the wrapper.
+	kickDaemonOf(jobDir, stderrLog)
+	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper: write exit_code:", err)
 		return 2
 	}
@@ -929,7 +933,9 @@ func finishBeforeRunner(jobDir string, res StreamResult, record func(StreamResul
 		fmt.Fprintln(log, "run-wrapper: record completion:", err)
 		return 2
 	}
-	if err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n")); err != nil {
+	err := writeAtomic(filepath.Join(jobDir, "exit_code"), []byte("1\n"))
+	kickDaemonOf(jobDir, log) // the completion is stored (G12); sent last, as in RunWrapper
+	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: write exit_code:", err)
 		return 2
 	}
@@ -1110,8 +1116,9 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 }
 
 // RunnerEnv is the environment a job's runner starts with, built from env: the job's git environment
-// (GitEnv), the job marker without the user bus (JobEnv), the job's temp dir (TempEnv) and, for a
-// claude runner, no fork subagents (ForkSubagentEnv). An advisor call of a crew job gets it too.
+// (GitEnv), the job marker without the user bus (JobEnv), the job's gate settings (gateSettingsEnv),
+// the job's temp dir (TempEnv) and, for a claude runner, no fork subagents (ForkSubagentEnv). An
+// advisor call of a crew job gets it too.
 func RunnerEnv(jobDir string, env []string, runner string) ([]string, error) {
 	env, err := GitEnv(jobDir, env)
 	if err != nil {
@@ -1119,6 +1126,9 @@ func RunnerEnv(jobDir string, env []string, runner string) ([]string, error) {
 	}
 	if env, err = JobEnv(jobDir, env); err != nil {
 		return nil, fmt.Errorf("job marker: %w", err)
+	}
+	if env, err = gateSettingsEnv(jobDir, env); err != nil {
+		return nil, fmt.Errorf("gate settings: %w", err)
 	}
 	// Created by prepare; again here for an attempt prepared by an older build.
 	tmp, err := ensureJobTmp(jobDir)

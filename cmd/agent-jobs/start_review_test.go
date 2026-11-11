@@ -69,4 +69,19 @@ func TestStartCLIReviewFlags(t *testing.T) {
 	if _, err := fix("--control-review=true"); err == nil || !strings.Contains(err.Error(), "control_review") {
 		t.Fatalf("--control-review without --review: %v", err)
 	}
+	// G05: --loop-override is stored; given empty it is refused; --design is passed on (an unknown id is
+	// refused by the daemon's check, naming the id).
+	over, err := fix("--review", reviewID, "--loop-override", "owner approved")
+	if err != nil || over.LoopOverride != "owner approved" {
+		t.Fatalf("--loop-override: %+v %v", over, err)
+	}
+	if out := captureStdout(t, func() error { return cmdStatus([]string{"--agent", "test", over.ID}) }); !strings.Contains(out, "fix loop:  override: owner approved") {
+		t.Fatalf("status lacks the fix-loop override:\n%s", out)
+	}
+	if _, err := fix("--review", reviewID, "--loop-override="); err == nil || !strings.Contains(err.Error(), "loop_override") {
+		t.Fatalf("empty --loop-override: %v", err)
+	}
+	if _, err := fix("--review", reviewID, "--design", "no-such-design"); err == nil || !strings.Contains(err.Error(), "no-such-design") {
+		t.Fatalf("--design: %v", err)
+	}
 }

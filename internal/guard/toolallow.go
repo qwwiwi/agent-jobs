@@ -13,7 +13,9 @@ var JobMCPTools = []string{"memory_search", "memory_write", "notify_owner", "che
 // allowedTools are the tools a job may call (an allowlist: the reference forbids tools that reach a
 // person or outlive the run, and a new Claude Code tool must not pass just because it is unknown).
 // Bash, the file and read tools and the subagent tool keep their own checks below; WebFetch and
-// WebSearch are closed by the deny rules for every kind except research; Skill loads the delivered
+// WebSearch are closed by the deny rules for every kind except research, except that a claude fix,
+// general or review job gets WebFetch on the hosts of config web_allow_hosts, which the guard checks
+// call by call (webfetch.go); Skill loads the delivered
 // skills; ToolSearch loads deferred tool schemas (the MCP tools above are deferred). TaskCreate,
 // TaskUpdate, TaskList and TaskGet are the newer in-session todo list (TodoWrite's successor);
 // TaskOutput, BashOutput, TaskStop and KillShell read or stop the job's own background shells, which

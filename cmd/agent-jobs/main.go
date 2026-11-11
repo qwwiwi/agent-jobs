@@ -122,10 +122,14 @@ const usage = `usage: agent-jobs <command> [flags]
   gate retire --agent A REPO               owner only: take REPO (its main work tree path as stored,
                                            also when it is gone) out of the merge gate (F9 (b)); a
                                            later checklist approval gates it again
-  gate run --head REV [--repo DIR] [--timeout 30m] [--lock-wait 60m] -- CMD [ARGS...]
+  gate run --head REV [--repo DIR] [--timeout 60m] [--lock-wait 60m] -- CMD [ARGS...]
                                            a heavy local gate (check.sh, a pg suite, a build):
-                                           one at a time per box (/run/lock/agent-jobs-gate.lock,
-                                           /tmp/ where /run/lock is missing), HEAD of DIR
+                                           one at a time per repository, at most
+                                           $AGENT_JOBS_GATE_MAX_PARALLEL (gate_max_parallel, default
+                                           2) per box (locks in /run/lock, /tmp/ where /run/lock is
+                                           missing); --timeout defaults to $AGENT_JOBS_GATE_TIMEOUT
+                                           (a job's card gate_timeout: or gate_timeout_minutes),
+                                           else 60m; HEAD of DIR
                                            must be REV before and after, own process group killed
                                            on timeout (exit 124) and after the command, TELEGRAM_*
                                            dropped; the last stdout line is always exit=N
@@ -424,6 +428,8 @@ func runGuard(args []string, stdin io.Reader) int {
 	fs.Var(&readAllow, "read-allow", "a path a gate job may read; given, every other path is refused (repeatable)")
 	var sources multi
 	fs.Var(&sources, "sources", "the job's cloned sources dir: read-only, its code never runs on the host (repeatable)")
+	var webAllow multi
+	fs.Var(&webAllow, "web-allow", "a host WebFetch may reach over https (config web_allow_hosts, repeatable); given, every other host and WebSearch are refused")
 	sandbox := fs.String("sandbox", "", "the job's sandbox dir: its copies run only in docker run --rm with one -v mount from it")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -446,7 +452,7 @@ func runGuard(args []string, stdin io.Reader) int {
 	reason, err := guard.Decide(stdin, guard.Config{
 		OwnerNames: owners, GitName: *name, GitEmail: *email, GitDirs: gitDirs, SubagentLog: *subagentLog,
 		SubagentReserve: reserve, Protected: protected, NoRead: noRead, ReadOnly: *readOnly, ReadAllow: readAllow,
-		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob),
+		Sources: sources, Sandbox: *sandbox, JobID: guardJobID(*subagentJob), WebAllow: webAllow,
 	})
 	if err != nil {
 		// Fail closed: an unparsable hook payload blocks the call.
@@ -591,9 +597,13 @@ func cmdStart(args []string) error {
 	fs.StringVar(&r.OnOverlap, "on-overlap", "", "warn (default)|serialize|refuse for declared path overlap")
 	fs.StringVar(&r.Review, "review", "", "fix job: id of a succeeded review job of this agent; its report is attached and every ### Blocking finding ID goes into the prompt")
 	controlReview := fs.Bool("control-review", true, "with --review: queue a control review (same model as the review, base = the fix result branch) when the fix succeeds; --control-review=false turns it off")
+	fs.StringVar(&r.Design, "design", "", "with --review: bypass the fix-loop cap (config review_max_fix_loops, default 2) with the id of a succeeded research or general job of this agent")
+	loopOverride := fs.String("loop-override", "", "with --review: bypass the fix-loop cap with a stated reason (must not be empty)")
 	fs.StringVar(&r.Parent, "parent", "", "job id to stack on: wait for success, then use its result as base (not with --base)")
 	var sources multi
 	fs.Var(&sources, "source", "absolute file path or job:<id> report of this agent; copied read-only before enqueue (repeatable, max 10 files, 2 MiB each)")
+	var docs multi
+	fs.Var(&docs, "doc", "provider docs: https URL on a config web_allow_hosts host; the daemon fetches it into sources/ as a text file before the job starts (repeatable, max 5)")
 	if _, err := parse(fs, args); err != nil {
 		return err
 	}
@@ -602,8 +612,11 @@ func cmdStart(args []string) error {
 	// The flag defaults to true; it is passed on only when given or when --review makes it apply, so
 	// the default alone never trips the "control_review needs review" refusal.
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "control-review" {
+		switch f.Name {
+		case "control-review":
 			r.ControlReview = controlReview
+		case "loop-override": // given empty, it reaches the daemon's refusal
+			r.LoopOverride = loopOverride
 		}
 	})
 	if r.Review != "" && r.ControlReview == nil {
@@ -611,6 +624,9 @@ func cmdStart(args []string) error {
 	}
 	if len(sources) > 0 {
 		r.Sources = sources
+	}
+	if len(docs) > 0 {
+		r.Docs = docs
 	}
 	switch {
 	case *brief != "":
@@ -752,6 +768,9 @@ func cmdStatus(args []string) error {
 		case j.ControlReview:
 			fmt.Printf("control:   review on success\n")
 		}
+		if f := jobs.FixLoopBypass(j); f != "" {
+			fmt.Printf("fix loop:  %s\n", strings.TrimPrefix(f, "fix loop: "))
+		}
 	}
 	if len(j.Paths) > 0 {
 		fmt.Printf("paths:     %s (%s)\n", strings.Join(j.Paths, ", "), j.OnOverlap)
@@ -788,6 +807,9 @@ func cmdStatus(args []string) error {
 	if len(j.SourceFiles) > 0 {
 		fmt.Printf("sources:   %s\n", strings.Join(j.SourceFiles, ", "))
 	}
+	if len(j.Docs) > 0 {
+		fmt.Printf("docs:      %s\n", strings.Join(j.Docs, ", "))
+	}
 	fmt.Printf("dir:       %s\n", m.JobDir(j.ID))
 	if p := m.PrepareResultOf(j); p != nil {
 		fmt.Printf("prepare:   %s (%s)\n", p.Command, prepareWord(*p))
@@ -821,9 +843,11 @@ func printQueue(m *jobs.Manager) error {
 		return err
 	}
 	fmt.Printf("queue:     %d running, %d queued (configured max_running %d)\n", q.Running, q.Queued, q.ConfiguredMaxRunning)
-	// The box-wide gate lock that serializes heavy steps (#208).
-	if g := q.GateLock; g.Holder != "" {
-		fmt.Printf("gate lock: held, untrusted holder line: %s\n", shown(g.Holder))
+	// The gate locks that serialize heavy steps (#208; per repository and box slot since v0.8.2).
+	if g := q.GateLock; len(g.Holders) > 0 {
+		for _, h := range g.Holders {
+			fmt.Printf("gate lock: held, untrusted holder line: %s\n", shown(h))
+		}
 	} else {
 		fmt.Println("gate lock: free")
 	}
@@ -1456,6 +1480,12 @@ func cmdTick(args []string) error {
 }
 
 func cmdDaemon(args []string) error {
+	// Kicks (G12) are caught before anything else: SIGUSR1 ends a process that does not handle it, and a
+	// wrapper or Enqueue may kick this pid as soon as daemon.json names it. The handler stays until the
+	// process exits (no signal.Stop): a kick during shutdown is dropped, it never ends the daemon. One
+	// buffered slot: kicks that arrive while one waits are folded into it.
+	kicks := make(chan os.Signal, 1)
+	signal.Notify(kicks, jobs.KickSignal)
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	agent := agentFlag(fs)
 	if _, err := parse(fs, args); err != nil {
@@ -1504,9 +1534,14 @@ func cmdDaemon(args []string) error {
 	}()
 	t := time.NewTicker(jobs.TickInterval)
 	defer t.Stop()
-	for {
+	// The minute tick as before, plus a debounced tick on every kick (G12, G13): a queued job starts
+	// seconds after a slot frees or it is enqueued, not at the next minute.
+	daemonLoop(ctx, wallClock{}, t.C, kicks, func(minute bool) {
 		if err := m.Tick(); err != nil {
 			m.Log.Printf("tick: %v", err)
+		}
+		if !minute {
+			return // the daily run and the heartbeat keep the minute's cadence
 		}
 		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
 		// the next ticks keep launching jobs while it runs.
@@ -1514,18 +1549,14 @@ func cmdDaemon(args []string) error {
 		// Heartbeat (off by default): the Go gate, then at most one small-model decision in the
 		// background, so a slow decision never delays the next tick.
 		m.StartHeartbeat(ctx)
-		select {
-		case <-ctx.Done():
-			// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
-			// in progress stops between jobs (ctx) and is waited for before the store closes.
-			m.Log.Printf("daemon stopping; running jobs keep running")
-			m.WaitDaily()
-			m.WaitHeartbeat()
-			<-httpDone
-			return nil
-		case <-t.C:
-		}
-	}
+	})
+	// Jobs run in their own sessions: stopping the daemon does not touch them. A daily run
+	// in progress stops between jobs (ctx) and is waited for before the store closes.
+	m.Log.Printf("daemon stopping; running jobs keep running")
+	m.WaitDaily()
+	m.WaitHeartbeat()
+	<-httpDone
+	return nil
 }
 
 func cmdMCP(args []string) error {

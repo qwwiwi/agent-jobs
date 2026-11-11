@@ -96,8 +96,12 @@ func (m *Manager) WriteDaemonInfo() error {
 }
 
 // ReadDaemonInfo reads <state>/daemon.json (os.ErrNotExist when the daemon never wrote one).
-func (m *Manager) ReadDaemonInfo() (*DaemonInfo, error) {
-	b, err := os.ReadFile(filepath.Join(m.StateDir, DaemonInfoFile))
+func (m *Manager) ReadDaemonInfo() (*DaemonInfo, error) { return readDaemonInfo(m.StateDir) }
+
+// readDaemonInfo reads <stateDir>/daemon.json (os.ErrNotExist when the daemon never wrote one); the
+// wrapper reads it without a Manager to kick the daemon (KickDaemon).
+func readDaemonInfo(stateDir string) (*DaemonInfo, error) {
+	b, err := os.ReadFile(filepath.Join(stateDir, DaemonInfoFile))
 	if err != nil {
 		return nil, err
 	}

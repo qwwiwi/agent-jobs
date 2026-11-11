@@ -216,6 +216,9 @@ type StartRequest struct {
 	// job gets the task's planned skills (G01).
 	Milestone int64
 	Task      string
+	// Docs are https URLs of provider documentation on config web_allow_hosts hosts, fetched by the daemon
+	// into the job's sources/ as text files before it starts (v0.8.2 G08).
+	Docs []string
 	// Sources are absolute file paths or job:<id> report references copied before enqueue.
 	// nil inherits a milestone's plan; legacy repository clone plans remain disabled.
 	Sources []string
@@ -232,6 +235,11 @@ type StartRequest struct {
 	// Review is set) chains a control review when the fix succeeds (item 7).
 	Review        string
 	ControlReview *bool
+	// Design and LoopOverride bypass the fix-loop cap (review_max_fix_loops, v0.8.2 G05), only with
+	// Review: Design is the id of a succeeded research or general job of this agent, LoopOverride a
+	// non-empty reason (nil = not given; given empty is refused). Either is stored on the job.
+	Design       string
+	LoopOverride *string
 	// IdemKey (internal, never set from a request) makes the creation idempotent: a start with a key an
 	// existing job already has returns that job instead of queueing another (the control review chain).
 	IdemKey string
@@ -448,6 +456,8 @@ func (m *Manager) Enqueue(r StartRequest) (*store.Job, error) {
 		inserted = ok
 		if ok {
 			m.logSize(j)
+			// The daemon starts the job at once, not at its next minute tick (G12).
+			m.kickDaemon()
 		}
 		return j, nil
 	}
@@ -545,6 +555,7 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	if err != nil {
 		return nil, err
 	}
+	m.attachGateArtifacts(&r)
 	if err := checkFileSourceOrigins(r.Sources); err != nil {
 		if r.plannedSources {
 			return nil, fmt.Errorf("%w: task %s of milestone %d has sources planned (give job_start sources: [] to run "+
@@ -554,6 +565,12 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 	}
 	if len(r.Sources) > 0 && r.Gate != nil {
 		return nil, errors.New("a gate job gets nothing but its input: no sources")
+	}
+	if err := checkDocs(r.Docs, m.Config().WebAllowHosts); err != nil {
+		return nil, err
+	}
+	if len(r.Docs) > 0 && r.Gate != nil {
+		return nil, errors.New("a gate job gets nothing but its input: no docs")
 	}
 	turns, budget, timeout, err := ValidateLimits(DefaultTurns(r.Kind, r.MaxTurns), r.MaxBudgetUSD, r.TimeoutMinutes)
 	if err != nil {
@@ -579,6 +596,9 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 					errOpenRouterSources, r.Task, r.Milestone)
 			}
 			return nil, errOpenRouterSources
+		}
+		if len(r.Docs) > 0 {
+			return nil, errOpenRouterDocs
 		}
 		provider, billing = store.ProviderOpenRouter, store.BillingAPI
 	}
@@ -691,9 +711,10 @@ func (m *Manager) newJob(r StartRequest) (*store.Job, error) {
 		Complexity: r.Complexity, Runner: runner, Billing: billing, Provider: provider, ReasoningEffort: effort,
 		ScheduleID: r.ScheduleID, AcceptanceCmd: acceptance, OwnerWaits: r.OwnerWaits, Skills: selected,
 		BaseBranch: branch, RequestedBranch: r.Branch, Covers: covers, CoverContract: cover, Gate: r.Gate, Size: size,
-		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources),
+		MilestoneID: r.Milestone, TaskKey: r.Task, SourceFiles: slices.Clone(r.Sources), Docs: slices.Clone(r.Docs),
 		Paths: r.Paths, OnOverlap: r.OnOverlap, Parent: r.Parent, Crew: crew,
 		Review: r.Review, ReviewBlocking: reviewFindings, ControlReview: controlReview, IdemKey: r.IdemKey,
+		LoopDesign: r.Design, LoopOverride: loopOverride(r.LoopOverride),
 	}
 	return j, nil
 }
@@ -709,7 +730,7 @@ func (m *Manager) Tick() error {
 	if m.daemonLockHeld {
 		m.prefetchInBackground()
 	} else if d, derr := m.ReadDaemonInfo(); derr != nil || !alive(d.PID) {
-		m.prefetchSources()
+		m.prefetchQueued()
 	}
 	err := m.tickLocked()
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
@@ -863,6 +884,9 @@ func (m *Manager) launchQueued() error {
 		}
 		if needsClone(j) && !m.sourcesCloned(j) {
 			continue // its sources are cloned outside the lifecycle lock (prefetchSources); it starts once they are
+		}
+		if needsDocs(j) && !m.docsFetched(j) {
+			continue // its docs are fetched outside the lifecycle lock (prefetchDocs); it starts once they are
 		}
 		if m.beforeClaim != nil {
 			m.beforeClaim(j)
@@ -2023,6 +2047,10 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 			status, msg = store.StatusFailed, RedactPrintable(err.Error(), 300)
 		}
 	}
+	// The job-done note is worked out here, once, with the work tree quiet (nothing of the job runs any
+	// more) and before the row turns terminal, so that no delivery can build the line without it. The
+	// line only reads the stored value (uiEvidenceNote).
+	m.recordUINote(j, status)
 	unknown, estimate := m.attemptCost(j, res, killed)
 	// Admission is closed for the transition: the running advisor calls end first, and one that cannot be
 	// ended (kept registered, retried every tick) keeps the attempt from counting as a clean finish.

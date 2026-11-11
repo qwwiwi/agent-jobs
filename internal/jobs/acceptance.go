@@ -243,6 +243,8 @@ type wrapperAcceptance struct {
 	// for the gate lock (acceptanceLockWait).
 	started    time.Time
 	jobTimeout time.Duration
+	// gateSlots is config gate_max_parallel: the box slots the step's gate lock takes one of.
+	gateSlots int
 }
 
 // acceptanceLockWait bounds the acceptance step's wait for the box-wide gate lock by what the job has
@@ -302,6 +304,7 @@ func openAcceptance(jobDir, token string) (*wrapperAcceptance, error) {
 		return nil, errors.New("acceptance_allowed is off in config.json; the acceptance command is not run")
 	}
 	a.timeout = c.AcceptanceTimeout()
+	a.gateSlots = c.GateMaxParallelSlots()
 	return a, nil
 }
 
@@ -326,19 +329,20 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 	// From here on a stop signal must not kill the wrapper before the command's group is gone.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer stop()
-	// The acceptance command is a heavy step: it runs under the box-wide gate lock (#208), with the other
-	// jobs' gates and acceptance steps and the main session's gates. The lock is taken before the start is
-	// recorded, so its wait counts neither against the acceptance timeout nor (gate-wait.json, credited by
-	// the daemon) against the job's own.
+	// The acceptance command is a heavy step: it runs under the gate lock (#208; per repository and box
+	// slot since v0.8.2), with the other jobs' gates and acceptance steps and the main session's gates.
+	// The lock is taken before the start is recorded, so its wait counts neither against the acceptance
+	// timeout nor (gate-wait.json, credited by the daemon) against the job's own.
 	abs, err := filepath.Abs(jobDir)
 	if err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance: not run:", err)
 		return 0
 	}
 	wait, jobBound := acceptanceLockWait(a.started, a.jobTimeout, time.Now())
+	work := filepath.Join(abs, "work")
 	lease, err := acquireGateLock(ctx, gateLockReq{path: GateLockPath(), wait: wait, job: a.id,
-		detail: " in " + filepath.Join(abs, "work") + ": acceptance " + Printable(a.cmd, 200), notes: log,
-		waits: newGateWaitRecorder(abs)})
+		detail: " in " + work + ": acceptance " + Printable(a.cmd, 200), notes: log,
+		waits: newGateWaitRecorder(abs), repo: gateRepoKey(work), slots: a.gateSlots})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintln(log, "run-wrapper: stopped by a signal while the acceptance command waited for the gate lock")
@@ -391,6 +395,14 @@ func runAcceptanceStep(jobDir, token string, log *os.File, result ...*StreamResu
 	}
 	if err := a.st.SetAcceptanceResult(a.id, token, exit, int(dur.Round(time.Second).Seconds())); err != nil {
 		fmt.Fprintln(log, "run-wrapper: acceptance: record result:", err)
+	} else {
+		// The reviewer's artifact (G09). Best effort: the result above is the one the daemon trusts, a
+		// failed write here only costs the reviewer the head.
+		head, _ := gateCommit(work, "HEAD^{commit}")
+		if err := recordGateAcceptance(abs, GateResultAcceptance{Head: head, Command: a.cmd, Exit: exit,
+			DurationSec: int(dur.Round(time.Second).Seconds()), At: now.UTC().Format(time.RFC3339)}); err != nil {
+			fmt.Fprintln(log, "run-wrapper: acceptance: record gate result:", err)
+		}
 	}
 	return 0
 }

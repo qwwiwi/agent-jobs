@@ -72,3 +72,36 @@ func TestJobStartFixFromReview(t *testing.T) {
 		t.Fatalf("control_review without review: %s", msg)
 	}
 }
+
+// G05: job_start takes design and loop_override; both show in job_status (design, loop_override) and a
+// blank loop_override is refused.
+func TestJobStartFixLoopBypass(t *testing.T) {
+	m := newManager(t)
+	cs := connect(t, mustServer(t, m))
+	repo := overlapRepo(t)
+	var review, design map[string]any
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["kind"], a["repo"], a["title"] = "review", repo, "review" }), &review)
+	call(t, cs, "job_start", startArgs(func(a map[string]any) { a["kind"], a["title"] = "research", "design" }), &design)
+	endReview(t, m, review["id"].(string), blockingReport)
+	endReview(t, m, design["id"].(string), shipReport)
+	fixArgs := func(mod func(map[string]any)) map[string]any {
+		return startArgs(func(a map[string]any) {
+			a["kind"], a["repo"], a["review"] = "fix", repo, review["id"]
+			mod(a)
+		})
+	}
+	var withDesign, withOverride, status map[string]any
+	call(t, cs, "job_start", fixArgs(func(a map[string]any) { a["design"] = design["id"] }), &withDesign)
+	call(t, cs, "job_status", map[string]any{"id": withDesign["id"]}, &status)
+	if status["design"] != design["id"] {
+		t.Fatalf("design not in job_status: %+v", status)
+	}
+	call(t, cs, "job_start", fixArgs(func(a map[string]any) { a["loop_override"] = "owner approved" }), &withOverride)
+	call(t, cs, "job_status", map[string]any{"id": withOverride["id"]}, &status)
+	if status["loop_override"] != "owner approved" {
+		t.Fatalf("loop_override not in job_status: %+v", status)
+	}
+	if msg := callErr(t, cs, "job_start", fixArgs(func(a map[string]any) { a["loop_override"] = " " })); !strings.Contains(msg, "loop_override") {
+		t.Fatalf("blank loop_override: %s", msg)
+	}
+}

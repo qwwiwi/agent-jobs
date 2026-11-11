@@ -31,3 +31,14 @@ func (s *Store) PendingControlReview() ([]*Job, error) {
 func (s *Store) SetControlReview(id, job, note string) error {
 	return affected(s.db.Exec(`UPDATE jobs SET control_job=?, control_note=? WHERE id=? AND control_job='' AND control_note=''`, job, note, id))
 }
+
+// FixByControlJob returns the fix job of agent whose control review is job id, nil when there is none:
+// one step back on a fix loop (v0.8.2 G04). The chain links a control review to one fix only (its
+// idempotency key), so the first match is the one.
+func (s *Store) FixByControlJob(agent, id string) (*Job, error) {
+	jobs, err := s.query(`WHERE agent = ? AND kind = 'fix' AND control_job = ? ORDER BY created_at LIMIT 1`, agent, id)
+	if err != nil || len(jobs) == 0 {
+		return nil, err
+	}
+	return jobs[0], nil
+}

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/sys/unix"
@@ -37,6 +38,15 @@ type Card struct {
 	Repos   []string // `repo:` keys: absolute repository paths (git top level)
 	Remotes []string // `remote:` keys as remote identities (RemoteIdentity: net:host/path or local:/path)
 	Body    string   // everything after the front matter, trimmed
+	// GateTimeout is the `gate_timeout:` key (once at most): the gate timeout of jobs in this
+	// repository, over config gate_timeout_minutes (0 = not set).
+	GateTimeout time.Duration
+	// ReviewQuestions is the `review_questions:` keys: known ids (reviewQuestions) in their canonical
+	// order, each once. The matching questions go into fix/general prompts (G14).
+	ReviewQuestions []string
+	// UI is the `ui: true` key: the screenshot matrix is part of acceptance for jobs in this
+	// repository (G15). Without the key, false.
+	UI bool
 }
 
 var reCardName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
@@ -45,9 +55,13 @@ var reCardName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 func (m *Manager) CardsDir() string { return m.Config().CardsDir }
 
 // ParseCard parses a card: a front matter block between `---` lines with `repo:` and/or `remote:`
-// keys (each repeatable, at least one), then a non-empty Markdown body.
+// keys (each repeatable, at least one), an optional `gate_timeout:` (a duration, e.g. 90m), an
+// optional `review_questions:` (known ids, comma separated, the key repeatable) and an optional
+// `ui:` (true or false, once), then a non-empty Markdown body.
 func ParseCard(name string, b []byte) (Card, error) {
 	c := Card{Name: name}
+	var asked []string
+	uiSeen := false
 	s := strings.ReplaceAll(string(b), "\r\n", "\n")
 	if !strings.HasPrefix(s, "---\n") {
 		return c, errors.New("card must start with a front matter line ---")
@@ -86,10 +100,38 @@ func ParseCard(name string, b []byte) (Card, error) {
 				return c, fmt.Errorf("front matter line %d: %w", i+2, err)
 			}
 			c.Remotes = append(c.Remotes, id)
+		case "gate_timeout":
+			if c.GateTimeout != 0 {
+				return c, fmt.Errorf("front matter line %d: gate_timeout given twice", i+2)
+			}
+			d, err := parseCardGateTimeout(v)
+			if err != nil {
+				return c, fmt.Errorf("front matter line %d: %w", i+2, err)
+			}
+			c.GateTimeout = d
+		case "review_questions":
+			ids, err := parseReviewQuestions(v)
+			if err != nil {
+				return c, fmt.Errorf("front matter line %d: %w", i+2, err)
+			}
+			asked = append(asked, ids...)
+		case "ui":
+			if uiSeen {
+				return c, fmt.Errorf("front matter line %d: ui given twice", i+2)
+			}
+			uiSeen = true
+			switch v {
+			case "true":
+				c.UI = true
+			case "false":
+			default:
+				return c, fmt.Errorf("front matter line %d: ui %q must be true or false", i+2, v)
+			}
 		default:
-			return c, fmt.Errorf("front matter line %d: unknown key %q (want repo or remote)", i+2, k)
+			return c, fmt.Errorf("front matter line %d: unknown key %q (want repo, remote, gate_timeout, review_questions or ui)", i+2, k)
 		}
 	}
+	c.ReviewQuestions = canonicalReviewQuestions(asked)
 	if len(c.Repos) == 0 && len(c.Remotes) == 0 {
 		return c, errors.New("card names no repo and no remote, so it matches nothing")
 	}

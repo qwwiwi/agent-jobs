@@ -621,3 +621,33 @@ func TestPrepareAgainStoreReadError(t *testing.T) {
 		t.Fatalf("store unreadable: again = %v without an error", again)
 	}
 }
+
+// G11 (#120): a codex review job whose repository matches a prepare entry gets the prepare step (the
+// daemon passes --prepare to its wrapper), so a venv built there is in the read-only worktree before codex
+// starts; a review of a repository no entry matches gets none. The recipe itself is in the GUIDE.
+func TestPrepareRunsForCodexReviewOfMatchingRepoOnly(t *testing.T) {
+	m := newCodexManager(t)
+	repo, other := newRepo(t), newRepo(t)
+	withPrepareConfig(t, m, []PrepareStep{{RepoGlob: filepath.Base(repo),
+		Command: "mkdir -p .venv/bin && echo venv > .venv/bin/marker && test ! -e ../stream.jsonl"}}, `, "codex_jobs_per_day": 0`)
+	review := func(r string) *store.Job {
+		return runToEnd(t, m, enqueue(t, m, "review the thing", func(q *StartRequest) { codexReview(q); q.RepoPath = r }).ID)
+	}
+	j := review(repo)
+	if j.Status != store.StatusSucceeded || j.Kind != "review" || j.Runner != store.RunnerCodex {
+		t.Fatalf("got %s/%s %s %q", j.Kind, j.Runner, j.Status, j.Error)
+	}
+	if p := m.PrepareResultOf(j); p == nil || p.Exit != 0 {
+		t.Fatalf("a codex review of the matching repo ran no prepare step: %+v", p)
+	}
+	if got := strings.TrimSpace(readFile(t, filepath.Join(m.JobDir(j.ID), "work", ".venv", "bin", "marker"))); got != "venv" {
+		t.Fatalf("the prepared venv is not in the review worktree: %q", got)
+	}
+	j2 := review(other)
+	if j2.Status != store.StatusSucceeded {
+		t.Fatalf("got %s %q", j2.Status, j2.Error)
+	}
+	if p := m.PrepareResultOf(j2); p != nil {
+		t.Fatalf("a repo no entry matches got a prepare step: %+v", p)
+	}
+}

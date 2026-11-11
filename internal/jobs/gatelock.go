@@ -3,6 +3,8 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,20 +18,23 @@ import (
 	"time"
 )
 
-// The box-wide gate lock (#134, #208): one heavy step (a full test suite, a type check, a build,
-// scripts/check.sh) at a time per box, for the main session's `agent-jobs gate run`, the jobs' own
-// `agent-jobs gate run` (allowed inside a job since #208) and the wrapper's acceptance step alike:
+// The gate lock (#134, #208, v0.8.2): one heavy step (a full test suite, a type check, a build,
+// scripts/check.sh) at a time per repository and at most gate_max_parallel (default 2) per box, for the
+// main session's `agent-jobs gate run`, the jobs' own `agent-jobs gate run` (allowed inside a job since
+// #208) and the wrapper's acceptance step alike. A gate takes three locks in a fixed order
+// (gateLockSteps): its repository's, one of the box slots, and the pre-0.8.2 single box lock shared, so
+// an old binary's gate (exclusive on it) never runs beside a new one. Each lock is:
 //   - fair: a waiter joins a FIFO queue next to the lock (<lock>.queue, one line per waiter with a
 //     heartbeat it refreshes every poll) and only the first live waiter tries the lock, so a gate that
 //     came later never overtakes; a waiter that died or stopped polling (no heartbeat for
 //     gateQueueStale) drops out of the queue. The holder is not queued;
 //   - bounded: a waiter gives up after its lock wait with an error showing the holder line;
-//   - not reentrant: a successful acquisition requires a successful exclusive flock on the shared
-//     lock file, and nothing else grants entry. The holder line is in a file anyone can write, so it is
+//   - not reentrant: a successful acquisition requires a successful flock on each shared lock file,
+//     and nothing else grants entry. The holder line is in a file anyone can write, so it is
 //     shown as untrusted text and never decides; a held lock is waited for, bounded, whoever holds it
 //     (a gate of the same job, the caller's own parent). Nested gates (a gate inside a gate or inside
-//     the acceptance command) are unsupported: they wait within their bound and time out without
-//     running their command;
+//     the acceptance command, of the same repository or without a free slot) are unsupported: they
+//     wait within their bound and time out without running their command;
 //   - released with its holder: flock belongs to the holder's open file, so a holder that is killed
 //     (with its job's process group or scope) releases it, and the queue forgets a killed waiter;
 //   - visible: a waiter inside a job records its wait in <jobdir>/gate-wait.json (gateWaitRecorder),
@@ -55,6 +60,8 @@ const (
 
 // gateLockReq is one acquisition of the gate lock.
 type gateLockReq struct {
+	// path is the single box lock of the pre-0.8.2 binaries (GateLockPath). With repo set, the
+	// repository locks and the box slots live next to it.
 	path   string
 	wait   time.Duration
 	job    string    // the caller's job id ("" = not in a job)
@@ -62,92 +69,284 @@ type gateLockReq struct {
 	notes  io.Writer // waiting notes
 	// waits, when set, records the wait (a job's gate-wait.json).
 	waits *gateWaitRecorder
+	// repo, when set, is the repository key of the gate (gateRepoKey): the gate then takes its
+	// repository's lock, one of slots box slots (0 = DefaultGateMaxParallel) and a shared flock on path
+	// (v0.8.2, G01-G03). "" = only an exclusive flock on path, the lock of the pre-0.8.2 binaries.
+	repo  string
+	slots int
+}
+
+// Gate lock files next to the box lock (v0.8.2): one lock per repository, keyed by its git common dir,
+// and the box slots with one FIFO queue for all of them.
+const (
+	gateRepoLockPrefix = "agent-jobs-gate-repo-"
+	gateSlotLockPrefix = "agent-jobs-gate-slot-"
+	gateSlotQueueName  = "agent-jobs-gate-slots.queue"
+)
+
+// gateLockStep is one lock of a gate's acquisition, taken in order (repository, slot, legacy), all
+// within the one wait of the request.
+type gateLockStep struct {
+	name  string   // for notes and errors
+	paths []string // the candidates: taking any one is the step (the box slots); one for a plain lock
+	queue string   // the FIFO of the step's waiters ("" = none: a shared lock never waits for its peers)
+	// yield is a FIFO the step does not join but waits behind while it has a live waiter: the shared
+	// step yields to the pre-0.8.2 gates queued for the single box lock, so they are not starved.
+	yield  string
+	how    int  // syscall.LOCK_EX or syscall.LOCK_SH
+	holder bool // the holder line goes into the taken file, cleared on release
+}
+
+// gateLockSteps are the locks r takes, in this order (every gate the same order, so no two wait for
+// each other's locks):
+//   - its repository's lock, exclusive: two gates of one repository (any of its work trees) serialize;
+//   - one of the box slots, exclusive: at most that many gates run on the box at once;
+//   - the pre-0.8.2 single box lock, shared: new gates run beside each other, but neither beside a gate
+//     of an old binary (which takes it exclusively) nor it beside them, while a box upgrades. A new gate
+//     waits while an old binary waits in that lock's queue, so a stream of new gates cannot starve it.
+func gateLockSteps(r gateLockReq) []gateLockStep {
+	legacy := gateLockStep{name: r.path, paths: []string{r.path}, queue: r.path + gateQueueSuffix, how: syscall.LOCK_EX, holder: true}
+	if r.repo == "" {
+		return []gateLockStep{legacy}
+	}
+	dir := filepath.Dir(r.path)
+	repo := gateRepoLockIn(dir, r.repo)
+	slots := make([]string, gateSlotCount(r.slots))
+	for i := range slots {
+		slots[i] = gateSlotPath(dir, i)
+	}
+	return []gateLockStep{
+		{name: repo + " (the repository's gate lock)", paths: []string{repo}, queue: repo + gateQueueSuffix, how: syscall.LOCK_EX, holder: true},
+		{name: fmt.Sprintf("%s* (%d box slots)", filepath.Join(dir, gateSlotLockPrefix), len(slots)), paths: slots,
+			queue: filepath.Join(dir, gateSlotQueueName), how: syscall.LOCK_EX, holder: true},
+		{name: r.path, paths: []string{r.path}, yield: r.path + gateQueueSuffix, how: syscall.LOCK_SH},
+	}
+}
+
+// gateSlotCount is n within 1..CeilingGateMaxParallel, DefaultGateMaxParallel for 0 or less.
+func gateSlotCount(n int) int {
+	if n <= 0 {
+		return DefaultGateMaxParallel
+	}
+	return min(n, CeilingGateMaxParallel)
+}
+
+// gateSlotPath is box slot i in dir.
+func gateSlotPath(dir string, i int) string {
+	return filepath.Join(dir, gateSlotLockPrefix+strconv.Itoa(i)+".lock")
+}
+
+// gateRepoKey is the identity of the repository with work tree dir: its git common dir (shared by all of
+// its work trees), absolute and without symlinks; dir itself when it is no git work tree.
+func gateRepoKey(dir string) string {
+	// Without --path-format (git 2.31+): a relative answer is relative to dir.
+	if out, err := git(dir, "rev-parse", "--git-common-dir"); err == nil {
+		if p := strings.TrimSpace(out); p != "" {
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
+			dir = p
+		}
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
+	return filepath.Clean(dir)
+}
+
+// gateRepoLockIn is the lock of the repository with key in lockDir: a fixed name derived from the key,
+// so every caller of the box finds the same file.
+func gateRepoLockIn(lockDir, key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return filepath.Join(lockDir, gateRepoLockPrefix+hex.EncodeToString(sum[:8])+".lock")
+}
+
+// GateRepoLockPath is the box-wide gate lock of the repository with work tree dir (v0.8.2, G01).
+func GateRepoLockPath(dir string) string {
+	return gateRepoLockIn(filepath.Dir(GateLockPath()), gateRepoKey(dir))
 }
 
 // gateLease is a held gate lock.
 type gateLease struct {
 	release func()
 	waited  time.Duration // time spent waiting for the lock (0 = it was free)
+	holders []string      // the files that carry the holder line
 }
 
-// acquireGateLock takes the box-wide gate lock for r (see the comment above), polling every
+// writeHolder replaces the holder line in the lease's files.
+func (l *gateLease) writeHolder(line string) {
+	for _, p := range l.holders {
+		writeGateHolderLine(p, line)
+	}
+}
+
+// gateHeld is one taken lock of a lease.
+type gateHeld struct {
+	f      *os.File
+	path   string
+	holder bool
+}
+
+// gateAcquisition is the state of one acquireGateLock across its steps: one start and deadline, one
+// recorded wait.
+type gateAcquisition struct {
+	r        gateLockReq
+	start    time.Time
+	deadline time.Time
+	waiting  bool
+}
+
+// begin records that the acquisition waits (once; later steps only note what they wait for).
+func (a *gateAcquisition) begin(step gateLockStep, holder string) {
+	fmt.Fprintf(a.r.notes, "gate: waiting up to %s for the gate lock %s, untrusted holder line: %s\n", a.r.wait, step.name, holder)
+	if a.waiting {
+		return
+	}
+	a.waiting = true
+	if a.r.waits != nil {
+		a.r.waits.start(a.start, holder)
+	}
+}
+
+// end closes the recorded wait.
+func (a *gateAcquisition) end() {
+	if a.waiting && a.r.waits != nil {
+		a.r.waits.end(time.Since(a.start))
+	}
+}
+
+// take takes one of step's files, waiting in its queue until a.deadline or ctx ends.
+func (a *gateAcquisition) take(ctx context.Context, step gateLockStep) (*gateHeld, error) {
+	files := make([]*os.File, 0, len(step.paths))
+	closeAll := func(keep *os.File) {
+		for _, f := range files {
+			if f != keep {
+				f.Close()
+			}
+		}
+	}
+	for _, p := range step.paths {
+		f, err := openGateLock(p)
+		if err != nil {
+			closeAll(nil)
+			return nil, fmt.Errorf("open gate lock: %w", err)
+		}
+		files = append(files, f)
+	}
+	q := &gateQueue{}
+	if step.queue != "" {
+		q = openGateQueue(step.queue)
+	}
+	defer q.close()
+	yield := &gateQueue{}
+	if step.yield != "" {
+		yield = openGateQueue(step.yield)
+	}
+	defer yield.close()
+	var me *gateEntry
+	defer func() {
+		if me != nil {
+			q.leave(*me)
+		}
+	}()
+	noted := false
+	for {
+		if !q.anyAhead(me) && !yield.anyAhead(nil) {
+			for i, f := range files {
+				err := syscall.Flock(int(f.Fd()), step.how|syscall.LOCK_NB)
+				if err == nil {
+					closeAll(f)
+					return &gateHeld{f: f, path: step.paths[i], holder: step.holder}, nil
+				}
+				if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+					closeAll(nil)
+					return nil, fmt.Errorf("flock gate lock: %w", err)
+				}
+			}
+		}
+		if !noted {
+			noted = true
+			a.begin(step, gateHolders(files))
+		}
+		if me == nil && step.queue != "" {
+			e := q.join()
+			me = &e
+		}
+		if time.Now().After(a.deadline) {
+			holder := gateHolders(files)
+			closeAll(nil)
+			return nil, fmt.Errorf("the gate lock %s is still held after %s (untrusted holder line: %s): another gate runs on this box",
+				step.name, a.r.wait, holder)
+		}
+		select {
+		case <-ctx.Done():
+			closeAll(nil)
+			return nil, ctx.Err()
+		case <-time.After(gateLockPoll):
+		}
+	}
+}
+
+// gateHolders are the untrusted holder lines of files (gateHolder), joined; "unknown" when none has one.
+func gateHolders(files []*os.File) string {
+	var lines []string
+	for _, f := range files {
+		if h := gateHolder(f); h != "unknown" {
+			lines = append(lines, h)
+		}
+	}
+	if len(lines) == 0 {
+		return "unknown"
+	}
+	return strings.Join(lines, " | ")
+}
+
+// acquireGateLock takes the gate lock for r (see the comment above and gateLockSteps), polling every
 // gateLockPoll until r.wait or ctx ends.
 func acquireGateLock(ctx context.Context, r gateLockReq) (*gateLease, error) {
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
 		return nil, fmt.Errorf("gate lock dir: %w", err)
 	}
-	f, err := openGateLock(r.path)
-	if err != nil {
-		return nil, fmt.Errorf("open gate lock: %w", err)
-	}
 	if r.notes == nil {
 		r.notes = io.Discard
 	}
-	q := openGateQueue(r.path + gateQueueSuffix)
-	defer q.close()
 	start := time.Now()
-	deadline := start.Add(r.wait)
-	var me *gateEntry
-	waiting := false
-	stopWaiting := func() {
-		if me != nil {
-			q.leave(*me)
-		}
-		if waiting && r.waits != nil {
-			r.waits.end(time.Since(start))
+	a := &gateAcquisition{r: r, start: start, deadline: start.Add(r.wait)}
+	var held []*gateHeld
+	unlock := func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			h := held[i]
+			if h.holder {
+				_ = h.f.Truncate(0)
+			}
+			_ = syscall.Flock(int(h.f.Fd()), syscall.LOCK_UN)
+			h.f.Close()
 		}
 	}
-	for {
-		first := me == nil && !q.anyAhead(nil) || me != nil && !q.anyAhead(me)
-		if first {
-			err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-			if err == nil {
-				break
-			}
-			if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
-				stopWaiting()
-				f.Close()
-				return nil, fmt.Errorf("flock gate lock: %w", err)
-			}
+	for _, step := range gateLockSteps(r) {
+		h, err := a.take(ctx, step)
+		if err != nil {
+			a.end()
+			unlock()
+			return nil, err
 		}
-		if !waiting {
-			waiting = true
-			holder := gateHolder(f)
-			fmt.Fprintf(r.notes, "gate: waiting up to %s for the gate lock %s, untrusted holder line: %s\n", r.wait, r.path, holder)
-			if r.waits != nil {
-				r.waits.start(start, holder)
-			}
-			if me == nil {
-				e := q.join()
-				me = &e
-			}
-		}
-		if time.Now().After(deadline) {
-			holder := gateHolder(f)
-			stopWaiting()
-			f.Close()
-			return nil, fmt.Errorf("the gate lock %s is still held after %s (untrusted holder line: %s): another gate runs on this box",
-				r.path, r.wait, holder)
-		}
-		select {
-		case <-ctx.Done():
-			stopWaiting()
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(gateLockPoll):
+		held = append(held, h)
+	}
+	a.end()
+	lease := &gateLease{release: unlock}
+	for _, h := range held {
+		if h.holder {
+			lease.holders = append(lease.holders, h.path)
 		}
 	}
-	stopWaiting()
-	lease := &gateLease{release: func() {
-		_ = f.Truncate(0)
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}}
-	if waiting {
+	if a.waiting {
 		lease.waited = time.Since(start)
 		fmt.Fprintf(r.notes, "gate: waited %s for the gate lock\n", lease.waited.Round(time.Millisecond))
 	}
-	writeGateHolderLine(r.path, gateHolderLine(r.job, r.detail))
+	lease.writeHolder(gateHolderLine(r.job, r.detail))
 	return lease, nil
 }
 

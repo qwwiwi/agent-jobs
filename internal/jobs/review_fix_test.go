@@ -182,7 +182,7 @@ func TestControlReviewQueuedAfterSuccessfulFix(t *testing.T) {
 	if ctl.BaseBranch != "refs/heads/"+fix.Branch || ctl.BaseCommit != head {
 		t.Fatalf("control review base %s@%s, want %s@%s", ctl.BaseBranch, ctl.BaseCommit, fix.Branch, head)
 	}
-	if want := []string{"job:" + review.ID, "job:" + fix.ID}; !slices.Equal(ctl.SourceFiles, want) {
+	if want := []string{"job:" + review.ID, "job:" + fix.ID, "gate:" + fix.ID}; !slices.Equal(ctl.SourceFiles, want) {
 		t.Fatalf("sources %v, want %v", ctl.SourceFiles, want)
 	}
 	if ctl.Review != "" || ctl.ControlReview {
@@ -491,5 +491,220 @@ func TestEnqueueWithTheSameKeyReturnsTheExistingJob(t *testing.T) {
 	req.Model = "no-such-model"
 	if got, err := m.Enqueue(req); err != nil || got.ID != first.ID {
 		t.Fatalf("retry with a changed request: %v, %v", got, err)
+	}
+}
+
+// fixWithControl starts a fix job from review, ends it as succeeded and links a finished control
+// review (with blocking findings) to it, as the daemon's chain does: the next link of a fix loop.
+func fixWithControl(t *testing.T, m *Manager, repo, review string) (fix, control *store.Job) {
+	t.Helper()
+	f, err := m.Enqueue(fixFromReview(repo, review, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Claim(f.ID, "fix-token", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(f.ID, "fix-token", store.StatusSucceeded, 1, 0, 1, "", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	control = finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	if err := m.Store.SetControlReview(f.ID, control.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	return get(t, m, f.ID), control
+}
+
+// fixLoopChain builds review -> fix -> control review -> fix -> control review: a chain that holds
+// two fix jobs. It returns the ids in chain order.
+func fixLoopChain(t *testing.T, m *Manager, repo string) []string {
+	t.Helper()
+	r0 := finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	f1, c1 := fixWithControl(t, m, repo, r0.ID)
+	f2, c2 := fixWithControl(t, m, repo, c1.ID)
+	return []string{r0.ID, f1.ID, c1.ID, f2.ID, c2.ID}
+}
+
+// endedJob queues a job of this agent and ends it by hand with the given status.
+func endedJob(t *testing.T, m *Manager, kind, status string) *store.Job {
+	t.Helper()
+	j := enqueue(t, m, "design the loop", func(r *StartRequest) { r.Kind = kind })
+	if err := m.Store.Claim(j.ID, "tok", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.Finish(j.ID, "tok", status, 1, 0, 1, "", m.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return get(t, m, j.ID)
+}
+
+// G04: with review_max_fix_loops at its default 2, a third fix on one chain is refused, and the error
+// names the chain (job ids in order); nothing is queued.
+func TestFixLoopCapRefusesThirdFix(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	chain := fixLoopChain(t, m, repo)
+	before, err := m.Store.List(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Enqueue(fixFromReview(repo, chain[len(chain)-1], nil))
+	if err == nil {
+		t.Fatal("a third fix on the chain was queued")
+	}
+	for _, want := range []string{strings.Join(chain, " -> "), "review_max_fix_loops", "2 fix"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q: %v", want, err)
+		}
+	}
+	after, err := m.Store.List(200)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("a refused start queued a job: %d -> %d (%v)", len(before), len(after), err)
+	}
+}
+
+// G04: the cap is the config key review_max_fix_loops; at 1 the second fix is already refused, and a
+// first fix from a fresh review is always allowed.
+func TestFixLoopCapFromConfig(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	m.Cfg.ReviewMaxFixLoops = 1
+	r0 := finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	f1, c1 := fixWithControl(t, m, repo, r0.ID)
+	_, err := m.Enqueue(fixFromReview(repo, c1.ID, nil))
+	if err == nil || !strings.Contains(err.Error(), strings.Join([]string{r0.ID, f1.ID, c1.ID}, " -> ")) {
+		t.Fatalf("second fix with review_max_fix_loops 1: %v", err)
+	}
+}
+
+// G05: design=<succeeded research or general job of this agent> bypasses the cap; it is stored on the
+// job and shown in the job-done line.
+func TestFixLoopCapDesignAccepted(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	chain := fixLoopChain(t, m, repo)
+	for _, kind := range []string{"research", "general"} {
+		design := endedJob(t, m, kind, store.StatusSucceeded)
+		j, err := m.Enqueue(fixFromReview(repo, chain[len(chain)-1], func(r *StartRequest) { r.Design = design.ID }))
+		if err != nil {
+			t.Fatalf("design %s job: %v", kind, err)
+		}
+		j = get(t, m, j.ID)
+		if j.LoopDesign != design.ID || j.LoopOverride != "" {
+			t.Fatalf("design not stored: %q %q", j.LoopDesign, j.LoopOverride)
+		}
+		if line := m.DoneLineFor(j); !strings.Contains(line, "fix loop: design "+design.ID) {
+			t.Fatalf("done line lacks the design: %s", line)
+		}
+	}
+}
+
+// G05: loop_override="<reason>" bypasses the cap; the reason is stored and shown in the job-done line.
+func TestFixLoopCapOverrideAccepted(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	chain := fixLoopChain(t, m, repo)
+	reason := "owner asked for a third loop on the lock race"
+	j, err := m.Enqueue(fixFromReview(repo, chain[len(chain)-1], func(r *StartRequest) { r.LoopOverride = &reason }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	j = get(t, m, j.ID)
+	if j.LoopOverride != reason || j.LoopDesign != "" {
+		t.Fatalf("override not stored: %q %q", j.LoopOverride, j.LoopDesign)
+	}
+	if line := m.DoneLineFor(j); !strings.Contains(line, "fix loop: override: "+reason) {
+		t.Fatalf("done line lacks the override: %s", line)
+	}
+}
+
+// G05: an empty or blank loop_override is refused, also below the cap; design and loop_override need
+// review.
+func TestFixLoopBypassRefusals(t *testing.T) {
+	m, repo := newManager(t), newRepo(t)
+	chain := fixLoopChain(t, m, repo)
+	last := chain[len(chain)-1]
+	fresh := finishedReview(t, m, repo, readFixtureFile(t, "review-blocking.md"), nil)
+	designOK := endedJob(t, m, "research", store.StatusSucceeded)
+	failed := endedJob(t, m, "research", store.StatusFailed)
+	running := enqueue(t, m, "still queued", func(r *StartRequest) { r.Kind = "general" })
+	fixJob := get(t, m, chain[1])
+	foreign := &store.Job{ID: "foreign-design", Agent: "someone-else", Title: "foreign", Kind: "research", Brief: "b",
+		Status: store.StatusSucceeded, Model: "sonnet", TimeoutMinutes: 1, CreatedAt: m.Now()}
+	if err := m.Store.Insert(foreign); err != nil {
+		t.Fatal(err)
+	}
+	empty, blank := "", "  \n "
+	before, err := m.Store.List(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]struct {
+		req  StartRequest
+		want string
+	}{
+		"empty override":        {fixFromReview(repo, last, func(r *StartRequest) { r.LoopOverride = &empty }), "loop_override"},
+		"blank override":        {fixFromReview(repo, last, func(r *StartRequest) { r.LoopOverride = &blank }), "loop_override"},
+		"empty override, fresh": {fixFromReview(repo, fresh.ID, func(r *StartRequest) { r.LoopOverride = &empty }), "loop_override"},
+		"unknown design":        {fixFromReview(repo, last, func(r *StartRequest) { r.Design = "no-such-job" }), "no-such-job"},
+		"failed design":         {fixFromReview(repo, last, func(r *StartRequest) { r.Design = failed.ID }), "did not succeed"},
+		"queued design":         {fixFromReview(repo, last, func(r *StartRequest) { r.Design = running.ID }), "did not succeed"},
+		"foreign design":        {fixFromReview(repo, last, func(r *StartRequest) { r.Design = foreign.ID }), "same agent"},
+		"review as design":      {fixFromReview(repo, last, func(r *StartRequest) { r.Design = fresh.ID }), "research or general"},
+		"fix as design":         {fixFromReview(repo, last, func(r *StartRequest) { r.Design = fixJob.ID }), "research or general"},
+		"design without review": {fixFromReview(repo, "", func(r *StartRequest) { r.Design = designOK.ID }), "review"},
+		"override without review": {fixFromReview(repo, "", func(r *StartRequest) {
+			s := "reason"
+			r.LoopOverride = &s
+		}), "review"},
+	}
+	for name, c := range cases {
+		if _, err := m.Enqueue(c.req); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: want an error with %q, got %v", name, c.want, err)
+		}
+	}
+	after, err := m.Store.List(200)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("a refused start queued a job: %d -> %d (%v)", len(before), len(after), err)
+	}
+}
+
+// G06: the control-review brief and kind-review.md carry the stop rule: a finding is closed when its
+// original scenario no longer reproduces; a deeper scenario is Non-blocking unless it shows
+// reproducible money or data loss with steps.
+func TestControlReviewStopRule(t *testing.T) {
+	fix := &store.Job{ID: "fix-1", Title: "fix", Branch: "job/fix-1", BaseCommit: "abc123",
+		ReviewBlocking: []store.BlockingFinding{{ID: "H1", Body: "H1: data loss"}}}
+	rev := &store.Job{ID: "rev-1"}
+	checklist, err := template("prompts/kind-review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, text := range map[string]string{"control review brief": controlReviewBrief(fix, rev), "kind-review.md": checklist} {
+		flat := strings.Join(strings.Fields(text), " ")
+		for _, want := range []string{
+			"closed when its original scenario no longer reproduces",
+			"deeper scenario",
+			"Non-blocking unless it shows reproducible money or data loss, with steps",
+		} {
+			if !strings.Contains(flat, want) {
+				t.Errorf("%s lacks %q", name, want)
+			}
+		}
+		if strings.Contains(flat, "can still be defeated another way stays") {
+			t.Errorf("%s still holds the old rule that keeps a finding open on any other way to defeat it", name)
+		}
+	}
+}
+
+// G04: review_max_fix_loops defaults to 2, takes 1 to 10, and anything outside 0 to 10 is a config error.
+func TestReviewMaxFixLoopsConfig(t *testing.T) {
+	c, err := loadConfigBody(t, `{}`)
+	if err != nil || c.reviewMaxFixLoops() != DefaultReviewMaxFixLoops || DefaultReviewMaxFixLoops != 2 {
+		t.Fatalf("default: %d %v", c.reviewMaxFixLoops(), err)
+	}
+	if c, err = loadConfigBody(t, `{"review_max_fix_loops": 3}`); err != nil || c.reviewMaxFixLoops() != 3 {
+		t.Fatalf("set: %d %v", c.reviewMaxFixLoops(), err)
+	}
+	for _, body := range []string{`{"review_max_fix_loops": -1}`, `{"review_max_fix_loops": 11}`} {
+		if _, err := loadConfigBody(t, body); err == nil || !strings.Contains(err.Error(), "review_max_fix_loops") {
+			t.Fatalf("%s: %v; want a review_max_fix_loops error", body, err)
+		}
 	}
 }
