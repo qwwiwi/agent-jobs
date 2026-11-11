@@ -41,7 +41,7 @@ type Card struct {
 	// GateTimeout is the `gate_timeout:` key (once at most): the gate timeout of jobs in this
 	// repository, over config gate_timeout_minutes (0 = not set).
 	GateTimeout time.Duration
-	// ReviewQuestions is the `review_questions:` keys: ids from ReviewQuestionIDs in their canonical
+	// ReviewQuestions is the `review_questions:` keys: known ids (reviewQuestions) in their canonical
 	// order, each once. The matching questions go into fix/general prompts (G14).
 	ReviewQuestions []string
 	// UI is the `ui: true` key: the screenshot matrix is part of acceptance for jobs in this
