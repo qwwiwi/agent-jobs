@@ -744,6 +744,7 @@ var migrations = []string{
 	`ALTER TABLE jobs ADD COLUMN loop_design TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN loop_override TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE jobs ADD COLUMN docs TEXT NOT NULL DEFAULT '[]'`,
+	uiNoteAlter,
 }
 
 // idemKeyIndex makes idem_key unique among the jobs that have one: a retried creation (the control review

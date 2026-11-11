@@ -177,14 +177,13 @@ func blankResults(path string) bool {
 // maxUINoteFiles caps the changed UI files the note names.
 const maxUINoteFiles = 3
 
-// uiNoteFile is the job's stored note, in the job dir: written once at the finish (recordUINote) and
-// only read when the job-done line is built (uiEvidenceNote).
-const uiNoteFile = "ui-note.txt"
-
-// uiNoteMaxOutput caps the diff output read for the note, and uiNoteMaxRead the stored note read back.
+// uiNoteMaxOutput caps the diff output read for the note and uiNoteMaxStderr what is kept of the diff's
+// stderr; uiNoteMaxName caps one file name inside the note and uiNoteMaxRunes the whole note.
 const (
 	uiNoteMaxOutput = 256 << 10
-	uiNoteMaxRead   = 1 << 10
+	uiNoteMaxStderr = 4 << 10
+	uiNoteMaxName   = 80
+	uiNoteMaxRunes  = 300
 )
 
 // uiNoteTimeout bounds the whole work of the note at the finish (the card lookup and the diff). Past it
@@ -194,30 +193,30 @@ var uiNoteTimeout = 5 * time.Second
 // errUINoteOutput is a diff output past uiNoteMaxOutput.
 var errUINoteOutput = errors.New("diff output over the cap")
 
-// recordUINote works out the job-done note once, when the attempt finishes with status, and stores it
-// in the job dir: the note when a succeeded fix/general job on a ui: true card has a UI diff and no
-// ui-check/ evidence, else nothing (an older note is removed). It is bounded by uiNoteTimeout and never
-// fails the finish: a timeout or any error means no note. Building or re-delivering the done line only
-// reads the stored value.
+// recordUINote works out the job-done note once, when the attempt of j finishes with status, and stores
+// it in the daemon's store on the job row, bound to that attempt (store.SetUINote). The job's own folder
+// holds no part of it: nothing the job can write is ever read back as the note. The order: the stored
+// note is cleared first, then the note is worked out (bounded by uiNoteTimeout), then it is stored with
+// the attempt number, all before the row turns terminal. Both writes only touch an attempt that has not
+// ended, so a finish repeated for an ended attempt changes nothing. It never fails the finish: a clear
+// that fails, a timeout, any error or a store write that fails mean no note, and the note of another
+// attempt is never shown (uiEvidenceNote asks for the line's own attempt).
 func (m *Manager) recordUINote(j *store.Job, status string) {
-	note := ""
-	if status == store.StatusSucceeded {
-		note = m.boundedUINote(j)
-	}
-	path := filepath.Join(m.JobDir(j.ID), uiNoteFile)
-	if note == "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			m.Log.Printf("job %s: ui note: remove: %v", j.ID, err)
+	if err := m.Store.ClearUINote(j.ID, j.LaunchToken); err != nil {
+		if !errors.Is(err, store.ErrImmutable) { // ErrImmutable: the attempt already ended, nothing to do
+			m.Log.Printf("job %s: ui note: clear: %v", j.ID, err)
 		}
 		return
 	}
-	// The job ended, but its dir is the job's: a planted link at the temp name is never written through.
-	if err := os.Remove(path + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
-		m.Log.Printf("job %s: ui note: %v", j.ID, err)
+	if status != store.StatusSucceeded {
 		return
 	}
-	if err := writeAtomic(path, []byte(note+"\n")); err != nil {
-		m.Log.Printf("job %s: ui note: write: %v", j.ID, err)
+	note := m.boundedUINote(j)
+	if note == "" {
+		return
+	}
+	if err := m.Store.SetUINote(j.ID, j.LaunchToken, j.Attempt, note); err != nil {
+		m.Log.Printf("job %s: ui note: store: %v", j.ID, err)
 	}
 }
 
@@ -240,26 +239,39 @@ func (m *Manager) boundedUINote(j *store.Job) string {
 	}
 }
 
-// uiEvidenceNote is the job-done note of a succeeded job: the value stored at its finish, "" when there
-// is none. It reads one small regular file and never runs git.
+// uiEvidenceNote is the job-done note of a succeeded job: the value the daemon stored at the finish of
+// this very attempt (j.Attempt), "" when there is none, when the stored one belongs to another attempt
+// or when it cannot be read. It reads one row and never runs git or opens a file of the job.
 func (m *Manager) uiEvidenceNote(j *store.Job) string {
 	if j.Status != store.StatusSucceeded {
 		return ""
 	}
-	path := filepath.Join(m.JobDir(j.ID), uiNoteFile)
-	if fi, err := os.Lstat(path); err != nil || !fi.Mode().IsRegular() {
-		return ""
-	}
-	f, err := os.Open(path)
+	note, err := m.Store.UINote(j.ID, j.Attempt)
 	if err != nil {
+		m.Log.Printf("job %s: ui note: read: %v", j.ID, err)
 		return ""
 	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, uiNoteMaxRead))
-	if err != nil {
-		return ""
+	return sanitizeUINote(note)
+}
+
+// uiNoteField makes s safe as one field of the one-line job-done format: printable characters only (no
+// line break, no control or format character), no field separator of its own ("·" becomes "-"), at most
+// max runes. "" stays "".
+func uiNoteField(s string, max int) string {
+	return Printable(strings.ReplaceAll(RedactPrintable(s, 0), "·", "-"), max)
+}
+
+// sanitizeUINote is a whole note under the hard cap (applied when it is built and again when it is read).
+func sanitizeUINote(s string) string { return uiNoteField(s, uiNoteMaxRunes) }
+
+// uiNoteNames is the bounded list of changed UI files as the note names them: at most maxUINoteFiles
+// names, each cut to uiNoteMaxName and made safe (uiNoteField), then "(+k more)".
+func uiNoteNames(files []string) string {
+	names := make([]string, 0, maxUINoteFiles)
+	for _, f := range files[:min(len(files), maxUINoteFiles)] {
+		names = append(names, uiNoteField(f, uiNoteMaxName))
 	}
-	return RedactPrintable(string(b), 300)
+	return capList(append(names, files[len(names):]...), maxUINoteFiles)
 }
 
 // uiNoteFor works out the note of a succeeded fix/general job in a repository whose card says
@@ -302,7 +314,7 @@ func (m *Manager) uiNoteFor(ctx context.Context, j *store.Job) string {
 	if len(files) == 0 {
 		return ""
 	}
-	return "ui: true but no ui-check/ evidence for " + capList(files, maxUINoteFiles)
+	return sanitizeUINote("ui: true but no ui-check/ evidence for " + uiNoteNames(files))
 }
 
 // cappedWriter keeps at most max bytes; the write that would pass it marks the output over and calls stop
@@ -328,15 +340,39 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
+// headWriter keeps the first max bytes written to it and discards the rest: a diagnostic stream of any
+// size costs max bytes of memory. Safe for a writer that outlives the reader (an abandoned wait).
+type headWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if room := w.max - len(w.buf); room > 0 {
+		w.buf = append(w.buf, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
+
+func (w *headWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
+}
+
 // cappedGit runs git -C dir args with the daemon's git environment until ctx ends (git's process group
 // is then killed), reading at most max bytes of stdout while it streams: more is errUINoteOutput and git
-// is stopped at once. Stdout is returned untrimmed.
+// is stopped at once. Of stderr only the first uiNoteMaxStderr bytes are kept (for the error), the rest
+// is discarded as it comes. Stdout is returned untrimmed.
 func cappedGit(ctx context.Context, dir string, max int, args ...string) (string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	out := &cappedWriter{max: max, stop: cancel}
-	var errOut bytes.Buffer
-	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdout, c.Stderr = out, &errOut }, append([]string{"-C", dir}, args...)...)
+	errOut := &headWriter{max: uiNoteMaxStderr}
+	p, err := startGit("", daemonGitEnv(), func(c *exec.Cmd) { c.Stdout, c.Stderr = out, errOut }, append([]string{"-C", dir}, args...)...)
 	if err != nil {
 		return "", err
 	}
@@ -350,7 +386,6 @@ func cappedGit(ctx context.Context, dir string, max int, args ...string) (string
 		if errors.Is(err, errGitTimeout) {
 			return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 		}
-		// errOut may still be written by an abandoned wait only after a timeout, handled above.
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()))
 	}
 	return out.buf.String(), nil
