@@ -181,6 +181,20 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	// released (this defer is registered before the lease's): a record that cannot be written is a note,
 	// never a change of the gate's own result.
 	jobDir := gateJobDir(g.Env, job)
+	//
+	// Order of the exit path (defers run in reverse): the lease is released, the record is written from the
+	// spool files, the forwarders are joined, the notes are flushed, the exit= marker is written. A
+	// destination that never reads can therefore keep this process (at the join, before the marker) but
+	// never the lease or the record.
+	var capture *gateCapture
+	defer func() {
+		if capture == nil {
+			return
+		}
+		for _, err := range capture.finish() {
+			fmt.Fprintf(g.Stderr, "gate: output spool: %v\n", err)
+		}
+	}()
 	var record func() GateResultRun
 	defer func() {
 		if record == nil {
@@ -188,15 +202,6 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 		}
 		if err := appendGateRun(jobDir, record()); err != nil {
 			fmt.Fprintf(g.Stderr, "gate: result not recorded in %s: %v\n", GateResultsFile, err)
-		}
-	}()
-	// The copies of the command's output are drained after the lease is released (this defer sits between
-	// the record and the lease) and before the record is built from their tail: a destination that does
-	// not read can never keep the lease, only delay the record by gateDrainWait.
-	var capture *gateCapture
-	defer func() {
-		if capture != nil {
-			capture.drain()
 		}
 	}()
 	lease, err := acquireGateLock(ctx, gateLockReq{path: g.LockPath, wait: g.LockWait, job: job,
@@ -222,20 +227,27 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	lease.writeHolder(gateHolderLine(job, gateHolderDetail(g, want)))
 	fmt.Fprintf(g.Stderr, "gate: %s at %s in %s, timeout %s\n", strings.Join(g.Argv, " "), want, g.Dir, g.Timeout)
 
-	// Inside a job the command's output also feeds the tail of its artifact entry, through pipes of the
-	// runner's own (gateCapture); its stdout copy goes through out, so the marker still follows it.
-	var tail *gateTail
+	// Inside a job the command's stdout and stderr are spool files in the job folder (gateCapture): the
+	// command never blocks on a reader, the artifact's tail is read from the files, and one forwarder per
+	// stream follows its file to the real destination (stdout through out, so the marker follows it). When
+	// a spool file cannot be created the command inherits its output as outside a job and no tail is kept.
 	if jobDir != "" {
-		tail = newGateTail()
-		var cerr error
-		if capture, cerr = newGateCapture(tail, out, stderr); cerr != nil {
-			return fail("cannot create the output pipes: %v", cerr)
+		c, cerr := newGateCapture(jobDir, out, stderr)
+		if cerr != nil {
+			fmt.Fprintf(g.Stderr, "gate: output spool not created in %s: %v; no output tail is recorded\n", jobDir, cerr)
+		} else {
+			capture = c
+			capture.begin()
 		}
-	} else if direct {
+	}
+	if capture == nil && direct {
 		out.unknownEnd()
 	}
 	start := time.Now()
 	code, started := runGateCmd(ctx, g, stderr, capture)
+	if capture != nil {
+		capture.commandOver()
+	}
 	took := time.Since(start)
 	fmt.Fprintf(g.Stderr, "gate: %s exit %d after %s\n", g.Argv[0], code, took.Round(time.Millisecond))
 	if moved := assertGateHead(g, want, "after the run"); moved != 0 && code == 0 {
@@ -243,9 +255,18 @@ func RunGate(ctx context.Context, g GateRun) (code int) {
 	}
 	// A command that started is a result whatever its exit code (a suite may itself exit 127); one that
 	// never started ran nothing.
-	if tail != nil && started {
+	if jobDir != "" && started {
 		exit := code
-		record = func() GateResultRun { return gateRunRecord(want, g.Argv, exit, start, took, tail) }
+		record = func() GateResultRun {
+			tail := ""
+			if capture != nil {
+				var terr error
+				if tail, terr = capture.tail(); terr != nil {
+					fmt.Fprintf(g.Stderr, "gate: output tail not read: %v\n", terr)
+				}
+			}
+			return gateRunRecord(want, g.Argv, exit, start, took, tail)
+		}
 	}
 	return code
 }
@@ -431,23 +452,19 @@ func gateHolder(f *os.File) string {
 // runGateCmd runs g.Argv in g.Dir as the leader of a process group of its own, stdin /dev/null, with
 // GateEnv(g.Env), and returns its exit code (see RunGate) and whether it started (GateExitNotStarted alone
 // cannot tell: a command that ran may exit 127 itself). With a capture the command writes to the capture's
-// pipes instead of g.Stdout and stderr; the capture's copiers start here and are drained by the caller.
+// spool files instead of g.Stdout and stderr; the capture's forwarders are started and joined by the caller.
 func runGateCmd(ctx context.Context, g GateRun, stderr io.Writer, capture *gateCapture) (code int, started bool) {
 	cmd := exec.Command(g.Argv[0], g.Argv[1:]...)
 	cmd.Dir = g.Dir
 	cmd.Env = GateEnv(g.Env)
 	cmd.Stdout, cmd.Stderr = g.Stdout, stderr
 	if capture != nil {
-		cmd.Stdout, cmd.Stderr = capture.stdout.w, capture.stderr.w
+		cmd.Stdout, cmd.Stderr = capture.stdout.f, capture.stderr.f
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// A process that left the group (setsid) and still holds a pipe must not hold Wait forever.
 	cmd.WaitDelay = gateKillGrace
-	err := cmd.Start()
-	if capture != nil {
-		capture.begin()
-	}
-	if err != nil {
+	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(g.Stderr, "gate: start %s: %v\n", g.Argv[0], err)
 		return GateExitNotStarted, false
 	}
@@ -484,7 +501,7 @@ func runGateCmd(ctx context.Context, g GateRun, stderr io.Writer, capture *gateC
 	}
 	// Nothing of the group outlives its leader (a suite's background servers, workers, watchers).
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	err = cmd.Wait()
+	err := cmd.Wait()
 	if result != 0 {
 		return result, true
 	}

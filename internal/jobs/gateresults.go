@@ -246,127 +246,205 @@ func sanitizeBlock(s string, max int) string {
 	return gateResultTailCut + strings.ToValidUTF8(out, "")
 }
 
-// gateTail keeps the end of what a gate's command wrote to stdout and stderr, for the artifact. Both
-// streams write into it from the copy goroutines of os/exec.
-type gateTail struct {
-	mu  sync.Mutex
-	buf tailBuffer
-}
+const (
+	gateSpoolPoll    = 20 * time.Millisecond // how often a forwarder looks for new bytes in its spool file
+	gateSpoolContext = 16 << 10              // bytes read before the tail window, so a key block cut by it is still recognised
+)
 
-func newGateTail() *gateTail { return &gateTail{buf: tailBuffer{max: GateResultTailBytes}} }
+// gateSpoolSeq makes spool names unique inside one process; pid and time make them unique across runs.
+var gateSpoolSeq atomic.Uint64
 
-func (g *gateTail) Write(p []byte) (int, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.buf.Write(p)
-}
-
-// text is the kept tail, sanitized.
-func (g *gateTail) text() string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	body, _ := keptTail(&g.buf)
-	return sanitizeBlock(string(body), GateResultTailBytes)
-}
-
-// gateDrainWait bounds how long the runner waits, once the command is over, for the copies of its output
-// to reach their destinations; what a blocked destination has not taken by then is dropped.
-const gateDrainWait = 500 * time.Millisecond
-
-// gateCopier copies one stream of a gate's command, read from a pipe of the runner's own, into the tail
-// first and then into the destination. The command writes to the pipe (a file, so os/exec starts no copy
-// goroutine and cmd.Wait waits for nothing but the process): a destination that stops reading blocks only
-// this copier, never the command's exit, the timeout or the gate lease. A destination that fails is
-// dropped, the tail keeps filling.
-type gateCopier struct {
-	r, w *os.File
+// gateSpool is one output stream of a gate's command inside a job: a regular file of the job folder that
+// the command gets as its stdout (or stderr), and the forwarder that follows it into the real destination.
+// The command writes to a file, so it never blocks on a reader and never gets EPIPE; a destination that
+// stops reading blocks only its own forwarder.
+type gateSpool struct {
+	path string
+	f    *os.File
 	dst  io.Writer
-	tail *gateTail
-	stop atomic.Bool
-	done chan struct{}
+	done chan struct{} // closed when the forwarder has returned
+	err  error         // the forwarder's read failure; read only after done
 }
 
-func (c *gateCopier) copy() {
-	defer close(c.done)
-	buf := make([]byte, 32<<10)
-	broken := false
-	for {
-		n, err := c.r.Read(buf)
-		if n > 0 {
-			_, _ = c.tail.Write(buf[:n])
-			if !broken && !c.stop.Load() {
-				if _, werr := c.dst.Write(buf[:n]); werr != nil {
-					broken = true
-				}
-			}
+// newGateSpool creates the spool file of one stream, private (0600), never an existing file or a symlink.
+func newGateSpool(dir, stream string, dst io.Writer) (*gateSpool, error) {
+	for range 8 {
+		path := filepath.Join(dir, fmt.Sprintf("gate-spool-%d-%d-%d-%s", os.Getpid(), time.Now().UnixNano(), gateSpoolSeq.Add(1), stream))
+		// O_APPEND: whoever holds the descriptor (the command, its children) always writes at the end.
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+		if errors.Is(err, fs.ErrExist) {
+			continue
 		}
-		if err != nil || c.stop.Load() {
-			return
-		}
-	}
-}
-
-// gateCapture is the pair of copiers of one gate command (stdout, stderr) that share one tail.
-type gateCapture struct {
-	tail           *gateTail
-	stdout, stderr *gateCopier
-}
-
-// newGateCapture makes the pipes and copiers for a command whose stdout goes to out and stderr to errw.
-func newGateCapture(tail *gateTail, out, errw io.Writer) (*gateCapture, error) {
-	mk := func(dst io.Writer) (*gateCopier, error) {
-		r, w, err := os.Pipe()
 		if err != nil {
 			return nil, err
 		}
-		return &gateCopier{r: r, w: w, dst: dst, tail: tail, done: make(chan struct{})}, nil
+		return &gateSpool{path: path, f: f, dst: dst, done: make(chan struct{})}, nil
 	}
-	o, err := mk(out)
-	if err != nil {
-		return nil, err
-	}
-	e, err := mk(errw)
-	if err != nil {
-		_ = o.r.Close()
-		_ = o.w.Close()
-		return nil, err
-	}
-	return &gateCapture{tail: tail, stdout: o, stderr: e}, nil
+	return nil, errors.New("no unused spool file name")
 }
 
-// begin hands the runner's copies of the write ends over (closed, so the reader sees the end once the
-// command and its children are gone) and starts the copiers. Call it once, after the command started or
-// failed to.
-func (g *gateCapture) begin() {
-	for _, c := range []*gateCopier{g.stdout, g.stderr} {
-		_ = c.w.Close()
-		go c.copy()
-	}
-}
-
-// drain waits at most gateDrainWait in all for the copiers to reach the end of their pipes, then stops
-// them and closes the pipes: a copier blocked in its destination ends when that write returns, a copier
-// waiting for a child that left the group ends with the read end closed. Safe to call twice.
-func (g *gateCapture) drain() {
-	deadline := make(chan struct{})
-	timer := time.AfterFunc(gateDrainWait, func() { close(deadline) })
-	defer timer.Stop()
-	for _, c := range []*gateCopier{g.stdout, g.stderr} {
+// forward follows the spool file from its start: it writes every new byte to the destination, in order,
+// and returns at the end of the file once over is closed (the command is gone, so the file is complete),
+// or when the destination fails (the reader went away: the rest is dropped, as gateStdout does).
+func (s *gateSpool) forward(over <-chan struct{}) {
+	defer close(s.done)
+	buf := make([]byte, 32<<10)
+	var off int64
+	for {
+		// over is read before the file: a byte written before over closed is seen by the read after it.
+		finished := false
 		select {
-		case <-c.done:
-		case <-deadline:
+		case <-over:
+			finished = true
+		default:
+		}
+		n, err := s.f.ReadAt(buf, off)
+		if n > 0 {
+			off += int64(n)
+			if _, werr := s.dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			s.err = fmt.Errorf("read %s: %w", filepath.Base(s.path), err)
+			return
+		}
+		if finished {
+			return
+		}
+		select {
+		case <-over:
+		case <-time.After(gateSpoolPoll):
 		}
 	}
-	for _, c := range []*gateCopier{g.stdout, g.stderr} {
-		c.stop.Store(true)
-		_ = c.r.Close()
+}
+
+// end is at most limit bytes of the end of the spool file, read from the file itself: a cut first line is
+// dropped and a key block cut by the window is redacted (keptTail). Only the end of the file is read.
+func (s *gateSpool) end(limit int) ([]byte, error) {
+	fi, err := s.f.Stat()
+	if err != nil {
+		return nil, err
 	}
+	size := fi.Size()
+	start := max(0, size-int64(limit+gateSpoolContext))
+	b := make([]byte, size-start)
+	n, err := s.f.ReadAt(b, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	tb := tailBuffer{max: limit}
+	_, _ = tb.Write(b[:n])
+	body, _ := keptTail(&tb)
+	return body, nil
+}
+
+// gateCapture is the pair of spool files of one gate command (stdout, stderr) inside a job.
+type gateCapture struct {
+	stdout, stderr *gateSpool
+	over           chan struct{}
+	overOnce       sync.Once
+}
+
+// newGateCapture creates the spool files in dir for a command whose stdout is forwarded to out and stderr
+// to errw. Nothing is left behind on an error.
+func newGateCapture(dir string, out, errw io.Writer) (*gateCapture, error) {
+	o, err := newGateSpool(dir, "out", out)
+	if err != nil {
+		return nil, err
+	}
+	e, err := newGateSpool(dir, "err", errw)
+	if err != nil {
+		o.discard()
+		return nil, err
+	}
+	return &gateCapture{stdout: o, stderr: e, over: make(chan struct{})}, nil
+}
+
+// discard closes and removes a spool file that never got a forwarder.
+func (s *gateSpool) discard() {
+	_ = s.f.Close()
+	_ = os.Remove(s.path)
+}
+
+// begin starts the forwarders; call it once, before the command starts.
+func (g *gateCapture) begin() {
+	go g.stdout.forward(g.over)
+	go g.stderr.forward(g.over)
+}
+
+// commandOver tells the forwarders that the command (and its group) is gone and the spool files are
+// complete: each then drains its file to the end and returns. Safe to call twice.
+func (g *gateCapture) commandOver() { g.overOnce.Do(func() { close(g.over) }) }
+
+// tail is the end of what the command wrote, read from the spool files themselves (complete whatever the
+// forwarders have done so far), at most GateResultTailBytes, sanitized. The two streams share the limit:
+// a stream shorter than its half leaves the rest to the other. stdout comes first, stderr after it.
+func (g *gateCapture) tail() (string, error) {
+	var so, se int64
+	for _, p := range []struct {
+		s *gateSpool
+		n *int64
+	}{{g.stdout, &so}, {g.stderr, &se}} {
+		fi, err := p.s.f.Stat()
+		if err != nil {
+			return "", err
+		}
+		*p.n = fi.Size()
+	}
+	limit := int64(GateResultTailBytes)
+	shareO, shareE := so, se
+	if so+se > limit {
+		half := limit / 2
+		switch {
+		case so < half:
+			shareE = limit - so
+		case se < half:
+			shareO = limit - se
+		default:
+			shareO, shareE = half, limit-half
+		}
+	}
+	ob, err := g.stdout.end(int(shareO))
+	if err != nil {
+		return "", err
+	}
+	eb, err := g.stderr.end(int(shareE))
+	if err != nil {
+		return "", err
+	}
+	text := string(ob)
+	if text != "" && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	return sanitizeBlock(text+string(eb), GateResultTailBytes), nil
+}
+
+// finish waits, with no deadline, for both forwarders to deliver everything their spool file holds, then
+// closes and removes the files. A destination that never reads keeps this call (and so the exit= marker
+// after it) waiting: the lease and the record are long done by then. It returns the forwarders' read errors.
+func (g *gateCapture) finish() []error {
+	g.commandOver()
+	<-g.stdout.done
+	<-g.stderr.done
+	var errs []error
+	for _, s := range []*gateSpool{g.stdout, g.stderr} {
+		if s.err != nil {
+			errs = append(errs, s.err)
+		}
+		_ = s.f.Close()
+		if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", filepath.Base(s.path), err))
+		}
+	}
+	return errs
 }
 
 // gateRunRecord is the artifact entry of a finished gate command that started at start and took took.
-func gateRunRecord(head string, argv []string, exit int, start time.Time, took time.Duration, tail *gateTail) GateResultRun {
+func gateRunRecord(head string, argv []string, exit int, start time.Time, took time.Duration, tail string) GateResultRun {
 	return GateResultRun{Head: head, Argv: argv, Exit: exit, DurationMS: took.Milliseconds(),
-		At: start.UTC().Format(time.RFC3339), Tail: tail.text()}
+		At: start.UTC().Format(time.RFC3339), Tail: tail}
 }
 
 // --- the reviewer's rendering (daemon side) ---

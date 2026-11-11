@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -592,5 +593,187 @@ func TestRunGateRecordsStartedCommandThatExits127(t *testing.T) {
 	}
 	if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 {
 		t.Fatalf("a command that never started was recorded: %+v", f)
+	}
+}
+
+// orderLog is a writer shared by several destinations: it records the order in which bytes arrived.
+type orderLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *orderLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *orderLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// stallWriter is a destination whose first write blocks until release is closed (a live reader that has
+// stopped reading for a while); entered is closed when that write starts. Every byte it takes goes into log.
+type stallWriter struct {
+	log     *orderLog
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newStallWriter(log *orderLog) *stallWriter {
+	return &stallWriter{log: log, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (w *stallWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.entered)
+		<-w.release
+	})
+	return w.log.Write(p)
+}
+
+// waitGateRecorded waits until jobDir's gate-results.json holds want runs and returns them.
+func waitGateRecorded(t *testing.T, jobDir string, want int) []GateResultRun {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if b, err := os.ReadFile(filepath.Join(jobDir, GateResultsFile)); err == nil {
+			var f gateResultsFile
+			if json.Unmarshal(b, &f) == nil && len(f.Runs) >= want {
+				return f.Runs
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d runs were never recorded in %s", want, jobDir)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func gateSpoolFiles(t *testing.T, jobDir string) []string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(jobDir, "gate-spool-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// F2a: the destination's write of chunk A blocks, chunk B is queued behind it and the command exits. The
+// lease is free and the record complete while the reader is away; when the reader comes back it receives A
+// then B in full, and the exit marker follows both. Nothing is dropped for a live reader.
+func TestRunGateJobBlockedChunkKeepsQueuedOutput(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	log := &orderLog{}
+	dst := newStallWriter(log)
+	done := make(chan int, 1)
+	go func() {
+		done <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Timeout: time.Minute,
+			Stdout: dst, Stderr: &lockedBuffer{}, Argv: []string{"/bin/sh", "-c", "printf AAAA; sleep 0.3; printf BBBB"}})
+	}()
+	select {
+	case <-dst.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("chunk A never reached the destination")
+	}
+	runs := waitGateRecorded(t, jobDir, 1)
+	if !strings.Contains(runs[0].Tail, "AAAABBBB") {
+		t.Errorf("the recorded tail is not complete while the reader is away: %q", runs[0].Tail)
+	}
+	// Past any bounded wait of the old drain.
+	time.Sleep(1200 * time.Millisecond)
+	if code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 15 * time.Second,
+		Argv: []string{"true"}}); code != 0 || lastLine(out) != "exit=0" {
+		t.Errorf("the lease is not free behind a stalled reader: code %d, out %q, err %q", code, out, errs)
+	}
+	close(dst.release)
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Errorf("exit %d, want 0", code)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the gate did not end after its reader resumed")
+	}
+	if got, want := log.String(), "AAAABBBB\nexit=0\n"; got != want {
+		t.Errorf("the reader received %q, want %q", got, want)
+	}
+}
+
+// F2b: stderr's destination stalls with a chunk pending while stdout's does not. No byte of the command's
+// output may reach a destination after the exit= marker, and the marker must not come early either.
+func TestRunGateJobNoOutputAfterMarker(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	log := &orderLog{}
+	errDst := newStallWriter(log)
+	done := make(chan int, 1)
+	go func() {
+		done <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Timeout: time.Minute,
+			Stdout: log, Stderr: errDst, Argv: []string{"/bin/sh", "-c", "echo OUT1; echo ERR1 >&2; echo OUT2"}})
+	}()
+	select {
+	case <-errDst.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("stderr never reached its destination")
+	}
+	waitGateRecorded(t, jobDir, 1)
+	time.Sleep(1200 * time.Millisecond)
+	if s := log.String(); strings.Contains(s, "exit=") {
+		t.Errorf("the marker was written while stderr output was still pending: %q", s)
+	}
+	close(errDst.release)
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the gate did not end after its reader resumed")
+	}
+	s := log.String()
+	mi := strings.Index(s, "exit=0\n")
+	if mi < 0 || !strings.HasSuffix(s, "exit=0\n") {
+		t.Fatalf("the marker is not the last line: %q", s)
+	}
+	for _, want := range []string{"OUT1\n", "ERR1\n", "OUT2\n"} {
+		if i := strings.Index(s, want); i < 0 || i > mi {
+			t.Errorf("%q is missing or comes after the marker: %q", want, s)
+		}
+	}
+}
+
+// The spool files of a run are gone once its output is forwarded, and the tail still carries both streams.
+func TestRunGateJobRemovesSpoolFiles(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env,
+		Argv: []string{"/bin/sh", "-c", "echo to-out; echo to-err >&2; exit 2"}})
+	if code != 2 || !strings.HasPrefix(out, "to-out\n") || lastLine(out) != "exit=2" {
+		t.Fatalf("exit %d, out %q", code, out)
+	}
+	if left := gateSpoolFiles(t, jobDir); len(left) != 0 {
+		t.Fatalf("spool files left behind: %v", left)
+	}
+	r := readGateResultsT(t, jobDir).Runs
+	if len(r) != 1 || !strings.Contains(r[0].Tail, "to-out") || !strings.Contains(r[0].Tail, "to-err") {
+		t.Fatalf("tail without both streams: %+v", r)
+	}
+}
+
+// The spool is a regular file of mode 0600 that the command gets as its stdout and stderr; the tail of a
+// huge output stays capped and keeps the end.
+func TestRunGateJobSpoolIsPrivateAndTailCapped(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env,
+		Argv: []string{"/bin/sh", "-c", "[ -f /proc/self/fd/1 ] && echo regular; stat -L -c %a /proc/self/fd/1; seq 1 200000; echo LAST-LINE"}})
+	if code != 0 || !strings.HasPrefix(out, "regular\n600\n") || !strings.Contains(out, "\n200000\nLAST-LINE\n") {
+		t.Fatalf("exit %d, out head %q", code, out[:min(len(out), 40)])
+	}
+	r := readGateResultsT(t, jobDir).Runs
+	if len(r) != 1 || len(r[0].Tail) > GateResultTailBytes || !strings.Contains(r[0].Tail, "LAST-LINE") || strings.Contains(r[0].Tail, "\n1\n") {
+		t.Fatalf("tail not capped at the end of the output: %d bytes", len(r[0].Tail))
 	}
 }

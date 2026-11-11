@@ -410,6 +410,13 @@ func unreadStdoutReleasesLock(t *testing.T, env []string, jobDir string) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// Inside a job the output goes to a spool file, so the command never blocks on the unread pipe: it ends
+	// on its own, and its record (the tail read from the spool) exists while the reader is still away.
+	if jobDir != "" {
+		if runs := waitGateRecorded(t, jobDir, 1); runs[0].Exit != 0 {
+			t.Fatalf("the run is not recorded complete while the reader is away: %+v", runs[0])
+		}
+	}
 	// The first gate's stdout stays unread meanwhile.
 	code, out, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, LockWait: 15 * time.Second,
 		Argv: []string{"true"}})
@@ -423,20 +430,30 @@ func unreadStdoutReleasesLock(t *testing.T, env []string, jobDir string) {
 		t.Fatalf("second gate behind an unread first gate: code %d, out %q, err %q (first: %q)", code, out, errs,
 			firstErr.String())
 	}
+	// Plain: the command blocked on the full pipe and the timeout ended it. In a job it never blocked.
+	wantCode := GateExitTimeout
+	if jobDir != "" {
+		wantCode = 0
+	}
 	select {
 	case c := <-first:
-		if c != GateExitTimeout {
-			t.Fatalf("first gate exited %d, want %d: %q", c, GateExitTimeout, firstErr.String())
+		if c != wantCode {
+			t.Fatalf("first gate exited %d, want %d: %q", c, wantCode, firstErr.String())
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("the first gate did not end after its reader resumed")
 	}
-	if o := <-got; !strings.HasSuffix(o, "\nexit=124\n") {
+	o := <-got
+	if !strings.HasSuffix(o, "\nexit="+strconv.Itoa(wantCode)+"\n") {
 		t.Fatalf("first gate's output does not end with the marker line: ...%q", o[max(0, len(o)-40):])
 	}
 	if jobDir != "" {
-		if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 || f.Runs[0].Exit != GateExitTimeout {
-			t.Fatalf("the timed-out run is not recorded: %+v", f)
+		// A live reader that comes back gets every byte of the output, then the marker.
+		if len(o) != 1<<20+len("\nexit=0\n") {
+			t.Fatalf("the reader received %d bytes, want the full 1 MiB and the marker", len(o))
+		}
+		if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 || f.Runs[0].Exit != 0 {
+			t.Fatalf("the run is not recorded: %+v", f)
 		}
 	}
 }
@@ -478,9 +495,11 @@ func unreadStderrReleasesLock(t *testing.T, newEnv func(*testing.T) []string) {
 			var out bytes.Buffer
 			done := make(chan int, 1)
 			returned := false
+			env := newEnv(t)
+			inJob := envValue(env, JobEnvVar) != ""
 			go func() {
 				done <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock,
-					Timeout: 500 * time.Millisecond, Stdout: &out, Stderr: w, Env: newEnv(t),
+					Timeout: 500 * time.Millisecond, Stdout: &out, Stderr: w, Env: env,
 					Argv: []string{"/bin/sh", "-c", "echo $$ > " + pidf + "; head -c 1048576 /dev/zero >&2; sleep 30"}})
 			}()
 			t.Cleanup(func() {
@@ -494,21 +513,46 @@ func unreadStderrReleasesLock(t *testing.T, newEnv func(*testing.T) []string) {
 				}
 			})
 			// Stderr stays open and completely unread through the timeout and lock handoff.
-			select {
-			case code := <-done:
-				returned = true
-				if code != GateExitTimeout || lastLine(out.String()) != "exit=124" {
-					t.Fatalf("code %d, stdout %q", code, out.String())
+			// The command is running (it wrote its pid) before anything else is judged.
+			for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				if b, _ := os.ReadFile(pidf); strings.HasSuffix(string(b), "\n") {
+					break
 				}
-			case <-time.After(3 * time.Second):
-				t.Error("runner blocked on unread stderr past its timeout")
+				if time.Now().After(deadline) {
+					t.Fatal("the command never started")
+				}
+			}
+			if !inJob {
+				select {
+				case code := <-done:
+					returned = true
+					if code != GateExitTimeout || lastLine(out.String()) != "exit=124" {
+						t.Fatalf("code %d, stdout %q", code, out.String())
+					}
+				case <-time.After(3 * time.Second):
+					t.Error("runner blocked on unread stderr past its timeout")
+				}
 			}
 			code, out2, errs := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock,
-				LockWait: 300 * time.Millisecond, Argv: []string{"true"}})
+				LockWait: 5 * time.Second, Argv: []string{"true"}})
 			if code != 0 || lastLine(out2) != "exit=0" {
 				t.Fatalf("gate lock not released: code %d, stdout %q, stderr %q", code, out2, errs)
 			}
 			waitDead(t, readPID(t, pidf))
+			if inJob {
+				// The forwarder of the unread stderr keeps the gate process (lease long released, record
+				// written) until the reader reads; then the marker follows and the gate ends.
+				go func() { _, _ = io.Copy(io.Discard, r) }()
+				select {
+				case code := <-done:
+					returned = true
+					if code != GateExitTimeout || lastLine(out.String()) != "exit=124" {
+						t.Fatalf("code %d, stdout %q", code, out.String())
+					}
+				case <-time.After(30 * time.Second):
+					t.Fatal("the gate did not end after its stderr reader resumed")
+				}
+			}
 		})
 	}
 }
