@@ -1117,6 +1117,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 	if section := m.pluginsPromptSection(j); section != "" {
 		resumed += "\nThe skills bootstrap, read again for this attempt:\n\n" + section
 	}
+	// The card's checklist is read again too: the card may have gained the keys since the last attempt.
+	// The fallback prompt gets it once through buildPrompt, so it is not part of the update both share.
+	if section := cardChecklistFor(j, cards); section != "" {
+		resumed += "\nThe project card's checklist, read again for this attempt:\n" + section
+	}
 	if err := writeFileReplace(filepath.Join(dir, resumePromptFile), []byte(resumed)); err != nil {
 		return launchPlan{}, err
 	}

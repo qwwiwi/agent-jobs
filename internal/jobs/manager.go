@@ -2047,6 +2047,10 @@ func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed b
 			status, msg = store.StatusFailed, RedactPrintable(err.Error(), 300)
 		}
 	}
+	// The job-done note is worked out here, once, with the work tree quiet (nothing of the job runs any
+	// more) and before the row turns terminal, so that no delivery can build the line without it. The
+	// line only reads the stored value (uiEvidenceNote).
+	m.recordUINote(j, status)
 	unknown, estimate := m.attemptCost(j, res, killed)
 	// Admission is closed for the transition: the running advisor calls end first, and one that cannot be
 	// ended (kept registered, retried every tick) keeps the attempt from counting as a clean finish.
