@@ -17,9 +17,11 @@ import (
 // MergeCheckTimeout bounds the merge check of one job at notify time (every git call together).
 var MergeCheckTimeout = 10 * time.Second
 
-// Caps of the merge check's line: conflicting files and commits the branch gained.
+// Caps of the merge check's line: conflicting files, the bytes of one file's name and commits the
+// branch gained.
 const (
 	mergeCheckMaxFiles   = 5
+	mergeCheckMaxName    = 120
 	mergeCheckMaxCommits = 5
 )
 
@@ -222,7 +224,7 @@ func (m *Manager) MergeNote(j *store.Job) string {
 	for _, f := range strings.Split(strings.TrimSpace(out), "\n")[1:] {
 		if f = strings.TrimSpace(f); f != "" && !seen[f] {
 			seen[f] = true
-			files = append(files, Printable(f, 120))
+			files = append(files, noteFileName(f, mergeCheckMaxName))
 		}
 	}
 	note := fmt.Sprintf("WARNING: conflicts with %s at %s in %s", Printable(branch, 80), shortSHA(tip), capList(files, mergeCheckMaxFiles))
@@ -328,6 +330,33 @@ func (m *Manager) forgetMergeNote(id string) {
 	m.mergeMu.Lock()
 	defer m.mergeMu.Unlock()
 	delete(m.mergeChecks, id)
+}
+
+// noteFileNameRune reports whether r may stand in a file name of a job-done note: an ASCII letter, a
+// digit or one of ". _ / -".
+func noteFileNameRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+		r == '.' || r == '_' || r == '/' || r == '-'
+}
+
+// noteFileName is a file's name as a note of the job-done line shows it (the UI note's changed files,
+// the merge note's conflicted files). A file name is the job's own text, so it passes an allowlist
+// instead of an escape per separator: every rune that is not noteFileNameRune (a space, ";", "·", ":",
+// a quote, a bracket, a control character, a non-ASCII letter, a broken byte) becomes "_". What is
+// left cannot spell a separator of the job-done formats: the fields' " · ", the "; " between the jobs
+// of a coalesced line, the ", " and " (+k more)" of the list. Redacted first (a value changed by the
+// allowlist no longer matches its format), then cut to max bytes, a cut name ending in "...".
+func noteFileName(name string, max int) string {
+	out := strings.Map(func(r rune) rune {
+		if noteFileNameRune(r) {
+			return r
+		}
+		return '_'
+	}, strings.ToValidUTF8(RedactText(name), "_"))
+	if len(out) > max {
+		out = out[:max-3] + "..."
+	}
+	return out
 }
 
 // capList joins at most n items, then "(+k more)".
