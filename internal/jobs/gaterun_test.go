@@ -375,6 +375,15 @@ func TestOpenGateLockShared(t *testing.T) {
 // blocks on the full pipe, the timeout ends it and the lock is free for the next gate before anyone
 // reads the first gate's output again (#134 fix loop 2).
 func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
+	t.Run("plain", func(t *testing.T) { unreadStdoutReleasesLock(t, os.Environ(), "") })
+	// Inside a job the output also feeds the artifact's tail: that copy must not hold the lock either.
+	t.Run("in job", func(t *testing.T) {
+		jobDir, env := gateJobFixture(t)
+		unreadStdoutReleasesLock(t, env, jobDir)
+	})
+}
+
+func unreadStdoutReleasesLock(t *testing.T, env []string, jobDir string) {
 	repo, _, head, lock := gateFixture(t)
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -387,7 +396,7 @@ func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
 		defer w.Close()
 		// Far more than a pipe holds (64 KiB on Linux), then it would end on its own.
 		first <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock, Timeout: 500 * time.Millisecond,
-			Env: os.Environ(), Argv: []string{"/bin/sh", "-c", "head -c 1048576 /dev/zero; sleep 0.2"}, Stdout: w, Stderr: &firstErr})
+			Env: env, Argv: []string{"/bin/sh", "-c", "head -c 1048576 /dev/zero; sleep 0.2"}, Stdout: w, Stderr: &firstErr})
 	}()
 	// Wait until the first gate holds the lock (it wrote the holder line into its repository's lock).
 	repoLock := gateRepoLockIn(filepath.Dir(lock), gateRepoKey(repo))
@@ -425,10 +434,22 @@ func TestRunGateUnreadStdoutReleasesLock(t *testing.T) {
 	if o := <-got; !strings.HasSuffix(o, "\nexit=124\n") {
 		t.Fatalf("first gate's output does not end with the marker line: ...%q", o[max(0, len(o)-40):])
 	}
+	if jobDir != "" {
+		if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 || f.Runs[0].Exit != GateExitTimeout {
+			t.Fatalf("the timed-out run is not recorded: %+v", f)
+		}
+	}
 }
 
 // Neither startup notes nor the note before the timeout kill may block on unread stderr (#178).
 func TestRunGateUnreadStderrReleasesLock(t *testing.T) {
+	t.Run("plain", func(t *testing.T) { unreadStderrReleasesLock(t, func(*testing.T) []string { return nil }) })
+	t.Run("in job", func(t *testing.T) {
+		unreadStderrReleasesLock(t, func(t *testing.T) []string { _, env := gateJobFixture(t); return env })
+	})
+}
+
+func unreadStderrReleasesLock(t *testing.T, newEnv func(*testing.T) []string) {
 	for _, prefill := range []bool{true, false} {
 		name := "timeout"
 		if prefill {
@@ -459,7 +480,7 @@ func TestRunGateUnreadStderrReleasesLock(t *testing.T) {
 			returned := false
 			go func() {
 				done <- RunGate(context.Background(), GateRun{Dir: repo, Head: head, LockPath: lock,
-					Timeout: 500 * time.Millisecond, Stdout: &out, Stderr: w,
+					Timeout: 500 * time.Millisecond, Stdout: &out, Stderr: w, Env: newEnv(t),
 					Argv: []string{"/bin/sh", "-c", "echo $$ > " + pidf + "; head -c 1048576 /dev/zero >&2; sleep 30"}})
 			}()
 			t.Cleanup(func() {

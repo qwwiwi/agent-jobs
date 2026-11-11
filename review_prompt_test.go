@@ -147,6 +147,12 @@ func TestReviewPromptUsesGateArtifact(t *testing.T) {
 			t.Errorf("kind-review.md lacks %q", want)
 		}
 	}
+	// A head is a claim to compare with the reviewed commit, also the acceptance head (S4 fix loop 1, F1).
+	for _, want := range []string{"claimed head", "names no commit", "compare it with the reviewed commit"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("kind-review.md lacks %q", want)
+		}
+	}
 	// The trusted side is the daemon's; the job's own runs are claims.
 	if !strings.Contains(s, "`trusted`") || !strings.Contains(s, "`job_reported`") {
 		t.Error("kind-review.md must name the artifact's two parts (`trusted`, `job_reported`)")

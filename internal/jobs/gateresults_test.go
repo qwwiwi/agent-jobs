@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -474,5 +475,122 @@ func TestGateRunCLIRecordsTwoConcurrentRuns(t *testing.T) {
 	f := readGateResultsT(t, jobDir)
 	if len(f.Runs) != 2 || !strings.Contains(f.Runs[0].Tail+f.Runs[1].Tail, "CLI-RUN-0") || !strings.Contains(f.Runs[0].Tail+f.Runs[1].Tail, "CLI-RUN-1") {
 		t.Fatalf("%+v", f)
+	}
+}
+
+// F1: the acceptance head is not something the daemon knows, so it is never in `trusted`: a job that plants
+// an acceptance entry with the daemon's own exit and a head of its choice gets that head shown as a claim
+// under `job_reported`, and `trusted.acceptance` carries no head at all.
+func TestGateArtifactTrustedHeadIsNotFromTheJobFile(t *testing.T) {
+	m := acceptanceManager(t, "")
+	j := runToEnd(t, m, enqueue(t, m, "work", withAcceptance("exit 1")).ID)
+	if j.AcceptanceExit == nil || *j.AcceptanceExit != 1 {
+		t.Fatalf("setup: acceptance exit %v", j.AcceptanceExit)
+	}
+	planted := "0123456789abcdef0123456789abcdef01234567"
+	b, _ := json.Marshal(gateResultsFile{Version: 1, Acceptance: &GateResultAcceptance{Head: planted, Exit: 1}})
+	writeT(t, filepath.Join(m.JobDir(j.ID), GateResultsFile), string(b))
+	art, err := m.gateArtifact(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Trusted     map[string]json.RawMessage
+		JobReported struct {
+			Acceptance *struct {
+				Head string
+				Exit int
+			}
+		} `json:"job_reported"`
+	}
+	if err := json.Unmarshal(art, &got); err != nil {
+		t.Fatalf("artifact is not JSON: %v\n%s", err, art)
+	}
+	var acc map[string]json.RawMessage
+	if err := json.Unmarshal(got.Trusted["acceptance"], &acc); err != nil {
+		t.Fatalf("trusted acceptance: %v\n%s", err, art)
+	}
+	if _, has := acc["head"]; has {
+		t.Errorf("trusted.acceptance carries a head taken from the job's file: %s", art)
+	}
+	if string(acc["exit"]) != "1" {
+		t.Errorf("trusted exit: %s", art)
+	}
+	trusted, _ := json.Marshal(got.Trusted)
+	if strings.Contains(string(trusted), planted) {
+		t.Errorf("the planted head reached `trusted`: %s", trusted)
+	}
+	if c := got.JobReported.Acceptance; c == nil || c.Head != planted || c.Exit != 1 {
+		t.Errorf("the planted head must show as a job-reported claim: %s", art)
+	}
+}
+
+// F1: the artifact's lock file is never followed through a symlink (the job folder is the job's): the
+// writer refuses, writes nothing through the link and leaves no artifact.
+func TestGateResultsLockSymlinkIsRefused(t *testing.T) {
+	jobDir, _ := gateJobFixture(t)
+	victim := filepath.Join(jobDir, "victim.txt")
+	writeT(t, victim, "keep")
+	if err := os.Symlink(victim, filepath.Join(jobDir, gateResultsLockFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendGateRun(jobDir, GateResultRun{Head: "abc1234", Argv: []string{"go", "test"}}); err == nil {
+		t.Fatal("a symlink at the lock file must make the writer fail")
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+		t.Fatalf("wrote through the symlink: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(jobDir, GateResultsFile)); !os.IsNotExist(err) {
+		t.Fatalf("an artifact appeared behind a refused lock: %v", err)
+	}
+}
+
+// Dependency failure: another process holds the artifact's lock for the whole wait. The gate's own result
+// and its exit= marker are unchanged, the failure is a note, nothing is recorded.
+func TestRunGateResultSurvivesHeldArtifactLock(t *testing.T) {
+	old := gateResultsLockTries
+	gateResultsLockTries = 3
+	t.Cleanup(func() { gateResultsLockTries = old })
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	held, err := os.OpenFile(filepath.Join(jobDir, gateResultsLockFile), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if err := syscall.Flock(int(held.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errb := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env,
+		Argv: []string{"/bin/sh", "-c", "echo hi; exit 3"}})
+	if code != 3 || lastLine(out) != "exit=3" {
+		t.Fatalf("want exit 3, got %d, out %q", code, out)
+	}
+	if !strings.Contains(errb, "not recorded in "+GateResultsFile) || !strings.Contains(errb, "stayed locked") {
+		t.Fatalf("no note about the lost record: %q", errb)
+	}
+	if _, err := os.Stat(filepath.Join(jobDir, GateResultsFile)); !os.IsNotExist(err) {
+		t.Fatalf("a record appeared behind a held lock: %v", err)
+	}
+}
+
+// F3: a command that started and itself exited 127 ran: it is recorded. A command that could not start
+// (also 127 for the caller) ran nothing and is not.
+func TestRunGateRecordsStartedCommandThatExits127(t *testing.T) {
+	repo, _, head, lock := gateFixture(t)
+	jobDir, env := gateJobFixture(t)
+	code, out, _ := runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Argv: []string{"/bin/sh", "-c", "exit 127"}})
+	if code != 127 || lastLine(out) != "exit=127" {
+		t.Fatalf("exit %d, out %q", code, out)
+	}
+	if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 || f.Runs[0].Exit != 127 {
+		t.Fatalf("a started command that exited 127 must be recorded: %+v", f)
+	}
+	code, _, _ = runGateT(t, GateRun{Dir: repo, Head: head, LockPath: lock, Env: env, Argv: []string{"/no/such/binary-agent-jobs"}})
+	if code != GateExitNotStarted {
+		t.Fatalf("missing binary: exit %d", code)
+	}
+	if f := readGateResultsT(t, jobDir); len(f.Runs) != 1 {
+		t.Fatalf("a command that never started was recorded: %+v", f)
 	}
 }
