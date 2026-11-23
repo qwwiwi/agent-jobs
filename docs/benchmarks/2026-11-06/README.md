@@ -2,6 +2,8 @@
 
 The write-up (results, method, caveats, routing) is [../2026-11-06-models.md](../2026-11-06-models.md). This folder holds everything behind it.
 
+A later rerun of the same nine tasks with Sonnet 5.5 and Opus 5.5: [../2026-11-23-models.md](../2026-11-23-models.md).
+
 Task sizes and what each of the nine tasks asked for: [../2026-11-06-models.md#what-the-task-sizes-mean](../2026-11-06-models.md#what-the-task-sizes-mean).
 
 ## Charts
