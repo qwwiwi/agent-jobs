@@ -8,9 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 )
 
 // The one system configuration a codex job tolerates in /etc/codex: the host owner's managed-hooks
@@ -19,6 +21,9 @@ const (
 	codexPackRequirements = "requirements.toml"
 	codexPackHooksDir     = "hooks"
 	codexPackMaxBytes     = 64 << 10
+	// Bounds on the walk of the hooks directory; a pack beyond them refuses.
+	codexPackMaxEntries = 20000
+	codexPackMaxDepth   = 16
 )
 
 // codexRootOwned reports whether a file belongs to root; a variable so tests can stand in.
@@ -41,8 +46,11 @@ func isCodexHooksPackListing(names []string) bool {
 
 // checkCodexHooksPack returns nil only when dir holds a recognised managed-hooks pack: dir, its
 // requirements.toml and its hooks directory are what they should be (no symlink), root-owned and not
-// group- or world-writable, and requirements.toml sets nothing but hooks that run commands from the
-// hooks directory. The caller has already seen that dir holds exactly these two entries.
+// group- or world-writable; so is every entry under the hooks directory, at any depth, each a regular
+// file or a directory, so that nothing a hook runs or loads resolves outside the pack or can be
+// replaced by anyone but root; requirements.toml sets nothing but hooks that run commands from the
+// hooks directory; and every program those commands name is a regular file directly in it. The caller
+// has already seen that dir holds exactly these two entries.
 func checkCodexHooksPack(dir string) error {
 	if err := checkCodexPackPath(dir, "", true); err != nil {
 		return err
@@ -73,12 +81,55 @@ func checkCodexHooksPack(dir string) error {
 	if len(data) > codexPackMaxBytes {
 		return fmt.Errorf("%s: larger than %d bytes", codexPackRequirements, codexPackMaxBytes)
 	}
-	doc, err := parseStrictTOML(string(data))
+	programs, err := checkCodexHooksRequirements(string(data), filepath.Join(dir, codexPackHooksDir))
 	if err != nil {
 		return fmt.Errorf("%s: %w", codexPackRequirements, err)
 	}
-	if err := validateCodexHooksRequirements(doc, filepath.Join(dir, codexPackHooksDir)); err != nil {
-		return fmt.Errorf("%s: %w", codexPackRequirements, err)
+	seen := 0
+	if err := checkCodexPackTree(dir, codexPackHooksDir, 1, &seen); err != nil {
+		return err
+	}
+	for _, prog := range programs {
+		rel := codexPackHooksDir + "/" + prog
+		// The tree walk has checked mode and owner; a program must also be there and be a file.
+		if fi, err := os.Lstat(filepath.Join(dir, rel)); err != nil || !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s: handler program is not a regular file in the hooks directory", rel)
+		}
+	}
+	return nil
+}
+
+// checkCodexPackTree checks every entry under dir/rel, a directory that has passed itself: a regular
+// file or a directory (no symlink, device, socket or fifo), root-owned, not group- or world-writable.
+func checkCodexPackTree(dir, rel string, depth int, seen *int) error {
+	if depth > codexPackMaxDepth {
+		return fmt.Errorf("%s: nested deeper than %d directories", rel, codexPackMaxDepth)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, rel))
+	if err != nil {
+		return fmt.Errorf("%s: %w", rel, err)
+	}
+	for _, e := range entries {
+		if *seen++; *seen > codexPackMaxEntries {
+			return fmt.Errorf("%s: more than %d entries", codexPackHooksDir, codexPackMaxEntries)
+		}
+		sub := rel + "/" + e.Name()
+		name := Printable(sub, 256)
+		fi, err := os.Lstat(filepath.Join(dir, sub))
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return fmt.Errorf("%s: not a regular file or directory", name)
+		}
+		if err := checkCodexPackInfo(fi, name, fi.IsDir()); err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			if err := checkCodexPackTree(dir, sub, depth+1, seen); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -110,145 +161,195 @@ func checkCodexPackInfo(fi fs.FileInfo, name string, wantDir bool) error {
 	return nil
 }
 
+// codexHookEvents are the hook events a pack may list. Codex drops a handler under a name it does not
+// know without a word, so an unknown name refuses: a pack that looks armed must be armed.
+var codexHookEvents = map[string]bool{
+	"SessionStart": true, "UserPromptSubmit": true, "PreToolUse": true, "PostToolUse": true,
+	"Stop": true, "PreCompact": true,
+}
+
+// codexHookLegacyFailureEvent is the one event whose handlers may still carry `onFailure`: not a
+// field codex knows (it ignores the key and loads the file), left over in the host's pack.
+const codexHookLegacyFailureEvent = "PreToolUse"
+
 var (
-	codexHookEventRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9]*$`)
-	// A program directly in the hooks directory, then plain word arguments: no other path, no shell syntax.
-	codexHookCommandTailRe = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*( [A-Za-z0-9_-]+)*$`)
+	// A program directly in the hooks directory: one path element, no other path.
+	codexHookProgramRe = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*$`)
+	// Plain word arguments: no shell syntax.
+	codexHookArgsRe = regexp.MustCompile(`^( [A-Za-z0-9_-]+)*$`)
 )
+
+// checkCodexHooksRequirements accepts the text of a requirements.toml only when it is a managed-hooks
+// declaration for hooksDir and nothing else, and returns the names of the programs in hooksDir its
+// handlers run (sorted, each once).
+func checkCodexHooksRequirements(src, hooksDir string) ([]string, error) {
+	doc, err := parseStrictTOML(src)
+	if err != nil {
+		return nil, err
+	}
+	return validateCodexHooksRequirements(doc, hooksDir)
+}
 
 // validateCodexHooksRequirements accepts a parsed requirements.toml only when it is a managed-hooks
 // declaration and nothing else: one top-level key `hooks`, in it `managed_dir` (the pack's hooks
-// directory) and event arrays, every handler a command from that directory. Any other key anywhere
-// (features, apps, mcp_servers, sandbox, approval, model, allowed_*, a matcher, ...) refuses.
-func validateCodexHooksRequirements(doc map[string]any, hooksDir string) error {
+// directory) and arrays for known events in the nested form only, `[[hooks.<Event>]]` groups that
+// hold nothing but `[[hooks.<Event>.hooks]]` handlers, at least one per group, every handler a command
+// from that directory. Any other key anywhere (features, apps, mcp_servers, sandbox, approval, model,
+// allowed_*, a matcher, ...) and any other shape (a handler written directly in the event array, an
+// event that is a plain table) refuses: a shape codex reads differently could lose a handler silently.
+func validateCodexHooksRequirements(doc map[string]any, hooksDir string) ([]string, error) {
 	for k := range doc {
 		if k != "hooks" {
-			return fmt.Errorf("top-level key %q is not allowed (only hooks)", Printable(k, 64))
+			return nil, fmt.Errorf("top-level key %q is not allowed (only hooks)", Printable(k, 64))
 		}
 	}
 	hooks, ok := doc["hooks"].(map[string]any)
 	if !ok {
-		return errors.New("no [hooks] table")
+		return nil, errors.New("no [hooks] table")
 	}
 	if md, ok := hooks["managed_dir"].(string); !ok || md != hooksDir {
-		return fmt.Errorf("hooks.managed_dir must be %q", hooksDir)
+		return nil, fmt.Errorf("hooks.managed_dir must be %q", hooksDir)
 	}
+	programs := map[string]bool{}
 	for event, v := range hooks {
 		if event == "managed_dir" {
 			continue
 		}
 		at := "hooks." + Printable(event, 64)
-		if !codexHookEventRe.MatchString(event) {
-			return fmt.Errorf("%s: not an event array", at)
+		if !codexHookEvents[event] {
+			return nil, fmt.Errorf("%s: not a known hook event", at)
 		}
-		groups, ok := tomlTables(v)
+		groups, ok := v.(*tomlTableArray)
 		if !ok {
-			return fmt.Errorf("%s: not an array of tables", at)
+			return nil, fmt.Errorf("%s: not an array of tables", at)
 		}
-		for _, g := range groups {
-			inner, isGroup := g["hooks"]
-			if !isGroup {
-				// A handler written directly in the event array.
-				if err := validateCodexHookHandler(g, hooksDir); err != nil {
-					return fmt.Errorf("%s: %w", at, err)
-				}
-				continue
-			}
+		for _, g := range groups.items {
 			for k := range g {
 				if k != "hooks" {
-					return fmt.Errorf("%s: key %q is not allowed", at, Printable(k, 64))
+					return nil, fmt.Errorf("%s: key %q is not allowed (only [[%s.hooks]] handlers)", at, Printable(k, 64), at)
 				}
 			}
-			handlers, ok := tomlTables(inner)
+			inner, has := g["hooks"]
+			if !has {
+				return nil, fmt.Errorf("%s: a group without handlers", at)
+			}
+			// An array built by headers always has an item.
+			handlers, ok := inner.(*tomlTableArray)
 			if !ok {
-				return fmt.Errorf("%s.hooks: not an array of tables", at)
+				return nil, fmt.Errorf("%s.hooks: not an array of tables", at)
 			}
-			for _, h := range handlers {
-				if err := validateCodexHookHandler(h, hooksDir); err != nil {
-					return fmt.Errorf("%s.hooks: %w", at, err)
+			for _, h := range handlers.items {
+				prog, err := validateCodexHookHandler(h, hooksDir, event == codexHookLegacyFailureEvent)
+				if err != nil {
+					return nil, fmt.Errorf("%s.hooks: %w", at, err)
 				}
+				programs[prog] = true
 			}
 		}
 	}
-	return nil
+	names := make([]string, 0, len(programs))
+	for p := range programs {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
-func validateCodexHookHandler(h map[string]any, hooksDir string) error {
+// validateCodexHookHandler checks one handler table and returns the name of the program it runs.
+func validateCodexHookHandler(h map[string]any, hooksDir string, legacyOnFailure bool) (string, error) {
 	for k, v := range h {
-		switch k {
-		case "type", "command", "onFailure", "statusMessage":
+		switch {
+		case k == "type" || k == "command" || k == "statusMessage" || k == "onFailure" && legacyOnFailure:
 			if _, ok := v.(string); !ok {
-				return fmt.Errorf("handler %s is not a string", k)
+				return "", fmt.Errorf("handler %s is not a string", k)
 			}
-		case "timeout":
+		case k == "timeout":
 			if n, ok := v.(int64); !ok || n <= 0 {
-				return errors.New("handler timeout is not a positive integer")
+				return "", errors.New("handler timeout is not a positive integer")
 			}
 		default:
-			return fmt.Errorf("handler key %q is not allowed", Printable(k, 64))
+			return "", fmt.Errorf("handler key %q is not allowed", Printable(k, 64))
 		}
 	}
 	if typ, ok := h["type"].(string); !ok {
-		return errors.New("handler without a type")
+		return "", errors.New("handler without a type")
 	} else if typ != "command" {
-		return fmt.Errorf("handler type %q is not allowed (only command)", Printable(typ, 64))
+		return "", fmt.Errorf("handler type %q is not allowed (only command)", Printable(typ, 64))
 	}
 	cmd, _ := h["command"].(string)
-	if !codexHookCommandInDir(cmd, hooksDir) {
-		return fmt.Errorf("handler command %q is not a program in %s with plain arguments", Printable(cmd, 128), hooksDir)
+	prog, ok := codexHookCommandProgram(cmd, hooksDir)
+	if !ok {
+		return "", fmt.Errorf("handler command %q is not a program in %s with plain arguments", Printable(cmd, 128), hooksDir)
 	}
-	return nil
+	return prog, nil
 }
 
-// codexHookCommandInDir reports whether a hook's shell command is `<hooksDir>/<program> [word...]`,
-// the path bare or in single quotes.
-func codexHookCommandInDir(cmd, hooksDir string) bool {
-	prefix := hooksDir + "/"
-	if strings.HasPrefix(cmd, "'") {
-		rest, ok := strings.CutPrefix(cmd, "'"+prefix)
+// codexHookCommandProgram splits a hook's shell command `<hooksDir>/<program> [word...]`, the path
+// bare or in single quotes, and returns the program's name. The path and the arguments are checked
+// apart: a quoted path ends at its quote, so `'<hooksDir>/run Stop'` is a program named "run Stop"
+// and refuses.
+func codexHookCommandProgram(cmd, hooksDir string) (string, bool) {
+	var prog, args string
+	if quoted, isQuoted := strings.CutPrefix(cmd, "'"); isQuoted {
+		rest, ok := strings.CutPrefix(quoted, hooksDir+"/")
 		if !ok {
-			return false
+			return "", false
 		}
-		prog, args, ok := strings.Cut(rest, "'")
-		if !ok || args != "" && !strings.HasPrefix(args, " ") {
-			return false
+		if prog, args, ok = strings.Cut(rest, "'"); !ok {
+			return "", false
 		}
-		return codexHookCommandTailRe.MatchString(prog + args)
+	} else {
+		rest, ok := strings.CutPrefix(cmd, hooksDir+"/")
+		if !ok {
+			return "", false
+		}
+		prog = rest
+		if i := strings.IndexByte(rest, ' '); i >= 0 {
+			prog, args = rest[:i], rest[i:]
+		}
 	}
-	rest, ok := strings.CutPrefix(cmd, prefix)
-	return ok && codexHookCommandTailRe.MatchString(rest)
+	if !codexHookProgramRe.MatchString(prog) || !codexHookArgsRe.MatchString(args) {
+		return "", false
+	}
+	return prog, true
 }
 
-// tomlTables returns v as a list of tables when it is an array of them, from `[[a.b]]` headers or
-// inline.
-func tomlTables(v any) ([]map[string]any, bool) {
-	switch a := v.(type) {
-	case *tomlTableArray:
-		return a.items, true
-	case []any:
-		out := make([]map[string]any, len(a))
-		for i, e := range a {
-			t, ok := e.(map[string]any)
-			if !ok {
-				return nil, false
-			}
-			out[i] = t
-		}
-		return out, true
-	}
-	return nil, false
-}
-
-// tomlTableArray is an array of tables built by `[[a.b]]` headers (an inline array is a []any).
+// tomlTableArray is an array of tables built by `[[a.b]]` headers.
 type tomlTableArray struct{ items []map[string]any }
 
 // parseStrictTOML parses the small TOML subset a managed-hooks requirements.toml needs and refuses
-// everything else, so that nothing it does not understand can pass as harmless: bare keys (no dotted or
-// quoted ones), `[a.b]` and `[[a.b]]` headers, values that are a basic string without escapes, a literal
-// string, a decimal integer, a boolean, an array or an inline table; comments. Duplicate keys and tables refuse.
-// Values are string, int64, bool, []any, map[string]any and *tomlTableArray. The repository has no TOML
-// library, and a guard this narrow is safer with a parser that knows less than codex's.
+// everything else, so that nothing it does not understand can pass as harmless. The repository has no
+// TOML library, and a guard this narrow is safer with a parser that knows less than codex's.
+//
+// Accepted: valid UTF-8 without control characters (tab, LF and CR LF aside), also in comments; bare
+// keys; `[a.b]` and `[[a.b]]` headers; values that are a one-line basic string without escapes, a
+// one-line literal string, a decimal integer or a boolean; comments.
+//
+// Refused, though TOML allows it: dotted and quoted keys (`hooks.managed_dir = ...`); arrays and
+// inline tables, so no table or array of tables exists but the ones headers build, and none can be
+// written inline and then extended by a header; a table header for a table that exists already, be it
+// from its own header or implied by a child's (`[[hooks.Stop]]` and later `[hooks]`), so a parent
+// comes before its children; floats, dates, signed or prefixed integers, multi-line strings. Duplicate
+// keys and tables refuse as in TOML.
+//
+// Values are string, int64, bool, map[string]any and *tomlTableArray.
 func parseStrictTOML(src string) (map[string]any, error) {
+	if !utf8.ValidString(src) {
+		return nil, errors.New("not valid UTF-8")
+	}
+	line := 1
+	for i := 0; i < len(src); i++ {
+		switch c := src[i]; {
+		case c == '\n':
+			line++
+		case c == '\r':
+			if i+1 >= len(src) || src[i+1] != '\n' {
+				return nil, fmt.Errorf("line %d: carriage return without a line feed", line)
+			}
+		case c < 0x20 && c != '\t' || c == 0x7f:
+			return nil, fmt.Errorf("line %d: control character 0x%02x", line, c)
+		}
+	}
 	p := &strictTOML{src: src, line: 1}
 	root := map[string]any{}
 	cur := root
@@ -419,7 +520,7 @@ func (p *strictTOML) keyValue(t map[string]any) error {
 		return fmt.Errorf("expected = after key %q (dotted and quoted keys are not supported)", k)
 	}
 	p.skipSpace(false)
-	v, err := p.value(0)
+	v, err := p.value()
 	if err != nil {
 		return err
 	}
@@ -430,10 +531,7 @@ func (p *strictTOML) keyValue(t map[string]any) error {
 	return nil
 }
 
-func (p *strictTOML) value(depth int) (any, error) {
-	if depth > 4 {
-		return nil, errors.New("value nested too deep")
-	}
+func (p *strictTOML) value() (any, error) {
 	switch c := p.peek(); {
 	case c == '"' || c == '\'':
 		return p.str(c)
@@ -453,70 +551,8 @@ func (p *strictTOML) value(depth int) (any, error) {
 	case strings.HasPrefix(p.src[p.pos:], "false"):
 		p.pos += 5
 		return false, nil
-	case c == '[':
-		p.pos++
-		arr := []any{}
-		for {
-			p.skipSpace(true)
-			if p.eat(']') {
-				return arr, nil
-			}
-			v, err := p.value(depth + 1)
-			if err != nil {
-				return nil, err
-			}
-			arr = append(arr, v)
-			p.skipSpace(true)
-			if !p.eat(',') {
-				if p.eat(']') {
-					return arr, nil
-				}
-				return nil, errors.New("malformed array")
-			}
-		}
-	case c == '{':
-		p.pos++
-		t := map[string]any{}
-		p.skipSpace(false)
-		if p.eat('}') {
-			return t, nil
-		}
-		for {
-			p.skipSpace(false)
-			if err := p.keyValueInline(t, depth); err != nil {
-				return nil, err
-			}
-			p.skipSpace(false)
-			if p.eat('}') {
-				return t, nil
-			}
-			if !p.eat(',') {
-				return nil, errors.New("malformed inline table")
-			}
-		}
 	}
-	return nil, errors.New("unsupported value (only strings, integers, booleans, arrays and inline tables)")
-}
-
-func (p *strictTOML) keyValueInline(t map[string]any, depth int) error {
-	k, err := p.bareKey()
-	if err != nil {
-		return err
-	}
-	p.skipSpace(false)
-	if !p.eat('=') {
-		return fmt.Errorf("expected = after key %q", k)
-	}
-	p.skipSpace(false)
-	v, err := p.value(depth + 1)
-	if err != nil {
-		return err
-	}
-	if _, dup := t[k]; dup {
-		return fmt.Errorf("duplicate key %q", k)
-	}
-	t[k] = v
-	return nil
+	return nil, errors.New("unsupported value (only one-line strings, integers and booleans; no arrays or inline tables)")
 }
 
 // str reads a one-line string; a basic one with a backslash is refused rather than unescaped, and a
