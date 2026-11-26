@@ -873,7 +873,8 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		if ca.resume != "" {
 			if j, err := st.Get(id); err == nil {
 				// The thread was admitted as the one the daemon recorded for this job: its rollout is the job's.
-				watch.base, watch.unreported = codexResumeBase(st, id, ca.resume, j.Attempt, codexHome(os.Environ()))
+				// Its rollout counts only where the job cannot write it (codexResumeBase).
+				watch.base, watch.unreported = codexResumeBase(st, id, ca.resume, j.Attempt, codexHome(os.Environ()), ca.sandbox)
 			}
 		}
 	}

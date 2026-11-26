@@ -299,6 +299,68 @@ func TestCodexTimeoutAutoContinuedOnce(t *testing.T) {
 	}
 }
 
+// Under workspace-write and worktree-full-access the job's commands can write its rollout file, so the
+// continuation's usage base comes from the wrapper's own records only: a token_count line the job
+// forged into its rollout neither lowers the continuation's own usage nor lifts its cap. The timed-out
+// attempt recorded no usage, so its tokens are counted in the continuation's (once in the job's).
+func TestCodexWritableRolloutBaseFromRecords(t *testing.T) {
+	for _, c := range []struct{ name, kind, config string }{
+		{"workspace-write", "general", `{"codex_max_tokens": 5000, "codex_write_allowed": true}`},
+		{"worktree-full-access", "review", `{"codex_max_tokens": 5000, "codex_write_allowed": true, "codex_sandbox": "worktree-full-access"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newCodexManager(t)
+			codexResumable(m)
+			limit := int64(5000)
+			m.Cfg.CodexMaxTokens, m.Cfg.CodexWriteAllowed = &limit, true
+			if c.kind == "review" {
+				m.Cfg.CodexSandboxMode = CodexSandboxModeWorktreeFullAccess
+			}
+			writeCodexConfig(t, m, c.config)
+			j := enqueue(t, m, "FAKE_CODEX_SLEEP=60", func(r *StartRequest) {
+				r.Kind, r.Model, r.TimeoutMinutes = c.kind, "gpt-6.1-sol", 1
+			})
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "fake codex", 5*time.Second, func() bool {
+				_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
+				return err == nil
+			})
+			rollout := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "11", "26",
+				"rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
+			forged := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":` +
+				`{"input_tokens":900000,"cached_input_tokens":0,"output_tokens":900000,"reasoning_output_tokens":0}}}}` + "\n"
+			f, err := os.OpenFile(rollout, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteString(forged); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+			real := time.Now
+			m.Now = func() time.Time { return real().Add(2 * time.Minute) }
+			if err := m.Tick(); err != nil {
+				t.Fatal(err)
+			}
+			m.Now = real
+			j = runCodexToRest(t, m, j.ID)
+			if j.Status != store.StatusSucceeded || j.Attempt != 2 || j.RunMode != store.RunResume {
+				t.Fatalf("continuation: %s %q attempt %d mode %q", j.Status, j.Error, j.Attempt, j.RunMode)
+			}
+			res := m.endedResult(j)
+			if res.InputTokens != 2400 || res.OutputTokens != 180 || res.CodexThreadBase != nil || res.CodexUnreported != nil {
+				t.Fatalf("continuation usage in %d out %d base %v unreported %v, want the thread's reported 2400/180 with no base",
+					res.InputTokens, res.OutputTokens, res.CodexThreadBase, res.CodexUnreported)
+			}
+			if line := m.DoneLineFor(j); !strings.Contains(line, "tokens in 2400 (cached 1600) · out 180 (reasoning 60)") {
+				t.Fatalf("the timed-out attempt's tokens must count once: %q", line)
+			}
+		})
+	}
+}
+
 // A codex attempt that ended its turn without a report is continued once; the resumed thread reports
 // its total usage, of which the attempt counts only its own part.
 func TestCodexNoReportAutoContinuedUsagePerAttempt(t *testing.T) {

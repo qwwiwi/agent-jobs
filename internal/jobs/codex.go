@@ -830,8 +830,15 @@ func codexUsageBase(st *store.Store, id, threadID string, attempt int) codexUsag
 // attempt recorded (nil = none): the records' base (codexUsageBase), or the thread's total in its
 // rollout file when that is more (an earlier attempt was killed before its turn reported its usage).
 // The unrecorded part counts once, in this attempt's record (CodexUnreported), never against its cap.
-func codexResumeBase(st *store.Store, id, threadID string, attempt int, home string) (codexUsage, *codexUsage) {
+// The rollout is read only under the read-only sandbox: under workspace-write (when codex's home lies in
+// a writable root) and danger-full-access the job's commands can write it, so a forged total there could
+// cancel the attempt's own usage and its cap. Those take the records' base alone: tokens of an attempt
+// killed before its turn reported them are then counted in this attempt's usage and against its cap.
+func codexResumeBase(st *store.Store, id, threadID string, attempt int, home, sandbox string) (codexUsage, *codexUsage) {
 	recorded := codexUsageBase(st, id, threadID, attempt)
+	if sandbox != CodexSandboxReadOnly {
+		return recorded, nil
+	}
 	rollout, ok := codexRolloutUsage(home, threadID)
 	if !ok || rollout.total() <= recorded.total() {
 		return recorded, nil
