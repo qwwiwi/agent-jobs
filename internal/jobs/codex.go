@@ -717,13 +717,35 @@ func codexHome(env []string) string {
 
 // codexRolloutExists reports whether the thread has a rollout file codex can resume:
 // <codex home>/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread_id>.jsonl (rollout/src/recorder.rs,
-// rollout_file_name.rs). Only names are matched; the file is never read.
+// rollout_file_name.rs), a regular file found by eachCodexRollout (no link followed, a symlinked codex
+// home included). Only names are matched; the file is never read.
 func codexRolloutExists(home, threadID string) bool {
-	if home == "" || !ValidCodexThreadID(threadID) {
-		return false
+	found := false
+	_ = eachCodexRollout(home, threadID, func(int, string, string, *unix.Stat_t) error {
+		found = true
+		return errStopWalk
+	})
+	return found
+}
+
+// errStopWalk ends an eachCodexRollout walk early (not a failure).
+var errStopWalk = errors.New("stop walk")
+
+// errCodexHomeLink: codex's home is a symlink (it may point at an archive of sessions), so nothing behind
+// it is walked, read or removed.
+var errCodexHomeLink = errors.New("codex home is a symlink, not walked")
+
+// openCodexHome opens codex's home directory without following a final symlink: a symlinked home is
+// errCodexHomeLink.
+func openCodexHome(home string) (int, error) {
+	if fi, err := os.Lstat(home); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return -1, errCodexHomeLink
 	}
-	found, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl"))
-	return err == nil && len(found) > 0
+	fd, err := unix.Open(home, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ELOOP) {
+		return -1, errCodexHomeLink // swapped for a link after the Lstat
+	}
+	return fd, err
 }
 
 // codexRolloutNameRe matches the name codex gives a rollout file, rollout-<YYYY-MM-DDThh-mm-ss>-<thread
@@ -736,11 +758,16 @@ var codexRolloutNameRe = regexp.MustCompile(`^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}
 // followed, and anything but a regular file (a directory, a link) is passed over. fn gets the open date
 // directory (valid during the call) to act on the entry by name, so what it does stays inside it. A
 // directory that cannot be opened or read is skipped, as Glob skips it; an error of fn ends the walk.
+// The home itself is opened without following a final symlink: a symlinked home is not walked at all
+// (errCodexHomeLink).
 func eachCodexRollout(home, threadID string, fn func(dirfd int, path, name string, st *unix.Stat_t) error) error {
 	if home == "" || !ValidCodexThreadID(threadID) {
 		return nil
 	}
-	homeFd, err := unix.Open(home, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	homeFd, err := openCodexHome(home)
+	if errors.Is(err, errCodexHomeLink) {
+		return err
+	}
 	if err != nil {
 		return nil
 	}

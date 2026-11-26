@@ -369,6 +369,13 @@ func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
 			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: st.Size, Reason: "codex rollout of the job"})
 			return nil
 		})
+		if errors.Is(err, errCodexHomeLink) {
+			// A symlinked home may point at an archive of sessions: its rollouts are left alone.
+			if !m.codexHomeLinkLogged.Swap(true) {
+				m.Log.Printf("prune: CODEX_HOME %s is a symlink; its codex rollouts are not pruned", home)
+			}
+			return
+		}
 		if err != nil {
 			pj.Error = err.Error()
 			return

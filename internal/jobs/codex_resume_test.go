@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -153,6 +155,84 @@ func TestPruneCodexRollouts(t *testing.T) {
 	rollouts := slices.DeleteFunc(slices.Clone(pj.Removed), func(e PruneEntry) bool { return e.Reason != "codex rollout of the job" })
 	if len(rollouts) != len(own) {
 		t.Fatalf("prune reports more than the job's rollout files: %+v", rollouts)
+	}
+}
+
+// A CODEX_HOME that is a symlink (to a session archive, say) is never walked through: prune leaves the
+// rollouts behind it alone and logs that once, and neither the usage reader nor resume admission
+// looks behind it.
+func TestPruneCodexRolloutsSymlinkedHome(t *testing.T) {
+	m := newCodexManager(t)
+	codexResumable(m)
+	var ids []string
+	for range 2 {
+		j := runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
+		if j.Status != store.StatusSucceeded || j.SessionID != fakeCodexThread {
+			t.Fatalf("got %s %q session %q", j.Status, j.Error, j.SessionID)
+		}
+		ids = append(ids, j.ID)
+	}
+	archive := os.Getenv("CODEX_HOME")
+	rollout := filepath.Join(archive, "sessions", "2026", "11", "26", "rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
+	if _, ok := codexRolloutUsage(archive, fakeCodexThread); !ok || !codexRolloutExists(archive, fakeCodexThread) {
+		t.Fatal("the rollout must be found under a real CODEX_HOME")
+	}
+	link := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.Symlink(archive, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", link)
+	if u, ok := codexRolloutUsage(link, fakeCodexThread); ok {
+		t.Fatalf("usage read through a symlinked CODEX_HOME: %+v", u)
+	}
+	if codexRolloutExists(link, fakeCodexThread) {
+		t.Fatal("resume admitted through a symlinked CODEX_HOME")
+	}
+	var logs bytes.Buffer
+	m.Log = log.New(&logs, "", 0)
+	for _, id := range ids {
+		pj, ok, err := m.pruneOne(id, m.Now().Add(time.Hour), false)
+		if err != nil || !ok || pj.Error != "" {
+			t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
+		}
+		if slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Reason == "codex rollout of the job" }) {
+			t.Fatalf("prune removed a rollout through a symlinked CODEX_HOME: %+v", pj.Removed)
+		}
+	}
+	if _, err := os.Stat(rollout); err != nil {
+		t.Fatalf("the archived rollout behind the symlinked CODEX_HOME was touched: %v", err)
+	}
+	if n := strings.Count(logs.String(), "CODEX_HOME"); n != 1 {
+		t.Fatalf("the skipped prune must be logged once, got %d lines:\n%s", n, logs.String())
+	}
+}
+
+// A rollout found only behind a symlinked date directory does not admit a same-thread resume: the
+// attempt starts a fresh thread.
+func TestCodexResumeRolloutBehindSymlinkedDir(t *testing.T) {
+	m := newCodexManager(t)
+	codexResumable(m)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCEFAIL", codexReview).ID)
+	if j.Status != store.StatusFailed || j.SessionID != fakeCodexThread {
+		t.Fatalf("first attempt: %s %q session %q", j.Status, j.Error, j.SessionID)
+	}
+	month := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "11")
+	outside := filepath.Join(t.TempDir(), "26")
+	if err := os.Rename(filepath.Join(month, "26"), outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(month, "26")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Resume(j.ID, "go on", Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	j = runCodexToRest(t, m, j.ID)
+	if j.RunMode != store.RunFallback {
+		t.Fatalf("a rollout behind a symlinked dir admitted a resume: %s %q mode %q", j.Status, j.Error, j.RunMode)
+	}
+	if argv := codexArgvOf(t, m, j.ID); strings.Contains(argv, "resume") {
+		t.Fatalf("fallback must start a new thread:\n%s", argv)
 	}
 }
 
@@ -323,12 +403,16 @@ func TestCodexWritableRolloutBaseFromRecords(t *testing.T) {
 			if err := m.Tick(); err != nil {
 				t.Fatal(err)
 			}
-			waitFor(t, "fake codex", 5*time.Second, func() bool {
-				_, err := os.Stat(filepath.Join(m.JobDir(j.ID), "argv.txt"))
-				return err == nil
-			})
 			rollout := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "11", "26",
 				"rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
+			// argv.txt comes before the rollout: wait until codex wrote its token_count to the rollout
+			// and the wrapper recorded the thread id in the stream, so the forged line comes last.
+			waitFor(t, "codex rollout and recorded thread", 5*time.Second, func() bool {
+				r, _ := os.ReadFile(rollout)
+				s, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stream.jsonl"))
+				return strings.Contains(string(r), `"token_count"`) &&
+					strings.Contains(string(s), `"thread_id":"`+fakeCodexThread+`"`)
+			})
 			forged := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":` +
 				`{"input_tokens":900000,"cached_input_tokens":0,"output_tokens":900000,"reasoning_output_tokens":0}}}}` + "\n"
 			f, err := os.OpenFile(rollout, os.O_APPEND|os.O_WRONLY, 0)

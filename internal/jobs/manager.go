@@ -63,6 +63,8 @@ type Manager struct {
 
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
+	codexHomeLinkLogged atomic.Bool // a symlinked CODEX_HOME skipped by prune was logged (once)
+
 	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
 	dailyNoteMu  sync.Mutex     // guards dailyHeld and dailySkipped
 	dailyHeld    string         // the day whose run holds dailyMu
