@@ -13,7 +13,8 @@ import (
 const (
 	// OwnerDelivering: the job finished and its line is being delivered (or a failed delivery is
 	// retried). The row is written before the line goes out, so the session never sees the line
-	// without the row.
+	// without the row. Without a tmux target the row stays here when the sinks of config notify
+	// failed to deliver the line (notify_sink_outbox has the error; they are not retried).
 	OwnerDelivering = "delivering"
 	// OwnerDelivered: tmux accepted the job-done line.
 	OwnerDelivered = "delivered"
@@ -129,10 +130,14 @@ func (s *Store) MarkNotified(id string, now time.Time) error {
 	return s.MarkNotifiedBatch([]string{id}, now, nil)
 }
 
-// markNotifiedTx is MarkNotified inside the caller's transaction.
-func markNotifiedTx(tx *sql.Tx, id string, now time.Time) error {
+// markNotifiedTx is MarkNotified inside the caller's transaction. Without promoteOwner only the job
+// is marked notified and its owner-waits row keeps its state.
+func markNotifiedTx(tx *sql.Tx, id string, now time.Time, promoteOwner bool) error {
 	if _, err := tx.Exec(`UPDATE jobs SET notified_at=? WHERE id=?`, now.Unix(), id); err != nil {
 		return fmt.Errorf("mark notified: %w", err)
+	}
+	if !promoteOwner {
+		return nil
 	}
 	if _, err := tx.Exec(`INSERT INTO owner_pending (job_id, attempt, state, created_at)
 		SELECT id, attempt, ?, ? FROM jobs WHERE id = ? AND owner_waits = 1

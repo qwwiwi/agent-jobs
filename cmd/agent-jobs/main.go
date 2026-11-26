@@ -70,7 +70,8 @@ const usage = `usage: agent-jobs <command> [flags]
   daemon     --agent A                     tick every minute, forever
   prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
                                            small top-level text files stay; stream.jsonl, stderr.log
-                                           move gzipped into the log archive, see archive)
+                                           move gzipped into the log archive, see archive) and the
+                                           temp dirs of jobs finished > job_tmp_retention_hours ago
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
@@ -156,6 +157,9 @@ const usage = `usage: agent-jobs <command> [flags]
   notify-owner --agent A --text T [--urgency normal|high]
                                            one "[jobs:notify-owner] T" line into the notify target
                                            for the session to relay (rate limited, stored)
+  inbox pull --agent A [--ack]             print the pending job-done lines of config notify.inbox_dir,
+                                           oldest first; --ack removes the printed ones (for a
+                                           SessionStart / UserPromptSubmit hook of the session)
   hook stop  --agent A                     Stop hook of the orchestrator session (JSON on stdin):
                                            blocks the stop once per turn while an owner-waits job's
                                            reply to the owner is pending (owner_replied clears it);
@@ -292,6 +296,8 @@ func main() {
 		err = cmdCheck(args)
 	case "notify-owner":
 		err = cmdNotifyOwner(args)
+	case "inbox":
+		err = cmdInbox(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "hook":
@@ -1546,6 +1552,9 @@ func cmdDaemon(args []string) error {
 		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
 		// the next ticks keep launching jobs while it runs.
 		m.StartDaily(ctx)
+		// Every few minutes: the temp dirs of jobs finished more than job_tmp_retention_hours ago
+		// (the same prune, temp dir only), also in the background.
+		m.StartTmpPrune(ctx)
 		// Heartbeat (off by default): the Go gate, then at most one small-model decision in the
 		// background, so a slow decision never delays the next tick.
 		m.StartHeartbeat(ctx)
@@ -1555,6 +1564,7 @@ func cmdDaemon(args []string) error {
 	m.Log.Printf("daemon stopping; running jobs keep running")
 	m.WaitDaily()
 	m.WaitHeartbeat()
+	m.WaitNotifySinks()
 	<-httpDone
 	return nil
 }
@@ -1624,7 +1634,11 @@ func cmdPrune(args []string) error {
 			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
 		}
 	}
-	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	atLeast := ""
+	if rep.Partial {
+		atLeast = "at least " // a dry run measures each entry within a bound
+	}
+	fmt.Printf("prune: %d job folders, %s %s%d bytes\n", len(rep.Jobs), verb, atLeast, rep.Bytes)
 	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
 	return perr
 }

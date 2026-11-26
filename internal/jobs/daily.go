@@ -121,6 +121,45 @@ func (m *Manager) StartDaily(ctx context.Context) bool {
 	return true
 }
 
+// TmpPruneInterval is how often the daemon runs the temp dir pass (StartTmpPrune).
+const TmpPruneInterval = 10 * time.Minute
+
+// StartTmpPrune starts the temp dir pass of prune (PruneTmpContext: job_tmp_retention_hours) in its
+// own goroutine, at most once per TmpPruneInterval and never two at once, so a finished job's temp
+// dir does not wait for the daily run. Off with daily_off (prune then runs only by hand) and with
+// job_tmp_retention_hours 0. It returns at once (true when a pass was started); WaitDaily waits for
+// the pass. Errors are logged, never returned.
+func (m *Manager) StartTmpPrune(ctx context.Context) bool {
+	if m.Config().DailyOff || ctx.Err() != nil || m.tmpCutoff().IsZero() {
+		return false
+	}
+	if !m.tmpPruneMu.TryLock() {
+		return false // the previous pass is still going
+	}
+	now := m.Now()
+	if !m.tmpPruneLast.IsZero() && now.Sub(m.tmpPruneLast) < TmpPruneInterval {
+		m.tmpPruneMu.Unlock()
+		return false
+	}
+	m.tmpPruneLast = now
+	m.dailyWG.Add(1)
+	go func() {
+		defer m.dailyWG.Done()
+		defer m.tmpPruneMu.Unlock()
+		defer func() {
+			if p := recover(); p != nil {
+				m.Log.Printf("temp dir prune panicked: %v", p)
+			}
+		}()
+		pctx, cancel := context.WithTimeout(ctx, DailyStepTimeout)
+		defer cancel()
+		if _, err := m.PruneTmpContext(pctx, false); err != nil {
+			m.Log.Printf("temp dir prune: %v", err)
+		}
+	}()
+	return true
+}
+
 // noteDailySkip logs, at most once per day, that day's run is skipped because an earlier day's run
 // (a hung step, or a doctor procs scan abandoned at its time-box) still holds the daily lock. The
 // tick that finds today's own run in progress logs nothing.

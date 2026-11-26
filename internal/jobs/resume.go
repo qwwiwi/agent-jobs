@@ -853,10 +853,11 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	if err := m.errArchived(j); err != nil {
 		return err
 	}
-	if j.ScopePending {
+	// The one hold rule; a live process group gets its refusal (with what to do) from checkEscaped below.
+	switch m.lifecycleHoldKind(j) {
+	case holdScope:
 		return fmt.Errorf("job %s: the cgroup scope of its last attempt is not stopped yet (retried every tick); resume once it is", id)
-	}
-	if m.advisorPending(j) {
+	case holdAdvisor:
 		return errAdvisorPending(id)
 	}
 	if err := m.checkEscaped(id); err != nil {
@@ -1047,11 +1048,14 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 // attempt + update) written. The same session is resumed when its transcript is on disk; otherwise
 // the attempt starts in a fresh session from fallback.md.
 func (m *Manager) prepareResume(j *store.Job, token string, codex *codexLaunch) (launchPlan, error) {
-	if j.ScopePending {
+	switch k := m.lifecycleHoldKind(j); k {
+	case holdNone:
+	case holdScope:
 		return launchPlan{}, errors.New("the cgroup scope of the previous attempt is not stopped yet")
-	}
-	if m.advisorPending(j) {
+	case holdAdvisor:
 		return launchPlan{}, errors.New("advisor calls of the previous attempt are not ended yet")
+	default:
+		return launchPlan{}, errors.New(holdText(k, j))
 	}
 	if err := m.errArchived(j); err != nil {
 		return launchPlan{}, err

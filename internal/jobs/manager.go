@@ -72,6 +72,8 @@ type Manager struct {
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
+	tmpPruneMu   sync.Mutex // held while a temp dir pass runs (StartTmpPrune); guards tmpPruneLast
+	tmpPruneLast time.Time  // when the last temp dir pass was started
 
 	noteMu       sync.Mutex     // guards noteUnmarked
 	noteUnmarked map[int64]bool // SLO breaches a delivery carried whose noted mark failed (wakes.go)
@@ -91,6 +93,11 @@ type Manager struct {
 	// waits for it.
 	prefetching atomic.Bool
 	prefetchWG  sync.WaitGroup
+	// sinking is set while the daemon's background sink run (deliverSinksInBackground) is on; sinkWG
+	// waits for it, sinkStop keeps it from claiming more lines (WaitNotifySinks).
+	sinking  atomic.Bool
+	sinkStop atomic.Bool
+	sinkWG   sync.WaitGroup
 	// sourcesRetryAt holds, per job id, when clones that could not record their outcome are tried again
 	// (time.Time, sourcesRetryBackoff after the failure).
 	sourcesRetryAt sync.Map
@@ -735,6 +742,14 @@ func (m *Manager) Tick() error {
 		m.prefetchQueued()
 	}
 	err := m.tickLocked()
+	// The sinks of config notify get the lines this tick delivered outside the lifecycle lock (a slow
+	// helper never holds up cancel or the next tick's tmux lines): in the background in the daemon,
+	// inline in a manual tick, which waits for them before it exits.
+	if m.daemonLockHeld {
+		m.deliverSinksInBackground()
+	} else {
+		m.deliverSinks()
+	}
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
 	// docker call may take up to containerCmdTimeout.
 	m.retryContainerCleanups()
@@ -1237,6 +1252,55 @@ func groupAlive(pgid int) bool {
 // (endSpawnedGroup). Holding up cleanup, prune or resume on a live group is the safe side.
 func liveSpawnedGroup(j *store.Job) bool {
 	return j.PGIDSpawned && plausibleGroup(j.PGID) == nil && groupAlive(j.PGID)
+}
+
+// holdKind is why a job that is no longer running must not have its files touched yet.
+type holdKind int
+
+const (
+	holdNone            holdKind = iota
+	holdScope                    // the cgroup scope stop of its last attempt is pending
+	holdAdvisor                  // advisor calls of its last attempt are not ended
+	holdSpawnedGroup             // its spawned process group is alive
+	holdAcceptanceGroup          // its acceptance process group is alive
+)
+
+// lifecycleHoldKind is the one rule behind "may the daemon touch this finished job's files?": cleanup,
+// resume and prune all ask it, so none of them can miss a condition the others wait for. The checks
+// run in the order of the constants; the first that holds is returned.
+func (m *Manager) lifecycleHoldKind(j *store.Job) holdKind {
+	switch {
+	case j.ScopePending:
+		return holdScope
+	case m.advisorPending(j):
+		return holdAdvisor
+	case m.spawnedGroupAlive(j):
+		return holdSpawnedGroup
+	case m.acceptanceGroupAlive(j):
+		return holdAcceptanceGroup
+	}
+	return holdNone
+}
+
+// lifecycleHold says why the files of a job that is no longer running must not be touched yet
+// ("" = free): processes of the job may still be alive.
+func (m *Manager) lifecycleHold(j *store.Job) string {
+	return holdText(m.lifecycleHoldKind(j), j)
+}
+
+// holdText is the reason of a hold in words.
+func holdText(k holdKind, j *store.Job) string {
+	switch k {
+	case holdScope:
+		return "the cgroup scope of the job is not stopped yet (retried every tick)"
+	case holdAdvisor:
+		return "advisor calls of the job are not ended yet (retried every tick)"
+	case holdSpawnedGroup:
+		return fmt.Sprintf("process group %d of the job is still alive", j.PGID)
+	case holdAcceptanceGroup:
+		return fmt.Sprintf("acceptance process group %d of the job is still alive", j.AcceptancePGID)
+	}
+	return ""
 }
 
 // spawnedGroupAlive is liveSpawnedGroup for a job that is no longer running: once its group is gone

@@ -132,7 +132,7 @@ func TestPruneCodexRollouts(t *testing.T) {
 			t.Fatalf("rollout of the job missing before prune: %v", err)
 		}
 	}
-	pj, ok, err := m.pruneOne(j.ID, m.Now().Add(time.Hour), false)
+	pj, ok, err := m.pruneOne(j.ID, m.Now().Add(time.Hour), time.Time{}, false, false)
 	if err != nil || !ok || pj.Error != "" {
 		t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
 	}
@@ -193,7 +193,7 @@ func TestPruneCodexRolloutsSymlinkedHome(t *testing.T) {
 		if codexRolloutExists(home, fakeCodexThread) {
 			t.Fatalf("resume admitted through a symlinked CODEX_HOME %q", home)
 		}
-		pj, ok, err := m.pruneOne(ids[i], m.Now().Add(time.Hour), false)
+		pj, ok, err := m.pruneOne(ids[i], m.Now().Add(time.Hour), time.Time{}, false, false)
 		if err != nil || !ok || pj.Error != "" {
 			t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
 		}

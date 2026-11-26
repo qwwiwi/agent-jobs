@@ -3,6 +3,7 @@ package jobs
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -186,10 +187,10 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		"-s\nread-only\n-c\napproval_policy=\"never\"\n-c\nmcp_servers={}\n" +
 		"--disable\napps\n--disable\nbrowser_use\n--disable\nbrowser_use_external\n" +
 		"--disable\nbrowser_use_full_cdp_access\n--disable\ncomputer_use\n--disable\nimage_generation\n" +
-		"--disable\nmulti_agent\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
+		"--disable\nmulti_agent\n--disable\nmulti_agent_v2\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
 		"--disable\nskill_mcp_dependency_install\n--disable\ndaemon_auto_start\n" +
 		"--disable\nin_app_local_automation\n--disable\ngoals\n--disable\nrealtime_conversation\n" +
-		"--disable\nworktrees\n--disable\nhooks\n" +
+		"--disable\nworktrees\n--disable\nhooks\n-c\nagents.enabled=false\n" +
 		"-m\ngpt-6.1-sol\n-c\nmodel_reasoning_effort=high\n-\n"
 	if string(argv) != want {
 		t.Fatalf("codex argv:\n%s\nwant:\n%s", argv, want)
@@ -633,4 +634,67 @@ func TestParseCodexStreamStrict(t *testing.T) {
 	} else if st, msg := Verdict(0, r, dir); st != store.StatusFailed || !strings.Contains(msg, "stream") {
 		t.Fatalf("read error verdict %s %q", st, msg)
 	}
+}
+
+// Issue #243: `--disable multi_agent` turns off only codex's V1 collab feature; a model whose catalog
+// entry says multi_agent_version V2 still gets the spawn tools unless `agents.enabled` is false (codex
+// rust-v0.172.0, Config::multi_agent_version_override). Every sandbox's argv carries the override once,
+// as a `-c` value, next to the --disable flags and before the prompt, and the wrapper accepts it.
+func TestCodexArgsDisableAgentsV2(t *testing.T) {
+	jobDir := filepath.Join(t.TempDir(), "jobs", "j1")
+	for _, sandbox := range []string{CodexSandboxReadOnly, CodexSandboxWrite, CodexSandboxFullAccess} {
+		args := CodexArgs(&store.Job{Kind: "fix", Model: "gpt-6.1-sol"}, "high", sandbox, jobDir, true)
+		const override = "agents.enabled=false"
+		i := slices.Index(args, override)
+		if i < 1 || args[i-1] != "-c" {
+			t.Fatalf("%s: argv lacks -c %s: %q", sandbox, override, args)
+		}
+		// Every override of the agents table, in any spelling codex takes, is exactly the one above:
+		// a later `-c agents.enabled=true` (or `agents={...}`) would win over it.
+		if got := codexAgentsOverrides(args); !slices.Equal(got, []string{override}) {
+			t.Fatalf("%s: agents overrides %q, want exactly [%s]: %q", sandbox, got, override, args)
+		}
+		for _, f := range []string{"multi_agent", "multi_agent_v2"} {
+			ma := slices.Index(args, f)
+			if ma < 1 || args[ma-1] != "--disable" {
+				t.Fatalf("%s: --disable %s missing: %q", sandbox, f, args)
+			}
+		}
+		if i > slices.Index(args, "-m") || i > slices.Index(args, "-") {
+			t.Fatalf("%s: override after the model or the prompt: %q", sandbox, args)
+		}
+		if _, err := codexArgvSandbox(append([]string{"codex"}, args...)); err != nil {
+			t.Fatalf("%s: wrapper refuses the argv: %v", sandbox, err)
+		}
+	}
+}
+
+// codexAgentsOverrides returns every config override in a codex argv (`-c v`, `--config v`, `-cv`,
+// `-c=v`, `--config=v`) whose key is the agents table or a key below it, key parts trimmed of blanks
+// and quotes as codex reads them.
+func codexAgentsOverrides(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a, value := args[i], ""
+		switch {
+		case a == "-c" || a == "--config":
+			if i+1 >= len(args) {
+				continue
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(a, "--config="):
+			value = strings.TrimPrefix(a, "--config=")
+		case strings.HasPrefix(a, "-c") && len(a) > 2:
+			value = strings.TrimPrefix(a[2:], "=")
+		default:
+			continue
+		}
+		key, _, _ := strings.Cut(value, "=")
+		head, _, _ := strings.Cut(key, ".")
+		if strings.Trim(head, " \t\"'") == "agents" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
