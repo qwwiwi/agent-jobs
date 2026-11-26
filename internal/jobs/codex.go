@@ -742,12 +742,15 @@ var errStopWalk = errors.New("stop walk")
 // canonically, so nothing behind it is walked, read or removed.
 var errCodexHomeLink = errors.New("codex home is a symlink or not canonical, not walked")
 
-// openCodexHome opens codex's home directory without following a final symlink: a symlinked home is
-// errCodexHomeLink. Trailing separators are stripped first ("/" stays "/"): with "link/" the kernel
-// resolves the link before either check could see it. The path is never normalized: the kernel resolves
-// "link/../home" through the link while a lexical clean names another directory, so a home with a "."
-// or ".." component is errCodexHomeLink too.
+// openCodexHome opens codex's home directory without following a final symlink. An empty or symlinked
+// home returns errCodexHomeLink. Trailing separators are stripped ("/" stays "/") because with "link/"
+// the kernel resolves the link before either check could see it. A lexical clean could name a
+// different directory than the kernel resolves through "link/../home", so a home with a "." or
+// ".." component returns errCodexHomeLink too.
 func openCodexHome(home string) (int, error) {
+	if home == "" {
+		return -1, errCodexHomeLink
+	}
 	if t := strings.TrimRight(home, "/"); t != "" {
 		home = t
 	} else {
