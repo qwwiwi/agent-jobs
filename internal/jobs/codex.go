@@ -471,6 +471,13 @@ var codexSystemConfigDir = "/etc/codex"
 // `managed_config.toml`, `requirements.toml`, ... in /etc/codex): they are applied after the job's CLI
 // overrides and can turn `apps` back on, whose implicit codex_apps server neither `--disable apps` nor
 // `mcp list` covers. A missing or empty dir passes; anything in it, or a dir that cannot be read, refuses.
+//
+// One narrow exception (owner decision): the dir holds exactly a recognised managed-hooks pack, a
+// root-owned `requirements.toml` that declares nothing but command hooks from the root-owned `hooks`
+// directory next to it (checkCodexHooksPack). The job still runs with `--disable hooks` and the rest,
+// but managed hooks may run all the same: they are the host owner's guard over every codex process on
+// the box, not a containment gap, since such a file can enable neither apps nor MCP servers (and
+// checkCodexMCP still runs).
 func checkCodexSystemConfig(dir string) error {
 	entries, err := os.ReadDir(dir)
 	switch {
@@ -481,12 +488,19 @@ func checkCodexSystemConfig(dir string) error {
 	case len(entries) == 0:
 		return nil
 	}
-	names := make([]string, len(entries))
+	names, raw := make([]string, len(entries)), make([]string, len(entries))
 	for i, e := range entries {
-		names[i] = Printable(e.Name(), 64)
+		names[i], raw[i] = Printable(e.Name(), 64), e.Name()
 	}
-	return fmt.Errorf("codex has system or managed configuration in %s (%s); codex jobs refuse to run with it",
+	refusal := fmt.Sprintf("codex has system or managed configuration in %s (%s); codex jobs refuse to run with it",
 		dir, strings.Join(names, ", "))
+	if !isCodexHooksPackListing(raw) {
+		return errors.New(refusal)
+	}
+	if err := checkCodexHooksPack(dir); err != nil {
+		return fmt.Errorf("%s: not a recognised managed-hooks pack: %w", refusal, err)
+	}
+	return nil
 }
 
 // codexMCPTimeout bounds the `codex mcp list --json` check before a codex launch.
