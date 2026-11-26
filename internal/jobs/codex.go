@@ -1007,14 +1007,26 @@ func (c *codexLaunch) resumePlan(m *Manager, j *store.Job, token string) (launch
 // its thread.started event, kept only for a run that persisted it) as the job's session, so the next
 // attempt can resume it. Called while the row still runs under its launch token.
 func (m *Manager) noteCodexThread(j *store.Job, res StreamResult) {
-	if j.Runner != store.RunnerCodex || !ValidCodexThreadID(res.CodexThreadID) || res.CodexThreadID == j.SessionID {
+	if j.Runner != store.RunnerCodex {
 		return
 	}
-	if err := m.Store.SetSession(j.ID, j.LaunchToken, res.CodexThreadID, j.RunMode); err != nil {
+	thread := res.CodexThreadID
+	if res.CodexThreadRejected {
+		// A resume that codex ran in another thread: that thread has neither the brief nor the update, and
+		// the one it was launched for could not be found. No session is kept, so the next attempt starts a
+		// fresh thread with the full fallback prompt.
+		thread = ""
+	} else if !ValidCodexThreadID(thread) {
+		return
+	}
+	if thread == j.SessionID {
+		return
+	}
+	if err := m.Store.SetSession(j.ID, j.LaunchToken, thread, j.RunMode); err != nil {
 		m.Log.Printf("job %s: record codex thread: %v", j.ID, err)
 		return
 	}
-	j.SessionID = res.CodexThreadID
+	j.SessionID = thread
 }
 
 // codexJobUsage sums the usage of a codex job's attempts from the wrapper's records (ok = one had any).

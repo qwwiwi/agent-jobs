@@ -874,9 +874,10 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 		return err
 	}
 	update := strings.TrimSpace(context)
-	if (j.StartedAt == nil || neverRan(j.Turns, j.Error)) && strings.TrimSpace(j.PendingContext) != "" {
-		// A resume stopped while still queued, or whose launch was refused, never ran: its update is
-		// kept, this one follows.
+	rejected := j.Runner == store.RunnerCodex && m.endedResult(j).CodexThreadRejected
+	if (j.StartedAt == nil || neverRan(j.Turns, j.Error) || rejected) && strings.TrimSpace(j.PendingContext) != "" {
+		// A resume stopped while still queued, or whose launch was refused, never ran, and a codex resume
+		// that ran in another thread never reached the job's thread: its update is kept, this one follows.
 		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
 	}
 	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it

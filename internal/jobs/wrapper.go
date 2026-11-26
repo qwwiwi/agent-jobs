@@ -79,6 +79,9 @@ type StreamResult struct {
 	// CodexStop is why the wrapper failed a codex attempt whatever codex wrote or however it exited: over
 	// its token cap, or a resume that ran in another thread ("" = neither).
 	CodexStop string `json:",omitempty"`
+	// CodexThreadRejected: a resume ran in another thread than the one it was launched for (CodexThreadID
+	// is that other thread, which has neither the brief nor the update): never adopted as the session.
+	CodexThreadRejected bool `json:",omitempty"`
 	// Skipped counts lines over the line limit that were skipped unread (codex streams only).
 	Skipped int
 	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
@@ -223,6 +226,7 @@ func (t *resultTee) applyCodex() {
 		case w.resume != "" && r.CodexThreadID != "" && r.CodexThreadID != w.resume:
 			r.CodexStop = fmt.Sprintf("codex did not resume thread %s: it started thread %s (it did not find the session), "+
 				"so the wrapper stopped it; resume again for a fresh session", w.resume, r.CodexThreadID)
+			r.CodexThreadRejected = true
 		case w.limit > 0 && own.total() > w.limit:
 			r.CodexStop = codexTokenCapStop(own.total(), w.limit)
 		}

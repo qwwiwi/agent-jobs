@@ -135,6 +135,28 @@ func TestCodexResumeOtherThreadFails(t *testing.T) {
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "did not resume thread "+fakeCodexThread) {
 		t.Fatalf("got %s %q", j.Status, j.Error)
 	}
+	// The thread codex started instead has neither the brief nor the update: it is not adopted, and the
+	// next resume starts a fresh thread with the brief, the rejected update and the new one.
+	if j.SessionID != "" {
+		t.Fatalf("the rejected thread was adopted as the session: %q", j.SessionID)
+	}
+	t.Setenv("FAKE_CODEX_LOSE_THREAD", "")
+	if _, err := m.Resume(j.ID, "second update", Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	j = runCodexToRest(t, m, j.ID)
+	if j.Status != store.StatusSucceeded || j.Attempt != 3 || j.RunMode != store.RunFallback {
+		t.Fatalf("after the rejected thread: %s %q attempt %d mode %q", j.Status, j.Error, j.Attempt, j.RunMode)
+	}
+	if argv := codexArgvOf(t, m, j.ID); strings.Contains(argv, "resume") {
+		t.Fatalf("the attempt after a rejected thread must start a new thread:\n%s", argv)
+	}
+	stdin, _ := os.ReadFile(filepath.Join(m.JobDir(j.ID), "stdin.txt"))
+	for _, want := range []string{"FAKE_CODEX_ONCEFAIL", "go on", "second update", "previous codex session could not be resumed"} {
+		if !strings.Contains(string(stdin), want) {
+			t.Fatalf("prompt after a rejected thread lacks %q:\n%s", want, stdin)
+		}
+	}
 }
 
 // A codex attempt that timed out is continued once, in its thread; the continuation that ends is not
