@@ -452,9 +452,10 @@ func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
 			return nil
 		})
 		if errors.Is(err, errCodexHomeLink) {
-			// A symlinked home may point at an archive of sessions: its rollouts are left alone.
+			// A symlinked home may point at an archive of sessions, and a non-canonical one ("." or "..")
+			// may name another directory than the kernel resolves: its rollouts are left alone.
 			if !m.codexHomeLinkLogged.Swap(true) {
-				m.Log.Printf("prune: CODEX_HOME %s is a symlink; its codex rollouts are not pruned", home)
+				m.Log.Printf("prune: CODEX_HOME %s is a symlink or not canonical; its codex rollouts are not pruned", home)
 			}
 			return
 		}

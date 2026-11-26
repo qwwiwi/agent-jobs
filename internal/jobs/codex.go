@@ -738,15 +738,26 @@ func codexRolloutExists(home, threadID string) bool {
 // errStopWalk ends an eachCodexRollout walk early (not a failure).
 var errStopWalk = errors.New("stop walk")
 
-// errCodexHomeLink: codex's home is a symlink (it may point at an archive of sessions), so nothing behind
-// it is walked, read or removed.
-var errCodexHomeLink = errors.New("codex home is a symlink, not walked")
+// errCodexHomeLink: codex's home is a symlink (it may point at an archive of sessions) or is not spelled
+// canonically, so nothing behind it is walked, read or removed.
+var errCodexHomeLink = errors.New("codex home is a symlink or not canonical, not walked")
 
 // openCodexHome opens codex's home directory without following a final symlink: a symlinked home is
 // errCodexHomeLink. Trailing separators are stripped first ("/" stays "/"): with "link/" the kernel
-// resolves the link before either check could see it.
+// resolves the link before either check could see it. The path is never normalized: the kernel resolves
+// "link/../home" through the link while a lexical clean names another directory, so a home with a "."
+// or ".." component is errCodexHomeLink too.
 func openCodexHome(home string) (int, error) {
-	home = filepath.Clean(home)
+	if t := strings.TrimRight(home, "/"); t != "" {
+		home = t
+	} else {
+		home = "/"
+	}
+	for _, c := range strings.Split(home, "/") {
+		if c == "." || c == ".." {
+			return -1, errCodexHomeLink
+		}
+	}
 	if fi, err := os.Lstat(home); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return -1, errCodexHomeLink
 	}

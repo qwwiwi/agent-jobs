@@ -158,51 +158,98 @@ func TestPruneCodexRollouts(t *testing.T) {
 	}
 }
 
-// A CODEX_HOME that is a symlink (to a session archive, say) is never walked through, however it is
-// spelled (with a trailing separator the kernel resolves the link before any no-follow check): prune
-// leaves the rollouts behind it alone and logs that once, and neither the usage reader nor resume
-// admission looks behind it.
+// A CODEX_HOME that is a symlink (to a session archive, say) or is not spelled canonically (a "." or ".."
+// component) is never walked through: with a trailing separator the kernel resolves the link before any
+// no-follow check, and "link/../home" is resolved by the kernel through the link while a lexical clean
+// would name a different directory. Prune leaves the rollouts behind such a home alone and logs that
+// once, and neither the usage reader nor resume admission looks behind it. A real directory with a
+// trailing separator is still pruned and admits a resume.
 func TestPruneCodexRolloutsSymlinkedHome(t *testing.T) {
 	m := newCodexManager(t)
 	codexResumable(m)
-	link := filepath.Join(t.TempDir(), "codex-home")
-	spellings := []string{link, link + "/", link + "//"}
+	fixture := t.TempDir()
+	link := filepath.Join(fixture, "codex-home")
+	archive := os.Getenv("CODEX_HOME")
+	rel := filepath.Join("sessions", "2026", "11", "26", "rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
+	rollout := filepath.Join(archive, rel)
+	// fixture/link -> fixture/live/nested: the kernel resolves link/../home to fixture/live/home, while
+	// filepath.Clean makes it fixture/home, where a backup rollout lies.
+	backup := filepath.Join(fixture, "home", rel)
+	kernelHome := filepath.Join(fixture, "live", "home", rel)
+	cases := []struct {
+		home    string
+		guarded []string
+	}{
+		{link, []string{rollout}},
+		{link + "/", []string{rollout}},
+		{link + "//", []string{rollout}},
+		{filepath.Join(fixture, "link") + "/../home/", []string{backup, kernelHome}},
+		{archive + "/./", []string{rollout}},
+	}
 	var ids []string
-	for range spellings {
+	for range len(cases) + 1 {
 		j := runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
 		if j.Status != store.StatusSucceeded || j.SessionID != fakeCodexThread {
 			t.Fatalf("got %s %q session %q", j.Status, j.Error, j.SessionID)
 		}
 		ids = append(ids, j.ID)
 	}
-	archive := os.Getenv("CODEX_HOME")
-	rollout := filepath.Join(archive, "sessions", "2026", "11", "26", "rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
 	if _, ok := codexRolloutUsage(archive, fakeCodexThread); !ok || !codexRolloutExists(archive, fakeCodexThread) {
 		t.Fatal("the rollout must be found under a real CODEX_HOME")
 	}
 	if err := os.Symlink(archive, link); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(fixture, "live", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(fixture, "live", "nested"), filepath.Join(fixture, "link")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(rollout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, backup, b, 0o600)
+	writeFile(t, kernelHome, b, 0o600)
 	var logs bytes.Buffer
 	m.Log = log.New(&logs, "", 0)
-	for i, home := range spellings {
-		t.Setenv("CODEX_HOME", home)
-		if u, ok := codexRolloutUsage(home, fakeCodexThread); ok {
-			t.Fatalf("usage read through a symlinked CODEX_HOME %q: %+v", home, u)
+	for i, c := range cases {
+		t.Setenv("CODEX_HOME", c.home)
+		if u, ok := codexRolloutUsage(c.home, fakeCodexThread); ok {
+			t.Fatalf("usage read through CODEX_HOME %q: %+v", c.home, u)
 		}
-		if codexRolloutExists(home, fakeCodexThread) {
-			t.Fatalf("resume admitted through a symlinked CODEX_HOME %q", home)
+		if codexRolloutExists(c.home, fakeCodexThread) {
+			t.Fatalf("resume admitted through CODEX_HOME %q", c.home)
 		}
 		pj, ok, err := m.pruneOne(ids[i], m.Now().Add(time.Hour), time.Time{}, false, false)
 		if err != nil || !ok || pj.Error != "" {
 			t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
 		}
 		if slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Reason == "codex rollout of the job" }) {
-			t.Fatalf("prune removed a rollout through a symlinked CODEX_HOME %q: %+v", home, pj.Removed)
+			t.Fatalf("prune removed a rollout through CODEX_HOME %q: %+v", c.home, pj.Removed)
 		}
-		if _, err := os.Stat(rollout); err != nil {
-			t.Fatalf("the archived rollout behind the symlinked CODEX_HOME %q was touched: %v", home, err)
+		for _, p := range c.guarded {
+			if _, err := os.Stat(p); err != nil {
+				t.Fatalf("the rollout %s behind CODEX_HOME %q was touched: %v", p, c.home, err)
+			}
 		}
+	}
+	// A real directory spelled with a trailing separator is an ordinary home.
+	home := archive + "/"
+	t.Setenv("CODEX_HOME", home)
+	if _, ok := codexRolloutUsage(home, fakeCodexThread); !ok || !codexRolloutExists(home, fakeCodexThread) {
+		t.Fatalf("the rollout must be found under the real CODEX_HOME %q", home)
+	}
+	pj, ok, err := m.pruneOne(ids[len(cases)], m.Now().Add(time.Hour), time.Time{}, false, false)
+	if err != nil || !ok || pj.Error != "" {
+		t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
+	}
+	if !slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Reason == "codex rollout of the job" }) {
+		t.Fatalf("prune kept the rollout under the real CODEX_HOME %q: %+v", home, pj.Removed)
+	}
+	if _, err := os.Lstat(rollout); !os.IsNotExist(err) {
+		t.Fatalf("the rollout under the real CODEX_HOME %q must be removed: %v", home, err)
 	}
 	if n := strings.Count(logs.String(), "CODEX_HOME"); n != 1 {
 		t.Fatalf("the skipped prune must be logged once, got %d lines:\n%s", n, logs.String())
