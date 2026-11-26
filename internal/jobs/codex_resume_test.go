@@ -96,6 +96,35 @@ func TestPruneCodexRollouts(t *testing.T) {
 	if err := os.WriteFile(foreign, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Planted where a job could write: directories named like a rollout of the job's thread (a loose
+	// match and an exact one), a symlinked date directory and a symlinked rollout name pointing outside.
+	// None of them is a regular rollout file: nothing in or behind them may go.
+	outside := t.TempDir()
+	var kept []string
+	for _, name := range []string{"rollout-backup-" + fakeCodexThread + ".jsonl", "rollout-2026-11-26T10-00-00-" + fakeCodexThread + ".jsonl"} {
+		sentinel := filepath.Join(day, name, "sentinel")
+		if err := os.MkdirAll(filepath.Dir(sentinel), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sentinel, []byte("keep\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		kept = append(kept, sentinel)
+	}
+	behindLink := filepath.Join(outside, "rollout-2026-11-27T09-00-00-"+fakeCodexThread+".jsonl")
+	linkTarget := filepath.Join(outside, "target.jsonl")
+	for _, p := range []string{behindLink, linkTarget} {
+		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kept = append(kept, behindLink, linkTarget)
+	if err := os.Symlink(outside, filepath.Join(filepath.Dir(day), "27")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, filepath.Join(day, "rollout-2026-11-26T11-00-00-"+fakeCodexThread+".jsonl")); err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range own {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("rollout of the job missing before prune: %v", err)
@@ -115,6 +144,15 @@ func TestPruneCodexRollouts(t *testing.T) {
 	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Fatalf("a rollout of another thread was touched: %v", err)
+	}
+	for _, p := range kept {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("prune removed what is not a regular rollout file of the job: %v", err)
+		}
+	}
+	rollouts := slices.DeleteFunc(slices.Clone(pj.Removed), func(e PruneEntry) bool { return e.Reason != "codex rollout of the job" })
+	if len(rollouts) != len(own) {
+		t.Fatalf("prune reports more than the job's rollout files: %+v", rollouts)
 	}
 }
 
@@ -433,6 +471,17 @@ func TestCodexRolloutUsage(t *testing.T) {
 	}
 	if _, ok := codexRolloutUsage(home, other); ok {
 		t.Fatal("a symlinked rollout must not be read")
+	}
+	// A symlinked date directory is not followed either.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "rollout-2026-11-27T09-00-00-"+other+".jsonl"), []byte(tc(900, 90)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(filepath.Dir(dir), "27")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := codexRolloutUsage(home, other); ok {
+		t.Fatal("a rollout behind a symlinked date directory must not be read")
 	}
 	if _, ok := codexRolloutUsage(home, "../x"); ok {
 		t.Fatal("an invalid thread id must not be looked up")

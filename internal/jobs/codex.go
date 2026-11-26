@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/qwwiwi/agent-jobs/internal/casefold"
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
@@ -724,6 +726,64 @@ func codexRolloutExists(home, threadID string) bool {
 	return err == nil && len(found) > 0
 }
 
+// codexRolloutNameRe matches the name codex gives a rollout file, rollout-<YYYY-MM-DDThh-mm-ss>-<thread
+// id>.jsonl (rollout_file_name.rs); the submatch is the thread id.
+var codexRolloutNameRe = regexp.MustCompile(`^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-([0-9a-f-]{36})\.jsonl$`)
+
+// eachCodexRollout calls fn for every regular file <home>/sessions/<Y>/<M>/<D>/<name> whose name is codex's
+// rollout name for threadID, in name order. Every directory below home is opened relative to its parent
+// with O_NOFOLLOW and every entry is lstat'ed through it: a symlinked directory is skipped, never
+// followed, and anything but a regular file (a directory, a link) is passed over. fn gets the open date
+// directory (valid during the call) to act on the entry by name, so what it does stays inside it. A
+// directory that cannot be opened or read is skipped, as Glob skips it; an error of fn ends the walk.
+func eachCodexRollout(home, threadID string, fn func(dirfd int, path, name string, st *unix.Stat_t) error) error {
+	if home == "" || !ValidCodexThreadID(threadID) {
+		return nil
+	}
+	homeFd, err := unix.Open(home, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil
+	}
+	fd, err := openDirNoFollow(homeFd, "sessions")
+	unix.Close(homeFd)
+	if err != nil {
+		return nil
+	}
+	return walkCodexRolloutDir(fd, filepath.Join(home, "sessions"), 0, threadID, fn)
+}
+
+// walkCodexRolloutDir is eachCodexRollout for the open directory fd at path (closed on return): depth 0
+// is sessions, 3 a day directory, whose rollout files are passed to fn.
+func walkCodexRolloutDir(fd int, path string, depth int, threadID string, fn func(int, string, string, *unix.Stat_t) error) error {
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	names, _ := f.Readdirnames(-1)
+	slices.Sort(names)
+	for _, name := range names {
+		if depth < 3 {
+			sub, err := openDirNoFollow(fd, name)
+			if err != nil {
+				continue
+			}
+			if err := walkCodexRolloutDir(sub, filepath.Join(path, name), depth+1, threadID, fn); err != nil {
+				return err
+			}
+			continue
+		}
+		if m := codexRolloutNameRe.FindStringSubmatch(name); m == nil || m[1] != threadID {
+			continue
+		}
+		var st unix.Stat_t
+		if unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+			continue
+		}
+		if err := fn(fd, filepath.Join(path, name), name, &st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // codexUsage is a token usage as codex reports it (turn.completed, exec/src/exec_events.rs `Usage`):
 // Input includes Cached, Output includes Reasoning.
 type codexUsage struct {
@@ -796,31 +856,29 @@ func codexRolloutUsage(home, threadID string) (codexUsage, bool) {
 	if home == "" || !ValidCodexThreadID(threadID) {
 		return codexUsage{}, false
 	}
-	files, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl"))
-	if err != nil {
-		return codexUsage{}, false
-	}
 	var best codexUsage
 	found := false
-	for _, f := range files {
-		if u, ok := rolloutFileUsage(f); ok && (!found || u.total() > best.total()) {
+	_ = eachCodexRollout(home, threadID, func(dirfd int, _, name string, _ *unix.Stat_t) error {
+		if u, ok := rolloutFileUsage(dirfd, name); ok && (!found || u.total() > best.total()) {
 			best, found = u, true
 		}
-	}
+		return nil
+	})
 	return best, found
 }
 
-// rolloutFileUsage is codexRolloutUsage for one file (a regular file only; symlinks are not followed).
-func rolloutFileUsage(path string) (codexUsage, bool) {
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
-		return codexUsage{}, false
-	}
-	f, err := os.Open(path)
+// rolloutFileUsage is codexRolloutUsage for the file name in the open directory dirfd (a regular file
+// only; a symlink is not followed, a fifo does not block).
+func rolloutFileUsage(dirfd int, name string) (codexUsage, bool) {
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return codexUsage{}, false
 	}
+	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return codexUsage{}, false
+	}
 	var last codexUsage
 	found := false
 	r := bufio.NewReaderSize(io.LimitReader(f, codexRolloutMaxBytes), codexRolloutMaxLine)

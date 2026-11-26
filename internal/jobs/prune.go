@@ -330,7 +330,8 @@ func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
 // pruneCodexRollouts removes the codex rollout files of a pruned codex job (config codex_resumable):
 // <codex home>/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl of every thread the job's records name
 // (its session, each attempt's session, and the thread the wrapper recorded for each attempt, a
-// rejected one too). The ids are validated thread ids, so nothing else under codex's home is touched.
+// rejected one too). The ids are validated thread ids and only their regular rollout files are unlinked
+// (eachCodexRollout, no link followed, no recursion), so nothing else under codex's home is touched.
 func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
 	if j.Runner != store.RunnerCodex {
 		return
@@ -356,20 +357,21 @@ func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
 		if !ValidCodexThreadID(id) {
 			continue
 		}
-		paths, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+id+".jsonl"))
+		// Only regular files named exactly as the thread's rollout are unlinked, by name in their date
+		// directory, without following a link or recursing: a job may have planted a directory or a
+		// symlink under the sessions dir.
+		err := eachCodexRollout(home, id, func(dirfd int, p, name string, st *unix.Stat_t) error {
+			if !dryRun {
+				if err := unix.Unlinkat(dirfd, name, 0); err != nil {
+					return &os.PathError{Op: "unlink", Path: p, Err: err}
+				}
+			}
+			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: st.Size, Reason: "codex rollout of the job"})
+			return nil
+		})
 		if err != nil {
 			pj.Error = err.Error()
 			return
-		}
-		for _, p := range paths {
-			size := treeSize(p)
-			if !dryRun {
-				if err := removeTree(p); err != nil {
-					pj.Error = err.Error()
-					return
-				}
-			}
-			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "codex rollout of the job"})
 		}
 	}
 }
