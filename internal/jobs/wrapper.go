@@ -76,6 +76,13 @@ type StreamResult struct {
 	// CodexThreadUsage is the usage as codex reported it, the thread's total: on a resumed thread it
 	// includes the earlier attempts', which the four counts above leave out (codexUsageBase).
 	CodexThreadUsage *codexUsage `json:",omitempty"`
+	// CodexThreadBase is what the resumed thread had used before this attempt (codexResumeBase; nil = a
+	// new thread or none): the four counts above are the reported total without it.
+	CodexThreadBase *codexUsage `json:",omitempty"`
+	// CodexUnreported is the part of CodexThreadBase no earlier attempt recorded (one killed before its
+	// turn reported its usage), as the thread's rollout file had it: counted once in the job's usage, not
+	// against this attempt's token cap.
+	CodexUnreported *codexUsage `json:",omitempty"`
 	// CodexStop is why the wrapper failed a codex attempt whatever codex wrote or however it exited: over
 	// its token cap, or a resume that ran in another thread ("" = neither).
 	CodexStop string `json:",omitempty"`
@@ -202,10 +209,12 @@ type resultTee struct {
 type codexWatch struct {
 	persisted bool       // the run keeps its thread (no --ephemeral)
 	resume    string     // the thread a resume must continue ("" = a new thread)
-	base      codexUsage // what that thread had used before this attempt (codexUsageBase)
-	limit     int64      // the attempt's token cap (0 = none)
-	stop      func()     // ends the runner (nil = not started)
-	reported  codexUsage // the usage as codex reported it so far
+	base      codexUsage // what that thread had used before this attempt (codexResumeBase)
+	// unreported is the part of base no earlier attempt recorded (nil = none).
+	unreported *codexUsage
+	limit      int64      // the attempt's token cap (0 = none)
+	stop       func()     // ends the runner (nil = not started)
+	reported   codexUsage // the usage as codex reported it so far
 }
 
 // applyCodex is applyCodexLine for the line read, with the attempt's own usage (the reported one without
@@ -863,7 +872,8 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 		watch = &codexWatch{persisted: !ca.ephemeral, resume: ca.resume, limit: limit}
 		if ca.resume != "" {
 			if j, err := st.Get(id); err == nil {
-				watch.base = codexUsageBase(st, id, ca.resume, j.Attempt)
+				// The thread was admitted as the one the daemon recorded for this job: its rollout is the job's.
+				watch.base, watch.unreported = codexResumeBase(st, id, ca.resume, j.Attempt, codexHome(os.Environ()))
 			}
 		}
 	}
@@ -1206,6 +1216,11 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 	if runner == store.RunnerCodex {
 		tee.res.Runner = runner
 		if tee.codex = watch; watch != nil {
+			if watch.base != (codexUsage{}) {
+				base := watch.base
+				tee.res.CodexThreadBase = &base
+			}
+			tee.res.CodexUnreported = watch.unreported
 			// Called from the tee, so after the runner started: SIGTERM, then a kill for one that stays.
 			watch.stop = func() {
 				proc := cmd.Process

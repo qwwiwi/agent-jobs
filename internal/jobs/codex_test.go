@@ -60,6 +60,11 @@ in=1200 cached=800 out=90 reason=30
 if [[ $prompt =~ FAKE_CODEX_TOKENS=([0-9]+) ]]; then in=${BASH_REMATCH[1]}; fi
 if [[ -n $resumed ]]; then in=$((in + 1200)) cached=$((cached + 800)) out=$((out + 90)) reason=$((reason + 30)); fi
 usage="{\"input_tokens\":$in,\"cached_input_tokens\":$cached,\"cache_write_input_tokens\":0,\"output_tokens\":$out,\"reasoning_output_tokens\":$reason}"
+# The rollout records the thread's total as token_count events (one after each model response, before
+# the turn ends), so an attempt killed before turn.completed has its usage there.
+if [[ -z $ephemeral && -n ${CODEX_HOME-} ]]; then
+  echo "{\"timestamp\":\"2026-11-26T09:00:01.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":$usage,\"last_token_usage\":$usage}}}" >> "$CODEX_HOME/sessions/2026/11/26/rollout-2026-11-26T09-00-00-$tid.jsonl"
+fi
 echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
 echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi

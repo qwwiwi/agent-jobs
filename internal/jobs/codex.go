@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -738,12 +739,13 @@ func (u codexUsage) sub(base codexUsage) codexUsage {
 		max(u.Reasoning-base.Reasoning, 0)}
 }
 
-// codexUsageBase is what the resumed thread had used before this attempt, as the wrapper's records of
-// the job's earlier attempts say: the last one that ran in the thread and saw its usage. codex reports
-// a thread's total (exec/src/event_processor_with_jsonl_output.rs usage_from_last_total; a resumed
-// thread restores it from its rollout), so an attempt's own usage is the total without this base. An
-// attempt killed before its turn ended recorded none: its tokens then count for the attempt that
-// resumed it.
+// codexUsageBase is what the resumed thread had used before this attempt, as far as the wrapper's
+// records of the job's earlier attempts account for it: the last one that ran in the thread and saw its
+// usage (CodexThreadUsage), or else the base it started from (CodexThreadBase, which counted what was
+// unreported before it). codex reports a thread's total (exec/src/event_processor_with_jsonl_output.rs
+// usage_from_last_total; a resumed thread restores it from its rollout), so an attempt's own usage is
+// the total without its base. An attempt killed before its turn ended recorded no usage: the rollout
+// (codexRolloutUsage) has it, see codexResumeBase.
 func codexUsageBase(st *store.Store, id, threadID string, attempt int) codexUsage {
 	for n := attempt - 1; n >= 1; n-- {
 		raw, err := st.AttemptWrapperResult(id, n)
@@ -751,11 +753,124 @@ func codexUsageBase(st *store.Store, id, threadID string, attempt int) codexUsag
 			continue
 		}
 		var res StreamResult
-		if json.Unmarshal([]byte(raw), &res) == nil && res.CodexThreadID == threadID && res.CodexThreadUsage != nil {
+		if json.Unmarshal([]byte(raw), &res) != nil || res.CodexThreadID != threadID {
+			continue
+		}
+		if res.CodexThreadUsage != nil {
 			return *res.CodexThreadUsage
+		}
+		if res.CodexThreadBase != nil {
+			return *res.CodexThreadBase
 		}
 	}
 	return codexUsage{}
+}
+
+// codexResumeBase is the usage base of an attempt that resumes threadID, and the part of it no earlier
+// attempt recorded (nil = none): the records' base (codexUsageBase), or the thread's total in its
+// rollout file when that is more (an earlier attempt was killed before its turn reported its usage).
+// The unrecorded part counts once, in this attempt's record (CodexUnreported), never against its cap.
+func codexResumeBase(st *store.Store, id, threadID string, attempt int, home string) (codexUsage, *codexUsage) {
+	recorded := codexUsageBase(st, id, threadID, attempt)
+	rollout, ok := codexRolloutUsage(home, threadID)
+	if !ok || rollout.total() <= recorded.total() {
+		return recorded, nil
+	}
+	unreported := rollout.sub(recorded)
+	return rollout, &unreported
+}
+
+// codexRolloutMaxBytes bounds how much of a rollout file codexRolloutUsage reads; codexRolloutMaxLine
+// bounds one line it parses (a token_count line is a few hundred bytes, longer ones are skipped).
+const (
+	codexRolloutMaxBytes = 256 << 20
+	codexRolloutMaxLine  = 64 << 10
+)
+
+// codexRolloutUsage is the thread's total usage as its rollout file last recorded it (ok = one found):
+// the total_token_usage of the last token_count event (a rollout line {"type":"event_msg","payload":
+// {"type":"token_count","info":{"total_token_usage":{...}}}}, which codex writes after each model
+// response). Only the rollout of threadID (a thread the job's own record names) is read, at most
+// codexRolloutMaxBytes, and only its numbers are used.
+func codexRolloutUsage(home, threadID string) (codexUsage, bool) {
+	if home == "" || !ValidCodexThreadID(threadID) {
+		return codexUsage{}, false
+	}
+	files, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl"))
+	if err != nil {
+		return codexUsage{}, false
+	}
+	var best codexUsage
+	found := false
+	for _, f := range files {
+		if u, ok := rolloutFileUsage(f); ok && (!found || u.total() > best.total()) {
+			best, found = u, true
+		}
+	}
+	return best, found
+}
+
+// rolloutFileUsage is codexRolloutUsage for one file (a regular file only; symlinks are not followed).
+func rolloutFileUsage(path string) (codexUsage, bool) {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return codexUsage{}, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return codexUsage{}, false
+	}
+	defer f.Close()
+	var last codexUsage
+	found := false
+	r := bufio.NewReaderSize(io.LimitReader(f, codexRolloutMaxBytes), codexRolloutMaxLine)
+	for {
+		line, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			for errors.Is(err, bufio.ErrBufferFull) { // over the line limit: skipped to its end
+				_, err = r.ReadSlice('\n')
+			}
+			if err != nil {
+				break
+			}
+			continue
+		}
+		if bytes.Contains(line, []byte(`"token_count"`)) {
+			if u, ok := tokenCountUsage(line); ok {
+				last, found = u, true
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return last, found
+}
+
+// tokenCountUsage reads the total of a rollout token_count line (ok = it is one, with no negative count).
+func tokenCountUsage(line []byte) (codexUsage, bool) {
+	var ev struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type string `json:"type"`
+			Info *struct {
+				Total struct {
+					Input     int64 `json:"input_tokens"`
+					Cached    int64 `json:"cached_input_tokens"`
+					Output    int64 `json:"output_tokens"`
+					Reasoning int64 `json:"reasoning_output_tokens"`
+				} `json:"total_token_usage"`
+			} `json:"info"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(line, &ev) != nil || ev.Type != "event_msg" || ev.Payload.Type != "token_count" || ev.Payload.Info == nil {
+		return codexUsage{}, false
+	}
+	t := ev.Payload.Info.Total
+	if t.Input < 0 || t.Cached < 0 || t.Output < 0 || t.Reasoning < 0 {
+		return codexUsage{}, false
+	}
+	return codexUsage{t.Input, t.Cached, t.Output, t.Reasoning}, true
 }
 
 // codexUsageText is a codex usage for people.
@@ -1037,13 +1152,21 @@ func (m *Manager) codexJobUsage(j *store.Job) (sum codexUsage, ok bool) {
 			sum, ok = codexUsage{sum.Input + u.Input, sum.Cached + u.Cached, sum.Output + u.Output, sum.Reasoning + u.Reasoning}, true
 		}
 	}
+	addAll := func(res StreamResult) {
+		add(res)
+		if res.CodexUnreported != nil {
+			// Tokens of an earlier attempt that did not report them (killed mid-turn), recovered once.
+			u := *res.CodexUnreported
+			add(StreamResult{InputTokens: u.Input, CachedInputTokens: u.Cached, OutputTokens: u.Output, ReasoningTokens: u.Reasoning})
+		}
+	}
 	for n := 1; n < j.Attempt; n++ {
 		var res StreamResult
 		if raw, err := m.Store.AttemptWrapperResult(j.ID, n); err == nil && json.Unmarshal([]byte(raw), &res) == nil {
-			add(res)
+			addAll(res)
 		}
 	}
-	add(m.endedResult(j))
+	addAll(m.endedResult(j))
 	return sum, ok
 }
 

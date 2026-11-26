@@ -3,6 +3,7 @@ package jobs
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -160,9 +161,14 @@ func TestCodexResumeOtherThreadFails(t *testing.T) {
 }
 
 // A codex attempt that timed out is continued once, in its thread; the continuation that ends is not
-// continued again.
+// continued again. The timed-out attempt reported no usage: the thread's earlier total comes from its
+// rollout file, so the continuation's token cap counts only its own tokens, and the earlier ones are
+// counted once in the job's usage.
 func TestCodexTimeoutAutoContinuedOnce(t *testing.T) {
 	m := newCodexManager(t)
+	limit := int64(2000)
+	m.Cfg.CodexMaxTokens = &limit
+	writeCodexConfig(t, m, `{"codex_max_tokens": 2000}`)
 	j := enqueue(t, m, "FAKE_CODEX_SLEEP=60", func(r *StartRequest) { codexReview(r); r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
@@ -191,6 +197,13 @@ func TestCodexTimeoutAutoContinuedOnce(t *testing.T) {
 	}
 	if line := m.DoneLineFor(j); !strings.Contains(line, "auto-continued (attempt 2") {
 		t.Fatalf("done line %q", line)
+	}
+	res := m.endedResult(j)
+	if res.InputTokens != 1200 || res.OutputTokens != 90 {
+		t.Fatalf("continuation usage in %d out %d, want its own 1200/90", res.InputTokens, res.OutputTokens)
+	}
+	if line := m.DoneLineFor(j); !strings.Contains(line, "tokens in 2400 (cached 1600) · out 180 (reasoning 60)") {
+		t.Fatalf("the timed-out attempt's tokens must count once: %q", line)
 	}
 }
 
@@ -330,5 +343,43 @@ func TestCodexNoSummaryAutoContinued(t *testing.T) {
 	}
 	if line := m.DoneLineFor(j); !strings.Contains(line, "auto-continued (attempt 2") {
 		t.Fatalf("done line %q", line)
+	}
+}
+
+// The rollout's usage is the total of its last token_count event; overlong lines and other events are
+// skipped, and a symlink is not followed.
+func TestCodexRolloutUsage(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "2026", "11", "26")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tc := func(in, out int) string {
+		return `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":` +
+			strconv.Itoa(in) + `,"cached_input_tokens":5,"output_tokens":` + strconv.Itoa(out) + `,"reasoning_output_tokens":2}}}}`
+	}
+	lines := []string{
+		tc(100, 10),
+		`{"type":"response_item","payload":{"type":"message","content":"` + strings.Repeat("x", codexRolloutMaxLine+10) + `"}}`,
+		tc(300, 30),
+		`{"type":"event_msg","payload":{"type":"token_count","info":null}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","message":"token_count"}}`,
+	}
+	p := filepath.Join(dir, "rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if u, ok := codexRolloutUsage(home, fakeCodexThread); !ok || u != (codexUsage{300, 5, 30, 2}) {
+		t.Fatalf("rollout usage %+v %v", u, ok)
+	}
+	other := "0199a213-81c0-7800-8aa1-000000000003"
+	if err := os.Symlink(p, filepath.Join(dir, "rollout-2026-11-26T09-00-00-"+other+".jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := codexRolloutUsage(home, other); ok {
+		t.Fatal("a symlinked rollout must not be read")
+	}
+	if _, ok := codexRolloutUsage(home, "../x"); ok {
+		t.Fatal("an invalid thread id must not be looked up")
 	}
 }
