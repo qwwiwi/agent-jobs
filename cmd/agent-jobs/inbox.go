@@ -42,11 +42,12 @@ func cmdInbox(args []string) error {
 	if cfg.Notify.InboxDir == "" {
 		return errors.New("notify.inbox_dir is not set in config.json: there is no inbox to pull")
 	}
-	events, skipped, err := jobs.InboxPull(cfg.Notify.InboxDir, *ack)
-	// What was read is printed even when an acknowledgement failed: the lines are not lost.
-	for _, ev := range events {
-		fmt.Println(jobs.Printable(ev.Line, 0))
-	}
+	// An event is acknowledged only after its line was written to stdout without an error: a closed
+	// or broken stdout stops the pull and leaves that event and the later ones in the inbox.
+	skipped, err := jobs.InboxPull(cfg.Notify.InboxDir, *ack, func(ev jobs.InboxEvent) error {
+		_, werr := fmt.Fprintln(os.Stdout, jobs.Printable(ev.Line, 0))
+		return werr
+	})
 	for _, s := range skipped {
 		fmt.Fprintln(os.Stderr, "agent-jobs: inbox: skipped", jobs.Printable(s, 0))
 	}

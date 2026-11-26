@@ -48,7 +48,8 @@ func logBuffer(m *Manager) *bytes.Buffer {
 
 func pull(t *testing.T, dir string, ack bool) []InboxEvent {
 	t.Helper()
-	evs, skipped, err := InboxPull(dir, ack)
+	var evs []InboxEvent
+	skipped, err := InboxPull(dir, ack, func(ev InboxEvent) error { evs = append(evs, ev); return nil })
 	if err != nil || len(skipped) != 0 {
 		t.Fatalf("InboxPull: %v, skipped %q", err, skipped)
 	}
@@ -241,7 +242,9 @@ func TestNotifyInboxWritePullAck(t *testing.T) {
 // event is named as skipped and survives an ack.
 func TestInboxPullMissingDirAndForeignFile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "inbox")
-	if evs, skipped, err := InboxPull(dir, true); err != nil || len(evs) != 0 || len(skipped) != 0 {
+	var evs []InboxEvent
+	collect := func(ev InboxEvent) error { evs = append(evs, ev); return nil }
+	if skipped, err := InboxPull(dir, true, collect); err != nil || len(evs) != 0 || len(skipped) != 0 {
 		t.Fatalf("missing dir: %v %v %v", evs, skipped, err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -250,7 +253,7 @@ func TestInboxPullMissingDirAndForeignFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "broken.json"), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	evs, skipped, err := InboxPull(dir, true)
+	skipped, err := InboxPull(dir, true, collect)
 	if err != nil || len(evs) != 0 || len(skipped) != 1 || !strings.Contains(skipped[0], "broken.json") {
 		t.Fatalf("foreign file: %v %q %v", evs, skipped, err)
 	}

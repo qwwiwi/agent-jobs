@@ -127,6 +127,13 @@ func WriteInboxEvent(dir string, ev InboxEvent) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if err := checkInboxDir(dir, info); err != nil {
+		return err
+	}
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return err
@@ -155,19 +162,66 @@ func WriteInboxEvent(dir string, ev InboxEvent) error {
 	return err
 }
 
-// InboxPull returns the pending events of dir, oldest first. With ack it then removes the files of
-// exactly the events it returns, so an event written meanwhile stays for the next pull. A missing
-// dir is an empty inbox. A file that is not a readable event (not a regular *.json file, not an
-// event's JSON) is never removed: it is named in skipped. Temporary files of a write in progress
-// are passed over silently.
-func InboxPull(dir string, ack bool) (events []InboxEvent, skipped []string, err error) {
-	entries, err := os.ReadDir(dir)
+// checkInboxDir refuses an inbox directory that someone else could plant or remove events in: one
+// writable by group or others, or not owned by this user. info is the directory's own (followed)
+// stat.
+func checkInboxDir(dir string, info os.FileInfo) error {
+	if !info.IsDir() {
+		return fmt.Errorf("notify.inbox_dir %s is not a directory", dir)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("notify.inbox_dir %s is writable by group or others (mode %o): refused, make it 0700", dir, perm)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("notify.inbox_dir %s: cannot read its owner", dir)
+	}
+	if uid := os.Getuid(); int(st.Uid) != uid {
+		return fmt.Errorf("notify.inbox_dir %s is not owned by this user (owner uid %d, this user %d): refused", dir, st.Uid, uid)
+	}
+	return nil
+}
+
+// InboxPull hands the pending events of dir to emit, oldest first. Pulls of one inbox are serialized
+// by an exclusive flock on the directory, so two pulls never hand out the same event. With ack an
+// event's file is removed only after emit returned nil for it: when emit fails (stdout closed) the
+// pull stops with that error and the event and the ones after it stay for the next pull. A missing
+// dir is an empty inbox; a dir writable by others or not owned by this user is refused
+// (checkInboxDir). A file that is not a readable event (not a regular *.json file, not an event's
+// JSON) is never removed: it is named in skipped. Temporary files of a write in progress are passed
+// over silently.
+func InboxPull(dir string, ack bool, emit func(InboxEvent) error) (skipped []string, err error) {
+	d, err := os.Open(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	defer d.Close()
+	info, err := d.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := checkInboxDir(dir, info); err != nil {
+		return nil, err
+	}
+	for {
+		err = syscall.Flock(int(d.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock inbox %s: %w", dir, err)
+	}
+	defer func() { _ = syscall.Flock(int(d.Fd()), syscall.LOCK_UN) }()
+	// Read under the lock: a pull that waited sees what the one before it left.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var events []InboxEvent
 	files := map[string]string{}
 	for _, e := range entries {
 		name := e.Name()
@@ -181,7 +235,7 @@ func InboxPull(dir string, ack bool) (events []InboxEvent, skipped []string, err
 		}
 		b, rerr := os.ReadFile(path)
 		if errors.Is(rerr, os.ErrNotExist) {
-			continue // acknowledged by another pull meanwhile
+			continue // removed by hand meanwhile
 		}
 		var ev InboxEvent
 		if rerr == nil {
@@ -207,12 +261,16 @@ func InboxPull(dir string, ack bool) (events []InboxEvent, skipped []string, err
 		}
 		return events[a].ID < events[b].ID
 	})
-	if ack {
-		for _, ev := range events {
-			if rerr := os.Remove(files[ev.ID]); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-				return events, skipped, fmt.Errorf("acknowledge event %s: %w", ev.ID, rerr)
-			}
+	for _, ev := range events {
+		if err := emit(ev); err != nil {
+			return skipped, fmt.Errorf("output of event %s failed, it and the later ones stay in the inbox: %w", ev.ID, err)
+		}
+		if !ack {
+			continue
+		}
+		if rerr := os.Remove(files[ev.ID]); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			return skipped, fmt.Errorf("acknowledge event %s: %w", ev.ID, rerr)
 		}
 	}
-	return events, skipped, nil
+	return skipped, nil
 }

@@ -53,3 +53,39 @@ func TestInboxPullCLI(t *testing.T) {
 		t.Fatal("unknown subcommand accepted")
 	}
 }
+
+// `inbox pull --ack` acknowledges only what it could print: with stdout closed the events stay.
+func TestInboxPullAckKeepsEventsWhenStdoutFails(t *testing.T) {
+	t.Setenv("AGENT_JOBS_HOME", t.TempDir())
+	state, err := jobs.StateDir("cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	cfg := `{"notify": {"inbox_dir": "` + inbox + `"}}`
+	if err := os.WriteFile(filepath.Join(state, "config.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs.WriteInboxEvent(inbox, jobs.InboxEvent{ID: "a", Line: "[jobs:job-done] job a", TS: time.Unix(1_800_000_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	_ = w.Close()
+	old := os.Stdout
+	os.Stdout = w
+	err = cmdInbox([]string{"pull", "--agent", "cli", "--ack"})
+	os.Stdout = old
+	if err == nil {
+		t.Fatal("a pull whose output failed reported success")
+	}
+	if out := captureStdout(t, func() error { return cmdInbox([]string{"pull", "--agent", "cli"}) }); out != "[jobs:job-done] job a\n" {
+		t.Fatalf("event lost after a failed output: %q", out)
+	}
+}
