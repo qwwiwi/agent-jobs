@@ -449,12 +449,12 @@ func (c Config) codexBin() string {
 // whatever could act outside the shell sandbox (apps, browsers, computer use, plugins, MCP installs,
 // hooks, background daemons and automations, worktrees, sub-agents) or a one-shot job has no use for.
 // With --ignore-user-config, --ignore-rules, --ephemeral and an empty mcp_servers table, a job does not
-// inherit the owner's codex config, rules, apps or plugins (this exact command line verified on
-// codex-cli 0.162.1); system/managed config layers are ruled out by checkCodexSystemConfig and MCP
+// inherit the owner's codex config, rules, apps or plugins (the command line before issue #243, without
+// multi_agent_v2 and CodexAgentsOverride, verified on codex-cli 0.162.1); system/managed config layers are ruled out by checkCodexSystemConfig and MCP
 // servers from other config layers by checkCodexMCP, so the sandbox is the whole containment.
 var CodexDisabledFeatures = []string{
 	"apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
-	"image_generation", "multi_agent", "plugins", "plugin_sharing", "remote_plugin",
+	"image_generation", "multi_agent", "multi_agent_v2", "plugins", "plugin_sharing", "remote_plugin",
 	"skill_mcp_dependency_install", "daemon_auto_start", "in_app_local_automation", "goals",
 	"realtime_conversation", "worktrees", "hooks",
 }

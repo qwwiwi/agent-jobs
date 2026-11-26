@@ -140,7 +140,7 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		"-s\nread-only\n-c\napproval_policy=\"never\"\n-c\nmcp_servers={}\n" +
 		"--disable\napps\n--disable\nbrowser_use\n--disable\nbrowser_use_external\n" +
 		"--disable\nbrowser_use_full_cdp_access\n--disable\ncomputer_use\n--disable\nimage_generation\n" +
-		"--disable\nmulti_agent\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
+		"--disable\nmulti_agent\n--disable\nmulti_agent_v2\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
 		"--disable\nskill_mcp_dependency_install\n--disable\ndaemon_auto_start\n" +
 		"--disable\nin_app_local_automation\n--disable\ngoals\n--disable\nrealtime_conversation\n" +
 		"--disable\nworktrees\n--disable\nhooks\n-c\nagents.enabled=false\n" +
@@ -600,12 +600,16 @@ func TestCodexArgsDisableAgentsV2(t *testing.T) {
 		if i < 1 || args[i-1] != "-c" {
 			t.Fatalf("%s: argv lacks -c %s: %q", sandbox, override, args)
 		}
-		if n := strings.Count(strings.Join(args, "\n")+"\n", "\n"+override+"\n"); n != 1 {
-			t.Fatalf("%s: %s given %d times: %q", sandbox, override, n, args)
+		// Every override of the agents table, in any spelling codex takes, is exactly the one above:
+		// a later `-c agents.enabled=true` (or `agents={...}`) would win over it.
+		if got := codexAgentsOverrides(args); !slices.Equal(got, []string{override}) {
+			t.Fatalf("%s: agents overrides %q, want exactly [%s]: %q", sandbox, got, override, args)
 		}
-		ma := slices.Index(args, "multi_agent")
-		if ma < 1 || args[ma-1] != "--disable" {
-			t.Fatalf("%s: --disable multi_agent dropped: %q", sandbox, args)
+		for _, f := range []string{"multi_agent", "multi_agent_v2"} {
+			ma := slices.Index(args, f)
+			if ma < 1 || args[ma-1] != "--disable" {
+				t.Fatalf("%s: --disable %s missing: %q", sandbox, f, args)
+			}
 		}
 		if i > slices.Index(args, "-m") || i > slices.Index(args, "-") {
 			t.Fatalf("%s: override after the model or the prompt: %q", sandbox, args)
@@ -614,4 +618,34 @@ func TestCodexArgsDisableAgentsV2(t *testing.T) {
 			t.Fatalf("%s: wrapper refuses the argv: %v", sandbox, err)
 		}
 	}
+}
+
+// codexAgentsOverrides returns every config override in a codex argv (`-c v`, `--config v`, `-cv`,
+// `-c=v`, `--config=v`) whose key is the agents table or a key below it, key parts trimmed of blanks
+// and quotes as codex reads them.
+func codexAgentsOverrides(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		a, value := args[i], ""
+		switch {
+		case a == "-c" || a == "--config":
+			if i+1 >= len(args) {
+				continue
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(a, "--config="):
+			value = strings.TrimPrefix(a, "--config=")
+		case strings.HasPrefix(a, "-c") && len(a) > 2:
+			value = strings.TrimPrefix(a[2:], "=")
+		default:
+			continue
+		}
+		key, _, _ := strings.Cut(value, "=")
+		head, _, _ := strings.Cut(key, ".")
+		if strings.Trim(head, " \t\"'") == "agents" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
