@@ -1,0 +1,38 @@
+[hooks]
+managed_dir = "/etc/codex/hooks"
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "'/etc/codex/hooks/run' SessionStart"
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "'/etc/codex/hooks/run' UserPromptSubmit"
+timeout = 30
+
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/etc/codex/hooks/run' PreToolUse"
+timeout = 30
+onFailure = "block"
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "'/etc/codex/hooks/run' PostToolUse"
+timeout = 30
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "'/etc/codex/hooks/run' Stop"
+timeout = 30
