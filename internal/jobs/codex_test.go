@@ -1,7 +1,6 @@
 package jobs
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,7 +34,33 @@ printf '%s' "$prompt" > ../stdin.txt
 printf '%s\n' "${AGENT_JOBS_JOB-unset}" > ../marker.txt
 env | grep -E '^CLAUDE_CODE_FORK_SUBAGENT=' > ../forkenv.txt || true
 env | grep -E '^(GH_TOKEN|GITHUB_TOKEN|SSH_AUTH_SOCK|GH_CONFIG_DIR)=' > ../credenv.txt || true
-echo '{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}'
+# The event shapes are codex-cli 0.172.0's (codex-rs/exec/src/exec_events.rs). A run without
+# --ephemeral persists a rollout file under $CODEX_HOME/sessions/YYYY/MM/DD (rollout/src/recorder.rs);
+# "exec resume ID" continues that thread and prints its id again, or starts a new thread when the id
+# has no rollout (exec/src/lib.rs, the else branch after resolve_resume_thread_id).
+tid=0199a213-81c0-7800-8aa1-bbab2a035a53
+resumed=
+ephemeral=
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [[ ${args[i]} == resume ]]; then resumed=${args[i+1]}; fi
+  if [[ ${args[i]} == --ephemeral ]]; then ephemeral=1; fi
+done
+if [[ -n $resumed ]]; then
+  tid=$resumed
+  if [[ -n ${FAKE_CODEX_LOSE_THREAD-} ]]; then tid=0199a213-81c0-7800-8aa1-000000000002; fi
+fi
+if [[ -z $ephemeral && -n ${CODEX_HOME-} ]]; then
+  mkdir -p "$CODEX_HOME/sessions/2026/11/26"
+  : >> "$CODEX_HOME/sessions/2026/11/26/rollout-2026-11-26T09-00-00-$tid.jsonl"
+fi
+# turn.completed carries the thread's total usage (event_processor_with_jsonl_output.rs,
+# usage_from_last_total): a resumed thread's includes what the earlier attempt used.
+in=1200 cached=800 out=90 reason=30
+if [[ $prompt =~ FAKE_CODEX_TOKENS=([0-9]+) ]]; then in=${BASH_REMATCH[1]}; fi
+if [[ -n $resumed ]]; then in=$((in + 1200)) cached=$((cached + 800)) out=$((out + 90)) reason=$((reason + 30)); fi
+usage="{\"input_tokens\":$in,\"cached_input_tokens\":$cached,\"cache_write_input_tokens\":0,\"output_tokens\":$out,\"reasoning_output_tokens\":$reason}"
+echo "{\"type\":\"thread.started\",\"thread_id\":\"$tid\"}"
 echo '{"type":"turn.started"}'
 if [[ $prompt =~ FAKE_CODEX_SLEEP=([0-9]+) ]]; then sleep "${BASH_REMATCH[1]}"; fi
 if [[ $prompt == *FAKE_CODEX_WRITE* ]]; then echo written > codex-wrote.txt; fi
@@ -75,10 +100,19 @@ if [[ $prompt == *FAKE_CODEX_NOTERMINAL* ]]; then
   echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"## Summary\npartial"}}'
   exit 0
 fi
+if [[ $prompt == *FAKE_CODEX_ONCEFAIL* && ! -d ../attempts ]]; then
+  echo '{"type":"turn.failed","error":{"message":"model overloaded"}}'
+  exit 1
+fi
+if [[ $prompt == *FAKE_CODEX_ONCENOREPORT* && ! -d ../attempts ]]; then
+  echo "{\"type\":\"turn.completed\",\"usage\":$usage}"
+  exit 0
+fi
 if [[ $prompt != *FAKE_CODEX_NOREPORT* ]]; then
   echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"## Summary\ncodex ok\n\n## Findings / Changes\n-\n\n## Evidence\n-\n\n## Not done / uncertain\nnothing"}}'
 fi
-echo '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":90}}'
+echo "{\"type\":\"turn.completed\",\"usage\":$usage}"
+if [[ $prompt == *FAKE_CODEX_LINGER* ]]; then sleep 60; fi
 `
 
 // newCodexManager is newManager with the fake codex first on PATH (and named as the codex binary).
@@ -87,6 +121,8 @@ func newCodexManager(t *testing.T) *Manager {
 	m := newManager(t)
 	t.Setenv("PATH", fakeHelpr+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AGENT_JOBS_CODEX_BIN", filepath.Join(fakeHelpr, "codex"))
+	// The fake codex keeps its rollout files here, never in the host's ~/.codex.
+	t.Setenv("CODEX_HOME", t.TempDir())
 	// Tests never read the host's /etc/codex: a missing dir by default.
 	prevDir := codexSystemConfigDir
 	codexSystemConfigDir = filepath.Join(t.TempDir(), "no-etc-codex")
@@ -135,7 +171,8 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		t.Fatalf("report.md: %q", rep)
 	}
 	argv, _ := os.ReadFile(filepath.Join(dir, "argv.txt"))
-	want := "exec\n--json\n--ignore-user-config\n--ignore-rules\n--ephemeral\n--skip-git-repo-check\n" +
+	// No --ephemeral: the thread is kept for a resume (codex_resumable, default on).
+	want := "exec\n--json\n--ignore-user-config\n--ignore-rules\n--skip-git-repo-check\n" +
 		"-s\nread-only\n-c\napproval_policy=\"never\"\n-c\nmcp_servers={}\n" +
 		"--disable\napps\n--disable\nbrowser_use\n--disable\nbrowser_use_external\n" +
 		"--disable\nbrowser_use_full_cdp_access\n--disable\ncomputer_use\n--disable\nimage_generation\n" +
@@ -155,7 +192,7 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 	if marker, _ := os.ReadFile(filepath.Join(dir, "marker.txt")); strings.TrimSpace(string(marker)) != j.ID {
 		t.Fatalf("job marker %q", marker)
 	}
-	if log, _ := os.ReadFile(filepath.Join(dir, "stderr.log")); !strings.Contains(string(log), "input 1200 (cached 800), output 90 tokens") {
+	if log, _ := os.ReadFile(filepath.Join(dir, "stderr.log")); !strings.Contains(string(log), "input 1200 (cached 800), output 90 (reasoning 30) tokens") {
 		t.Fatalf("usage not logged: %s", log)
 	}
 	// Unknown cost and the absent turn/budget caps are said as such, never as $0.00 or a number.
@@ -206,6 +243,7 @@ func TestCodexOwnReportKept(t *testing.T) {
 
 func TestCodexWithoutReportFails(t *testing.T) {
 	m := newCodexManager(t)
+	noAutoContinue(m) // the attempt as it ended (its continuation: codex_resume_test.go)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_NOREPORT", codexReview).ID)
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "without a report") {
 		t.Fatalf("got %s %q", j.Status, j.Error)
@@ -214,9 +252,9 @@ func TestCodexWithoutReportFails(t *testing.T) {
 	if j.Status != store.StatusFailed || !strings.Contains(j.Error, "codex exited with code 1") {
 		t.Fatalf("got %s %q", j.Status, j.Error)
 	}
-	// Resume of a codex job is refused with a clear error.
-	if _, err := m.Resume(j.ID, "try again", Limits{}); !errors.Is(err, errCodexResume) {
-		t.Fatalf("resume of a codex job: %v", err)
+	// A codex job has no turn or budget limit to pass on a resume (the resume itself: codex_resume_test.go).
+	if _, err := m.Resume(j.ID, "try again", Limits{MaxTurns: 5}); err == nil || !strings.Contains(err.Error(), "no turn or budget limit") {
+		t.Fatalf("resume of a codex job with max_turns: %v", err)
 	}
 }
 

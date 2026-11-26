@@ -276,7 +276,7 @@ func TestResumeLegacySkillsQueuedRefusedAtLaunch(t *testing.T) {
 		t.Fatalf("fixture must be a claimed legacy row: manifest=%q delivered=%v attempt=%d", j.SkillsManifest, j.SkillsDelivered, j.Attempt)
 	}
 	const reason = "no verifiable baseline"
-	if _, err := m.prepareResume(j, "resume-test"); err == nil || !strings.Contains(err.Error(), reason) {
+	if _, err := m.prepareResume(j, "resume-test", nil); err == nil || !strings.Contains(err.Error(), reason) {
 		t.Fatalf("queued legacy delivery must be refused at launch with %q: %v", reason, err)
 	}
 	if got := get(t, m, j.ID); got.SkillsManifest != "" {
@@ -337,7 +337,7 @@ func TestResumeDeliveredSkillsSymlinkedWorkRefused(t *testing.T) {
 				if mode == "admission" {
 					_, err = m.Resume(j.ID, "continue", Limits{})
 				} else {
-					_, err = m.prepareResume(get(t, m, j.ID), "resume-test")
+					_, err = m.prepareResume(get(t, m, j.ID), "resume-test", nil)
 				}
 				if err == nil || !strings.Contains(err.Error(), "work is not a real directory") {
 					t.Fatalf("symlinked work must be refused at %s: %v", mode, err)
