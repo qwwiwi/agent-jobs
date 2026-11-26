@@ -37,7 +37,10 @@ type SinkDelivery struct {
 	Jobs []SinkJob
 	// Owner is set when the sinks alone carry the line (no tmux target): their success marks the
 	// owner-waits attempts of Jobs delivered, a failure leaves them delivering.
-	Owner     bool
+	Owner bool
+	// Noted are the SLO breaches whose note rides on Line: marked noted in the transaction that
+	// inserts the row, so a rolled-back insert keeps them pending for the next line. Not stored.
+	Noted     []int64
 	State     string
 	Error     string
 	CreatedAt time.Time
@@ -61,7 +64,9 @@ CREATE INDEX IF NOT EXISTS notify_sink_outbox_state ON notify_sink_outbox(state,
 
 const sinkCols = `ref, line, jobs, owner, state, error, created_at, updated_at`
 
-// queueSinkDeliveryTx inserts d as a pending row unless its Ref is queued already.
+// queueSinkDeliveryTx inserts d as a pending row unless its Ref is queued already, and marks the
+// breaches its line carries (d.Noted) noted only when it inserted the row: an existing row keeps its
+// own line, so the breaches of this one were not queued and stay pending.
 func queueSinkDeliveryTx(tx *sql.Tx, d *SinkDelivery, now time.Time) error {
 	if d.Ref == "" {
 		return errors.New("queue sink delivery: empty ref")
@@ -70,12 +75,20 @@ func queueSinkDeliveryTx(tx *sql.Tx, d *SinkDelivery, now time.Time) error {
 	for _, j := range d.Jobs {
 		jobs = append(jobs, j.ID+"@"+strconv.Itoa(j.Attempt))
 	}
-	if _, err := tx.Exec(`INSERT INTO notify_sink_outbox (`+sinkCols+`) VALUES (?, ?, ?, ?, ?, '', ?, ?)
+	res, err := tx.Exec(`INSERT INTO notify_sink_outbox (`+sinkCols+`) VALUES (?, ?, ?, ?, ?, '', ?, ?)
 		ON CONFLICT(ref) DO NOTHING`, d.Ref, d.Line, strings.Join(jobs, ","), boolInt(d.Owner), SinkPending,
-		now.Unix(), now.Unix()); err != nil {
+		now.Unix(), now.Unix())
+	if err != nil {
 		return fmt.Errorf("queue sink delivery: %w", err)
 	}
-	return nil
+	inserted, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("queue sink delivery: %w", err)
+	}
+	if inserted == 0 {
+		return nil
+	}
+	return markSLOBreachesNoted(tx, d.Noted, now)
 }
 
 func boolInt(b bool) int {

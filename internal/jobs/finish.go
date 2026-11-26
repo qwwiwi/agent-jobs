@@ -479,18 +479,21 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 		// (notify_sink_outbox, keyed by ref) together with the mark notified, so the cleanup of the
 		// batch proceeds whatever they answer; they run after the lifecycle lock is released
 		// (deliverSinks). An owner-waits attempt stays delivering until they delivered it, and a
-		// failed sink leaves it there. The idle note is a tmux matter and does not ride.
-		var queued string
-		if err := m.deliverVia(context.Background(), WakeJobDone, ref, batchMembers(batch), line, true,
-			func(_ context.Context, l string) (string, error) {
-				queued = l
-				return l, nil
-			}); err != nil {
+		// failed sink leaves it there. The idle note is a tmux matter and does not ride. The SLO
+		// breach note rides, and its breaches are marked noted in that same transaction: a rejected
+		// insert keeps them pending, so the next line carries them again.
+		note, noted := m.sloNote()
+		if note != "" {
+			line += " · " + note
+		}
+		sink := m.sinkDelivery(ref, line, batch, true)
+		if sink != nil {
+			sink.Noted = noted
+		}
+		if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), nil, sink); err != nil {
 			return false, err
 		}
-		if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), nil, m.sinkDelivery(ref, queued, batch, true)); err != nil {
-			return false, err
-		}
+		m.recordWake(WakeJobDone, ref, batchMembers(batch), len(Printable(line, 0)))
 		for _, j := range batch {
 			m.forgetMergeNote(j.ID)
 		}
