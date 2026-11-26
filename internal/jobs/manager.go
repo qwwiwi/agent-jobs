@@ -70,6 +70,8 @@ type Manager struct {
 	dailyWG      sync.WaitGroup // the daily run goroutine (WaitDaily)
 	dailyPruneFn func(context.Context) (PruneReport, error)
 	dailyProcsFn func(context.Context) (ProcsReport, error)
+	tmpPruneMu   sync.Mutex // held while a temp dir pass runs (StartTmpPrune); guards tmpPruneLast
+	tmpPruneLast time.Time  // when the last temp dir pass was started
 
 	noteMu       sync.Mutex     // guards noteUnmarked
 	noteUnmarked map[int64]bool // SLO breaches a delivery carried whose noted mark failed (wakes.go)

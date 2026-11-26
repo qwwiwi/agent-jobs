@@ -105,7 +105,7 @@ func TestPruneOneKeepsSessionsWhileAcceptanceGroupAlive(t *testing.T) {
 			groupExists = func(got int) bool { return got == pgid && live }
 			t.Cleanup(func() { groupExists = oldExists })
 			cutoff := m.Now().Add(-PruneAge)
-			pj, ok, err := m.pruneOne(j.ID, cutoff, false)
+			pj, ok, err := m.pruneOne(j.ID, cutoff, time.Time{}, false, false)
 			if err != nil || !ok || pj.Error != "" || !strings.Contains(pj.Skipped, "acceptance process group") || len(pj.Removed) != 0 {
 				t.Fatalf("prune with live acceptance group: %+v, ok %v, err %v", pj, ok, err)
 			}
@@ -113,7 +113,7 @@ func TestPruneOneKeepsSessionsWhileAcceptanceGroupAlive(t *testing.T) {
 				t.Fatalf("live acceptance group lost transcript contents: %q", got)
 			}
 			live = false
-			pj, ok, err = m.pruneOne(j.ID, cutoff, false)
+			pj, ok, err = m.pruneOne(j.ID, cutoff, time.Time{}, false, false)
 			if err != nil || !ok || pj.Error != "" || pj.Skipped != "" {
 				t.Fatalf("prune after acceptance group exits: %+v, ok %v, err %v", pj, ok, err)
 			}

@@ -29,16 +29,27 @@ type DiskStatus struct {
 	TotalBytes uint64  `json:"total_bytes"`
 	FreeBytes  uint64  `json:"free_bytes"` // available to this user
 	UsedPct    float64 `json:"used_pct"`
-	// PrunableBytes is what `prune` would remove now (job folders finished > 48 h ago).
+	// PrunableBytes is what `prune` would remove now (job folders finished > 48 h ago, temp dirs of
+	// jobs finished > job_tmp_retention_hours ago).
 	PrunableBytes int64 `json:"prunable_bytes"`
 	// PruneError is a failure of the prune dry run behind PrunableBytes (then the number may be low).
 	PruneError string `json:"prune_error,omitempty"`
 	// LargestJobDirs are the MaxLargestJobDirs biggest job folders (worktrees of repo jobs left out).
 	LargestJobDirs []JobDirUsage `json:"largest_job_dirs"`
 	// JobTmpBytes is what all job temp dirs (<jobdir>/tmp, the jobs' TMPDIR) hold together.
-	JobTmpBytes int64  `json:"job_tmp_bytes"`
-	Error       string `json:"error,omitempty"`
+	JobTmpBytes int64 `json:"job_tmp_bytes"`
+	// JobDirsBytes is what all job folders hold together (worktrees of repo jobs left out): the sizes
+	// recorded when each job ended or was pruned, and for running jobs a bounded walk made now.
+	// JobDirsPartial: a walk stopped at its bound or was skipped for lack of time, so JobDirsBytes
+	// and JobTmpBytes are lower bounds.
+	JobDirsBytes   int64  `json:"job_dirs_bytes"`
+	JobDirsPartial bool   `json:"job_dirs_partial,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
+
+// runningDirsBudget bounds the walks of all running jobs' folders in one disk status together (each
+// walk has the bounds of jobDirSize besides).
+var runningDirsBudget = 5 * time.Second
 
 // MaxLargestJobDirs is how many job folders DiskStatus lists.
 const MaxLargestJobDirs = 5
@@ -53,36 +64,49 @@ type JobDirUsage struct {
 	Partial  bool   `json:"partial,omitempty"`
 }
 
-// largestJobDirs returns the largest job folders, biggest first, and the total of their temp dirs,
-// from the sizes recorded on the rows (recordDirSize: when an attempt ended, after a prune); nothing
-// is walked here. A job that is still running has no recorded size yet.
-func (m *Manager) largestJobDirs() ([]JobDirUsage, int64, error) {
+// jobDirs fills the job folder part of the disk status: the largest folders, biggest first, the total
+// of all folders and of their temp dirs. The sizes are those recorded on the rows (recordDirSize:
+// when an attempt ended, after a prune); only the folder of a running job, which has no current
+// record, is measured here (jobDirSize, a bounded read-only walk), all of them within
+// runningDirsBudget.
+func (m *Manager) jobDirs(d *DiskStatus) error {
 	all, err := m.Store.List(-1) // negative: no limit
 	if err != nil {
-		return nil, 0, err
+		return err
 	}
+	deadline := time.Now().Add(runningDirsBudget)
 	var out []JobDirUsage
-	var tmp int64
 	for _, j := range all {
-		tmp += j.DirTmpBytes
-		if j.DirBytes > 0 {
-			out = append(out, JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial})
+		u := JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial}
+		if j.Status == store.StatusRunning {
+			if time.Now().After(deadline) {
+				d.JobDirsPartial = true
+			} else if s, err := jobDirSize(j, m.JobDir(j.ID)); err == nil {
+				u.Bytes, u.TmpBytes, u.Partial = s.Bytes, s.TmpBytes, s.Partial
+				d.JobDirsPartial = d.JobDirsPartial || s.Partial
+			}
+		}
+		d.JobDirsBytes += u.Bytes
+		d.JobTmpBytes += u.TmpBytes
+		if u.Bytes > 0 {
+			out = append(out, u)
 		}
 	}
 	slices.SortStableFunc(out, func(a, b JobDirUsage) int { return cmp.Compare(b.Bytes, a.Bytes) })
 	if len(out) > MaxLargestJobDirs {
 		out = out[:MaxLargestJobDirs]
 	}
-	return out, tmp, nil
+	if out != nil {
+		d.LargestJobDirs = out
+	}
+	return nil
 }
 
 // Disk reports the state dir's filesystem.
 func (m *Manager) Disk() DiskStatus {
 	d := DiskStatus{Path: m.StateDir, LargestJobDirs: []JobDirUsage{}}
-	if dirs, tmp, err := m.largestJobDirs(); err != nil {
+	if err := m.jobDirs(&d); err != nil {
 		d.Error = "job folders: " + err.Error()
-	} else {
-		d.LargestJobDirs, d.JobTmpBytes = dirs, tmp
 	}
 	var st unix.Statfs_t
 	if err := unix.Statfs(m.StateDir, &st); err != nil {

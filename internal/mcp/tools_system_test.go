@@ -304,3 +304,39 @@ func TestSystemDoctorHTTPAPINotServing(t *testing.T) {
 		t.Fatalf("problems %q", out.Problems)
 	}
 }
+
+// #240: system_doctor warns (ok unaffected) once all job folders together reach job_dirs_warn_gb.
+func TestSystemDoctorJobDirsWarning(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin
+	now := time.Now()
+	j := &store.Job{ID: "big", Agent: m.Agent, Title: "t", Kind: "general", Brief: "b", Status: store.StatusSucceeded,
+		Model: "sonnet", MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, CreatedAt: now, StartedAt: &now, FinishedAt: &now}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Store.SetDirBytes("big", 3<<30, 2<<30, false); err != nil {
+		t.Fatal(err)
+	}
+	warned := func() bool {
+		cs := connect(t, mustServer(t, m))
+		var out SystemDoctorOutput
+		call(t, cs, "system_doctor", map[string]any{}, &out)
+		if out.Disk.JobDirsBytes != 3<<30 {
+			t.Fatalf("disk.job_dirs_bytes %d", out.Disk.JobDirsBytes)
+		}
+		return slices.ContainsFunc(out.Warnings, func(w string) bool { return strings.HasPrefix(w, "job folders: 3.0 GB") })
+	}
+	if warned() {
+		t.Fatal("3 GB warned below the default threshold")
+	}
+	gb := 3
+	m.Cfg.JobDirsWarnGB = &gb
+	if !warned() {
+		t.Fatal("no warning at job_dirs_warn_gb")
+	}
+	gb = 0
+	if warned() {
+		t.Fatal("warning with job_dirs_warn_gb 0")
+	}
+}
