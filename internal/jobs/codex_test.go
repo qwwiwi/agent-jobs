@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -142,7 +143,7 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		"--disable\nmulti_agent\n--disable\nplugins\n--disable\nplugin_sharing\n--disable\nremote_plugin\n" +
 		"--disable\nskill_mcp_dependency_install\n--disable\ndaemon_auto_start\n" +
 		"--disable\nin_app_local_automation\n--disable\ngoals\n--disable\nrealtime_conversation\n" +
-		"--disable\nworktrees\n--disable\nhooks\n" +
+		"--disable\nworktrees\n--disable\nhooks\n-c\nagents.enabled=false\n" +
 		"-m\ngpt-6.1-sol\n-c\nmodel_reasoning_effort=high\n-\n"
 	if string(argv) != want {
 		t.Fatalf("codex argv:\n%s\nwant:\n%s", argv, want)
@@ -583,5 +584,34 @@ func TestParseCodexStreamStrict(t *testing.T) {
 		t.Fatalf("read error not propagated: %+v", r)
 	} else if st, msg := Verdict(0, r, dir); st != store.StatusFailed || !strings.Contains(msg, "stream") {
 		t.Fatalf("read error verdict %s %q", st, msg)
+	}
+}
+
+// Issue #243: `--disable multi_agent` turns off only codex's V1 collab feature; a model whose catalog
+// entry says multi_agent_version V2 still gets the spawn tools unless `agents.enabled` is false (codex
+// rust-v0.172.0, Config::multi_agent_version_override). Every sandbox's argv carries the override once,
+// as a `-c` value, next to the --disable flags and before the prompt, and the wrapper accepts it.
+func TestCodexArgsDisableAgentsV2(t *testing.T) {
+	jobDir := filepath.Join(t.TempDir(), "jobs", "j1")
+	for _, sandbox := range []string{CodexSandboxReadOnly, CodexSandboxWrite, CodexSandboxFullAccess} {
+		args := CodexArgs(&store.Job{Kind: "fix", Model: "gpt-6.1-sol"}, "high", sandbox, jobDir, true)
+		const override = "agents.enabled=false"
+		i := slices.Index(args, override)
+		if i < 1 || args[i-1] != "-c" {
+			t.Fatalf("%s: argv lacks -c %s: %q", sandbox, override, args)
+		}
+		if n := strings.Count(strings.Join(args, "\n")+"\n", "\n"+override+"\n"); n != 1 {
+			t.Fatalf("%s: %s given %d times: %q", sandbox, override, n, args)
+		}
+		ma := slices.Index(args, "multi_agent")
+		if ma < 1 || args[ma-1] != "--disable" {
+			t.Fatalf("%s: --disable multi_agent dropped: %q", sandbox, args)
+		}
+		if i > slices.Index(args, "-m") || i > slices.Index(args, "-") {
+			t.Fatalf("%s: override after the model or the prompt: %q", sandbox, args)
+		}
+		if _, err := codexArgvSandbox(append([]string{"codex"}, args...)); err != nil {
+			t.Fatalf("%s: wrapper refuses the argv: %v", sandbox, err)
+		}
 	}
 }

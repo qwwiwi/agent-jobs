@@ -634,10 +634,16 @@ func codexPreamble(pre string, j *store.Job, jobDir string, cfg Config) (string,
 // danger-full-access codex confines no network anyway.
 const CodexNetworkOverride = "sandbox_workspace_write.network_access=true"
 
+// CodexAgentsOverride is the `-c` override that keeps sub-agents off for models whose catalog entry
+// selects multi-agent V2 (issue #243): `--disable multi_agent` turns off only the V1 collab feature, and
+// codex lets `agents.enabled=false` (MultiAgentVersion::Disabled) override the model's V2 (codex
+// rust-v0.172.0, codex-rs/core/src/config/mod.rs Config::multi_agent_version_override).
+const CodexAgentsOverride = "agents.enabled=false"
+
 // CodexArgs is the `codex exec` command line of a job: non-interactive, JSON events on stdout,
 // isolated from the owner's codex setup (no user config, rules or session files, no MCP servers, the
-// CodexDisabledFeatures off, never asks for approval), no git-repo check (a job without a repo works in
-// an empty dir), the given sandbox (the kind's, CodexSandbox, or CodexSandboxFullAccess under
+// CodexDisabledFeatures off, sub-agents off by CodexAgentsOverride, never asks for approval), no
+// git-repo check (a job without a repo works in an empty dir), the given sandbox (the kind's, CodexSandbox, or CodexSandboxFullAccess under
 // codex_sandbox worktree-full-access), under workspace-write the job's progress folder in jobDir as the
 // one extra writable root (codexProgressRoot) and, with network, CodexNetworkOverride, the job's model
 // and reasoning effort; the prompt arrives on stdin ("-"). The working dir is the job's work dir (set by
@@ -656,6 +662,7 @@ func CodexArgs(j *store.Job, effort, sandbox, jobDir string, network bool) []str
 	for _, f := range CodexDisabledFeatures {
 		args = append(args, "--disable", f)
 	}
+	args = append(args, "-c", CodexAgentsOverride)
 	return append(args, "-m", j.Model, "-c", "model_reasoning_effort="+effort, "-")
 }
 
