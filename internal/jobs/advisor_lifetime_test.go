@@ -511,7 +511,7 @@ func TestAdvisorScopeSurvivorKeepsOwnership(t *testing.T) {
 	if _, err := e.m.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
 		t.Fatalf("resume with an advisor survivor: %v", err)
 	}
-	if pj, ok, err := e.m.pruneOne(j.ID, e.m.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+	if pj, ok, err := e.m.pruneOne(j.ID, e.m.Now().Add(time.Hour), time.Time{}, false, true); err != nil || !ok || pj.Skipped == "" {
 		t.Fatalf("prune with an advisor survivor: %+v %v %v", pj, ok, err)
 	}
 	if err := e.m.Tick(); err != nil {
@@ -534,7 +534,7 @@ func TestAdvisorScopeSurvivorKeepsOwnership(t *testing.T) {
 	if _, err := m2.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
 		t.Fatalf("resume with an advisor survivor after a restart: %v", err)
 	}
-	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), time.Time{}, false, true); err != nil || !ok || pj.Skipped == "" {
 		t.Fatalf("prune with an advisor survivor after a restart: %+v %v %v", pj, ok, err)
 	}
 	if err := m2.Tick(); err != nil {
@@ -736,7 +736,7 @@ func TestAdvisorMarkerlessSurvivorKeepsOwnership(t *testing.T) {
 	if _, err := m2.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
 		t.Fatalf("resume with a markerless advisor survivor after a restart: %v", err)
 	}
-	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+	if pj, ok, err := m2.pruneOne(j.ID, m2.Now().Add(time.Hour), time.Time{}, false, true); err != nil || !ok || pj.Skipped == "" {
 		t.Fatalf("prune with a markerless advisor survivor after a restart: %+v %v %v", pj, ok, err)
 	}
 	// The child ends by itself: the next tick finds nothing of the call left and drops the registration.

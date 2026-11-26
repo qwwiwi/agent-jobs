@@ -171,7 +171,7 @@ func TestAdvisorStatReadFailureKeepsOwnership(t *testing.T) {
 			if _, err := e.m.Resume(j.ID, "go on", Limits{}); err == nil || !strings.Contains(err.Error(), "advisor") {
 				t.Fatalf("resume while an advisor child could not be inspected: %v", err)
 			}
-			if pj, ok, err := e.m.pruneOne(j.ID, e.m.Now().Add(time.Hour), true); err != nil || !ok || pj.Skipped == "" {
+			if pj, ok, err := e.m.pruneOne(j.ID, e.m.Now().Add(time.Hour), time.Time{}, false, true); err != nil || !ok || pj.Skipped == "" {
 				t.Fatalf("prune while an advisor child could not be inspected: %+v %v %v", pj, ok, err)
 			}
 			if err := e.m.Tick(); err != nil {

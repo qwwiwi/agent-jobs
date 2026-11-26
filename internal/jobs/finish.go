@@ -717,9 +717,9 @@ func (m *Manager) cleanupDue() error {
 		if j.NotifiedAt == nil || now.Sub(*j.NotifiedAt) < CleanupDelay {
 			continue
 		}
-		if j.ScopePending || m.advisorPending(j) {
+		if k := m.lifecycleHoldKind(j); k == holdScope || k == holdAdvisor {
 			continue // processes of the job may still use the worktree; retried after the scope stop
-		}
+		} // a live process group is refused by Cleanup itself: reported, with a backoff
 		f := m.cleanupFails[j.ID]
 		if now.Before(f.next) {
 			continue // backing off
@@ -863,11 +863,8 @@ func (m *Manager) Cleanup(j *store.Job) error {
 	if j.RepoPath == "" {
 		return nil // empty work dir, nothing to preserve; prune comes later
 	}
-	if m.spawnedGroupAlive(j) {
-		return fmt.Errorf("refusing to touch %s: process group %d of the job is still alive", work, j.PGID)
-	}
-	if m.acceptanceGroupAlive(j) {
-		return fmt.Errorf("refusing to touch %s: acceptance process group %d of the job is still alive", work, j.AcceptancePGID)
+	if hold := m.lifecycleHold(j); hold != "" {
+		return fmt.Errorf("refusing to touch %s: %s", work, hold)
 	}
 	fi, err := os.Lstat(work)
 	if os.IsNotExist(err) {

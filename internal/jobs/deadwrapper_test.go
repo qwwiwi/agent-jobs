@@ -106,7 +106,7 @@ func TestDeadWrapperLiveGroupBlocksResumeAndCleanup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.JobDir(j.ID), "work", ".git")); err != nil {
 		t.Fatalf("worktree removed: %v", err)
 	}
-	pj := m.pruneJob(j, true)
+	pj := m.pruneJob(j, true, false)
 	if !strings.Contains(pj.Skipped, "still alive") {
 		t.Fatalf("prune with a live group: %+v", pj)
 	}
