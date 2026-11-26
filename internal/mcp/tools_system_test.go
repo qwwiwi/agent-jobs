@@ -340,3 +340,36 @@ func TestSystemDoctorJobDirsWarning(t *testing.T) {
 		t.Fatal("warning with job_dirs_warn_gb 0")
 	}
 }
+
+// #240: a finished job that still records a temp dir well past the retention is a problem in
+// system_doctor, naming the job; the doctor reads rows for it (no prune dry run).
+func TestSystemDoctorPruneOverdue(t *testing.T) {
+	m := newManager(t)
+	m.SelfBin = selfBin
+	fin := time.Now().Add(-5 * time.Hour)
+	j := &store.Job{ID: "stuck", Agent: m.Agent, Title: "t", Kind: "general", Brief: "b", Status: store.StatusFailed,
+		Model: "sonnet", MaxTurns: 80, MaxBudgetUSD: 10, TimeoutMinutes: 45, CreatedAt: fin, StartedAt: &fin, FinishedAt: &fin}
+	if err := m.Store.Insert(j); err != nil {
+		t.Fatal(err)
+	}
+	doctor := func() SystemDoctorOutput {
+		cs := connect(t, mustServer(t, m))
+		var out SystemDoctorOutput
+		call(t, cs, "system_doctor", map[string]any{}, &out)
+		return out
+	}
+	behind := func(out SystemDoctorOutput) bool {
+		return slices.ContainsFunc(out.Problems, func(p string) bool {
+			return strings.HasPrefix(p, "prune is behind: ") && strings.Contains(p, "stuck")
+		})
+	}
+	if out := doctor(); out.Disk.PruneOverdue != 0 || behind(out) {
+		t.Fatalf("a job without a recorded temp dir is overdue: %+v", out.Problems)
+	}
+	if err := m.Store.SetDirBytes("stuck", 3<<20, 2<<20, false); err != nil {
+		t.Fatal(err)
+	}
+	if out := doctor(); out.Disk.PruneOverdue != 1 || out.Disk.PrunableBytes != 2<<20 || !behind(out) {
+		t.Fatalf("overdue %d prunable %d problems %v", out.Disk.PruneOverdue, out.Disk.PrunableBytes, out.Problems)
+	}
+}

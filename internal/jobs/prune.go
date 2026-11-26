@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,6 +37,8 @@ type PruneEntry struct {
 	Path   string `json:"path"`
 	Bytes  int64  `json:"bytes"`
 	Reason string `json:"reason"`
+	// Partial: a dry run's bounded measurement stopped early, Bytes is a lower bound.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // PruneJob is what prune does to one job folder.
@@ -58,6 +59,8 @@ type PruneReport struct {
 	DryRun bool       `json:"dry_run"`
 	Jobs   []PruneJob `json:"jobs"`
 	Bytes  int64      `json:"bytes"` // total size of what was (or would be) removed
+	// Partial: a dry run measured at least one entry only up to its bound, Bytes is a lower bound.
+	Partial bool `json:"partial,omitempty"`
 	// ArchivedBytes is the size of the files moved into the log archive (before gzip).
 	ArchivedBytes int64 `json:"archived_bytes"`
 	// ArchiveExpired are the archived months removed by the archive retention (log_archive_days).
@@ -135,6 +138,9 @@ func (m *Manager) prune(ctx context.Context, dryRun, tmpPass bool) (PruneReport,
 		}
 		rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
 		unlock()
+		for _, e := range rep.ArchiveExpired {
+			rep.Partial = rep.Partial || e.Partial
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("archive retention: %w", err))
 		}
@@ -159,6 +165,7 @@ func (m *Manager) prune(ctx context.Context, dryRun, tmpPass bool) (PruneReport,
 		}
 		for _, e := range pj.Removed {
 			rep.Bytes += e.Bytes
+			rep.Partial = rep.Partial || e.Partial
 		}
 		for _, e := range pj.Archived {
 			rep.ArchivedBytes += e.Bytes
@@ -337,7 +344,8 @@ const pruneSkipBudget = "removal continues on the next pass"
 // (a mount point below p) also lists what it freed before the error is returned.
 func pruneRemove(pj *PruneJob, p, reason string, dryRun bool) (stop bool, err error) {
 	if dryRun {
-		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: treeSize(p), Reason: reason})
+		n, partial := boundedSize(p)
+		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: n, Reason: reason, Partial: partial})
 		return false, nil
 	}
 	n, err := removeTreeSized(p)
@@ -461,23 +469,8 @@ func isTextFile(p string) (bool, error) {
 	return utf8.Valid(b), nil
 }
 
-// treeSize sums the sizes of everything under p (symlinks counted as links, never followed).
-func treeSize(p string) int64 {
-	var n int64
-	_ = filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			n += fi.Size()
-		}
-		return nil
-	})
-	return n
-}
-
-// Bounds of one job folder measurement (jobDirSize), which runs synchronously when a job settles: a
-// walk stops after this many entries or this long, and the size is then recorded as partial.
+// Bounds of one measurement (jobDirSize, which runs synchronously when a job settles; boundedSize, one
+// entry of a prune dry run): a walk stops after this many entries or this long, and the size is then recorded as partial.
 var (
 	dirWalkMaxEntries = 200_000
 	dirWalkBudget     = 2 * time.Second
@@ -542,6 +535,29 @@ func (w *dirWalk) size(dirfd int, name string, depth int) int64 {
 		}
 	})
 	return n
+}
+
+// boundedSize sums the sizes of p and everything under it (symlinks counted as links, never followed,
+// no mount point entered) within dirWalkMaxEntries and dirWalkBudget; partial says the walk stopped
+// early and the sum is a lower bound. A path that is not there counts 0.
+func boundedSize(p string) (n int64, partial bool) {
+	p = filepath.Clean(p)
+	parent, err := unix.Open(filepath.Dir(p), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, false
+	}
+	defer unix.Close(parent)
+	var st unix.Stat_t
+	if unix.Fstatat(parent, filepath.Base(p), &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+		return 0, false
+	}
+	n = st.Size
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return n, false
+	}
+	w := &dirWalk{left: dirWalkMaxEntries, deadline: time.Now().Add(dirWalkBudget)}
+	n += w.size(parent, filepath.Base(p), 0)
+	return n, w.partial
 }
 
 // jobDirSize measures job j's folder dir, the worktree of a repo job left out (it is the repository's

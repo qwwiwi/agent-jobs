@@ -1628,7 +1628,11 @@ func cmdPrune(args []string) error {
 			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
 		}
 	}
-	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	atLeast := ""
+	if rep.Partial {
+		atLeast = "at least " // a dry run measures each entry within a bound
+	}
+	fmt.Printf("prune: %d job folders, %s %s%d bytes\n", len(rep.Jobs), verb, atLeast, rep.Bytes)
 	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
 	return perr
 }

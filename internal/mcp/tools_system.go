@@ -87,7 +87,8 @@ type MCPServerStatus struct {
 func addSystemDoctor(s *sdk.Server, d Deps) {
 	addManagerTool(s, d, &sdk.Tool{
 		Name: "system_doctor",
-		Description: "Health of this agent's job system: disk (free space, what prune would free, " +
+		Description: "Health of this agent's job system: disk (free space, prunable_bytes: an estimate from recorded sizes of what prune would free, " +
+			"prune_overdue: finished jobs that still hold their temp dir well past job_tmp_retention_hours, each run a problem naming the oldest, " +
 			"job_dirs_bytes: all job folders together, running jobs measured now by a bounded walk, job_dirs_partial when that is a lower bound; " +
 			"at job_dirs_warn_gb and above it is listed in warnings), the queue " +
 			"(configured_max_running is the value of config.json as this MCP server last loaded it, reloaded when the file changes; the daemon's active cap is max_running in /v1/health; " +
@@ -194,7 +195,7 @@ func addSystemDoctor(s *sdk.Server, d Deps) {
 				atLeast, jobs.SizeText(out.Disk.JobDirsBytes), jobs.SizeText(out.Disk.JobTmpBytes), warn>>30, jobs.SizeText(out.Disk.PrunableBytes)))
 		}
 		if out.Disk.PruneError != "" {
-			out.Problems = append(out.Problems, "prune dry run failed (prunable bytes may be low): "+out.Disk.PruneError)
+			out.Problems = append(out.Problems, "prune is behind: "+out.Disk.PruneError)
 		}
 		for _, c := range out.Hooks {
 			if !c.OK {

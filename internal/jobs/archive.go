@@ -547,14 +547,16 @@ func (m *Manager) expireArchive(dryRun bool) (out []PruneEntry, off string, err 
 			continue
 		}
 		p := filepath.Join(root, e.Name())
-		size := treeSize(p)
+		size, partial := boundedSize(p)
 		if !dryRun {
-			if err := removeTree(p); err != nil {
+			n, err := removeTreeSized(p)
+			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
+			size, partial = n, false
 		}
-		out = append(out, PruneEntry{Path: p, Bytes: size, Reason: fmt.Sprintf("archived month older than %d days", days)})
+		out = append(out, PruneEntry{Path: p, Bytes: size, Reason: fmt.Sprintf("archived month older than %d days", days), Partial: partial})
 	}
 	return out, "", errors.Join(errs...)
 }
