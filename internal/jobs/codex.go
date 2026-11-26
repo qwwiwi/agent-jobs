@@ -736,8 +736,10 @@ var errStopWalk = errors.New("stop walk")
 var errCodexHomeLink = errors.New("codex home is a symlink, not walked")
 
 // openCodexHome opens codex's home directory without following a final symlink: a symlinked home is
-// errCodexHomeLink.
+// errCodexHomeLink. Trailing separators are stripped first ("/" stays "/"): with "link/" the kernel
+// resolves the link before either check could see it.
 func openCodexHome(home string) (int, error) {
+	home = filepath.Clean(home)
 	if fi, err := os.Lstat(home); err == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return -1, errCodexHomeLink
 	}

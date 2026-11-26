@@ -158,14 +158,17 @@ func TestPruneCodexRollouts(t *testing.T) {
 	}
 }
 
-// A CODEX_HOME that is a symlink (to a session archive, say) is never walked through: prune leaves the
-// rollouts behind it alone and logs that once, and neither the usage reader nor resume admission
-// looks behind it.
+// A CODEX_HOME that is a symlink (to a session archive, say) is never walked through, however it is
+// spelled (with a trailing separator the kernel resolves the link before any no-follow check): prune
+// leaves the rollouts behind it alone and logs that once, and neither the usage reader nor resume
+// admission looks behind it.
 func TestPruneCodexRolloutsSymlinkedHome(t *testing.T) {
 	m := newCodexManager(t)
 	codexResumable(m)
+	link := filepath.Join(t.TempDir(), "codex-home")
+	spellings := []string{link, link + "/", link + "//"}
 	var ids []string
-	for range 2 {
+	for range spellings {
 		j := runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
 		if j.Status != store.StatusSucceeded || j.SessionID != fakeCodexThread {
 			t.Fatalf("got %s %q session %q", j.Status, j.Error, j.SessionID)
@@ -177,30 +180,29 @@ func TestPruneCodexRolloutsSymlinkedHome(t *testing.T) {
 	if _, ok := codexRolloutUsage(archive, fakeCodexThread); !ok || !codexRolloutExists(archive, fakeCodexThread) {
 		t.Fatal("the rollout must be found under a real CODEX_HOME")
 	}
-	link := filepath.Join(t.TempDir(), "codex-home")
 	if err := os.Symlink(archive, link); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CODEX_HOME", link)
-	if u, ok := codexRolloutUsage(link, fakeCodexThread); ok {
-		t.Fatalf("usage read through a symlinked CODEX_HOME: %+v", u)
-	}
-	if codexRolloutExists(link, fakeCodexThread) {
-		t.Fatal("resume admitted through a symlinked CODEX_HOME")
-	}
 	var logs bytes.Buffer
 	m.Log = log.New(&logs, "", 0)
-	for _, id := range ids {
-		pj, ok, err := m.pruneOne(id, m.Now().Add(time.Hour), false)
+	for i, home := range spellings {
+		t.Setenv("CODEX_HOME", home)
+		if u, ok := codexRolloutUsage(home, fakeCodexThread); ok {
+			t.Fatalf("usage read through a symlinked CODEX_HOME %q: %+v", home, u)
+		}
+		if codexRolloutExists(home, fakeCodexThread) {
+			t.Fatalf("resume admitted through a symlinked CODEX_HOME %q", home)
+		}
+		pj, ok, err := m.pruneOne(ids[i], m.Now().Add(time.Hour), false)
 		if err != nil || !ok || pj.Error != "" {
 			t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
 		}
 		if slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Reason == "codex rollout of the job" }) {
-			t.Fatalf("prune removed a rollout through a symlinked CODEX_HOME: %+v", pj.Removed)
+			t.Fatalf("prune removed a rollout through a symlinked CODEX_HOME %q: %+v", home, pj.Removed)
 		}
-	}
-	if _, err := os.Stat(rollout); err != nil {
-		t.Fatalf("the archived rollout behind the symlinked CODEX_HOME was touched: %v", err)
+		if _, err := os.Stat(rollout); err != nil {
+			t.Fatalf("the archived rollout behind the symlinked CODEX_HOME %q was touched: %v", home, err)
+		}
 	}
 	if n := strings.Count(logs.String(), "CODEX_HOME"); n != 1 {
 		t.Fatalf("the skipped prune must be logged once, got %d lines:\n%s", n, logs.String())
