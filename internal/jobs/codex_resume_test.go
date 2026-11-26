@@ -312,3 +312,23 @@ func TestParseCodexStream0172Usage(t *testing.T) {
 		t.Fatalf("parsed %+v", r)
 	}
 }
+
+// A codex turn that ends with a final message without a Summary section (it stopped mid-task) is no
+// report: the attempt fails like a claude one, and it is continued once.
+func TestCodexNoSummaryAutoContinued(t *testing.T) {
+	m := newCodexManager(t)
+	noAutoContinue(m)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCESTILL", codexReview).ID)
+	if j.Status != store.StatusFailed || !strings.Contains(j.Error, NoteNoSummary) {
+		t.Fatalf("a final message without a Summary: %s %q", j.Status, j.Error)
+	}
+
+	m = newCodexManager(t)
+	j = runCodexToRest(t, m, enqueue(t, m, "FAKE_CODEX_ONCESTILL", codexReview).ID)
+	if j.Status != store.StatusSucceeded || j.Attempt != 2 {
+		t.Fatalf("not continued: %s %q attempt %d", j.Status, j.Error, j.Attempt)
+	}
+	if line := m.DoneLineFor(j); !strings.Contains(line, "auto-continued (attempt 2") {
+		t.Fatalf("done line %q", line)
+	}
+}

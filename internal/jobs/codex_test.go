@@ -104,6 +104,11 @@ if [[ $prompt == *FAKE_CODEX_ONCEFAIL* && ! -d ../attempts ]]; then
   echo '{"type":"turn.failed","error":{"message":"model overloaded"}}'
   exit 1
 fi
+if [[ $prompt == *FAKE_CODEX_ONCESTILL* && ! -d ../attempts ]]; then
+  echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Still working"}}'
+  echo "{\"type\":\"turn.completed\",\"usage\":$usage}"
+  exit 0
+fi
 if [[ $prompt == *FAKE_CODEX_ONCENOREPORT* && ! -d ../attempts ]]; then
   echo "{\"type\":\"turn.completed\",\"usage\":$usage}"
   exit 0
