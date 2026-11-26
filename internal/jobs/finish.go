@@ -355,7 +355,7 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	t := m.Config().NotifyTmuxTarget
-	if t == "" {
+	if t == "" && !m.Config().Notify.enabled() {
 		for _, j := range jobs {
 			m.checkMerge(j)
 			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", m.DoneLineFor(j))
@@ -473,13 +473,35 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
+	ref := WakeJobDone + ":" + strings.Join(batchRefs(batch), ",")
+	if target == "" {
+		// No tmux target: the sinks of config notify alone carry the line. They are best effort (a
+		// failure is logged), so the batch is marked notified whatever they answered; the idle note
+		// is a tmux matter and does not ride.
+		if err := m.deliverVia(context.Background(), WakeJobDone, ref, batchMembers(batch), line, true,
+			func(_ context.Context, l string) (string, error) {
+				m.notifySinks(ref, l)
+				return l, nil
+			}); err != nil {
+			return false, err
+		}
+		if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now(), nil); err != nil {
+			return false, err
+		}
+		for _, j := range batch {
+			m.forgetMergeNote(j.ID)
+		}
+		return false, nil
+	}
 	// An emptied queue adds its idle note to this same line (#165), never a line of its own. The note
 	// is only a candidate here: its final check runs inside the tmux delivery, under the idle lock.
 	note, epoch, retry := m.idleDelivery(batch)
 	var rode bool
+	var sent string
 	err = m.withTmuxLock(func(ctx context.Context) error {
-		return m.deliverVia(ctx, WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs(batch), ","), batchMembers(batch), line, true,
-			func(ctx context.Context, l string) (string, error) {
+		return m.deliverVia(ctx, WakeJobDone, ref, batchMembers(batch), line, true,
+			func(ctx context.Context, l string) (l2 string, err error) {
+				defer func() { sent = l2 }()
 				if err := m.waitPaneOutOfMode(ctx, target); err != nil {
 					return "", err
 				}
@@ -520,6 +542,9 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	for _, j := range batch {
 		m.forgetMergeNote(j.ID)
 	}
+	// The sinks of config notify get the line tmux accepted, after its acknowledgement: they never
+	// hold up or fail the session's own delivery.
+	m.notifySinks(ref, sent)
 	return false, nil
 }
 

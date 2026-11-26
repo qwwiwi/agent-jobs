@@ -75,6 +75,9 @@ type Config struct {
 	// NotifyCoalesceMaxSeconds caps the held window from the first held job's finish, however many
 	// jobs keep finishing inside it. 0 = DefaultNotifyCoalesceMax (300 s).
 	NotifyCoalesceMaxSeconds int `json:"notify_coalesce_max_seconds"`
+	// Notify holds the extra sinks of a job-done line (a command, a file inbox), both off by default;
+	// see NotifyConfig. With NotifyTmuxTarget empty they alone carry the line.
+	Notify NotifyConfig `json:"notify"`
 	// OwnerNames must never appear in a job's commit (guard).
 	OwnerNames []string `json:"owner_names"`
 	// GitName / GitEmail is the job's git identity, both or neither (one alone is a config error: the
@@ -599,6 +602,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if c.NotifyCoalesceMaxSeconds < 0 {
 		return c, fmt.Errorf("config.json: notify_coalesce_max_seconds %d must be 0 (default %d) or positive",
 			c.NotifyCoalesceMaxSeconds, int(DefaultNotifyCoalesceMax/time.Second))
+	}
+	if err := c.Notify.validate(); err != nil {
+		return c, fmt.Errorf("config.json: %w", err)
 	}
 	if c.OwnerWaitsMaxHours < 0 {
 		return c, fmt.Errorf("config.json: owner_waits_max_hours %d must be 0 (default %d) or positive", c.OwnerWaitsMaxHours, DefaultOwnerWaitsMaxHours)

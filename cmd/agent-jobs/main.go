@@ -156,6 +156,9 @@ const usage = `usage: agent-jobs <command> [flags]
   notify-owner --agent A --text T [--urgency normal|high]
                                            one "[jobs:notify-owner] T" line into the notify target
                                            for the session to relay (rate limited, stored)
+  inbox pull --agent A [--ack]             print the pending job-done lines of config notify.inbox_dir,
+                                           oldest first; --ack removes the printed ones (for a
+                                           SessionStart / UserPromptSubmit hook of the session)
   hook stop  --agent A                     Stop hook of the orchestrator session (JSON on stdin):
                                            blocks the stop once per turn while an owner-waits job's
                                            reply to the owner is pending (owner_replied clears it);
@@ -292,6 +295,8 @@ func main() {
 		err = cmdCheck(args)
 	case "notify-owner":
 		err = cmdNotifyOwner(args)
+	case "inbox":
+		err = cmdInbox(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "hook":
