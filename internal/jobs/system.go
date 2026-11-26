@@ -87,7 +87,6 @@ func (m *Manager) jobDirs(d *DiskStatus) error {
 	var oldest *store.Job // the overdue job that finished first
 	for _, j := range all {
 		u := JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial}
-		d.JobDirsPartial = d.JobDirsPartial || j.DirPartial
 		if slices.Contains(pruneStatuses, j.Status) && j.FinishedAt != nil {
 			// What prune would take, from the row alone (no walk, no lifecycle lock).
 			if !j.FinishedAt.After(cutoff) {
@@ -112,6 +111,7 @@ func (m *Manager) jobDirs(d *DiskStatus) error {
 				d.JobDirsPartial = d.JobDirsPartial || s.Partial
 			}
 		}
+		d.JobDirsPartial = d.JobDirsPartial || u.Partial // a recorded lower bound counts like a live one
 		d.JobDirsBytes += u.Bytes
 		d.JobTmpBytes += u.TmpBytes
 		if u.Bytes > 0 {

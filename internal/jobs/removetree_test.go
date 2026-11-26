@@ -208,3 +208,25 @@ func TestRemoveTreeBudget(t *testing.T) {
 		t.Fatalf("deadline: err = %v", err)
 	}
 }
+
+// An empty directory that cannot be opened (mode 0000, a test suite's leftover) is still removed:
+// rmdir needs no descriptor. One with content stays and is reported.
+func TestRemoveTreeUnreadableDirs(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root opens every directory")
+	}
+	tree := filepath.Join(t.TempDir(), "tree")
+	empty, full := filepath.Join(tree, "empty"), filepath.Join(tree, "full")
+	writeFile(t, filepath.Join(full, "f"), []byte("x"), 0o600)
+	if err := os.Mkdir(empty, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(full, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(full, 0o700) })
+	err := removeTree(tree)
+	if !errors.Is(err, syscall.EACCES) || exists(empty) || !exists(full) {
+		t.Fatalf("err %v, empty exists %v, full exists %v; want EACCES for full only", err, exists(empty), exists(full))
+	}
+}

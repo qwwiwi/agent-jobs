@@ -156,3 +156,15 @@ func TestPruneDryRunBoundedWalk(t *testing.T) {
 		t.Fatalf("unbounded: err %v partial %v bytes %d", err, rep.Partial, rep.Bytes)
 	}
 }
+
+// A running job is measured now: the partial flag recorded for its previous attempt does not make the
+// totals lower bounds when the live walk was complete.
+func TestDiskRunningJobUsesLivePartial(t *testing.T) {
+	m := newManager(t)
+	insertJob(t, m, "run", store.StatusRunning, nil, nil)
+	writeBytes(t, filepath.Join(m.JobDir("run"), JobTmpDir, "f"), 4096)
+	recorded(t, m, "run", 10, 10, true)
+	if d := m.Disk(); d.JobDirsPartial || d.JobTmpBytes < 4096 {
+		t.Fatalf("partial %v tmp %d, want the complete live measurement", d.JobDirsPartial, d.JobTmpBytes)
+	}
+}

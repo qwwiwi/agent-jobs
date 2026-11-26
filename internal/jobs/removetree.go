@@ -137,6 +137,14 @@ func (r *remover) removeAt(dfd int, name, path string, depth int) bool {
 	switch {
 	case errors.Is(err, unix.EXDEV):
 		return r.fail(&MountBoundaryError{Path: path})
+	case errors.Is(err, unix.EACCES):
+		// An unreadable directory cannot be entered, but an empty one needs no descriptor: rmdir takes
+		// it (and refuses one with content, and a mount point).
+		if unix.Unlinkat(dfd, name, unix.AT_REMOVEDIR) == nil {
+			r.bytes += st.Size
+			return true
+		}
+		return r.fail(&os.PathError{Op: "open", Path: path, Err: err})
 	case err != nil:
 		return r.fail(&os.PathError{Op: "open", Path: path, Err: err})
 	}
