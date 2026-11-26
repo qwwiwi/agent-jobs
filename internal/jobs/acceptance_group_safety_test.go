@@ -143,7 +143,7 @@ func TestLiveAcceptanceGroupBlocksResumeCleanupAndPrune(t *testing.T) {
 	if err := m.Cleanup(got); err == nil || !strings.Contains(err.Error(), "acceptance process group") || !strings.Contains(err.Error(), "still alive") {
 		t.Fatalf("cleanup with a live acceptance group: %v", err)
 	}
-	if pj := m.pruneJob(got, true); !strings.Contains(pj.Skipped, "acceptance process group") || !strings.Contains(pj.Skipped, "still alive") {
+	if pj := m.pruneJob(got, true, false); !strings.Contains(pj.Skipped, "acceptance process group") || !strings.Contains(pj.Skipped, "still alive") {
 		t.Fatalf("prune with a live acceptance group: %+v", pj)
 	}
 	live = false

@@ -70,7 +70,8 @@ const usage = `usage: agent-jobs <command> [flags]
   daemon     --agent A                     tick every minute, forever
   prune      --agent A [--dry-run]         clean folders of jobs finished > 48 h ago (records and
                                            small top-level text files stay; stream.jsonl, stderr.log
-                                           move gzipped into the log archive, see archive)
+                                           move gzipped into the log archive, see archive) and the
+                                           temp dirs of jobs finished > job_tmp_retention_hours ago
   archive    --agent A [--dry-run] [--json]  move the records of jobs prune would clean into the log
                                            archive (<archive>/<YYYY-MM>/<id>/) and drop months past
                                            log_archive_days; --dry-run shows what would move
@@ -1551,6 +1552,9 @@ func cmdDaemon(args []string) error {
 		// Once a day after daily_hour: prune and doctor procs (report only) in the background, so
 		// the next ticks keep launching jobs while it runs.
 		m.StartDaily(ctx)
+		// Every few minutes: the temp dirs of jobs finished more than job_tmp_retention_hours ago
+		// (the same prune, temp dir only), also in the background.
+		m.StartTmpPrune(ctx)
 		// Heartbeat (off by default): the Go gate, then at most one small-model decision in the
 		// background, so a slow decision never delays the next tick.
 		m.StartHeartbeat(ctx)
@@ -1630,7 +1634,11 @@ func cmdPrune(args []string) error {
 			fmt.Printf("    %s  %d  %s\n", e.Path, e.Bytes, e.Reason)
 		}
 	}
-	fmt.Printf("prune: %d job folders, %s %d bytes\n", len(rep.Jobs), verb, rep.Bytes)
+	atLeast := ""
+	if rep.Partial {
+		atLeast = "at least " // a dry run measures each entry within a bound
+	}
+	fmt.Printf("prune: %d job folders, %s %s%d bytes\n", len(rep.Jobs), verb, atLeast, rep.Bytes)
 	printArchived(rep.ArchivedBytes, rep.ArchiveExpired, rep.RetentionOff, *dry)
 	return perr
 }

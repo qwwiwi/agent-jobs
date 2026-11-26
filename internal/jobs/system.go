@@ -29,16 +29,33 @@ type DiskStatus struct {
 	TotalBytes uint64  `json:"total_bytes"`
 	FreeBytes  uint64  `json:"free_bytes"` // available to this user
 	UsedPct    float64 `json:"used_pct"`
-	// PrunableBytes is what `prune` would remove now (job folders finished > 48 h ago).
+	// PrunableBytes is an estimate from recorded sizes of what `prune` would remove now: the temp dirs
+	// of jobs finished > job_tmp_retention_hours ago and the folders of jobs finished > 48 h ago whose
+	// records are not archived yet (their kept records included). No directory is read for it and no
+	// lock is taken; the exact figure is `agent-jobs prune --dry-run`.
 	PrunableBytes int64 `json:"prunable_bytes"`
-	// PruneError is a failure of the prune dry run behind PrunableBytes (then the number may be low).
-	PruneError string `json:"prune_error,omitempty"`
+	// PruneOverdue is how many finished jobs still record a temp dir well past its retention (the
+	// retention plus three temp dir passes): prune skips them or fails on them (a pending scope stop,
+	// a mount point in the temp dir, openat2 unavailable, a worktree cleanup that has not run).
+	// PruneError says so in words and names the oldest of them.
+	PruneOverdue int    `json:"prune_overdue,omitempty"`
+	PruneError   string `json:"prune_error,omitempty"`
 	// LargestJobDirs are the MaxLargestJobDirs biggest job folders (worktrees of repo jobs left out).
 	LargestJobDirs []JobDirUsage `json:"largest_job_dirs"`
 	// JobTmpBytes is what all job temp dirs (<jobdir>/tmp, the jobs' TMPDIR) hold together.
-	JobTmpBytes int64  `json:"job_tmp_bytes"`
-	Error       string `json:"error,omitempty"`
+	JobTmpBytes int64 `json:"job_tmp_bytes"`
+	// JobDirsBytes is what all job folders hold together (worktrees of repo jobs left out): the sizes
+	// recorded when each job ended or was pruned, and for running jobs a bounded walk made now.
+	// JobDirsPartial: a walk stopped at its bound or was skipped for lack of time, so JobDirsBytes
+	// and JobTmpBytes are lower bounds.
+	JobDirsBytes   int64  `json:"job_dirs_bytes"`
+	JobDirsPartial bool   `json:"job_dirs_partial,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
+
+// runningDirsBudget bounds the walks of all running jobs' folders in one disk status together (each
+// walk has the bounds of jobDirSize besides).
+var runningDirsBudget = 5 * time.Second
 
 // MaxLargestJobDirs is how many job folders DiskStatus lists.
 const MaxLargestJobDirs = 5
@@ -53,36 +70,85 @@ type JobDirUsage struct {
 	Partial  bool   `json:"partial,omitempty"`
 }
 
-// largestJobDirs returns the largest job folders, biggest first, and the total of their temp dirs,
-// from the sizes recorded on the rows (recordDirSize: when an attempt ended, after a prune); nothing
-// is walked here. A job that is still running has no recorded size yet.
-func (m *Manager) largestJobDirs() ([]JobDirUsage, int64, error) {
+// jobDirs fills the job folder part of the disk status: the largest folders, biggest first, the total
+// of all folders and of their temp dirs, the prunable estimate and the overdue temp dirs. The sizes are those recorded on the rows (recordDirSize:
+// when an attempt ended, after a prune); only the folder of a running job, which has no current
+// record, is measured here (jobDirSize, a bounded read-only walk), all of them within
+// runningDirsBudget.
+func (m *Manager) jobDirs(d *DiskStatus) error {
 	all, err := m.Store.List(-1) // negative: no limit
 	if err != nil {
-		return nil, 0, err
+		return err
 	}
+	deadline := time.Now().Add(runningDirsBudget)
+	now := m.Now()
+	cutoff, tmpCutoff, overdueCutoff := now.Add(-PruneAge), m.tmpCutoff(), now.Add(-m.tmpOverdueAfter())
 	var out []JobDirUsage
-	var tmp int64
+	var oldest *store.Job // the overdue job that finished first
 	for _, j := range all {
-		tmp += j.DirTmpBytes
-		if j.DirBytes > 0 {
-			out = append(out, JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial})
+		u := JobDirUsage{ID: j.ID, Status: j.Status, Bytes: j.DirBytes, TmpBytes: j.DirTmpBytes, Partial: j.DirPartial}
+		if slices.Contains(pruneStatuses, j.Status) && j.FinishedAt != nil {
+			// What prune would take, from the row alone (no walk, no lifecycle lock).
+			if !j.FinishedAt.After(cutoff) {
+				if _, archived := m.existingArchiveDir(j); !archived {
+					d.PrunableBytes += j.DirBytes
+				}
+			} else if !j.FinishedAt.After(tmpCutoff) {
+				d.PrunableBytes += j.DirTmpBytes
+			}
+			if j.DirTmpBytes > 0 && j.FinishedAt.Before(overdueCutoff) {
+				d.PruneOverdue++
+				if oldest == nil || j.FinishedAt.Before(*oldest.FinishedAt) {
+					oldest = j
+				}
+			}
+		}
+		if j.Status == store.StatusRunning {
+			if time.Now().After(deadline) {
+				d.JobDirsPartial = true
+			} else if s, err := jobDirSize(j, m.JobDir(j.ID)); err == nil {
+				u.Bytes, u.TmpBytes, u.Partial = s.Bytes, s.TmpBytes, s.Partial
+				d.JobDirsPartial = d.JobDirsPartial || s.Partial
+			}
+		}
+		d.JobDirsPartial = d.JobDirsPartial || u.Partial // a recorded lower bound counts like a live one
+		d.JobDirsBytes += u.Bytes
+		d.JobTmpBytes += u.TmpBytes
+		if u.Bytes > 0 {
+			out = append(out, u)
 		}
 	}
 	slices.SortStableFunc(out, func(a, b JobDirUsage) int { return cmp.Compare(b.Bytes, a.Bytes) })
 	if len(out) > MaxLargestJobDirs {
 		out = out[:MaxLargestJobDirs]
 	}
-	return out, tmp, nil
+	if out != nil {
+		d.LargestJobDirs = out
+	}
+	if oldest != nil {
+		d.PruneError = fmt.Sprintf("%d finished jobs still hold their temp dir past its retention, the oldest is %s (finished %s): "+
+			"prune skips them or fails on them; the reason is in the daemon log and in `agent-jobs prune --dry-run`",
+			d.PruneOverdue, oldest.ID, oldest.FinishedAt.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
-// Disk reports the state dir's filesystem.
+// tmpOverdueAfter is how long after its finish a job that still records a temp dir counts as overdue:
+// the temp retention plus three passes, or with the short retention off, the folder's 48 h plus a day
+// (the daily prune).
+func (m *Manager) tmpOverdueAfter() time.Duration {
+	if r := m.Config().JobTmpRetention(); r > 0 && r < PruneAge {
+		return r + 3*TmpPruneInterval
+	}
+	return PruneAge + 24*time.Hour
+}
+
+// Disk reports the state dir's filesystem. It reads rows and measures running jobs only: it takes no
+// lifecycle lock and opens no directory of a finished job (a prune dry run used to do both).
 func (m *Manager) Disk() DiskStatus {
 	d := DiskStatus{Path: m.StateDir, LargestJobDirs: []JobDirUsage{}}
-	if dirs, tmp, err := m.largestJobDirs(); err != nil {
+	if err := m.jobDirs(&d); err != nil {
 		d.Error = "job folders: " + err.Error()
-	} else {
-		d.LargestJobDirs, d.JobTmpBytes = dirs, tmp
 	}
 	var st unix.Statfs_t
 	if err := unix.Statfs(m.StateDir, &st); err != nil {
@@ -93,18 +159,6 @@ func (m *Manager) Disk() DiskStatus {
 	d.TotalBytes, d.FreeBytes = st.Blocks*bs, st.Bavail*bs
 	if st.Blocks > 0 {
 		d.UsedPct = float64(st.Blocks-st.Bfree) * 100 / float64(st.Blocks)
-	}
-	rep, err := m.Prune(true)
-	d.PrunableBytes = rep.Bytes
-	if err != nil {
-		d.PruneError = err.Error()
-		return d
-	}
-	for _, j := range rep.Jobs {
-		if j.Error != "" {
-			d.PruneError = fmt.Sprintf("job %s: %s", j.ID, j.Error)
-			break
-		}
 	}
 	return d
 }

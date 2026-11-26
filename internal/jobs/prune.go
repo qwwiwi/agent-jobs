@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -38,6 +37,8 @@ type PruneEntry struct {
 	Path   string `json:"path"`
 	Bytes  int64  `json:"bytes"`
 	Reason string `json:"reason"`
+	// Partial: a dry run's bounded measurement stopped early, Bytes is a lower bound.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // PruneJob is what prune does to one job folder.
@@ -58,6 +59,8 @@ type PruneReport struct {
 	DryRun bool       `json:"dry_run"`
 	Jobs   []PruneJob `json:"jobs"`
 	Bytes  int64      `json:"bytes"` // total size of what was (or would be) removed
+	// Partial: a dry run measured at least one entry only up to its bound, Bytes is a lower bound.
+	Partial bool `json:"partial,omitempty"`
 	// ArchivedBytes is the size of the files moved into the log archive (before gzip).
 	ArchivedBytes int64 `json:"archived_bytes"`
 	// ArchiveExpired are the archived months removed by the archive retention (log_archive_days).
@@ -85,8 +88,31 @@ func (m *Manager) Prune(dryRun bool) (PruneReport, error) {
 // further job is started (the one in progress finishes) and the error says so; the report covers
 // what was done.
 func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, error) {
+	return m.prune(ctx, dryRun, false)
+}
+
+// PruneTmpContext is the temp dir part of a prune pass alone: of the jobs that finished more than
+// job_tmp_retention_hours but less than PruneAge ago it removes the temp dir (pruneJob, tmpOnly) and
+// nothing else; no folder is cleaned, nothing is archived and no archived month is expired. The
+// daemon runs it between the daily prunes (StartTmpPrune).
+func (m *Manager) PruneTmpContext(ctx context.Context, dryRun bool) (PruneReport, error) {
+	return m.prune(ctx, dryRun, true)
+}
+
+// tmpCutoff is the finish time up to which a job's temp dir alone is pruned (the zero time when
+// job_tmp_retention_hours is 0 or not shorter than PruneAge: the temp dir then goes with the folder).
+func (m *Manager) tmpCutoff() time.Time {
+	if r := m.Config().JobTmpRetention(); r > 0 && r < PruneAge {
+		return m.Now().Add(-r)
+	}
+	return time.Time{}
+}
+
+// prune is one prune pass; tmpPass limits it to the temp dirs of the jobs not yet due for the full
+// prune (PruneTmpContext).
+func (m *Manager) prune(ctx context.Context, dryRun, tmpPass bool) (PruneReport, error) {
 	rep := PruneReport{DryRun: dryRun, Jobs: []PruneJob{}, ArchiveExpired: []PruneEntry{}}
-	cutoff := m.Now().Add(-PruneAge)
+	cutoff, tmpCutoff := m.Now().Add(-PruneAge), m.tmpCutoff()
 	var ids []string
 	for _, status := range pruneStatuses {
 		list, err := m.Store.ListByStatus(status)
@@ -94,28 +120,37 @@ func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, e
 			return rep, err
 		}
 		for _, j := range list {
-			if j.FinishedAt != nil && !j.FinishedAt.After(cutoff) {
+			if j.FinishedAt == nil {
+				continue
+			}
+			full := !j.FinishedAt.After(cutoff)
+			if (full && !tmpPass) || (!full && !j.FinishedAt.After(tmpCutoff)) {
 				ids = append(ids, j.ID)
 			}
 		}
 	}
-	// Archive retention runs first, so a per-job pass cut short by ctx never starves it.
 	var errs []error
-	unlock, err := m.lock()
-	if err != nil {
-		return rep, err
-	}
-	rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
-	unlock()
-	if err != nil {
-		errs = append(errs, fmt.Errorf("archive retention: %w", err))
+	if !tmpPass {
+		// Archive retention runs first, so a per-job pass cut short by ctx never starves it.
+		unlock, err := m.lock()
+		if err != nil {
+			return rep, err
+		}
+		rep.ArchiveExpired, rep.RetentionOff, err = m.expireArchive(dryRun)
+		unlock()
+		for _, e := range rep.ArchiveExpired {
+			rep.Partial = rep.Partial || e.Partial
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("archive retention: %w", err))
+		}
 	}
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("prune stopped before job %s: %w", id, err))
 			break
 		}
-		pj, ok, err := m.pruneOne(id, cutoff, dryRun)
+		pj, ok, err := m.pruneOne(id, cutoff, tmpCutoff, tmpPass, dryRun)
 		if err != nil {
 			return rep, errors.Join(append(errs, err)...)
 		}
@@ -130,13 +165,14 @@ func (m *Manager) PruneContext(ctx context.Context, dryRun bool) (PruneReport, e
 		}
 		for _, e := range pj.Removed {
 			rep.Bytes += e.Bytes
+			rep.Partial = rep.Partial || e.Partial
 		}
 		for _, e := range pj.Archived {
 			rep.ArchivedBytes += e.Bytes
 		}
 		rep.Jobs = append(rep.Jobs, pj)
 	}
-	if !dryRun {
+	if !dryRun && (!tmpPass || rep.Bytes > 0) { // a temp dir pass (every few minutes) logs only what it freed
 		m.Log.Printf("prune: %d job folders, %d bytes removed, %d bytes moved to the archive, %d archived months expired",
 			len(rep.Jobs), rep.Bytes, rep.ArchivedBytes, len(rep.ArchiveExpired))
 	}
@@ -148,8 +184,9 @@ var pruneStatuses = []string{store.StatusSucceeded, store.StatusFailed, store.St
 
 // pruneOne prunes one job under the lifecycle lock, after re-reading its row: a job resumed or
 // otherwise changed since the listing (no longer terminal, or finished after cutoff) is left alone
-// (ok false).
-func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, bool, error) {
+// (ok false). A job finished after cutoff but not after tmpCutoff loses its temp dir only (the short
+// retention, job_tmp_retention_hours); a tmpPass leaves a job due for the full prune alone.
+func (m *Manager) pruneOne(id string, cutoff, tmpCutoff time.Time, tmpPass, dryRun bool) (PruneJob, bool, error) {
 	unlock, err := m.lock()
 	if err != nil {
 		return PruneJob{}, false, err
@@ -159,11 +196,15 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 	if err != nil {
 		return PruneJob{}, false, err
 	}
-	if !slices.Contains(pruneStatuses, j.Status) || j.FinishedAt == nil || j.FinishedAt.After(cutoff) {
+	if !slices.Contains(pruneStatuses, j.Status) || j.FinishedAt == nil {
 		return PruneJob{}, false, nil
 	}
-	pj := m.pruneJob(j, dryRun)
-	if pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
+	tmpOnly := j.FinishedAt.After(cutoff)
+	if (tmpPass && !tmpOnly) || (tmpOnly && j.FinishedAt.After(tmpCutoff)) {
+		return PruneJob{}, false, nil
+	}
+	pj := m.pruneJob(j, dryRun, tmpOnly)
+	if !tmpOnly && pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
 		m.pruneAdvisorDir(j, dryRun, &pj)
 	}
@@ -173,11 +214,24 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 	return pj, true, nil
 }
 
-func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
+// pruneJob cleans one job folder. With tmpOnly (the short retention, job_tmp_retention_hours) the
+// same checks decide whether the folder may be touched, but only its temp dir is removed: nothing
+// is archived (the job stays resumable; a resumed attempt gets a new temp dir) and no other entry
+// is looked at.
+func (m *Manager) pruneJob(j *store.Job, dryRun, tmpOnly bool) PruneJob {
 	pj := PruneJob{ID: j.ID, Status: j.Status, Removed: []PruneEntry{}, Archived: []PruneEntry{}, Kept: []string{}}
-	if m.advisorPending(j) {
-		// Its registrations are the only record of what to end: kept with the folder until the tick ended them.
-		pj.Skipped = "advisor calls of the job are not ended yet (retried every tick), not touched"
+	if tmpOnly {
+		if _, err := os.Lstat(filepath.Join(m.JobDir(j.ID), JobTmpDir)); err != nil {
+			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+				pj.Error = err.Error()
+			}
+			return pj // no temp dir (an earlier pass removed it): nothing to check or report
+		}
+	}
+	if hold := m.lifecycleHold(j); hold != "" {
+		// Processes of the job may still write its folder (a pending scope stop, a live group), and the
+		// registrations of its advisor calls are the only record of what to end.
+		pj.Skipped = hold + ", not touched"
 		return pj
 	}
 	dir := m.JobDir(j.ID)
@@ -192,14 +246,6 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 		pj.Skipped = "job folder is not a real directory (" + fi.Mode().Type().String() + "), not touched"
 		return pj
 	}
-	if m.spawnedGroupAlive(j) {
-		pj.Skipped = fmt.Sprintf("process group %d of the job is still alive, not touched", j.PGID)
-		return pj
-	}
-	if m.acceptanceGroupAlive(j) {
-		pj.Skipped = fmt.Sprintf("acceptance process group %d of the job is still alive, not touched", j.AcceptancePGID)
-		return pj
-	}
 	if j.RepoPath != "" && j.CleanedAt == nil {
 		pj.Skipped = "worktree cleanup has not run yet (patches not saved), not touched"
 		return pj
@@ -210,6 +256,9 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 			pj.Error = err.Error()
 			return pj
 		}
+	}
+	if tmpOnly {
+		return m.pruneTmp(j, dir, dryRun, pj)
 	}
 	aj := m.archiveJob(j, dir, dryRun)
 	// A failed archive keeps the files it would have moved or copied; the rest is still pruned,
@@ -255,41 +304,76 @@ func (m *Manager) pruneJob(j *store.Job, dryRun bool) PruneJob {
 			pj.Kept = append(pj.Kept, name)
 			continue
 		}
-		size := treeSize(p)
-		if !dryRun {
-			if err := removeTree(p); err != nil {
-				return fail(err.Error())
-			}
+		if stop, err := pruneRemove(&pj, p, reason, dryRun); err != nil {
+			return fail(err.Error())
+		} else if stop {
+			return pj
 		}
-		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})
 	}
 	return pj
+}
+
+// pruneTmp is the tmpOnly end of pruneJob: the temp dir entry goes the way every directory of a
+// pruned folder goes (pruneDecide, pruneRemove); an entry of that name that pruneDecide keeps (a
+// small text file the job put there) stays.
+func (m *Manager) pruneTmp(j *store.Job, dir string, dryRun bool, pj PruneJob) PruneJob {
+	p := filepath.Join(dir, JobTmpDir)
+	keep, _, err := pruneDecide(p, JobTmpDir, j)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			pj.Error = err.Error()
+		}
+		return pj
+	}
+	if keep {
+		return pj
+	}
+	reason := fmt.Sprintf("temp dir of a job finished more than %s ago (job_tmp_retention_hours)", m.Config().JobTmpRetention())
+	if _, err := pruneRemove(&pj, p, reason, dryRun); err != nil {
+		pj.Error = err.Error()
+	}
+	return pj
+}
+
+// pruneSkipBudget is the Skipped text of a job whose removal ran out of its budget (removeBudget).
+const pruneSkipBudget = "removal continues on the next pass"
+
+// pruneRemove removes p (on a dry run: measures it) and lists it in pj.Removed with the bytes freed,
+// which come from the removal's own walk. A removal that ran out of its budget lists what it freed,
+// sets pj.Skipped and returns stop: the job is left for the next pass. A removal that failed part way
+// (a mount point below p) also lists what it freed before the error is returned.
+func pruneRemove(pj *PruneJob, p, reason string, dryRun bool) (stop bool, err error) {
+	if dryRun {
+		n, partial := boundedSize(p)
+		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: n, Reason: reason, Partial: partial})
+		return false, nil
+	}
+	n, err := removeTreeSized(p)
+	if err == nil || n > 0 {
+		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: n, Reason: reason})
+	}
+	if errors.Is(err, errRemovalBudget) {
+		if pj.Skipped == "" {
+			pj.Skipped = pruneSkipBudget
+		}
+		return true, nil
+	}
+	return false, err
 }
 
 // pruneAdvisorDir removes a pruned crew job's advisor dir (<state>/advisor/<id>: the settings and MCP
 // config of its advisor calls, written by the daemon; the calls themselves stay in the database).
 func (m *Manager) pruneAdvisorDir(j *store.Job, dryRun bool, pj *PruneJob) {
 	p := m.AdvisorDir(j.ID)
-	fi, err := os.Lstat(p)
-	if err != nil {
+	if _, err := os.Lstat(p); err != nil {
 		if !errors.Is(err, os.ErrNotExist) && pj.Error == "" {
 			pj.Error = err.Error()
 		}
 		return
 	}
-	size := int64(0)
-	if fi.IsDir() {
-		size = treeSize(p)
+	if _, err := pruneRemove(pj, p, "advisor settings of the crew job", dryRun); err != nil && pj.Error == "" {
+		pj.Error = err.Error()
 	}
-	if !dryRun {
-		if err := removeTree(p); err != nil {
-			if pj.Error == "" {
-				pj.Error = err.Error()
-			}
-			return
-		}
-	}
-	pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "advisor settings of the crew job"})
 }
 
 // pruneSessions removes the claude session files of a pruned job (DEVIATIONS #15): the transcript
@@ -313,14 +397,12 @@ func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
 			return
 		}
 		for _, p := range paths {
-			size := treeSize(p)
-			if !dryRun {
-				if err := removeTree(p); err != nil {
-					pj.Error = err.Error()
-					return
-				}
+			if stop, err := pruneRemove(pj, p, "claude session of the job", dryRun); err != nil {
+				pj.Error = err.Error()
+				return
+			} else if stop {
+				return
 			}
-			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "claude session of the job"})
 		}
 	}
 }
@@ -387,23 +469,8 @@ func isTextFile(p string) (bool, error) {
 	return utf8.Valid(b), nil
 }
 
-// treeSize sums the sizes of everything under p (symlinks counted as links, never followed).
-func treeSize(p string) int64 {
-	var n int64
-	_ = filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if fi, err := d.Info(); err == nil {
-			n += fi.Size()
-		}
-		return nil
-	})
-	return n
-}
-
-// Bounds of one job folder measurement (jobDirSize), which runs synchronously when a job settles: a
-// walk stops after this many entries or this long, and the size is then recorded as partial.
+// Bounds of one measurement (jobDirSize, which runs synchronously when a job settles; boundedSize, one
+// entry of a prune dry run): a walk stops after this many entries or this long, and the size is then recorded as partial.
 var (
 	dirWalkMaxEntries = 200_000
 	dirWalkBudget     = 2 * time.Second
@@ -450,13 +517,13 @@ func (w *dirWalk) each(fd int, fn func(name string, st *unix.Stat_t)) {
 }
 
 // size sums the sizes of everything in the directory name under dirfd (symlinks counted as links).
-// A directory that cannot be opened counts as its entry alone.
+// A directory that cannot be opened (a mount point included: openDirBeneath) counts as its entry alone.
 func (w *dirWalk) size(dirfd int, name string, depth int) int64 {
 	if depth > maxChmodDepth {
 		w.partial = true
 		return 0
 	}
-	fd, err := openDirNoFollow(dirfd, name)
+	fd, err := openDirBeneath(dirfd, name) // never into a mounted filesystem
 	if err != nil {
 		return 0
 	}
@@ -468,6 +535,29 @@ func (w *dirWalk) size(dirfd int, name string, depth int) int64 {
 		}
 	})
 	return n
+}
+
+// boundedSize sums the sizes of p and everything under it (symlinks counted as links, never followed,
+// no mount point entered) within dirWalkMaxEntries and dirWalkBudget; partial says the walk stopped
+// early and the sum is a lower bound. A path that is not there counts 0.
+func boundedSize(p string) (n int64, partial bool) {
+	p = filepath.Clean(p)
+	parent, err := unix.Open(filepath.Dir(p), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, false
+	}
+	defer unix.Close(parent)
+	var st unix.Stat_t
+	if unix.Fstatat(parent, filepath.Base(p), &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+		return 0, false
+	}
+	n = st.Size
+	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return n, false
+	}
+	w := &dirWalk{left: dirWalkMaxEntries, deadline: time.Now().Add(dirWalkBudget)}
+	n += w.size(parent, filepath.Base(p), 0)
+	return n, w.partial
 }
 
 // jobDirSize measures job j's folder dir, the worktree of a repo job left out (it is the repository's
@@ -514,41 +604,6 @@ func (m *Manager) recordDirSize(id string) {
 	}
 }
 
-// removeTree removes p and everything under it without following symlinks. A job may leave
-// read-only directories behind (and the job dir holds a 0500 no-hooks/), so on a failure every real
-// directory under p is made writable and the removal is retried once.
-func removeTree(p string) error {
-	if err := os.RemoveAll(p); err == nil {
-		return nil
-	}
-	chmodTree(unix.AT_FDCWD, p, 0)
-	return os.RemoveAll(p)
-}
-
-// maxChmodDepth bounds chmodTree's recursion.
+// maxChmodDepth bounds the depth of a removal (removeTree) and of a size walk: one descriptor is held
+// per level.
 const maxChmodDepth = 256
-
-// chmodTree makes the directory name (relative to dirfd) and every directory under it 0700. Each
-// directory is opened relative to its parent's descriptor with O_NOFOLLOW and changed through its
-// own descriptor, so a directory swapped for a symlink mid-walk (a ghost still writing in the job
-// dir) is never followed: the chmod cannot reach outside the tree. A directory that cannot be
-// opened for reading is left as it is (the removal then reports the error).
-func chmodTree(dirfd int, name string, depth int) {
-	if depth > maxChmodDepth {
-		return
-	}
-	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return
-	}
-	f := os.NewFile(uintptr(fd), name)
-	defer f.Close()
-	_ = unix.Fchmod(fd, 0o700)
-	names, _ := f.Readdirnames(-1)
-	for _, n := range names {
-		var st unix.Stat_t
-		if unix.Fstatat(fd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
-			chmodTree(fd, n, depth+1)
-		}
-	}
-}

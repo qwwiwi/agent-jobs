@@ -161,6 +161,13 @@ type Config struct {
 	// JobDirNoteMB is the job folder size (MB, worktree of a repo job left out) from which the
 	// job-done line says how big the folder is. Nil = DefaultJobDirNoteMB (100), 0 = never.
 	JobDirNoteMB *int `json:"job_dir_note_mb"`
+	// JobTmpRetentionHours is how long after a job finished prune leaves its temp dir (<jobdir>/tmp)
+	// alone; the rest of the folder stays for PruneAge. Nil = DefaultJobTmpRetentionHours (2), 0 = the
+	// temp dir goes with the folder (after PruneAge).
+	JobTmpRetentionHours *int `json:"job_tmp_retention_hours"`
+	// JobDirsWarnGB is the total size of all job folders (GB) from which system_doctor warns.
+	// Nil = DefaultJobDirsWarnGB (20), 0 = never.
+	JobDirsWarnGB *int `json:"job_dirs_warn_gb"`
 	// MaxRunning is how many jobs of this agent run at once; the rest wait in the queue.
 	// nil (absent) = DefaultMaxRunningPerAgent (2); 1..CeilingMaxRunningPerAgent (8); explicit null is refused.
 	MaxRunning *int `json:"max_running"`
@@ -389,6 +396,31 @@ func (c Config) MaxRunningJobs() int {
 	return *c.MaxRunning
 }
 
+// DefaultJobTmpRetentionHours is job_tmp_retention_hours when it is not set.
+const DefaultJobTmpRetentionHours = 2
+
+// JobTmpRetention returns how long a finished job's temp dir is kept before prune removes it alone
+// (0 = no separate retention: it goes with the folder after PruneAge).
+func (c Config) JobTmpRetention() time.Duration {
+	h := DefaultJobTmpRetentionHours
+	if c.JobTmpRetentionHours != nil {
+		h = *c.JobTmpRetentionHours
+	}
+	return time.Duration(h) * time.Hour
+}
+
+// DefaultJobDirsWarnGB is job_dirs_warn_gb when it is not set.
+const DefaultJobDirsWarnGB = 20
+
+// JobDirsWarnBytes returns the total size of the job folders from which system_doctor warns (0 = never).
+func (c Config) JobDirsWarnBytes() int64 {
+	gb := DefaultJobDirsWarnGB
+	if c.JobDirsWarnGB != nil {
+		gb = *c.JobDirsWarnGB
+	}
+	return int64(gb) << 30
+}
+
 // DefaultJobDirNoteMB is job_dir_note_mb when it is not set.
 const DefaultJobDirNoteMB = 100
 
@@ -563,6 +595,12 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	}
 	if c.JobDirNoteMB != nil && *c.JobDirNoteMB < 0 {
 		return c, fmt.Errorf("config.json: job_dir_note_mb %d must be 0 (never) or positive", *c.JobDirNoteMB)
+	}
+	if c.JobTmpRetentionHours != nil && *c.JobTmpRetentionHours < 0 {
+		return c, fmt.Errorf("config.json: job_tmp_retention_hours %d must be 0 (with the folder, after 48 h) or positive", *c.JobTmpRetentionHours)
+	}
+	if c.JobDirsWarnGB != nil && *c.JobDirsWarnGB < 0 {
+		return c, fmt.Errorf("config.json: job_dirs_warn_gb %d must be 0 (never) or positive", *c.JobDirsWarnGB)
 	}
 	if c.IdleAfterResultSeconds < IdleAfterResultOff {
 		return c, fmt.Errorf("config.json: idle_after_result_seconds %d must be -1 (off), 0 (default) or positive", c.IdleAfterResultSeconds)
