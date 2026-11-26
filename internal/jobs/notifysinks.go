@@ -167,9 +167,8 @@ func (m *Manager) runSinkDelivery(d *store.SinkDelivery) {
 	}
 	if len(n.Command) > 0 {
 		if err := runNotifyCommand(n.Command, d.Line); err != nil {
-			msg := RedactText(err.Error())
-			m.Log.Printf("notify.command failed: %s", msg)
-			errs = append(errs, "notify.command: "+msg)
+			m.Log.Printf("notify.command failed: %s", RedactText(err.Error()))
+			errs = append(errs, "notify.command: "+RedactText(sinkFailureReason(err)))
 		}
 	}
 	errText := Printable(strings.Join(errs, "; "), sinkErrorMax)
@@ -234,9 +233,10 @@ func runNotifyCommand(argv []string, line string) error {
 	}
 	out := &limitedBuffer{max: notifyCommandBufferMax}
 	copied := make(chan struct{})
+	var outBytes int64
 	go func() {
 		defer close(copied)
-		_, _ = io.Copy(out, r)
+		outBytes, _ = io.Copy(out, r)
 	}()
 	err = cmd.Wait()
 	timedOut := ctx.Err() != nil
@@ -245,13 +245,53 @@ func runNotifyCommand(argv []string, line string) error {
 	// A child that left the group may still hold the pipe: stop reading after a short grace.
 	_ = r.SetReadDeadline(time.Now().Add(time.Second))
 	<-copied
-	if timedOut {
-		return fmt.Errorf("timed out after %s, killed", NotifyCommandTimeout)
-	}
-	if err == nil {
+	if err == nil && !timedOut {
 		return nil
 	}
-	return fmt.Errorf("%w: %s", err, Printable(out.String(), notifyCommandOutputMax))
+	var reason string
+	var exit *exec.ExitError
+	switch {
+	case timedOut:
+		reason = fmt.Sprintf("timed out after %s, killed", NotifyCommandTimeout)
+	case errors.As(err, &exit):
+		reason = fmt.Sprintf("exit status %d", exit.ExitCode())
+		if ws, ok := exit.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			reason = "killed by signal " + ws.Signal().String()
+		}
+	default:
+		reason = "wait: " + err.Error()
+	}
+	return &notifyCommandError{
+		reason: fmt.Sprintf("%s, %d bytes of output", reason, outBytes),
+		output: Printable(out.String(), notifyCommandOutputMax),
+	}
+}
+
+// notifyCommandError is a failed run of notify.command. Error() carries the start of the helper's
+// output, for the log (which redacts it); reason is only the exit code, signal or timeout and the
+// byte count of the output, the part safe to persist: the output may hold a credential redaction
+// cannot recognize.
+type notifyCommandError struct {
+	reason string
+	output string
+}
+
+func (e *notifyCommandError) Error() string {
+	if e.output == "" {
+		return e.reason
+	}
+	return e.reason + ": " + e.output
+}
+
+// sinkFailureReason is the text of a notify.command failure that may be stored in
+// notify_sink_outbox: never the helper's output. Errors that are not a finished run (the program
+// could not be started) come from this process and carry no helper output.
+func sinkFailureReason(err error) string {
+	var ce *notifyCommandError
+	if errors.As(err, &ce) {
+		return ce.reason
+	}
+	return err.Error()
 }
 
 // WriteInboxEvent stores ev as <dir>/<id>.json, mode 0600, creating dir (0700) when missing. The
