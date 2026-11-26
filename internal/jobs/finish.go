@@ -475,17 +475,20 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	}
 	ref := WakeJobDone + ":" + strings.Join(batchRefs(batch), ",")
 	if target == "" {
-		// No tmux target: the sinks of config notify alone carry the line. They are best effort (a
-		// failure is logged), so the batch is marked notified whatever they answered; the idle note
-		// is a tmux matter and does not ride.
+		// No tmux target: the sinks of config notify alone carry the line. It is queued for them
+		// (notify_sink_outbox, keyed by ref) together with the mark notified, so the cleanup of the
+		// batch proceeds whatever they answer; they run after the lifecycle lock is released
+		// (deliverSinks). An owner-waits attempt stays delivering until they delivered it, and a
+		// failed sink leaves it there. The idle note is a tmux matter and does not ride.
+		var queued string
 		if err := m.deliverVia(context.Background(), WakeJobDone, ref, batchMembers(batch), line, true,
 			func(_ context.Context, l string) (string, error) {
-				m.notifySinks(ref, l)
+				queued = l
 				return l, nil
 			}); err != nil {
 			return false, err
 		}
-		if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now(), nil); err != nil {
+		if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), nil, m.sinkDelivery(ref, queued, batch, true)); err != nil {
 			return false, err
 		}
 		for _, j := range batch {
@@ -536,15 +539,15 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if rode || (retry && note != "") {
 		mark = &store.IdleMark{Kind: store.IdleNote, Epoch: epoch}
 	}
-	if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now(), mark); err != nil {
+	// The sinks of config notify get the line tmux accepted, queued in the same transaction as its
+	// acknowledgement (once per batch) and run after the lifecycle lock is released: they never hold
+	// up or fail the session's own delivery.
+	if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), mark, m.sinkDelivery(ref, sent, batch, false)); err != nil {
 		return false, err
 	}
 	for _, j := range batch {
 		m.forgetMergeNote(j.ID)
 	}
-	// The sinks of config notify get the line tmux accepted, after its acknowledgement: they never
-	// hold up or fail the session's own delivery.
-	m.notifySinks(ref, sent)
 	return false, nil
 }
 

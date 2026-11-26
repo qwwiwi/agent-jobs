@@ -1,20 +1,23 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
 // NotifyConfig is the config block "notify": extra sinks for a job-done line, next to (or instead
@@ -63,31 +66,138 @@ var NotifyCommandTimeout = 10 * time.Second
 // notifyCommandOutputMax caps how much of a failed command's output reaches the log.
 const notifyCommandOutputMax = 300
 
+// notifyCommandBufferMax caps how much of a command's output is kept in memory (the rest is read
+// and dropped); the log gets at most notifyCommandOutputMax of it.
+const notifyCommandBufferMax = 4 << 10
+
 const (
 	inboxEventExt  = ".json"
 	inboxTmpPrefix = ".tmp-"
 )
 
-// notifySinks hands a delivered job-done line to the configured sinks. ref is the delivery's
-// identity (deliverDone). Each sink is on its own: a failure is logged and neither stops the other
-// sink nor fails the delivery.
-func (m *Manager) notifySinks(ref, line string) {
-	n := m.Config().Notify
-	if !n.enabled() {
-		return
+// notifySinkWorkers bounds how many queued lines are handed to the sinks side by side.
+const notifySinkWorkers = 2
+
+// sinkStaleAfter is how long a claimed sink delivery may stay unfinished before it counts as
+// interrupted (its run ended part way): far above one run, NotifyCommandTimeout plus an inbox write.
+const sinkStaleAfter = 5 * time.Minute
+
+// sinkRetention is how long a finished sink delivery is kept for inspection.
+const sinkRetention = 7 * 24 * time.Hour
+
+// sinkErrorMax caps the error text a failed sink delivery records.
+const sinkErrorMax = 500
+
+// Crash semantics of the sinks (notify_sink_outbox). A delivered job-done line is queued in the
+// same transaction that marks its jobs notified, keyed by the batch identity (deliverDone's ref):
+// the line is acknowledged and queued together or not at all, and a batch is queued once, so a
+// retried batch never runs its sinks again. The sinks run later, outside the lifecycle lock
+// (Tick): a run first claims its row (pending -> running) and only then writes the inbox file and
+// runs the command. Delivery is therefore at most once per batch: a crash after the claim leaves
+// the row running, and the next run past sinkStaleAfter records it failed («interrupted») instead
+// of running the command again or bringing back an inbox file that may have been pulled and
+// acknowledged meanwhile. That line may be lost to the sinks; the log and the row name it.
+
+// sinkDelivery is the queue row of a delivered batch line, nil when no sink is configured. owner
+// is set when the sinks alone carry the line (no tmux target).
+func (m *Manager) sinkDelivery(ref, line string, batch []*store.Job, owner bool) *store.SinkDelivery {
+	if !m.Config().Notify.enabled() {
+		return nil
 	}
-	line = Printable(line, 0)
+	d := &store.SinkDelivery{Ref: ref, Line: Printable(line, 0), Owner: owner}
+	for _, j := range batch {
+		d.Jobs = append(d.Jobs, store.SinkJob{ID: j.ID, Attempt: j.Attempt})
+	}
+	return d
+}
+
+// deliverSinks hands the queued lines to the sinks of config notify, at most notifySinkWorkers side
+// by side, until none is pending (or WaitNotifySinks asked it to stop). It never runs under the
+// lifecycle lock or tmux.lock: a slow helper holds up neither cancellations nor tmux lines. First
+// it records the runs that were interrupted (see the crash semantics above) and prunes old rows.
+func (m *Manager) deliverSinks() {
+	now := m.Now()
+	refs, err := m.Store.InterruptStaleSinkDeliveries(now.Add(-sinkStaleAfter), now)
+	if err != nil {
+		m.Log.Printf("notify sinks: %v", err)
+	}
+	for _, ref := range refs {
+		m.Log.Printf("notify sinks: delivery %s was interrupted before it finished; not run again", ref)
+	}
+	if err := m.Store.PruneSinkDeliveries(now.Add(-sinkRetention)); err != nil {
+		m.Log.Printf("notify sinks: %v", err)
+	}
+	var wg sync.WaitGroup
+	for range notifySinkWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !m.sinkStop.Load() {
+				d, err := m.Store.ClaimSinkDelivery(m.Now())
+				if err != nil {
+					m.Log.Printf("notify sinks: %v", err)
+					return
+				}
+				if d == nil {
+					return
+				}
+				m.runSinkDelivery(d)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// runSinkDelivery hands one claimed line to every configured sink and records the outcome: done
+// when all of them took it, failed (with their errors) otherwise. Each sink is on its own: one
+// failing never stops the other.
+func (m *Manager) runSinkDelivery(d *store.SinkDelivery) {
+	n := m.Config().Notify
+	var errs []string
+	if !n.enabled() {
+		errs = append(errs, "no notify sink is configured any more")
+	}
 	if n.InboxDir != "" {
-		ev := InboxEvent{ID: inboxEventID(ref), Line: line, TS: m.Now().UTC()}
+		ev := InboxEvent{ID: inboxEventID(d.Ref), Line: d.Line, TS: d.CreatedAt.UTC()}
 		if err := WriteInboxEvent(n.InboxDir, ev); err != nil {
-			m.Log.Printf("notify.inbox_dir failed, line not stored: %s", RedactText(err.Error()))
+			msg := RedactText(err.Error())
+			m.Log.Printf("notify.inbox_dir failed, line not stored: %s", msg)
+			errs = append(errs, "notify.inbox_dir: "+msg)
 		}
 	}
 	if len(n.Command) > 0 {
-		if err := runNotifyCommand(n.Command, line); err != nil {
-			m.Log.Printf("notify.command failed: %s", RedactText(err.Error()))
+		if err := runNotifyCommand(n.Command, d.Line); err != nil {
+			msg := RedactText(err.Error())
+			m.Log.Printf("notify.command failed: %s", msg)
+			errs = append(errs, "notify.command: "+msg)
 		}
 	}
+	errText := Printable(strings.Join(errs, "; "), sinkErrorMax)
+	if err := m.Store.FinishSinkDelivery(d.Ref, errText, m.Now()); err != nil {
+		m.Log.Printf("notify sinks: %v", err)
+	}
+}
+
+// deliverSinksInBackground is deliverSinks in the daemon: in a goroutine of its own, so the tick
+// returns at once. A run still in progress usually picks up what this tick queued; a line it just
+// missed goes out with the next tick.
+func (m *Manager) deliverSinksInBackground() {
+	if !m.sinking.CompareAndSwap(false, true) {
+		return
+	}
+	m.sinkWG.Add(1)
+	go func() {
+		defer m.sinkWG.Done()
+		defer m.sinking.Store(false)
+		m.deliverSinks()
+	}()
+}
+
+// WaitNotifySinks stops a background sink run from claiming more lines and waits for the ones in
+// flight (each bounded by NotifyCommandTimeout). Lines still pending go out after the next start.
+func (m *Manager) WaitNotifySinks() {
+	m.sinkStop.Store(true)
+	m.sinkWG.Wait()
 }
 
 // inboxEventID is the event id of a delivery: a short hash of its identity, safe as a file name.
@@ -97,7 +207,10 @@ func inboxEventID(ref string) string {
 }
 
 // runNotifyCommand runs argv directly (no shell) with line and a newline on stdin, in a process
-// group of its own that is killed at NotifyCommandTimeout.
+// group of its own. The group is killed when the program exits (a background child it left behind
+// ends with it) or at NotifyCommandTimeout. Its output is read into a capped buffer
+// (notifyCommandBufferMax), so a loud helper costs no memory; the program's own exit decides the
+// outcome, never a child that still holds the output open.
 func runNotifyCommand(argv []string, line string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), NotifyCommandTimeout)
 	defer cancel()
@@ -106,14 +219,37 @@ func runNotifyCommand(argv []string, line string) error {
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
 	cmd.Stdin = strings.NewReader(line + "\n")
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := cmd.Run()
+	// An *os.File as stdout and stderr: Wait returns when the program exits, not when the last
+	// holder of the pipe closes it; the copy below drains the pipe on its own.
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	cmd.Stdout, cmd.Stderr = w, w
+	err = cmd.Start()
+	_ = w.Close()
+	if err != nil {
+		return err
+	}
+	out := &limitedBuffer{max: notifyCommandBufferMax}
+	copied := make(chan struct{})
+	go func() {
+		defer close(copied)
+		_, _ = io.Copy(out, r)
+	}()
+	err = cmd.Wait()
+	timedOut := ctx.Err() != nil
+	// Whatever the program left running in its group ends with it.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	// A child that left the group may still hold the pipe: stop reading after a short grace.
+	_ = r.SetReadDeadline(time.Now().Add(time.Second))
+	<-copied
+	if timedOut {
+		return fmt.Errorf("timed out after %s, killed", NotifyCommandTimeout)
+	}
 	if err == nil {
 		return nil
-	}
-	if ctx.Err() != nil {
-		return fmt.Errorf("timed out after %s, killed", NotifyCommandTimeout)
 	}
 	return fmt.Errorf("%w: %s", err, Printable(out.String(), notifyCommandOutputMax))
 }

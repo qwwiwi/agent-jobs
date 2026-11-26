@@ -1560,6 +1560,7 @@ func cmdDaemon(args []string) error {
 	m.Log.Printf("daemon stopping; running jobs keep running")
 	m.WaitDaily()
 	m.WaitHeartbeat()
+	m.WaitNotifySinks()
 	<-httpDone
 	return nil
 }

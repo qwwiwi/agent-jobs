@@ -33,6 +33,8 @@ func notifyAt(t *testing.T, m *Manager, now *time.Time, at time.Time) {
 	if err := m.notifyPending(); err != nil {
 		t.Fatal(err)
 	}
+	// What a tick does next, outside the lifecycle lock: the sinks of config notify run.
+	m.deliverSinks()
 }
 
 // donePart is a job's part of a coalesced line: its own job-done line without the prefix.
