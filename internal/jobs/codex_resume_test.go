@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/qwwiwi/agent-jobs/internal/store"
 )
 
@@ -155,6 +157,16 @@ func TestPruneCodexRollouts(t *testing.T) {
 	rollouts := slices.DeleteFunc(slices.Clone(pj.Removed), func(e PruneEntry) bool { return e.Reason != "codex rollout of the job" })
 	if len(rollouts) != len(own) {
 		t.Fatalf("prune reports more than the job's rollout files: %+v", rollouts)
+	}
+}
+
+func TestOpenCodexHomeRejectsEmpty(t *testing.T) {
+	fd, err := openCodexHome("")
+	if fd >= 0 {
+		_ = unix.Close(fd)
+	}
+	if fd != -1 || err != errCodexHomeLink {
+		t.Fatalf("openCodexHome(%q) = (%d, %v), want (-1, %v)", "", fd, err, errCodexHomeLink)
 	}
 }
 
