@@ -260,6 +260,7 @@ func TestCodexWithoutReportFails(t *testing.T) {
 
 func TestCodexTimeoutKills(t *testing.T) {
 	m := newCodexManager(t)
+	noAutoContinue(m) // the timeout as it ended (its continuation: TestCodexTimeoutAutoContinuedOnce)
 	j := enqueue(t, m, "FAKE_CODEX_SLEEP=60", func(r *StartRequest) { codexReview(r); r.TimeoutMinutes = 1 })
 	if err := m.Tick(); err != nil {
 		t.Fatal(err)
