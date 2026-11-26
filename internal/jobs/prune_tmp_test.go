@@ -2,7 +2,9 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -240,5 +242,98 @@ func TestPruneTmpBudgetContinuesNextPass(t *testing.T) {
 	removeMaxEntries = oldN
 	if _, err := m.PruneTmpContext(context.Background(), false); err != nil || exists(filepath.Join(dir, JobTmpDir)) {
 		t.Fatalf("second pass: err %v, temp dir exists %v", err, exists(filepath.Join(dir, JobTmpDir)))
+	}
+}
+
+// #240 High (b): a finished job whose cgroup scope stop is still pending may have live processes
+// writing its folder. Neither the temp dir pass nor the full prune touches it; once the stop went
+// through, the next pass removes the temp dir.
+func TestPruneSkipsPendingScopeStop(t *testing.T) {
+	m := newManager(t)
+	recent := tmpJob(t, m, "recent", store.StatusFailed, 3*time.Hour, func(j *store.Job) { j.ScopePending = true })
+	old := tmpJob(t, m, "old", store.StatusFailed, 50*time.Hour, func(j *store.Job) { j.ScopePending = true })
+
+	check := func(rep PruneReport, err error, id string) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rep.Jobs) != 1 || rep.Jobs[0].ID != id || !strings.Contains(rep.Jobs[0].Skipped, "scope") || len(rep.Jobs[0].Removed) != 0 {
+			t.Fatalf("report = %+v, want job %s skipped for its scope", rep.Jobs, id)
+		}
+	}
+	rep, err := m.PruneTmpContext(context.Background(), false)
+	check(rep, err, "recent")
+	rep, err = m.Prune(false)
+	if err != nil || len(rep.Jobs) != 2 {
+		t.Fatalf("full prune: err %v, report %+v", err, rep.Jobs)
+	}
+	for _, pj := range rep.Jobs {
+		if !strings.Contains(pj.Skipped, "scope") || len(pj.Removed)+len(pj.Archived) != 0 {
+			t.Fatalf("job %s: %+v, want skipped for its scope", pj.ID, pj)
+		}
+	}
+	for _, dir := range []string{recent, old} {
+		for _, keep := range []string{filepath.Join(JobTmpDir, "go-build1", "big.bin"), "work/out.txt", "stream.jsonl"} {
+			if !exists(filepath.Join(dir, keep)) {
+				t.Fatalf("%s: %s removed while the scope stop is pending", dir, keep)
+			}
+		}
+	}
+	if err := m.Store.SetScopePending("recent", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.PruneTmpContext(context.Background(), false); err != nil || exists(filepath.Join(recent, JobTmpDir)) {
+		t.Fatalf("after the stop: err %v, temp dir exists %v", err, exists(filepath.Join(recent, JobTmpDir)))
+	}
+}
+
+// The one hold rule (#240 High b): each condition alone yields its reason, in the order scope,
+// advisor calls, spawned group, acceptance group; a job with none of them is free.
+func TestLifecycleHoldTable(t *testing.T) {
+	m := newManager(t)
+	const accPGID = 1<<22 - 1
+	// The spawned group is checked with the kernel (groupAlive): a real group of its own.
+	sleep := exec.Command("sleep", "60")
+	sleep.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := sleep.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sleep.Process.Kill(); _ = sleep.Wait() })
+	pgid := sleep.Process.Pid
+	alive := 0
+	oldExists := groupExists
+	groupExists = func(got int) bool { return got == alive }
+	t.Cleanup(func() { groupExists = oldExists })
+	fin := m.Now().Add(-time.Hour)
+	cases := []struct {
+		id    string
+		mod   func(*store.Job)
+		alive int
+		kind  holdKind
+		want  string
+	}{
+		{"free", nil, 0, holdNone, ""},
+		{"scope", func(j *store.Job) { j.ScopePending = true }, 0, holdScope, "cgroup scope"},
+		{"advisor", func(j *store.Job) { j.Crew = &store.Crew{AdvisorModel: "opus"} }, 0, holdAdvisor, "advisor calls"},
+		{"spawned", func(j *store.Job) { j.PGID, j.PGIDSpawned = pgid, true }, pgid, holdSpawnedGroup, fmt.Sprintf("process group %d of", pgid)},
+		{"acceptance", func(j *store.Job) { j.AcceptancePGID = accPGID }, accPGID, holdAcceptanceGroup, "acceptance process group 4194303"},
+		{"all", func(j *store.Job) {
+			j.ScopePending, j.Crew, j.AcceptancePGID = true, &store.Crew{AdvisorModel: "opus"}, accPGID
+		}, accPGID, holdScope, "cgroup scope"},
+	}
+	for _, c := range cases {
+		j := insertJob(t, m, c.id, store.StatusFailed, &fin, c.mod)
+		if j.Crew.HasAdvisor() {
+			writeFile(t, filepath.Join(m.AdvisorDir(j.ID), "run.1.json"), []byte("{}"), 0o600)
+		}
+		alive = c.alive
+		if got := m.lifecycleHoldKind(j); got != c.kind {
+			t.Fatalf("%s: kind = %d, want %d", c.id, got, c.kind)
+		}
+		got := m.lifecycleHold(j)
+		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
+			t.Fatalf("%s: hold = %q, want it to name %q", c.id, got, c.want)
+		}
 	}
 }

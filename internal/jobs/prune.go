@@ -221,9 +221,10 @@ func (m *Manager) pruneJob(j *store.Job, dryRun, tmpOnly bool) PruneJob {
 			return pj // no temp dir (an earlier pass removed it): nothing to check or report
 		}
 	}
-	if m.advisorPending(j) {
-		// Its registrations are the only record of what to end: kept with the folder until the tick ended them.
-		pj.Skipped = "advisor calls of the job are not ended yet (retried every tick), not touched"
+	if hold := m.lifecycleHold(j); hold != "" {
+		// Processes of the job may still write its folder (a pending scope stop, a live group), and the
+		// registrations of its advisor calls are the only record of what to end.
+		pj.Skipped = hold + ", not touched"
 		return pj
 	}
 	dir := m.JobDir(j.ID)
@@ -236,14 +237,6 @@ func (m *Manager) pruneJob(j *store.Job, dryRun, tmpOnly bool) PruneJob {
 		return pj
 	case !fi.IsDir():
 		pj.Skipped = "job folder is not a real directory (" + fi.Mode().Type().String() + "), not touched"
-		return pj
-	}
-	if m.spawnedGroupAlive(j) {
-		pj.Skipped = fmt.Sprintf("process group %d of the job is still alive, not touched", j.PGID)
-		return pj
-	}
-	if m.acceptanceGroupAlive(j) {
-		pj.Skipped = fmt.Sprintf("acceptance process group %d of the job is still alive, not touched", j.AcceptancePGID)
 		return pj
 	}
 	if j.RepoPath != "" && j.CleanedAt == nil {
