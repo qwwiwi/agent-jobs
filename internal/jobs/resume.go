@@ -515,6 +515,7 @@ func (m *Manager) Stop(id, reason string) (*store.Job, error) {
 		msg += "; " + survivors
 	}
 	m.noteFallback(j)
+	m.noteCodexThread(j, res)
 	// The scope is ended like a cancel's: nothing of the attempt may outlive it. A failed stop stays
 	// pending (retried every tick) and the job cannot be resumed until it succeeds.
 	if err := m.endScope(j); err != nil {
@@ -650,7 +651,16 @@ func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.Resume
 	case j.CostUnknown:
 		unknown = " (its cost is unknown: it ended without a result event, so it counts at its whole budget)"
 	}
+	if j.Runner == store.RunnerCodex {
+		// Codex has no turn or budget caps (the timeout and codex_max_tokens are its limits): both stay 0.
+		if l.MaxTurns != 0 || l.MaxBudgetUSD != 0 {
+			return store.ResumeLimits{}, errors.New("a codex job has no turn or budget limit: pass only timeout_minutes")
+		}
+		out.MaxTurns, out.MaxBudgetUSD = 0, 0
+	}
+	codexJob := j.Runner == store.RunnerCodex
 	switch {
+	case codexJob:
 	case l.MaxTurns < 0 || l.MaxTurns > CeilingMaxTurns:
 		errs = append(errs, fmt.Sprintf("max_turns %d is outside 1..%d", l.MaxTurns, CeilingMaxTurns))
 	case l.MaxTurns > leftTurns:
@@ -662,6 +672,7 @@ func resumeLimits(j *store.Job, earlier []store.Attempt, l Limits) (store.Resume
 		errs = append(errs, "no turns left of the previous limit: pass max_turns")
 	}
 	switch {
+	case codexJob:
 	case l.MaxBudgetUSD < 0 || l.MaxBudgetUSD > CeilingMaxBudgetUSD:
 		errs = append(errs, fmt.Sprintf("max_budget_usd %.2f is outside 0..%.0f", l.MaxBudgetUSD, CeilingMaxBudgetUSD))
 	case l.MaxBudgetUSD > leftBudget+1e-9:
@@ -836,9 +847,6 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 	if err := refuseSources(j.Sources); err != nil {
 		return fmt.Errorf("job %s carries sources: %w; start a new job without them", id, err)
 	}
-	if j.Runner == store.RunnerCodex {
-		return fmt.Errorf("job %s: %w", id, errCodexResume)
-	}
 	if _, err := os.Lstat(filepath.Join(m.JobDir(id), "prompt.md")); err != nil {
 		return fmt.Errorf("job %s never started claude (%s); start a new job instead", id, j.Error)
 	}
@@ -867,9 +875,10 @@ func (m *Manager) queueResume(j *store.Job, context string, l Limits) error {
 		return err
 	}
 	update := strings.TrimSpace(context)
-	if (j.StartedAt == nil || neverRan(j.Turns, j.Error)) && strings.TrimSpace(j.PendingContext) != "" {
-		// A resume stopped while still queued, or whose launch was refused, never ran: its update is
-		// kept, this one follows.
+	rejected := j.Runner == store.RunnerCodex && m.endedResult(j).CodexThreadRejected
+	if (j.StartedAt == nil || neverRan(j.Turns, j.Error) || rejected) && strings.TrimSpace(j.PendingContext) != "" {
+		// A resume stopped while still queued, or whose launch was refused, never ran, and a codex resume
+		// that ran in another thread never reached the job's thread: its update is kept, this one follows.
 		update = strings.TrimSpace(j.PendingContext) + "\n\n" + update
 	}
 	// The requeued attempt starts with no zero-commits evidence (#132): the merge check sets it
@@ -1038,7 +1047,7 @@ func (m *Manager) refreshJobFiles(j *store.Job, dir string, gitDirs ...string) e
 // patches when cleanup removed it), resume.md (the update) and fallback.md (brief + previous
 // attempt + update) written. The same session is resumed when its transcript is on disk; otherwise
 // the attempt starts in a fresh session from fallback.md.
-func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) {
+func (m *Manager) prepareResume(j *store.Job, token string, codex *codexLaunch) (launchPlan, error) {
 	switch k := m.lifecycleHoldKind(j); k {
 	case holdNone:
 	case holdScope:
@@ -1138,10 +1147,13 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 		return launchPlan{}, err
 	}
 	fallback := brief + "\n" + m.previousAttempt(j, dir) + "\n" + update +
-		"\nNote: the previous claude session could not be resumed, so this is a fresh session in the same work " +
+		"\nNote: the previous " + StreamResult{Runner: j.Runner}.program() + " session could not be resumed, so this is a fresh session in the same work " +
 		"directory. Say so in the \"Not done / uncertain\" section of your report.\n"
 	if err := writeFileReplace(filepath.Join(dir, fallbackPromptFile), []byte(fallback)); err != nil {
 		return launchPlan{}, err
+	}
+	if codex != nil {
+		return codex.resumePlan(m, j, token)
 	}
 	fresh := NewSessionID()
 	intact, why := m.sessionIntact(j)
@@ -1166,6 +1178,11 @@ func (m *Manager) prepareResume(j *store.Job, token string) (launchPlan, error) 
 
 // resumeMessage is the new user message of a resumed attempt.
 func (m *Manager) resumeMessage(j *store.Job) string {
+	if j.Runner == store.RunnerCodex {
+		return fmt.Sprintf("%s\nContinue the task with this update; keep the report contract: your final message is the "+
+			"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Forks and Progress.\n"+
+			"Limit of this continuation (attempt %d): %d minutes.\n", updateBlock(j.PendingContext), j.Attempt, j.TimeoutMinutes)
+	}
 	return fmt.Sprintf("%s\nContinue the task with this update; keep the report contract: your final message is the "+
 		"report with exactly the four sections (Summary, Findings / Changes, Evidence, Not done / uncertain), then Forks and Progress.\n"+
 		"Limits of this continuation (attempt %d): %d turns, $%g, %d minutes.\n",

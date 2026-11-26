@@ -123,9 +123,11 @@ func TestCodexAutoRefusesWithoutNativeSandbox(t *testing.T) {
 // signs count: a command whose output starts with a bwrap error (any job), and a repo job without a
 // single command that ran successfully (codex 0.162 under read-only shows no command item at all, only
 // the model's message quoting bwrap). Ordinary non-zero exits next to a success, and a job without a
-// repository that ran no command, are not sandbox failures.
+// repository that ran no command, are not sandbox failures (that one's final message has no Summary
+// section, so it fails as no report instead).
 func TestCodexSandboxFailureFailsJob(t *testing.T) {
 	m := newCodexManager(t)
+	noAutoContinue(m) // each attempt as it ended
 	repo := newRepo(t)
 	withRepo := func(r *StartRequest) { codexReview(r); r.RepoPath = repo }
 	for _, c := range []struct {
@@ -138,7 +140,7 @@ func TestCodexSandboxFailureFailsJob(t *testing.T) {
 		{"repo, every command failed", "FAKE_CODEX_ALLFAIL", withRepo, "codex ran no command in the repository successfully (2 commands, none exited 0)"},
 		{"repo, rg miss and a success", "FAKE_CODEX_RGMISS", withRepo, ""},
 		{"repo, one success", "review it", withRepo, ""},
-		{"no repo, no command", "FAKE_CODEX_NOCMD", codexReview, ""},
+		{"no repo, no command", "FAKE_CODEX_NOCMD", codexReview, NoteNoSummary},
 		{"no repo, every command failed", "FAKE_CODEX_ALLFAIL", codexReview, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -146,6 +148,12 @@ func TestCodexSandboxFailureFailsJob(t *testing.T) {
 			if c.want == "" {
 				if j.Status != store.StatusSucceeded {
 					t.Fatalf("got %s %q, want succeeded", j.Status, j.Error)
+				}
+				return
+			}
+			if c.want == NoteNoSummary {
+				if j.Status != store.StatusFailed || !strings.Contains(j.Error, NoteNoSummary) || strings.Contains(j.Error, "sandbox") {
+					t.Fatalf("got %s %q, want failed as no report, not as a sandbox failure", j.Status, j.Error)
 				}
 				return
 			}

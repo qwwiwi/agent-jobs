@@ -264,6 +264,9 @@ func (m *Manager) DoneLineFor(j *store.Job) string {
 			cost = "cost " + EstimatedCostText(st.CostUSD+st.CostEstimatedUSD)
 		}
 	}
+	if j.Runner == store.RunnerCodex {
+		cost = m.codexDoneCost(j, cost) // a codex job's token usage rides on the cost field
+	}
 	return doneLine(j, m.Config().JobDirNoteBytes(), cost, m.suspiciousNote(j), m.uiEvidenceNote(j))
 }
 

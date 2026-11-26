@@ -63,6 +63,8 @@ type Manager struct {
 
 	jobWritesOff atomic.Bool // set once a job's note could not be tracked (brain proxy fails closed)
 
+	codexHomeLinkLogged atomic.Bool // a symlinked CODEX_HOME skipped by prune was logged (once)
+
 	dailyMu      sync.Mutex     // held while a daily run is in progress (two never overlap)
 	dailyNoteMu  sync.Mutex     // guards dailyHeld and dailySkipped
 	dailyHeld    string         // the day whose run holds dailyMu
@@ -1074,10 +1076,8 @@ func (m *Manager) launch(j *store.Job, token string) error {
 		return errors.New("acceptance_allowed is off in active daemon config or config.json: the judge's manifest-check " +
 			"(scripts/manifest-check.sh) cannot run, so the judge is not launched")
 	}
+	var codex *codexLaunch // a codex job's launch settings (nil = a claude job)
 	if j.Runner == store.RunnerCodex {
-		if j.Attempt > 1 {
-			return errCodexResume
-		}
 		if err := launchCfg.checkCodexJob(j.Kind); err != nil {
 			return err
 		}
@@ -1085,15 +1085,18 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			return err
 		}
 		codexNetwork = codexSandbox == CodexSandboxWrite && launchCfg.CodexWriteNetworkOn()
+		codex = &codexLaunch{cfg: launchCfg, sandbox: codexSandbox, network: codexNetwork}
 	}
 	if j.Attempt > 1 {
-		p, err := m.prepareResume(j, token)
+		p, err := m.prepareResume(j, token, codex)
 		if err != nil {
 			return err
 		}
 		plan = p
 	} else {
-		if j.SessionID == "" {
+		if j.Runner == store.RunnerCodex {
+			j.SessionID = "" // codex names its thread itself: recorded when the attempt ends (noteCodexThread)
+		} else if j.SessionID == "" {
 			j.SessionID = NewSessionID()
 		}
 		if err := m.Store.SetSession(j.ID, token, j.SessionID, store.RunNew); err != nil {
@@ -1103,20 +1106,21 @@ func (m *Manager) launch(j *store.Job, token string) error {
 			return err
 		}
 		plan = launchPlan{args: ClaudeArgs(j, m.JobDir(j.ID))}
-		if j.Runner == store.RunnerCodex {
-			// Fail closed on system/managed config layers and on MCP servers codex would load, read where
-			// and how the job would run.
-			if err := checkCodexSystemConfig(codexSystemConfigDir); err != nil {
-				return err
-			}
-			if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
-				return err
-			}
-			if err := checkCodexIdentity(m.JobDir(j.ID), j.RepoPath, m.jobSpawnEnv(), launchCfg.OwnerNames); err != nil {
-				return err
-			}
-			plan = launchPlan{bin: launchCfg.codexBin(), args: CodexArgs(j, launchCfg.reasoningEffort(j.ReasoningEffort), codexSandbox, m.JobDir(j.ID), codexNetwork),
-				wrapper: []string{"--runner", store.RunnerCodex}, codexFullAccess: codexSandbox == CodexSandboxFullAccess}
+		if codex != nil {
+			plan = codex.plan(m, j, codexSession{ephemeral: !launchCfg.codexResumableJob(j)})
+		}
+	}
+	if codex != nil {
+		// Fail closed on system/managed config layers and on MCP servers codex would load, read where
+		// and how the job would run; before every launch, a resumed one too.
+		if err := checkCodexSystemConfig(codexSystemConfigDir); err != nil {
+			return err
+		}
+		if err := checkCodexMCP(launchCfg.codexBin(), filepath.Join(m.JobDir(j.ID), "work"), m.jobSpawnEnv()); err != nil {
+			return err
+		}
+		if err := checkCodexIdentity(m.JobDir(j.ID), j.RepoPath, m.jobSpawnEnv(), launchCfg.OwnerNames); err != nil {
+			return err
 		}
 	}
 	if j.RepoPath != "" && !IsGateKind(j.Kind) && launchCfg.PrepareFor(j.RepoPath) != nil {
@@ -2047,7 +2051,7 @@ func (m *Manager) collectExited(j *store.Job, code, dur int, now time.Time) {
 // exit) are not, nor are gate jobs: their stored result is what they deliver, and their input is the
 // daemon's (job_resume refuses them too).
 func midTaskEnd(j *store.Job, status, msg string, res StreamResult) bool {
-	if status != store.StatusFailed || j.Runner == store.RunnerCodex || IsGateKind(j.Kind) {
+	if status != store.StatusFailed || IsGateKind(j.Kind) {
 		return false
 	}
 	return OffContractNote(msg) == NoteNoSummary ||
@@ -2095,6 +2099,7 @@ func (m *Manager) endedResult(j *store.Job) StreamResult {
 // when the row was not finished).
 func (m *Manager) finish(j *store.Job, status string, res StreamResult, killed bool, dur int, msg string, now time.Time) (string, string, bool) {
 	m.noteFallback(j)
+	m.noteCodexThread(j, res)
 	delivered := slices.Clone(j.SkillsDelivered)
 	m.removeSkills(j)
 	// Whatever ended the job, nothing of it may outlive the row turning terminal.
@@ -2262,6 +2267,10 @@ func Verdict(code int, res StreamResult, dir string) (string, string) {
 	}
 	if res.ProviderFailure != "" {
 		return store.StatusFailed, res.ProviderFailure
+	}
+	if res.CodexStop != "" {
+		// The wrapper ended codex itself: its exit code says nothing.
+		return store.StatusFailed, res.CodexStop
 	}
 	// A natural failed exit retains its diagnostic reason; idle closure uses its trusted provenance.
 	if code != 0 && res.IdleReason == "" {

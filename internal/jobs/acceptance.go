@@ -201,7 +201,7 @@ func (m *Manager) completedReportContract(j *store.Job, status, msg string, res 
 // without a "## Summary" section is no report: it fails in both modes (gate jobs aside, whose stored
 // result is what they deliver).
 func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string, string) {
-	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
+	if status != store.StatusSucceeded {
 		return status, msg
 	}
 	report, err := readSmall(filepath.Join(dir, "report.md"), maxContractReportBytes+1)
@@ -211,8 +211,11 @@ func (m *Manager) reportContract(j *store.Job, status, msg, dir string) (string,
 	return m.applyReportContract(j, status, msg, reportContractNote(report, j.Covers))
 }
 
+// applyReportContract applies the report contract note of a succeeded job. A codex job is held only to
+// the Summary rule (a codex gate job to none): a final message without one is no report (it stopped
+// mid-task), so it fails and is continued once like a claude job; its other sections are not judged.
 func (m *Manager) applyReportContract(j *store.Job, status, msg, note string) (string, string) {
-	if status != store.StatusSucceeded || j.Runner == store.RunnerCodex {
+	if status != store.StatusSucceeded || (j.Runner == store.RunnerCodex && (note != NoteNoSummary || IsGateKind(j.Kind))) {
 		return status, msg
 	}
 	switch {

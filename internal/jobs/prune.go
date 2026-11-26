@@ -3,6 +3,7 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -206,6 +207,7 @@ func (m *Manager) pruneOne(id string, cutoff, tmpCutoff time.Time, tmpPass, dryR
 	pj := m.pruneJob(j, dryRun, tmpOnly)
 	if !tmpOnly && pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
+		m.pruneCodexRollouts(j, dryRun, &pj)
 		m.pruneAdvisorDir(j, dryRun, &pj)
 	}
 	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
@@ -403,6 +405,63 @@ func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
 			} else if stop {
 				return
 			}
+		}
+	}
+}
+
+// pruneCodexRollouts removes the codex rollout files of a pruned codex job (config codex_resumable):
+// <codex home>/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl of every thread the job's records name
+// (its session, each attempt's session, and the thread the wrapper recorded for each attempt, a
+// rejected one too). The ids are validated thread ids and only their regular rollout files are unlinked
+// (eachCodexRollout, no link followed, no recursion), so nothing else under codex's home is touched.
+func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
+	if j.Runner != store.RunnerCodex {
+		return
+	}
+	ids := []string{j.SessionID, m.endedResult(j).CodexThreadID}
+	if atts, err := m.Store.Attempts(j.ID); err == nil {
+		for _, a := range atts {
+			ids = append(ids, a.SessionID)
+		}
+	}
+	for n := 1; n < j.Attempt; n++ {
+		var res StreamResult
+		if raw, err := m.Store.AttemptWrapperResult(j.ID, n); err == nil && json.Unmarshal([]byte(raw), &res) == nil {
+			ids = append(ids, res.CodexThreadID)
+		}
+	}
+	home := codexHome(m.jobSpawnEnv())
+	if home == "" {
+		return
+	}
+	slices.Sort(ids)
+	for _, id := range slices.Compact(ids) {
+		if !ValidCodexThreadID(id) {
+			continue
+		}
+		// Only regular files named exactly as the thread's rollout are unlinked, by name in their date
+		// directory, without following a link or recursing: a job may have planted a directory or a
+		// symlink under the sessions dir.
+		err := eachCodexRollout(home, id, func(dirfd int, p, name string, st *unix.Stat_t) error {
+			if !dryRun {
+				if err := unix.Unlinkat(dirfd, name, 0); err != nil {
+					return &os.PathError{Op: "unlink", Path: p, Err: err}
+				}
+			}
+			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: st.Size, Reason: "codex rollout of the job"})
+			return nil
+		})
+		if errors.Is(err, errCodexHomeLink) {
+			// A symlinked home may point at an archive of sessions, and a non-canonical one ("." or "..")
+			// may name another directory than the kernel resolves: its rollouts are left alone.
+			if !m.codexHomeLinkLogged.Swap(true) {
+				m.Log.Printf("prune: CODEX_HOME %s is a symlink or not canonical; its codex rollouts are not pruned", home)
+			}
+			return
+		}
+		if err != nil {
+			pj.Error = err.Error()
+			return
 		}
 	}
 }

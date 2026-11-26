@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,10 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/qwwiwi/agent-jobs/internal/casefold"
 	"github.com/qwwiwi/agent-jobs/internal/store"
@@ -649,10 +653,29 @@ const CodexAgentsOverride = "agents.enabled=false"
 // and reasoning effort; the prompt arrives on stdin ("-"). The working dir is the job's work dir (set by
 // the wrapper).
 func CodexArgs(j *store.Job, effort, sandbox, jobDir string, network bool) []string {
-	args := []string{
-		"exec", "--json", "--ignore-user-config", "--ignore-rules", "--ephemeral", "--skip-git-repo-check",
-		"-s", sandbox, "-c", `approval_policy="never"`, "-c", "mcp_servers={}",
+	return codexArgs(j, effort, sandbox, jobDir, network, codexSession{ephemeral: true})
+}
+
+// codexSession is how a codex launch treats its thread: ephemeral (`--ephemeral`: no session files, so
+// nothing to resume), else persisted as a rollout file under codex's home and, with resume, continuing
+// that thread (`codex exec resume <thread_id>`).
+type codexSession struct {
+	ephemeral bool
+	resume    string
+}
+
+// codexArgs is CodexArgs for the given session. A resume keeps every isolation flag and puts
+// `resume <thread_id>` after them, right before the stdin prompt: `--sandbox` and `--add-dir` are
+// options of `codex exec` itself, not global ones (codex-cli 0.172.0, exec/src/cli.rs
+// mark_exec_global_args), so they must precede the subcommand; the explicit sandbox is what makes
+// codex apply it to the resumed thread (exec/src/lib.rs thread_resume_params_from_config).
+func codexArgs(j *store.Job, effort, sandbox, jobDir string, network bool, s codexSession) []string {
+	args := []string{"exec", "--json", "--ignore-user-config", "--ignore-rules"}
+	if s.ephemeral {
+		args = append(args, "--ephemeral")
 	}
+	args = append(args, "--skip-git-repo-check",
+		"-s", sandbox, "-c", `approval_policy="never"`, "-c", "mcp_servers={}")
 	if root := codexProgressRoot(sandbox, jobDir); root != "" {
 		args = append(args, "--add-dir", root)
 	}
@@ -663,7 +686,314 @@ func CodexArgs(j *store.Job, effort, sandbox, jobDir string, network bool) []str
 		args = append(args, "--disable", f)
 	}
 	args = append(args, "-c", CodexAgentsOverride)
-	return append(args, "-m", j.Model, "-c", "model_reasoning_effort="+effort, "-")
+	args = append(args, "-m", j.Model, "-c", "model_reasoning_effort="+effort)
+	if s.resume != "" {
+		args = append(args, "resume", s.resume)
+	}
+	return append(args, "-")
+}
+
+// codexThreadIDRe matches a codex thread id: a lower-case UUID (codex makes version 7 ones,
+// protocol/src/thread_id.rs).
+var codexThreadIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ValidCodexThreadID reports whether s is a codex thread id (a lower-case UUID): the only thing ever
+// passed to `codex exec resume`.
+func ValidCodexThreadID(s string) bool { return codexThreadIDRe.MatchString(s) }
+
+// codexResumableJob reports whether a codex job keeps its thread for a resume: codex_resumable is on
+// and it is not a gate job (those are never resumed).
+func (c Config) codexResumableJob(j *store.Job) bool {
+	return j.Runner == store.RunnerCodex && c.CodexResumableOn() && !IsGateKind(j.Kind)
+}
+
+// codexHome is codex's home as a job's codex sees it: $CODEX_HOME of env, else ~/.codex
+// (utils/home-dir/src/lib.rs find_codex_home).
+func codexHome(env []string) string {
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "CODEX_HOME="); ok && v != "" {
+			return v
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex")
+}
+
+// codexRolloutExists reports whether the thread has a rollout file codex can resume:
+// <codex home>/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread_id>.jsonl (rollout/src/recorder.rs,
+// rollout_file_name.rs), a regular file found by eachCodexRollout (no link followed, a symlinked codex
+// home included). Only names are matched; the file is never read.
+func codexRolloutExists(home, threadID string) bool {
+	found := false
+	_ = eachCodexRollout(home, threadID, func(int, string, string, *unix.Stat_t) error {
+		found = true
+		return errStopWalk
+	})
+	return found
+}
+
+// errStopWalk ends an eachCodexRollout walk early (not a failure).
+var errStopWalk = errors.New("stop walk")
+
+// errCodexHomeLink: codex's home is a symlink (it may point at an archive of sessions) or is not spelled
+// canonically, so nothing behind it is walked, read or removed.
+var errCodexHomeLink = errors.New("codex home is a symlink or not canonical, not walked")
+
+// openCodexHome opens codex's home directory without following a final symlink: a symlinked home is
+// errCodexHomeLink. Trailing separators are stripped first ("/" stays "/"): with "link/" the kernel
+// resolves the link before either check could see it. The path is never normalized: the kernel resolves
+// "link/../home" through the link while a lexical clean names another directory, so a home with a "."
+// or ".." component is errCodexHomeLink too.
+func openCodexHome(home string) (int, error) {
+	if t := strings.TrimRight(home, "/"); t != "" {
+		home = t
+	} else {
+		home = "/"
+	}
+	for _, c := range strings.Split(home, "/") {
+		if c == "." || c == ".." {
+			return -1, errCodexHomeLink
+		}
+	}
+	if fi, err := os.Lstat(home); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return -1, errCodexHomeLink
+	}
+	fd, err := unix.Open(home, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ELOOP) {
+		return -1, errCodexHomeLink // swapped for a link after the Lstat
+	}
+	return fd, err
+}
+
+// codexRolloutNameRe matches the name codex gives a rollout file, rollout-<YYYY-MM-DDThh-mm-ss>-<thread
+// id>.jsonl (rollout_file_name.rs); the submatch is the thread id.
+var codexRolloutNameRe = regexp.MustCompile(`^rollout-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}-([0-9a-f-]{36})\.jsonl$`)
+
+// eachCodexRollout calls fn for every regular file <home>/sessions/<Y>/<M>/<D>/<name> whose name is codex's
+// rollout name for threadID, in name order. Every directory below home is opened relative to its parent
+// with O_NOFOLLOW and every entry is lstat'ed through it: a symlinked directory is skipped, never
+// followed, and anything but a regular file (a directory, a link) is passed over. fn gets the open date
+// directory (valid during the call) to act on the entry by name, so what it does stays inside it. A
+// directory that cannot be opened or read is skipped, as Glob skips it; an error of fn ends the walk.
+// The home itself is opened without following a final symlink: a symlinked home is not walked at all
+// (errCodexHomeLink).
+func eachCodexRollout(home, threadID string, fn func(dirfd int, path, name string, st *unix.Stat_t) error) error {
+	if home == "" || !ValidCodexThreadID(threadID) {
+		return nil
+	}
+	homeFd, err := openCodexHome(home)
+	if errors.Is(err, errCodexHomeLink) {
+		return err
+	}
+	if err != nil {
+		return nil
+	}
+	fd, err := openDirNoFollow(homeFd, "sessions")
+	unix.Close(homeFd)
+	if err != nil {
+		return nil
+	}
+	return walkCodexRolloutDir(fd, filepath.Join(home, "sessions"), 0, threadID, fn)
+}
+
+// walkCodexRolloutDir is eachCodexRollout for the open directory fd at path (closed on return): depth 0
+// is sessions, 3 a day directory, whose rollout files are passed to fn.
+func walkCodexRolloutDir(fd int, path string, depth int, threadID string, fn func(int, string, string, *unix.Stat_t) error) error {
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	names, _ := f.Readdirnames(-1)
+	slices.Sort(names)
+	for _, name := range names {
+		if depth < 3 {
+			sub, err := openDirNoFollow(fd, name)
+			if err != nil {
+				continue
+			}
+			if err := walkCodexRolloutDir(sub, filepath.Join(path, name), depth+1, threadID, fn); err != nil {
+				return err
+			}
+			continue
+		}
+		if m := codexRolloutNameRe.FindStringSubmatch(name); m == nil || m[1] != threadID {
+			continue
+		}
+		var st unix.Stat_t
+		if unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+			continue
+		}
+		if err := fn(fd, filepath.Join(path, name), name, &st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// codexUsage is a token usage as codex reports it (turn.completed, exec/src/exec_events.rs `Usage`):
+// Input includes Cached, Output includes Reasoning.
+type codexUsage struct {
+	Input, Cached, Output, Reasoning int64
+}
+
+// total is what the token cap counts: input (cached included) plus output.
+func (u codexUsage) total() int64 { return u.Input + u.Output }
+
+// sub is u without base, no count below zero.
+func (u codexUsage) sub(base codexUsage) codexUsage {
+	return codexUsage{max(u.Input-base.Input, 0), max(u.Cached-base.Cached, 0), max(u.Output-base.Output, 0),
+		max(u.Reasoning-base.Reasoning, 0)}
+}
+
+// codexUsageBase is what the resumed thread had used before this attempt, as far as the wrapper's
+// records of the job's earlier attempts account for it: the last one that ran in the thread and saw its
+// usage (CodexThreadUsage), or else the base it started from (CodexThreadBase, which counted what was
+// unreported before it). codex reports a thread's total (exec/src/event_processor_with_jsonl_output.rs
+// usage_from_last_total; a resumed thread restores it from its rollout), so an attempt's own usage is
+// the total without its base. An attempt killed before its turn ended recorded no usage: the rollout
+// (codexRolloutUsage) has it, see codexResumeBase.
+func codexUsageBase(st *store.Store, id, threadID string, attempt int) codexUsage {
+	for n := attempt - 1; n >= 1; n-- {
+		raw, err := st.AttemptWrapperResult(id, n)
+		if err != nil {
+			continue
+		}
+		var res StreamResult
+		if json.Unmarshal([]byte(raw), &res) != nil || res.CodexThreadID != threadID {
+			continue
+		}
+		if res.CodexThreadUsage != nil {
+			return *res.CodexThreadUsage
+		}
+		if res.CodexThreadBase != nil {
+			return *res.CodexThreadBase
+		}
+	}
+	return codexUsage{}
+}
+
+// codexResumeBase is the usage base of an attempt that resumes threadID, and the part of it no earlier
+// attempt recorded (nil = none): the records' base (codexUsageBase), or the thread's total in its
+// rollout file when that is more (an earlier attempt was killed before its turn reported its usage).
+// The unrecorded part counts once, in this attempt's record (CodexUnreported), never against its cap.
+// The rollout is read only under the read-only sandbox: under workspace-write (when codex's home lies in
+// a writable root) and danger-full-access the job's commands can write it, so a forged total there could
+// cancel the attempt's own usage and its cap. Those take the records' base alone: tokens of an attempt
+// killed before its turn reported them are then counted in this attempt's usage and against its cap.
+func codexResumeBase(st *store.Store, id, threadID string, attempt int, home, sandbox string) (codexUsage, *codexUsage) {
+	recorded := codexUsageBase(st, id, threadID, attempt)
+	if sandbox != CodexSandboxReadOnly {
+		return recorded, nil
+	}
+	rollout, ok := codexRolloutUsage(home, threadID)
+	if !ok || rollout.total() <= recorded.total() {
+		return recorded, nil
+	}
+	unreported := rollout.sub(recorded)
+	return rollout, &unreported
+}
+
+// codexRolloutMaxBytes bounds how much of a rollout file codexRolloutUsage reads; codexRolloutMaxLine
+// bounds one line it parses (a token_count line is a few hundred bytes, longer ones are skipped).
+const (
+	codexRolloutMaxBytes = 256 << 20
+	codexRolloutMaxLine  = 64 << 10
+)
+
+// codexRolloutUsage is the thread's total usage as its rollout file last recorded it (ok = one found):
+// the total_token_usage of the last token_count event (a rollout line {"type":"event_msg","payload":
+// {"type":"token_count","info":{"total_token_usage":{...}}}}, which codex writes after each model
+// response). Only the rollout of threadID (a thread the job's own record names) is read, at most
+// codexRolloutMaxBytes, and only its numbers are used.
+func codexRolloutUsage(home, threadID string) (codexUsage, bool) {
+	if home == "" || !ValidCodexThreadID(threadID) {
+		return codexUsage{}, false
+	}
+	var best codexUsage
+	found := false
+	_ = eachCodexRollout(home, threadID, func(dirfd int, _, name string, _ *unix.Stat_t) error {
+		if u, ok := rolloutFileUsage(dirfd, name); ok && (!found || u.total() > best.total()) {
+			best, found = u, true
+		}
+		return nil
+	})
+	return best, found
+}
+
+// rolloutFileUsage is codexRolloutUsage for the file name in the open directory dirfd (a regular file
+// only; a symlink is not followed, a fifo does not block).
+func rolloutFileUsage(dirfd int, name string) (codexUsage, bool) {
+	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return codexUsage{}, false
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return codexUsage{}, false
+	}
+	var last codexUsage
+	found := false
+	r := bufio.NewReaderSize(io.LimitReader(f, codexRolloutMaxBytes), codexRolloutMaxLine)
+	for {
+		line, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			for errors.Is(err, bufio.ErrBufferFull) { // over the line limit: skipped to its end
+				_, err = r.ReadSlice('\n')
+			}
+			if err != nil {
+				break
+			}
+			continue
+		}
+		if bytes.Contains(line, []byte(`"token_count"`)) {
+			if u, ok := tokenCountUsage(line); ok {
+				last, found = u, true
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return last, found
+}
+
+// tokenCountUsage reads the total of a rollout token_count line (ok = it is one, with no negative count).
+func tokenCountUsage(line []byte) (codexUsage, bool) {
+	var ev struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type string `json:"type"`
+			Info *struct {
+				Total struct {
+					Input     int64 `json:"input_tokens"`
+					Cached    int64 `json:"cached_input_tokens"`
+					Output    int64 `json:"output_tokens"`
+					Reasoning int64 `json:"reasoning_output_tokens"`
+				} `json:"total_token_usage"`
+			} `json:"info"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(line, &ev) != nil || ev.Type != "event_msg" || ev.Payload.Type != "token_count" || ev.Payload.Info == nil {
+		return codexUsage{}, false
+	}
+	t := ev.Payload.Info.Total
+	if t.Input < 0 || t.Cached < 0 || t.Output < 0 || t.Reasoning < 0 {
+		return codexUsage{}, false
+	}
+	return codexUsage{t.Input, t.Cached, t.Output, t.Reasoning}, true
+}
+
+// codexUsageText is a codex usage for people.
+func codexUsageText(u codexUsage) string {
+	return fmt.Sprintf("tokens in %d (cached %d) · out %d (reasoning %d)", u.Input, u.Cached, u.Output, u.Reasoning)
+}
+
+// codexTokenCapStop is CodexStop of an attempt over its token cap.
+func codexTokenCapStop(used, limit int64) string {
+	return fmt.Sprintf("codex token cap exceeded: the attempt used %d of %d tokens (config codex_max_tokens; input plus output, "+
+		"as codex reports them), so the wrapper stopped it", used, limit)
 }
 
 // codexMaxLineBytes caps one line of a codex stream; a longer line (a huge command output) is skipped
@@ -673,7 +1003,9 @@ var codexMaxLineBytes = MaxStreamLineBytes
 // codexEvent is one line of `codex exec --json` output (the fields this package reads).
 type codexEvent struct {
 	Type string `json:"type"`
-	Item struct {
+	// thread.started: the thread's id (ThreadStartedEvent), what `codex exec resume` takes.
+	ThreadID string `json:"thread_id"`
+	Item     struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 		// command_execution items: the command's output, exit code and status (completed, failed, declined).
@@ -685,6 +1017,8 @@ type codexEvent struct {
 		InputTokens       int64 `json:"input_tokens"`
 		CachedInputTokens int64 `json:"cached_input_tokens"`
 		OutputTokens      int64 `json:"output_tokens"`
+		// Part of OutputTokens (codex-cli 0.172.0 `Usage`; absent in older streams).
+		ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
 	} `json:"usage"`
 	Error struct {
 		Message string `json:"message"`
@@ -726,6 +1060,10 @@ func applyCodexLine(out *StreamResult, line []byte) {
 		out.AfterEnd++
 	}
 	switch ev.Type {
+	case "thread.started":
+		if ValidCodexThreadID(ev.ThreadID) {
+			out.CodexThreadID = ev.ThreadID
+		}
 	case "turn.started":
 		out.Found, out.IsError, out.Subtype = false, false, ""
 	case "item.completed":
@@ -748,6 +1086,7 @@ func applyCodexLine(out *StreamResult, line []byte) {
 			out.InputTokens += ev.Usage.InputTokens
 			out.CachedInputTokens += ev.Usage.CachedInputTokens
 			out.OutputTokens += ev.Usage.OutputTokens
+			out.ReasoningTokens += ev.Usage.ReasoningOutputTokens
 		}
 	case "turn.failed":
 		out.Results++
@@ -789,6 +1128,8 @@ const codexSandboxHint = "on Ubuntu 24.04 the usual cause is kernel.apparmor_res
 // decides the verdict; a bwrap error quoted in it is only named in the reason.
 func codexStreamFailure(res StreamResult) string {
 	switch {
+	case res.CodexStop != "":
+		return res.CodexStop // the wrapper stopped it: over its token cap, or a resume in another thread
 	case res.Err != "":
 		return "codex stream not read to its end: " + RedactPrintable(res.Err, 200)
 	case res.CodexSandboxError != "":
@@ -820,15 +1161,11 @@ func codexRepoJob(st *store.Store, id, jobDir string) bool {
 	return err == nil
 }
 
-// errCodexResume is the refusal of a resume of a codex job.
-var errCodexResume = errors.New("resume of a codex job is not supported: start a new job " +
-	"(codex exec has a resume subcommand, but it is not verified to work under the job's containment yet)")
-
 // writeCodexResultReport writes the final message from the trusted stdout result when the runner
 // ended in a completed turn and the job did not write report.md itself, and logs token usage.
 func writeCodexResultReport(jobDir string, res StreamResult, log io.Writer) {
-	fmt.Fprintf(log, "run-wrapper: codex usage: input %d (cached %d), output %d tokens; %d items\n",
-		res.InputTokens, res.CachedInputTokens, res.OutputTokens, res.Turns)
+	fmt.Fprintf(log, "run-wrapper: codex usage: input %d (cached %d), output %d (reasoning %d) tokens; %d items\n",
+		res.InputTokens, res.CachedInputTokens, res.OutputTokens, res.ReasoningTokens, res.Turns)
 	if res.Skipped > 0 {
 		fmt.Fprintf(log, "run-wrapper: codex stream: %d line(s) over %d bytes skipped\n", res.Skipped, codexMaxLineBytes)
 	}
@@ -843,4 +1180,117 @@ func writeCodexResultReport(jobDir string, res StreamResult, log io.Writer) {
 	if err := writeAtomic(filepath.Join(jobDir, "report.md"), []byte(res.Text+"\n")); err != nil {
 		fmt.Fprintln(log, "run-wrapper: write report.md:", err)
 	}
+}
+
+// codexLaunch is what a codex job's launch was authorized with: the launch config, the sandbox and the
+// network of this attempt.
+type codexLaunch struct {
+	cfg     Config
+	sandbox string
+	network bool
+}
+
+// plan is the launch of j's codex attempt in session s, with prompt as the stdin file ("" = prompt.md).
+func (c *codexLaunch) plan(m *Manager, j *store.Job, s codexSession, prompt ...string) launchPlan {
+	p := launchPlan{bin: c.cfg.codexBin(), wrapper: []string{"--runner", store.RunnerCodex},
+		args:            codexArgs(j, c.cfg.reasoningEffort(j.ReasoningEffort), c.sandbox, m.JobDir(j.ID), c.network, s),
+		codexFullAccess: c.sandbox == CodexSandboxFullAccess}
+	if len(prompt) > 0 && prompt[0] != "" {
+		p.wrapper = append(p.wrapper, "--prompt", prompt[0])
+	}
+	return p
+}
+
+// resumePlan is the launch of a resumed codex attempt (prepareResume wrote both prompts): the thread of
+// the job's last attempt is continued with the update when it is known and its rollout file is still
+// there; otherwise (an ephemeral attempt, codex_resumable off now, session files removed) a fresh
+// thread gets the brief, the previous attempt and the update.
+func (c *codexLaunch) resumePlan(m *Manager, j *store.Job, token string) (launchPlan, error) {
+	thread, why := j.SessionID, ""
+	switch {
+	case !c.cfg.codexResumableJob(j):
+		why = "codex_resumable is off"
+	case !ValidCodexThreadID(thread):
+		why = "has no recorded codex thread"
+	case !codexRolloutExists(codexHome(m.jobSpawnEnv()), thread):
+		why = "has no rollout file under codex's sessions dir"
+	}
+	if why == "" {
+		if err := m.Store.SetSession(j.ID, token, thread, store.RunResume); err != nil {
+			return launchPlan{}, err
+		}
+		j.RunMode = store.RunResume
+		return c.plan(m, j, codexSession{resume: thread}, resumePromptFile), nil
+	}
+	m.Log.Printf("job %s: codex thread %q %s, attempt %d starts a fresh thread", j.ID, thread, why, j.Attempt)
+	j.SessionID, j.RunMode = "", store.RunFallback
+	if err := m.Store.SetSession(j.ID, token, "", store.RunFallback); err != nil {
+		return launchPlan{}, err
+	}
+	return c.plan(m, j, codexSession{ephemeral: !c.cfg.codexResumableJob(j)}, fallbackPromptFile), nil
+}
+
+// noteCodexThread records the thread of a codex attempt that is ending (the wrapper's trusted record of
+// its thread.started event, kept only for a run that persisted it) as the job's session, so the next
+// attempt can resume it. Called while the row still runs under its launch token.
+func (m *Manager) noteCodexThread(j *store.Job, res StreamResult) {
+	if j.Runner != store.RunnerCodex {
+		return
+	}
+	thread := res.CodexThreadID
+	if res.CodexThreadRejected {
+		// A resume that codex ran in another thread: that thread has neither the brief nor the update, and
+		// the one it was launched for could not be found. No session is kept, so the next attempt starts a
+		// fresh thread with the full fallback prompt.
+		thread = ""
+	} else if !ValidCodexThreadID(thread) {
+		return
+	}
+	if thread == j.SessionID {
+		return
+	}
+	if err := m.Store.SetSession(j.ID, j.LaunchToken, thread, j.RunMode); err != nil {
+		m.Log.Printf("job %s: record codex thread: %v", j.ID, err)
+		return
+	}
+	j.SessionID = thread
+}
+
+// codexJobUsage sums the usage of a codex job's attempts from the wrapper's records (ok = one had any).
+func (m *Manager) codexJobUsage(j *store.Job) (sum codexUsage, ok bool) {
+	add := func(res StreamResult) {
+		u := codexUsage{res.InputTokens, res.CachedInputTokens, res.OutputTokens, res.ReasoningTokens}
+		if u != (codexUsage{}) {
+			sum, ok = codexUsage{sum.Input + u.Input, sum.Cached + u.Cached, sum.Output + u.Output, sum.Reasoning + u.Reasoning}, true
+		}
+	}
+	addAll := func(res StreamResult) {
+		add(res)
+		if res.CodexUnreported != nil {
+			// Tokens of an earlier attempt that did not report them (killed mid-turn), recovered once.
+			u := *res.CodexUnreported
+			add(StreamResult{InputTokens: u.Input, CachedInputTokens: u.Cached, OutputTokens: u.Output, ReasoningTokens: u.Reasoning})
+		}
+	}
+	for n := 1; n < j.Attempt; n++ {
+		var res StreamResult
+		if raw, err := m.Store.AttemptWrapperResult(j.ID, n); err == nil && json.Unmarshal([]byte(raw), &res) == nil {
+			addAll(res)
+		}
+	}
+	addAll(m.endedResult(j))
+	return sum, ok
+}
+
+// codexDoneCost is the cost field of a codex job's job-done line: cost (its estimate, "" = unknown) and
+// the job's token usage over all attempts, as the wrapper read it from codex's stdout.
+func (m *Manager) codexDoneCost(j *store.Job, cost string) string {
+	u, ok := m.codexJobUsage(j)
+	if !ok {
+		return cost
+	}
+	if cost == "" {
+		cost = "cost " + CostText(j.CostUSD, j.CostIsUnknown())
+	}
+	return cost + " · " + codexUsageText(u)
 }

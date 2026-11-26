@@ -126,6 +126,17 @@ type Config struct {
 	// DefaultCodexJobsPerDay (3); 0 turns the cap off. The count is per agent (each agent has its own
 	// state dir); a host-wide cap would need a counter shared by all agents.
 	CodexJobsPerDay *int `json:"codex_jobs_per_day"`
+	// CodexResumable lets a codex job be resumed and continued (job_resume, the automatic continuation):
+	// it then runs without `--ephemeral`, so codex keeps the thread's rollout file under its home
+	// ($CODEX_HOME/sessions, default ~/.codex/sessions) and a later attempt continues it with
+	// `codex exec resume <thread_id>`. Opt-in: nil (absent) or false runs every codex job `--ephemeral`
+	// (no session files; a resume then starts a fresh thread). Prune removes the rollout files of the
+	// threads a pruned job's records name, never others. Gate jobs always run ephemeral.
+	CodexResumable *bool `json:"codex_resumable"`
+	// CodexMaxTokens caps the tokens one codex attempt may use (input, cached input included, plus
+	// output), as codex reports them in its stream: the wrapper stops the attempt once it is over and
+	// the attempt fails. Nil (absent) or 0 = no cap; the timeout stays the limit either way.
+	CodexMaxTokens *int64 `json:"codex_max_tokens"`
 	// EffortByKind overrides the default reasoning effort of claude jobs per kind
 	// (low|medium|high|xhigh|max), e.g. {"general": "low"}. Unset kinds keep DefaultEffortByKind.
 	EffortByKind map[string]string `json:"effort_by_kind"`
@@ -300,6 +311,17 @@ func (c Config) AutoContinueShare() float64 {
 		return c.AutoContinueFraction
 	}
 	return DefaultAutoContinueFraction
+}
+
+// CodexResumableOn reports whether codex jobs keep their thread for a resume (codex_resumable, default off).
+func (c Config) CodexResumableOn() bool { return c.CodexResumable != nil && *c.CodexResumable }
+
+// CodexTokenCap is the token cap of one codex attempt (codex_max_tokens; 0 = none).
+func (c Config) CodexTokenCap() int64 {
+	if c.CodexMaxTokens == nil {
+		return 0
+	}
+	return *c.CodexMaxTokens
 }
 
 // DefaultCodexJobsPerDay is the codex daily cap when codex_jobs_per_day is not set.
@@ -657,6 +679,9 @@ func parseConfig(stateDir string, b []byte) (Config, error) {
 	if c.CodexJobsPerDay != nil && *c.CodexJobsPerDay < 0 {
 		return c, fmt.Errorf("config.json: codex_jobs_per_day %d must be 0 (off) or more (absent = default %d)",
 			*c.CodexJobsPerDay, DefaultCodexJobsPerDay)
+	}
+	if c.CodexMaxTokens != nil && *c.CodexMaxTokens < 0 {
+		return c, fmt.Errorf("config.json: codex_max_tokens %d must be 0 (no cap) or more", *c.CodexMaxTokens)
 	}
 	if c.DailyHour != nil && (*c.DailyHour < 0 || *c.DailyHour > 23) {
 		return c, fmt.Errorf("config.json: daily_hour %d must be 0..23 (local time)", *c.DailyHour)

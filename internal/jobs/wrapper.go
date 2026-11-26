@@ -68,6 +68,27 @@ type StreamResult struct {
 	Runner string
 	// Token usage (codex streams only).
 	InputTokens, CachedInputTokens, OutputTokens int64
+	// ReasoningTokens are the reasoning output tokens (part of OutputTokens; codex streams only).
+	ReasoningTokens int64 `json:",omitempty"`
+	// CodexThreadID is the thread of a codex attempt (its thread.started event), kept only for a run
+	// that persisted it (no --ephemeral): what `codex exec resume` continues.
+	CodexThreadID string `json:",omitempty"`
+	// CodexThreadUsage is the usage as codex reported it, the thread's total: on a resumed thread it
+	// includes the earlier attempts', which the four counts above leave out (codexUsageBase).
+	CodexThreadUsage *codexUsage `json:",omitempty"`
+	// CodexThreadBase is what the resumed thread had used before this attempt (codexResumeBase; nil = a
+	// new thread or none): the four counts above are the reported total without it.
+	CodexThreadBase *codexUsage `json:",omitempty"`
+	// CodexUnreported is the part of CodexThreadBase no earlier attempt recorded (one killed before its
+	// turn reported its usage), as the thread's rollout file had it: counted once in the job's usage, not
+	// against this attempt's token cap.
+	CodexUnreported *codexUsage `json:",omitempty"`
+	// CodexStop is why the wrapper failed a codex attempt whatever codex wrote or however it exited: over
+	// its token cap, or a resume that ran in another thread ("" = neither).
+	CodexStop string `json:",omitempty"`
+	// CodexThreadRejected: a resume ran in another thread than the one it was launched for (CodexThreadID
+	// is that other thread, which has neither the brief nor the update): never adopted as the session.
+	CodexThreadRejected bool `json:",omitempty"`
 	// Skipped counts lines over the line limit that were skipped unread (codex streams only).
 	Skipped int
 	// Err is why the stream could not be read to its end ("" = read through; codex streams only).
@@ -180,7 +201,71 @@ type resultTee struct {
 	seen    map[string]bool
 	observe func(StreamResult)
 	tokens  streamTokenCounter
+	codex   *codexWatch // a codex attempt's thread and token cap (nil = not held to any)
 }
+
+// codexWatch is what the wrapper holds a codex attempt to while it reads its stdout: the thread a
+// resume must continue and the attempt's token cap. Either one broken sets CodexStop and ends the runner.
+type codexWatch struct {
+	persisted bool       // the run keeps its thread (no --ephemeral)
+	resume    string     // the thread a resume must continue ("" = a new thread)
+	base      codexUsage // what that thread had used before this attempt (codexResumeBase)
+	// unreported is the part of base no earlier attempt recorded (nil = none).
+	unreported *codexUsage
+	limit      int64      // the attempt's token cap (0 = none)
+	stop       func()     // ends the runner (nil = not started)
+	reported   codexUsage // the usage as codex reported it so far
+}
+
+// applyCodex is applyCodexLine for the line read, with the attempt's own usage (the reported one without
+// the resumed thread's base) and the two stops.
+func (t *resultTee) applyCodex() {
+	w, r := t.codex, &t.res
+	if w == nil {
+		applyCodexLine(r, t.line)
+		return
+	}
+	r.InputTokens, r.CachedInputTokens, r.OutputTokens, r.ReasoningTokens = w.reported.Input, w.reported.Cached, w.reported.Output, w.reported.Reasoning
+	applyCodexLine(r, t.line)
+	w.reported = codexUsage{r.InputTokens, r.CachedInputTokens, r.OutputTokens, r.ReasoningTokens}
+	own := w.reported.sub(w.base)
+	r.InputTokens, r.CachedInputTokens, r.OutputTokens, r.ReasoningTokens = own.Input, own.Cached, own.Output, own.Reasoning
+	if r.CodexStop == "" {
+		switch {
+		case w.resume != "" && r.CodexThreadID != "" && r.CodexThreadID != w.resume:
+			r.CodexStop = fmt.Sprintf("codex did not resume thread %s: it started thread %s (it did not find the session), "+
+				"so the wrapper stopped it; resume again for a fresh session", w.resume, r.CodexThreadID)
+			r.CodexThreadRejected = true
+		case w.limit > 0 && own.total() > w.limit:
+			r.CodexStop = codexTokenCapStop(own.total(), w.limit)
+		}
+		if r.CodexStop != "" && w.stop != nil {
+			w.stop()
+		}
+	}
+	if !w.persisted {
+		r.CodexThreadID = "" // an ephemeral thread has no session files: nothing to resume
+	} else if w.reported != (codexUsage{}) {
+		reported := w.reported
+		r.CodexThreadUsage = &reported
+	}
+}
+
+// codexTokenCapOf is the codex token cap from the agent's config.json (<state>/jobs/<id> = jobDir).
+func codexTokenCapOf(jobDir string) (int64, error) {
+	abs, err := filepath.Abs(jobDir)
+	if err != nil {
+		return 0, err
+	}
+	c, err := LoadConfig(filepath.Dir(filepath.Dir(abs)))
+	if err != nil {
+		return 0, err
+	}
+	return c.CodexTokenCap(), nil
+}
+
+// codexStopGrace is how long a codex stopped by the wrapper (SIGTERM) has before it is killed.
+var codexStopGrace = 5 * time.Second
 
 func (t *resultTee) Write(p []byte) (int, error) {
 	t.mu.Lock()
@@ -235,7 +320,7 @@ func (t *resultTee) end() {
 		if t.skip {
 			t.res.Skipped++
 		} else {
-			applyCodexLine(&t.res, t.line)
+			t.applyCodex()
 		}
 	} else if !t.skip {
 		var kind struct {
@@ -285,6 +370,11 @@ func (t *resultTee) end() {
 		}
 	}
 	t.res.Tokens, t.res.TokensInvalid = t.tokens.total, t.tokens.invalid
+	if t.codex != nil && !t.res.TokensInvalid {
+		// Priced from the attempt's own usage: the counter above summed the thread's reported totals.
+		t.res.Tokens = TokenUsage{Input: max(t.res.InputTokens-t.res.CachedInputTokens, 0), Output: t.res.OutputTokens,
+			CacheRead: t.res.CachedInputTokens}
+	}
 	if t.observe != nil {
 		t.observe(t.res)
 	}
@@ -431,6 +521,10 @@ func admitted(jobDir, token string, argv []string) error {
 		if err == nil {
 			err = admittedCodexNetwork(st, j, token, ca)
 		}
+		if err == nil && ca.resume != "" && (ca.ephemeral || j.RunMode != store.RunResume || j.SessionID != ca.resume) {
+			// Only the thread the daemon recorded for this launch is resumed.
+			err = fmt.Errorf("codex resume of thread %s was not recorded for this launch", ca.resume)
+		}
 		if err != nil {
 			return fmt.Errorf("codex command line was not authorized by the launching daemon: %w", err)
 		}
@@ -503,6 +597,10 @@ type codexArgv struct {
 	sandbox string   // the --sandbox value
 	addDirs []string // the --add-dir values (extra writable roots)
 	network bool     // CodexNetworkOverride is given
+	// ephemeral: --ephemeral is given (no session files); resume: the thread id of `resume <id>` ("" = a
+	// new thread).
+	ephemeral bool
+	resume    string
 }
 
 // codexArgvSandbox is the sandbox of a codex command line (argv[0] is the binary), read with codex's
@@ -527,6 +625,12 @@ func codexArgvSandbox(argv []string) (codexArgv, error) {
 		if (a == "exec" && i == 1) || (a == "-" && i > 1 && argv[1] == "exec") {
 			continue
 		}
+		// `resume <thread_id>` only as codexArgs writes it: after every option, right before the stdin prompt.
+		if a == "resume" && argv[1] == "exec" && i+3 == len(argv) && argv[i+2] == "-" && ValidCodexThreadID(argv[i+1]) {
+			out.resume = argv[i+1]
+			i++
+			continue
+		}
 		if !strings.HasPrefix(a, "-") || a == "-" {
 			return fail(fmt.Errorf("unexpected codex argument %q", a))
 		}
@@ -543,6 +647,7 @@ func codexArgvSandbox(argv []string) (codexArgv, error) {
 			if attached {
 				return fail(fmt.Errorf("codex option %q takes no value", a))
 			}
+			out.ephemeral = out.ephemeral || name == "--ephemeral"
 			continue
 		case "-s", "--sandbox", "-c", "--config", "-m", "--model", "--disable", "--add-dir":
 		default:
@@ -754,7 +859,26 @@ func RunWrapper(jobDir, token string, argv []string, opts WrapperOptions) int {
 			defer costJournal.end(orj, store.StatusFailed, "the wrapper ended without recording the attempt's completion (see stderr.log)", nil)
 		}
 	}
-	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, runEnv, observe)
+	var watch *codexWatch
+	if opts.Runner == store.RunnerCodex {
+		// The command line was admitted above, so it parses; the cap is read where the job cannot write.
+		ca, _ := codexArgvSandbox(argv)
+		limit, err := codexTokenCapOf(jobDir)
+		if err != nil {
+			fail := "codex token cap unknown (config.json unreadable: " + RedactPrintable(err.Error(), 200) + "); codex is not started"
+			fmt.Fprintln(stderrLog, "run-wrapper:", fail)
+			return finishBeforeRunner(jobDir, StreamResult{Runner: opts.Runner, ProviderFailure: fail}, record, stderrLog)
+		}
+		watch = &codexWatch{persisted: !ca.ephemeral, resume: ca.resume, limit: limit}
+		if ca.resume != "" {
+			if j, err := st.Get(id); err == nil {
+				// The thread was admitted as the one the daemon recorded for this job: its rollout is the job's.
+				// Its rollout counts only where the job cannot write it (codexResumeBase).
+				watch.base, watch.unreported = codexResumeBase(st, id, ca.resume, j.Attempt, codexHome(os.Environ()), ca.sandbox)
+			}
+		}
+	}
+	code, idleClosed, res := runClaude(jobDir, opts.prompt(), argv, opts.Runner, idle, stderrLog, runEnv, watch, observe)
 	if !idleClosed && opts.FallbackPrompt != "" && code != 0 && code < 128 && !res.Progressed && !res.Found {
 		code, idleClosed, res = runFallback(jobDir, argv, opts, idle, stderrLog, code, res, record, runEnv)
 	}
@@ -1034,7 +1158,7 @@ func runFallback(jobDir string, argv []string, opts WrapperOptions, idle time.Du
 			fmt.Fprintln(stderrLog, "run-wrapper: record progress:", err)
 		}
 	}
-	code, closed, res := runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog, runEnv, observe)
+	code, closed, res := runClaude(jobDir, opts.FallbackPrompt, fresh, opts.Runner, idle, stderrLog, runEnv, nil, observe)
 	res.FallbackSession = opts.FallbackSession
 	return code, closed, res
 }
@@ -1060,7 +1184,7 @@ var teeWaitDelay = 10 * time.Second
 // whether the idle-after-result rule ended it, and the result parsed from its stdout. runEnv (nil =
 // none) finishes the runner's environment last (an OpenRouter job's, openRouterEnv).
 func runClaude(jobDir, promptFile string, argv []string, runner string, idle time.Duration, stderrLog *os.File,
-	runEnv func([]string) []string, observe ...func(StreamResult)) (int, bool, StreamResult) {
+	runEnv func([]string) []string, watch *codexWatch, observe ...func(StreamResult)) (int, bool, StreamResult) {
 	stdin, err := os.Open(filepath.Join(jobDir, promptFile))
 	if err != nil {
 		fmt.Fprintln(stderrLog, "run-wrapper:", err)
@@ -1092,6 +1216,22 @@ func runClaude(jobDir, promptFile string, argv []string, runner string, idle tim
 	}
 	if runner == store.RunnerCodex {
 		tee.res.Runner = runner
+		if tee.codex = watch; watch != nil {
+			if watch.base != (codexUsage{}) {
+				base := watch.base
+				tee.res.CodexThreadBase = &base
+			}
+			tee.res.CodexUnreported = watch.unreported
+			// Called from the tee, so after the runner started: SIGTERM, then a kill for one that stays.
+			watch.stop = func() {
+				proc := cmd.Process
+				if proc == nil {
+					return
+				}
+				_ = proc.Signal(syscall.SIGTERM)
+				time.AfterFunc(codexStopGrace, func() { _ = proc.Kill() })
+			}
+		}
 	}
 	cmd.Stdout, cmd.WaitDelay = tee, teeWaitDelay
 	closed, err := runIdleWatched(cmd, tee, idle, stderrLog)
