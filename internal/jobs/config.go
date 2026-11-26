@@ -126,8 +126,9 @@ type Config struct {
 	// CodexResumable lets a codex job be resumed and continued (job_resume, the automatic continuation):
 	// it then runs without `--ephemeral`, so codex keeps the thread's rollout file under its home
 	// ($CODEX_HOME/sessions, default ~/.codex/sessions) and a later attempt continues it with
-	// `codex exec resume <thread_id>`. Nil (absent) = on; false runs every codex job `--ephemeral` again
-	// (no session files; a resume then starts a fresh thread). Gate jobs always run ephemeral.
+	// `codex exec resume <thread_id>`. Opt-in: nil (absent) or false runs every codex job `--ephemeral`
+	// (no session files; a resume then starts a fresh thread). Prune removes the rollout files of the
+	// threads a pruned job's records name, never others. Gate jobs always run ephemeral.
 	CodexResumable *bool `json:"codex_resumable"`
 	// CodexMaxTokens caps the tokens one codex attempt may use (input, cached input included, plus
 	// output), as codex reports them in its stream: the wrapper stops the attempt once it is over and
@@ -302,8 +303,8 @@ func (c Config) AutoContinueShare() float64 {
 	return DefaultAutoContinueFraction
 }
 
-// CodexResumableOn reports whether codex jobs keep their thread for a resume (codex_resumable, default on).
-func (c Config) CodexResumableOn() bool { return c.CodexResumable == nil || *c.CodexResumable }
+// CodexResumableOn reports whether codex jobs keep their thread for a resume (codex_resumable, default off).
+func (c Config) CodexResumableOn() bool { return c.CodexResumable != nil && *c.CodexResumable }
 
 // CodexTokenCap is the token cap of one codex attempt (codex_max_tokens; 0 = none).
 func (c Config) CodexTokenCap() int64 {

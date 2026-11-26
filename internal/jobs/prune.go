@@ -3,6 +3,7 @@ package jobs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,6 +166,7 @@ func (m *Manager) pruneOne(id string, cutoff time.Time, dryRun bool) (PruneJob, 
 	pj := m.pruneJob(j, dryRun)
 	if pj.Error == "" && pj.Skipped == "" && (j.RepoPath == "" || j.CleanedAt != nil) {
 		m.pruneSessions(j, dryRun, &pj)
+		m.pruneCodexRollouts(j, dryRun, &pj)
 		m.pruneAdvisorDir(j, dryRun, &pj)
 	}
 	if !dryRun && len(pj.Removed)+len(pj.Archived) > 0 {
@@ -321,6 +323,53 @@ func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
 				}
 			}
 			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "claude session of the job"})
+		}
+	}
+}
+
+// pruneCodexRollouts removes the codex rollout files of a pruned codex job (config codex_resumable):
+// <codex home>/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl of every thread the job's records name
+// (its session, each attempt's session, and the thread the wrapper recorded for each attempt, a
+// rejected one too). The ids are validated thread ids, so nothing else under codex's home is touched.
+func (m *Manager) pruneCodexRollouts(j *store.Job, dryRun bool, pj *PruneJob) {
+	if j.Runner != store.RunnerCodex {
+		return
+	}
+	ids := []string{j.SessionID, m.endedResult(j).CodexThreadID}
+	if atts, err := m.Store.Attempts(j.ID); err == nil {
+		for _, a := range atts {
+			ids = append(ids, a.SessionID)
+		}
+	}
+	for n := 1; n < j.Attempt; n++ {
+		var res StreamResult
+		if raw, err := m.Store.AttemptWrapperResult(j.ID, n); err == nil && json.Unmarshal([]byte(raw), &res) == nil {
+			ids = append(ids, res.CodexThreadID)
+		}
+	}
+	home := codexHome(m.jobSpawnEnv())
+	if home == "" {
+		return
+	}
+	slices.Sort(ids)
+	for _, id := range slices.Compact(ids) {
+		if !ValidCodexThreadID(id) {
+			continue
+		}
+		paths, err := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+id+".jsonl"))
+		if err != nil {
+			pj.Error = err.Error()
+			return
+		}
+		for _, p := range paths {
+			size := treeSize(p)
+			if !dryRun {
+				if err := removeTree(p); err != nil {
+					pj.Error = err.Error()
+					return
+				}
+			}
+			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "codex rollout of the job"})
 		}
 	}
 }

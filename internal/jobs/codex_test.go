@@ -181,8 +181,8 @@ func TestCodexReadOnlyReviewWritesReportFromStream(t *testing.T) {
 		t.Fatalf("report.md: %q", rep)
 	}
 	argv, _ := os.ReadFile(filepath.Join(dir, "argv.txt"))
-	// No --ephemeral: the thread is kept for a resume (codex_resumable, default on).
-	want := "exec\n--json\n--ignore-user-config\n--ignore-rules\n--skip-git-repo-check\n" +
+	// --ephemeral: no session files (codex_resumable is off by default).
+	want := "exec\n--json\n--ignore-user-config\n--ignore-rules\n--ephemeral\n--skip-git-repo-check\n" +
 		"-s\nread-only\n-c\napproval_policy=\"never\"\n-c\nmcp_servers={}\n" +
 		"--disable\napps\n--disable\nbrowser_use\n--disable\nbrowser_use_external\n" +
 		"--disable\nbrowser_use_full_cdp_access\n--disable\ncomputer_use\n--disable\nimage_generation\n" +

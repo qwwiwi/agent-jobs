@@ -3,6 +3,7 @@ package jobs
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,11 +42,26 @@ func codexArgvOf(t *testing.T, m *Manager, id string) string {
 	return string(b)
 }
 
-// A codex job runs without --ephemeral and its thread id (thread.started) is recorded as the attempt's
-// session; with codex_resumable off it runs ephemeral and records none.
+// codexResumable turns codex_resumable on (it is off by default: config absent).
+func codexResumable(m *Manager) {
+	on := true
+	m.Cfg.CodexResumable = &on
+}
+
+// codex_resumable is opt-in: by default a codex job runs ephemeral and records no thread. With it on, the
+// job runs without --ephemeral and its thread id (thread.started) is recorded as the attempt's session.
 func TestCodexThreadIDRecorded(t *testing.T) {
 	m := newCodexManager(t)
 	j := runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
+	if j.Status != store.StatusSucceeded {
+		t.Fatalf("got %s %q", j.Status, j.Error)
+	}
+	if !strings.Contains(codexArgvOf(t, m, j.ID), "\n--ephemeral\n") || j.SessionID != "" {
+		t.Fatalf("codex_resumable absent (off): session %q argv:\n%s", j.SessionID, codexArgvOf(t, m, j.ID))
+	}
+
+	codexResumable(m)
+	j = runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
 	if j.Status != store.StatusSucceeded {
 		t.Fatalf("got %s %q", j.Status, j.Error)
 	}
@@ -55,16 +71,50 @@ func TestCodexThreadIDRecorded(t *testing.T) {
 	if j.SessionID != fakeCodexThread {
 		t.Fatalf("session id %q, want the codex thread id", j.SessionID)
 	}
+}
 
-	off := false
-	m.Cfg.CodexResumable = &off
-	writeCodexConfig(t, m, `{"codex_resumable": false}`)
-	j = runToEnd(t, m, enqueue(t, m, "review the thing", codexReview).ID)
-	if j.Status != store.StatusSucceeded {
-		t.Fatalf("got %s %q", j.Status, j.Error)
+// Prune removes the rollout files of the threads the job's records name (its session and every
+// attempt's thread, a rejected one too) and no other rollout.
+func TestPruneCodexRollouts(t *testing.T) {
+	m := newCodexManager(t)
+	codexResumable(m)
+	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCEFAIL", codexReview).ID)
+	t.Setenv("FAKE_CODEX_LOSE_THREAD", "1")
+	if _, err := m.Resume(j.ID, "go on", Limits{}); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(codexArgvOf(t, m, j.ID), "\n--ephemeral\n") || j.SessionID != "" {
-		t.Fatalf("codex_resumable off: session %q argv:\n%s", j.SessionID, codexArgvOf(t, m, j.ID))
+	j = runCodexToRest(t, m, j.ID)
+	if j.Status != store.StatusFailed || j.SessionID != "" {
+		t.Fatalf("rejected resume: %s %q session %q", j.Status, j.Error, j.SessionID)
+	}
+	day := filepath.Join(os.Getenv("CODEX_HOME"), "sessions", "2026", "11", "26")
+	own := []string{
+		filepath.Join(day, "rollout-2026-11-26T09-00-00-"+fakeCodexThread+".jsonl"),
+		filepath.Join(day, "rollout-2026-11-26T09-00-00-0199a213-81c0-7800-8aa1-000000000002.jsonl"),
+	}
+	foreign := filepath.Join(day, "rollout-2026-11-26T09-00-00-0199a213-81c0-7800-8aa1-000000000009.jsonl")
+	if err := os.WriteFile(foreign, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range own {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("rollout of the job missing before prune: %v", err)
+		}
+	}
+	pj, ok, err := m.pruneOne(j.ID, m.Now().Add(time.Hour), false)
+	if err != nil || !ok || pj.Error != "" {
+		t.Fatalf("prune: %+v ok %v err %v", pj, ok, err)
+	}
+	for _, p := range own {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Fatalf("rollout of the job not pruned: %s (%v)", p, err)
+		}
+		if !slices.ContainsFunc(pj.Removed, func(e PruneEntry) bool { return e.Path == p }) {
+			t.Fatalf("pruned rollout %s missing from the report: %+v", p, pj.Removed)
+		}
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("a rollout of another thread was touched: %v", err)
 	}
 }
 
@@ -72,6 +122,7 @@ func TestCodexThreadIDRecorded(t *testing.T) {
 // isolation flags, with the update on stdin.
 func TestCodexResumeContinuesThread(t *testing.T) {
 	m := newCodexManager(t)
+	codexResumable(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCEFAIL", codexReview).ID)
 	if j.Status != store.StatusFailed || j.SessionID != fakeCodexThread {
 		t.Fatalf("first attempt: %s %q session %q", j.Status, j.Error, j.SessionID)
@@ -98,6 +149,7 @@ func TestCodexResumeContinuesThread(t *testing.T) {
 // brief, the previous attempt and the update.
 func TestCodexResumeFallsBackWithoutRollout(t *testing.T) {
 	m := newCodexManager(t)
+	codexResumable(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCEFAIL", codexReview).ID)
 	if j.Status != store.StatusFailed {
 		t.Fatalf("first attempt: %s %q", j.Status, j.Error)
@@ -127,6 +179,7 @@ func TestCodexResumeFallsBackWithoutRollout(t *testing.T) {
 // instead of letting a thread without the brief run on.
 func TestCodexResumeOtherThreadFails(t *testing.T) {
 	m := newCodexManager(t)
+	codexResumable(m)
 	j := runToEnd(t, m, enqueue(t, m, "FAKE_CODEX_ONCEFAIL", codexReview).ID)
 	t.Setenv("FAKE_CODEX_LOSE_THREAD", "1")
 	if _, err := m.Resume(j.ID, "go on", Limits{}); err != nil {
@@ -166,6 +219,7 @@ func TestCodexResumeOtherThreadFails(t *testing.T) {
 // counted once in the job's usage.
 func TestCodexTimeoutAutoContinuedOnce(t *testing.T) {
 	m := newCodexManager(t)
+	codexResumable(m)
 	limit := int64(2000)
 	m.Cfg.CodexMaxTokens = &limit
 	writeCodexConfig(t, m, `{"codex_max_tokens": 2000}`)
@@ -211,6 +265,7 @@ func TestCodexTimeoutAutoContinuedOnce(t *testing.T) {
 // its total usage, of which the attempt counts only its own part.
 func TestCodexNoReportAutoContinuedUsagePerAttempt(t *testing.T) {
 	m := newCodexManager(t)
+	codexResumable(m)
 	j := runCodexToRest(t, m, enqueue(t, m, "FAKE_CODEX_ONCENOREPORT", codexReview).ID)
 	if j.Status != store.StatusSucceeded || j.Attempt != 2 || j.RunMode != store.RunResume {
 		t.Fatalf("got %s %q attempt %d mode %q", j.Status, j.Error, j.Attempt, j.RunMode)

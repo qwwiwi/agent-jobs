@@ -139,6 +139,13 @@ A job on a `gpt-*` model runs on `codex exec` and is read-only by default (revie
 - **No network unless you say so.** Under `workspace-write`, `codex_write_network: true` lets the job's commands reach the network (package installs); it is off by default, and read-only codex jobs never get it. Exception: under `codex_sandbox: worktree-full-access` there is no codex sandbox, so the job has network whatever `codex_write_network` says, and it commits itself (no wrapper commit).
 - **Still no guard.** The codex sandbox is the only containment of a codex job; the session reads the report, checks the diff and ships, as with every job.
 
+Two more `config.json` keys for codex jobs:
+
+| key | default | what it does |
+|---|---|---|
+| `codex_resumable` | `false` | `true` keeps a codex job's thread (no `--ephemeral`), so `job_resume` and the one automatic continuation continue it with `codex exec resume <thread_id>`; codex then keeps the thread's rollout file under `$CODEX_HOME/sessions` until prune removes the job's own rollouts. Off: every codex job runs `--ephemeral`, and a resume or continuation starts a fresh thread with the brief, the previous attempt and the update. Gate jobs always run ephemeral. |
+| `codex_max_tokens` | absent (no cap) | caps the tokens of one codex attempt (input, cached included, plus output, as codex reports them): the wrapper stops codex once it is over and the attempt fails. Tokens an earlier, killed attempt of the thread used are not charged to the attempt that resumes it. `0` = no cap. |
+
 Details: [docs/GUIDE.md, Limits](docs/GUIDE.md#limits) (codex runner, commits and network, `codex_sandbox`).
 
 ---
