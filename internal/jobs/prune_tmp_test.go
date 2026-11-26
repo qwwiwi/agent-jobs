@@ -1,10 +1,12 @@
 package jobs
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -196,5 +198,47 @@ func TestDiskCountsRunningJobDirs(t *testing.T) {
 	t.Cleanup(func() { runningDirsBudget = oldBudget })
 	if d := m.Disk(); !d.JobDirsPartial || d.JobDirsBytes != 5<<20 {
 		t.Fatalf("over budget: dirs %d partial %v", d.JobDirsBytes, d.JobDirsPartial)
+	}
+}
+
+// #240 High (a), end to end: a mount point inside a finished job's temp dir is left alone with its
+// content, the rest of the temp dir is removed and the job is reported with an error.
+func TestPruneTmpKeepsMountedSubtree(t *testing.T) {
+	m := newManager(t)
+	dir := tmpJob(t, m, "mnt", store.StatusSucceeded, 3*time.Hour, nil)
+	mount := filepath.Join(dir, JobTmpDir, "pg", "mnt")
+	writeFile(t, filepath.Join(mount, "data"), []byte("d"), 0o600)
+	stubOpener(t, mount, syscall.EXDEV)
+
+	rep, err := m.PruneTmpContext(context.Background(), false)
+	if err == nil || !strings.Contains(err.Error(), "mount") {
+		t.Fatalf("err = %v, want the mount boundary reported", err)
+	}
+	if !exists(filepath.Join(mount, "data")) {
+		t.Fatal("content behind the mount point removed")
+	}
+	if exists(filepath.Join(dir, JobTmpDir, "go-build1")) {
+		t.Fatal("the rest of the temp dir was kept")
+	}
+	if len(rep.Jobs) != 1 || rep.Jobs[0].ID != "mnt" || !strings.Contains(rep.Jobs[0].Error, mount) || rep.Bytes < 4096 {
+		t.Fatalf("report = %+v", rep)
+	}
+}
+
+// A removal that runs out of its budget is not an error: the job is reported as continuing and a later
+// pass finishes it.
+func TestPruneTmpBudgetContinuesNextPass(t *testing.T) {
+	m := newManager(t)
+	dir := tmpJob(t, m, "big", store.StatusSucceeded, 3*time.Hour, nil)
+	oldN := removeMaxEntries
+	removeMaxEntries = 2
+	t.Cleanup(func() { removeMaxEntries = oldN })
+	rep, err := m.PruneTmpContext(context.Background(), false)
+	if err != nil || len(rep.Jobs) != 1 || rep.Jobs[0].Skipped != pruneSkipBudget || !exists(filepath.Join(dir, JobTmpDir)) {
+		t.Fatalf("first pass: err %v, report %+v", err, rep)
+	}
+	removeMaxEntries = oldN
+	if _, err := m.PruneTmpContext(context.Background(), false); err != nil || exists(filepath.Join(dir, JobTmpDir)) {
+		t.Fatalf("second pass: err %v, temp dir exists %v", err, exists(filepath.Join(dir, JobTmpDir)))
 	}
 }

@@ -304,19 +304,17 @@ func (m *Manager) pruneJob(j *store.Job, dryRun, tmpOnly bool) PruneJob {
 			pj.Kept = append(pj.Kept, name)
 			continue
 		}
-		size := treeSize(p)
-		if !dryRun {
-			if err := removeTree(p); err != nil {
-				return fail(err.Error())
-			}
+		if stop, err := pruneRemove(&pj, p, reason, dryRun); err != nil {
+			return fail(err.Error())
+		} else if stop {
+			return pj
 		}
-		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: reason})
 	}
 	return pj
 }
 
 // pruneTmp is the tmpOnly end of pruneJob: the temp dir entry goes the way every directory of a
-// pruned folder goes (pruneDecide, removeTree); an entry of that name that pruneDecide keeps (a
+// pruned folder goes (pruneDecide, pruneRemove); an entry of that name that pruneDecide keeps (a
 // small text file the job put there) stays.
 func (m *Manager) pruneTmp(j *store.Job, dir string, dryRun bool, pj PruneJob) PruneJob {
 	p := filepath.Join(dir, JobTmpDir)
@@ -330,42 +328,51 @@ func (m *Manager) pruneTmp(j *store.Job, dir string, dryRun bool, pj PruneJob) P
 	if keep {
 		return pj
 	}
-	size := treeSize(p)
-	if !dryRun {
-		if err := removeTree(p); err != nil {
-			pj.Error = err.Error()
-			return pj
-		}
+	reason := fmt.Sprintf("temp dir of a job finished more than %s ago (job_tmp_retention_hours)", m.Config().JobTmpRetention())
+	if _, err := pruneRemove(&pj, p, reason, dryRun); err != nil {
+		pj.Error = err.Error()
 	}
-	pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size,
-		Reason: fmt.Sprintf("temp dir of a job finished more than %s ago (job_tmp_retention_hours)", m.Config().JobTmpRetention())})
 	return pj
+}
+
+// pruneSkipBudget is the Skipped text of a job whose removal ran out of its budget (removeBudget).
+const pruneSkipBudget = "removal continues on the next pass"
+
+// pruneRemove removes p (on a dry run: measures it) and lists it in pj.Removed with the bytes freed,
+// which come from the removal's own walk. A removal that ran out of its budget lists what it freed,
+// sets pj.Skipped and returns stop: the job is left for the next pass. A removal that failed part way
+// (a mount point below p) also lists what it freed before the error is returned.
+func pruneRemove(pj *PruneJob, p, reason string, dryRun bool) (stop bool, err error) {
+	if dryRun {
+		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: treeSize(p), Reason: reason})
+		return false, nil
+	}
+	n, err := removeTreeSized(p)
+	if err == nil || n > 0 {
+		pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: n, Reason: reason})
+	}
+	if errors.Is(err, errRemovalBudget) {
+		if pj.Skipped == "" {
+			pj.Skipped = pruneSkipBudget
+		}
+		return true, nil
+	}
+	return false, err
 }
 
 // pruneAdvisorDir removes a pruned crew job's advisor dir (<state>/advisor/<id>: the settings and MCP
 // config of its advisor calls, written by the daemon; the calls themselves stay in the database).
 func (m *Manager) pruneAdvisorDir(j *store.Job, dryRun bool, pj *PruneJob) {
 	p := m.AdvisorDir(j.ID)
-	fi, err := os.Lstat(p)
-	if err != nil {
+	if _, err := os.Lstat(p); err != nil {
 		if !errors.Is(err, os.ErrNotExist) && pj.Error == "" {
 			pj.Error = err.Error()
 		}
 		return
 	}
-	size := int64(0)
-	if fi.IsDir() {
-		size = treeSize(p)
+	if _, err := pruneRemove(pj, p, "advisor settings of the crew job", dryRun); err != nil && pj.Error == "" {
+		pj.Error = err.Error()
 	}
-	if !dryRun {
-		if err := removeTree(p); err != nil {
-			if pj.Error == "" {
-				pj.Error = err.Error()
-			}
-			return
-		}
-	}
-	pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "advisor settings of the crew job"})
 }
 
 // pruneSessions removes the claude session files of a pruned job (DEVIATIONS #15): the transcript
@@ -389,14 +396,12 @@ func (m *Manager) pruneSessions(j *store.Job, dryRun bool, pj *PruneJob) {
 			return
 		}
 		for _, p := range paths {
-			size := treeSize(p)
-			if !dryRun {
-				if err := removeTree(p); err != nil {
-					pj.Error = err.Error()
-					return
-				}
+			if stop, err := pruneRemove(pj, p, "claude session of the job", dryRun); err != nil {
+				pj.Error = err.Error()
+				return
+			} else if stop {
+				return
 			}
-			pj.Removed = append(pj.Removed, PruneEntry{Path: p, Bytes: size, Reason: "claude session of the job"})
 		}
 	}
 }
@@ -526,13 +531,13 @@ func (w *dirWalk) each(fd int, fn func(name string, st *unix.Stat_t)) {
 }
 
 // size sums the sizes of everything in the directory name under dirfd (symlinks counted as links).
-// A directory that cannot be opened counts as its entry alone.
+// A directory that cannot be opened (a mount point included: openDirBeneath) counts as its entry alone.
 func (w *dirWalk) size(dirfd int, name string, depth int) int64 {
 	if depth > maxChmodDepth {
 		w.partial = true
 		return 0
 	}
-	fd, err := openDirNoFollow(dirfd, name)
+	fd, err := openDirBeneath(dirfd, name) // never into a mounted filesystem
 	if err != nil {
 		return 0
 	}
@@ -590,41 +595,6 @@ func (m *Manager) recordDirSize(id string) {
 	}
 }
 
-// removeTree removes p and everything under it without following symlinks. A job may leave
-// read-only directories behind (and the job dir holds a 0500 no-hooks/), so on a failure every real
-// directory under p is made writable and the removal is retried once.
-func removeTree(p string) error {
-	if err := os.RemoveAll(p); err == nil {
-		return nil
-	}
-	chmodTree(unix.AT_FDCWD, p, 0)
-	return os.RemoveAll(p)
-}
-
-// maxChmodDepth bounds chmodTree's recursion.
+// maxChmodDepth bounds the depth of a removal (removeTree) and of a size walk: one descriptor is held
+// per level.
 const maxChmodDepth = 256
-
-// chmodTree makes the directory name (relative to dirfd) and every directory under it 0700. Each
-// directory is opened relative to its parent's descriptor with O_NOFOLLOW and changed through its
-// own descriptor, so a directory swapped for a symlink mid-walk (a ghost still writing in the job
-// dir) is never followed: the chmod cannot reach outside the tree. A directory that cannot be
-// opened for reading is left as it is (the removal then reports the error).
-func chmodTree(dirfd int, name string, depth int) {
-	if depth > maxChmodDepth {
-		return
-	}
-	fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return
-	}
-	f := os.NewFile(uintptr(fd), name)
-	defer f.Close()
-	_ = unix.Fchmod(fd, 0o700)
-	names, _ := f.Readdirnames(-1)
-	for _, n := range names {
-		var st unix.Stat_t
-		if unix.Fstatat(fd, n, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
-			chmodTree(fd, n, depth+1)
-		}
-	}
-}
