@@ -91,6 +91,11 @@ type Manager struct {
 	// waits for it.
 	prefetching atomic.Bool
 	prefetchWG  sync.WaitGroup
+	// sinking is set while the daemon's background sink run (deliverSinksInBackground) is on; sinkWG
+	// waits for it, sinkStop keeps it from claiming more lines (WaitNotifySinks).
+	sinking  atomic.Bool
+	sinkStop atomic.Bool
+	sinkWG   sync.WaitGroup
 	// sourcesRetryAt holds, per job id, when clones that could not record their outcome are tried again
 	// (time.Time, sourcesRetryBackoff after the failure).
 	sourcesRetryAt sync.Map
@@ -735,6 +740,14 @@ func (m *Manager) Tick() error {
 		m.prefetchQueued()
 	}
 	err := m.tickLocked()
+	// The sinks of config notify get the lines this tick delivered outside the lifecycle lock (a slow
+	// helper never holds up cancel or the next tick's tmux lines): in the background in the daemon,
+	// inline in a manual tick, which waits for them before it exits.
+	if m.daemonLockHeld {
+		m.deliverSinksInBackground()
+	} else {
+		m.deliverSinks()
+	}
 	// Sandbox containers of ended jobs (containers.pending) are removed outside the lifecycle lock: each
 	// docker call may take up to containerCmdTimeout.
 	m.retryContainerCleanups()

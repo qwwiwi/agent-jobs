@@ -355,7 +355,7 @@ func (m *Manager) notifyPending() error {
 		return nil
 	}
 	t := m.Config().NotifyTmuxTarget
-	if t == "" {
+	if t == "" && !m.Config().Notify.enabled() {
 		for _, j := range jobs {
 			m.checkMerge(j)
 			m.Log.Printf("notify off (notify_tmux_target not configured), marked notified: %s", m.DoneLineFor(j))
@@ -473,13 +473,41 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if len(batch) > 1 {
 		line = m.coalescedLine(batch)
 	}
+	ref := WakeJobDone + ":" + strings.Join(batchRefs(batch), ",")
+	if target == "" {
+		// No tmux target: the sinks of config notify alone carry the line. It is queued for them
+		// (notify_sink_outbox, keyed by ref) together with the mark notified, so the cleanup of the
+		// batch proceeds whatever they answer; they run after the lifecycle lock is released
+		// (deliverSinks). An owner-waits attempt stays delivering until they delivered it, and a
+		// failed sink leaves it there. The idle note is a tmux matter and does not ride. The SLO
+		// breach note rides, and its breaches are marked noted in that same transaction: a rejected
+		// insert keeps them pending, so the next line carries them again.
+		note, noted := m.sloNote()
+		if note != "" {
+			line += " · " + note
+		}
+		sink := m.sinkDelivery(ref, line, batch, true)
+		if sink != nil {
+			sink.Noted = noted
+		}
+		if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), nil, sink); err != nil {
+			return false, err
+		}
+		m.recordWake(WakeJobDone, ref, batchMembers(batch), len(Printable(line, 0)))
+		for _, j := range batch {
+			m.forgetMergeNote(j.ID)
+		}
+		return false, nil
+	}
 	// An emptied queue adds its idle note to this same line (#165), never a line of its own. The note
 	// is only a candidate here: its final check runs inside the tmux delivery, under the idle lock.
 	note, epoch, retry := m.idleDelivery(batch)
 	var rode bool
+	var sent string
 	err = m.withTmuxLock(func(ctx context.Context) error {
-		return m.deliverVia(ctx, WakeJobDone, WakeJobDone+":"+strings.Join(batchRefs(batch), ","), batchMembers(batch), line, true,
-			func(ctx context.Context, l string) (string, error) {
+		return m.deliverVia(ctx, WakeJobDone, ref, batchMembers(batch), line, true,
+			func(ctx context.Context, l string) (l2 string, err error) {
+				defer func() { sent = l2 }()
 				if err := m.waitPaneOutOfMode(ctx, target); err != nil {
 					return "", err
 				}
@@ -514,7 +542,10 @@ func (m *Manager) deliverDone(target string, batch []*store.Job) (stalled bool, 
 	if rode || (retry && note != "") {
 		mark = &store.IdleMark{Kind: store.IdleNote, Epoch: epoch}
 	}
-	if err := m.Store.MarkNotifiedBatch(batchIDList(batch), m.Now(), mark); err != nil {
+	// The sinks of config notify get the line tmux accepted, queued in the same transaction as its
+	// acknowledgement (once per batch) and run after the lifecycle lock is released: they never hold
+	// up or fail the session's own delivery.
+	if err := m.Store.MarkNotifiedSinks(batchIDList(batch), m.Now(), mark, m.sinkDelivery(ref, sent, batch, false)); err != nil {
 		return false, err
 	}
 	for _, j := range batch {

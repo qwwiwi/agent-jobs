@@ -269,6 +269,13 @@ func (s *Store) UnnotedSLOBreaches() ([]SLOBreach, error) {
 
 // MarkSLOBreachesNoted marks breaches as carried by a delivery; one already marked keeps its time.
 func (s *Store) MarkSLOBreachesNoted(ids []int64, at time.Time) error {
+	return markSLOBreachesNoted(s.db, ids, at)
+}
+
+// markSLOBreachesNoted is MarkSLOBreachesNoted on db or inside a transaction.
+func markSLOBreachesNoted(db interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, ids []int64, at time.Time) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -277,7 +284,7 @@ func (s *Store) MarkSLOBreachesNoted(ids []int64, at time.Time) error {
 	for _, id := range ids {
 		args = append(args, id)
 	}
-	if _, err := s.db.Exec(`UPDATE slo_breaches SET noted_at = ? WHERE noted_at IS NULL AND id IN (`+marks+`)`, args...); err != nil {
+	if _, err := db.Exec(`UPDATE slo_breaches SET noted_at = ? WHERE noted_at IS NULL AND id IN (`+marks+`)`, args...); err != nil {
 		return fmt.Errorf("mark slo breaches noted: %w", err)
 	}
 	return nil

@@ -120,13 +120,29 @@ func (s *Store) LastIdlePickEpoch(kinds ...string) (int64, error) {
 // recorded, or neither is and the whole line is retried. A saved idle delivery is cleared when its
 // batch matches or all of its members have been notified, including through separate acknowledgements.
 func (s *Store) MarkNotifiedBatch(ids []string, now time.Time, idle *IdleMark) error {
+	return s.MarkNotifiedSinks(ids, now, idle, nil)
+}
+
+// MarkNotifiedSinks is MarkNotifiedBatch that also queues the line for the sinks of config notify
+// (sink nil: none), in the same transaction, so a line is acknowledged and queued together or not at
+// all. The queue is keyed by sink.Ref, the batch identity: a batch queued before keeps its row (and
+// its outcome), so a retry never runs its sinks twice. With sink.Owner (the sinks alone carry the
+// line) an owner-waits attempt is not marked delivered here: FinishSinkDelivery does that once the
+// sinks delivered it.
+func (s *Store) MarkNotifiedSinks(ids []string, now time.Time, idle *IdleMark, sink *SinkDelivery) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("mark notified: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	promote := sink == nil || !sink.Owner
 	for _, id := range ids {
-		if err := markNotifiedTx(tx, id, now); err != nil {
+		if err := markNotifiedTx(tx, id, now, promote); err != nil {
+			return err
+		}
+	}
+	if sink != nil {
+		if err := queueSinkDeliveryTx(tx, sink, now); err != nil {
 			return err
 		}
 	}
