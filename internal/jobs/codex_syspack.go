@@ -239,7 +239,7 @@ func validateCodexHooksRequirements(doc map[string]any, hooksDir string) ([]stri
 				return nil, fmt.Errorf("%s.hooks: not an array of tables", at)
 			}
 			for _, h := range handlers.items {
-				prog, err := validateCodexHookHandler(h, hooksDir, event == codexHookLegacyFailureEvent)
+				prog, err := validateCodexHookHandler(h, hooksDir, event)
 				if err != nil {
 					return nil, fmt.Errorf("%s.hooks: %w", at, err)
 				}
@@ -256,16 +256,21 @@ func validateCodexHooksRequirements(doc map[string]any, hooksDir string) ([]stri
 }
 
 // validateCodexHookHandler checks one handler table and returns the name of the program it runs.
-func validateCodexHookHandler(h map[string]any, hooksDir string, legacyOnFailure bool) (string, error) {
+func validateCodexHookHandler(h map[string]any, hooksDir, event string) (string, error) {
 	for k, v := range h {
 		switch {
-		case k == "type" || k == "command" || k == "statusMessage" || k == "onFailure" && legacyOnFailure:
+		case k == "type" || k == "command" || k == "statusMessage" || k == "onFailure" && event == codexHookLegacyFailureEvent:
 			if _, ok := v.(string); !ok {
 				return "", fmt.Errorf("handler %s is not a string", k)
 			}
 		case k == "timeout":
 			if n, ok := v.(int64); !ok || n <= 0 {
 				return "", errors.New("handler timeout is not a positive integer")
+			}
+		case k == "additionalContextLimit" && event == "SessionStart":
+			const maxAdditionalContextLimit = 100000
+			if n, ok := v.(int64); !ok || n <= 0 || n > maxAdditionalContextLimit {
+				return "", fmt.Errorf("handler additionalContextLimit must be an integer between 1 and %d", maxAdditionalContextLimit)
 			}
 		default:
 			return "", fmt.Errorf("handler key %q is not allowed", Printable(k, 64))

@@ -105,6 +105,48 @@ func TestCodexSystemConfigHostRequirements(t *testing.T) {
 	}
 }
 
+func TestCodexSystemConfigTyrandeM5Requirements(t *testing.T) {
+	b, err := os.ReadFile("testdata/codex-requirements-tyrande-m5.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pack := string(b)
+	const limit = "additionalContextLimit = 6000\n"
+	const invalidLimit = "handler additionalContextLimit must be an integer between 1 and 100000"
+	for _, tt := range []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{"staged pack", pack, ""},
+		{"minimum", strings.Replace(pack, limit, "additionalContextLimit = 1\n", 1), ""},
+		{"maximum", strings.Replace(pack, limit, "additionalContextLimit = 100000\n", 1), ""},
+		{"zero", strings.Replace(pack, limit, "additionalContextLimit = 0\n", 1), invalidLimit},
+		{"negative", strings.Replace(pack, limit, "additionalContextLimit = -1\n", 1), "unsupported value"},
+		{"string", strings.Replace(pack, limit, "additionalContextLimit = \"6000\"\n", 1), invalidLimit},
+		{"float", strings.Replace(pack, limit, "additionalContextLimit = 6000.0\n", 1), "unexpected text after a value"},
+		{"over maximum", strings.Replace(pack, limit, "additionalContextLimit = 100001\n", 1), invalidLimit},
+		{"unknown key", strings.Replace(pack, limit, "unknownKey = 6000\n", 1), `handler key "unknownKey" is not allowed`},
+		{"other event", strings.Replace(pack, limit, "", 1) + limit, `hooks.PreCompact.hooks: handler key "additionalContextLimit" is not allowed`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			programs, err := checkCodexHooksRequirements(tt.src, "/etc/codex/hooks")
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("must pass: %v", err)
+			}
+			if len(programs) != 1 || programs[0] != "run" {
+				t.Fatalf("programs = %q, want [run]", programs)
+			}
+		})
+	}
+}
+
 // Anything that is not exactly the pack refuses with the old message.
 func TestCodexSystemConfigRefusesNonPack(t *testing.T) {
 	const old = "codex has system or managed configuration in "
