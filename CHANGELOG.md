@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex jobs accept managed `SessionStart` hook handlers with an `additionalContextLimit` integer from 1 to 100,000.
+
 ## [0.8.2] - 2026-11-11
 
 This release is about speed: gates of different repositories run side by side, a queued job starts seconds after a slot frees, and a fix loop stops after two rounds unless someone decides otherwise.
